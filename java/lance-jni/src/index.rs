@@ -173,6 +173,8 @@ fn determine_index_type<'local>(
             Some("ZONEMAP")
         } else if lower.contains("bloomfilter") {
             Some("BLOOM_FILTER")
+        } else if lower.contains("rtree") {
+            Some("RTREE")
         } else if lower.contains("ivfhnsw") {
             if lower.contains("sq") {
                 Some("IVF_HNSW_SQ")

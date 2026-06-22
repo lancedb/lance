@@ -8,13 +8,15 @@ use arrow_array::{
     Float32Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use half::bf16;
 use lance_arrow::{ArrowFloatType, FloatArray};
 use num_traits::Float;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_linalg::distance::dot::{Dot, dot, dot_distance};
 use lance_testing::datagen::generate_random_array_with_seed;

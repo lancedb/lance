@@ -7,7 +7,7 @@ use lance_arrow::FixedSizeListArrayExt;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_index::vector::ivf::IvfTransformer;
 use lance_linalg::distance::DistanceType;

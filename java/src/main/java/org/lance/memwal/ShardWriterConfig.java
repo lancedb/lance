@@ -15,6 +15,8 @@ package org.lance.memwal;
 
 import com.google.common.base.Preconditions;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -38,6 +40,7 @@ public class ShardWriterConfig {
   private Optional<Long> asyncIndexIntervalMs = Optional.empty();
   private Optional<Long> backpressureLogIntervalMs = Optional.empty();
   private Optional<Long> statsLogIntervalMs = Optional.empty();
+  private List<MemWalHnswParams> hnswParams = Collections.emptyList();
 
   /** Whether each {@code put} is durably persisted to the WAL before returning. */
   public ShardWriterConfig withDurableWrite(boolean durableWrite) {
@@ -155,6 +158,16 @@ public class ShardWriterConfig {
     return this;
   }
 
+  /**
+   * Per-index HNSW build-parameter overrides for the MemTable this writer builds. Each {@link
+   * MemWalHnswParams#indexName} should reference a maintained vector index.
+   */
+  public ShardWriterConfig withHnswParams(List<MemWalHnswParams> hnswParams) {
+    Preconditions.checkNotNull(hnswParams, "hnswParams must not be null");
+    this.hnswParams = hnswParams;
+    return this;
+  }
+
   public Optional<Boolean> durableWrite() {
     return durableWrite;
   }
@@ -205,5 +218,9 @@ public class ShardWriterConfig {
 
   public Optional<Long> statsLogIntervalMs() {
     return statsLogIntervalMs;
+  }
+
+  public List<MemWalHnswParams> hnswParams() {
+    return hnswParams;
   }
 }

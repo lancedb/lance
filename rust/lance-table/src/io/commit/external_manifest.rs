@@ -456,6 +456,31 @@ impl CommitHandler for ExternalManifestCommitHandler {
         .await
     }
 
+    async fn version_exists(
+        &self,
+        base_path: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+        naming_scheme: ManifestNamingScheme,
+    ) -> Result<bool> {
+        match self
+            .external_manifest_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(Error::NotFound { .. }) => {
+                let path = naming_scheme.manifest_path(base_path, version);
+                match object_store.head(&path).await {
+                    Ok(_) => Ok(true),
+                    Err(ObjectStoreError::NotFound { .. }) => Ok(false),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     async fn commit(
         &self,
         manifest: &mut Manifest,

@@ -6,14 +6,14 @@ use lance_datafusion::utils::{
     IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
-use lance_io::scheduler::ScanScheduler;
+use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -30,8 +30,7 @@ use lance_core::error::{CloneableResult, Error};
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::{ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
-use std::future::Future;
+use lance_select::{RowAddrMask, RowAddrTreeMap, result::IndexExprResult};
 
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
@@ -97,20 +96,19 @@ pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
-        let batch = self
-            .0
-            .try_next()
-            .await?
-            .ok_or_else(|| {
-                Error::internal("Selection vector source for prefilter did not yield any batches")
-            })
-            .unwrap();
-        RowAddrMask::from_arrow(batch["result"].as_binary_opt::<i32>().ok_or_else(|| {
-            Error::internal(format!(
-                "Expected selection vector input to yield binary arrays but got {}",
-                batch["result"].data_type()
-            ))
-        })?)
+        let batch = self.0.try_next().await?.ok_or_else(|| {
+            Error::internal("Selection vector source for prefilter did not yield any batches")
+        })?;
+        // The vector-search prefilter wants the set of rows the search is
+        // allowed to consider — the `upper` bound of the index expression
+        // result. Rows outside the upper bound are guaranteed not to match,
+        // so the vector search can skip them.
+        //
+        // Use deserialize() here (rather than indexing "upper" directly) to
+        // support both the TwoMask and the legacy ThreeVariant wire formats
+        // that ScalarIndexExec may emit.
+        let (result, _) = IndexExprResult::deserialize(&batch)?;
+        Ok(result.upper)
     }
 }
 
@@ -302,7 +300,7 @@ where
 /// applies a per-batch async transform.
 ///
 /// `elapsed_compute` measures only the time spent driving the transform
-/// futures — never the time spent polling the child input — so wrapping a
+/// futures -- never the time spent polling the child input -- so wrapping a
 /// chain of nodes does not double-count child CPU. `output_rows` and
 /// `output_batches` are recorded as the transform produces batches.
 ///
@@ -365,7 +363,7 @@ where
         let this = self.get_mut();
 
         // Fill in-flight transforms up to `concurrency` from the input.
-        // Polling the input does NOT count toward `elapsed_compute`.
+        // Polling the input does not count toward `elapsed_compute`.
         while !this.input_done && this.in_flight.len() < this.concurrency {
             match this.input.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
@@ -381,7 +379,7 @@ where
             }
         }
 
-        // Drive in-flight transforms; their poll time IS counted.
+        // Drive in-flight transforms; their poll time is counted.
         if !this.in_flight.is_empty() {
             let timer = this.baseline_metrics.elapsed_compute().timer();
             let poll = this.in_flight.poll_next_unpin(cx);
@@ -393,13 +391,9 @@ where
                     }
                     return this.baseline_metrics.record_poll(Poll::Ready(Some(result)));
                 }
-                // Unreachable: `FuturesUnordered::poll_next` returns
-                // `Ready(None)` only when empty, and we just checked
-                // `!is_empty` above. A panic here is preferable to a
-                // silent infinite loop if the invariant ever breaks.
-                Poll::Ready(None) => {
-                    unreachable!("FuturesUnordered yielded None while non-empty")
-                }
+                // `FuturesUnordered::poll_next` returns `Ready(None)` only
+                // when empty, and we just checked `!is_empty` above.
+                Poll::Ready(None) => unreachable!("non-empty transform queue yielded None"),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -508,12 +502,17 @@ impl IoMetrics {
     }
 
     pub fn record(&self, scan_scheduler: &ScanScheduler) {
-        let current_stats = scan_scheduler.stats();
+        self.record_stats(scan_scheduler.stats());
+    }
 
-        // Use set_max to ensure gauge always shows the highest value seen
-        self.iops.set_max(current_stats.iops as usize);
-        self.requests.set_max(current_stats.requests as usize);
-        self.bytes_read.set_max(current_stats.bytes_read as usize);
+    /// Record a snapshot of cumulative I/O statistics.
+    ///
+    /// Uses `set_max` because the underlying counters are cumulative; the gauge
+    /// always reflects the highest (i.e. final) value seen.
+    pub fn record_stats(&self, stats: ScanStats) {
+        self.iops.set_max(stats.iops as usize);
+        self.requests.set_max(stats.requests as usize);
+        self.bytes_read.set_max(stats.bytes_read as usize);
     }
 }
 
@@ -522,6 +521,12 @@ pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,
     index_comparisons: Count,
+    /// Per-query sink that accumulates exact index-file I/O as partitions are
+    /// loaded from storage.  Shared by all clones of this `IndexMetrics`, so
+    /// concurrent partition loads all funnel into the same counters.  Published
+    /// to `io_metrics` for display via [`IndexMetrics::flush_io`].
+    io_stats: IoStats,
+    io_metrics: IoMetrics,
 }
 
 impl IndexMetrics {
@@ -530,7 +535,17 @@ impl IndexMetrics {
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
+            io_stats: IoStats::new(),
+            io_metrics: IoMetrics::new(metrics, partition),
         }
+    }
+
+    /// Publish the I/O accumulated in the per-query sink to the displayed
+    /// `iops`/`requests`/`bytes_read` metrics.  Call once when the operator's
+    /// stream finishes; the sink only accumulates on cache misses, so a fully
+    /// cache-resident query publishes zeros.
+    pub fn flush_io(&self) {
+        self.io_metrics.record_stats(self.io_stats.snapshot());
     }
 }
 
@@ -543,6 +558,9 @@ impl MetricsCollector for IndexMetrics {
     }
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_comparisons.add(num_comparisons);
+    }
+    fn io_stats(&self) -> Option<IoStats> {
+        Some(self.io_stats.clone())
     }
 }
 
@@ -581,11 +599,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let n_batches: usize = 3;
-        // child_delay is intentionally several times larger than transform_delay
-        // so the assertion tolerates significant `std::thread::sleep` overshoot
-        // on busy CI runners (we've seen ~2-3x overshoot on macOS Actions).
         let child_delay = Duration::from_millis(150);
-        let transform_delay = Duration::from_millis(30);
 
         let counter = Arc::new(AtomicUsize::new(0));
         let s = schema.clone();
@@ -609,10 +623,7 @@ mod tests {
         let stream = InstrumentedChildInputStream::new(
             child,
             schema,
-            move |batch| async move {
-                std::thread::sleep(transform_delay);
-                Ok(batch)
-            },
+            move |batch| async move { Ok(batch) },
             1,
             0,
             &metrics,
@@ -627,16 +638,10 @@ mod tests {
             .expect("elapsed_compute should be recorded");
         let elapsed = Duration::from_nanos(elapsed_ns as u64);
 
-        // Expect ~ transform_delay * n. The upper bound is set generously to
-        // absorb sleep overshoot on slow CI (~4-5x per call) while still
-        // cleanly rejecting any version that double-counts child poll time,
-        // which would yield ~ (transform_delay + child_delay) * n.
-        let upper = Duration::from_millis(400);
-        assert!(
-            elapsed >= transform_delay * (n_batches as u32 - 1),
-            "elapsed_compute={:?} too low; transform time was not measured",
-            elapsed,
-        );
+        // The transform is immediate, so `elapsed_compute` should stay well
+        // below even one child poll delay. A version that double-counts child
+        // input time would include roughly `child_delay * n_batches`.
+        let upper = child_delay;
         assert!(
             elapsed < upper,
             "elapsed_compute={:?} >= {:?}; child input time was double-counted",

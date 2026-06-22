@@ -38,6 +38,7 @@ public class MergeInsertParams {
   private int conflictRetries = 10;
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
+  private boolean useIndex = true;
   private List<MergedGeneration> markedGenerations = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
@@ -228,6 +229,22 @@ public class MergeInsertParams {
   }
 
   /**
+   * Controls whether to use indices for the merge operation.
+   *
+   * <p>When set to false, forces a full table scan even if an index exists on the join key. This
+   * can be useful for benchmarking or when the optimizer chooses a suboptimal path.
+   *
+   * <p>Default is true (use index if available).
+   *
+   * @param useIndex Whether to use indices for the merge join
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withUseIndex(boolean useIndex) {
+    this.useIndex = useIndex;
+    return this;
+  }
+
+  /**
    * Mark MemWAL generations as merged into the base table.
    *
    * <p>Use this when the merge insert incorporates data from MemWAL flushed generations. It updates
@@ -298,6 +315,10 @@ public class MergeInsertParams {
     return skipAutoCleanup;
   }
 
+  public boolean useIndex() {
+    return useIndex;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -315,6 +336,7 @@ public class MergeInsertParams {
         .add("conflictRetries", conflictRetries)
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
+        .add("useIndex", useIndex)
         .toString();
   }
 

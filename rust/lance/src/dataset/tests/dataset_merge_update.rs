@@ -14,7 +14,9 @@ use crate::{Dataset, Error};
 use lance_core::ROW_ADDR;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use mock_instant::thread_local::MockClock;
 
 use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};
@@ -2630,4 +2632,83 @@ async fn test_sub_schema_merge_insert_binary_v2_2() {
     let binary_arr = a_col.as_any().downcast_ref::<BinaryArray>().unwrap();
     assert_eq!(binary_arr.value(0), data_a.as_slice());
     assert_eq!(binary_arr.value(1), data_b.as_slice());
+}
+
+#[tokio::test]
+async fn test_fts_unfiltered_after_compaction_returns_remapped_row_ids() {
+    // After `compact_files` with `defer_index_remap = true`, queries
+    // read the old FTS index but must apply the dataset's
+    // FragReuseIndex remap. Otherwise the deferred-row_id path
+    // returns pre-compaction row_ids that no longer exist.
+    use arrow::datatypes::UInt64Type;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                "alpha first",
+                "alpha second",
+                "alpha third",
+                "alpha fourth",
+            ])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://test_fts_frag_reuse",
+        Some(WriteParams {
+            max_rows_per_file: 1, // 4 fragments -> 4 partitions
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1000,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let after = dataset
+        .scan()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(after.num_rows(), 4);
+    let returned: Vec<u64> = after[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+    let live: std::collections::HashSet<u64> =
+        dataset.scan().with_row_id().try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+    for id in &returned {
+        assert!(live.contains(id), "stale row_id {id}");
+    }
 }

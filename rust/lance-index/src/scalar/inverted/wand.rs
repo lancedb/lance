@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
@@ -434,9 +435,19 @@ impl PostingIterator {
     }
 }
 
+/// How wand identified a candidate: either it already had the real
+/// row_id (DocSet carried row_ids), or only the partition-local
+/// doc_id (deferred-row_id path; the caller must resolve via
+/// [`super::lazy_docset::LazyDocSet::resolve_row_ids`]).
+#[derive(Debug, Clone, Copy)]
+pub enum CandidateAddr {
+    RowId(u64),
+    Pending(u32),
+}
+
 #[derive(Debug)]
 pub struct DocCandidate {
-    pub row_id: u64,
+    pub addr: CandidateAddr,
     /// (term_index, freq)
     pub freqs: Vec<(u32, u32)>,
     pub doc_length: u32,
@@ -446,25 +457,27 @@ struct HeadPosting {
     // Iterators that are already positioned on or after the next candidate doc.
     // The heap is ordered by smallest doc id so the top element determines
     // the next target doc to consider.
+    doc_id: u64,
     posting: Box<PostingIterator>,
 }
 
 impl HeadPosting {
     fn new(posting: Box<PostingIterator>) -> Self {
-        Self { posting }
+        let doc_id = posting
+            .doc()
+            .map(|doc| doc.doc_id())
+            .unwrap_or(TERMINATED_DOC_ID);
+        Self { doc_id, posting }
     }
 
     fn doc_id(&self) -> u64 {
-        self.posting
-            .doc()
-            .map(|doc| doc.doc_id())
-            .unwrap_or(TERMINATED_DOC_ID)
+        self.doc_id
     }
 }
 
 impl PartialEq for HeadPosting {
     fn eq(&self, other: &Self) -> bool {
-        self.doc_id() == other.doc_id()
+        self.doc_id == other.doc_id
             && self.posting.approximate_upper_bound().to_bits()
                 == other.posting.approximate_upper_bound().to_bits()
             && self.posting.token_id == other.posting.token_id
@@ -483,8 +496,8 @@ impl PartialOrd for HeadPosting {
 impl Ord for HeadPosting {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         other
-            .doc_id()
-            .cmp(&self.doc_id())
+            .doc_id
+            .cmp(&self.doc_id)
             .then_with(|| {
                 self.posting
                     .approximate_upper_bound()
@@ -574,6 +587,22 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     docs: &'a DocSet,
     scorer: S,
+    // Shared cross-partition top-k floor. Each partition publishes its local
+    // k-th score (`atomic_store_max_f32`) and prunes against the running value
+    // -- a lower bound on the global k-th, so it never drops a real top-k doc.
+    shared_threshold: Option<Arc<AtomicU32>>,
+}
+
+/// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
+/// bit-max) so it stays correct for negative scores -- BM25 idf can go negative.
+fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
+    let mut cur = slot.load(Ordering::Relaxed);
+    while val > f32::from_bits(cur) {
+        match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 // we were using row id as doc id in the past, which is u64,
@@ -620,6 +649,38 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_last_doc: None,
             docs,
             scorer,
+            shared_threshold: None,
+        }
+    }
+
+    /// Share one cross-partition top-k floor across a query's partitions.
+    pub(crate) fn with_shared_threshold(mut self, shared: Arc<AtomicU32>) -> Self {
+        self.shared_threshold = Some(shared);
+        self
+    }
+
+    /// Set the pruning threshold from this partition's k-th best, raised to the
+    /// shared cross-partition floor when one is attached.
+    fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
+        let mut t = local_kth * wand_factor;
+        if let Some(shared) = self.shared_threshold.as_ref() {
+            atomic_store_max_f32(shared, local_kth);
+            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+            if g > t {
+                t = g;
+            }
+        }
+        self.threshold = t;
+    }
+
+    /// Raise the local threshold to the shared cross-partition floor, picking up
+    /// updates published by sibling partitions.
+    fn raise_to_shared_floor(&mut self, wand_factor: f32) {
+        if let Some(shared) = self.shared_threshold.as_ref() {
+            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+            if g > self.threshold {
+                self.threshold = g;
+            }
         }
     }
 
@@ -647,19 +708,44 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
+        // Deferred-row_id path: when the DocSet was built without
+        // row_ids, wand emits candidates carrying just the
+        // partition-local doc_id; the outer caller resolves them to
+        // row_ids post-wand.
+        let docs_has_row_ids = self.docs.has_row_ids();
+
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
-        while let Some((doc, mut score)) = self.next()? {
+        loop {
+            self.raise_to_shared_floor(params.wand_factor);
+            let Some((doc, mut score)) = self.next()? else {
+                break;
+            };
             num_comparisons += 1;
 
+            // Either a real row_id (so we can run the mask check
+            // inline) or the doc_id widened to u64 (deferred path;
+            // the outer caller will resolve it post-wand).
             let row_id = match &doc {
                 DocInfo::Raw(doc) => {
-                    // if the doc is not located, we need to find the row id
-                    self.docs.row_id(doc.doc_id)
+                    if docs_has_row_ids {
+                        self.docs.row_id(doc.doc_id)
+                    } else {
+                        doc.doc_id as u64
+                    }
                 }
                 DocInfo::Located(doc) => doc.row_id,
             };
-            if !mask.selected(row_id) {
+            // Skip docs the fragment-reuse remap deleted. They are tombstoned
+            // in the DocSet (slot kept so posting-list doc_ids stay aligned)
+            // and must not surface in results.
+            if docs_has_row_ids && row_id == RowAddress::TOMBSTONE_ROW {
+                if self.operator == Operator::Or {
+                    self.push_back_leads(doc.doc_id() + 1);
+                }
+                continue;
+            }
+            if docs_has_row_ids && !mask.selected(row_id) {
                 if self.operator == Operator::Or {
                     self.push_back_leads(doc.doc_id() + 1);
                 }
@@ -690,16 +776,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.score(doc_length)
             };
 
-            let freqs = self.iter_term_freqs().collect();
             if candidates.len() < limit {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                    let kth = candidates.peek().unwrap().0.0.score.0;
+                    self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                let kth = candidates.peek().unwrap().0.0.score.0;
+                self.update_threshold(kth, params.wand_factor);
             }
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
@@ -707,10 +796,21 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
         metrics.record_comparisons(num_comparisons);
 
+        // The heap entry's `row_id` slot is either a real row_id
+        // (DocSet had row_ids) or the doc_id widened to u64
+        // (deferred). Tag it accordingly so the caller can match
+        // rather than guess.
+        let to_addr = |row_id_slot: u64| {
+            if docs_has_row_ids {
+                CandidateAddr::RowId(row_id_slot)
+            } else {
+                CandidateAddr::Pending(row_id_slot as u32)
+            }
+        };
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                addr: to_addr(doc.row_id),
                 freqs,
                 doc_length,
             })
@@ -729,11 +829,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
 
         // we need to map the row ids to doc ids, and sort them,
-        // because WAND PostingIterator can't go back to the previous doc id
+        // because WAND PostingIterator can't go back to the previous doc id.
+        // A list column maps one row id to several doc ids, so expand every
+        // document the row owns — keying on a single doc id would drop matches
+        // at non-last list positions (lancedb#3352).
         let doc_ids = row_ids
-            .filter_map(|row_addr| {
+            .flat_map(|row_addr| {
                 let row_id: u64 = row_addr.into();
-                self.docs.doc_id(row_id).map(|doc_id| (doc_id, row_id))
+                self.docs
+                    .doc_ids(row_id)
+                    .map(move |doc_id| (doc_id, row_id))
             })
             .sorted_unstable()
             .collect::<Vec<_>>();
@@ -795,27 +900,32 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             self.collect_tail_matches(doc_id);
             let score = self.score(doc_length);
-            let freqs = self.iter_term_freqs().collect();
 
             if candidates.len() < limit {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
-                    self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                    let kth = candidates.peek().unwrap().0.0.score.0;
+                    self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
+                let freqs = self.iter_term_freqs().collect();
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
-                self.threshold = candidates.peek().unwrap().0.0.score.0 * params.wand_factor;
+                let kth = candidates.peek().unwrap().0.0.score.0;
+                self.update_threshold(kth, params.wand_factor);
             }
 
             self.advance_lead_to_head(doc_id + 1);
         }
         metrics.record_comparisons(num_comparisons);
 
+        // flat_search is driven by an explicit row_ids iterator, so
+        // every candidate already has a real row_id.
         Ok(candidates
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
-                row_id: doc.row_id,
+                addr: CandidateAddr::RowId(doc.row_id),
                 freqs,
                 doc_length,
             })
@@ -860,47 +970,55 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             }
 
-            let Some(doc) = self.lead.first().and_then(|posting| posting.doc()) else {
+            // Block-Max WAND pruning: skip the whole window when its score upper
+            // bound cannot reach the top-k threshold.
+            if self.threshold > 0.0 && self.or_block_window_max() <= self.threshold {
+                // On the final block `up_to` is the `u64::MAX` sentinel; step once
+                // there to avoid seeking past the valid doc id range.
+                let skip_to = match self.up_to {
+                    Some(up_to) if up_to < u32::MAX as u64 => up_to + 1,
+                    _ => target + 1,
+                };
+                self.push_back_leads(skip_to);
+                continue;
+            }
+
+            let Some(first_doc) = self.lead.first().and_then(|posting| posting.doc()) else {
                 self.push_back_leads(target + 1);
                 continue;
             };
-            let doc_length = match &doc {
+            let doc_length = match &first_doc {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
-            let mut lead_score = self
-                .lead
-                .iter()
-                .filter_map(|posting| {
-                    posting.doc().map(|lead_doc| {
-                        posting.score(&self.scorer, lead_doc.frequency(), doc_length)
-                    })
-                })
-                .sum::<f32>();
+            let mut lead_score = 0.0;
+            if let Some(first_posting) = self.lead.first() {
+                lead_score += first_posting.score(&self.scorer, first_doc.frequency(), doc_length);
+            }
+            for posting in self.lead.iter().skip(1) {
+                if let Some(lead_doc) = posting.doc() {
+                    lead_score += posting.score(&self.scorer, lead_doc.frequency(), doc_length);
+                }
+            }
 
             while lead_score <= self.threshold {
                 if lead_score + self.tail_max_score <= self.threshold {
-                    self.push_back_leads(doc.doc_id() + 1);
+                    self.push_back_leads(first_doc.doc_id() + 1);
                     break;
                 }
                 if !self.advance_tail_top(target, doc_length, &mut lead_score) {
-                    self.push_back_leads(doc.doc_id() + 1);
+                    self.push_back_leads(first_doc.doc_id() + 1);
                     break;
                 }
             }
 
             if !self.lead.is_empty() {
-                return Ok(self
-                    .lead
-                    .first()
-                    .and_then(|posting| posting.doc())
-                    .map(|doc| (doc, lead_score)));
+                return Ok(Some((first_doc, lead_score)));
             }
         }
 
         Ok(None)
     }
-
     fn next_and_candidate(&mut self) -> Option<DocInfo> {
         if self.lead.len() < self.num_terms {
             return None;
@@ -1032,6 +1150,24 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
             }
         }
+    }
+
+    /// Upper bound on the score of any document in the window `[target, up_to]`
+    /// for a disjunction. Sums the block-max of every overlapping iterator:
+    /// `lead`, `head` (later docs still in the window, which
+    /// `can_target_beat_threshold` omits), and the tail via `tail_max_score`.
+    fn or_block_window_max(&self) -> f32 {
+        let lead: f32 = self
+            .lead
+            .iter()
+            .map(|posting| posting.block_max_score())
+            .sum();
+        let head: f32 = self
+            .head
+            .iter()
+            .map(|posting| posting.posting.block_max_score())
+            .sum();
+        lead + head + self.tail_max_score
     }
 
     fn can_target_beat_threshold(&mut self, target: u64) -> bool {
@@ -1244,8 +1380,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // After finishing a candidate doc, convert the aligned iterators back
         // into lagging iterators. Entries that do not stay in `tail` are
         // advanced to `target` and returned to `head`.
-        let leads = std::mem::take(&mut self.lead);
-        for posting in leads {
+        // pop() drains in place, keeping self.lead's capacity for reuse.
+        while let Some(posting) = self.lead.pop() {
             let upper_bound = posting.approximate_upper_bound();
             if let Some(mut evicted) = self.insert_tail_with_overflow(posting, upper_bound) {
                 evicted.next(target);
@@ -1268,10 +1404,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         };
         self.tail_max_score -= upper_bound;
         posting.next(target);
-        match posting.doc().map(|doc| doc.doc_id()) {
-            Some(doc_id) if doc_id == target => {
-                let frequency = posting.doc().expect("posting must exist").frequency();
-                *lead_score += posting.score(&self.scorer, frequency, doc_length);
+        match posting.doc() {
+            Some(doc) if doc.doc_id() == target => {
+                *lead_score += posting.score(&self.scorer, doc.frequency(), doc_length);
                 self.lead.push(posting);
             }
             Some(_) => self.push_head(posting),
@@ -1294,14 +1429,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         for tail_posting in tail.into_vec() {
             let mut posting = tail_posting.posting;
             posting.next(target);
-            match posting.doc().map(|doc| doc.doc_id()) {
-                Some(doc_id) if doc_id == target => {
+            match posting.doc() {
+                Some(doc) if doc.doc_id() == target => {
                     if let (Some(doc_length), Some(score)) = (doc_length, score.as_deref_mut()) {
-                        let frequency = posting
-                            .doc()
-                            .expect("posting moved to target should have doc")
-                            .frequency();
-                        *score += posting.score(&self.scorer, frequency, doc_length);
+                        *score += posting.score(&self.scorer, doc.frequency(), doc_length);
                     }
                     self.lead.push(posting)
                 }
@@ -1495,6 +1626,8 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use rstest::rstest;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
@@ -1537,6 +1670,23 @@ mod tests {
         }
 
         fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            freq as f32 / doc_tokens as f32
+        }
+    }
+
+    // Inverse-doc-length scorer that counts scored documents, so a test can
+    // assert that block-max pruning skipped blocks.
+    struct CountingScorer {
+        scored: Arc<AtomicUsize>,
+    }
+
+    impl Scorer for CountingScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            self.scored.fetch_add(1, Ordering::Relaxed);
             freq as f32 / doc_tokens as f32
         }
     }
@@ -1655,6 +1805,70 @@ mod tests {
         assert_eq!(result.len(), 0); // Should not panic
     }
 
+    /// The shared floor prunes partitions that can't reach the global top-k: a
+    /// high-scoring partition sets the floor and the rest skip their blocks.
+    /// (Result correctness is covered by the FTS search tests, since sharing is
+    /// always on.)
+    #[test]
+    fn cross_partition_threshold_sharing_prunes() {
+        use crate::metrics::MetricsCollector;
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Default)]
+        struct CountComparisons(AtomicUsize);
+        impl MetricsCollector for CountComparisons {
+            fn record_parts_loaded(&self, _: usize) {}
+            fn record_index_loads(&self, _: usize) {}
+            fn record_comparisons(&self, n: usize) {
+                self.0.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let part_docs = 4 * BLOCK_SIZE as u32;
+        // One high-scoring partition (weight 10) then 7 low-scoring ones.
+        let parts: Vec<(f32, std::ops::Range<u32>)> = std::iter::once((10.0, 0..part_docs))
+            .chain((1..8).map(|i| (1.0, i * part_docs..(i + 1) * part_docs)))
+            .collect();
+
+        let new_floor = || Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+
+        // Total comparisons across all partitions. `Some(floor)` makes every
+        // partition share that one floor; `None` gives each its own.
+        let total_comparisons = |shared_floor: Option<&Arc<AtomicU32>>| -> usize {
+            let metrics = CountComparisons::default();
+            for (qw, rows) in &parts {
+                let mut docs = DocSet::default();
+                for d in rows.clone() {
+                    docs.append(d as u64, 1);
+                }
+                let postings = vec![PostingIterator::with_query_weight(
+                    String::from("t"),
+                    0,
+                    0,
+                    *qw,
+                    generate_posting_list(rows.clone().collect(), *qw, None, false),
+                    docs.len(),
+                )];
+                let floor = shared_floor.cloned().unwrap_or_else(new_floor);
+                Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer)
+                    .with_shared_threshold(floor)
+                    .search(&params, Arc::new(RowAddrMask::default()), &metrics)
+                    .unwrap();
+            }
+            metrics.0.load(Ordering::Relaxed)
+        };
+
+        let one_floor = new_floor();
+        let with_shared_floor = total_comparisons(Some(&one_floor));
+        let with_private_floors = total_comparisons(None);
+        assert!(
+            with_shared_floor < with_private_floors,
+            "shared floor should prune comparisons: \
+             shared={with_shared_floor} private={with_private_floors}"
+        );
+    }
+
     #[test]
     fn test_posting_iterator_next_compressed_partition_point() {
         let mut docs = DocSet::default();
@@ -1718,6 +1932,82 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_or_single_term_block_skip_matches_and() {
+        // Hot docs occupy the middle block; the flanking blocks score far below
+        // the threshold. A single-term disjunction must skip them yet return what
+        // the conjunctive path returns.
+        let total = 3 * BLOCK_SIZE as u32;
+        let hot = BLOCK_SIZE as u32..BLOCK_SIZE as u32 + 12;
+
+        let mut docs = DocSet::default();
+        for row_id in 0..total {
+            // hot docs get distinct scores 1/1..1/12; the rest score 0.001
+            let doc_tokens = if hot.contains(&row_id) {
+                row_id - hot.start + 1
+            } else {
+                1000
+            };
+            docs.append(row_id as u64, doc_tokens);
+        }
+
+        let params = FtsSearchParams::new().with_limit(Some(10));
+        let run = |operator| {
+            let scored = Arc::new(AtomicUsize::new(0));
+            let posting = PostingIterator::with_query_weight(
+                String::from("term"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(
+                    (0..total).collect(),
+                    1.0,
+                    Some(vec![0.001, 1.0, 0.001]),
+                    true,
+                ),
+                docs.len(),
+            );
+            let mut wand = Wand::new(
+                operator,
+                std::iter::once(posting),
+                &docs,
+                CountingScorer {
+                    scored: scored.clone(),
+                },
+            );
+            let hits = wand
+                .search(
+                    &params,
+                    Arc::new(RowAddrMask::default()),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            let mut row_ids = hits
+                .iter()
+                .map(|hit| match hit.addr {
+                    CandidateAddr::RowId(r) => r,
+                    CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+                })
+                .collect::<Vec<_>>();
+            row_ids.sort_unstable();
+            (row_ids, scored.load(Ordering::Relaxed))
+        };
+
+        let (or_hits, or_scored) = run(Operator::Or);
+        let (and_hits, _) = run(Operator::And);
+
+        let expected = (hot.start..hot.start + 10)
+            .map(u64::from)
+            .collect::<Vec<_>>();
+        assert_eq!(or_hits, expected, "OR must return the top-k");
+        assert_eq!(or_hits, and_hits, "OR and AND must agree for a single term");
+        // Without pruning OR scores all `total` docs; with it the cold blocks are skipped.
+        assert!(
+            or_scored <= 2 * BLOCK_SIZE,
+            "expected pruning to skip a block, but scored {or_scored} of {total}",
+        );
     }
 
     #[test]
@@ -1918,8 +2208,82 @@ mod tests {
             )
             .unwrap();
 
-        let matched = result.into_iter().map(|doc| doc.row_id).collect::<Vec<_>>();
+        let matched = result
+            .into_iter()
+            .map(|doc| match doc.addr {
+                CandidateAddr::RowId(r) => r,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
         assert_eq!(matched, vec![2]);
+    }
+
+    #[test]
+    fn test_doc_ids_resolves_every_document_a_row_owns() {
+        // A list<string> column indexes each element as its own document, so
+        // one row id owns several doc ids. row 100 -> {0, 1}, row 101 -> {2}.
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        assert_eq!(docs.doc_ids(100).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(docs.doc_ids(101).collect::<Vec<_>>(), vec![2]);
+        assert!(docs.doc_ids(999).next().is_none());
+
+        // legacy shape (row id == doc id) still resolves to a single document.
+        let mut legacy = DocSet::default();
+        legacy.append(7, 1);
+        assert_eq!(legacy.doc_ids(7).collect::<Vec<_>>(), vec![7]);
+        assert!(legacy.doc_ids(8).next().is_none());
+    }
+
+    #[rstest]
+    fn test_flat_search_finds_list_row_with_match_at_non_last_position(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        // row 100 owns two element-documents (doc 0, doc 1) that share its row
+        // id; row 101 owns doc 2. The query term lives only in doc 0 — the
+        // *non-last* element of row 100. Resolving the row to a single doc id
+        // would evaluate doc 1, miss the term, and drop the row (lancedb#3352).
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(vec![0], 1.0, None, is_compressed),
+            docs.len(),
+        );
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            vec![posting].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        wand.threshold = 0.5;
+
+        let selected = vec![RowAddress::from(100_u64)];
+        let result = wand
+            .flat_search(
+                &FtsSearchParams::default(),
+                Box::new(selected.into_iter()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        // flat_search resolves the prefilter against the DocSet, so the single
+        // match comes back as a concrete RowId(100) rather than a deferred
+        // Pending addr. Asserting on the whole result avoids a never-taken
+        // match arm that would otherwise read as uncovered.
+        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
+        assert!(
+            matches!(addrs.as_slice(), [CandidateAddr::RowId(100)]),
+            "expected exactly row 100, got {addrs:?}"
+        );
     }
 
     #[test]

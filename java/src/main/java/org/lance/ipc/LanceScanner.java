@@ -77,7 +77,10 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
             options.isUseScalarIndex(),
             options.isFastSearch(),
             options.getSubstraitAggregate(),
-            options.isCollectStats());
+            options.isCollectStats(),
+            options.isIncludeDeletedRows(),
+            options.isStrictBatchSize(),
+            options.isDisableScoringAutoprojection());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
     scanner.options = options;
@@ -103,7 +106,10 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       boolean useScalarIndex,
       boolean fastSearch,
       Optional<ByteBuffer> substraitAggregate,
-      boolean collectStats);
+      boolean collectStats,
+      boolean includeDeletedRows,
+      boolean strictBatchSize,
+      boolean disableScoringAutoprojection);
 
   /**
    * Closes this scanner and releases any system resources associated with it. If the scanner is

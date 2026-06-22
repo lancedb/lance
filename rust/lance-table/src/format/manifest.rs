@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use chrono::prelude::*;
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::version::{LEGACY_FORMAT_VERSION, LanceFileVersion};
@@ -588,7 +588,7 @@ impl BasePath {
 }
 
 impl DeepSizeOf for BasePath {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.name.deep_size_of_children(context)
             + self.path.deep_size_of_children(context) * 2
             + size_of::<bool>()

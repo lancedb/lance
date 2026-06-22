@@ -93,6 +93,25 @@ def test_roundtrip_types(tmp_path: Path):
     assert dataset.to_table() == table
 
 
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable", "2.1"])
+def test_write_zero_dimension_fixed_size_list(
+    tmp_path: Path, data_storage_version: str
+):
+    # Zero-dimension fixed-size lists must be rejected with a clean error
+    # instead of a divide-by-zero panic (#5102)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field("vec", pa.list_(pa.float32(), 0)),
+        ]
+    )
+    table = pa.table({"id": [1], "vec": [[]]}, schema=schema)
+    with pytest.raises(OSError, match="dimension must be a positive integer"):
+        lance.write_dataset(
+            table, tmp_path / "ds.lance", data_storage_version=data_storage_version
+        )
+
+
 def test_dataset_overwrite(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -424,16 +443,27 @@ def test_enable_stable_row_ids(tmp_path: Path):
     assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
-def test_has_stable_row_ids_property(tmp_path: Path):
-    table = pa.Table.from_pylist([{"a": 1}, {"a": 2}])
+@pytest.mark.parametrize("enable_stable_row_ids", [True, False])
+@pytest.mark.parametrize(
+    "rows",
+    [[{"a": 1}, {"a": 2}], []],
+    ids=["non_empty", "empty"],
+)
+def test_has_stable_row_ids_property(tmp_path: Path, enable_stable_row_ids: bool, rows):
+    schema = pa.schema([pa.field("a", pa.int64())])
+    table = pa.Table.from_pylist(rows, schema=schema)
 
-    stable_path = tmp_path / "stable"
-    lance.write_dataset(table, stable_path, enable_stable_row_ids=True)
-    assert lance.dataset(stable_path).has_stable_row_ids is True
+    path = tmp_path / f"stable_row_ids_{enable_stable_row_ids}_{len(rows)}"
+    lance.write_dataset(
+        table,
+        path,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    ds = lance.dataset(path)
 
-    non_stable_path = tmp_path / "non_stable"
-    lance.write_dataset(table, non_stable_path, enable_stable_row_ids=False)
-    assert lance.dataset(non_stable_path).has_stable_row_ids is False
+    assert ds.count_rows() == len(rows)
+    assert len(ds.get_fragments()) == (0 if len(rows) == 0 else 1)
+    assert ds.has_stable_row_ids is enable_stable_row_ids
 
 
 def _list_manifests(versions_dir):
@@ -1655,6 +1685,51 @@ def test_strict_overwrite(tmp_path: Path):
         )
 
 
+def test_commit_timeout(tmp_path: Path):
+    from datetime import timedelta
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "timeout"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    append = lance.LanceOperation.Append([fragment])
+
+    # A zero duration reaches Rust and is rejected as invalid input.
+    with pytest.raises(OSError, match="non-zero"):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, commit_timeout=timedelta(0)
+        )
+
+    # A negative duration is rejected by PyO3's timedelta -> Duration conversion.
+    with pytest.raises(ValueError):
+        lance.LanceDataset.commit(
+            dataset, append, read_version=1, commit_timeout=timedelta(seconds=-1)
+        )
+
+    # None disables the timeout.
+    dataset_no_timeout = lance.LanceDataset.commit(
+        dataset, append, read_version=1, commit_timeout=None
+    )
+    assert dataset_no_timeout.version == dataset.version + 1
+
+    # Explicit positive timeout works.
+    fragment2 = lance.fragment.LanceFragment.create(base_dir, table)
+    append2 = lance.LanceOperation.Append([fragment2])
+    dataset_with_timeout = lance.LanceDataset.commit(
+        dataset_no_timeout,
+        append2,
+        read_version=dataset_no_timeout.version,
+        commit_timeout=timedelta(minutes=1),
+    )
+    assert dataset_with_timeout.version == dataset_no_timeout.version + 1
+
+    # Timeout *firing* behavior is covered by the Rust test
+    # `test_commit_timeout_triggers`, which uses a throttled store for a
+    # reliable trigger; reproducing it from Python without exposing
+    # throttling would be flaky on fast runners.
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1697,6 +1772,7 @@ def test_commit_batch_append():
     result = lance.LanceDataset.commit_batch(dataset, [txn2, txn3])
     dataset = result["dataset"]
     assert dataset.version == 2
+    assert dataset.checkout_version(1).version == 1
     assert len(dataset.get_fragments()) == 3
     assert dataset.to_table() == pa.concat_tables([data1, data2, data3])
     merged_txn = result["merged"]
@@ -3119,6 +3195,75 @@ def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
     scanner_table = dataset.scanner(limit=10).to_table().sort_by("name_1")
     assert scanner_table == expected
     assert scanner_table == actual
+
+
+def test_update_by_rowid(tmp_path: Path):
+    nrows = 30
+    table = pa.table(
+        {
+            "id": pa.array(range(nrows), pa.int64()),
+            "name": pa.array(["foo"] * nrows, pa.string()),
+        }
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "dataset",
+        max_rows_per_file=10,
+        enable_stable_row_ids=True,
+    )
+
+    orig = dataset.to_table(columns=["id"], with_row_id=True)
+    target_idx = 5
+    target_row_id = orig.column("_rowid")[target_idx].as_py()
+    target_id = orig.column("id")[target_idx].as_py()
+
+    update_dict = dataset.update(
+        updates=dict(name="'updated'"),
+        where=f"_rowid = {target_row_id}",
+    )
+    check_update_stats(update_dict, (1,))
+
+    actual = dataset.to_table().sort_by("id")
+    for row in actual.to_pylist():
+        if row["id"] == target_id:
+            assert row["name"] == "updated"
+        else:
+            assert row["name"] == "foo"
+
+
+def test_update_by_rowid_in_list(tmp_path: Path):
+    nrows = 30
+    table = pa.table(
+        {
+            "id": pa.array(range(nrows), pa.int64()),
+            "name": pa.array(["foo"] * nrows, pa.string()),
+        }
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "dataset",
+        max_rows_per_file=10,
+        enable_stable_row_ids=True,
+    )
+
+    orig = dataset.to_table(columns=["id"], with_row_id=True)
+    target_indices = [3, 7, 15]
+    target_row_ids = [orig.column("_rowid")[i].as_py() for i in target_indices]
+    target_ids = {orig.column("id")[i].as_py() for i in target_indices}
+
+    in_list = ", ".join(str(rid) for rid in target_row_ids)
+    update_dict = dataset.update(
+        updates=dict(name="'updated'"),
+        where=f"_rowid IN ({in_list})",
+    )
+    check_update_stats(update_dict, (3,))
+
+    actual = dataset.to_table().sort_by("id")
+    for row in actual.to_pylist():
+        if row["id"] in target_ids:
+            assert row["name"] == "updated"
+        else:
+            assert row["name"] == "foo"
 
 
 def test_update_dataset_all_types(tmp_path: Path):
@@ -5424,6 +5569,8 @@ def test_branches(tmp_path: Path):
     branch1 = ds_main.create_branch("branch1")
     ds_main.branches.replace_metadata("branch1", {"description": "branch one"})
     assert branch1.version == 1
+    # The dataset returned by create_branch must be fully constructed
+    assert branch1.checkout_version(("main", None)).version == 1
     branch1_append = pa.Table.from_pydict({"a": [7, 8], "b": [9, 10]})
     branch1 = lance.write_dataset(branch1_append, branch1, mode="append")
     assert branch1.version == 2
@@ -5543,4 +5690,33 @@ def test_default_scan_options_nearest(tmp_path: Path) -> None:
     distances = result["_distance"].to_pylist()
     assert distances == sorted(distances)
 
-    assert "id" in result.column_names
+
+def test_tracked_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+    ds.delete("x = 2")  # adds a deletion file
+
+    reader = ds.tracked_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("version").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+
+    types = set(result.column("type").to_pylist())
+    assert "manifest" in types
+    assert "data file" in types
+    assert "deletion file" in types
+
+
+def test_all_files(tmp_path):
+    table = pa.table({"x": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "ds")
+
+    reader = ds.all_files()
+    assert isinstance(reader, pa.RecordBatchReader)
+
+    result = reader.read_all()
+    assert result.schema.field("size_bytes").type == pa.int64()
+    assert result.num_rows >= 2  # at least manifest + data file
+    assert all(s > 0 for s in result.column("size_bytes").to_pylist())

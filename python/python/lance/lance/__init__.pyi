@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -20,6 +21,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Self,
     Sequence,
@@ -63,7 +65,6 @@ from .fragment import (
 )
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
-from .indices import IndexSegmentPlan as IndexSegmentPlan
 from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
@@ -191,14 +192,6 @@ class LanceColumnStatistics:
 class _Session:
     def size_bytes(self) -> int: ...
 
-class IndexSegmentBuilder:
-    def with_index_type(self, index_type: str) -> Self: ...
-    def with_segments(self, segments: List[Index]) -> Self: ...
-    def with_target_segment_bytes(self, bytes: int) -> Self: ...
-    def plan(self) -> List[IndexSegmentPlan]: ...
-    def build(self, plan: IndexSegmentPlan) -> IndexSegment: ...
-    def build_all(self) -> List[IndexSegment]: ...
-
 class LanceBlobFile:
     def close(self): ...
     def is_closed(self) -> bool: ...
@@ -233,9 +226,10 @@ class _Dataset:
     def replace_field_metadata(self, field_name: str, metadata: Dict[str, str]): ...
     @property
     def data_storage_version(self) -> str: ...
+    @property
+    def has_stable_row_ids(self) -> bool: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
-    def load_indices(self) -> List[Index]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
     def scanner(
         self,
@@ -253,6 +247,7 @@ class _Dataset:
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[List[_Fragment]] = None,
+        index_segments: Optional[List[str]] = None,
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
@@ -409,7 +404,6 @@ class _Dataset:
         batch_readhead: Optional[int] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ): ...
-    def create_index_segment_builder(self) -> IndexSegmentBuilder: ...
     def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
     def commit_existing_index_segments(
         self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
@@ -438,6 +432,7 @@ class _Dataset:
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        commit_timeout: Optional[timedelta] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod
@@ -449,6 +444,7 @@ class _Dataset:
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
+        commit_timeout: Optional[timedelta] = None,
     ) -> Tuple[_Dataset, Transaction]: ...
     def validate(self): ...
     def migrate_manifest_paths_v2(self): ...
@@ -467,6 +463,27 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def hamming_clustering_for_ivf_partition(
+        self,
+        index_name: str,
+        partition_id: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def get_ivf_partition_info(self, index_name: str) -> List[dict]: ...
+    def hamming_clustering_for_sample(
+        self,
+        column: str,
+        sample_size: Optional[int],
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def hamming_clustering_for_range(
+        self,
+        column: str,
+        fragment_id: int,
+        start_row: int,
+        num_rows: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
@@ -480,7 +497,7 @@ class _Scanner:
     @property
     def schema(self) -> pa.Schema: ...
     def explain_plan(self, verbose: bool) -> str: ...
-    def analyze_plan(self) -> str: ...
+    def analyze_plan(self, count_rows: bool = False) -> str: ...
     def count_rows(self) -> int: ...
     def to_pyarrow(self) -> pa.RecordBatchReader: ...
 
@@ -562,6 +579,8 @@ def _write_fragments(
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List[Any]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -579,6 +598,8 @@ def _write_fragments_transaction(
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List[Any]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...

@@ -254,15 +254,7 @@ impl ObjectWriter {
                         match res {
                             Ok(Ok(())) => {}
                             Err(err) => return Err(std::io::Error::other(err)),
-                            Ok(Err(UploadPutError {
-                                source: OSError::Generic { source, .. },
-                                part_idx,
-                                buffer,
-                            })) if source
-                                .to_string()
-                                .to_lowercase()
-                                .contains("connection reset by peer") =>
-                            {
+                            Ok(Err(err)) if should_retry_upload_put(&err.source) => {
                                 if mut_self.connection_resets < max_conn_reset_retries() {
                                     // Retry, but only up to max_conn_reset_retries of them.
                                     mut_self.connection_resets += 1;
@@ -274,8 +266,8 @@ impl ObjectWriter {
 
                                     futures.spawn(Self::put_part(
                                         upload.as_mut(),
-                                        buffer,
-                                        part_idx,
+                                        err.buffer,
+                                        err.part_idx,
                                         Some(sleep_time),
                                     ));
                                 } else {
@@ -283,10 +275,10 @@ impl ObjectWriter {
                                         io::ErrorKind::ConnectionReset,
                                         Box::new(ConnectionResetError {
                                             message: format!(
-                                                "Hit max retries ({}) for connection reset",
+                                                "Hit max retries ({}) for retryable upload error",
                                                 max_conn_reset_retries()
                                             ),
-                                            source,
+                                            source: Box::new(err.source),
                                         }),
                                     ));
                                 }
@@ -344,6 +336,15 @@ struct UploadPutError {
     part_idx: u16,
     buffer: Bytes,
     source: OSError,
+}
+
+fn should_retry_upload_put(source: &OSError) -> bool {
+    let OSError::Generic { source, .. } = source else {
+        return false;
+    };
+
+    let message = source.to_string().to_ascii_lowercase();
+    message.contains("connection reset by peer") || message.contains("requesttimeout")
 }
 
 #[derive(Debug)]
@@ -855,6 +856,35 @@ mod tests {
         );
         let mid = INITIAL_UPLOAD_STEP * 8; // 40MB, in range
         assert_eq!(clamp_initial_upload_size(mid), (mid, false));
+    }
+
+    #[test]
+    fn should_retry_upload_put_detects_transient_errors() {
+        let request_timeout = OSError::Generic {
+            store: "S3",
+            source: Box::new(io::Error::other(
+                "Server returned non-2xx status code: 400 Bad Request: \
+                 <Error><Code>RequestTimeout</Code><Message>Your socket connection to the server \
+                 was not read from or written to within the timeout period. Idle connections will \
+                 be closed.</Message></Error>",
+            )),
+        };
+        assert!(should_retry_upload_put(&request_timeout));
+
+        let connection_reset = OSError::Generic {
+            store: "S3",
+            source: Box::new(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        };
+        assert!(should_retry_upload_put(&connection_reset));
+
+        let not_retryable = OSError::Generic {
+            store: "S3",
+            source: Box::new(io::Error::other("access denied")),
+        };
+        assert!(!should_retry_upload_put(&not_retryable));
     }
 
     #[test]

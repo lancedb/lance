@@ -211,14 +211,7 @@ async fn test_segmented_inverted_match_query() {
             .fragments(vec![fragment_id]);
         metadatas.push(builder.execute_uncommitted().await.unwrap());
     }
-    let segments = ds
-        .create_index_segment_builder()
-        .with_index_type(IndexType::Inverted)
-        .with_segments(metadatas.clone())
-        .build_all()
-        .await
-        .unwrap();
-    ds.commit_existing_index_segments("segmented_fts", "text", segments)
+    ds.commit_existing_index_segments("segmented_fts", "text", metadatas.clone())
         .await
         .unwrap();
     assert!(metadatas.len() >= 2);
@@ -288,14 +281,7 @@ async fn test_segmented_inverted_fuzzy_match_uses_global_idf() {
             .fragments(vec![fragment_id]);
         metadatas.push(builder.execute_uncommitted().await.unwrap());
     }
-    let segments = ds
-        .create_index_segment_builder()
-        .with_index_type(IndexType::Inverted)
-        .with_segments(metadatas)
-        .build_all()
-        .await
-        .unwrap();
-    ds.commit_existing_index_segments("segmented_fuzzy", "text", segments)
+    ds.commit_existing_index_segments("segmented_fuzzy", "text", metadatas)
         .await
         .unwrap();
 
@@ -374,14 +360,7 @@ async fn test_segmented_inverted_phrase_query() {
             .fragments(vec![fragment_id]);
         metadatas.push(builder.execute_uncommitted().await.unwrap());
     }
-    let segments = ds
-        .create_index_segment_builder()
-        .with_index_type(IndexType::Inverted)
-        .with_segments(metadatas)
-        .build_all()
-        .await
-        .unwrap();
-    ds.commit_existing_index_segments("segmented_phrase_fts", "text", segments)
+    ds.commit_existing_index_segments("segmented_phrase_fts", "text", metadatas)
         .await
         .unwrap();
 
@@ -444,14 +423,7 @@ async fn test_segmented_inverted_match_query_with_unindexed_fragments() {
             .fragments(vec![fragment_id]);
         metadatas.push(builder.execute_uncommitted().await.unwrap());
     }
-    let segments = ds
-        .create_index_segment_builder()
-        .with_index_type(IndexType::Inverted)
-        .with_segments(metadatas)
-        .build_all()
-        .await
-        .unwrap();
-    ds.commit_existing_index_segments("segmented_mixed_fts", "text", segments)
+    ds.commit_existing_index_segments("segmented_mixed_fts", "text", metadatas)
         .await
         .unwrap();
 

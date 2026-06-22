@@ -68,6 +68,16 @@ fn build_hf_base_options(
     options
 }
 
+fn normalize_download_mode(download_mode: String) -> Result<String> {
+    match download_mode.to_lowercase().as_str() {
+        "xet" => Ok("xet".to_string()),
+        "http" => Ok("http".to_string()),
+        _ => Err(Error::invalid_input(format!(
+            "Invalid Huggingface download_mode: {download_mode}. Expected one of: xet, http"
+        ))),
+    }
+}
+
 fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<String, String>> {
     let mut config_map = HashMap::new();
 
@@ -109,6 +119,22 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
         config_map.insert("token".to_string(), token);
     }
 
+    let download_mode = options
+        .get("hf_download_mode")
+        .filter(|download_mode| !download_mode.is_empty())
+        .cloned()
+        .or_else(|| {
+            options
+                .get("download_mode")
+                .filter(|download_mode| !download_mode.is_empty())
+                .cloned()
+        })
+        .unwrap_or_else(|| "http".to_string());
+    config_map.insert(
+        "download_mode".to_string(),
+        normalize_download_mode(download_mode)?,
+    );
+
     Ok(config_map)
 }
 
@@ -129,6 +155,9 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     }
     if let Some(token) = config_map.get("token") {
         builder = builder.token(token);
+    }
+    if let Some(download_mode) = config_map.get("download_mode") {
+        builder = builder.download_mode(download_mode);
     }
 
     let operator = Operator::new(builder)
@@ -279,6 +308,52 @@ mod tests {
         assert_eq!(config.get("repo_type").unwrap(), "dataset");
         assert_eq!(config.get("repo_id").unwrap(), "acme/repo");
         assert_eq!(config.get("revision").unwrap(), "stable");
+    }
+
+    #[test]
+    fn storage_option_download_mode_takes_hf_prefix_precedence() {
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &crate::object_store::StorageOptions(HashMap::from([
+                ("download_mode".to_string(), "xet".to_string()),
+                ("hf_download_mode".to_string(), "http".to_string()),
+            ])),
+        ))
+        .unwrap();
+
+        assert_eq!(config.get("download_mode").unwrap(), "http");
+    }
+
+    #[test]
+    fn storage_option_download_mode_defaults_to_http() {
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &crate::object_store::StorageOptions(HashMap::new()),
+        ))
+        .unwrap();
+
+        assert_eq!(config.get("download_mode").unwrap(), "http");
+    }
+
+    #[test]
+    fn storage_option_download_mode_rejects_invalid_value() {
+        let err = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &crate::object_store::StorageOptions(HashMap::from([(
+                "hf_download_mode".to_string(),
+                "invalid".to_string(),
+            )])),
+        ))
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("download_mode"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

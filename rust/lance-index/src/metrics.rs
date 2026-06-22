@@ -43,6 +43,19 @@ pub trait MetricsCollector: Send + Sync {
     ///
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
+
+    /// Returns an optional sink for recording exact I/O statistics (bytes read,
+    /// IOPS, and requests) performed on behalf of this collector.
+    ///
+    /// Index implementations that read from a
+    /// [`lance_io::scheduler::ScanScheduler`] can attach the returned handle to
+    /// their file readers so the I/O performed for a single query is measured
+    /// and attributed here.  The default returns `None`, meaning the caller does
+    /// not want I/O measured (and index implementations should then take their
+    /// normal, uninstrumented read path).
+    fn io_stats(&self) -> Option<lance_io::scheduler::IoStats> {
+        None
+    }
 }
 
 /// A no-op metrics collector that does nothing

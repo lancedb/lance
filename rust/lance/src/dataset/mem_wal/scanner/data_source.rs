@@ -11,6 +11,29 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
+/// A watermark marking how far into one shard's fresh tier a prior scan
+/// observed, so membership can be evaluated as of that point (see
+/// [`super::builder::LsmScanner::contains_pks_at`]).
+///
+/// Only the active memtable grows between two reads (appended batches, and a new
+/// generation when it rolls); everything at a lower generation — frozen and
+/// flushed — is immutable and was fully observed. The watermark includes lower
+/// generations whole, the active generation up to `active_batch_count` batches,
+/// and excludes higher generations (which appeared after it). It uses only the
+/// batch count and generation — both always available, unlike per-batch WAL
+/// positions, which the write path does not track. The bound only excludes rows
+/// the scan did not observe, so a stale watermark under-counts (a tolerable
+/// stale read) rather than dropping a row with no replacement.
+#[derive(Debug, Clone, Copy)]
+pub struct FreshTierWatermark {
+    /// Active generation the scan observed. Higher generations are excluded;
+    /// lower ones are immutable and included whole.
+    pub active_generation: u64,
+    /// Active-memtable batch count at snapshot time. Within the active
+    /// generation, only batches at index `< active_batch_count` were observed.
+    pub active_batch_count: u64,
+}
+
 /// Generation number in LSM tree.
 ///
 /// The base table has generation 0. MemTables have positive integers

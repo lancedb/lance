@@ -31,6 +31,13 @@ struct Args {
     seed: u64,
     clusters: usize,
     noise: f32,
+    query_repeats: usize,
+    /// When > 0, rebuild the graph in a loop for this many seconds (sustained
+    /// write), instead of a single build.
+    insert_seconds: f64,
+    /// When > 0, run the query workload in a loop for this many seconds
+    /// (sustained read), instead of `query_repeats` passes.
+    query_seconds: f64,
 }
 
 impl Default for Args {
@@ -48,6 +55,9 @@ impl Default for Args {
             seed: 100,
             clusters: 4096,
             noise: 0.05,
+            query_repeats: 1,
+            insert_seconds: 0.0,
+            query_seconds: 0.0,
         }
     }
 }
@@ -102,27 +112,61 @@ fn main() -> Result<(), Box<dyn Error>> {
         .num_edges(args.m)
         .ef_construction(args.ef_construction)
         .seed(args.seed);
-    let graph = HnswGraph::try_new(args.rows, params)?;
 
+    // Sustained write: rebuild a fresh graph in a loop for `insert_seconds`
+    // (or a single build when 0) so throughput reflects steady-state, not a
+    // burst. Only the last graph is retained for the query phase.
     let insert_start = Instant::now();
-    graph.insert_batch(ids, &snapshot)?;
+    let mut insert_passes: u64 = 0;
+    let mut insert_core = std::time::Duration::ZERO;
+    let graph = loop {
+        let g = HnswGraph::try_new(args.rows, params.clone())?;
+        let core = Instant::now();
+        g.insert_batch(ids.clone(), &snapshot)?;
+        insert_core += core.elapsed();
+        insert_passes += 1;
+        if args.insert_seconds <= 0.0 || insert_start.elapsed().as_secs_f64() >= args.insert_seconds
+        {
+            break g;
+        }
+    };
     let insert_s = insert_start.elapsed().as_secs_f64();
-    let insert_qps = args.rows as f64 / insert_s;
+    let insert_qps = (args.rows as u64 * insert_passes) as f64 / insert_s;
+    // insert_core excludes graph allocation + teardown, isolating the insertion
+    // algorithm from the per-build alloc/free cost.
+    let insert_core_s = insert_core.as_secs_f64();
+    let insert_core_qps = (args.rows as u64 * insert_passes) as f64 / insert_core_s;
 
+    // Sustained read: run the query workload in a loop for `query_seconds`
+    // (or `query_repeats` passes when 0).
     let search_query_ids = query_ids(&args, args.queries);
     let query_start = Instant::now();
-    let hits: usize = search_query_ids
-        .par_iter()
-        .map(|row| {
-            let query = snapshot.vector(*row as u32);
-            let results = graph
-                .search(query, SearchParams::new(args.k, args.ef_search), &snapshot)
-                .expect("search should succeed");
-            usize::from(results.iter().any(|result| result.id as usize == *row))
-        })
-        .sum();
+    // Assigned on every loop iteration before any break; the loop always runs at
+    // least once, so no dead initial store.
+    let mut hits: usize;
+    let mut query_passes: u64 = 0;
+    loop {
+        hits = search_query_ids
+            .par_iter()
+            .map(|row| {
+                let query = snapshot.vector(*row as u32);
+                let results = graph
+                    .search(query, SearchParams::new(args.k, args.ef_search), &snapshot)
+                    .expect("search should succeed");
+                usize::from(results.iter().any(|result| result.id as usize == *row))
+            })
+            .sum();
+        query_passes += 1;
+        if args.query_seconds > 0.0 {
+            if query_start.elapsed().as_secs_f64() >= args.query_seconds {
+                break;
+            }
+        } else if query_passes >= args.query_repeats as u64 {
+            break;
+        }
+    }
     let query_s = query_start.elapsed().as_secs_f64();
-    let query_qps = args.queries as f64 / query_s;
+    let query_qps = (args.queries as u64 * query_passes) as f64 / query_s;
     let self_recall = hits as f64 / args.queries as f64;
 
     let truth_query_ids = query_ids(&args, args.truth_queries);
@@ -145,14 +189,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let recall_at_k = recall_hits as f64 / (args.truth_queries * args.k) as f64;
 
     println!(
-        "result impl=lance_hnsw rows={} dim={} generate_s={:.6} arrow_s={:.6} insert_s={:.6} insert_qps={:.3} query_s={:.6} query_qps={:.3} truth_s={:.6} recall_at_{}={:.6} self_recall_at_{}={:.6}",
+        "result impl=lance_hnsw rows={} dim={} generate_s={:.6} arrow_s={:.6} insert_s={:.6} insert_passes={} insert_qps={:.3} insert_core_s={:.6} insert_core_qps={:.3} query_s={:.6} query_passes={} query_qps={:.3} truth_s={:.6} recall_at_{}={:.6} self_recall_at_{}={:.6}",
         args.rows,
         args.dim,
         generate_s,
         arrow_s,
         insert_s,
+        insert_passes,
         insert_qps,
+        insert_core_s,
+        insert_core_qps,
         query_s,
+        query_passes,
         query_qps,
         truth_s,
         args.k,
@@ -204,6 +252,9 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--seed" => args.seed = value.parse()?,
             "--clusters" => args.clusters = value.parse()?,
             "--noise" => args.noise = value.parse()?,
+            "--query-repeats" => args.query_repeats = value.parse()?,
+            "--insert-seconds" => args.insert_seconds = value.parse()?,
+            "--query-seconds" => args.query_seconds = value.parse()?,
             _ => return Err(format!("unknown argument: {flag}").into()),
         }
     }
