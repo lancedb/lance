@@ -123,7 +123,8 @@ use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
     LanceScanExec, Planner, PreFilterSource, RowAddrMaskFilterExec, ScanConfig, TakeExec,
     knn::{
-        KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_exec, query_index_field,
+        KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
+        query_index_field,
     },
     project,
 };
@@ -5417,7 +5418,16 @@ impl Scanner {
 
         if let Some((index_name, index_segments, index_metric)) = index_and_segments {
             if self.is_batch_nearest {
-                return self.batch_indexed_vector_search(filter_plan, &q).await;
+                validate_distance_type_for(index_metric, &element_type)?;
+                return self
+                    .batch_indexed_vector_search(
+                        filter_plan,
+                        &q,
+                        &index_name,
+                        &index_segments,
+                        index_metric,
+                    )
+                    .await;
             }
 
             log::trace!("index found for vector search");
@@ -5527,11 +5537,107 @@ impl Scanner {
         }
     }
 
+    /// Whether a batch (multi-query) vector search can use the shared-scan
+    /// indexed fast path ([`new_knn_batch_exec`]) instead of running one indexed
+    /// search per query vector.
+    ///
+    /// Requires all of:
+    /// - no refine step (the batch path does not yet rerank);
+    /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
+    /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
+    /// - all target fragments indexed (or `fast_search`, which ignores
+    ///   unindexed fragments).
+    ///
+    /// The fixed-nprobes requirement is a *correctness* gate, not just an
+    /// optimization. The shared-scan path searches exactly `minimum_nprobes`
+    /// partitions per query, but the single-query path is adaptive: it applies a
+    /// k-dependent `early_pruning` floor and then expands probes up to
+    /// `maximum_nprobes` (late search) when a query has fewer than `k` results.
+    /// When `minimum_nprobes == maximum_nprobes` neither adjustment can fire
+    /// (pruning is capped at the maximum, and the late-search range is empty), so
+    /// the batch result is provably identical to repeated single-query search.
+    /// With adaptive nprobes the two would diverge, so we fall back to the
+    /// per-query loop, which reuses the real adaptive search and stays exact.
+    ///
+    /// Extending the shared-scan path to adaptive nprobes (a batched early/late
+    /// search) is left as a follow-up.
+    async fn batch_index_search_supported(
+        &self,
+        index_name: &str,
+        index_segments: &[IndexMetadata],
+        q: &Query,
+    ) -> Result<bool> {
+        if matches!(q.refine_factor, Some(rf) if rf > 1) {
+            return Ok(false);
+        }
+        // Only fixed nprobes is provably equivalent to single-query search; see
+        // the method docs. Adaptive nprobes falls back to the per-query loop.
+        if q.maximum_nprobes != Some(q.minimum_nprobes) {
+            return Ok(false);
+        }
+        // Decide from the index metadata (no I/O) rather than opening the index
+        // to call `supports_batch_partition_search()`: this is a planning-time
+        // gate and the single-query path likewise avoids opening the index here.
+        // An IVF index with a flat-style sub-index (i.e. not HNSW) is exactly the
+        // set for which `supports_batch_partition_search()` is true; the exec
+        // re-checks that trait as a defensive invariant. Legacy segments without
+        // details fall back.
+        let all_ivf_flat_style = index_segments.iter().all(|index| {
+            index
+                .index_details
+                .as_ref()
+                .filter(|details| !details.value.is_empty())
+                .map(|details| {
+                    let index_type =
+                        crate::index::vector::details::derive_vector_index_type(details);
+                    index_type.starts_with("IVF_") && !index_type.contains("HNSW")
+                })
+                .unwrap_or(false)
+        });
+        if !all_ivf_flat_style {
+            return Ok(false);
+        }
+        if self.fast_search {
+            return Ok(true);
+        }
+        // The batch node only searches indexed partitions, so any unindexed
+        // target fragment would silently drop rows; fall back in that case.
+        let unindexed_fragments =
+            self.retain_target_fragments(self.dataset.unindexed_fragments(index_name).await?);
+        Ok(unindexed_fragments.is_empty())
+    }
+
     async fn batch_indexed_vector_search(
         &self,
         filter_plan: &ExprFilterPlan,
         q: &Query,
+        index_name: &str,
+        index_segments: &[IndexMetadata],
+        index_metric: MetricType,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Fast path: when every index segment is an IVF index with a flat-style
+        // sub-index (IVF_FLAT/PQ/SQ/RQ), search all query vectors in a single
+        // pass that reads each partition's storage once and shares the prefilter
+        // across the batch. HNSW, refine, and mixed indexed/unindexed scans fall
+        // back to the per-query loop below, which never regresses behavior.
+        if self
+            .batch_index_search_supported(index_name, index_segments, q)
+            .await?
+        {
+            let mut batch_query = q.clone();
+            batch_query.metric_type = Some(index_metric);
+            let prefilter_source = self
+                .prefilter_source(filter_plan, self.get_indexed_frags(index_segments))
+                .await?;
+            return new_knn_batch_exec(
+                self.dataset.clone(),
+                index_segments,
+                &batch_query,
+                self.nearest_query_count,
+                prefilter_source,
+            );
+        }
+
         let query_dim = q.key.len() / self.nearest_query_count;
         let mut query_plans = Vec::with_capacity(self.nearest_query_count);
 
@@ -7099,8 +7205,10 @@ pub mod test_dataset {
         IndexType,
         scalar::{ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
         vector::{
+            hnsw::builder::HnswBuildParams,
             ivf::IvfBuildParams,
             kmeans::{KMeansParams, train_kmeans},
+            sq::builder::SQBuildParams,
         },
     };
     use lance_linalg::distance::DistanceType;
@@ -7202,7 +7310,30 @@ pub mod test_dataset {
         }
 
         pub async fn make_vector_index(&mut self) -> Result<()> {
-            let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
+            self.make_vector_index_with_metric(MetricType::L2).await
+        }
+
+        pub async fn make_vector_index_with_metric(&mut self, metric: MetricType) -> Result<()> {
+            let params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
+            self.dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await?;
+            Ok(())
+        }
+
+        pub async fn make_ivf_hnsw_index(&mut self) -> Result<()> {
+            let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default(),
+            );
             self.dataset
                 .create_index(
                     &["vec"],
@@ -9122,6 +9253,7 @@ mod test {
         k: usize,
         use_index: bool,
         distance_range: Option<(Option<f32>, Option<f32>)>,
+        nprobes: Option<usize>,
     ) {
         let query_count = query_values.len() / 32;
         assert_eq!(batch.num_rows(), query_count * k);
@@ -9132,6 +9264,12 @@ mod test {
             let mut scan = dataset.scan();
             scan.nearest("vec", &query, k).unwrap();
             scan.use_index(use_index);
+            // Pin nprobes to match the batch query: the single-query indexed path
+            // otherwise adaptively expands nprobes, which would make equivalence
+            // depend on data distribution rather than be guaranteed.
+            if let Some(nprobes) = nprobes {
+                scan.nprobes(nprobes);
+            }
             if let Some((lower, upper)) = distance_range {
                 scan.distance_range(lower, upper);
             }
@@ -9210,7 +9348,8 @@ mod test {
                 "query_index {query_index} should have exactly {k} rows"
             );
         }
-        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None, None)
+            .await;
 
         let mut scan_with_vec = dataset.scan();
         scan_with_vec.nearest("vec", &queries, k).unwrap();
@@ -9227,6 +9366,7 @@ mod test {
             &query_values,
             k,
             false,
+            None,
             None,
         )
         .await;
@@ -9281,7 +9421,8 @@ mod test {
         assert_query_index_field(&batch);
         assert!(batch.schema().column_with_name("i").is_some());
         assert!(batch.schema().column_with_name(DIST_COL).is_some());
-        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None, None)
+            .await;
 
         let mut scan_rowid_only = dataset.scan();
         scan_rowid_only.nearest("vec", &queries, k).unwrap();
@@ -9567,6 +9708,7 @@ mod test {
             2,
             false,
             Some((Some(1.0), None)),
+            None,
         )
         .await;
     }
@@ -9582,12 +9724,22 @@ mod test {
 
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, 2).unwrap();
+        // Probe both partitions (minimum == maximum) so the per-query top-k is
+        // merged across multiple partitions and the batch result is
+        // deterministically equivalent to repeated single-query search (which
+        // would otherwise adaptively expand nprobes).
+        scan.nprobes(2);
         scan.project(&["i"]).unwrap();
 
         let plan = scan.explain_plan(false).await.unwrap();
         assert!(
-            plan.contains("ANNSubIndex"),
-            "batch KNN should use the vector index when available, got:\n{}",
+            plan.contains("ANNIvfBatch"),
+            "IVF batch KNN should use the shared-scan batch node, got:\n{}",
+            plan
+        );
+        assert!(
+            !plan.contains("ANNSubIndex"),
+            "IVF batch KNN should not fall back to per-query ANN search, got:\n{}",
             plan
         );
         assert!(
@@ -9602,11 +9754,16 @@ mod test {
             batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0, 1, 1]
         );
+        // Shared-scan batch search must return the same rows/distances as
+        // issuing the queries one at a time against the index.
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, 2, true, None, Some(2))
+            .await;
 
         let batch = dataset
             .scan()
             .nearest("vec", &queries, 2)
             .unwrap()
+            .nprobes(2)
             .distance_range(Some(1.0), None)
             .project(&["i"])
             .unwrap()
@@ -9620,8 +9777,276 @@ mod test {
             2,
             true,
             Some((Some(1.0), None)),
+            Some(2),
         )
         .await;
+    }
+
+    /// `refine_factor` is not yet supported by the shared-scan batch path, so
+    /// the scanner must fall back to the per-query indexed loop and still
+    /// produce correctly grouped per-query results.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_refine_falls_back() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, _query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.refine(2);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "refine must not use the shared-scan batch node, got:\n{}",
+            plan
+        );
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "refine batch search should fall back to the per-query indexed loop, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_eq!(
+            batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
+            &[0, 0, 1, 1]
+        );
+    }
+
+    /// Without pinned nprobes the shared-scan fast path is not equivalent to
+    /// single-query search (the single-query path applies an adaptive
+    /// `early_pruning` floor and late-search expansion that the batch path does
+    /// not), so the scanner must fall back to the per-query loop, which reuses
+    /// the real adaptive search and stays exact.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_adaptive_nprobes_falls_back() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+        let k = 2;
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        // No nprobes() call: adaptive (minimum_nprobes=1, maximum_nprobes=None).
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "adaptive nprobes must not use the shared-scan batch node, got:\n{}",
+            plan
+        );
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "adaptive nprobes batch search should fall back to the per-query loop, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        // The fallback runs real single-query searches, so it stays exact even
+        // with adaptive nprobes.
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, None)
+            .await;
+    }
+
+    /// IVF_HNSW is an unsupported index type for the shared-scan batch path (its
+    /// graph sub-index has no global top-k heap), so batch search must fall back
+    /// to the per-query indexed loop and still produce correct grouped results.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_hnsw_falls_back() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_ivf_hnsw_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+        let k = 2;
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.nprobes(2);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "HNSW batch search must not use the shared-scan batch node, got:\n{}",
+            plan
+        );
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "HNSW batch search should fall back to the per-query indexed loop, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, Some(2))
+            .await;
+    }
+
+    /// Regression test for cosine batch search: each query vector must be
+    /// normalized independently. The two queries below have very different
+    /// magnitudes, so normalizing the concatenated batch key by a single global
+    /// norm (the bug) would scale them unequally and diverge from per-query
+    /// single search.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_cosine_normalizes_per_query() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds
+            .make_vector_index_with_metric(MetricType::Cosine)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+
+        // q0: small-magnitude constant direction; q1: large-magnitude ramp.
+        let mut query_values = vec![0.05f32; 32];
+        query_values.extend((1..=32).map(|v| v as f32 * 3.0));
+        let queries =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
+                .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap();
+        scan.nprobes(2);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfBatch"),
+            "cosine IVF batch KNN should use the shared-scan batch node, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, 2, true, None, Some(2))
+            .await;
+    }
+
+    /// Batch indexed search builds a single shared prefilter for all queries;
+    /// results must match per-query single search with the same prefilter.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_with_prefilter() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+        let k = 2;
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.nprobes(2);
+        scan.filter("i > 100").unwrap();
+        scan.prefilter(true);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfBatch"),
+            "prefiltered IVF batch KNN should use the shared-scan batch node, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        // The shared prefilter must exclude i <= 100 for every query.
+        assert!(
+            batch["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .all(|i| *i > 100),
+            "shared prefilter should remove rows with i <= 100"
+        );
+
+        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
+        for query_index in 0..2 {
+            let query =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let single = dataset
+                .scan()
+                .nearest("vec", &query, k)
+                .unwrap()
+                .nprobes(2)
+                .filter("i > 100")
+                .unwrap()
+                .prefilter(true)
+                .project(&["i"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mask = BooleanArray::from_iter(
+                query_indices
+                    .iter()
+                    .map(|v| v.map(|v| v == query_index as i32)),
+            );
+            let slice = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(
+                slice["i"].as_primitive::<Int32Type>().values(),
+                single["i"].as_primitive::<Int32Type>().values(),
+                "prefiltered batch query {query_index} should match single-query search"
+            );
+        }
+    }
+
+    /// Batch indexed search must merge each query's top-k across multiple delta
+    /// indices, not just within a single delta.
+    #[tokio::test]
+    async fn test_batch_knn_indexed_multiple_deltas() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        // Append new data and optimize with `append` to add a second delta
+        // index (rather than merging into the existing one).
+        test_ds.append_data_with_range(400, 480).await.unwrap();
+        test_ds
+            .dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let segments = dataset.load_indices_by_name("idx").await.unwrap();
+        assert!(
+            segments.len() >= 2,
+            "expected multiple delta index segments to exercise cross-delta merge, got {}",
+            segments.len()
+        );
+
+        let (queries, query_values) = batch_knn_two_queries();
+        let k = 3;
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.nprobes(2);
+        scan.project(&["i"]).unwrap();
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNIvfBatch"),
+            "multi-delta IVF batch KNN should use the shared-scan batch node, got:\n{}",
+            plan
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, Some(2))
+            .await;
     }
 
     #[tokio::test]

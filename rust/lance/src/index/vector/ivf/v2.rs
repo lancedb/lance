@@ -1928,6 +1928,147 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         )))
     }
 
+    fn supports_batch_partition_search(&self) -> bool {
+        S::supports_global_topk_heap()
+    }
+
+    async fn search_partitions_batch(
+        self: Arc<Self>,
+        query: Query,
+        partitions_per_query: Vec<Arc<UInt32Array>>,
+        q_c_dists_per_query: Vec<Arc<Float32Array>>,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<Vec<RecordBatch>> {
+        if !S::supports_global_topk_heap() {
+            return Err(Error::not_supported(
+                "batch partition search requires a global top-k heap sub-index",
+            ));
+        }
+        let query_count = partitions_per_query.len();
+        if q_c_dists_per_query.len() != query_count {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: {query_count} query partition lists but {} distance lists",
+                q_c_dists_per_query.len()
+            )));
+        }
+        if query_count == 0 {
+            return Ok(Vec::new());
+        }
+        if !query.key.len().is_multiple_of(query_count) {
+            return Err(Error::invalid_input(format!(
+                "batch partition search: query key length {} is not divisible by query count {query_count}",
+                query.key.len()
+            )));
+        }
+        let dim = query.key.len() / query_count;
+
+        // Per-query immutable search state: the query vector slice and the
+        // optional Rabit raw-query context both depend only on the query vector,
+        // so compute them once up front rather than per probed partition.
+        let mut base_queries = Vec::with_capacity(query_count);
+        let mut raw_query_contexts = Vec::with_capacity(query_count);
+        for query_index in 0..query_count {
+            if partitions_per_query[query_index].len() != q_c_dists_per_query[query_index].len() {
+                return Err(Error::invalid_input(format!(
+                    "batch partition search: query {query_index} has {} partitions but {} distances",
+                    partitions_per_query[query_index].len(),
+                    q_c_dists_per_query[query_index].len()
+                )));
+            }
+            let mut single_query = query.clone();
+            single_query.key = query.key.slice(query_index * dim, dim);
+            raw_query_contexts.push(self.prepare_rq_raw_query_context(&single_query.key)?);
+            base_queries.push(single_query);
+        }
+
+        // Invert the per-query partition lists so each distinct partition is
+        // loaded once and scored against every query that probes it.
+        let mut assignments: HashMap<u32, Vec<(usize, f32)>> = HashMap::new();
+        for (query_index, (parts, dists)) in partitions_per_query
+            .iter()
+            .zip(q_c_dists_per_query.iter())
+            .enumerate()
+        {
+            for (part_id, dist_q_c) in parts.values().iter().zip(dists.values().iter()) {
+                assignments
+                    .entry(*part_id)
+                    .or_default()
+                    .push((query_index, *dist_q_c));
+            }
+        }
+
+        pre_filter.wait_for_ready().await?;
+
+        // Load each distinct partition's storage exactly once. This shared I/O
+        // is the whole point of batch search versus repeated single queries.
+        let load_parallelism = get_num_compute_intensive_cpus().max(1);
+        let load_index = self.clone();
+        let load_metrics = metrics.clone();
+        let loaded = stream::iter(assignments)
+            .map(move |(part_id, probing_queries)| {
+                let index = load_index.clone();
+                let metrics = load_metrics.clone();
+                async move {
+                    let part_entry = index
+                        .load_partition(part_id as usize, true, metrics.as_ref())
+                        .await?;
+                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                }
+            })
+            .buffered(load_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Score the loaded partitions into one top-k heap per query.
+        let use_query_residual = self.use_query_residual;
+        let use_residual_scratch = self.use_residual_scratch;
+        let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let scratch_pool = self.scratch_pool.clone();
+        let index = self.clone();
+        let search_metrics = metrics.clone();
+        let batches = spawn_cpu(move || -> Result<Vec<RecordBatch>> {
+            let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
+                .map(|_| BinaryHeap::with_capacity(heap_capacity))
+                .collect();
+            scratch_pool.with_scratch(|scratch| -> Result<()> {
+                for (part_id, part_entry, probing_queries) in &loaded {
+                    let partition_centroid = index.ivf.centroid(*part_id);
+                    for (query_index, dist_q_c) in probing_queries {
+                        let mut single_query = base_queries[*query_index].clone();
+                        single_query.dist_q_c = *dist_q_c;
+                        let prepared = PreparedPartitionSearch::<S, Q> {
+                            query: single_query,
+                            pre_filter: pre_filter.clone(),
+                            partition_id: *part_id,
+                            partition_centroid: partition_centroid.clone(),
+                            rq_search_cache: index.rq_search_cache.clone(),
+                            raw_query_context: raw_query_contexts[*query_index].clone(),
+                            part_entry: part_entry.clone(),
+                            _marker: PhantomData,
+                        };
+                        Self::accumulate_prepared_partition_search(
+                            use_query_residual,
+                            use_residual_scratch,
+                            prepared,
+                            &mut heaps[*query_index],
+                            scratch,
+                            search_metrics.as_ref(),
+                        )?;
+                    }
+                }
+                Ok(())
+            })?;
+            heaps
+                .into_iter()
+                .map(Self::global_heap_to_batch)
+                .collect::<Result<Vec<_>>>()
+        })
+        .await?;
+
+        Ok(batches)
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
