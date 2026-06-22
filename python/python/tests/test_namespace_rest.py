@@ -750,10 +750,11 @@ class TestDynamicContextProvider:
 
 
 class TestSigV4Auth:
-
     def test_sigv4_connects_and_signs_requests(self, monkeypatch):
         monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
-        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+        monkeypatch.setenv(
+            "AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+        )
         monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -815,12 +816,14 @@ class TestSigV4Auth:
             def _capture_and_respond(self):
                 content_length = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_length) if content_length else b""
-                captured_requests.append({
-                    "method": self.command,
-                    "path": self.path,
-                    "headers": {k.lower(): v for k, v in self.headers.items()},
-                    "body": body,
-                })
+                captured_requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "headers": {k.lower(): v for k, v in self.headers.items()},
+                        "body": body,
+                    }
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -881,9 +884,9 @@ class TestSigV4Auth:
 
                 url = f"http://127.0.0.1:{port}{req['path']}"
 
-                signed_names = re.search(
-                    r"SignedHeaders=([^,]+)", rust_auth
-                ).group(1).split(";")
+                signed_names = (
+                    re.search(r"SignedHeaders=([^,]+)", rust_auth).group(1).split(";")
+                )
                 headers_for_signing = {}
                 for name in signed_names:
                     if name in req["headers"]:
@@ -923,9 +926,7 @@ class TestSigV4Auth:
 
         class Recorder(BaseHTTPRequestHandler):
             def _capture_and_respond(self):
-                captured_headers.append(
-                    {k.lower(): v for k, v in self.headers.items()}
-                )
+                captured_headers.append({k.lower(): v for k, v in self.headers.items()})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -978,7 +979,9 @@ class TestSigV4Auth:
             backend_config = {"root": tmpdir}
 
             with lance.namespace.RestAdapter("dir", backend_config, port=0) as adapter:
-                with pytest.raises(Exception, match="rest.auth.sigv4.secret-access-key"):
+                with pytest.raises(
+                    Exception, match="rest.auth.sigv4.secret-access-key"
+                ):
                     connect(
                         "rest",
                         {
@@ -1002,9 +1005,7 @@ class TestSigV4Auth:
 
         class Recorder(BaseHTTPRequestHandler):
             def _capture_and_respond(self):
-                captured_headers.append(
-                    {k.lower(): v for k, v in self.headers.items()}
-                )
+                captured_headers.append({k.lower(): v for k, v in self.headers.items()})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1065,9 +1066,7 @@ class TestSigV4Auth:
 
         class Recorder(BaseHTTPRequestHandler):
             def _capture_and_respond(self):
-                captured_headers.append(
-                    {k.lower(): v for k, v in self.headers.items()}
-                )
+                captured_headers.append({k.lower(): v for k, v in self.headers.items()})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

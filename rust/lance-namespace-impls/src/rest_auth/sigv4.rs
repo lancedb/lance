@@ -564,13 +564,8 @@ mod tests {
 
     #[tokio::test]
     async fn injected_provider_takes_precedence_over_static_credentials() {
-        let injected_creds = Credentials::new(
-            VECTOR_ACCESS_KEY,
-            VECTOR_SECRET_KEY,
-            None,
-            None,
-            "injected",
-        );
+        let injected_creds =
+            Credentials::new(VECTOR_ACCESS_KEY, VECTOR_SECRET_KEY, None, None, "injected");
         let mut props = HashMap::new();
         props.insert(REGION_KEY.to_string(), VECTOR_REGION.to_string());
         props.insert(SERVICE_KEY.to_string(), VECTOR_SERVICE.to_string());

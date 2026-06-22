@@ -128,8 +128,8 @@ import java.util.Optional;
  *   <li>rest.auth.sigv4.session-token (optional): STS session token
  * </ul>
  *
- * <p>Note: {@code rest.auth.*} and {@code header.Authorization} are mutually exclusive.
- * Setting both will throw an error at initialization time.
+ * <p>Note: {@code rest.auth.*} and {@code header.Authorization} are mutually exclusive. Setting
+ * both will throw an error at initialization time.
  *
  * <ul>
  *   <li>tls.cert_file (optional): Path to client certificate file

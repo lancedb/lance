@@ -118,7 +118,11 @@ where
                 headers.insert(name, val);
             }
             _ => {
-                log::warn!("dropping invalid header: {:?}: {:?}", k.as_ref(), v.as_ref());
+                log::warn!(
+                    "dropping invalid header: {:?}: {:?}",
+                    k.as_ref(),
+                    v.as_ref()
+                );
             }
         }
     }
@@ -160,7 +164,9 @@ impl RestClient {
         }
     }
 
-    /// Apply headers: base → auth (signed) → context (unsigned).
+    /// Apply headers: base → context → auth (signed last).
+    /// Context is applied before auth so it participates in signing;
+    /// auth overrides conflicting keys.
     async fn apply_headers(
         &self,
         request: &mut reqwest::Request,
@@ -168,6 +174,16 @@ impl RestClient {
         object_id: &str,
     ) -> Result<()> {
         apply_string_headers(request.headers_mut(), &self.base_headers);
+
+        if let Some(provider) = &self.context_provider {
+            let info = OperationInfo::new(operation, object_id);
+            const HEADERS_PREFIX: &str = "headers.";
+            let context_headers = provider
+                .provide_context(&info)
+                .into_iter()
+                .filter_map(|(k, v)| k.strip_prefix(HEADERS_PREFIX).map(|n| (n.to_string(), v)));
+            apply_string_headers(request.headers_mut(), context_headers);
+        }
 
         if let Some(auth) = &self.auth_provider {
             let ctx = Self::build_auth_context(request);
@@ -182,15 +198,6 @@ impl RestClient {
             apply_string_headers(request.headers_mut(), auth_headers);
         }
 
-        if let Some(provider) = &self.context_provider {
-            let info = OperationInfo::new(operation, object_id);
-            const HEADERS_PREFIX: &str = "headers.";
-            let context_headers = provider
-                .provide_context(&info)
-                .into_iter()
-                .filter_map(|(k, v)| k.strip_prefix(HEADERS_PREFIX).map(|n| (n.to_string(), v)));
-            apply_string_headers(request.headers_mut(), context_headers);
-        }
         Ok(())
     }
 
@@ -289,6 +296,14 @@ impl std::fmt::Debug for RestNamespaceBuilder {
             .field(
                 "auth_provider",
                 &self.auth_provider.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "auth_properties",
+                &if self.auth_properties.is_empty() {
+                    "{}".to_string()
+                } else {
+                    format!("<{} keys, redacted>", self.auth_properties.len())
+                },
             )
             .finish()
     }
@@ -549,9 +564,14 @@ impl RestNamespaceBuilder {
 
     /// Build the RestNamespace.
     pub fn build(self) -> Result<RestNamespace> {
-        let has_auth = self.auth_provider.is_some()
-            || self.auth_properties.contains_key(AUTH_TYPE_KEY);
-        if has_auth && self.headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) {
+        let has_auth =
+            self.auth_provider.is_some() || self.auth_properties.contains_key(AUTH_TYPE_KEY);
+        if has_auth
+            && self
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("authorization"))
+        {
             return Err(NamespaceError::InvalidInput {
                 message: "cannot combine header.Authorization with rest.auth.* — \
                           use one authentication method"
@@ -563,6 +583,15 @@ impl RestNamespaceBuilder {
             Some(p)
         } else if self.auth_properties.contains_key(AUTH_TYPE_KEY) {
             Some(create_auth_provider(&self.auth_properties)?)
+        } else if !self.auth_properties.is_empty() {
+            let keys: Vec<_> = self.auth_properties.keys().collect();
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "found auth properties {keys:?} but {AUTH_TYPE_KEY} is not set — \
+                     add rest.auth.type to enable authentication"
+                ),
+            }
+            .into());
         } else {
             None
         };
@@ -2597,7 +2626,10 @@ mod tests {
     fn build_rejects_header_authorization_combined_with_auth_type() {
         let mut props = HashMap::new();
         props.insert("uri".to_string(), "http://localhost:8080".to_string());
-        props.insert("header.Authorization".to_string(), "Bearer token".to_string());
+        props.insert(
+            "header.Authorization".to_string(),
+            "Bearer token".to_string(),
+        );
         props.insert("rest.auth.type".to_string(), "none".to_string());
         let err = RestNamespaceBuilder::from_properties(props)
             .unwrap()
@@ -2606,6 +2638,154 @@ mod tests {
         assert!(
             err.to_string().contains("one authentication method"),
             "build must reject header.Authorization + rest.auth.*: {err}"
+        );
+    }
+
+    #[test]
+    fn build_rejects_orphaned_auth_properties() {
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), "http://localhost:8080".to_string());
+        props.insert(
+            "rest.auth.sigv4.region".to_string(),
+            "us-east-1".to_string(),
+        );
+        let err = RestNamespaceBuilder::from_properties(props)
+            .unwrap()
+            .build()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rest.auth.type"),
+            "must mention rest.auth.type: {msg}"
+        );
+    }
+
+    #[test]
+    fn debug_output_does_not_contain_secrets() {
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), "http://localhost:8080".to_string());
+        props.insert("rest.auth.type".to_string(), "sigv4".to_string());
+        props.insert(
+            "rest.auth.sigv4.region".to_string(),
+            "us-east-1".to_string(),
+        );
+        props.insert(
+            "rest.auth.sigv4.access-key-id".to_string(),
+            "AKIAIOSFODNN7EXAMPLE".to_string(),
+        );
+        props.insert(
+            "rest.auth.sigv4.secret-access-key".to_string(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+        );
+        props.insert(
+            "rest.auth.sigv4.session-token".to_string(),
+            "FakeSessionToken123".to_string(),
+        );
+        let builder = RestNamespaceBuilder::from_properties(props).unwrap();
+        let debug = format!("{:?}", builder);
+        assert!(
+            !debug.contains("wJalrXUtnFEMI"),
+            "secret key must not appear in Debug: {debug}"
+        );
+        assert!(
+            !debug.contains("AKIAIOSFODNN7EXAMPLE"),
+            "access key must not appear in Debug: {debug}"
+        );
+        assert!(
+            !debug.contains("FakeSessionToken123"),
+            "session token must not appear in Debug: {debug}"
+        );
+        assert!(
+            debug.contains("redacted"),
+            "must show redacted marker: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_overrides_context_and_context_participates_in_signing() {
+        use crate::rest_auth::{RequestContext, RestAuthProvider};
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct CapturingAuth {
+            captured_ctx: Mutex<Option<RequestContext>>,
+        }
+
+        #[async_trait::async_trait]
+        impl RestAuthProvider for CapturingAuth {
+            async fn authenticate(
+                &self,
+                ctx: &RequestContext,
+            ) -> lance_core::Result<HashMap<String, String>> {
+                *self.captured_ctx.lock().unwrap() = Some(ctx.clone());
+                let mut h = HashMap::new();
+                h.insert(
+                    "Authorization".to_string(),
+                    "AWS4-HMAC-SHA256 signed".to_string(),
+                );
+                h.insert("x-amz-date".to_string(), "20150830T123600Z".to_string());
+                Ok(h)
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestContextProvider;
+
+        impl DynamicContextProvider for TestContextProvider {
+            fn provide_context(&self, _info: &OperationInfo) -> HashMap<String, String> {
+                let mut ctx = HashMap::new();
+                ctx.insert(
+                    "headers.Authorization".to_string(),
+                    "Bearer should-be-overridden".to_string(),
+                );
+                ctx.insert(
+                    "headers.X-Custom-Trace".to_string(),
+                    "trace-123".to_string(),
+                );
+                ctx
+            }
+        }
+
+        let auth = std::sync::Arc::new(CapturingAuth {
+            captured_ctx: Mutex::new(None),
+        });
+        let ns = RestNamespaceBuilder::new("http://127.0.0.1:9999")
+            .auth_provider(auth.clone())
+            .context_provider(std::sync::Arc::new(TestContextProvider))
+            .build()
+            .unwrap();
+
+        let req_builder = ns
+            .rest_client
+            .client
+            .get("http://127.0.0.1:9999/v1/namespaces");
+        let mut request = req_builder.build().unwrap();
+        ns.rest_client
+            .apply_headers(&mut request, "list_namespaces", "")
+            .await
+            .unwrap();
+
+        let final_auth = request
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(final_auth, "AWS4-HMAC-SHA256 signed");
+
+        let trace = request
+            .headers()
+            .get("x-custom-trace")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(trace, "trace-123");
+
+        let captured = auth.captured_ctx.lock().unwrap();
+        let ctx = captured.as_ref().unwrap();
+        assert_eq!(
+            ctx.headers.get("x-custom-trace").map(|s| s.as_str()),
+            Some("trace-123"),
         );
     }
 }
