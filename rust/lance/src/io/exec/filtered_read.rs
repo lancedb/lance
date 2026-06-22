@@ -49,7 +49,7 @@ use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
 use roaring::RoaringBitmap;
-use tokio::sync::{Mutex as AsyncMutex, OnceCell};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, Semaphore, mpsc};
 use tracing::{Instrument, instrument};
 
 use crate::Dataset;
@@ -354,6 +354,17 @@ struct FilteredReadStream {
     scan_range_after_filter: Option<Range<u64>>,
 }
 
+struct UnorderedFilteredReadInit {
+    scoped_fragments: Vec<ScopedFragmentRead>,
+    global_metrics: Arc<FilteredReadGlobalMetrics>,
+    worker_count: usize,
+}
+
+enum UnorderedFilteredReadState {
+    Init(Option<UnorderedFilteredReadInit>),
+    Running(mpsc::Receiver<Result<ReadBatchFut>>),
+}
+
 impl std::fmt::Debug for FilteredReadStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FilteredReadStream").finish()
@@ -431,22 +442,35 @@ impl FilteredReadStream {
             scan_scheduler.clone(),
         );
 
-        let global_metrics_clone = global_metrics.clone();
-
-        let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map({
-                let scan_range_after_filter = scan_range_after_filter.clone();
-                move |scoped_fragment| {
-                    let metrics = global_metrics_clone.clone();
-                    let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    SpawnedTask::spawn(
-                        Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
-                    )
-                    .map(|thread_result| thread_result.unwrap())
-                }
-            })
-            .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+        let task_stream = if options.ordered_output || scan_range_after_filter.is_some() {
+            let global_metrics_clone = global_metrics.clone();
+            let fragment_streams = futures::stream::iter(scoped_fragments)
+                .map({
+                    let scan_range_after_filter = scan_range_after_filter.clone();
+                    move |scoped_fragment| {
+                        let metrics = global_metrics_clone.clone();
+                        let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                        SpawnedTask::spawn(
+                            Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
+                        )
+                        .map(|thread_result| thread_result.unwrap())
+                    }
+                })
+                .buffered(fragment_readahead);
+            fragment_streams.try_flatten().boxed()
+        } else {
+            let worker_count = Self::unordered_worker_count(
+                scoped_fragments.len(),
+                options.fragment_readahead,
+                options.threading_mode,
+            );
+            log::debug!(
+                "Filtered read unordered worker backend on {} fragments with workers={}",
+                scoped_fragments.len(),
+                worker_count
+            );
+            Self::unordered_task_stream(scoped_fragments, global_metrics.clone(), worker_count)
+        };
 
         Ok(Self {
             output_schema,
@@ -457,6 +481,101 @@ impl FilteredReadStream {
             threading_mode,
             scan_range_after_filter,
         })
+    }
+
+    fn unordered_worker_count(
+        fragment_count: usize,
+        fragment_readahead: Option<usize>,
+        threading_mode: FilteredReadThreadingMode,
+    ) -> usize {
+        let default_workers = match threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => num_threads,
+            FilteredReadThreadingMode::MultiplePartitions(num_partitions) => num_partitions,
+        }
+        .max(1);
+        let configured_workers = std::env::var("LANCE_V2_SCAN_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default_workers);
+        let readahead_cap = match fragment_readahead {
+            Some(0) | None => configured_workers,
+            Some(limit) => configured_workers.min(limit),
+        };
+
+        readahead_cap.min(fragment_count).max(1)
+    }
+
+    fn unordered_task_stream(
+        scoped_fragments: Vec<ScopedFragmentRead>,
+        global_metrics: Arc<FilteredReadGlobalMetrics>,
+        worker_count: usize,
+    ) -> BoxStream<'static, Result<ReadBatchFut>> {
+        futures::stream::unfold(
+            UnorderedFilteredReadState::Init(Some(UnorderedFilteredReadInit {
+                scoped_fragments,
+                global_metrics,
+                worker_count,
+            })),
+            |mut state| async move {
+                loop {
+                    match state {
+                        UnorderedFilteredReadState::Init(ref mut init) => {
+                            let init = init.take()?;
+                            let channel_capacity = init.worker_count.saturating_mul(2).max(1);
+                            let (tx, rx) = mpsc::channel(channel_capacity);
+                            let semaphore = Arc::new(Semaphore::new(init.worker_count.max(1)));
+
+                            for scoped_fragment in init.scoped_fragments {
+                                let tx = tx.clone();
+                                let error_tx = tx.clone();
+                                let semaphore = semaphore.clone();
+                                let metrics = init.global_metrics.clone();
+                                tokio::spawn(async move {
+                                    let result = async move {
+                                        if tx.is_closed() {
+                                            return Ok(());
+                                        }
+                                        let _permit =
+                                            semaphore.acquire_owned().await.map_err(|error| {
+                                                Error::internal(format!(
+                                                    "scan worker closed: {error}"
+                                                ))
+                                            })?;
+                                        if tx.is_closed() {
+                                            return Ok(());
+                                        }
+                                        let mut fragment_stream = Box::pin(
+                                            Self::read_fragment(scoped_fragment, metrics, None)
+                                                .await?,
+                                        );
+                                        while let Some(task) = fragment_stream.next().await {
+                                            if tx.send(task).await.is_err() {
+                                                return Ok(());
+                                            }
+                                        }
+                                        Ok::<(), Error>(())
+                                    }
+                                    .await;
+                                    if let Err(error) = result {
+                                        let _ = error_tx.send(Err(error)).await;
+                                    }
+                                });
+                            }
+                            drop(tx);
+                            state = UnorderedFilteredReadState::Running(rx);
+                        }
+                        UnorderedFilteredReadState::Running(mut rx) => {
+                            return rx
+                                .recv()
+                                .await
+                                .map(|task| (task, UnorderedFilteredReadState::Running(rx)));
+                        }
+                    }
+                }
+            },
+        )
+        .boxed()
     }
 
     async fn load_fragment(
@@ -1267,6 +1386,8 @@ pub struct FilteredReadOptions {
     pub full_filter: Option<Expr>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
+    /// Whether to preserve fragment order in the output stream.
+    pub ordered_output: bool,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
 }
@@ -1300,6 +1421,7 @@ impl FilteredReadOptions {
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
+            ordered_output: true,
         }
     }
 
@@ -1393,6 +1515,12 @@ impl FilteredReadOptions {
     /// scheduler.
     pub fn with_fragment_readahead(mut self, fragment_readahead: usize) -> Self {
         self.fragment_readahead = Some(fragment_readahead);
+        self
+    }
+
+    /// Controls whether the read should preserve fragment order.
+    pub fn with_ordered_output(mut self, ordered_output: bool) -> Self {
+        self.ordered_output = ordered_output;
         self
     }
 

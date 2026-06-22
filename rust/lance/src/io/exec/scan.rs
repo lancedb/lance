@@ -31,6 +31,7 @@ use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::Instrument;
 
 use crate::dataset::Dataset;
@@ -67,6 +68,140 @@ async fn open_file(
 struct FragmentWithRange {
     fragment: FileFragment,
     range: Option<Range<u32>>,
+}
+
+struct V2UnorderedScanInit {
+    file_fragments: Vec<FragmentWithRange>,
+    project_schema: Arc<Schema>,
+    config: LanceScanConfig,
+    scan_scheduler: Arc<ScanScheduler>,
+    worker_count: usize,
+}
+
+enum V2UnorderedScanState {
+    Init(Option<V2UnorderedScanInit>),
+    Running(mpsc::Receiver<Result<RecordBatch>>),
+}
+
+async fn read_v2_fragment_unordered(
+    file_fragment: FragmentWithRange,
+    project_schema: Arc<Schema>,
+    config: LanceScanConfig,
+    scan_scheduler: Arc<ScanScheduler>,
+    priority: usize,
+    tx: mpsc::Sender<Result<RecordBatch>>,
+) -> Result<()> {
+    let mut frag_config = FragReadConfig::default()
+        .with_row_id(config.with_row_id)
+        .with_row_address(config.with_row_address)
+        .with_row_last_updated_at_version(config.with_row_last_updated_at_version)
+        .with_row_created_at_version(config.with_row_created_at_version);
+    if let Some(file_reader_options) = config.file_reader_options {
+        frag_config = frag_config.with_file_reader_options(file_reader_options);
+    }
+    let reader = open_file(
+        file_fragment.fragment,
+        project_schema,
+        frag_config,
+        config.with_make_deletions_null,
+        Some((scan_scheduler, priority as u32)),
+    )
+    .await?;
+    let batch_stream = if let Some(range) = file_fragment.range {
+        reader.read_range(range, config.batch_size as u32)?
+    } else {
+        reader.read_all(config.batch_size as u32)?
+    };
+    let mut batches = batch_stream.buffered(1);
+    while let Some(batch) = batches.next().await {
+        if tx.send(batch.map_err(DataFusionError::from)).await.is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn v2_unordered_scan_stream(init: V2UnorderedScanInit) -> BoxStream<'static, Result<RecordBatch>> {
+    stream::unfold(
+        V2UnorderedScanState::Init(Some(init)),
+        |mut state| async move {
+            loop {
+                match state {
+                    V2UnorderedScanState::Init(ref mut init) => {
+                        let init = init.take()?;
+                        let channel_capacity = init.worker_count.saturating_mul(2).max(1);
+                        let (tx, rx) = mpsc::channel(channel_capacity);
+                        let semaphore = Arc::new(Semaphore::new(init.worker_count.max(1)));
+                        for (priority, file_fragment) in init.file_fragments.into_iter().enumerate()
+                        {
+                            let permit = semaphore.clone();
+                            let tx = tx.clone();
+                            let error_tx = tx.clone();
+                            let project_schema = init.project_schema.clone();
+                            let config = init.config.clone();
+                            let scan_scheduler = init.scan_scheduler.clone();
+                            tokio::spawn(async move {
+                                let result = async move {
+                                    if tx.is_closed() {
+                                        return Ok(());
+                                    }
+                                    let _permit = permit.acquire_owned().await.map_err(|err| {
+                                        DataFusionError::Internal(format!(
+                                            "v2 scan fragment semaphore closed: {err}"
+                                        ))
+                                    })?;
+                                    if tx.is_closed() {
+                                        return Ok(());
+                                    }
+                                    read_v2_fragment_unordered(
+                                        file_fragment,
+                                        project_schema,
+                                        config,
+                                        scan_scheduler,
+                                        priority,
+                                        tx.clone(),
+                                    )
+                                    .await
+                                }
+                                .await;
+                                if let Err(error) = result {
+                                    let _ = error_tx.send(Err(error)).await;
+                                }
+                            });
+                        }
+                        drop(tx);
+                        state = V2UnorderedScanState::Running(rx);
+                    }
+                    V2UnorderedScanState::Running(mut rx) => {
+                        return rx
+                            .recv()
+                            .await
+                            .map(|batch| (batch, V2UnorderedScanState::Running(rx)));
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+fn v2_unordered_scan_worker_count(
+    fragment_count: usize,
+    fragment_readahead: Option<usize>,
+) -> usize {
+    let default_workers = get_num_compute_intensive_cpus().max(1);
+    let configured_workers = std::env::var("LANCE_V2_SCAN_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_workers);
+
+    let readahead_cap = match fragment_readahead {
+        Some(0) | None => configured_workers,
+        Some(limit) => configured_workers.min(limit),
+    };
+
+    readahead_cap.min(fragment_count).max(1)
 }
 
 struct ScanMetrics {
@@ -208,14 +343,8 @@ impl LanceStream {
         let frag_parallelism = config
             .fragment_readahead
             .unwrap_or((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
-            // fragment_readhead=0 doesn't make sense so we just bump it to 1
+            // fragment_readahead=0 doesn't make sense for the ordered pre-open buffer.
             .max(1);
-        debug!(
-            "Given io_parallelism={} and num_columns={} we will read {} fragments at once while scanning v2 dataset",
-            io_parallelism,
-            projection.fields.len(),
-            frag_parallelism
-        );
 
         let mut file_fragments = fragments
             .iter()
@@ -267,6 +396,16 @@ impl LanceStream {
             }
             file_fragments = filtered_fragments;
         }
+        let unordered_worker_count =
+            v2_unordered_scan_worker_count(file_fragments.len(), config.fragment_readahead);
+        debug!(
+            "Given io_parallelism={} and num_columns={} we will use frag_parallelism={} ordered_output={} unordered_worker_count={} while scanning v2 dataset",
+            io_parallelism,
+            projection.fields.len(),
+            frag_parallelism,
+            config.ordered_output,
+            unordered_worker_count,
+        );
 
         let scan_scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
@@ -275,73 +414,86 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
-        let config_for_stream = config.clone();
-        let batches = stream::iter(file_fragments.into_iter().enumerate())
-            .map(move |(priority, file_fragment)| {
-                let project_schema = project_schema.clone();
-                let scan_scheduler = scan_scheduler.clone();
-                let config = config_for_stream.clone();
-                #[allow(clippy::type_complexity)]
-                let frag_task: BoxFuture<
-                    Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
-                > = tokio::spawn(
-                    (async move {
-                        let mut frag_config = FragReadConfig::default()
-                            .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
-                            .with_row_last_updated_at_version(
-                                config.with_row_last_updated_at_version,
+        let inner_stream = if config.ordered_output {
+            let config_for_stream = config.clone();
+            let batches = stream::iter(file_fragments.into_iter().enumerate())
+                .map(move |(priority, file_fragment)| {
+                    let project_schema = project_schema.clone();
+                    let scan_scheduler = scan_scheduler.clone();
+                    let config = config_for_stream.clone();
+                    #[allow(clippy::type_complexity)]
+                    let frag_task: BoxFuture<
+                        Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
+                    > = tokio::spawn(
+                        (async move {
+                            let mut frag_config = FragReadConfig::default()
+                                .with_row_id(config.with_row_id)
+                                .with_row_address(config.with_row_address)
+                                .with_row_last_updated_at_version(
+                                    config.with_row_last_updated_at_version,
+                                )
+                                .with_row_created_at_version(config.with_row_created_at_version);
+                            if let Some(file_reader_options) = config.file_reader_options {
+                                frag_config =
+                                    frag_config.with_file_reader_options(file_reader_options);
+                            }
+                            let reader = open_file(
+                                file_fragment.fragment,
+                                project_schema,
+                                frag_config,
+                                config.with_make_deletions_null,
+                                Some((scan_scheduler, priority as u32)),
                             )
-                            .with_row_created_at_version(config.with_row_created_at_version);
-                        if let Some(file_reader_options) = config.file_reader_options {
-                            frag_config = frag_config.with_file_reader_options(file_reader_options);
-                        }
-                        let reader = open_file(
-                            file_fragment.fragment,
-                            project_schema,
-                            frag_config,
-                            config.with_make_deletions_null,
-                            Some((scan_scheduler, priority as u32)),
-                        )
-                        .await?;
-                        let batch_stream = if let Some(range) = file_fragment.range {
-                            reader.read_range(range, config.batch_size as u32)?.boxed()
-                        } else {
-                            reader.read_all(config.batch_size as u32)?.boxed()
-                        };
-                        let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
-                            batch_stream
-                                .map(|fut| {
-                                    Result::Ok(
-                                        fut.map_err(|e| DataFusionError::External(Box::new(e)))
-                                            .boxed(),
-                                    )
-                                })
-                                .boxed();
-                        Result::Ok(batch_stream)
-                    })
-                    .in_current_span(),
-                )
-                .map(|res_res| res_res.unwrap())
+                            .await?;
+                            let batch_stream = if let Some(range) = file_fragment.range {
+                                reader.read_range(range, config.batch_size as u32)?.boxed()
+                            } else {
+                                reader.read_all(config.batch_size as u32)?.boxed()
+                            };
+                            let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
+                                batch_stream
+                                    .map(|fut| {
+                                        Result::Ok(
+                                            fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                                                .boxed(),
+                                        )
+                                    })
+                                    .boxed();
+                            Result::Ok(batch_stream)
+                        })
+                        .in_current_span(),
+                    )
+                    .map(|res_res| res_res.unwrap())
+                    .boxed();
+                    Ok(frag_task)
+                })
+                // We need two levels of try_buffered here.  The first kicks off the tasks to read the fragments.
+                // As soon as we open the fragment we will start scheduling and that will kick off many background
+                // tasks (not tracked by this stream) to read I/O.  The limit here is really to limit how many open
+                // files we have.  It's not going to have much affect on how much RAM we are using.
+                .try_buffered(frag_parallelism)
                 .boxed();
-                Ok(frag_task)
+            batches
+                .try_flatten()
+                // The second try_buffered controls how many CPU decode tasks we kick off in parallel.
+                //
+                // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
+                // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
+                // transfer between the two steps.
+                .try_buffered(get_num_compute_intensive_cpus())
+                .stream_in_current_span()
+                .boxed()
+        } else {
+            v2_unordered_scan_stream(V2UnorderedScanInit {
+                file_fragments,
+                project_schema,
+                config: config.clone(),
+                scan_scheduler: scan_scheduler.clone(),
+                worker_count: unordered_worker_count,
             })
-            // We need two levels of try_buffered here.  The first kicks off the tasks to read the fragments.
-            // As soon as we open the fragment we will start scheduling and that will kick off many background
-            // tasks (not tracked by this stream) to read I/O.  The limit here is really to limit how many open
-            // files we have.  It's not going to have much affect on how much RAM we are using.
-            .try_buffered(frag_parallelism)
-            .boxed();
-        let inner_stream = batches
-            .try_flatten()
-            // The second try_buffered controls how many CPU decode tasks we kick off in parallel.
-            //
-            // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
-            // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
-            // transfer between the two steps.
-            .try_buffered(get_num_compute_intensive_cpus())
             .stream_in_current_span()
-            .boxed();
+            .boxed()
+        };
 
         timer.done();
         Ok(Self {

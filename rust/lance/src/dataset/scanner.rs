@@ -2688,9 +2688,19 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let ordered = if self.ordering.is_some() || self.nearest.is_some() {
+            false
+        } else if projection.with_row_last_updated_at_version
+            || projection.with_row_created_at_version
+        {
+            true
+        } else {
+            self.ordered
+        };
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
-            .with_projection(projection);
+            .with_projection(projection)
+            .with_ordered_output(ordered);
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
