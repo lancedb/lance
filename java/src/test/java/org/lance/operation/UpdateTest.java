@@ -169,7 +169,7 @@ public class UpdateTest extends OperationTestBase {
                   Update.builder()
                       .removedFragmentIds(Collections.singletonList(fragmentId))
                       .newFragments(Collections.singletonList(newFragment))
-                      .updateMode(Optional.of(UpdateMode.RewriteRows))
+                      .updateMode(Optional.of(UpdateMode.RewriteColumns))
                       .updatedFragmentOffsets(offsets)
                       .build())
               .build()) {
