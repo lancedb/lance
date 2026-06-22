@@ -442,11 +442,7 @@ impl PostingIterator {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let mut block_idx = self.index / BLOCK_SIZE;
-                while block_idx + 1 < list.blocks.len()
-                    && list.block_least_doc_id(block_idx + 1) <= least_id
-                {
-                    block_idx += 1;
-                }
+                block_idx = list.block_idx_for_doc(block_idx, least_id);
                 self.index = self.index.max(block_idx * BLOCK_SIZE);
                 let length = list.length as usize;
                 while self.index < length {
@@ -480,11 +476,7 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
-                while self.block_idx + 1 < list.blocks.len()
-                    && list.block_least_doc_id(self.block_idx + 1) <= least_id
-                {
-                    self.block_idx += 1;
-                }
+                self.block_idx = list.block_idx_for_doc(self.block_idx, least_id);
             }
             PostingList::Plain(_) => {
                 // we don't have block max score for legacy index,
@@ -2107,6 +2099,29 @@ mod tests {
             .collect::<Vec<_>>();
         row_ids.sort_unstable();
         row_ids
+    }
+
+    #[test]
+    fn compressed_posting_next_skips_to_target_block() {
+        let doc_ids = (0..(BLOCK_SIZE * 4 + 17))
+            .map(|doc_id| (doc_id as u32) * 3)
+            .collect::<Vec<_>>();
+        let posting = generate_posting_list(doc_ids, 1.0, None, true);
+        let mut iter =
+            PostingIterator::with_query_weight("t".to_string(), 0, 0, 1.0, posting, 10_000);
+
+        iter.next((BLOCK_SIZE as u64 * 3 * 3) + 7);
+        let doc = iter.doc().expect("target doc should exist");
+        assert_eq!(doc.doc_id(), (BLOCK_SIZE as u64 * 3 * 3) + 9);
+        assert_eq!(iter.block_idx, 3);
+
+        iter.shallow_next((BLOCK_SIZE as u64 * 4 * 3) + 1);
+        assert_eq!(iter.block_idx, 4);
+
+        iter.next(0);
+        let doc = iter.doc().expect("iterator must not move backwards");
+        assert_eq!(doc.doc_id(), (BLOCK_SIZE as u64 * 3 * 3) + 9);
+        assert_eq!(iter.block_idx, 3);
     }
 
     #[rstest]

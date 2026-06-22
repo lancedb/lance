@@ -3743,6 +3743,27 @@ impl CompressedPostingList {
             block[4..8].try_into().map(u32::from_le_bytes).unwrap()
         }
     }
+
+    pub(crate) fn block_idx_for_doc(&self, current_block_idx: usize, doc_id: u32) -> usize {
+        let num_blocks = self.blocks.len();
+        if current_block_idx + 1 >= num_blocks
+            || self.block_least_doc_id(current_block_idx + 1) > doc_id
+        {
+            return current_block_idx;
+        }
+
+        let mut lo = current_block_idx + 1;
+        let mut hi = num_blocks;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.block_least_doc_id(mid) <= doc_id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo - 1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
