@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{AsArray, BooleanBuilder};
 use arrow::datatypes::{Float32Type, UInt64Type};
@@ -21,7 +22,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Time};
 use futures::future::try_join_all;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -39,7 +40,11 @@ use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_PRUNED_BEFORE_SCORE_METRIC,
-    AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC, FREQS_COLLECTED_METRIC, MetricsCollector,
+    AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC, FREQS_COLLECTED_METRIC,
+    FTS_DOCS_FOR_WAND_TIME_METRIC, FTS_EMPTY_PARTITIONS_METRIC, FTS_NON_EMPTY_PARTITIONS_METRIC,
+    FTS_PARTITION_CANDIDATES_METRIC, FTS_POSTING_LOAD_TIME_METRIC, FTS_RESCORE_TIME_METRIC,
+    FTS_RESOLVE_ROW_IDS_TIME_METRIC, FTS_WAND_CPU_TIME_METRIC, FTS_WAND_WALL_TIME_METRIC,
+    MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -56,6 +61,15 @@ use lance_index::scalar::inverted::{
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
+
+const FTS_LOAD_SEGMENTS_TIME_METRIC: &str = "fts_load_segments_time";
+const FTS_OPEN_SEGMENTS_TIME_METRIC: &str = "fts_open_segments_time";
+const FTS_PREFILTER_TIME_METRIC: &str = "fts_prefilter_time";
+const FTS_TOKENIZE_TIME_METRIC: &str = "fts_tokenize_time";
+const FTS_SCORER_TIME_METRIC: &str = "fts_scorer_time";
+const FTS_SEARCH_SEGMENTS_TIME_METRIC: &str = "fts_search_segments_time";
+const FTS_OUTPUT_TIME_METRIC: &str = "fts_output_time";
+const TRACE_FTS_PROFILE: &str = "lance::events::fts_profile";
 
 /// Open one FTS segment as an [`InvertedIndex`].
 async fn open_fts_segment(
@@ -167,6 +181,22 @@ pub struct FtsIndexMetrics {
     and_candidates_pruned_before_score: Count,
     and_full_scores: Count,
     freqs_collected: Count,
+    fts_empty_partitions: Count,
+    fts_non_empty_partitions: Count,
+    fts_partition_candidates: Count,
+    fts_load_segments_time: Time,
+    fts_open_segments_time: Time,
+    fts_prefilter_time: Time,
+    fts_tokenize_time: Time,
+    fts_scorer_time: Time,
+    fts_search_segments_time: Time,
+    fts_output_time: Time,
+    fts_posting_load_time: Time,
+    fts_docs_for_wand_time: Time,
+    fts_wand_wall_time: Time,
+    fts_wand_cpu_time: Time,
+    fts_resolve_row_ids_time: Time,
+    fts_rescore_time: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -182,12 +212,65 @@ impl FtsIndexMetrics {
                 .new_count(AND_CANDIDATES_PRUNED_BEFORE_SCORE_METRIC, partition),
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            fts_empty_partitions: metrics.new_count(FTS_EMPTY_PARTITIONS_METRIC, partition),
+            fts_non_empty_partitions: metrics.new_count(FTS_NON_EMPTY_PARTITIONS_METRIC, partition),
+            fts_partition_candidates: metrics.new_count(FTS_PARTITION_CANDIDATES_METRIC, partition),
+            fts_load_segments_time: metrics.new_time(FTS_LOAD_SEGMENTS_TIME_METRIC, partition),
+            fts_open_segments_time: metrics.new_time(FTS_OPEN_SEGMENTS_TIME_METRIC, partition),
+            fts_prefilter_time: metrics.new_time(FTS_PREFILTER_TIME_METRIC, partition),
+            fts_tokenize_time: metrics.new_time(FTS_TOKENIZE_TIME_METRIC, partition),
+            fts_scorer_time: metrics.new_time(FTS_SCORER_TIME_METRIC, partition),
+            fts_search_segments_time: metrics.new_time(FTS_SEARCH_SEGMENTS_TIME_METRIC, partition),
+            fts_output_time: metrics.new_time(FTS_OUTPUT_TIME_METRIC, partition),
+            fts_posting_load_time: metrics.new_time(FTS_POSTING_LOAD_TIME_METRIC, partition),
+            fts_docs_for_wand_time: metrics.new_time(FTS_DOCS_FOR_WAND_TIME_METRIC, partition),
+            fts_wand_wall_time: metrics.new_time(FTS_WAND_WALL_TIME_METRIC, partition),
+            fts_wand_cpu_time: metrics.new_time(FTS_WAND_CPU_TIME_METRIC, partition),
+            fts_resolve_row_ids_time: metrics.new_time(FTS_RESOLVE_ROW_IDS_TIME_METRIC, partition),
+            fts_rescore_time: metrics.new_time(FTS_RESCORE_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 
     pub fn record_parts_searched(&self, num_parts: usize) {
         self.partitions_searched.add(num_parts);
+    }
+
+    fn record_time(time: &Time, elapsed: Duration) {
+        time.add_duration(elapsed);
+    }
+
+    fn time_ms(time: &Time) -> f64 {
+        time.value() as f64 / 1_000_000.0
+    }
+
+    pub fn log_profile_summary(&self) {
+        tracing::info!(
+            target: TRACE_FTS_PROFILE,
+            partitions_searched = self.partitions_searched.value(),
+            fts_empty_partitions = self.fts_empty_partitions.value(),
+            fts_non_empty_partitions = self.fts_non_empty_partitions.value(),
+            fts_partition_candidates = self.fts_partition_candidates.value(),
+            and_candidates_seen = self.and_candidates_seen.value(),
+            and_candidates_pruned_before_return =
+                self.and_candidates_pruned_before_return.value(),
+            and_full_scores = self.and_full_scores.value(),
+            freqs_collected = self.freqs_collected.value(),
+            fts_load_segments_ms = Self::time_ms(&self.fts_load_segments_time),
+            fts_open_segments_ms = Self::time_ms(&self.fts_open_segments_time),
+            fts_prefilter_ms = Self::time_ms(&self.fts_prefilter_time),
+            fts_tokenize_ms = Self::time_ms(&self.fts_tokenize_time),
+            fts_scorer_ms = Self::time_ms(&self.fts_scorer_time),
+            fts_search_segments_ms = Self::time_ms(&self.fts_search_segments_time),
+            fts_output_ms = Self::time_ms(&self.fts_output_time),
+            fts_posting_load_ms = Self::time_ms(&self.fts_posting_load_time),
+            fts_docs_for_wand_ms = Self::time_ms(&self.fts_docs_for_wand_time),
+            fts_wand_wall_ms = Self::time_ms(&self.fts_wand_wall_time),
+            fts_wand_cpu_ms = Self::time_ms(&self.fts_wand_cpu_time),
+            fts_resolve_row_ids_ms = Self::time_ms(&self.fts_resolve_row_ids_time),
+            fts_rescore_ms = Self::time_ms(&self.fts_rescore_time),
+            "fts query profile"
+        );
     }
 }
 
@@ -222,6 +305,42 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_freqs_collected(&self, num_collections: usize) {
         self.freqs_collected.add(num_collections);
+    }
+
+    fn record_fts_empty_partition(&self) {
+        self.fts_empty_partitions.add(1);
+    }
+
+    fn record_fts_non_empty_partition(&self) {
+        self.fts_non_empty_partitions.add(1);
+    }
+
+    fn record_fts_partition_candidates(&self, num_candidates: usize) {
+        self.fts_partition_candidates.add(num_candidates);
+    }
+
+    fn record_fts_posting_load_time(&self, elapsed: Duration) {
+        Self::record_time(&self.fts_posting_load_time, elapsed);
+    }
+
+    fn record_fts_docs_for_wand_time(&self, elapsed: Duration) {
+        Self::record_time(&self.fts_docs_for_wand_time, elapsed);
+    }
+
+    fn record_fts_wand_wall_time(&self, elapsed: Duration) {
+        Self::record_time(&self.fts_wand_wall_time, elapsed);
+    }
+
+    fn record_fts_wand_cpu_time(&self, elapsed: Duration) {
+        Self::record_time(&self.fts_wand_cpu_time, elapsed);
+    }
+
+    fn record_fts_resolve_row_ids_time(&self, elapsed: Duration) {
+        Self::record_time(&self.fts_resolve_row_ids_time, elapsed);
+    }
+
+    fn record_fts_rescore_time(&self, elapsed: Duration) {
+        Self::record_time(&self.fts_rescore_time, elapsed);
     }
 }
 
@@ -480,6 +599,7 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let stage_start = Instant::now();
             let segments = match preset_segments {
                 Some(segments) => segments,
                 None => load_segments(&ds, &column)
@@ -489,10 +609,15 @@ impl ExecutionPlan for MatchQueryExec {
                         column,
                     )))?,
             };
+            FtsIndexMetrics::record_time(&metrics.fts_load_segments_time, stage_start.elapsed());
+
+            let stage_start = Instant::now();
             let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
+            FtsIndexMetrics::record_time(&metrics.fts_open_segments_time, stage_start.elapsed());
 
+            let stage_start = Instant::now();
             let mut pre_filter =
                 build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
             let deleted_fragments =
@@ -509,7 +634,9 @@ impl ExecutionPlan for MatchQueryExec {
             }
             metrics
                 .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
+            FtsIndexMetrics::record_time(&metrics.fts_prefilter_time, stage_start.elapsed());
 
+            let stage_start = Instant::now();
             let is_fuzzy = matches!(query.fuzziness, Some(n) if n != 0);
             let first_index = indices.first().ok_or(DataFusionError::Execution(format!(
                 "FTS index for column {} has no segments",
@@ -530,6 +657,9 @@ impl ExecutionPlan for MatchQueryExec {
                 }
             };
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
+            FtsIndexMetrics::record_time(&metrics.fts_tokenize_time, stage_start.elapsed());
+
+            let stage_start = Instant::now();
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
                 None => Arc::new(
@@ -538,10 +668,15 @@ impl ExecutionPlan for MatchQueryExec {
                         .await?,
                 ),
             };
+            FtsIndexMetrics::record_time(&metrics.fts_scorer_time, stage_start.elapsed());
 
+            let stage_start = Instant::now();
             pre_filter.wait_for_ready().await?;
+            FtsIndexMetrics::record_time(&metrics.fts_prefilter_time, stage_start.elapsed());
+
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
+            let stage_start = Instant::now();
             let (doc_ids, mut scores) = search_segments(
                 &indices,
                 tokens,
@@ -552,6 +687,9 @@ impl ExecutionPlan for MatchQueryExec {
                 base_scorer,
             )
             .await?;
+            FtsIndexMetrics::record_time(&metrics.fts_search_segments_time, stage_start.elapsed());
+
+            let stage_start = Instant::now();
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });
@@ -564,6 +702,8 @@ impl ExecutionPlan for MatchQueryExec {
                     Arc::new(Float32Array::from(scores)),
                 ],
             )?;
+            FtsIndexMetrics::record_time(&metrics.fts_output_time, stage_start.elapsed());
+            metrics.log_profile_summary();
             Ok::<_, DataFusionError>(batch)
         });
 

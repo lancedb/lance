@@ -767,6 +767,7 @@ impl InvertedIndex {
                 let metrics = metrics.clone();
                 let shared_threshold = shared_threshold.clone();
                 async move {
+                    let stage_start = Instant::now();
                     let loaded_postings = part
                         .load_posting_lists(
                             tokens.as_ref(),
@@ -775,6 +776,7 @@ impl InvertedIndex {
                             metrics.as_ref(),
                         )
                         .await?;
+                    metrics.record_fts_posting_load_time(stage_start.elapsed());
                     let LoadedPostings {
                         postings,
                         grouped_expansions,
@@ -783,9 +785,13 @@ impl InvertedIndex {
                         // No hits in this partition; its DocSet stays
                         // unloaded, so we never pay the per-doc
                         // row_id/num_tokens download for it.
+                        metrics.record_fts_empty_partition();
                         return Result::Ok(PartitionCandidates::empty());
                     }
+                    metrics.record_fts_non_empty_partition();
+                    let stage_start = Instant::now();
                     let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
+                    metrics.record_fts_docs_for_wand_time(stage_start.elapsed());
                     let max_position = postings
                         .iter()
                         .map(|posting| posting.term_index() as usize)
@@ -813,26 +819,34 @@ impl InvertedIndex {
                     } else {
                         shared_threshold
                     };
+                    let metrics_for_wand = metrics.clone();
+                    let stage_start = Instant::now();
                     let candidates = spawn_cpu(move || {
+                        let cpu_start = Instant::now();
                         let candidates = part_for_wand.bm25_search(
                             docs_for_wand.as_ref(),
                             wand_params.as_ref(),
                             operator,
                             mask,
                             postings,
-                            metrics.as_ref(),
+                            metrics_for_wand.as_ref(),
                             partition_threshold,
                         )?;
+                        metrics_for_wand.record_fts_wand_cpu_time(cpu_start.elapsed());
                         std::result::Result::<_, Error>::Ok(candidates)
                     })
                     .await?;
+                    metrics.record_fts_wand_wall_time(stage_start.elapsed());
                     let mut partition_result = PartitionCandidates {
                         tokens_by_position,
                         grouped_expansions,
                         candidates,
                     };
+                    metrics.record_fts_partition_candidates(partition_result.candidates.len());
+                    let stage_start = Instant::now();
                     resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
                         .await?;
+                    metrics.record_fts_resolve_row_ids_time(stage_start.elapsed());
                     Result::Ok(partition_result)
                 }
             })
@@ -843,6 +857,7 @@ impl InvertedIndex {
             if res.candidates.is_empty() {
                 continue;
             }
+            let stage_start = Instant::now();
             let PartitionCandidates {
                 tokens_by_position,
                 grouped_expansions,
@@ -913,6 +928,7 @@ impl InvertedIndex {
                     candidates.push(Reverse(ScoredDoc::new(row_id, score)));
                 }
             }
+            metrics.record_fts_rescore_time(stage_start.elapsed());
         }
 
         Ok(candidates

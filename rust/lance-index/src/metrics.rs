@@ -2,12 +2,22 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
 pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
 pub const AND_CANDIDATES_PRUNED_BEFORE_SCORE_METRIC: &str = "and_candidates_pruned_before_score";
 pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
 pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
+pub const FTS_EMPTY_PARTITIONS_METRIC: &str = "fts_empty_partitions";
+pub const FTS_NON_EMPTY_PARTITIONS_METRIC: &str = "fts_non_empty_partitions";
+pub const FTS_PARTITION_CANDIDATES_METRIC: &str = "fts_partition_candidates";
+pub const FTS_POSTING_LOAD_TIME_METRIC: &str = "fts_posting_load_time";
+pub const FTS_DOCS_FOR_WAND_TIME_METRIC: &str = "fts_docs_for_wand_time";
+pub const FTS_WAND_WALL_TIME_METRIC: &str = "fts_wand_wall_time";
+pub const FTS_WAND_CPU_TIME_METRIC: &str = "fts_wand_cpu_time";
+pub const FTS_RESOLVE_ROW_IDS_TIME_METRIC: &str = "fts_resolve_row_ids_time";
+pub const FTS_RESCORE_TIME_METRIC: &str = "fts_rescore_time";
 
 /// A trait used by the index to report metrics
 ///
@@ -59,6 +69,24 @@ pub trait MetricsCollector: Send + Sync {
     fn record_and_full_scores(&self, _num_scores: usize) {}
 
     fn record_freqs_collected(&self, _num_collections: usize) {}
+
+    fn record_fts_empty_partition(&self) {}
+
+    fn record_fts_non_empty_partition(&self) {}
+
+    fn record_fts_partition_candidates(&self, _num_candidates: usize) {}
+
+    fn record_fts_posting_load_time(&self, _elapsed: Duration) {}
+
+    fn record_fts_docs_for_wand_time(&self, _elapsed: Duration) {}
+
+    fn record_fts_wand_wall_time(&self, _elapsed: Duration) {}
+
+    fn record_fts_wand_cpu_time(&self, _elapsed: Duration) {}
+
+    fn record_fts_resolve_row_ids_time(&self, _elapsed: Duration) {}
+
+    fn record_fts_rescore_time(&self, _elapsed: Duration) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
