@@ -38,7 +38,7 @@ use lance_file::previous::reader::{
     FileReader as PreviousFileReader, read_batch as previous_read_batch,
 };
 use lance_file::reader::{
-    CachedFileMetadata, FileDataReader, FileMetadataIndex, FileReaderOptions, ReaderProjection,
+    CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
 };
 use lance_file::version::LanceFileVersion;
 use lance_file::{LanceEncodingsIo, determine_file_version};
@@ -135,7 +135,7 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn projection(&self) -> &Arc<Schema>;
 
     /// Get storage statistics for this file (ignored by v1 reader)
-    fn storage_stats(&self) -> Vec<(u32, u64)>;
+    fn storage_stats(&self) -> Result<Vec<(u32, u64)>>;
 
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
@@ -301,9 +301,9 @@ impl GenericFileReader for V1Reader {
         self.reader.len() as u32
     }
 
-    fn storage_stats(&self) -> Vec<(u32, u64)> {
+    fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
         // No-op for v1 files
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
@@ -330,7 +330,7 @@ mod v2_adapter {
 
     #[derive(Debug, Clone)]
     pub struct Reader {
-        reader: Arc<FileDataReader>,
+        reader: Arc<ProjectedFileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         default_priority: u32,
@@ -339,7 +339,7 @@ mod v2_adapter {
 
     impl Reader {
         pub fn new(
-            reader: Arc<FileDataReader>,
+            reader: Arc<ProjectedFileReader>,
             projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             default_priority: u32,
@@ -489,10 +489,10 @@ mod v2_adapter {
             .boxed()
         }
 
-        fn storage_stats(&self) -> Vec<(u32, u64)> {
-            let Some(file_statistics) = self.reader.file_statistics() else {
-                panic!("storage_stats requires full file metadata");
-            };
+        fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
+            let file_statistics = self.reader.file_statistics().ok_or_else(|| {
+                Error::internal("storage_stats requires full file metadata".to_string())
+            })?;
             let column_idx_to_field_id = self
                 .field_id_to_column_idx
                 .iter()
@@ -509,7 +509,7 @@ mod v2_adapter {
                 }
                 stats.push((current_field_id, col_stats.size_bytes));
             }
-            stats
+            Ok(stats)
         }
 
         fn projection(&self) -> &Arc<Schema> {
@@ -618,9 +618,9 @@ impl GenericFileReader for NullReader {
         self.read_ranges_tasks(vec![0..num_rows].into(), batch_size, projection)
     }
 
-    fn storage_stats(&self) -> Vec<(u32, u64)> {
+    fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
         // No-op for null reader
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn projection(&self) -> &Arc<Schema> {
@@ -855,7 +855,7 @@ impl FileFragment {
             )
             .await?
         {
-            stats.extend(reader.storage_stats());
+            stats.extend(reader.storage_stats()?);
         }
         Ok(stats)
     }
@@ -973,7 +973,7 @@ impl FileFragment {
         projection: &ReaderProjection,
         file_version: LanceFileVersion,
     ) -> bool {
-        if !FileDataReader::supports_projection(projection, file_version) {
+        if !ProjectedFileReader::supports_projection(projection, file_version) {
             return false;
         }
         let total_columns = data_file
@@ -1152,7 +1152,7 @@ impl FileFragment {
                         .with_read_chunk_size(file_reader_options.read_chunk_size),
                 );
                 let reader = if let Some(metadata_index) = metadata_index {
-                    FileDataReader::try_open_with_metadata_index(
+                    ProjectedFileReader::try_open_with_metadata_index(
                         encodings_io.clone(),
                         path.clone(),
                         Some(reader_projection.clone()),
@@ -1164,7 +1164,7 @@ impl FileFragment {
                     .await?
                 } else {
                     let file_metadata = self.get_file_metadata(&file_scheduler).await?;
-                    FileDataReader::try_open_with_file_metadata(
+                    ProjectedFileReader::try_open_with_file_metadata(
                         encodings_io,
                         path.clone(),
                         None,
@@ -4332,6 +4332,17 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
         assert_eq!(taken_values.values(), &[0, 777, 999]);
+
+        let projected_readers = fragment
+            .open_readers(&projection, &FragReadConfig::default())
+            .await
+            .unwrap();
+        let err = projected_readers[0].storage_stats().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("storage_stats requires full file metadata"),
+            "expected storage_stats to reject projected metadata, got {err:?}"
+        );
     }
 
     #[tokio::test]

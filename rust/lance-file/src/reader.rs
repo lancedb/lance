@@ -136,34 +136,6 @@ fn column_metadata_deep_size(column_metadatas: &[pbfile::ColumnMetadata]) -> usi
         + std::mem::size_of_val(column_metadatas)
 }
 
-fn column_info_deep_size(column_info: &ColumnInfo) -> usize {
-    let pages_size: usize = column_info
-        .page_infos
-        .iter()
-        .map(|pi| {
-            let enc_size = match &pi.encoding {
-                lance_encoding::decoder::PageEncoding::Legacy(e) => e.encoded_len() * 4,
-                lance_encoding::decoder::PageEncoding::Structural(e) => e.encoded_len() * 4,
-            };
-            enc_size
-                + std::mem::size_of_val(pi.buffer_offsets_and_sizes.as_ref())
-                + std::mem::size_of::<u64>() * 2 // num_rows + priority
-        })
-        .sum();
-    pages_size
-        + std::mem::size_of_val(column_info.buffer_offsets_and_sizes.as_ref())
-        + column_info.encoding.encoded_len() * 4
-        + std::mem::size_of::<u32>() // index
-        + std::mem::size_of::<usize>() * 2 // Arc overhead
-}
-
-fn column_infos_deep_size(column_infos: &[Arc<ColumnInfo>]) -> usize {
-    column_infos
-        .iter()
-        .map(|column_info| column_info_deep_size(column_info))
-        .sum()
-}
-
 impl DeepSizeOf for CachedFileMetadata {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         let schema_size = self.file_schema.deep_size_of_children(context);
@@ -184,14 +156,10 @@ impl DeepSizeOf for CachedFileMetadata {
         // column_infos is Vec<Arc<ColumnInfo>>. Each ColumnInfo contains
         // page_infos (with protobuf PageEncoding), buffer offsets, and a
         // column-level ColumnEncoding protobuf.
-        let column_infos_size = column_infos_deep_size(self.column_infos.as_slice());
+        let column_infos_size = self.column_infos.deep_size_of_children(context);
 
         // Global buffer bytes retained for zero-IO reads (copied out of the tail).
-        let retained_buffers_size: usize = self
-            .retained_global_buffers
-            .values()
-            .map(|buf| buf.len())
-            .sum();
+        let retained_buffers_size = self.retained_global_buffers.deep_size_of_children(context);
 
         schema_size
             + buffers_size
@@ -206,7 +174,7 @@ impl DeepSizeOf for CachedFileMetadata {
 /// This contains the file-level schema, row count, global buffer descriptors,
 /// and column metadata offset table. Unlike [`CachedFileMetadata`], it does not
 /// hold decoded metadata for every column.
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub struct FileMetadataIndex {
     file_schema: Arc<Schema>,
     num_rows: u64,
@@ -230,24 +198,6 @@ impl FileMetadataIndex {
     }
 }
 
-impl DeepSizeOf for FileMetadataIndex {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        let schema_size = self.file_schema.deep_size_of_children(context);
-        let buffers_size: usize = self
-            .file_buffers
-            .iter()
-            .map(|buffer| buffer.deep_size_of_children(context))
-            .sum();
-        let offsets_size = std::mem::size_of_val(self.column_metadata_offsets.as_ref());
-        let retained_buffers_size: usize = self
-            .retained_global_buffers
-            .values()
-            .map(|buf| buf.len())
-            .sum();
-        schema_size + buffers_size + offsets_size + retained_buffers_size
-    }
-}
-
 #[derive(Debug)]
 struct CachedColumnMetadata {
     column_metadata: pbfile::ColumnMetadata,
@@ -255,26 +205,22 @@ struct CachedColumnMetadata {
 }
 
 impl DeepSizeOf for CachedColumnMetadata {
-    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
         column_metadata_deep_size(std::slice::from_ref(&self.column_metadata))
-            + column_info_deep_size(self.column_info.as_ref())
+            + self.column_info.deep_size_of_children(context)
     }
 }
 
 #[derive(Debug, Clone)]
 struct ColumnMetadataCacheKey {
     column_index: u32,
-    file_size_bytes: u64,
 }
 
 impl CacheKey for ColumnMetadataCacheKey {
     type ValueType = CachedColumnMetadata;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "column_metadata/{}/{}",
-            self.file_size_bytes, self.column_index
-        ))
+        Cow::Owned(format!("column_metadata/{}", self.column_index))
     }
 
     fn type_name() -> &'static str {
@@ -539,13 +485,15 @@ struct FileReadCore {
     options: FileReaderOptions,
 }
 
-/// A data reader for Lance files.
+/// A projection-scoped reader for Lance files.
 ///
-/// This reader can use either full file metadata or indexed per-column metadata
-/// internally. It intentionally does not expose APIs that require synchronous
-/// access to full file metadata.
+/// This reader fixes a base projection at construction time. All later reads
+/// must stay within that projection, which lets the reader load only the column
+/// metadata needed by the base projection when opening from a [`FileMetadataIndex`].
+/// It intentionally does not expose APIs that require synchronous access to full
+/// file metadata.
 #[derive(Debug, Clone)]
-pub struct FileDataReader {
+pub struct ProjectedFileReader {
     core: FileReadCore,
 }
 
@@ -1829,10 +1777,7 @@ impl FileMetadataProvider {
         let mut missing_columns = Vec::new();
 
         for (result_index, column_index) in column_indices.iter().copied().enumerate() {
-            let cache_key = ColumnMetadataCacheKey {
-                column_index,
-                file_size_bytes: metadata_index.file_size_bytes,
-            };
+            let cache_key = ColumnMetadataCacheKey { column_index };
             if let Some(cached) = cache.get_with_key(&cache_key).await {
                 column_infos[result_index] = Some(cached.column_info.clone());
             } else {
@@ -1861,10 +1806,7 @@ impl FileMetadataProvider {
                     column_metadata,
                     column_info: column_info.clone(),
                 });
-                let cache_key = ColumnMetadataCacheKey {
-                    column_index,
-                    file_size_bytes: metadata_index.file_size_bytes,
-                };
+                let cache_key = ColumnMetadataCacheKey { column_index };
                 cache.insert_with_key(&cache_key, cached).await;
                 column_infos[result_index] = Some(column_info);
             }
@@ -2151,7 +2093,7 @@ impl FileReadCore {
     }
 }
 
-impl FileDataReader {
+impl ProjectedFileReader {
     /// Opens a data reader backed by indexed column metadata.
     ///
     /// `base_projection` must be a supported indexed projection. Reads that do
@@ -2211,9 +2153,7 @@ impl FileDataReader {
         base_projection: Option<ReaderProjection>,
     ) -> Result<ReaderProjection> {
         base_projection.ok_or_else(|| {
-            Error::invalid_input(
-                "indexed column metadata reader requires an explicit base projection",
-            )
+            Error::invalid_input("ProjectedFileReader requires an explicit base projection")
         })
     }
 
@@ -2475,7 +2415,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::reader::{
-        EncodedBatchReaderExt, FileDataReader, FileReader, FileReaderOptions, ReaderProjection,
+        EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader, ReaderProjection,
     };
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
@@ -2911,11 +2851,12 @@ mod tests {
             .await
             .unwrap();
 
-        let lazy_reader = FileDataReader::try_open(
+        let cache = test_cache();
+        let lazy_reader = ProjectedFileReader::try_open(
             file_scheduler,
             Some(projection.clone()),
             Arc::<DecoderPlugins>::default(),
-            &test_cache(),
+            &cache,
             FileReaderOptions::default(),
         )
         .await
@@ -2950,7 +2891,7 @@ mod tests {
             .open_file(&fs.tmp_path, &CachedFileSize::unknown())
             .await
             .unwrap();
-        let lazy_reader = FileDataReader::try_open(
+        let lazy_reader = ProjectedFileReader::try_open(
             file_scheduler,
             Some(projection.clone()),
             Arc::<DecoderPlugins>::default(),
@@ -2982,7 +2923,7 @@ mod tests {
             .read_tasks(
                 lance_io::ReadBatchParams::Range(0..0),
                 1024,
-                Some(projection),
+                Some(projection.clone()),
                 FilterExpression::no_filter(),
             )
             .await
@@ -2998,6 +2939,57 @@ mod tests {
             requested_metadata_bytes,
             total_metadata_bytes
         );
+
+        fs.object_store.io_stats_incremental();
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::Range(0..0),
+                1024,
+                Some(projection),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches = collect_read_tasks(tasks, 1).await;
+        assert!(batches.is_empty());
+
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            stats.read_iops, 0,
+            "cached column metadata should avoid repeat metadata I/O"
+        );
+        assert_eq!(
+            stats.read_bytes, 0,
+            "cached column metadata should avoid repeat metadata reads"
+        );
+    }
+
+    #[rstest]
+    #[case::before_metadata_region(90, 5)]
+    #[case::after_metadata_region(190, 20)]
+    fn test_decode_cmo_table_rejects_out_of_range_offsets(
+        #[case] position: u64,
+        #[case] length: u64,
+    ) {
+        let mut cmo_table = [0; 16];
+        cmo_table[0..8].copy_from_slice(&position.to_le_bytes());
+        cmo_table[8..16].copy_from_slice(&length.to_le_bytes());
+        let footer = super::Footer {
+            column_meta_start: 100,
+            column_meta_offsets_start: 200,
+            global_buff_offsets_start: 200,
+            num_global_buffers: 0,
+            num_columns: 1,
+            major_version: 2,
+            minor_version: 1,
+        };
+
+        let err = FileReader::decode_cmo_table(Bytes::copy_from_slice(&cmo_table), &footer)
+            .expect_err("out-of-range CMO entries must be rejected");
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3011,7 +3003,7 @@ mod tests {
             &["location"],
         )
         .unwrap();
-        assert!(!FileDataReader::supports_projection(
+        assert!(!ProjectedFileReader::supports_projection(
             &projection,
             LanceFileVersion::V2_1
         ));
@@ -3021,7 +3013,7 @@ mod tests {
             .open_file(&fs.tmp_path, &CachedFileSize::unknown())
             .await
             .unwrap();
-        let err = FileDataReader::try_open(
+        let err = ProjectedFileReader::try_open(
             file_scheduler.clone(),
             None,
             Arc::<DecoderPlugins>::default(),
@@ -3035,7 +3027,7 @@ mod tests {
             "expected InvalidInput, got {err:?}"
         );
 
-        let err = FileDataReader::try_open(
+        let err = ProjectedFileReader::try_open(
             file_scheduler,
             Some(projection),
             Arc::<DecoderPlugins>::default(),
