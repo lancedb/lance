@@ -21,7 +21,7 @@ use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    TrainsOnColumnStream, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -1279,11 +1279,7 @@ impl NGramIndexPlugin {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for NGramIndexPlugin {
-    fn name(&self) -> &str {
-        "NGram"
-    }
-
+impl TrainsOnColumnStream for NGramIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -1298,29 +1294,6 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         }
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-        )))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        false
-    }
-
-    fn version(&self) -> u32 {
-        NGRAM_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(TextQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            // needs_recheck: ngram results are an inexact candidate superset.
-            true,
-            // supports_regex: the ngram index can answer regex queries.
-            true,
         )))
     }
 
@@ -1345,6 +1318,40 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             index_version: NGRAM_INDEX_VERSION,
             files: vec![file],
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for NGramIndexPlugin {
+    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "NGram"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        NGRAM_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(TextQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            // needs_recheck: ngram results are an inexact candidate superset.
+            true,
+            // supports_regex: the ngram index can answer regex queries.
+            true,
+        )))
     }
 
     async fn load_index(
