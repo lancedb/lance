@@ -966,7 +966,7 @@ impl TrainsOnColumnStream for RTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for RTreeIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 

@@ -135,7 +135,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// Plugins that support training on a stream of column data should override
     /// this to return `Some(self)`.
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         None
     }
 

@@ -1075,7 +1075,7 @@ impl TrainsOnColumnStream for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 

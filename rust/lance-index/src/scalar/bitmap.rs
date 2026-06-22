@@ -1772,7 +1772,7 @@ impl TrainsOnColumnStream for BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 

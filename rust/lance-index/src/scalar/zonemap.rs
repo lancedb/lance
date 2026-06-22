@@ -1005,7 +1005,7 @@ impl TrainsOnColumnStream for ZoneMapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 

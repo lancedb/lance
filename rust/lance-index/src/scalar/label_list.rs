@@ -744,7 +744,7 @@ impl TrainsOnColumnStream for LabelListIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 

@@ -254,7 +254,7 @@ impl TrainsOnColumnStream for InvertedIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for InvertedIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 

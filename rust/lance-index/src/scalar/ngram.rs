@@ -1323,7 +1323,7 @@ impl TrainsOnColumnStream for NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 

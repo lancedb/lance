@@ -2471,7 +2471,7 @@ impl TrainsOnColumnStream for FMIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
-    fn as_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
+    fn simple_trainer(&self) -> Option<&dyn TrainsOnColumnStream> {
         Some(self)
     }
 
