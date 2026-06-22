@@ -73,7 +73,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_select::NullableRowAddrSet;
+use lance_select::{NullableRowAddrSet, RowSetOps};
 use log::{debug, warn};
 use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
@@ -1832,13 +1832,22 @@ impl BTreeIndex {
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<OldIndexDataFilter>],
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
             return Err(Error::invalid_input(
                 "cannot merge BTree index without at least one source segment".to_string(),
             ));
         };
+
+        if old_data_filters.len() != segments.len() {
+            return Err(Error::invalid_input(format!(
+                "BTree merge: expected one old-data filter per source segment \
+                 (segments={}, filters={})",
+                segments.len(),
+                old_data_filters.len()
+            )));
+        }
 
         for segment in segments.iter().skip(1) {
             if segment.data_type != first.data_type {
@@ -1861,14 +1870,20 @@ impl BTreeIndex {
         }
 
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
-        for segment in segments {
+        for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
+            if filter_keeps_nothing(old_data_filter) {
+                continue;
+            }
             let stream = segment.data_stream().await?;
+            let stream = match segment.frag_reuse_index.clone() {
+                Some(frag_reuse_index) => remap_row_ids(stream, frag_reuse_index),
+                None => stream,
+            };
             let stream = match old_data_filter.clone() {
                 Some(filter) => filter_row_ids(stream, filter),
                 None => stream,
             };
-            let exec = Arc::new(OneShotExec::new(stream));
-            inputs.push(exec);
+            inputs.push(Arc::new(OneShotExec::new(stream)));
         }
         inputs.push(Arc::new(OneShotExec::new(new_data)));
 
@@ -1921,6 +1936,28 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+/// True if `filter` would keep no rows at all (its keep-set is empty), letting
+/// the merge skip reading the segment entirely.
+fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
+    match filter {
+        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
+        None => false,
+    }
+}
+
+fn remap_row_ids(
+    stream: SendableRecordBatchStream,
+    frag_reuse_index: Arc<FragReuseIndex>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let remapped = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        Ok(frag_reuse_index.remap_row_ids_record_batch(batch, 1)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
 
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
@@ -2283,7 +2320,7 @@ impl ScalarIndex for BTreeIndex {
             &[Arc::new(self.clone())],
             new_data,
             dest_store,
-            old_data_filter,
+            &[old_data_filter],
         )
         .await
     }

@@ -37,7 +37,7 @@ use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use lance_arrow::{RecordBatchExt, iter_str_array};
 use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
@@ -4615,18 +4615,25 @@ impl DocSet {
         self.row_ids[doc_id as usize]
     }
 
-    pub fn doc_id(&self, row_id: u64) -> Option<u64> {
+    /// Resolve a `row_id` to every `doc_id` it owns.
+    ///
+    /// A scalar column maps each row to a single document, but a
+    /// `list<string>` column indexes every element as its own document, so a
+    /// single `row_id` can own several `doc_id`s sharing that key in `inv`.
+    /// The prefilter path (`flat_search`) walks an allow-list of row_ids and
+    /// must evaluate *all* of a row's documents; resolving to one `doc_id`
+    /// silently drops matches at non-last list positions (lancedb#3352).
+    pub fn doc_ids(&self, row_id: u64) -> impl Iterator<Item = u64> + '_ {
         if self.inv.is_empty() {
-            // in legacy format, the row id is doc id
-            match self.row_ids.binary_search(&row_id) {
-                Ok(_) => Some(row_id),
-                Err(_) => None,
-            }
+            // in legacy format, the row id is doc id (one document per row)
+            let found = self.row_ids.binary_search(&row_id).is_ok();
+            Either::Left(found.then_some(row_id).into_iter())
         } else {
-            match self.inv.binary_search_by_key(&row_id, |x| x.0) {
-                Ok(idx) => Some(self.inv[idx].1 as u64),
-                Err(_) => None,
-            }
+            // `inv` is sorted by row_id, so the entries sharing this key form a
+            // contiguous run; yield the doc_id of each.
+            let lo = self.inv.partition_point(|entry| entry.0 < row_id);
+            let hi = self.inv.partition_point(|entry| entry.0 <= row_id);
+            Either::Right(self.inv[lo..hi].iter().map(|entry| entry.1 as u64))
         }
     }
     pub fn total_tokens_num(&self) -> u64 {

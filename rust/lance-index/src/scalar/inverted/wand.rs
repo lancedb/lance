@@ -829,11 +829,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
 
         // we need to map the row ids to doc ids, and sort them,
-        // because WAND PostingIterator can't go back to the previous doc id
+        // because WAND PostingIterator can't go back to the previous doc id.
+        // A list column maps one row id to several doc ids, so expand every
+        // document the row owns — keying on a single doc id would drop matches
+        // at non-last list positions (lancedb#3352).
         let doc_ids = row_ids
-            .filter_map(|row_addr| {
+            .flat_map(|row_addr| {
                 let row_id: u64 = row_addr.into();
-                self.docs.doc_id(row_id).map(|doc_id| (doc_id, row_id))
+                self.docs
+                    .doc_ids(row_id)
+                    .map(move |doc_id| (doc_id, row_id))
             })
             .sorted_unstable()
             .collect::<Vec<_>>();
@@ -2211,6 +2216,74 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(matched, vec![2]);
+    }
+
+    #[test]
+    fn test_doc_ids_resolves_every_document_a_row_owns() {
+        // A list<string> column indexes each element as its own document, so
+        // one row id owns several doc ids. row 100 -> {0, 1}, row 101 -> {2}.
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        assert_eq!(docs.doc_ids(100).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(docs.doc_ids(101).collect::<Vec<_>>(), vec![2]);
+        assert!(docs.doc_ids(999).next().is_none());
+
+        // legacy shape (row id == doc id) still resolves to a single document.
+        let mut legacy = DocSet::default();
+        legacy.append(7, 1);
+        assert_eq!(legacy.doc_ids(7).collect::<Vec<_>>(), vec![7]);
+        assert!(legacy.doc_ids(8).next().is_none());
+    }
+
+    #[rstest]
+    fn test_flat_search_finds_list_row_with_match_at_non_last_position(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        // row 100 owns two element-documents (doc 0, doc 1) that share its row
+        // id; row 101 owns doc 2. The query term lives only in doc 0 — the
+        // *non-last* element of row 100. Resolving the row to a single doc id
+        // would evaluate doc 1, miss the term, and drop the row (lancedb#3352).
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(vec![0], 1.0, None, is_compressed),
+            docs.len(),
+        );
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            vec![posting].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        wand.threshold = 0.5;
+
+        let selected = vec![RowAddress::from(100_u64)];
+        let result = wand
+            .flat_search(
+                &FtsSearchParams::default(),
+                Box::new(selected.into_iter()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        // flat_search resolves the prefilter against the DocSet, so the single
+        // match comes back as a concrete RowId(100) rather than a deferred
+        // Pending addr. Asserting on the whole result avoids a never-taken
+        // match arm that would otherwise read as uncovered.
+        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
+        assert!(
+            matches!(addrs.as_slice(), [CandidateAddr::RowId(100)]),
+            "expected exactly row 100, got {addrs:?}"
+        );
     }
 
     #[test]
