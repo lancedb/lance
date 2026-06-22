@@ -58,9 +58,19 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let (eigenvalues, v) = jacobi_eigen(&ata, n);
     
     let k = m.min(n);
-    let mut sigma: Vec<f64> = eigenvalues
+
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && eigenvalues[order[j - 1]] < eigenvalues[order[j]] {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+
+    let mut sigma: Vec<f64> = order[..k]
         .iter()
-        .map(|&l| (if l > 0.0 { l } else { 0.0 }).sqrt())
+        .map(|&i| if eigenvalues[i] > 0.0 { eigenvalues[i].sqrt() } else { 0.0 })
         .collect();
 
 }
