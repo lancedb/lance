@@ -1552,21 +1552,17 @@ impl ShardWriter {
         }
     }
 
-    /// Like [`Self::put`], but performs only the visible in-memory insert (and
-    /// triggers the durable flush) and returns the durability watcher *without*
-    /// awaiting it. The row is visible to subsequent reads on this writer the
-    /// instant this returns; durability is the caller's to await via the
-    /// returned watcher (`None` when `durable_write` is off).
+    /// Like [`Self::put`], but returns the durability watcher *without* awaiting
+    /// it. The row is visible to reads on this writer the instant this returns;
+    /// the caller awaits durability via the watcher (`None` when `durable_write`
+    /// is off).
     ///
-    /// This lets a caller hold an *external* serialization lock across only the
-    /// in-memory critical section (read-merge-insert) and await durability
-    /// after releasing it, so concurrent durable flushes still coalesce. The
-    /// in-memory insert remains guarded by the writer's internal `state_lock`
-    /// exactly as [`Self::put`], so `BatchStore`'s single-writer invariant is
-    /// upheld without relying on the external lock.
+    /// This lets a caller hold an *external* lock across only the in-memory
+    /// read-merge-insert and await durability after releasing it, so concurrent
+    /// flushes still coalesce. The insert stays guarded by the internal
+    /// `state_lock`, so `BatchStore`'s single-writer invariant holds regardless.
     ///
-    /// MemTable mode only; WAL-only mode has no in-memory tier to read back and
-    /// returns an error.
+    /// MemTable mode only; errors in WAL-only mode (no in-memory tier).
     #[instrument(name = "sw_put_no_wait", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
     pub async fn put_no_wait(
         &self,
@@ -1619,10 +1615,8 @@ impl ShardWriter {
     }
 
     /// In-memory half of [`Self::put_memtable`]: insert under `state_lock`,
-    /// trigger the WAL flush, and return the durability watcher *without*
-    /// awaiting it. The caller decides when (and outside which locks) to await
-    /// durability. The returned watcher is `None` when `durable_write` is off
-    /// (nothing to wait on). See [`Self::put_no_wait`].
+    /// trigger the WAL flush, and return the watcher un-awaited for the caller
+    /// to wait on. `None` when `durable_write` is off. See [`Self::put_no_wait`].
     async fn put_memtable_no_wait(
         &self,
         batches: Vec<RecordBatch>,
@@ -1674,9 +1668,8 @@ impl ShardWriter {
 
         self.stats.record_put(start.elapsed());
 
-        // Trigger the durable flush (outside the lock) and hand the watcher back
-        // un-awaited. The flush must be triggered here so the watcher can ever
-        // resolve; only the `wait()` is the caller's to schedule.
+        // Trigger the flush here (outside the lock) so the watcher can resolve;
+        // only the `wait()` is the caller's to schedule.
         let watcher = if self.config.durable_write {
             self.wal_flusher.trigger_flush(
                 WalFlushSource::BatchStore {
