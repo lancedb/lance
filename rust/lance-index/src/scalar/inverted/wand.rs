@@ -716,6 +716,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
+        let mut and_candidates_seen = 0;
+        let mut and_candidates_pruned_before_score = 0;
+        let mut and_full_scores = 0;
+        let mut freqs_collected = 0;
         loop {
             self.raise_to_shared_floor(params.wand_factor);
             let Some((doc, mut score)) = self.next()? else {
@@ -756,6 +760,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
+            if self.operator == Operator::And {
+                and_candidates_seen += 1;
+            }
 
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), Some(doc_length), Some(&mut score));
@@ -769,6 +776,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             } else {
                 self.advance_all_tail(doc.doc_id(), None, None);
                 if self.and_candidate_cannot_beat_threshold(doc_length) {
+                    and_candidates_pruned_before_score += 1;
                     continue;
                 }
                 if params.phrase_slop.is_some()
@@ -776,11 +784,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 {
                     continue;
                 }
+                and_full_scores += 1;
                 self.score(doc_length)
             };
 
             if candidates.len() < limit {
                 let freqs = self.iter_term_freqs().collect();
+                if self.operator == Operator::And {
+                    freqs_collected += 1;
+                }
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
@@ -788,6 +800,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 let freqs = self.iter_term_freqs().collect();
+                if self.operator == Operator::And {
+                    freqs_collected += 1;
+                }
                 candidates.pop();
                 candidates.push(Reverse((ScoredDoc::new(row_id, score), freqs, doc_length)));
                 let kth = candidates.peek().unwrap().0.0.score.0;
@@ -798,6 +813,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
         }
         metrics.record_comparisons(num_comparisons);
+        metrics.record_and_candidates_seen(and_candidates_seen);
+        metrics.record_and_candidates_pruned_before_score(and_candidates_pruned_before_score);
+        metrics.record_and_full_scores(and_full_scores);
+        metrics.record_freqs_collected(freqs_collected);
 
         // The heap entry's `row_id` slot is either a real row_id
         // (DocSet had row_ids) or the doc_id widened to u64
@@ -958,6 +977,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn and_candidate_cannot_beat_threshold(&self, doc_length: u32) -> bool {
         if self.operator != Operator::And
             || self.threshold <= 0.0
+            || self.num_terms < 2
             || self.lead.len() != self.num_terms
         {
             return false;
@@ -1657,7 +1677,7 @@ mod tests {
     use super::*;
     use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
-        metrics::NoOpMetricsCollector,
+        metrics::{MetricsCollector, NoOpMetricsCollector},
         scalar::inverted::{
             CompressedPostingList, PlainPostingList, PostingListBuilder, builder::PositionRecorder,
             encoding::compress_posting_list,
@@ -1714,6 +1734,42 @@ mod tests {
         fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
             self.scored.fetch_add(1, Ordering::Relaxed);
             freq as f32 / doc_tokens as f32
+        }
+    }
+
+    #[derive(Default)]
+    struct CountAndSearchStats {
+        comparisons: AtomicUsize,
+        candidates_seen: AtomicUsize,
+        candidates_pruned_before_score: AtomicUsize,
+        full_scores: AtomicUsize,
+        freqs_collected: AtomicUsize,
+    }
+
+    impl MetricsCollector for CountAndSearchStats {
+        fn record_parts_loaded(&self, _: usize) {}
+
+        fn record_index_loads(&self, _: usize) {}
+
+        fn record_comparisons(&self, n: usize) {
+            self.comparisons.fetch_add(n, Ordering::Relaxed);
+        }
+
+        fn record_and_candidates_seen(&self, n: usize) {
+            self.candidates_seen.fetch_add(n, Ordering::Relaxed);
+        }
+
+        fn record_and_candidates_pruned_before_score(&self, n: usize) {
+            self.candidates_pruned_before_score
+                .fetch_add(n, Ordering::Relaxed);
+        }
+
+        fn record_and_full_scores(&self, n: usize) {
+            self.full_scores.fetch_add(n, Ordering::Relaxed);
+        }
+
+        fn record_freqs_collected(&self, n: usize) {
+            self.freqs_collected.fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -2222,6 +2278,66 @@ mod tests {
             scored <= BLOCK_SIZE + 1,
             "expected candidate pruning to avoid full scoring in the first block, scored {scored}"
         );
+    }
+
+    #[test]
+    fn test_and_candidate_prune_records_scoring_counters() {
+        let total_docs = 2 * BLOCK_SIZE as u32 + 1;
+        let mut docs = DocSet::default();
+        for doc_id in 0..total_docs {
+            let doc_tokens = if doc_id == 0 { 1 } else { 1000 };
+            docs.append(doc_id as u64, doc_tokens);
+        }
+
+        let first_docs = (0..2 * BLOCK_SIZE as u32).collect::<Vec<_>>();
+        let second_docs = (0..total_docs).collect::<Vec<_>>();
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("a"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(first_docs, 1.0, Some(vec![1.0, 0.001]), true),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("b"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(second_docs, 1.0, Some(vec![1.0, 0.001, 0.001]), true),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let metrics = CountAndSearchStats::default();
+        let result = wand
+            .search(
+                &FtsSearchParams::new().with_limit(Some(1)),
+                Arc::new(RowAddrMask::default()),
+                &metrics,
+            )
+            .unwrap();
+
+        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
+        assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(0)]));
+
+        let candidates_seen = metrics.candidates_seen.load(Ordering::Relaxed);
+        let candidates_pruned = metrics
+            .candidates_pruned_before_score
+            .load(Ordering::Relaxed);
+        let full_scores = metrics.full_scores.load(Ordering::Relaxed);
+        assert!(candidates_seen > full_scores);
+        assert!(candidates_pruned > 0);
+        assert_eq!(full_scores, 1);
+        assert_eq!(metrics.freqs_collected.load(Ordering::Relaxed), 1);
+        assert_eq!(candidates_seen, candidates_pruned + full_scores);
     }
 
     #[test]
