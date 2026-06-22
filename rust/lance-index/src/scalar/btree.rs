@@ -672,11 +672,11 @@ fn btree_page_read_plan(
     let mut pages_by_file: HashMap<String, Vec<u32>> = HashMap::with_capacity(candidate_pages);
 
     for matches in pages {
-        let page_id = matches.page_id();
-        min_page_id = Some(min_page_id.map_or(page_id, |min: u32| min.min(page_id)));
-        max_page_id = Some(max_page_id.map_or(page_id, |max: u32| max.max(page_id)));
+        let global_page_id = matches.page_id();
+        min_page_id = Some(min_page_id.map_or(global_page_id, |min: u32| min.min(global_page_id)));
+        max_page_id = Some(max_page_id.map_or(global_page_id, |max: u32| max.max(global_page_id)));
 
-        let (file_name, local_page_id) = resolve_btree_page_file(page_id, ranges_to_files)?;
+        let (file_name, local_page_id) = resolve_btree_page_file(global_page_id, ranges_to_files)?;
         pages_by_file
             .entry(file_name)
             .or_default()
@@ -710,19 +710,19 @@ fn btree_page_read_plan(
 
 /// Resolves a global BTree page id into a page_data file and local page id.
 fn resolve_btree_page_file(
-    page_id: u32,
+    global_page_id: u32,
     ranges_to_files: Option<&RangeInclusiveMap<u32, (String, u32)>>,
 ) -> Result<(String, u32)> {
     if let Some(ranges_to_files) = ranges_to_files {
-        let (file_name, offset) = ranges_to_files.get(&page_id).ok_or_else(|| {
+        let (file_name, offset) = ranges_to_files.get(&global_page_id).ok_or_else(|| {
             Error::internal(format!(
                 "Unexpected page index, index {} is out of range.",
-                page_id
+                global_page_id
             ))
         })?;
-        Ok((file_name.clone(), page_id - *offset))
+        Ok((file_name.clone(), global_page_id - *offset))
     } else {
-        Ok((BTREE_PAGES_NAME.to_string(), page_id))
+        Ok((BTREE_PAGES_NAME.to_string(), global_page_id))
     }
 }
 
@@ -809,6 +809,33 @@ struct BTreeCoalescedReadMetrics {
     batches: usize,
     row_ranges: usize,
     pages_read: usize,
+    peak_materialized_pages: usize,
+}
+
+impl BTreeCoalescedReadMetrics {
+    fn observe_materialized_pages(&mut self, num_pages: usize) {
+        self.peak_materialized_pages = self.peak_materialized_pages.max(num_pages);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BTreeMaterializedPage {
+    global_page_id: u32,
+    index: Arc<FlatIndex>,
+}
+
+fn group_matches_by_page(pages: &[Matches]) -> (Vec<u32>, HashMap<u32, Vec<Matches>>) {
+    let mut global_page_ids = Vec::with_capacity(pages.len());
+    let mut matches_by_page = HashMap::with_capacity(pages.len());
+    for &matches in pages {
+        let global_page_id = matches.page_id();
+        let entry = matches_by_page.entry(global_page_id).or_insert_with(|| {
+            global_page_ids.push(global_page_id);
+            Vec::new()
+        });
+        entry.push(matches);
+    }
+    (global_page_ids, matches_by_page)
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1111,10 +1138,10 @@ impl LazyRangedIndexReader {
 
     async fn get_reader_and_local_page_idx(
         &self,
-        page_idx: u32,
+        global_page_idx: u32,
     ) -> Result<(Arc<dyn IndexReader>, u32)> {
         let (page_file_name, local_page_idx) =
-            resolve_btree_page_file(page_idx, Some(&self.ranges_to_files))?;
+            resolve_btree_page_file(global_page_idx, Some(&self.ranges_to_files))?;
         let reader = self.get_reader(&page_file_name).await?;
         Ok((reader.clone(), local_page_idx))
     }
@@ -1471,155 +1498,236 @@ impl BTreeIndex {
             .await
     }
 
-    async fn lookup_pages(
+    async fn search_pages_bounded(
         &self,
+        query: &SargableQuery,
         pages: &[Matches],
         index_reader: LazyIndexReader,
         metrics: &dyn MetricsCollector,
-    ) -> Result<(HashMap<u32, Arc<FlatIndex>>, BTreeCoalescedReadMetrics)> {
-        let mut page_indices = HashMap::with_capacity(pages.len());
-        let mut missing_pages = Vec::new();
-        let mut missing_seen = HashSet::new();
+    ) -> Result<(NullableRowAddrSet, BTreeCoalescedReadMetrics)> {
+        let (unique_global_page_ids, matches_by_page) = group_matches_by_page(pages);
+        let mut batch_results = Vec::new();
+        let mut hot_pages = Vec::with_capacity(DEFAULT_BTREE_MAX_COALESCED_PAGES_PER_BATCH);
+        let mut missing_global_page_ids = Vec::new();
         let mut read_metrics = BTreeCoalescedReadMetrics::default();
 
-        for matches in pages {
-            let page_number = matches.page_id();
-            if page_indices.contains_key(&page_number) || missing_seen.contains(&page_number) {
-                continue;
-            }
-
-            let cache_key = BTreePageKey { page_number };
+        for global_page_id in unique_global_page_ids {
+            let cache_key = BTreePageKey {
+                page_number: global_page_id,
+            };
             if let Some(page) = self.index_cache.get_with_key(&cache_key).await {
                 read_metrics.cache_hits += 1;
-                page_indices.insert(page_number, page);
-            } else if missing_seen.insert(page_number) {
-                missing_pages.push(page_number);
+                hot_pages.push(BTreeMaterializedPage {
+                    global_page_id,
+                    index: page,
+                });
+                read_metrics.observe_materialized_pages(hot_pages.len());
+                if hot_pages.len() == DEFAULT_BTREE_MAX_COALESCED_PAGES_PER_BATCH {
+                    let result = self
+                        .search_materialized_pages(
+                            query,
+                            std::mem::take(&mut hot_pages),
+                            &matches_by_page,
+                            metrics,
+                        )
+                        .await?;
+                    batch_results.push(result);
+                }
+            } else {
+                read_metrics.cache_misses += 1;
+                missing_global_page_ids.push(global_page_id);
             }
         }
 
-        if missing_pages.is_empty() {
-            return Ok((page_indices, read_metrics));
+        if !hot_pages.is_empty() {
+            let result = self
+                .search_materialized_pages(query, hot_pages, &matches_by_page, metrics)
+                .await?;
+            batch_results.push(result);
         }
-        read_metrics.cache_misses = missing_pages.len();
 
-        if missing_pages.len() == 1 {
-            let page_number = missing_pages[0];
+        if missing_global_page_ids.is_empty() {
+            return Ok((NullableRowAddrSet::union_all(&batch_results), read_metrics));
+        }
+
+        if missing_global_page_ids.len() == 1 {
+            let global_page_id = missing_global_page_ids[0];
             let pages_read_counter = Arc::new(AtomicUsize::new(0));
             let page = self
                 .lookup_page(
-                    page_number,
+                    global_page_id,
                     index_reader,
                     metrics,
                     pages_read_counter.clone(),
                 )
                 .await?;
             let pages_read = pages_read_counter.load(AtomicOrdering::Relaxed);
-            page_indices.insert(page_number, page);
             read_metrics.pages_read = pages_read;
-            return Ok((page_indices, read_metrics));
+            let materialized_pages = vec![BTreeMaterializedPage {
+                global_page_id,
+                index: page,
+            }];
+            read_metrics.observe_materialized_pages(materialized_pages.len());
+            let result = self
+                .search_materialized_pages(query, materialized_pages, &matches_by_page, metrics)
+                .await?;
+            batch_results.push(result);
+            return Ok((NullableRowAddrSet::union_all(&batch_results), read_metrics));
         }
 
-        let mut coalesced_metrics = self
-            .read_missing_pages(missing_pages, index_reader, metrics, &mut page_indices)
+        let read_batches = self
+            .plan_coalesced_page_reads(missing_global_page_ids, index_reader.clone())
             .await?;
-        coalesced_metrics.cache_hits = read_metrics.cache_hits;
-        coalesced_metrics.cache_misses = read_metrics.cache_misses;
-        Ok((page_indices, coalesced_metrics))
+        for (batch_id, read_batch) in read_batches.into_iter().enumerate() {
+            let materialized_pages = self
+                .read_coalesced_batch(
+                    batch_id,
+                    read_batch,
+                    &index_reader,
+                    metrics,
+                    &mut read_metrics,
+                )
+                .await?;
+            read_metrics.observe_materialized_pages(materialized_pages.len());
+            let result = self
+                .search_materialized_pages(query, materialized_pages, &matches_by_page, metrics)
+                .await?;
+            batch_results.push(result);
+        }
+
+        Ok((NullableRowAddrSet::union_all(&batch_results), read_metrics))
     }
 
-    /// Materializes cache misses only and emits one summary event per storage batch.
-    async fn read_missing_pages(
+    async fn search_materialized_pages(
         &self,
-        page_numbers: Vec<u32>,
-        index_reader: LazyIndexReader,
+        query: &SargableQuery,
+        materialized_pages: Vec<BTreeMaterializedPage>,
+        matches_by_page: &HashMap<u32, Vec<Matches>>,
         metrics: &dyn MetricsCollector,
-        page_indices: &mut HashMap<u32, Arc<FlatIndex>>,
-    ) -> Result<BTreeCoalescedReadMetrics> {
-        let read_batches = self
-            .plan_coalesced_page_reads(page_numbers, index_reader.clone())
-            .await?;
-        let mut read_metrics = BTreeCoalescedReadMetrics::default();
-
-        for (batch_id, read_batch) in read_batches.into_iter().enumerate() {
-            let reader = index_reader.get_file_reader(&read_batch.file_name).await?;
-            let row_ranges = read_batch
-                .ranges
-                .iter()
-                .map(|range| range.range.clone())
-                .collect::<Vec<_>>();
-
-            read_metrics.batches += 1;
-            read_metrics.row_ranges += row_ranges.len();
-            read_metrics.pages_read += read_batch.num_pages;
-
-            metrics.record_parts_loaded(read_batch.num_pages);
-            let rows_requested = read_batch.rows_requested();
-            let read_started = Instant::now();
-            let serialized_ranges = reader.read_ranges(row_ranges, None).await?;
-            let read_ranges_elapsed_ms = read_started.elapsed().as_millis() as u64;
-            if serialized_ranges.len() != read_batch.ranges.len() {
-                return Err(Error::internal(format!(
-                    "BTree coalesced read expected {} batches from '{}', got {}",
-                    read_batch.ranges.len(),
-                    read_batch.file_name,
-                    serialized_ranges.len()
-                )));
-            }
-            info!(
-                target: TRACE_IO_EVENTS,
-                r#type = "btree_coalesced_read_batch",
-                index_type = "btree",
-                batch_id = batch_id,
-                file_name = %read_batch.file_name,
-                page_count = read_batch.num_pages,
-                row_range_count = read_batch.ranges.len(),
-                rows_requested = rows_requested,
-                read_ranges_elapsed_ms = read_ranges_elapsed_ms,
-            );
-
-            for (range_to_read, serialized_range) in
-                read_batch.ranges.iter().zip(serialized_ranges.into_iter())
-            {
-                let mut offset = 0;
-                for page in &range_to_read.pages {
-                    let page_len = page.row_range.end - page.row_range.start;
-                    let mut serialized_page = serialized_range.slice(offset, page_len);
-                    offset += page_len;
-
-                    if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-                        serialized_page =
-                            frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
+    ) -> Result<NullableRowAddrSet> {
+        let page_tasks = materialized_pages
+            .into_iter()
+            .map(|page| {
+                let matches = matches_by_page
+                    .get(&page.global_page_id)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "BTree page {} was loaded without matching page work",
+                            page.global_page_id
+                        ))
+                    })?
+                    .clone();
+                Ok(matches.into_iter().map(move |page_match| {
+                    let subindex = page.index.clone();
+                    async move {
+                        self.search_materialized_page(query, page_match, subindex, metrics)
                     }
-                    let page_index = Arc::new(FlatIndex::try_new(serialized_page)?);
-                    let cache_key = BTreePageKey {
-                        page_number: page.global_page_id,
-                    };
-                    self.index_cache
-                        .insert_with_key(&cache_key, page_index.clone())
-                        .await;
-                    page_indices.insert(page.global_page_id, page_index);
+                    .boxed()
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        debug!("Searching {} btree pages", page_tasks.len());
+        let results = stream::iter(page_tasks)
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<NullableRowAddrSet>>()
+            .await?;
+        Ok(NullableRowAddrSet::union_all(&results))
+    }
+
+    async fn read_coalesced_batch(
+        &self,
+        batch_id: usize,
+        read_batch: BTreeCoalescedReadBatch,
+        index_reader: &LazyIndexReader,
+        metrics: &dyn MetricsCollector,
+        read_metrics: &mut BTreeCoalescedReadMetrics,
+    ) -> Result<Vec<BTreeMaterializedPage>> {
+        let reader = index_reader.get_file_reader(&read_batch.file_name).await?;
+        let row_ranges = read_batch
+            .ranges
+            .iter()
+            .map(|range| range.range.clone())
+            .collect::<Vec<_>>();
+
+        read_metrics.batches += 1;
+        read_metrics.row_ranges += row_ranges.len();
+        read_metrics.pages_read += read_batch.num_pages;
+
+        metrics.record_parts_loaded(read_batch.num_pages);
+        let rows_requested = read_batch.rows_requested();
+        let read_started = Instant::now();
+        let serialized_ranges = reader.read_ranges(row_ranges, None).await?;
+        let read_ranges_elapsed_ms = read_started.elapsed().as_millis() as u64;
+        if serialized_ranges.len() != read_batch.ranges.len() {
+            return Err(Error::internal(format!(
+                "BTree coalesced read expected {} batches from '{}', got {}",
+                read_batch.ranges.len(),
+                read_batch.file_name,
+                serialized_ranges.len()
+            )));
+        }
+        info!(
+            target: TRACE_IO_EVENTS,
+            r#type = "btree_coalesced_read_batch",
+            index_type = "btree",
+            batch_id = batch_id,
+            file_name = %read_batch.file_name,
+            page_count = read_batch.num_pages,
+            row_range_count = read_batch.ranges.len(),
+            rows_requested = rows_requested,
+            read_ranges_elapsed_ms = read_ranges_elapsed_ms,
+        );
+
+        let mut materialized_pages = Vec::with_capacity(read_batch.num_pages);
+        for (range_to_read, serialized_range) in
+            read_batch.ranges.iter().zip(serialized_ranges.into_iter())
+        {
+            let mut offset = 0;
+            for page in &range_to_read.pages {
+                let page_len = page.row_range.end - page.row_range.start;
+                let mut serialized_page = serialized_range.slice(offset, page_len);
+                offset += page_len;
+
+                if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
+                    serialized_page =
+                        frag_reuse_index_ref.remap_row_ids_record_batch(serialized_page, 1)?;
                 }
+                let page_index = Arc::new(FlatIndex::try_new(serialized_page)?);
+                let cache_key = BTreePageKey {
+                    page_number: page.global_page_id,
+                };
+                self.index_cache
+                    .insert_with_key(&cache_key, page_index.clone())
+                    .await;
+                materialized_pages.push(BTreeMaterializedPage {
+                    global_page_id: page.global_page_id,
+                    index: page_index,
+                });
             }
         }
 
-        Ok(read_metrics)
+        Ok(materialized_pages)
     }
 
     /// Plans storage batches without changing the missing global page set.
     async fn plan_coalesced_page_reads(
         &self,
-        page_numbers: Vec<u32>,
+        global_page_ids: Vec<u32>,
         index_reader: LazyIndexReader,
     ) -> Result<Vec<BTreeCoalescedReadBatch>> {
         let mut pages_by_file: HashMap<String, Vec<(u32, u32)>> =
-            HashMap::with_capacity(page_numbers.len());
-        for page_number in page_numbers {
+            HashMap::with_capacity(global_page_ids.len());
+        for global_page_id in global_page_ids {
             let (file_name, local_page_id) =
-                resolve_btree_page_file(page_number, self.ranges_to_files.as_deref())?;
+                resolve_btree_page_file(global_page_id, self.ranges_to_files.as_deref())?;
             pages_by_file
                 .entry(file_name)
                 .or_default()
-                .push((page_number, local_page_id));
+                .push((global_page_id, local_page_id));
         }
 
         let mut read_batches = Vec::with_capacity(pages_by_file.len());
@@ -2208,40 +2316,9 @@ impl ScalarIndex for BTreeIndex {
 
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
-        let (page_indices, coalesced_metrics) = self
-            .lookup_pages(&pages, lazy_index_reader, metrics)
+        let (selection, coalesced_metrics) = self
+            .search_pages_bounded(query, &pages, lazy_index_reader, metrics)
             .await?;
-        let page_tasks = pages
-            .into_iter()
-            .map(|page_index| {
-                let subindex = page_indices
-                    .get(&page_index.page_id())
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "BTree page {} was not loaded before search",
-                            page_index.page_id()
-                        ))
-                    })
-                    .cloned();
-                async move {
-                    let subindex = subindex?;
-                    self.search_materialized_page(query, page_index, subindex, metrics)
-                }
-                .boxed()
-            })
-            .collect::<Vec<_>>();
-        debug!("Searching {} btree pages", page_tasks.len());
-
-        // Collect both matching row IDs and null row IDs from all pages
-        let results: Vec<NullableRowAddrSet> = stream::iter(page_tasks)
-            // I/O and compute mixed here but important case is index in cache so
-            // use compute intensive thread count
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect()
-            .await?;
-
-        // Merge matching row IDs
-        let selection = NullableRowAddrSet::union_all(&results);
         let pages_read_from_storage = coalesced_metrics.pages_read;
         let search_elapsed_ms = search_started.elapsed().as_millis() as u64;
         let search_metrics = BTreeSearchMetrics {
@@ -2251,6 +2328,7 @@ impl ScalarIndex for BTreeIndex {
             coalesced_batches: coalesced_metrics.batches,
             coalesced_row_ranges: coalesced_metrics.row_ranges,
             pages_read_from_storage,
+            peak_materialized_pages_in_search: coalesced_metrics.peak_materialized_pages,
             search_elapsed_ms,
         };
         metrics.record_btree_search(&search_metrics);
@@ -2264,6 +2342,7 @@ impl ScalarIndex for BTreeIndex {
             btree_coalesced_batches = search_metrics.coalesced_batches,
             btree_coalesced_row_ranges = search_metrics.coalesced_row_ranges,
             btree_pages_read_from_storage = search_metrics.pages_read_from_storage,
+            btree_peak_materialized_pages_in_search = search_metrics.peak_materialized_pages_in_search,
             btree_search_elapsed_ms = search_metrics.search_elapsed_ms,
         );
 
@@ -3481,8 +3560,8 @@ mod tests {
 
     use super::{
         BTreeIndexPlugin, BTreeIndexState, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        OrderableScalarValue, btree_page_read_plan, part_lookup_file_path,
-        part_page_data_file_path, train_btree_index,
+        DEFAULT_BTREE_MAX_COALESCED_PAGES_PER_BATCH, OrderableScalarValue, btree_page_read_plan,
+        part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use lance_core::cache::{CacheCodecImpl, CacheKey};
@@ -3974,6 +4053,53 @@ mod tests {
         );
         assert_eq!(record_batch_reads, 0);
         assert_eq!(counters.range_batch_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_btree_search_bounds_peak_materialized_pages() {
+        let store = build_btree_index_at("btree-bounded-materialized-pages", 4096, 256).await;
+        let counting_store = Arc::new(CountingIndexStore::new(store));
+        let index = BTreeIndex::load(counting_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let metrics = BTreeSearchMetricsCollector::default();
+        let upper_value = 4096 * 200;
+        let query = SargableQuery::Range(
+            std::collections::Bound::Included(ScalarValue::Int32(Some(0))),
+            std::collections::Bound::Excluded(ScalarValue::Int32(Some(upper_value))),
+        );
+        let result = index.search(&query, &metrics).await.unwrap();
+
+        let SearchResult::Exact(row_ids) = result else {
+            panic!("expected exact BTree result");
+        };
+        let actual_rows: Vec<u64> = row_ids
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
+            .collect();
+        assert_eq!(actual_rows, (0_u64..upper_value as u64).collect::<Vec<_>>());
+
+        let search = metrics.last_search();
+        assert!(
+            search.candidate_pages > DEFAULT_BTREE_MAX_COALESCED_PAGES_PER_BATCH,
+            "test should exercise more pages than one materialization batch: {:?}",
+            search
+        );
+        assert_eq!(search.cache_hits, 0, "got {:?}", search);
+        assert_eq!(
+            search.cache_misses, search.candidate_pages,
+            "got {:?}",
+            search
+        );
+        assert_eq!(search.pages_read_from_storage, search.candidate_pages);
+        assert!(
+            search.peak_materialized_pages_in_search <= DEFAULT_BTREE_MAX_COALESCED_PAGES_PER_BATCH,
+            "search retained more materialized pages than the bounded batch size: {:?}",
+            search
+        );
     }
 
     #[tokio::test]

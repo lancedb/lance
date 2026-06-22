@@ -22,6 +22,8 @@ pub struct BTreeSearchMetrics {
     pub coalesced_row_ranges: usize,
     /// Number of BTree pages materialized from storage.
     pub pages_read_from_storage: usize,
+    /// Peak number of materialized BTree pages retained by one search batch.
+    pub peak_materialized_pages_in_search: usize,
     /// End-to-end BTree search elapsed time in milliseconds.
     pub search_elapsed_ms: u64,
 }
