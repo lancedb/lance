@@ -1473,12 +1473,11 @@ impl BatchDecodeStream {
                     // Real decode work happens inside into_batch, which can block the current
                     // thread for a long time. By spawning it as a new task, we allow Tokio's
                     // worker threads to keep making progress.
-                    let (batch, _data_size) =
-                        tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
-                        )
-                        .await
-                        .map_err(|err| Error::wrapped(err.into()))??;
+                    let (batch, _data_size) = tokio::task::spawn_blocking(move || {
+                        next_task.into_batch(emitted_batch_size_warning)
+                    })
+                    .await
+                    .map_err(|err| Error::wrapped(err.into()))??;
                     Ok(batch)
                 };
                 (task, num_rows)
@@ -1880,9 +1879,9 @@ impl StructuralBatchDecodeStream {
                 let task = async move {
                     let next_task = next_task?;
                     let (batch, data_size) = if spawn_batch_decode_tasks {
-                        tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
-                        )
+                        tokio::task::spawn_blocking(move || {
+                            next_task.into_batch(emitted_batch_size_warning)
+                        })
                         .await
                         .map_err(|err| Error::wrapped(err.into()))??
                     } else {
