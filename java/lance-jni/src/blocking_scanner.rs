@@ -605,8 +605,9 @@ fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -
     // The struct is allocated by Arrow Java inside an ArrowBuf and is not guaranteed to be aligned
     // (hence `write_unaligned` below), so we must not form a reference to it. We read only the
     // `release` field through an unaligned read: `addr_of!` computes the field address without
-    // creating an intermediate (mis)aligned reference, and the field is an `Option<fn>` which is
-    // `Copy` with no destructor, so reading a copy of it leaves the caller's stream untouched.
+    // creating an intermediate, possibly-unaligned reference, and the field is an `Option<fn>`
+    // which is `Copy` with no destructor, so reading a copy of it leaves the caller's stream
+    // untouched.
     let release_is_set = unsafe {
         let stream_ptr = stream_addr as *const FFI_ArrowArrayStream;
         let release = std::ptr::read_unaligned(std::ptr::addr_of!((*stream_ptr).release));
