@@ -830,7 +830,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .saturating_sub(pruned_before_return_start);
         metrics.record_and_candidates_seen(and_candidates_seen);
         metrics.record_and_candidates_pruned_before_return(and_candidates_pruned_before_return);
-        metrics.record_and_candidates_pruned_before_score(and_candidates_pruned_before_return);
         metrics.record_and_full_scores(and_full_scores);
         metrics.record_freqs_collected(freqs_collected);
 
@@ -1789,7 +1788,6 @@ mod tests {
         comparisons: AtomicUsize,
         candidates_seen: AtomicUsize,
         candidates_pruned_before_return: AtomicUsize,
-        candidates_pruned_before_score: AtomicUsize,
         full_scores: AtomicUsize,
         freqs_collected: AtomicUsize,
     }
@@ -1809,11 +1807,6 @@ mod tests {
 
         fn record_and_candidates_pruned_before_return(&self, n: usize) {
             self.candidates_pruned_before_return
-                .fetch_add(n, Ordering::Relaxed);
-        }
-
-        fn record_and_candidates_pruned_before_score(&self, n: usize) {
-            self.candidates_pruned_before_score
                 .fetch_add(n, Ordering::Relaxed);
         }
 
@@ -2382,17 +2375,13 @@ mod tests {
         assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(0)]));
 
         let candidates_seen = metrics.candidates_seen.load(Ordering::Relaxed);
-        let candidates_pruned = metrics
-            .candidates_pruned_before_score
-            .load(Ordering::Relaxed);
         let candidates_pruned_before_return = metrics
             .candidates_pruned_before_return
             .load(Ordering::Relaxed);
         let full_scores = metrics.full_scores.load(Ordering::Relaxed);
         assert_eq!(metrics.comparisons.load(Ordering::Relaxed), 1);
         assert_eq!(candidates_seen, 1);
-        assert!(candidates_pruned > 0);
-        assert_eq!(candidates_pruned_before_return, candidates_pruned);
+        assert!(candidates_pruned_before_return > 0);
         assert_eq!(full_scores, 1);
         assert_eq!(metrics.freqs_collected.load(Ordering::Relaxed), 1);
     }
