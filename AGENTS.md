@@ -41,6 +41,7 @@ Key technical traits: async-first (tokio), Arrow-native, versioned writes with m
 * Coverage: `cargo +nightly llvm-cov -q -p <crate> --branch`
 * Coverage HTML: `cargo +nightly llvm-cov -q -p <crate> --branch --html`
 * Coverage for file: `python ci/coverage.py -p <crate> -f <file_path>`
+* Do not enable LTO for local development, debugging, or performance testing. Keep LTO reserved for explicitly requested release artifact validation.
 
 ### Python / Java
 
