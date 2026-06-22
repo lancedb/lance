@@ -90,10 +90,11 @@ async fn live_row_ids(
     fragment: Option<&crate::dataset::fragment::FileFragment>,
     seq: &lance_table::rowids::RowIdSequence,
 ) -> Result<RowAddrTreeMap> {
+    // Propagate a deletion-vector read failure rather than swallowing it: a
+    // swallowed error would fall through to the "no deletions" branch below,
+    // putting the deleted rows back into the allow-list as stale entries.
     let deletion_vector = match fragment {
-        Some(f) if f.metadata().deletion_file.is_some() => {
-            f.get_deletion_vector().await.ok().flatten()
-        }
+        Some(f) if f.metadata().deletion_file.is_some() => f.get_deletion_vector().await?,
         _ => None,
     };
     Ok(match deletion_vector {
@@ -2139,6 +2140,95 @@ mod tests {
             .unwrap();
         let fts_count = scan.count_rows().await.unwrap();
         assert_eq!(fts_count, 25, "FTS index returned stale rows");
+    }
+
+    /// `optimize_indices` builds the stable-row-id allow-list by subtracting each
+    /// fragment's deletion vector. If a deletion vector cannot be read, the merge
+    /// must fail loudly: swallowing the error (treating the load as "no
+    /// deletions") would put every deleted row back into the allow-list and
+    /// silently reintroduce the stale entries this fix removes. Simulate an
+    /// unreadable deletion vector by deleting the file the manifest still
+    /// references, then assert optimize errors instead of succeeding.
+    #[tokio::test]
+    async fn test_optimize_errors_when_deletion_vector_unreadable() {
+        use crate::dataset::UpdateBuilder;
+        use arrow_array::Int32Array;
+        use lance_table::io::deletion::deletion_file_path;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("num", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(0..100)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["num"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Update rewrites the first 25 rows under the same stable row ids,
+        // leaving a deletion vector on the original fragment.
+        UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 25")
+            .unwrap()
+            .set("num", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        // Reload cold (nothing has cached the deletion vector), then remove the
+        // deletion file the manifest still references so the next read fails.
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let mut removed = 0;
+        for fragment in dataset.get_fragments() {
+            if let Some(deletion_file) = fragment.metadata().deletion_file.clone() {
+                let path =
+                    deletion_file_path(&dataset.base, fragment.metadata().id, &deletion_file);
+                dataset.object_store.delete(&path).await.unwrap();
+                removed += 1;
+            }
+        }
+        assert_eq!(
+            removed, 1,
+            "update should have left exactly one deletion file"
+        );
+
+        let result = dataset.optimize_indices(&OptimizeOptions::default()).await;
+        assert!(
+            result.is_err(),
+            "optimize must fail when a deletion vector cannot be read, not \
+             silently keep the deleted rows in the index"
+        );
     }
 
     #[tokio::test]
