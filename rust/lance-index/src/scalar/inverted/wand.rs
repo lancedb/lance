@@ -38,8 +38,6 @@ use super::{
 use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
-const AND_WIDE_MAX_SCORE_LOOSENING_RATIO: f32 = 1.001;
-
 pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
         .unwrap_or_else(|_| "10".to_string())
@@ -845,9 +843,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 break;
             };
             num_comparisons += 1;
-            if self.operator == Operator::And {
-                self.and_window_stats.candidates_returned += 1;
-            }
 
             // Either a real row_id (so we can run the mask check
             // inline) or the doc_id widened to u64 (deferred path;
@@ -1094,7 +1089,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
     // from `tail` iterators that are advanced to the same doc later.
     fn next(&mut self) -> Result<Option<(DocInfo, f32)>> {
         if self.operator == Operator::And {
-            return Ok(self.next_and_candidate().map(|doc| (doc, 0.0)));
+            let candidate = self.next_and_candidate();
+            if candidate.is_some() {
+                self.and_window_stats.candidates_returned += 1;
+            }
+            return Ok(candidate.map(|doc| (doc, 0.0)));
         }
 
         while let Some(target) = self.head_doc() {
@@ -1248,13 +1247,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .map(|posting| posting.block_max_score())
             .sum::<f32>();
 
+        if narrow_max_score >= self.threshold {
+            self.up_to = Some(narrow_up_to);
+            self.and_max_score = narrow_max_score;
+            self.and_window_stats.windows_narrow += 1;
+            return;
+        }
+
         let lead_up_to = self
             .lead
             .first()
             .map(|posting| Self::posting_block_up_to(posting, target))
             .unwrap_or(TERMINATED_DOC_ID);
-        let can_try_wide = narrow_max_score >= self.threshold
-            && lead_up_to > narrow_up_to
+        let can_try_wide = lead_up_to > narrow_up_to
             && lead_up_to != TERMINATED_DOC_ID
             && self.lead.iter().all(|posting| posting.is_compressed());
 
@@ -1268,7 +1273,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
             self.and_window_stats.range_blocks_scanned += range_blocks_scanned;
 
-            if wide_max_score <= narrow_max_score * AND_WIDE_MAX_SCORE_LOOSENING_RATIO {
+            if wide_max_score < self.threshold {
                 self.up_to = Some(lead_up_to);
                 self.and_max_score = wide_max_score;
                 self.and_window_stats.windows_wide += 1;
@@ -2374,7 +2379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_and_advance_uses_wide_window_when_bound_stays_tight() {
+    fn test_and_advance_uses_narrow_window_for_candidate_ranges() {
         let total = 4 * BLOCK_SIZE as u32;
         let mut docs = DocSet::default();
         for i in 0..total {
@@ -2408,11 +2413,53 @@ mod tests {
         let target = wand.and_advance_target(0);
 
         assert_eq!(target, 0);
-        assert_eq!(wand.up_to, Some((2 * BLOCK_SIZE - 1) as u64));
+        assert_eq!(wand.up_to, Some((BLOCK_SIZE - 1) as u64));
         assert!((wand.and_max_score - 2.0).abs() < 1e-6);
+        assert_eq!(wand.and_window_stats.windows_wide, 0);
+        assert_eq!(wand.and_window_stats.windows_narrow, 1);
+        assert_eq!(wand.and_window_stats.range_blocks_scanned, 0);
+    }
+
+    #[test]
+    fn test_and_wide_window_only_skips_and_does_not_return_candidates() {
+        let total = 4 * BLOCK_SIZE as u32;
+        let mut docs = DocSet::default();
+        for i in 0..total {
+            docs.append(i as u64, 1);
+        }
+
+        let lead_docs = (0..total).step_by(2).collect::<Vec<_>>();
+        let follower_docs = (0..total).collect::<Vec<_>>();
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("lead"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(lead_docs, 3.0, Some(vec![1.0, 3.0]), true),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("follower"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(follower_docs, 3.0, Some(vec![0.1, 0.1, 3.0, 3.0]), true),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+        wand.threshold = 2.0;
+
+        let candidate = wand.next().unwrap().unwrap();
+
+        assert_eq!(candidate.0.doc_id(), (2 * BLOCK_SIZE) as u64);
+        assert_eq!(wand.up_to, Some((3 * BLOCK_SIZE - 1) as u64));
         assert_eq!(wand.and_window_stats.windows_wide, 1);
-        assert_eq!(wand.and_window_stats.windows_narrow, 0);
-        assert_eq!(wand.and_window_stats.range_blocks_scanned, 3);
+        assert_eq!(wand.and_window_stats.windows_skipped, 1);
+        assert_eq!(wand.and_window_stats.windows_narrow, 1);
+        assert_eq!(wand.and_window_stats.candidates_returned, 1);
     }
 
     #[test]
