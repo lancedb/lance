@@ -34,7 +34,6 @@ use super::{
 };
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
-use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
@@ -42,7 +41,7 @@ use crate::scalar::registry::{
     BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     TrainingRequest, VALUE_COLUMN_NAME,
 };
-use crate::scalar::{CreatedIndex, UpdateCriteria};
+use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
@@ -93,7 +92,7 @@ impl LabelListIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let values_index =
@@ -443,7 +442,7 @@ fn unnest_chunks(
 
 async fn read_list_nulls(
     store: Arc<dyn IndexStore>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 ) -> Result<RowAddrTreeMap> {
     let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
     if let Some(buffer_idx_str) = reader.schema().metadata.get(LABEL_LIST_NULLS_METADATA_KEY) {
@@ -601,7 +600,7 @@ impl LabelListIndexState {
         self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<LabelListIndex>> {
         let bitmap = self
             .bitmap_state
@@ -776,7 +775,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
@@ -788,7 +787,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&LabelListIndexStateKey).await else {

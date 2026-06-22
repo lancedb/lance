@@ -27,8 +27,9 @@ use std::sync::LazyLock;
 use datafusion::execution::SendableRecordBatchStream;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::scalar::FragReuseIndex;
-use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
+use crate::scalar::{
+    AnyQuery, IndexStore, MetricsCollector, RowIdRemapper, ScalarIndex, SearchResult,
+};
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -89,7 +90,7 @@ impl DeepSizeOf for BloomFilterIndex {
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
@@ -1107,7 +1108,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(

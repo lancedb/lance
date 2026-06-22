@@ -51,8 +51,8 @@ use lance_index::scalar::registry::{
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
-    ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
-    lance_format::LanceIndexStore,
+    RowIdRemapper, ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME,
+    inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
 };
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
@@ -458,6 +458,9 @@ pub async fn open_scalar_index(
     let index_cache = dataset
         .index_cache
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
+
+    let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
+        frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
 
     if let Some(index) = plugin
         .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)

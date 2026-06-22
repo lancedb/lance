@@ -15,7 +15,6 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
@@ -23,7 +22,7 @@ use crate::scalar::registry::{
     BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     TrainingRequest, VALUE_COLUMN_NAME,
 };
-use crate::scalar::{CreatedIndex, UpdateCriteria};
+use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
@@ -186,7 +185,7 @@ impl CacheKey for NGramPostingListKey {
 impl NGramPostingList {
     fn try_from_batch(
         batch: RecordBatch,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
         let mut bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
@@ -213,7 +212,7 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
 }
 
@@ -298,7 +297,7 @@ impl DeepSizeOf for NGramIndex {
 impl NGramIndex {
     async fn from_store(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
@@ -374,7 +373,7 @@ impl NGramIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -1358,7 +1357,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(NGramIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
