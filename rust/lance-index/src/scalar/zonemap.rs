@@ -869,6 +869,7 @@ pub async fn write_zonemap_index_from_batch(
     index_store: &dyn IndexStore,
 ) -> Result<IndexFile> {
     validate_zonemap_stats_schema(record_batch.schema().as_ref())?;
+    validate_zone_bounds(&record_batch, params.rows_per_zone())?;
 
     let mut file_schema = record_batch.schema().as_ref().clone();
     file_schema.metadata.insert(
@@ -881,6 +882,57 @@ pub async fn write_zonemap_index_from_batch(
         .await?;
     index_file.write_record_batch(record_batch).await?;
     index_file.finish().await
+}
+
+/// Validate the per-zone bounds carried in `record_batch` against `rows_per_zone`.
+///
+/// [`validate_zonemap_stats_schema`] only checks column shape; the read path's zone-address
+/// arithmetic (`(fragment_id << 32) + zone_start .. + zone_length`, see `zoned.rs`) needs more.
+/// The caller has already validated the schema, so columns 5/6 are non-null `UInt64`:
+/// - `rows_per_zone` must be non-zero — the invariant [`ZoneTrainer::new`] enforces for trained
+///   zones; persisting zero produces a zonemap that loads but breaks on a later update/rebuild.
+/// - every `zone_length` must be at least 1; it is the offset span `(last - first + 1)`, not the
+///   live-row count, so after deletions it can legitimately exceed `rows_per_zone` and is
+///   intentionally not capped at the zone capacity here. A zero-length zone would match nothing.
+/// - `zone_start + zone_length <= 2^32` — `zone_start` is a within-fragment row offset, so a zone
+///   must stay inside its fragment's 32-bit offset space and not spill into the next fragment's
+///   row addresses.
+fn validate_zone_bounds(record_batch: &RecordBatch, rows_per_zone: u64) -> Result<()> {
+    if rows_per_zone == 0 {
+        return Err(Error::invalid_input(
+            "zonemap rows_per_zone must be greater than zero",
+        ));
+    }
+
+    let zone_start = record_batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("zonemap stats batch 'zone_start' is not UInt64"))?;
+    let zone_length = record_batch
+        .column(6)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| Error::invalid_input("zonemap stats batch 'zone_length' is not UInt64"))?;
+
+    // Row addresses pack the fragment id into the high 32 bits, leaving 2^32 offsets per fragment.
+    const FRAGMENT_ROW_SPACE: u64 = 1 << 32;
+    for i in 0..record_batch.num_rows() {
+        let start = zone_start.value(i);
+        let length = zone_length.value(i);
+        if length == 0 {
+            return Err(Error::invalid_input(format!(
+                "zonemap zone {i} has zone_length 0; every zone must cover at least one row"
+            )));
+        }
+        if start >= FRAGMENT_ROW_SPACE || start + length > FRAGMENT_ROW_SPACE {
+            return Err(Error::invalid_input(format!(
+                "zonemap zone {i} row range [{start}, {start} + {length}) overflows the \
+                 per-fragment 2^32 row-offset space"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate that `schema` matches the canonical zonemap stats shape: 7 columns in canonical
@@ -2849,5 +2901,69 @@ mod tests {
         });
         super::validate_zonemap_stats_schema(&schema)
             .expect("non-nullable min/max with matching types must validate");
+    }
+
+    /// Build a single-zone canonical stats batch with the given zone bounds, for the
+    /// `validate_zone_bounds` rejection tests below.
+    fn one_zone_stats_batch(zone_start: u64, zone_length: u64) -> RecordBatch {
+        let schema = super::zonemap_stats_schema(&DataType::Int32);
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![Some(0)])),
+                Arc::new(arrow_array::Int32Array::from(vec![Some(10)])),
+                Arc::new(arrow_array::UInt32Array::from(vec![0u32])),
+                Arc::new(arrow_array::UInt32Array::from(vec![0u32])),
+                Arc::new(UInt64Array::from(vec![0u64])),
+                Arc::new(UInt64Array::from(vec![zone_start])),
+                Arc::new(UInt64Array::from(vec![zone_length])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_validate_zone_bounds_accepts_valid() {
+        let batch = one_zone_stats_batch(0, 8);
+        super::validate_zone_bounds(&batch, 8).expect("valid zone bounds must pass");
+    }
+
+    #[test]
+    fn test_validate_zone_bounds_rejects_zero_rows_per_zone() {
+        let batch = one_zone_stats_batch(0, 8);
+        let err =
+            super::validate_zone_bounds(&batch, 0).expect_err("rows_per_zone 0 must be rejected");
+        assert!(
+            err.to_string().contains("greater than zero"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_zone_bounds_rejects_zero_length() {
+        let batch = one_zone_stats_batch(0, 0);
+        let err =
+            super::validate_zone_bounds(&batch, 8).expect_err("zero-length zone must be rejected");
+        assert!(err.to_string().contains("zone_length 0"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_zone_bounds_accepts_span_exceeding_rows_per_zone() {
+        // zone_length is an offset span (last - first + 1), not a live-row count: after deletions
+        // a zone of `rows_per_zone` live rows can span a wider offset range, so a length above
+        // rows_per_zone is legitimate and must NOT be rejected (regression guard).
+        let batch = one_zone_stats_batch(0, 16383);
+        super::validate_zone_bounds(&batch, 8192)
+            .expect("a zone span wider than rows_per_zone (post-deletion) must be accepted");
+    }
+
+    #[test]
+    fn test_validate_zone_bounds_rejects_fragment_offset_overflow() {
+        // zone_start + zone_length must stay within the 2^32 per-fragment row-offset space.
+        let batch = one_zone_stats_batch((1u64 << 32) - 4, 8);
+        let err = super::validate_zone_bounds(&batch, 8)
+            .expect_err("zone spilling past 2^32 must be rejected");
+        assert!(err.to_string().contains("overflows"), "got: {}", err);
     }
 }

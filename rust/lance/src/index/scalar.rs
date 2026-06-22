@@ -310,13 +310,43 @@ pub async fn write_consolidated_zonemap_segment(
     use uuid::Uuid;
 
     // Validate the indexed column exists in the dataset schema and capture its field id for
-    // IndexMetadata.fields. We deliberately do NOT cross-check the batch's min/max type
-    // against the column type — write_zonemap_index_from_batch validates structural shape, and
-    // value-type adaptation (dict→primitive etc.) is the writer's domain.
+    // IndexMetadata.fields.
     let field = dataset.schema().field(column).ok_or_else(|| {
         Error::invalid_input_source(format!("No column with name {}", column).into())
     })?;
     let field_id = field.id;
+
+    // Cross-check the batch's min/max value type against the type the read path compares query
+    // values against. That is the *scanned* column type (after dict→primitive / extension unwrap
+    // / nullability adaptation), so we re-derive it exactly as compute_zonemap_batch does — from
+    // the training stream's schema — rather than from the raw dataset schema, which can
+    // legitimately differ. A batch whose min/max type disagrees would silently prune matching
+    // rows at query time because cross-type ScalarValue comparisons return false.
+    let criteria = TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr();
+    let expected_value_type = load_training_data(dataset, column, &criteria, None, true, None)
+        .await?
+        .schema()
+        .field(0)
+        .data_type()
+        .clone();
+    let batch_value_type = batch
+        .schema()
+        .field_with_name("min")
+        .map_err(|_| {
+            Error::invalid_input_source("consolidated zonemap batch missing 'min' column".into())
+        })?
+        .data_type()
+        .clone();
+    if batch_value_type != expected_value_type {
+        return Err(Error::invalid_input_source(
+            format!(
+                "consolidated zonemap batch min/max type {:?} does not match indexed column '{}' \
+                 scan type {:?}",
+                batch_value_type, column, expected_value_type
+            )
+            .into(),
+        ));
+    }
 
     // Derive fragment bitmap from the batch's fragment_id column BEFORE consuming the batch
     // in write_zonemap_index_from_batch. The schema validator inside the writer will reject a
@@ -332,6 +362,14 @@ pub async fn write_consolidated_zonemap_segment(
             "consolidated zonemap batch 'fragment_id' must be UInt64".into(),
         )
     })?;
+    // The dataset's current fragment ids. A stale or foreign batch referencing fragments outside
+    // this dataset version must be rejected rather than yield commit-ready metadata claiming
+    // coverage the dataset does not actually have.
+    let mut dataset_fragments = RoaringBitmap::new();
+    for frag in dataset.get_fragments() {
+        dataset_fragments.insert(frag.id() as u32);
+    }
+
     let mut fragment_bitmap = RoaringBitmap::new();
     for f in frag_array.values() {
         if *f > u32::MAX as u64 {
@@ -339,11 +377,23 @@ pub async fn write_consolidated_zonemap_segment(
                 format!("fragment_id {} exceeds u32::MAX", f).into(),
             ));
         }
-        fragment_bitmap.insert(*f as u32);
+        let frag_id = *f as u32;
+        if !dataset_fragments.contains(frag_id) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "consolidated zonemap batch references fragment {} not present in dataset \
+                     version {}",
+                    f,
+                    dataset.version_id()
+                )
+                .into(),
+            ));
+        }
+        fragment_bitmap.insert(frag_id);
     }
 
     let uuid = Uuid::new_v4();
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid.to_string())?;
+    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
     write_zonemap_index_from_batch(batch, params, &index_store).await?;
 
     let index_details =
@@ -1344,6 +1394,87 @@ mod tests {
             "freshly written segment must contain {}; got {:?}",
             lance_index::scalar::zonemap::ZONEMAP_FILENAME,
             files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_consolidated_zonemap_rejects_value_type_mismatch() {
+        // A batch whose min/max type disagrees with the indexed column's scanned type must be
+        // rejected — otherwise cross-type comparisons silently prune matching rows at query time.
+        use crate::index::scalar::write_consolidated_zonemap_segment;
+        use lance_index::scalar::zonemap::{ZoneMapIndexBuilderParams, zonemap_stats_schema};
+
+        let dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+        let params = ZoneMapIndexBuilderParams::new(4);
+
+        // Structurally valid batch, but min/max are Int64 while "values" scans as Int32.
+        let schema = zonemap_stats_schema(&DataType::Int64);
+        let bad = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![Some(0i64)])),
+                Arc::new(arrow_array::Int64Array::from(vec![Some(10i64)])),
+                Arc::new(arrow_array::UInt32Array::from(vec![0u32])),
+                Arc::new(arrow_array::UInt32Array::from(vec![0u32])),
+                Arc::new(arrow_array::UInt64Array::from(vec![0u64])),
+                Arc::new(arrow_array::UInt64Array::from(vec![0u64])),
+                Arc::new(arrow_array::UInt64Array::from(vec![4u64])),
+            ],
+        )
+        .unwrap();
+
+        let err = write_consolidated_zonemap_segment(&dataset, "values_zm", "values", bad, &params)
+            .await
+            .expect_err("min/max type mismatch must be rejected");
+        assert!(
+            err.to_string().contains("does not match indexed column"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_consolidated_zonemap_rejects_foreign_fragment() {
+        // A batch referencing a fragment outside the dataset must be rejected rather than yield
+        // commit-ready metadata claiming coverage the dataset does not actually have.
+        use crate::index::scalar::write_consolidated_zonemap_segment;
+        use lance_index::scalar::zonemap::{ZoneMapIndexBuilderParams, zonemap_stats_schema};
+
+        let dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+        let params = ZoneMapIndexBuilderParams::new(4);
+
+        // Correct value type, but fragment_id 99 does not exist in the 4-fragment dataset.
+        let schema = zonemap_stats_schema(&DataType::Int32);
+        let foreign = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![Some(0)])),
+                Arc::new(arrow_array::Int32Array::from(vec![Some(10)])),
+                Arc::new(arrow_array::UInt32Array::from(vec![0u32])),
+                Arc::new(arrow_array::UInt32Array::from(vec![0u32])),
+                Arc::new(arrow_array::UInt64Array::from(vec![99u64])),
+                Arc::new(arrow_array::UInt64Array::from(vec![0u64])),
+                Arc::new(arrow_array::UInt64Array::from(vec![4u64])),
+            ],
+        )
+        .unwrap();
+
+        let err =
+            write_consolidated_zonemap_segment(&dataset, "values_zm", "values", foreign, &params)
+                .await
+                .expect_err("foreign fragment must be rejected");
+        assert!(
+            err.to_string().contains("not present in dataset"),
+            "got: {}",
+            err
         );
     }
 
