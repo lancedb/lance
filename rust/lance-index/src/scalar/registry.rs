@@ -135,10 +135,12 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Returns this plugin's [`BasicTrainer`] implementation, if any.
     ///
     /// Training an index can be a complex process.  For example, a btree index might
-    /// be trained using a distributed shuffler on a distributed OLAP system such as
+    /// be trained using a shuffler from a distributed OLAP system such as
     /// Spark or Ray.  A vector index can be trained by sampling the column to create
-    /// a kmenas model and then streaming the vectors to assign partitions.  Encapsulating
+    /// a kmeans model and then streaming the vectors to assign partitions.  Encapsulating
     /// the entire set of possible approches is beyond what this trait can model.
+    /// This is especially true because this is a low-level crate with no concept of a table
+    /// or a dataset.
     ///
     /// However, in many cases, an index can be trained on a (potentially sorted) stream
     /// of column data.  There is also significant utility in being able to provide users
@@ -149,7 +151,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// individualized training approaches should return `None` and provide their own
     /// methods for training.
     ///
-    /// An index can even take both approaches.  Providing a simple (but maybe less
+    /// An index can take both approaches.  Providing a simple (but maybe less
     /// efficient) stream-based trainer while also providing more specialized index
     /// creation methods elsewhere.
     fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
