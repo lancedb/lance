@@ -125,7 +125,25 @@ pub fn sanitized_authority(url: &Url) -> String {
 }
 
 type CacheKey = (String, ObjectStoreParams);
-type BuildLockMap = HashMap<CacheKey, Arc<AsyncMutex<()>>>;
+type BuildLockMap = HashMap<CacheKey, BuildLockEntry>;
+
+/// A per-key cold-build lock plus an explicit count of the tasks currently
+/// holding or queued on it.
+///
+/// The count is the cleanup signal — not `Arc::strong_count` of the mutex.
+/// `acquire_build_lock` increments it (under the `build_locks` std mutex) the
+/// instant a task claims the entry; [`BuildLockSession::drop`] decrements it on
+/// every exit path. Both happen with no intervening `.await`, so the
+/// increment/decrement is perfectly paired regardless of when the pending
+/// `lock_owned()` future releases its own Arc — which is what makes
+/// cancellation-while-queued safe without relying on async drop order.
+#[derive(Debug)]
+struct BuildLockEntry {
+    mutex: Arc<AsyncMutex<()>>,
+    /// Number of tasks holding or queued on `mutex`. The entry is removed when
+    /// this reaches zero.
+    waiters: usize,
+}
 
 /// Statistics for the object store registry cache.
 ///
@@ -136,6 +154,11 @@ type BuildLockMap = HashMap<CacheKey, Arc<AsyncMutex<()>>>;
 /// change without a semver bump.
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
+// Adding fields to this struct must stay source-compatible: external code may
+// read it via `stats()` and `..Default::default()`-construct it. `#[non_exhaustive]`
+// forbids struct-literal construction outside this crate, so future field
+// additions don't break downstream builds.
+#[non_exhaustive]
 pub struct ObjectStoreRegistryStats {
     /// Number of cache hits (store was already cached and reused).
     pub hits: u64,
@@ -143,8 +166,8 @@ pub struct ObjectStoreRegistryStats {
     pub misses: u64,
     /// Number of currently active object stores in the cache.
     pub active_stores: usize,
-    /// Number of cache keys with an in-flight or recently-finished cold
-    /// build whose RAII cleanup has not yet acquired the build-locks mutex.
+    /// Number of cache keys with at least one task currently holding or queued
+    /// on the per-key cold-build lock.
     ///
     /// Steady-state should be 0 — non-zero indicates either an in-progress
     /// thundering herd (expected during cold start) or a stuck builder.
@@ -200,23 +223,27 @@ pub struct ObjectStoreRegistry {
     build_failures: AtomicU64,
 }
 
-/// RAII session for the cold-build path: holds the per-key async lock guard
-/// and reclaims the `build_locks` HashMap entry on drop, in that order.
+/// RAII session for the cold-build path. On drop it releases the per-key async
+/// lock guard, then calls `release_build_lock` to drop this task's
+/// [`BuildLockEntry::waiters`] hold (which removes the entry at zero). Releasing
+/// the guard first lets a queued waiter wake before the build-locks map is
+/// touched.
 ///
-/// `Drop::drop` explicitly releases `guard` *before* running
-/// `cleanup_build_lock_if_idle`, so cleanup observes `strong_count == 1`
-/// (only the HashMap entry) and can remove the lock entry safely. Encoding
-/// the ordering in this Drop body — rather than relying on the declaration
-/// order of two separate `let` bindings at the call site — keeps the
-/// invariant locally checkable: a future refactor of the cold path cannot
-/// accidentally invert it.
+/// It is constructed *before* awaiting `lock_owned()`, with no `.await` between
+/// `acquire_build_lock`'s increment and the construction. So a waiter cancelled
+/// while still *queued* on `lock_owned()` — guard never assigned — still drops a
+/// live session and decrements; without that ordering the entry would be
+/// orphaned until the next open for the same key. (Cleanup tracks the explicit
+/// count, not `Arc::strong_count`, so it is also immune to the drop order of the
+/// pending `lock_owned()` future — see [`BuildLockEntry`].)
 ///
-/// Drop runs on every exit (success, error, panic, cancellation), so the
-/// `build_locks` entry can never leak if the cold-build path is interrupted
-/// between acquiring the lock and finishing the build.
+/// Drop runs on every unwinding exit — success, error, unwinding panic,
+/// cancellation. (`panic = "abort"` skips destructors, but the process is dying,
+/// so there is no surviving registry to leak into; see
+/// `test_get_store_cleans_build_locks_after_panic`.)
 ///
-/// Owns the `CacheKey` (rather than borrowing) so the session's drop is not
-/// tied to the lifetime of a local variable.
+/// `guard` is `None` until the lock is acquired. The owned `CacheKey` keeps the
+/// drop independent of any local variable's lifetime.
 struct BuildLockSession<'a> {
     registry: &'a ObjectStoreRegistry,
     cache_key: CacheKey,
@@ -225,14 +252,11 @@ struct BuildLockSession<'a> {
 
 impl Drop for BuildLockSession<'_> {
     fn drop(&mut self) {
-        // 1. Release the per-key async lock first by dropping the
-        //    `OwnedMutexGuard`. This decrements the per-key
-        //    `Arc<AsyncMutex<()>>` strong count.
+        // Release the async lock first so a queued waiter can wake before we
+        // touch the build-locks map, then drop this task's waiter hold (which
+        // removes the entry once the last waiter leaves).
         self.guard.take();
-        // 2. Reclaim the `build_locks` entry. With the guard gone, only the
-        //    HashMap entry holds an Arc, so cleanup observes count == 1 and
-        //    safely removes it.
-        self.registry.cleanup_build_lock_if_idle(&self.cache_key);
+        self.registry.release_build_lock(&self.cache_key);
     }
 }
 
@@ -381,19 +405,20 @@ impl ObjectStoreRegistry {
             return Ok(store);
         }
 
-        // Cold path: per-key single-flight. The RAII session guarantees the
-        // build_locks entry is GC'd on every exit (success, error, panic,
-        // cancellation), preventing unbounded HashMap growth. Drop ordering
-        // (guard released *before* cleanup) is encoded in
-        // `BuildLockSession::drop`, so the cold path can't accidentally
-        // invert it via `let` reordering.
+        // Cold path: per-key single-flight. `acquire_build_lock` registers this
+        // task as a waiter; the RAII `BuildLockSession` releases that hold on
+        // every exit, bounding the map. The session is built before the
+        // `lock_owned()` await (see `BuildLockSession`) so a waiter cancelled
+        // while queued still cleans up.
         let lock = self.acquire_build_lock(&cache_key);
-        let guard = lock.lock_owned().await;
-        let _session = BuildLockSession {
+        let mut _session = BuildLockSession {
             registry: self,
             cache_key: cache_key.clone(),
-            guard: Some(guard),
+            guard: None,
         };
+        // Cancellation point: `_session` already exists, so its Drop cleans up
+        // even if we are cancelled here before the guard is assigned.
+        _session.guard = Some(lock.lock_owned().await);
 
         // Re-check after acquiring the lock — coalesced waiters become hits.
         if let Some(store) = self.lookup_cached(&cache_key) {
@@ -479,54 +504,52 @@ impl ObjectStoreRegistry {
         Ok(cached)
     }
 
-    /// Acquire (or create) the per-key async build lock for `cache_key`.
+    /// Acquire (or create) the per-key async build lock for `cache_key`,
+    /// registering this task as a waiter.
+    ///
+    /// Increments [`BuildLockEntry::waiters`] under the `build_locks` std
+    /// mutex; the caller MUST pair this with exactly one `release_build_lock`,
+    /// which the RAII [`BuildLockSession`] guarantees on every exit path.
     ///
     /// On poison: recovers via `into_inner()` rather than bricking the
-    /// registry. The protected data is just a HashMap of build-lock Arcs;
+    /// registry. The protected data is just a HashMap of build-lock entries;
     /// any stale entry left by a panic is reclaimed by `BuildLockSession`.
     fn acquire_build_lock(&self, cache_key: &CacheKey) -> Arc<AsyncMutex<()>> {
         let mut locks = self
             .build_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        locks
+        let entry = locks
             .entry(cache_key.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+            .or_insert_with(|| BuildLockEntry {
+                mutex: Arc::new(AsyncMutex::new(())),
+                waiters: 0,
+            });
+        entry.waiters += 1;
+        entry.mutex.clone()
     }
 
-    /// Drop the build-lock entry for `cache_key` if no waiters remain.
+    /// Release this task's hold on the per-key build lock for `cache_key`,
+    /// removing the entry once the last waiter leaves.
     ///
-    /// Strong-count == 1 means only the HashMap entry references the Arc, so
-    /// no concurrent task is using or queued on the lock. The HashMap mutex
-    /// makes this atomic: a new caller can't clone the Arc between the count
-    /// read and the removal because `acquire_build_lock` takes the same mutex.
-    /// A waiter parked inside `lock_owned()` holds its own Arc clone in the
-    /// future, so it counts toward `strong_count` and keeps the entry alive
-    /// until it wakes.
+    /// Decrements [`BuildLockEntry::waiters`] and removes the entry at zero. The
+    /// `build_locks` std mutex makes the decrement-and-maybe-remove atomic
+    /// against concurrent `acquire_build_lock` calls, so a new waiter can't be
+    /// lost between the two.
     ///
-    /// Best-effort: if a task drops without calling this (e.g. between
-    /// dropping the build lock and entering this function), the entry is
-    /// reclaimed by the next caller for the same key, who finds count == 1
-    /// and removes it.
-    ///
-    /// Bound: per-key cleanup is sufficient — no periodic full-map sweep is
-    /// needed. The map's worst-case size is the number of distinct cache keys
-    /// with an in-flight builder *plus* keys whose builder has finished but
-    /// whose `BuildLockSession::drop` has not yet acquired the std mutex.
-    /// Both terms are bounded by concurrently outstanding cold opens, which
-    /// the underlying I/O concurrency limits already cap. RAII guarantees
-    /// every successful `acquire_build_lock` is paired with exactly one
-    /// `cleanup_build_lock_if_idle`, on every exit path.
-    fn cleanup_build_lock_if_idle(&self, cache_key: &CacheKey) {
+    /// The map's worst-case size is the number of distinct cache keys with an
+    /// outstanding cold open, which the I/O concurrency limits already cap —
+    /// RAII pairs every `acquire_build_lock` with exactly one `release_build_lock`.
+    fn release_build_lock(&self, cache_key: &CacheKey) {
         let mut locks = self
             .build_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = locks.get(cache_key)
-            && Arc::strong_count(entry) == 1
-        {
-            locks.remove(cache_key);
+        if let Some(entry) = locks.get_mut(cache_key) {
+            entry.waiters -= 1;
+            if entry.waiters == 0 {
+                locks.remove(cache_key);
+            }
         }
     }
 
@@ -536,6 +559,18 @@ impl ObjectStoreRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    /// Current waiter count for `cache_key`, or `None` if no entry exists.
+    /// Lets tests observe the per-key acquire/release count directly — the
+    /// signal that drives cleanup — rather than only the map's key count.
+    #[cfg(test)]
+    fn build_lock_waiters(&self, cache_key: &CacheKey) -> Option<usize> {
+        self.build_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(cache_key)
+            .map(|entry| entry.waiters)
     }
 
     /// Look up a cached store by key, evicting the entry if its weak ref is
@@ -1067,6 +1102,154 @@ mod tests {
             registry.build_locks_len(),
             0,
             "RAII guard must clean up the build_locks entry on panic"
+        );
+    }
+
+    /// A waiter cancelled while still *queued* on the per-key build lock —
+    /// before its `OwnedMutexGuard` is acquired — must still reclaim the
+    /// `build_locks` entry on drop. This pins that state directly: the
+    /// [`BuildLockSession`] is built with `guard: None`, exactly as it exists
+    /// for a task cancelled inside `lock_owned().await`. The lingering
+    /// `Arc<AsyncMutex<()>>` (`_held`) stands in for the Arc that the pending
+    /// `lock_owned()` future keeps alive — cleanup must not be fooled by it,
+    /// because it keys off the explicit waiter count, not `Arc::strong_count`.
+    #[tokio::test]
+    async fn test_build_lock_session_reclaims_entry_when_cancelled_before_guard() {
+        let registry = ObjectStoreRegistry::empty();
+        let cache_key = ("memory$queued".to_string(), ObjectStoreParams::default());
+
+        // Mirror the cold path: register a waiter and take the lock Arc, but
+        // never acquire the guard.
+        let _held = registry.acquire_build_lock(&cache_key);
+        assert_eq!(
+            registry.build_locks_len(),
+            1,
+            "acquiring the build lock must register the entry"
+        );
+
+        let session = BuildLockSession {
+            registry: &registry,
+            cache_key,
+            guard: None,
+        };
+        drop(session);
+
+        assert_eq!(
+            registry.build_locks_len(),
+            0,
+            "dropping the session for a still-queued (guard-less) waiter must \
+             reclaim the entry, even while another Arc to the lock is alive"
+        );
+    }
+
+    /// A provider that signals when its build starts and blocks until released,
+    /// pinning a builder in flight so other callers queue behind it.
+    #[derive(Debug)]
+    struct BlockingProvider {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for BlockingProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            self.started.notify_one();
+            self.release.notified().await;
+            memory::MemoryStoreProvider
+                .new_store(base_path, params)
+                .await
+        }
+    }
+
+    /// End-to-end cancellation safety: a waiter cancelled while queued behind
+    /// an in-flight builder must release its hold on the build lock. The test
+    /// observes the per-key waiter count directly so the cancellation's effect
+    /// is visible *before* the builder finishes — otherwise the builder's own
+    /// cleanup would mask whether the cancelled waiter ever decremented.
+    ///
+    /// Sequence: builder A registers (count 1) and parks; waiter B queues
+    /// (count 2); B is cancelled mid-wait → count must drop back to 1; A
+    /// completes → entry fully reclaimed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_get_store_cleans_build_locks_when_queued_waiter_cancelled() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(BlockingProvider {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let registry = Arc::new(ObjectStoreRegistry::empty());
+        registry.insert("blocking", provider);
+
+        let url = Url::parse("blocking://same").unwrap();
+        let params = ObjectStoreParams::default();
+        // The cache key the cold path computes for this URL: default prefix is
+        // `scheme$sanitized_authority`, paired with the (default) params.
+        let cache_key = ("blocking$same".to_string(), params.clone());
+
+        // Builder A acquires the lock and parks inside `new_store`.
+        let (ra, ua, pa) = (registry.clone(), url.clone(), params.clone());
+        let builder = tokio::spawn(async move { ra.get_store(ua, &pa).await });
+        started.notified().await;
+        assert_eq!(
+            registry.build_lock_waiters(&cache_key),
+            Some(1),
+            "builder A must be registered as the sole waiter"
+        );
+
+        // Waiter B targets the same key, so it queues on `lock_owned()` behind
+        // A (it cannot acquire the guard — A holds it). Wait deterministically
+        // for B to register rather than racing a fixed sleep; a regression that
+        // never queues fails here loudly instead of hanging.
+        let (rb, ub, pb) = (registry.clone(), url.clone(), params.clone());
+        let waiter = tokio::spawn(async move { rb.get_store(ub, &pb).await });
+        let mut queued = false;
+        for _ in 0..200 {
+            if registry.build_lock_waiters(&cache_key) == Some(2) {
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            queued,
+            "waiter B did not queue on the build lock within timeout"
+        );
+
+        // Cancel B while it is parked, then confirm its session decremented the
+        // count back to 1. This is the assertion the old strong-count cleanup
+        // could not satisfy: a waiter cancelled mid-await left its hold behind.
+        waiter.abort();
+        assert!(
+            waiter.await.unwrap_err().is_cancelled(),
+            "waiter must be cancelled, not completed"
+        );
+        assert_eq!(
+            registry.build_lock_waiters(&cache_key),
+            Some(1),
+            "B's cancellation must decrement the waiter count, leaving only A"
+        );
+
+        // Release A; it finishes the build and drops its session, draining the
+        // entry entirely.
+        release.notify_one();
+        assert!(
+            builder.await.unwrap().is_ok(),
+            "builder must complete successfully"
+        );
+        assert_eq!(
+            registry.build_lock_waiters(&cache_key),
+            None,
+            "after the builder completes, the build-lock entry must be reclaimed"
+        );
+        assert_eq!(
+            registry.build_locks_len(),
+            0,
+            "no build-lock entries may leak",
         );
     }
 
