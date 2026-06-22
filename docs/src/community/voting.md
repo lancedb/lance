@@ -59,9 +59,10 @@ pull request, and the requirement is enforced structurally in CI rather than by
 convention.
 
 A PR is considered a format-specification change when it modifies the protobuf
-definitions (`protos/**/*.proto`) or the spec documentation (`docs/src/format/**`).
-The [format spec vote gate](https://github.com/lance-format/lance/blob/main/.github/workflows/format-vote-gate.yml)
-labels such PRs `format-change` and blocks merging until all of the following hold:
+definitions (`protos/**/*.proto`) or the spec documentation (`docs/src/format/**`);
+such PRs are labelled `format-change` automatically. The
+[format spec vote gate](https://github.com/lance-format/lance/blob/main/.github/workflows/format-vote-gate.yml)
+blocks merging a `format-change` PR until all of the following hold:
 
 - **Three binding +1 votes.** Three PMC members have approved the PR, excluding
   the proposer. Cast +1 by approving the PR. Only approvals on the latest commit
@@ -78,5 +79,5 @@ The PMC roster used to count votes is read from
 [`docs/src/community/pmc.yaml`](./pmc.md).
 
 For a trivial edit that does not change the format — a typo, wording, or
-formatting fix — a PMC member may remove the `format-change` label to waive the
+formatting fix — a PMC member may apply the `format-waived` label to waive the
 vote.

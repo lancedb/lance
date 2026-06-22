@@ -13,8 +13,8 @@ on:
       - main
       - release/**
     paths:
-      - ci/format_vote_gate.js
-      - ci/format_vote_gate.test.js
+      - ci/format_vote_gate.py
+      - ci/test_format_vote_gate.py
       - .github/workflows/format-vote-gate.yml
       - .github/workflows/ci-scripts.yml
 
@@ -28,9 +28,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          node-version: "20"
+          python-version: "3.12"
+      - name: Install pytest
+        run: pip install pytest
       - name: Run tests
-        run: node --test ci/format_vote_gate.test.js
+        run: pytest ci/test_format_vote_gate.py

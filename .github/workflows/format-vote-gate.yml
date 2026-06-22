@@ -1,9 +1,10 @@
 name: Format spec vote gate
 
 # Structurally enforces the PMC vote required for Lance format-specification
-# changes (see https://lance.org/community/voting/). A PR that touches the
-# format spec (`protos/**/*.proto`, `docs/src/format/**`) is labelled
-# `format-change` and cannot merge until it has 3 binding +1 votes from PMC
+# changes (see https://lance.org/community/voting/). The path labeler
+# (.github/labeler-area.yml) applies the `format-change` label to PRs that touch
+# the format spec (`protos/**/*.proto`, `docs/src/format/**`); this gate reads
+# that label and blocks merging until the PR has 3 binding +1 votes from PMC
 # members (PR approvals, excluding the author), has no outstanding veto (a PMC
 # "Request changes" review), and the 1-week voting period has elapsed.
 #
@@ -13,12 +14,12 @@ name: Format spec vote gate
 # release branches). The status is posted on *every* PR — success immediately
 # for non-format PRs — so a required check is never left pending forever.
 #
-# A PMC member may exempt a trivial edit (typo, wording, formatting) by removing
-# the `format-change` label; the gate respects that and will not re-add it.
+# A PMC member may waive a trivial edit (typo, wording, formatting) by applying
+# the `format-waived` label.
 #
-# Uses pull_request_target so the token can label PRs and post statuses on
-# fork-based PRs. It never checks out or executes PR code: it reads the trusted
-# base checkout (for the PMC roster) and queries the API only.
+# Uses pull_request_target so the token can post statuses/comments on fork-based
+# PRs. It never checks out or executes PR code: it reads the trusted base
+# checkout (for the PMC roster and this script) and queries the API only.
 
 on:
   pull_request_target:
@@ -48,17 +49,13 @@ jobs:
     steps:
       - name: Checkout base
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          node-version: "20"
-      - name: Install js-yaml
-        run: npm install --no-save js-yaml@4
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install PyGithub PyYAML
       - name: Evaluate vote
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            const path = require('path');
-            // Loaded from the trusted base checkout, never from PR code.
-            const gate = require(path.join(process.env.GITHUB_WORKSPACE, 'ci', 'format_vote_gate.js'));
-            await gate.run({ github, context, core });
+        run: python ci/format_vote_gate.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
