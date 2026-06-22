@@ -63,7 +63,7 @@ public class FragmentUpdateResultTest {
   @Test
   void testGetUpdatedRowOffsetBytesRoundTripViaDeprecatedGetter() {
     FragmentUpdateResult result =
-        new FragmentUpdateResult(null, new long[0], PORTABLE_ROARING_BYTES_135);
+        FragmentUpdateResult.create(null, new long[0], PORTABLE_ROARING_BYTES_135);
     assertArrayEquals(PORTABLE_ROARING_BYTES_135, result.getUpdatedRowOffsetBytes());
     assertArrayEquals(new long[] {1, 3, 5}, result.getUpdatedRowOffsets());
   }
@@ -75,7 +75,7 @@ public class FragmentUpdateResultTest {
 
     // Stored bytes from the deprecated long[] constructor decode to the same offsets.
     FragmentUpdateResult fromEncodedBytes =
-        new FragmentUpdateResult(null, new long[0], result.getUpdatedRowOffsetBytes());
+        FragmentUpdateResult.create(null, new long[0], result.getUpdatedRowOffsetBytes());
     assertArrayEquals(new long[] {1, 3, 5}, fromEncodedBytes.getUpdatedRowOffsets());
   }
 

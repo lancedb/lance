@@ -635,6 +635,11 @@ fn inner_encode_updated_row_offset_bytes<'local>(
                 "updatedRowOffsets must be non-negative, got {offset}"
             )));
         }
+        if offset > u32::MAX as i64 {
+            return Err(Error::input_error(format!(
+                "updatedRowOffsets value {offset} exceeds u32::MAX"
+            )));
+        }
         bitmap.insert(offset as u32);
     }
     let bytes = serialize_matched_offsets(&bitmap)?;

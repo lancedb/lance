@@ -14,6 +14,7 @@
 package org.lance.fragment;
 
 import org.lance.FragmentMetadata;
+import org.lance.JniLoader;
 
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.c.ArrowArrayStream;
@@ -23,6 +24,10 @@ import org.apache.arrow.c.ArrowArrayStream;
  * Fragment.updateColumns()}.
  */
 public class FragmentUpdateResult {
+  static {
+    JniLoader.ensureLoaded();
+  }
+
   private final FragmentMetadata updatedFragment;
   private final long[] fieldsModified;
 
@@ -32,12 +37,18 @@ public class FragmentUpdateResult {
    */
   private final byte[] updatedRowOffsetBytes;
 
+  /** Primary public API for constructing a result with portable RoaringBitmap offset bytes. */
+  public static FragmentUpdateResult create(
+      FragmentMetadata updatedFragment, long[] updatedFieldIds, byte[] updatedRowOffsetBytes) {
+    return new FragmentUpdateResult(updatedFragment, updatedFieldIds, updatedRowOffsetBytes);
+  }
+
   /** Two-argument form for callers that do not track per-row offsets; offsets default to empty. */
   public FragmentUpdateResult(FragmentMetadata updatedFragment, long[] updatedFieldIds) {
     this(updatedFragment, updatedFieldIds, new byte[0]);
   }
 
-  public FragmentUpdateResult(
+  private FragmentUpdateResult(
       FragmentMetadata updatedFragment, long[] updatedFieldIds, byte[] updatedRowOffsetBytes) {
     this.updatedFragment = updatedFragment;
     this.fieldsModified = updatedFieldIds;
