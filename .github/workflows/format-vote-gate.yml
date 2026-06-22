@@ -1,0 +1,64 @@
+name: Format spec vote gate
+
+# Structurally enforces the PMC vote required for Lance format-specification
+# changes (see https://lance.org/community/voting/). A PR that touches the
+# format spec (`protos/**/*.proto`, `docs/src/format/**`) is labelled
+# `format-change` and cannot merge until it has 3 binding +1 votes from PMC
+# members (PR approvals, excluding the author), has no outstanding veto (a PMC
+# "Request changes" review), and the 1-week voting period has elapsed.
+#
+# The gate publishes its verdict as the `format-spec-vote` commit status on the
+# PR head. To make it a merge blocker, an org admin must add `format-spec-vote`
+# as a required status check in the branch protection rules for `main` (and any
+# release branches). The status is posted on *every* PR — success immediately
+# for non-format PRs — so a required check is never left pending forever.
+#
+# A PMC member may exempt a trivial edit (typo, wording, formatting) by removing
+# the `format-change` label; the gate respects that and will not re-add it.
+#
+# Uses pull_request_target so the token can label PRs and post statuses on
+# fork-based PRs. It never checks out or executes PR code: it reads the trusted
+# base checkout (for the PMC roster) and queries the API only.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  schedule:
+    # Re-evaluate open format-change PRs so the voting-period clock is re-checked
+    # even when no PR event fires (e.g. the 1-week period elapses days after the
+    # third approval lands).
+    - cron: "0 */8 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+jobs:
+  gate:
+    name: Evaluate format spec vote
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Install js-yaml
+        run: npm install --no-save js-yaml@4
+      - name: Evaluate vote
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const path = require('path');
+            // Loaded from the trusted base checkout, never from PR code.
+            const gate = require(path.join(process.env.GITHUB_WORKSPACE, 'ci', 'format_vote_gate.js'));
+            await gate.run({ github, context, core });

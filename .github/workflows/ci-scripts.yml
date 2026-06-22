@@ -1,0 +1,36 @@
+name: CI scripts
+
+# Tests for helper scripts under ci/ that aren't covered by the language test
+# suites (e.g. the format-spec vote gate logic).
+
+on:
+  push:
+    branches:
+      - main
+      - release/**
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - ci/format_vote_gate.js
+      - ci/format_vote_gate.test.js
+      - .github/workflows/format-vote-gate.yml
+      - .github/workflows/ci-scripts.yml
+
+permissions:
+  contents: read
+
+jobs:
+  format-vote-gate:
+    name: Format vote gate unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Run tests
+        run: node --test ci/format_vote_gate.test.js

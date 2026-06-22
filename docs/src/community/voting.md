@@ -47,7 +47,36 @@ A **-1** binding vote is considered a veto for all decision types. Vetoes:
 | Release a new stable major version of the core project                            | 3                                            | PMC                            | GitHub Discussions                    | 3 days         |
 | Release a new stable minor version of the core project                            | 3                                            | PMC                            | GitHub Discussions                    | 3 days         |
 | Release a new stable patch version of the core project                            | 3                                            | PMC                            | GitHub Discussions                    | N/A            |
-| Lance Format Specification modifications                                      | 3 (excluding proposer)                       | PMC                            | GitHub Discussions (with a GitHub PR) | 1 week         |
+| Lance Format Specification modifications                                      | 3 (excluding proposer)                       | PMC                            | GitHub PR (see [below](#lance-format-specification-vote-gate)) | 1 week         |
 | Code modifications in the core project (except changes to format specifications)  | 1 (excluding proposer)                       | Maintainers with write access  | GitHub PR                             | N/A            |
 | Release a new stable version of subprojects                                   | 1                                            | PMC                            | GitHub Discussions                    | N/A            |
 | Code modifications in subprojects                                             | 1 (excluding proposer)                       | Contributors with write access | GitHub PR                             | N/A            |
+
+## Lance Format Specification Vote Gate
+
+Votes on Lance format-specification changes are cast and counted directly on the
+pull request, and the requirement is enforced structurally in CI rather than by
+convention.
+
+A PR is considered a format-specification change when it modifies the protobuf
+definitions (`protos/**/*.proto`) or the spec documentation (`docs/src/format/**`).
+The [format spec vote gate](https://github.com/lance-format/lance/blob/main/.github/workflows/format-vote-gate.yml)
+labels such PRs `format-change` and blocks merging until all of the following hold:
+
+- **Three binding +1 votes.** Three PMC members have approved the PR, excluding
+  the proposer. Cast +1 by approving the PR. Only approvals on the latest commit
+  count — pushing new commits invalidates earlier approvals, since the proposal
+  has changed.
+- **No veto.** No PMC member has an outstanding "Request changes" review. A `-1`
+  binding vote (cast by requesting changes) is a veto and blocks the merge until
+  withdrawn.
+- **Minimum voting period.** At least one week has elapsed since the PR was
+  flagged as a format change.
+
+The gate is the `format-spec-vote` required status check on protected branches.
+The PMC roster used to count votes is read from
+[`docs/src/community/pmc.yaml`](./pmc.md).
+
+For a trivial edit that does not change the format — a typo, wording, or
+formatting fix — a PMC member may remove the `format-change` label to waive the
+vote.

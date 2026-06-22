@@ -27,6 +27,9 @@ In addition to the [activities of maintainers](./maintainers.md#activities), PMC
 
 ## Roster
 
+<!-- This table is generated from `pmc.yaml`. Edit that file and run
+     `python ci/sync_pmc_docs.py` to update it; do not edit the table by hand. -->
+<!-- BEGIN PMC ROSTER -->
 | Name            | GitHub Handle   | Affiliation  | Ecosystem Roles                                                                                               |
 |-----------------|-----------------|--------------|---------------------------------------------------------------------------------------------------------------|
 | Yang Cen        | BubbleCal       | LanceDB      | Milvus Contributor                                                                                            |
@@ -41,13 +44,14 @@ In addition to the [activities of maintainers](./maintainers.md#activities), PMC
 | Weston Pace     | westonpace      | LanceDB      | Apache Arrow PMC Member, Substrait SMC Member                                                                 |
 | Calvin Qi       | calvinqi        | Harvey.ai    |                                                                                                               |
 | Prashanth Rao   | prrao87         | LanceDB      |                                                                                                               |
-| Ethan Rosenthal | EthanRosenthal  | Runway AI    |                                                                                                               |                                                 |
+| Ethan Rosenthal | EthanRosenthal  | Runway AI    |                                                                                                               |
 | Tim Saucer      | timsaucer       | Rerun.io     | Apache DataFusion PMC Member                                                                                  |
 | Chang She       | changhiskhan    | LanceDB      | Pandas Co-Author                                                                                              |
 | Jasmine Wang    | onigiriisabunny | LanceDB      | Alluxio PMC Community Manager                                                                                 |
 | Lei Xu          | eddyxu          | LanceDB      | Apache Hadoop PMC Member                                                                                      |
 | Vino Yang       | yanghua         | Bytedance    | Apache Hudi PMC Member, Apache Kyuubi PMC Member, Apache Kylin Committer, Apache Incubation Program Committer |
 | Jack Ye         | jackye1995      | LanceDB      | Apache Iceberg PMC Member, Apache Polaris (incubating) PPMC Member, Apache Incubation Program Committer       |
+<!-- END PMC ROSTER -->
 
 ## Becoming a PMC Member
 
