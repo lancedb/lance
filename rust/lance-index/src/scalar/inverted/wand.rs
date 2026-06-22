@@ -585,6 +585,7 @@ pub struct Wand<'a, S: Scorer> {
     // Last conjunction doc returned to the caller. The next conjunction search
     // resumes strictly after this doc, like Lucene's `nextDoc()/advance()`.
     and_last_doc: Option<u64>,
+    and_candidates_pruned_before_return: usize,
     docs: &'a DocSet,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -647,6 +648,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             up_to: None,
             and_max_score: f32::INFINITY,
             and_last_doc: None,
+            and_candidates_pruned_before_return: 0,
             docs,
             scorer,
             shared_threshold: None,
@@ -717,15 +719,18 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         let mut and_candidates_seen = 0;
-        let mut and_candidates_pruned_before_score = 0;
         let mut and_full_scores = 0;
         let mut freqs_collected = 0;
+        let pruned_before_return_start = self.and_candidates_pruned_before_return;
         loop {
             self.raise_to_shared_floor(params.wand_factor);
             let Some((doc, mut score)) = self.next()? else {
                 break;
             };
             num_comparisons += 1;
+            if self.operator == Operator::And {
+                and_candidates_seen += 1;
+            }
 
             // Either a real row_id (so we can run the mask check
             // inline) or the doc_id widened to u64 (deferred path;
@@ -760,9 +765,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
-            if self.operator == Operator::And {
-                and_candidates_seen += 1;
-            }
 
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), Some(doc_length), Some(&mut score));
@@ -775,10 +777,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 score
             } else {
                 self.advance_all_tail(doc.doc_id(), None, None);
-                if self.and_candidate_cannot_beat_threshold(doc_length) {
-                    and_candidates_pruned_before_score += 1;
-                    continue;
-                }
                 if params.phrase_slop.is_some()
                     && !self.check_positions(params.phrase_slop.unwrap() as i32)
                 {
@@ -813,8 +811,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
         }
         metrics.record_comparisons(num_comparisons);
+        let and_candidates_pruned_before_return = self
+            .and_candidates_pruned_before_return
+            .saturating_sub(pruned_before_return_start);
         metrics.record_and_candidates_seen(and_candidates_seen);
-        metrics.record_and_candidates_pruned_before_score(and_candidates_pruned_before_score);
+        metrics.record_and_candidates_pruned_before_return(and_candidates_pruned_before_return);
+        metrics.record_and_candidates_pruned_before_score(and_candidates_pruned_before_return);
         metrics.record_and_full_scores(and_full_scores);
         metrics.record_freqs_collected(freqs_collected);
 
@@ -1116,8 +1118,23 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
             }
 
+            let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
+            let doc_length = match &lead_doc {
+                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
+            };
+            if self.and_candidate_cannot_beat_threshold(doc_length) {
+                self.and_candidates_pruned_before_return += 1;
+                let next_target = self.and_advance_target(doc.saturating_add(1));
+                if next_target == TERMINATED_DOC_ID {
+                    return None;
+                }
+                self.lead[0].next(next_target);
+                continue;
+            }
+
             self.and_last_doc = Some(doc);
-            return self.lead.first().and_then(|posting| posting.doc());
+            return Some(lead_doc);
         }
     }
 
@@ -1741,6 +1758,7 @@ mod tests {
     struct CountAndSearchStats {
         comparisons: AtomicUsize,
         candidates_seen: AtomicUsize,
+        candidates_pruned_before_return: AtomicUsize,
         candidates_pruned_before_score: AtomicUsize,
         full_scores: AtomicUsize,
         freqs_collected: AtomicUsize,
@@ -1757,6 +1775,11 @@ mod tests {
 
         fn record_and_candidates_seen(&self, n: usize) {
             self.candidates_seen.fetch_add(n, Ordering::Relaxed);
+        }
+
+        fn record_and_candidates_pruned_before_return(&self, n: usize) {
+            self.candidates_pruned_before_return
+                .fetch_add(n, Ordering::Relaxed);
         }
 
         fn record_and_candidates_pruned_before_score(&self, n: usize) {
@@ -2332,12 +2355,16 @@ mod tests {
         let candidates_pruned = metrics
             .candidates_pruned_before_score
             .load(Ordering::Relaxed);
+        let candidates_pruned_before_return = metrics
+            .candidates_pruned_before_return
+            .load(Ordering::Relaxed);
         let full_scores = metrics.full_scores.load(Ordering::Relaxed);
-        assert!(candidates_seen > full_scores);
+        assert_eq!(metrics.comparisons.load(Ordering::Relaxed), 1);
+        assert_eq!(candidates_seen, 1);
         assert!(candidates_pruned > 0);
+        assert_eq!(candidates_pruned_before_return, candidates_pruned);
         assert_eq!(full_scores, 1);
         assert_eq!(metrics.freqs_collected.load(Ordering::Relaxed), 1);
-        assert_eq!(candidates_seen, candidates_pruned + full_scores);
     }
 
     #[test]

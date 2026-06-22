@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
+pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
 pub const AND_CANDIDATES_PRUNED_BEFORE_SCORE_METRIC: &str = "and_candidates_pruned_before_score";
 pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
 pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
@@ -50,6 +51,8 @@ pub trait MetricsCollector: Send + Sync {
     fn record_comparisons(&self, num_comparisons: usize);
 
     fn record_and_candidates_seen(&self, _num_candidates: usize) {}
+
+    fn record_and_candidates_pruned_before_return(&self, _num_candidates: usize) {}
 
     fn record_and_candidates_pruned_before_score(&self, _num_candidates: usize) {}
 
