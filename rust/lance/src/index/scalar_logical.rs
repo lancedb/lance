@@ -86,13 +86,6 @@ impl Index for LogicalScalarIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn lance_index::vector::VectorIndex>> {
-        Err(Error::invalid_input(format!(
-            "LogicalScalarIndex '{}' is not a vector index",
-            self.name
-        )))
-    }
-
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_name": self.name,

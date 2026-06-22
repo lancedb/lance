@@ -46,7 +46,6 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 
 const FMINDEX_INDEX_VERSION: u32 = 10;
@@ -1294,11 +1293,6 @@ impl Index for FMIndexScalarIndex {
     }
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "Fm is not a vector index".into(),
-        ))
     }
     async fn prewarm(&self) -> Result<()> {
         Ok(())
