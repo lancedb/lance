@@ -13,7 +13,6 @@ use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
     IndexWriter, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType, pb};
 use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
@@ -447,12 +446,6 @@ impl Index for RTreeIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::not_supported_source(
-            "RTreeIndex is not vector index".into(),
-        ))
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {

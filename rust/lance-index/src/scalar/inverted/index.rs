@@ -986,12 +986,6 @@ impl Index for InvertedIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::invalid_input(
-            "inverted index cannot be cast to vector index",
-        ))
-    }
-
     fn statistics(&self) -> Result<serde_json::Value> {
         let num_tokens = self
             .partitions
