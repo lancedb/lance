@@ -150,7 +150,7 @@ class IndicesBuilder:
                 max_iters=max_iters,
             )
             num_dims = ivf_centroids.shape[1]
-            ivf_centroids.shape = -1
+            ivf_centroids = ivf_centroids.reshape(-1)
             flat_centroids_array = pa.array(ivf_centroids)
             centroids_array = pa.FixedSizeListArray.from_arrays(
                 flat_centroids_array, num_dims

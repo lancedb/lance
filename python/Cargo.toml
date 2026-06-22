@@ -60,7 +60,7 @@ prost = "0.14.1"
 prost-types = "0.14.1"
 pyo3 = { version = "0.28", features = [
     "extension-module",
-    "abi3-py39",
+    "abi3-py310",
     "py-clone",
     "chrono",
 ] }
