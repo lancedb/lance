@@ -71,7 +71,6 @@ mod test {
             self
         }
 
-
         async fn prewarm(&self) -> Result<()> {
             Ok(())
         }

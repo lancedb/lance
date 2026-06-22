@@ -86,7 +86,6 @@ impl Index for LogicalScalarIndex {
         self
     }
 
-
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
             "index_name": self.name,
