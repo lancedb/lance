@@ -1740,9 +1740,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         fri: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let _ = details
-            .to_msg::<pb::FmIndexDetails>()
-            .unwrap_or_default();
+        let _ = details.to_msg::<pb::FmIndexDetails>().unwrap_or_default();
         Ok(FMIndexScalarIndex::load(store, fri, cache).await? as Arc<dyn ScalarIndex>)
     }
     async fn load_statistics(
