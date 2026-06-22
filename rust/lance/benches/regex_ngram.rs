@@ -6,15 +6,17 @@
 //! Each query is a `regexp_match(doc, '...')` filter against a dataset that has
 //! an NGram index on `doc`. The query set spans a selective AND pattern, an
 //! alternation, a plain literal (rewritten to an infix LIKE before it reaches
-//! the index), and a deliberately non-accelerable pattern (`a.b`, which yields
-//! no trigram) that serves as a regression guard.
+//! the index), skewed conjunctions with common / rare / missing trigrams, and a
+//! deliberately non-accelerable pattern (`a.b`, which yields no trigram) that
+//! serves as a regression guard.
 //!
-//! On `main` none of these use the index (regex falls through to a full scan +
-//! recheck); with the ngram-regex acceleration the index prunes candidates for
-//! the first three while `a.b` stays a full scan. Capture a baseline on `main`
-//! with `--save-baseline before_7130`, then compare after the change with
-//! `--baseline before_7130`.
+//! This benchmark covers regex-to-NGram acceleration for indexable patterns and
+//! includes skewed conjunction cases where posting-list cardinality affects
+//! query planning. The `a.b` case stays a full scan because it yields no
+//! trigram. Set `LANCE_REGEX_NGRAM_TOTAL` to scale the dataset beyond the
+//! default 200k rows.
 
+use std::env;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,34 +37,56 @@ use lance_testing::pprof::{Output, PProfProfiler};
 
 const TOTAL: usize = 200_000;
 
-/// Build the `doc` column: random sentences with rare markers injected into a
-/// small fraction of rows so the regex queries have controlled selectivity.
-/// The markers (`zqxwvu`, `needlexyz`, `qwerasdf`) are unlikely to appear in
-/// the generated English-word sentences.
-fn build_docs() -> StringArray {
+fn total_rows() -> usize {
+    env::var("LANCE_REGEX_NGRAM_TOTAL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(TOTAL)
+}
+
+/// Build the `doc` column: random sentences with markers injected into rows so
+/// the regex queries have controlled selectivity. The markers are unlikely to
+/// appear in the generated English-word sentences.
+fn build_docs(total: usize) -> StringArray {
     let mut sentence_gen = array::random_sentence(1, 30, false);
     let base = sentence_gen
-        .generate_default(RowCount::from(TOTAL as u64))
+        .generate_default(RowCount::from(total as u64))
         .unwrap();
     let base = base.as_string::<i32>();
-    let docs = (0..TOTAL).map(|i| {
+    let docs = (0..total).map(|i| {
         let sentence = base.value(i);
+        let mut doc = sentence.to_string();
         if i % 200 == 0 {
             // ~0.5% of rows match `zqxwvu.*needlexyz` and `zqxwvu`.
-            format!("{sentence} zqxwvu needlexyz")
+            doc.push_str(" zqxwvu needlexyz");
         } else if i % 211 == 0 {
             // A second marker for the alternation query.
-            format!("{sentence} qwerasdf")
-        } else {
-            sentence.to_string()
+            doc.push_str(" qwerasdf");
         }
+        if i % 2 == 0 {
+            // A deliberately common marker used to benchmark rare-token selection
+            // in large regex conjunctions.
+            doc.push_str(" commoncommon");
+        }
+        doc.push_str(" commonmarkerabcdefghijklmnopqrstuvwx");
+        if i % 997 == 0 {
+            doc.push_str(" raremarker");
+        }
+        if i % 3 == 0 {
+            doc.push_str(" densecommonprefix densecommonsuffix");
+        }
+        if i % 1501 == 0 {
+            doc.push_str(" longrareanchor");
+        }
+        doc
     });
     StringArray::from_iter_values(docs)
 }
 
 async fn build_dataset(tempdir: &TempStrDir) -> Arc<Dataset> {
     let schema = Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, false)]));
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(build_docs())]).unwrap();
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(build_docs(total_rows()))]).unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
 
     let mut dataset = Dataset::write(reader, tempdir.as_str(), None)
@@ -101,6 +125,26 @@ fn bench_regex_ngram(c: &mut Criterion) {
             "regexp_match(doc, '(zqxwvu|qwerasdf|needlexyz)')",
         ),
         ("plain_literal", "regexp_match(doc, 'zqxwvu')"),
+        (
+            // Common required trigram plus a rare required trigram.
+            "skewed_and",
+            "regexp_match(doc, 'commoncommon.*raremarker')",
+        ),
+        (
+            // Several required trigrams, including one rare anchor.
+            "many_required_trigrams",
+            "regexp_match(doc, 'densecommonprefix.*longrareanchor.*densecommonsuffix')",
+        ),
+        (
+            // One common required trigram and one missing required trigram.
+            "missing_required_trigram",
+            "regexp_match(doc, 'commoncommon.*missingmarker')",
+        ),
+        (
+            // Many common required trigrams followed by a missing required trigram.
+            "many_common_missing_trigram",
+            "regexp_match(doc, 'commonmarkerabcdefghijklmnopqrstuvwx.*missingmarker')",
+        ),
         ("non_accelerable_a_dot_b", "regexp_match(doc, 'a.b')"),
     ];
 
