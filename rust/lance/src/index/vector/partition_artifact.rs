@@ -239,7 +239,9 @@ impl PartitionArtifactBuilder {
             let bucket_id = partition_id % self.num_buckets;
             let buffer = &mut self.buffers[bucket_id];
             buffer.row_ids.push(row_ids.value(row_idx));
-            buffer.partition_ids.push(partition_id as u32);
+            if self.num_buckets != self.num_partitions {
+                buffer.partition_ids.push(partition_id as u32);
+            }
             let start = row_idx * self.pq_code_width;
             let end = start + self.pq_code_width;
             buffer.pq_values.extend_from_slice(&pq_values[start..end]);
@@ -307,11 +309,20 @@ impl PartitionArtifactBuilder {
         }
 
         let buffer = &mut self.buffers[bucket_id];
-        let row_ids = UInt64Array::from(mem::take(&mut buffer.row_ids));
+        let row_ids = mem::take(&mut buffer.row_ids);
         let part_ids = mem::take(&mut buffer.partition_ids);
-        let pq_values = UInt8Array::from(mem::take(&mut buffer.pq_values));
+        let pq_values = mem::take(&mut buffer.pq_values);
         let total_rows = row_ids.len();
 
+        if self.num_buckets == self.num_partitions {
+            debug_assert!(part_ids.is_empty());
+            return self
+                .flush_single_partition_bucket(bucket_id, row_ids, pq_values, total_rows)
+                .await;
+        }
+
+        let row_ids = UInt64Array::from(row_ids);
+        let pq_values = UInt8Array::from(pq_values);
         let mut permutation = (0..total_rows).collect::<Vec<_>>();
         permutation.sort_unstable_by_key(|&idx| part_ids[idx]);
 
@@ -360,12 +371,65 @@ impl PartitionArtifactBuilder {
             UInt8Array::from(sorted_pq_values),
             self.pq_code_width as i32,
         )?;
+        self.write_bucket_batch(
+            bucket_id,
+            UInt64Array::from(sorted_row_ids),
+            pq_codes,
+            total_rows,
+        )
+        .await
+    }
+
+    /// Flush a bucket that maps exactly to one partition.
+    ///
+    /// When the number of buckets equals the number of partitions, all rows in
+    /// one bucket already belong to the same partition. Sorting by partition id
+    /// would only add CPU work and another PQ-code copy.
+    async fn flush_single_partition_bucket(
+        &mut self,
+        bucket_id: usize,
+        row_ids: Vec<u64>,
+        pq_values: Vec<u8>,
+        total_rows: usize,
+    ) -> Result<()> {
+        let file_offset = self.bucket_row_counts[bucket_id];
+        let final_relative_path = self.final_bucket_relative_path(bucket_id);
+        let partition = &mut self.partitions[bucket_id];
+        match &partition.path {
+            Some(existing) if existing != &final_relative_path => {
+                return Err(Error::io(format!(
+                    "partition {} is split across multiple bucket files: '{}' vs '{}'",
+                    bucket_id, existing, final_relative_path
+                )));
+            }
+            None => partition.path = Some(final_relative_path),
+            _ => {}
+        }
+        partition.num_rows += total_rows;
+        partition.ranges.push(PartitionArtifactRange {
+            offset: file_offset,
+            num_rows: total_rows as u64,
+        });
+
+        let pq_codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(pq_values),
+            self.pq_code_width as i32,
+        )?;
+        self.write_bucket_batch(bucket_id, UInt64Array::from(row_ids), pq_codes, total_rows)
+            .await
+    }
+
+    /// Write a finalized bucket batch and update the bucket row count.
+    async fn write_bucket_batch(
+        &mut self,
+        bucket_id: usize,
+        row_ids: UInt64Array,
+        pq_codes: FixedSizeListArray,
+        total_rows: usize,
+    ) -> Result<()> {
         let final_batch = RecordBatch::try_new(
             self.final_schema.clone(),
-            vec![
-                Arc::new(UInt64Array::from(sorted_row_ids)),
-                Arc::new(pq_codes),
-            ],
+            vec![Arc::new(row_ids), Arc::new(pq_codes)],
         )?;
         let writer = self.ensure_final_writer(bucket_id).await?;
         writer.write_batch(&final_batch).await?;
