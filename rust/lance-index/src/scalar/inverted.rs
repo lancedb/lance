@@ -254,7 +254,7 @@ impl BasicTrainer for InvertedIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for InvertedIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

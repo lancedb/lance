@@ -1323,7 +1323,7 @@ impl BasicTrainer for NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

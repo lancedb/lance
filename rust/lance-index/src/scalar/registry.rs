@@ -154,7 +154,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// An index can take both approaches.  Providing a simple (but maybe less
     /// efficient) stream-based trainer while also providing more specialized index
     /// creation methods elsewhere.
-    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         None
     }
 

@@ -684,7 +684,7 @@ impl BasicTrainer for JsonIndexPlugin {
         let params = serde_json::from_str::<JsonIndexParameters>(params)?;
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
-        let target_trainer = target_plugin.simple_trainer().ok_or_else(|| {
+        let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
                 format!("The '{}' index type does not support training", params.target_index_type).into(),
             )
@@ -723,7 +723,7 @@ impl BasicTrainer for JsonIndexPlugin {
         let target_plugin = registry.get_plugin_by_name(&request.parameters.target_index_type)?;
 
         // Create a new training request with the inferred type
-        let target_trainer = target_plugin.simple_trainer().ok_or_else(|| {
+        let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
             Error::invalid_input_source(
                 format!("The '{}' index type does not support training", request.parameters.target_index_type).into(),
             )
@@ -761,7 +761,7 @@ impl BasicTrainer for JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

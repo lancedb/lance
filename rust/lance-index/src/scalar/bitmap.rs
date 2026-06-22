@@ -1772,7 +1772,7 @@ impl BasicTrainer for BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 

@@ -297,7 +297,7 @@ pub(super) async fn build_scalar_index(
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
 
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
-    let trainer = plugin.simple_trainer().ok_or_else(|| {
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
         Error::invalid_input_source(
             format!("The '{}' index type does not support training", params.index_type).into(),
         )
@@ -359,7 +359,7 @@ pub(super) async fn build_bitmap_index_segment(
 
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
-    let trainer = plugin.simple_trainer().ok_or_else(|| {
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
         Error::invalid_input_source(
             format!("The '{}' index type does not support training", params.index_type).into(),
         )

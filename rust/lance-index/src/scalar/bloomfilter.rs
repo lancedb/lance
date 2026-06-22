@@ -1075,7 +1075,7 @@ impl BasicTrainer for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
-    fn simple_trainer(&self) -> Option<&dyn BasicTrainer> {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
 
