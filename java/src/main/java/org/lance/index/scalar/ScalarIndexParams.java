@@ -31,7 +31,7 @@ public class ScalarIndexParams {
    * Create a new ScalarIndexParams with the given index type and no parameters.
    *
    * @param indexType the index type (e.g., "btree", "zonemap", "bitmap", "inverted", "labellist",
-   *     "ngram")
+   *     "ngram", "rtree")
    * @return ScalarIndexParams
    */
   public static ScalarIndexParams create(String indexType) {
@@ -42,7 +42,7 @@ public class ScalarIndexParams {
    * Create a new ScalarIndexParams with the given index type and JSON parameters.
    *
    * @param indexType the index type (e.g., "btree", "zonemap", "bitmap", "inverted", "labellist",
-   *     "ngram")
+   *     "ngram", "rtree")
    * @param jsonParams JSON string containing index-specific parameters
    * @return ScalarIndexParams
    */
@@ -58,7 +58,7 @@ public class ScalarIndexParams {
      * Create a new builder for scalar index parameters.
      *
      * @param indexType the index type (e.g., "btree", "zonemap", "bitmap", "inverted", "labellist",
-     *     "ngram")
+     *     "ngram", "rtree")
      */
     public Builder(String indexType) {
       this.indexType = indexType;

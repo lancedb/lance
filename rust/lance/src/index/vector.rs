@@ -9,6 +9,7 @@ use std::{any::Any, collections::HashMap};
 
 pub mod builder;
 pub(crate) mod details;
+pub mod hamming;
 pub mod ivf;
 pub mod pq;
 pub mod utils;

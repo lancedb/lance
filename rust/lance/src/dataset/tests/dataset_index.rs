@@ -1138,6 +1138,78 @@ async fn test_fts_without_index() {
 }
 
 #[tokio::test]
+async fn test_fts_without_index_uses_scalar_index_for_prefilter() {
+    // Verify that flat FTS (no inverted index on text) routes its prefilter
+    // through `FilteredReadExec` so a scalar index on the filter column is
+    // actually used. Six rows with two distinct ids: a prefilter of `id = 1`
+    // must match exactly the three text rows tagged with id=1.
+    let text = StringArray::from(vec![
+        "alpha bravo",
+        "charlie delta",
+        "alpha echo",
+        "foxtrot",
+        "alpha golf",
+        "hotel india",
+    ]);
+    let ids = Int32Array::from(vec![1, 1, 1, 2, 2, 2]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            Field::new("text", text.data_type().to_owned(), false),
+            Field::new("id", ids.data_type().to_owned(), false),
+        ])
+        .into(),
+        vec![Arc::new(text) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+
+    // Scalar index on `id` only — no FTS index on `text`.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.prefilter(true)
+        .full_text_search(
+            FullTextSearchQuery::new("alpha".to_owned())
+                .with_columns(&["text".to_string()])
+                .unwrap(),
+        )
+        .unwrap()
+        .filter("id = 1")
+        .unwrap();
+
+    let plan = scan.analyze_plan().await.unwrap();
+    // The flat-FTS path now reads via `FilteredReadExec` (prints as `LanceRead`)
+    // with the prefilter plumbed into it, so the scalar index on `id` is used.
+    assert_contains!(&plan, "FlatMatchQuery");
+    assert_contains!(&plan, "LanceRead");
+    assert_contains!(&plan, "full_filter=id = Int32(1)");
+    // The legacy plan ran a `LanceScan` wrapped in a manual `LanceFilterExec`;
+    // make sure we did not regress to that shape.
+    assert_not_contains!(&plan, "LanceScan:");
+
+    let results = scan.try_into_batch().await.unwrap();
+    // Only rows with id=1 AND text matching "alpha": rows 0 ("alpha bravo")
+    // and 2 ("alpha echo"). Row 4 ("alpha golf") has id=2 and must be excluded.
+    assert_eq!(
+        results.num_rows(),
+        2,
+        "expected the two id=1 rows that match `alpha`, got plan:\n{plan}"
+    );
+}
+
+#[tokio::test]
 async fn test_fts_rank() {
     let params = InvertedIndexParams::default();
     let text_col =
@@ -2078,11 +2150,7 @@ mod fts_serializing_backend {
         ) -> Option<CacheEntry> {
             let guard = self.serialized.lock().await;
             if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return Some(
-                    stored_codec
-                        .deserialize(&bytes.clone())
-                        .expect("deserialization should succeed"),
-                );
+                return stored_codec.deserialize(&bytes.clone()).hit();
             }
             drop(guard);
             self.passthrough.get(key, codec).await

@@ -17,7 +17,6 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
@@ -64,7 +63,7 @@ pub(crate) async fn open_and_merge_segments(
     segments: &[&IndexMetadata],
     new_data: SendableRecordBatchStream,
     new_store: &LanceIndexStore,
-    old_data_filter: Option<OldIndexDataFilter>,
+    old_data_filters: &[Option<OldIndexDataFilter>],
 ) -> Result<CreatedIndex> {
     let mut source_indices = Vec::with_capacity(segments.len());
     for &segment in segments {
@@ -82,7 +81,7 @@ pub(crate) async fn open_and_merge_segments(
             })?;
         source_indices.push(Arc::new(btree.clone()));
     }
-    BTreeIndex::merge_segments(&source_indices, new_data, new_store, old_data_filter).await
+    BTreeIndex::merge_segments(&source_indices, new_data, new_store, old_data_filters).await
 }
 
 /// Merge one caller-defined group of source BTree segments into a single
@@ -118,48 +117,22 @@ pub(crate) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
-    // Intersect each segment's stored bitmap with the dataset's current
-    // fragments so we don't claim coverage on IDs that compaction or pruning
-    // has already retired.
-    let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    let mut effective_old_frags = RoaringBitmap::new();
-    let mut deleted_old_frags = RoaringBitmap::new();
-    for segment in &segments {
-        if segment.fragment_bitmap.is_none() {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            )));
-        }
-        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
-            effective_old_frags |= effective;
-        }
-        if let Some(deleted) = segment.deleted_fragment_bitmap(dataset_fragments) {
-            deleted_old_frags |= deleted;
-        }
-    }
-
-    let fragment_bitmap = effective_old_frags.clone();
-    let old_data_filter = crate::index::append::build_old_data_filter(
-        dataset,
-        &effective_old_frags,
-        &deleted_old_frags,
-    )
-    .await?;
+    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    let (fragment_bitmap, old_data_filters) =
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
 
     let output_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
     // Pure segment consolidation: no dataset scan, so `new_data` is an empty
     // stream and the merge is driven entirely by the source page data.
     let empty_new_data = empty_btree_update_stream(dataset, field_id)?;
-    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     let created_index = open_and_merge_segments(
         dataset,
         &field_path,
         &segment_refs,
         empty_new_data,
         &new_store,
-        old_data_filter,
+        &old_data_filters,
     )
     .await?;
 

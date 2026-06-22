@@ -2382,6 +2382,38 @@ pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
     FixedSizeListArray::try_new_from_values(UInt8Array::from(unpacked), code_len as i32).unwrap()
 }
 
+/// Build a row-id remapping for the rows present in this partition from a
+/// fragment-reuse index, mirroring the PQ storage frag-reuse path.
+///
+/// Returns `None` when there is nothing to do (no fragment-reuse index, or the
+/// index leaves every present row id unchanged), so callers keep the zero-cost
+/// no-op path. Otherwise, returns a `HashMap` mapping every affected old row id
+/// to `Some(new_id)` for surviving rows or `None` for rows whose covering
+/// fragment was compacted away, suitable for `RabitQuantizationStorage::remap`.
+fn build_frag_reuse_mapping(
+    fri: Option<&FragReuseIndex>,
+    row_ids: &UInt64Array,
+) -> Option<HashMap<u64, Option<u64>>> {
+    let fri = fri?;
+    if fri.row_id_maps.is_empty() {
+        return None;
+    }
+    let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
+    for row_id in row_ids.values().iter() {
+        match fri.remap_row_id(*row_id) {
+            Some(new_id) if new_id == *row_id => {}
+            mapped => {
+                mapping.insert(*row_id, mapped);
+            }
+        }
+    }
+    if mapping.is_empty() {
+        None
+    } else {
+        Some(mapping)
+    }
+}
+
 #[async_trait]
 impl QuantizerStorage for RabitQuantizationStorage {
     type Metadata = RabitQuantizationMetadata;
@@ -2390,7 +2422,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        _fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
@@ -2486,7 +2518,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let packed_ex_codes =
             maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref());
 
-        Ok(Self {
+        let storage = Self {
             metadata,
             batch,
             distance_type,
@@ -2499,7 +2531,12 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
-        })
+        };
+
+        match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
+            Some(mapping) => storage.remap(&mapping),
+            None => Ok(storage),
+        }
     }
 
     fn metadata(&self) -> &Self::Metadata {

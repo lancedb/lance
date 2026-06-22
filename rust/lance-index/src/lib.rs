@@ -68,6 +68,13 @@ pub mod pbold {
     include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
 }
 
+/// Protobuf headers for serialized index cache entries (FTS posting lists,
+/// scalar indices, and IVF vector partitions).
+pub mod cache_pb {
+    #![allow(clippy::use_self)]
+    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.rs"));
+}
+
 /// Generic methods common across all types of secondary indices
 ///
 #[async_trait]
@@ -77,9 +84,6 @@ pub trait Index: Send + Sync + DeepSizeOf {
 
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index>;
-
-    /// Cast to [vector::VectorIndex]
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn vector::VectorIndex>>;
 
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value>;

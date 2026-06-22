@@ -3701,12 +3701,7 @@ struct SerializedFullZip {
 //
 // If we directly record the size in bytes with 12 bits we would be limited to
 // 4KiB which is too small.  Since we know each mini-block consists of 8 byte
-// words we can store the # of words instead which gives us 32KiB.  We want
-// at least 24KiB so we can handle even the worst case of
-// - 4Ki values compressed into an 8186 byte buffer
-// - 4 bytes to describe rep & def lengths
-// - 16KiB of rep & def buffer (this will almost never happen but life is easier if we
-//   plan for it)
+// words we can store the # of words instead which gives us 32KiB.
 //
 // Second, each chunk in a mini-block is aligned to 8 bytes.  This allows multi-byte
 // values like offsets to be stored in a mini-block and safely read back out.  It also
@@ -3906,9 +3901,9 @@ impl PrimitiveStructuralEncoder {
     // 0xA)  All blocks except the last must have power-of-two number of values.
     // This not only makes metadata smaller but it makes decoding easier since
     // batch sizes are typically a power of 2.  4 bits would allow us to express
-    // up to 16Ki values but we restrict this further to 4Ki values.
+    // up to 32Ki values.
     //
-    // This means blocks can have 1 to 4Ki values and 8 - 32Ki bytes.
+    // This means blocks can have 1 to 32Ki values and 8 - 32Ki bytes.
     //
     // All metadata words are serialized (as little endian) into a single buffer
     // of metadata values.
@@ -4007,7 +4002,13 @@ impl PrimitiveStructuralEncoder {
                 }
             } else {
                 for &buffer_size in &chunk.buffer_sizes {
-                    data_buffer.extend_from_slice(&(buffer_size as u16).to_le_bytes());
+                    let buffer_size = u16::try_from(buffer_size).map_err(|_| {
+                        Error::internal(format!(
+                            "Mini-block buffer size ({} bytes) too large for 16-bit metadata",
+                            buffer_size
+                        ))
+                    })?;
+                    data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
                 }
             }
 
@@ -4041,15 +4042,28 @@ impl PrimitiveStructuralEncoder {
 
             let chunk_bytes = data_buffer.len() - start_pos;
             let max_chunk_size = if support_large_chunk {
-                4 * 1024 * 1024 * 1024 // 4GB limit with u32 metadata
+                1_u64 << 31 // 28 bits of 8-byte words in u32 metadata
             } else {
                 32 * 1024 // 32KiB limit with u16 metadata
             };
-            assert!(chunk_bytes <= max_chunk_size);
-            assert!(chunk_bytes > 0);
-            assert_eq!(chunk_bytes % 8, 0);
-            // 4Ki values max
-            assert!(chunk.log_num_values <= 12);
+            if chunk_bytes == 0 || chunk_bytes as u64 > max_chunk_size {
+                return Err(Error::internal(format!(
+                    "Mini-block chunk size {} bytes exceeds the {} byte metadata limit",
+                    chunk_bytes, max_chunk_size
+                )));
+            }
+            if chunk_bytes % MINIBLOCK_ALIGNMENT != 0 {
+                return Err(Error::internal(format!(
+                    "Mini-block chunk size {} bytes is not aligned to {} bytes",
+                    chunk_bytes, MINIBLOCK_ALIGNMENT
+                )));
+            }
+            if chunk.log_num_values > 15 {
+                return Err(Error::internal(format!(
+                    "Mini-block log_num_values {} exceeds the 4-bit metadata limit",
+                    chunk.log_num_values
+                )));
+            }
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
             // 0xFFF
@@ -5768,8 +5782,9 @@ mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
         FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, MiniBlockRepIndex, PerValueDecompressor,
-        PreambleAction, StructuralPageScheduler, VariableFullZipDecoder,
+        FullZipRepIndexDetails, FullZipScheduler, MiniBlockChunk, MiniBlockCompressed,
+        MiniBlockRepIndex, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
+        VariableFullZipDecoder,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::DefaultDecompressionStrategy;
@@ -6967,7 +6982,7 @@ mod tests {
     #[tokio::test]
     async fn test_binary_large_minichunk_size_over_max_miniblock_values() {
         let mut string_data = Vec::new();
-        // 128kb/chunk / 6 bytes (t_9999) = 21845 > max 4096 items per chunk
+        // 128kb/chunk / 6 bytes (t_9999) = 21845 items per chunk
         for i in 0..10000 {
             string_data.push(Some(format!("t_{}", i)));
         }
@@ -7563,6 +7578,36 @@ mod tests {
         assert!(
             result.is_none(),
             "Should not probe dictionary encoding for near-unique data"
+        );
+    }
+
+    #[test]
+    fn test_v2_1_miniblock_serializes_log_num_values_15() {
+        let miniblocks = MiniBlockCompressed {
+            data: vec![LanceBuffer::from(vec![1_u8; 16])],
+            chunks: vec![
+                MiniBlockChunk {
+                    buffer_sizes: vec![8],
+                    log_num_values: 15,
+                },
+                MiniBlockChunk {
+                    buffer_sizes: vec![8],
+                    log_num_values: 0,
+                },
+            ],
+            num_values: 32_769,
+        };
+
+        let serialized =
+            PrimitiveStructuralEncoder::serialize_miniblocks(miniblocks, None, None, false)
+                .unwrap();
+
+        let chunk_metadata = serialized.metadata.borrow_to_typed_slice::<u16>();
+        assert_eq!(chunk_metadata.len(), 2);
+        assert_eq!(
+            chunk_metadata[0] & 0x0F,
+            15,
+            "V2.1 metadata should use all 4 bits for log_num_values"
         );
     }
 
