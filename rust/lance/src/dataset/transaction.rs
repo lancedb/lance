@@ -2070,17 +2070,27 @@ impl Transaction {
                     next_row_id.as_ref(),
                 )?;
 
+                let live_fragments: RoaringBitmap =
+                    final_fragments.iter().map(|f| f.id as u32).collect();
                 if next_row_id.is_some() {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap =
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                            *fragment_bitmap = Self::recalculate_fragment_bitmap(
+                                fragment_bitmap,
+                                groups,
+                                &live_fragments,
+                            )?;
                         }
                     }
                 } else {
-                    Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                    Self::handle_rewrite_indices(
+                        &mut final_indices,
+                        rewritten_indices,
+                        groups,
+                        &live_fragments,
+                    )?;
                 }
 
                 if let Some(frag_reuse_index) = frag_reuse_index {
@@ -2744,6 +2754,7 @@ impl Transaction {
     fn recalculate_fragment_bitmap(
         old: &RoaringBitmap,
         groups: &[RewriteGroup],
+        live_fragments: &RoaringBitmap,
     ) -> Result<RoaringBitmap> {
         let mut new_bitmap = old.clone();
         for group in groups {
@@ -2772,6 +2783,12 @@ impl Transaction {
                 }
             }
         }
+        // Drop fragments that are no longer in the dataset (fully deleted before
+        // this compaction). They were never part of a rewrite group, so the loop
+        // above leaves them in coverage; trimming them here keeps index searches
+        // on the fast path. The corresponding index data is dropped during the
+        // remap (see index::deleted_fragment_row_id_drops).
+        new_bitmap &= live_fragments;
         Ok(new_bitmap)
     }
 
@@ -2779,6 +2796,7 @@ impl Transaction {
         indices: &mut [IndexMetadata],
         rewritten_indices: &[RewrittenIndex],
         groups: &[RewriteGroup],
+        live_fragments: &RoaringBitmap,
     ) -> Result<()> {
         let mut modified_indices = HashSet::new();
 
@@ -2806,6 +2824,7 @@ impl Transaction {
                     ))
                 })?,
                 groups,
+                live_fragments,
             )?);
             index.uuid = rewritten_index.new_id;
             // Update file sizes to match the new index files. When not available
@@ -4816,7 +4835,12 @@ mod tests {
         }];
 
         // Should succeed (skip missing index) instead of error
-        let result = Transaction::handle_rewrite_indices(&mut indices, &rewritten_indices, &[]);
+        let result = Transaction::handle_rewrite_indices(
+            &mut indices,
+            &rewritten_indices,
+            &[],
+            &RoaringBitmap::new(),
+        );
         assert!(result.is_ok());
         assert!(indices.is_empty());
     }
