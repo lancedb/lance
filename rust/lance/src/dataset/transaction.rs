@@ -1960,6 +1960,27 @@ impl Transaction {
                         if fragment.last_updated_at_version_meta.is_none() {
                             continue;
                         }
+                        let max_allowed = existing_fragments
+                            .iter()
+                            .find(|f| f.id == fragment.id)
+                            .and_then(|f| f.physical_rows)
+                            .unwrap_or(1 << 24);
+                        if bitmap.len() as usize > max_allowed {
+                            return Err(Error::invalid_input(format!(
+                                "updatedFragmentOffsets cardinality {} exceeds fragment {} limit {}",
+                                bitmap.len(),
+                                fragment.id,
+                                max_allowed
+                            )));
+                        }
+                        if let Some(max_off) = bitmap.max()
+                            && max_off as usize >= max_allowed
+                        {
+                            return Err(Error::invalid_input(format!(
+                                "updatedFragmentOffsets max offset {} exceeds fragment {} limit {}",
+                                max_off, fragment.id, max_allowed
+                            )));
+                        }
                         let offsets: Vec<usize> = bitmap.iter().map(|o| o as usize).collect();
                         lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                             fragment,
