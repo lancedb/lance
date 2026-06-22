@@ -38,6 +38,7 @@ use super::{
 use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
+const AND_WIDE_MAX_SCORE_LOOSENING_RATIO: f32 = 1.001;
 
 pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
@@ -128,6 +129,11 @@ struct BlockMaxWindow {
     max_scores: VecDeque<(usize, f32)>,
 }
 
+struct BlockMaxScore {
+    score: f32,
+    blocks_scanned: usize,
+}
+
 impl BlockMaxWindow {
     fn new() -> Self {
         Self {
@@ -148,10 +154,13 @@ impl BlockMaxWindow {
         list: &CompressedPostingList,
         start_block_idx: usize,
         up_to: u64,
-    ) -> f32 {
+    ) -> BlockMaxScore {
         if start_block_idx >= list.blocks.len() {
             self.reset(start_block_idx);
-            return 0.0;
+            return BlockMaxScore {
+                score: 0.0,
+                blocks_scanned: 0,
+            };
         }
         if start_block_idx < self.start_block_idx || start_block_idx > self.next_block_idx {
             self.reset(start_block_idx);
@@ -164,10 +173,14 @@ impl BlockMaxWindow {
 
         if list.block_least_doc_id(start_block_idx) as u64 > up_to {
             self.reset(start_block_idx);
-            return 0.0;
+            return BlockMaxScore {
+                score: 0.0,
+                blocks_scanned: 0,
+            };
         }
 
         self.next_block_idx = self.next_block_idx.max(start_block_idx);
+        let mut blocks_scanned = 0;
         while self.next_block_idx < list.blocks.len()
             && list.block_least_doc_id(self.next_block_idx) as u64 <= up_to
         {
@@ -177,12 +190,18 @@ impl BlockMaxWindow {
             }
             self.max_scores.push_back((self.next_block_idx, score));
             self.next_block_idx += 1;
+            blocks_scanned += 1;
         }
 
-        self.max_scores
+        let score = self
+            .max_scores
             .front()
             .map(|(_, score)| *score)
-            .unwrap_or(0.0)
+            .unwrap_or(0.0);
+        BlockMaxScore {
+            score,
+            blocks_scanned,
+        }
     }
 }
 
@@ -485,7 +504,7 @@ impl PostingIterator {
     }
 
     #[inline]
-    fn block_max_score_up_to(&mut self, up_to: u64) -> f32 {
+    fn block_max_score_up_to_with_stats(&mut self, up_to: u64) -> BlockMaxScore {
         match self.list {
             PostingList::Compressed(ref list) => {
                 let compressed = unsafe { &mut *self.compressed_state_ptr() };
@@ -493,8 +512,16 @@ impl PostingIterator {
                     .block_max_window
                     .max_score_up_to(list, self.block_idx, up_to)
             }
-            PostingList::Plain(_) => self.approximate_upper_bound,
+            PostingList::Plain(_) => BlockMaxScore {
+                score: self.approximate_upper_bound,
+                blocks_scanned: 0,
+            },
         }
+    }
+
+    #[inline]
+    fn is_compressed(&self) -> bool {
+        matches!(self.list, PostingList::Compressed(_))
     }
 
     fn block_first_doc(&self) -> Option<u64> {
@@ -622,6 +649,15 @@ impl PartialEq for TailPosting {
     }
 }
 
+#[derive(Default)]
+struct AndWindowStats {
+    windows_wide: usize,
+    windows_narrow: usize,
+    windows_skipped: usize,
+    range_blocks_scanned: usize,
+    candidates_returned: usize,
+}
+
 impl Eq for TailPosting {}
 
 impl PartialOrd for TailPosting {
@@ -670,6 +706,7 @@ pub struct Wand<'a, S: Scorer> {
     // Last conjunction doc returned to the caller. The next conjunction search
     // resumes strictly after this doc, like Lucene's `nextDoc()/advance()`.
     and_last_doc: Option<u64>,
+    and_window_stats: AndWindowStats,
     docs: &'a DocSet,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -732,6 +769,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             up_to: None,
             and_max_score: f32::INFINITY,
             and_last_doc: None,
+            and_window_stats: AndWindowStats::default(),
             docs,
             scorer,
             shared_threshold: None,
@@ -807,6 +845,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 break;
             };
             num_comparisons += 1;
+            if self.operator == Operator::And {
+                self.and_window_stats.candidates_returned += 1;
+            }
 
             // Either a real row_id (so we can run the mask check
             // inline) or the doc_id widened to u64 (deferred path;
@@ -878,6 +919,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
             }
+        }
+        if self.operator == Operator::And {
+            tracing::debug!(
+                and_windows_wide = self.and_window_stats.windows_wide,
+                and_windows_narrow = self.and_window_stats.windows_narrow,
+                and_windows_skipped = self.and_window_stats.windows_skipped,
+                and_range_blocks_scanned = self.and_window_stats.range_blocks_scanned,
+                and_candidates_returned = self.and_window_stats.candidates_returned,
+                "fts conjunction block-max window stats"
+            );
         }
         metrics.record_comparisons(num_comparisons);
 
@@ -1160,6 +1211,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
     }
 
+    fn posting_block_up_to(posting: &PostingIterator, target: u64) -> u64 {
+        posting
+            .next_block_first_doc()
+            .map(|doc| doc.saturating_sub(1))
+            .unwrap_or(TERMINATED_DOC_ID)
+            .max(target)
+    }
+
     fn and_move_to_next_block(&mut self, target: u64) {
         if self.threshold <= 0.0 {
             self.up_to = Some(target);
@@ -1167,26 +1226,59 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return;
         }
 
-        let Some((lead, followers)) = self.lead.split_first_mut() else {
+        if self.lead.is_empty() {
             self.up_to = Some(TERMINATED_DOC_ID);
             self.and_max_score = 0.0;
             return;
-        };
-
-        lead.shallow_next(target);
-        let up_to = lead
-            .next_block_first_doc()
-            .map(|doc| doc.saturating_sub(1))
-            .unwrap_or(TERMINATED_DOC_ID)
-            .max(target);
-
-        let mut max_score = lead.block_max_score_up_to(up_to);
-        for posting in followers {
-            posting.shallow_next(target);
-            max_score += posting.block_max_score_up_to(up_to);
         }
-        self.up_to = Some(up_to);
-        self.and_max_score = max_score;
+
+        for posting in &mut self.lead {
+            posting.shallow_next(target);
+        }
+
+        let narrow_up_to = self
+            .lead
+            .iter()
+            .map(|posting| Self::posting_block_up_to(posting, target))
+            .min()
+            .unwrap_or(TERMINATED_DOC_ID);
+        let narrow_max_score = self
+            .lead
+            .iter()
+            .map(|posting| posting.block_max_score())
+            .sum::<f32>();
+
+        let lead_up_to = self
+            .lead
+            .first()
+            .map(|posting| Self::posting_block_up_to(posting, target))
+            .unwrap_or(TERMINATED_DOC_ID);
+        let can_try_wide = narrow_max_score >= self.threshold
+            && lead_up_to > narrow_up_to
+            && lead_up_to != TERMINATED_DOC_ID
+            && self.lead.iter().all(|posting| posting.is_compressed());
+
+        if can_try_wide {
+            let mut wide_max_score = 0.0;
+            let mut range_blocks_scanned = 0;
+            for posting in &mut self.lead {
+                let block_max = posting.block_max_score_up_to_with_stats(lead_up_to);
+                wide_max_score += block_max.score;
+                range_blocks_scanned += block_max.blocks_scanned;
+            }
+            self.and_window_stats.range_blocks_scanned += range_blocks_scanned;
+
+            if wide_max_score <= narrow_max_score * AND_WIDE_MAX_SCORE_LOOSENING_RATIO {
+                self.up_to = Some(lead_up_to);
+                self.and_max_score = wide_max_score;
+                self.and_window_stats.windows_wide += 1;
+                return;
+            }
+        }
+
+        self.up_to = Some(narrow_up_to);
+        self.and_max_score = narrow_max_score;
+        self.and_window_stats.windows_narrow += 1;
     }
 
     fn and_advance_target(&mut self, mut target: u64) -> u64 {
@@ -1201,6 +1293,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if self.and_max_score >= self.threshold {
                 return target;
             }
+            self.and_window_stats.windows_skipped += 1;
             if up_to == TERMINATED_DOC_ID {
                 return TERMINATED_DOC_ID;
             }
@@ -2235,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_and_advance_uses_lead_up_to_with_follower_range_max() {
+    fn test_and_advance_falls_back_to_narrow_when_range_max_loosens_bound() {
         let total = 4 * BLOCK_SIZE as u32;
         let mut docs = DocSet::default();
         for i in 0..total {
@@ -2268,13 +2361,58 @@ mod tests {
 
         let target = wand.and_advance_target(0);
 
-        assert_eq!(target, 0);
+        assert_eq!(target, BLOCK_SIZE as u64);
         assert_eq!(wand.up_to, Some((2 * BLOCK_SIZE - 1) as u64));
         assert!(
             (wand.and_max_score - 11.0).abs() < 1e-6,
-            "expected lead block max plus follower range max, got {}",
+            "expected the second narrow window to include the high follower block, got {}",
             wand.and_max_score
         );
+        assert_eq!(wand.and_window_stats.windows_wide, 0);
+        assert_eq!(wand.and_window_stats.windows_narrow, 2);
+        assert_eq!(wand.and_window_stats.windows_skipped, 1);
+    }
+
+    #[test]
+    fn test_and_advance_uses_wide_window_when_bound_stays_tight() {
+        let total = 4 * BLOCK_SIZE as u32;
+        let mut docs = DocSet::default();
+        for i in 0..total {
+            docs.append(i as u64, 1);
+        }
+
+        let lead_docs = (0..total).step_by(2).collect::<Vec<_>>();
+        let follower_docs = (0..total).collect::<Vec<_>>();
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("lead"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(lead_docs, 1.0, Some(vec![1.0, 1.0]), true),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("follower"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(follower_docs, 1.0, Some(vec![1.0, 1.0, 1.0, 1.0]), true),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+        wand.threshold = 1.5;
+
+        let target = wand.and_advance_target(0);
+
+        assert_eq!(target, 0);
+        assert_eq!(wand.up_to, Some((2 * BLOCK_SIZE - 1) as u64));
+        assert!((wand.and_max_score - 2.0).abs() < 1e-6);
+        assert_eq!(wand.and_window_stats.windows_wide, 1);
+        assert_eq!(wand.and_window_stats.windows_narrow, 0);
+        assert_eq!(wand.and_window_stats.range_blocks_scanned, 3);
     }
 
     #[test]
@@ -2347,19 +2485,25 @@ mod tests {
 
         posting.shallow_next(0);
         assert_eq!(
-            posting.block_max_score_up_to((3 * BLOCK_SIZE - 1) as u64),
+            posting
+                .block_max_score_up_to_with_stats((3 * BLOCK_SIZE - 1) as u64)
+                .score,
             4.0
         );
 
         posting.shallow_next((2 * BLOCK_SIZE) as u64);
         assert_eq!(
-            posting.block_max_score_up_to((4 * BLOCK_SIZE - 1) as u64),
+            posting
+                .block_max_score_up_to_with_stats((4 * BLOCK_SIZE - 1) as u64)
+                .score,
             5.0
         );
 
         posting.shallow_next((4 * BLOCK_SIZE) as u64);
         assert_eq!(
-            posting.block_max_score_up_to((5 * BLOCK_SIZE - 1) as u64),
+            posting
+                .block_max_score_up_to_with_stats((5 * BLOCK_SIZE - 1) as u64)
+                .score,
             3.0
         );
     }
