@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use lance_core::datatypes::Schema;
@@ -51,6 +51,7 @@ use super::scanner::GenerationWarmer;
 use super::wal::{
     TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, WalTailer, empty_flush_result,
 };
+use super::{TOMBSTONE, schema_with_tombstone};
 
 use super::manifest::ShardManifestStore;
 
@@ -849,7 +850,16 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    memtable.insert_batches_only(entry.batches).await?;
+                    // Entries written before deletes existed lack `_tombstone`;
+                    // inject `false` so they match the extended memtable schema.
+                    // Normal entries already carry it and pass through unchanged.
+                    let target_schema = memtable.schema().clone();
+                    let batches = entry
+                        .batches
+                        .into_iter()
+                        .map(|b| ensure_tombstone_column(b, &target_schema))
+                        .collect::<Result<Vec<_>>>()?;
+                    memtable.insert_batches_only(batches).await?;
                 }
                 position = position.checked_add(1).ok_or_else(|| {
                     Error::io(format!(
@@ -894,6 +904,69 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .cloned()
         .zip(pk_field_ids.iter().copied())
         .collect()
+}
+
+/// Ensure `batch` carries the `_tombstone` column required by the extended
+/// memtable schema, injecting `false` for every row when it is absent.
+///
+/// Used on the normal write path ([`ShardWriter::put`]) where callers pass
+/// base-shaped batches, and on WAL replay of entries written before deletes
+/// existed (legacy entries lack the column). A batch that already carries
+/// `_tombstone` (a normal replayed entry) is returned unchanged.
+fn ensure_tombstone_column(
+    batch: RecordBatch,
+    target_schema: &Arc<ArrowSchema>,
+) -> Result<RecordBatch> {
+    if batch.schema().column_with_name(TOMBSTONE).is_some() {
+        return Ok(batch);
+    }
+    let n = batch.num_rows();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(Arc::new(BooleanArray::from(vec![false; n])));
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+        Error::invalid_input(format!(
+            "failed to inject _tombstone column (does the batch match the base schema?): {}",
+            e
+        ))
+    })
+}
+
+/// Build a tombstone batch from a key-only `keys` batch: the primary key
+/// columns are carried through, `_tombstone` is set to `true`, and every other
+/// column in the memtable schema is null.
+///
+/// Errors if `keys` is missing a primary key column, or if a non-PK column is
+/// non-nullable (a tombstone must null it) — surfaced via the `RecordBatch`
+/// validation.
+fn build_tombstone_batch(
+    keys: &RecordBatch,
+    target_schema: &Arc<ArrowSchema>,
+    pk_columns: &[String],
+) -> Result<RecordBatch> {
+    let n = keys.num_rows();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target_schema.fields().len());
+    for field in target_schema.fields() {
+        let name = field.name();
+        if name == TOMBSTONE {
+            columns.push(Arc::new(BooleanArray::from(vec![true; n])));
+        } else if pk_columns.iter().any(|c| c == name) {
+            let col = keys.column_by_name(name).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "delete keys batch is missing primary key column '{}'",
+                    name
+                ))
+            })?;
+            columns.push(col.clone());
+        } else {
+            columns.push(new_null_array(field.data_type(), n));
+        }
+    }
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+        Error::invalid_input(format!(
+            "failed to build tombstone batch (is every non-primary-key column nullable?): {}",
+            e
+        ))
+    })
 }
 
 /// Shared state for writer operations.
@@ -1233,6 +1306,11 @@ impl ShardWriter {
             ));
         }
 
+        // Callers pass the base schema; lance owns the `_tombstone` column and
+        // appends it here so the memtable/generation schema = base + tombstone.
+        // Idempotent, so a reopen that already extended the schema is a no-op.
+        let schema = schema_with_tombstone(&schema);
+
         let base_uri = base_uri.into();
         let shard_id = config.shard_id;
         let manifest_store = Arc::new(ShardManifestStore::new(
@@ -1543,6 +1621,13 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
+                // Inject `_tombstone = false` so the batch matches the
+                // extended memtable schema; callers only ever pass base-shaped
+                // batches and never name the column.
+                let batches = batches
+                    .into_iter()
+                    .map(|b| ensure_tombstone_column(b, &writer_state.schema))
+                    .collect::<Result<Vec<_>>>()?;
                 self.put_memtable(batches, state, writer_state, backpressure)
                     .await
             }
@@ -1555,6 +1640,65 @@ impl ShardWriter {
                 self.put_wal_only(batches, state, wal_flush_tx, trigger, backpressure)
                     .await
             }
+        }
+    }
+
+    /// Delete rows by primary key.
+    ///
+    /// Each batch in `keys` must carry the shard's primary key column(s); other
+    /// columns are ignored. lance builds a tombstone row per key — the primary
+    /// key plus `_tombstone = true` and null in every other column — and
+    /// appends it like an ordinary write. The tombstone is the newest value for
+    /// its key: it wins newest-per-PK resolution (suppressing the older real
+    /// row) and is then dropped from query results.
+    ///
+    /// Only supported in memtable mode. Because a tombstone nulls every non-PK
+    /// column, those columns must be nullable in the base schema; a delete
+    /// against a schema with a non-nullable non-PK column errors.
+    ///
+    /// ```
+    /// # use lance::Result;
+    /// # use lance::dataset::mem_wal::ShardWriter;
+    /// # use arrow_array::RecordBatch;
+    /// # async fn doc(writer: &ShardWriter, keys: Vec<RecordBatch>) -> Result<()> {
+    /// writer.delete(keys).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(name = "sw_delete", level = "info", skip_all, fields(batch_count = keys.len(), shard_id = %self.config.shard_id))]
+    pub async fn delete(&self, keys: Vec<RecordBatch>) -> Result<WriteResult> {
+        if keys.is_empty() {
+            return Err(Error::invalid_input("Cannot delete with empty key list"));
+        }
+        for (i, batch) in keys.iter().enumerate() {
+            if batch.num_rows() == 0 {
+                return Err(Error::invalid_input(format!("Key batch {} is empty", i)));
+            }
+        }
+
+        match &self.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                backpressure,
+            } => {
+                if writer_state.pk_columns.is_empty() {
+                    return Err(Error::invalid_input(
+                        "delete requires a primary key, but this shard has no primary key columns",
+                    ));
+                }
+                let tombstones = keys
+                    .into_iter()
+                    .map(|k| {
+                        build_tombstone_batch(&k, &writer_state.schema, &writer_state.pk_columns)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_memtable(tombstones, state, writer_state, backpressure)
+                    .await
+            }
+            WriterMode::WalOnly { .. } => Err(Error::invalid_input(
+                "delete is only supported in memtable mode (enable_memtable = true)",
+            )),
         }
     }
 
@@ -2747,6 +2891,203 @@ mod tests {
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
         (store, path, uri, temp_dir)
+    }
+
+    /// Base schema with `id` marked as the unenforced primary key (delete needs
+    /// a PK). `name` is nullable so a tombstone can null it.
+    fn create_pk_test_schema() -> Arc<ArrowSchema> {
+        let mut id_metadata = std::collections::HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id = Field::new("id", DataType::Int32, false).with_metadata(id_metadata);
+        Arc::new(ArrowSchema::new(vec![
+            id,
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    fn id_only_keys(ids: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_ensure_tombstone_column_injects_false() {
+        let base = create_test_schema();
+        let target = schema_with_tombstone(&base);
+        let out = ensure_tombstone_column(create_test_batch(&base, 0, 3), &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let ts = out
+            .column_by_name(TOMBSTONE)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(
+            (0..3).all(|i| !ts.value(i)),
+            "put injects _tombstone = false"
+        );
+        // Idempotent: a batch already carrying the column passes through.
+        let again = ensure_tombstone_column(out.clone(), &target).unwrap();
+        assert_eq!(again.schema(), out.schema());
+    }
+
+    #[test]
+    fn test_build_tombstone_batch_shape() {
+        let target = schema_with_tombstone(&create_test_schema());
+        let tomb =
+            build_tombstone_batch(&id_only_keys(&[5, 7]), &target, &["id".to_string()]).unwrap();
+        assert_eq!(tomb.schema(), target);
+        assert_eq!(tomb.num_rows(), 2);
+        let ids = tomb
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[5, 7]);
+        let name = tomb.column_by_name("name").unwrap();
+        assert!(
+            name.is_null(0) && name.is_null(1),
+            "non-PK columns are null in a tombstone"
+        );
+        let ts = tomb
+            .column_by_name(TOMBSTONE)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(ts.value(0) && ts.value(1), "_tombstone = true");
+    }
+
+    #[test]
+    fn test_build_tombstone_batch_missing_pk_errors() {
+        let target = schema_with_tombstone(&create_test_schema());
+        let keys = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "other",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        assert!(build_tombstone_batch(&keys, &target, &["id".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_build_tombstone_batch_non_nullable_nonpk_errors() {
+        // A tombstone must null every non-PK column; a non-nullable one fails.
+        let base = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let target = schema_with_tombstone(&base);
+        assert!(build_tombstone_batch(&id_only_keys(&[1]), &target, &["id".to_string()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_shard_writer_delete_round_trip() {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+        use futures::TryStreamExt;
+
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            ..Default::default()
+        };
+        let shard_id = config.shard_id;
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // ids 0..5, then delete id=2.
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.delete(vec![id_only_keys(&[2])]).await.unwrap();
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri,
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let arr = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..arr.len()).map(|i| arr.value(i)));
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0, 1, 3, 4],
+            "id=2 deleted; tombstone not surfaced"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_validation_errors() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+
+        // No primary key on the schema → delete is rejected.
+        let no_pk = create_test_schema();
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                durable_write: false,
+                ..Default::default()
+            },
+            no_pk,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(
+            writer.delete(vec![id_only_keys(&[1])]).await.is_err(),
+            "delete without a primary key must error"
+        );
+        // Empty key list is rejected.
+        assert!(writer.delete(vec![]).await.is_err());
+        writer.close().await.unwrap();
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
