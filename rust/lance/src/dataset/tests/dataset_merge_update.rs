@@ -1742,6 +1742,405 @@ async fn test_update_struct_column_keeps_nested_index() {
     assert_eq!(old.num_rows(), 0, "s.x=20 should no longer match any row");
 }
 
+/// Sum a named execution metric (e.g. `fragments_scanned`) across every node of a
+/// physical plan. Used to observe FilteredReadExec data-scan behavior.
+fn sum_scan_metric(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, name: &str) -> usize {
+    let mut total = plan
+        .metrics()
+        .and_then(|m| m.sum_by_name(name))
+        .map(|v| v.as_usize())
+        .unwrap_or(0);
+    for child in plan.children() {
+        total += sum_scan_metric(child, name);
+    }
+    total
+}
+
+/// Control: with stable row ids, a merge_insert full-row update of a *flat*
+/// indexed column is handled correctly. The flat field's id is in
+/// `fields_for_preserving_frag_bitmap`, so the RewriteRows index-maintenance path
+/// does NOT extend the index bitmap to the rewritten fragment; that fragment stays
+/// unindexed and is fully scanned, so the new value is found and the old is not.
+/// Contrast with `test_merge_insert_nested_index_stable_row_id`.
+#[tokio::test]
+async fn test_merge_insert_flat_index_stable_row_id() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("val", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_mi_flat_index",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // BTree index on the flat indexed column `val`.
+    dataset
+        .create_index(
+            &["val"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Sanity: index returns id=2 for val=20 before the update.
+    let pre = dataset
+        .scan()
+        .filter("val = 20")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(pre.num_rows(), 1, "precondition: val=20 should match id=2");
+
+    // Full-row update of id=2 changing val 20 -> 999. Only id=2 is in the source
+    // (all matched, no inserts) so the new fragment is a pure rewrite-rows fragment.
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(Int32Array::from(vec![999])),
+        ],
+    )
+    .unwrap();
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(vec![Ok(source)], schema.clone()));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+
+    // Index bitmap coverage: the guard did NOT extend the bitmap, so the index
+    // still covers only the original fragment 0, not the rewritten fragment.
+    let val_idx = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|i| i.name == "val_idx")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        val_idx
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![0],
+        "flat index must not be extended to the rewritten fragment"
+    );
+
+    // The scan is PARTIALLY indexed, not fully indexed: the index's effective
+    // coverage ({0}) is a strict subset of the live fragments ({0, 1}), so the
+    // rewritten fragment is left to a full scan.
+    assert_eq!(
+        dataset.fragment_bitmap.iter().collect::<Vec<_>>(),
+        vec![0, 1],
+        "the update should have produced a second fragment"
+    );
+    let effective = val_idx
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .expect("index has a fragment bitmap");
+    assert_eq!(
+        effective.iter().collect::<Vec<_>>(),
+        vec![0],
+        "index effectively covers only fragment 0"
+    );
+    assert!(
+        effective.len() < dataset.fragment_bitmap.len(),
+        "scan must be partially indexed: the rewritten fragment is not covered by the index"
+    );
+
+    // Project only _rowid. The scan is PARTIALLY indexed: because the rewritten
+    // fragment is not covered by the index, FilteredReadExec must DATA-SCAN it to
+    // surface the moved value, which shows up in its `fragments_scanned` metric.
+    let mut scanner = dataset.scan();
+    scanner
+        .empty_project()
+        .unwrap()
+        .with_row_id()
+        .filter("val = 999")
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+    let batches = datafusion::physical_plan::collect(
+        plan.clone(),
+        Arc::new(datafusion::execution::TaskContext::default()),
+    )
+    .await
+    .unwrap();
+    // Exactly one fragment — the uncovered (rewritten) one — is data-scanned.
+    let fragments_scanned = sum_scan_metric(&plan, "fragments_scanned");
+    assert_eq!(
+        fragments_scanned, 1,
+        "partially-indexed scan must data-scan exactly the one uncovered fragment, but fragments_scanned={fragments_scanned}"
+    );
+    let val999_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        val999_rows, 1,
+        "val=999 lives only in the unindexed fragment and must be found by the full scan"
+    );
+
+    // The stale old value is gone (the index-covered fragment's row was moved out).
+    let val20_rows = dataset
+        .scan()
+        .empty_project()
+        .unwrap()
+        .with_row_id()
+        .filter("val = 20")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()
+        .num_rows();
+    assert_eq!(val20_rows, 0, "val=20 should no longer match any row");
+}
+
+/// With stable row ids, a full-row merge_insert update of a column covered by a
+/// NESTED-field scalar index keeps that index correct.
+///
+/// The updated row keeps its row id and moves to a new fragment.
+/// `register_pure_rewrite_rows_update_frags_in_indices` decides whether to extend each
+/// index's bitmap to that new fragment by testing `index.fields` against
+/// `fields_for_preserving_frag_bitmap`, which merge_insert builds via `fields_pre_order()`
+/// so that nested leaf ids are included. The nested `s.x` index must therefore NOT be
+/// extended over the rewritten fragment: that fragment stays unindexed and is fully
+/// scanned, so the updated value is found.
+///
+/// Regression guard: before the fix the set was built from top-level `schema().fields`,
+/// omitting the nested leaf id, so the index was wrongly extended over the rewritten
+/// fragment and the updated value was silently dropped.
+#[tokio::test]
+async fn test_merge_insert_nested_index_stable_row_id() {
+    let struct_fields = Fields::from(vec![ArrowField::new("x", DataType::Int32, false)]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("s", DataType::Struct(struct_fields.clone()), false),
+    ]));
+    let make_batch = |ids: Vec<i32>, xs: Vec<i32>| {
+        let s = StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(Int32Array::from(xs)) as ArrayRef],
+            None,
+        );
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(s) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let reader = RecordBatchIterator::new(
+        vec![Ok(make_batch(vec![1, 2, 3], vec![10, 20, 30]))],
+        schema.clone(),
+    );
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_mi_nested_index",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // BTree index on the NESTED field `s.x`.
+    dataset
+        .create_index(
+            &["s.x"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Sanity: index finds id=2 for s.x = 20.
+    let pre = dataset
+        .scan()
+        .filter("s.x = 20")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(pre.num_rows(), 1, "precondition: s.x=20 should match id=2");
+
+    // Full-row merge_insert update of id=2 changing s.x 20 -> 999 (pure rewrite-rows fragment).
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(make_batch(vec![2], vec![999]))],
+        schema.clone(),
+    ));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+
+    // The rewritten fragment must NOT be covered by the nested `s.x` index, so
+    // FilteredReadExec data-scans exactly that one fragment and finds the updated value.
+    // (Before the fix the index was wrongly extended over the rewritten fragment, so it
+    // was never data-scanned — fragments_scanned == 0 — and the value was dropped.)
+    let mut scanner = dataset.scan();
+    scanner
+        .empty_project()
+        .unwrap()
+        .with_row_id()
+        .filter("s.x = 999")
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+    let batches = datafusion::physical_plan::collect(
+        plan.clone(),
+        Arc::new(datafusion::execution::TaskContext::default()),
+    )
+    .await
+    .unwrap();
+    let fragments_scanned = sum_scan_metric(&plan, "fragments_scanned");
+    assert_eq!(
+        fragments_scanned, 1,
+        "the rewritten fragment must be data-scanned exactly once, but fragments_scanned={fragments_scanned}"
+    );
+    let sx999_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        sx999_rows, 1,
+        "updated value s.x=999 must be found after the nested-field merge_insert update"
+    );
+}
+
+/// With stable row ids, a merge_insert full-row update invalidates EVERY column index
+/// for the rewritten rows — not only indices on columns that actually changed — because
+/// merge_insert treats the whole schema as modified (it does not detect which columns
+/// changed). Here `col1` is updated and `col2` is left unchanged, yet both `col1_idx`
+/// and `col2_idx` drop the rewritten fragment from their coverage.
+#[tokio::test]
+async fn test_merge_insert_flat_index_stable_row_id_multiple_indexes() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("col1", DataType::Int32, false),
+        ArrowField::new("col2", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_mi_flat_multi_index",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    for col in ["col1", "col2"] {
+        dataset
+            .create_index(
+                &[col],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Full-row update of id=1: col1 10 -> 999, col2 left unchanged (100).
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![999])),
+            Arc::new(Int32Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(vec![Ok(source)], schema.clone()));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+
+    // The update produced a second fragment holding the rewritten row id=1.
+    assert_eq!(
+        dataset.fragment_bitmap.iter().collect::<Vec<_>>(),
+        vec![0, 1],
+        "update should have produced a second fragment"
+    );
+
+    let indices = dataset.load_indices().await.unwrap();
+    let covered = |name: &str| {
+        indices
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap()
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>()
+    };
+
+    // The index on the CHANGED column is invalidated (the rewritten fragment is not
+    // covered) -- expected.
+    assert_eq!(
+        covered("col1_idx"),
+        vec![0],
+        "col1 index must drop the rewritten fragment (col1 changed)"
+    );
+
+    // ALL column indexes are invalidated, not only the changed ones: the index on the
+    // UNCHANGED column `col2` also drops the rewritten fragment.
+    //
+    // TODO(stable-row-id optimization): merge_insert treats the whole schema as modified
+    // because it does not detect which columns actually changed, so every index is
+    // invalidated for the rewritten rows. With stable row ids the moved rows keep their
+    // row ids and col2's values are unchanged, so `col2_idx` could instead be EXTENDED to
+    // the rewritten fragment (preserving its coverage) rather than invalidated, avoiding
+    // an unnecessary reindex. See `register_pure_rewrite_rows_update_frags_in_indices`.
+    assert_eq!(
+        covered("col2_idx"),
+        vec![0],
+        "col2 index is also invalidated even though col2 was not changed (see TODO)"
+    );
+}
+
 /// DataReplacement should invalidate index fragment bitmaps for replaced fields.
 #[tokio::test]
 async fn test_data_replacement_invalidates_index_bitmap() {
