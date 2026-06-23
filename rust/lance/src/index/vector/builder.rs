@@ -4,6 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, pin::Pin};
 
 use arrow::array::{AsArray as _, PrimitiveBuilder, UInt32Builder, UInt64Builder};
@@ -139,8 +140,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     progress: Arc<dyn IndexBuildProgress>,
 }
 
+type PartitionBuildOutput<S, Q> = (<Q as Quantization>::Storage, S, f64, Duration, Duration);
 type BuildStream<S, Q> =
-    Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
+    Pin<Box<dyn Stream<Item = Result<Option<PartitionBuildOutput<S, Q>>>> + Send>>;
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
     async fn try_open_precomputed_partition_artifact_reader(
@@ -332,7 +334,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                     let storage = part.storage.remap(&mapping)?;
                     let index = part.index.remap(&mapping, &storage)?;
-                    Result::Ok(Some((storage, index, 0.0)))
+                    Result::Ok(Some((
+                        storage,
+                        index,
+                        0.0,
+                        Duration::default(),
+                        Duration::default(),
+                    )))
                 }
             });
 
@@ -875,6 +883,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         _ => partition,
                     };
                     async move {
+                        let take_start = Instant::now();
                         let (mut batches, loss) = if skip_existing_batches {
                             (Vec::new(), 0.0)
                         } else {
@@ -885,8 +894,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             )
                             .await?
                         };
+                        let take_elapsed = take_start.elapsed();
 
-                        spawn_cpu(move || {
+                        let build_start = Instant::now();
+                        let part = spawn_cpu(move || {
                             if let Some((assign_batch, deleted_row_ids)) = assign_batch {
                                 if !deleted_row_ids.is_empty() {
                                     let deleted_row_ids = HashSet::<u64>::from_iter(
@@ -913,7 +924,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
                             let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
                             if num_rows == 0 {
-                                return Ok(None);
+                                return Ok::<_, Error>(None);
                             }
 
                             let (storage, sub_index) = Self::build_index(
@@ -924,9 +935,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 column,
                                 frag_reuse_index,
                             )?;
-                            Ok(Some((storage, sub_index, loss)))
+                            Ok::<_, Error>(Some((storage, sub_index, loss)))
                         })
-                        .await
+                        .await?;
+                        let build_elapsed = build_start.elapsed();
+                        Ok(part.map(|(storage, sub_index, loss)| {
+                            (storage, sub_index, loss, take_elapsed, build_elapsed)
+                        }))
                     }
                 });
         Ok(stream::iter(build_iter)
@@ -1090,12 +1105,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let mut part_id = 0;
         let mut total_loss = 0.0;
+        let mut take_batches_time = Duration::default();
+        let mut build_index_time = Duration::default();
+        let mut storage_batches_time = Duration::default();
+        let mut storage_write_time = Duration::default();
+        let mut index_batch_time = Duration::default();
+        let mut index_write_time = Duration::default();
         let progress = self.progress.clone();
         log::info!("merging {} partitions", ivf.num_partitions());
         while let Some(part) = build_stream.try_next().await? {
             part_id += 1;
             progress.stage_progress("merge_partitions", part_id).await?;
-            let Some((storage, index, loss)) = part else {
+            let Some((storage, index, loss, take_elapsed, build_elapsed)) = part else {
                 log::warn!("partition {} is empty, skipping", part_id);
 
                 storage_ivf.add_partition(0);
@@ -1105,11 +1126,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 continue;
             };
             total_loss += loss;
+            take_batches_time += take_elapsed;
+            build_index_time += build_elapsed;
 
             if storage.len() == 0 {
                 storage_ivf.add_partition(0);
             } else {
-                for mut batch in storage.to_batches()? {
+                let storage_batches_start = Instant::now();
+                let storage_batches = storage.to_batches()?;
+                storage_batches_time += storage_batches_start.elapsed();
+                for mut batch in storage_batches {
                     if is_pq
                         && !self.transpose_codes
                         && batch.num_rows() > 0
@@ -1151,21 +1177,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             writer_options.clone(),
                         )?);
                     }
+                    let storage_write_start = Instant::now();
                     storage_writer
                         .as_mut()
                         .expect("storage writer must be initialized before write")
                         .write_batch(&batch)
                         .await?;
+                    storage_write_time += storage_write_start.elapsed();
                     storage_ivf.add_partition(batch.num_rows() as u32);
                 }
             }
 
+            let index_batch_start = Instant::now();
             let index_batch = index.to_batch()?;
+            index_batch_time += index_batch_start.elapsed();
             if index_batch.num_rows() == 0 {
                 index_ivf.add_partition(0);
                 partition_index_metadata.push(String::new());
             } else {
+                let index_write_start = Instant::now();
                 index_writer.write_batch(&index_batch).await?;
+                index_write_time += index_write_start.elapsed();
                 index_ivf.add_partition(index_batch.num_rows() as u32);
                 partition_index_metadata.push(
                     index_batch
@@ -1281,8 +1313,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             serde_json::to_string(&partition_index_metadata)?,
         );
 
+        let finish_start = Instant::now();
         storage_writer.finish().await?;
         index_writer.finish().await?;
+        let finish_time = finish_start.elapsed();
+
+        eprintln!(
+            "lance vector merge_partitions stages: partitions={} take_s={:.3} build_s={:.3} storage_batches_s={:.3} storage_write_s={:.3} index_batch_s={:.3} index_write_s={:.3} finish_s={:.3}",
+            ivf.num_partitions(),
+            take_batches_time.as_secs_f64(),
+            build_index_time.as_secs_f64(),
+            storage_batches_time.as_secs_f64(),
+            storage_write_time.as_secs_f64(),
+            index_batch_time.as_secs_f64(),
+            index_write_time.as_secs_f64(),
+            finish_time.as_secs_f64(),
+        );
 
         log::info!("merging {} partitions done", ivf.num_partitions());
 
