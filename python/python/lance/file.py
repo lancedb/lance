@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
@@ -207,6 +208,26 @@ class LanceFileReader:
         return self._reader.num_rows()
 
 
+@dataclass
+class ListResult:
+    """
+    Result of a non-recursive, delimited list (see
+    :meth:`LanceFileSession.list_with_delimiter`).
+
+    Attributes
+    ----------
+    common_prefixes : List[str]
+        The immediate child "directories" of the listed path, relative to the
+        session's base path.
+    objects : List[str]
+        The immediate child files of the listed path, relative to the session's
+        base path.
+    """
+
+    common_prefixes: List[str]
+    objects: List[str]
+
+
 class LanceFileSession:
     """
     A file session for reading and writing Lance files.
@@ -343,6 +364,30 @@ class LanceFileSession:
             List of file paths.
         """
         return self._session.list(path)
+
+    def list_with_delimiter(self, path: Optional[str] = None) -> ListResult:
+        """
+        Non-recursively list a single directory level (relative to this
+        session's base path).
+
+        Unlike :meth:`list`, which recurses into the entire subtree, this
+        returns only the immediate children of ``path``: the child
+        "directories" as ``common_prefixes`` and the direct child files as
+        ``objects``. On Azure this is served entirely from the blob endpoint, so
+        it never probes the hierarchical-namespace (DFS) endpoint.
+
+        Parameters
+        ----------
+        path : str, optional
+            Path relative to `base_path` to list. If None, lists the base path.
+
+        Returns
+        -------
+        ListResult
+            The immediate child prefixes and objects of `path`.
+        """
+        common_prefixes, objects = self._session.list_with_delimiter(path)
+        return ListResult(common_prefixes=common_prefixes, objects=objects)
 
     def upload_file(self, local_path: Union[str, Path], remote_path: str) -> None:
         """

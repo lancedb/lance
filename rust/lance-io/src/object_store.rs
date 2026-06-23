@@ -25,7 +25,7 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -847,6 +847,18 @@ impl ObjectStore {
             .chain(output.objects.iter().map(|o| &o.location))
             .filter_map(|s| s.filename().map(|f| f.to_string()))
             .collect())
+    }
+
+    /// Non-recursive, path-segment delimited list of a single directory level.
+    ///
+    /// Unlike [`Self::list`], which recurses into the entire subtree, this returns
+    /// only the immediate children of `prefix`: the child "directories" as
+    /// [`ListResult::common_prefixes`] and the direct child files as
+    /// [`ListResult::objects`]. On Azure this is served entirely from the blob
+    /// endpoint (`List Blobs` with `delimiter=/`), so it never probes the
+    /// hierarchical-namespace (DFS) endpoint.
+    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
     pub fn list(

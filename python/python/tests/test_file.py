@@ -736,6 +736,44 @@ def test_session_list_with_trailing_slash(tmp_path):
     assert files_no_slash == ["dir/file.lance"]
 
 
+def test_session_list_with_delimiter(tmp_path):
+    """Test that LanceFileSession.list_with_delimiter() is non-recursive."""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # Two top-level files and two nested subtrees.
+    with session.open_writer("file1.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+    with session.open_writer("file2.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+    with session.open_writer("subdir/file3.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [3]}))
+    with session.open_writer("subdir/nested/file4.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [4]}))
+    with session.open_writer("other/file5.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [5]}))
+
+    # Listing the base path returns only the immediate children: the two
+    # top-level files and the two child directories (not their contents).
+    result = session.list_with_delimiter()
+    assert sorted(result.common_prefixes) == ["other", "subdir"]
+    assert sorted(result.objects) == ["file1.lance", "file2.lance"]
+
+    # Listing a subdirectory descends exactly one level: the direct file and
+    # the nested directory, but not the file inside the nested directory.
+    subdir = session.list_with_delimiter("subdir")
+    assert subdir.common_prefixes == ["subdir/nested"]
+    assert subdir.objects == ["subdir/file3.lance"]
+
+    # Trailing slash behaves the same as no trailing slash.
+    assert session.list_with_delimiter("subdir/") == subdir
+
+    # A non-existent prefix yields empty results rather than erroring.
+    empty = session.list_with_delimiter("nonexistent")
+    assert empty.common_prefixes == []
+    assert empty.objects == []
+
+
 def test_session_contains(tmp_path):
     """Test that LanceFileSession.contains() works correctly"""
     session = LanceFileSession(str(tmp_path))
