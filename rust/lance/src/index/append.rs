@@ -231,6 +231,58 @@ async fn rebuild_scalar_segment(
     .await
 }
 
+/// The index segments to rewrite in this optimize pass.
+///
+/// Normally the trailing `num_indices_to_merge` segments. Under stable row ids,
+/// any *older* segment that still covers a fragment carrying deletions is added
+/// too: an update deletes a row's old copy (leaving a deletion vector) and
+/// rewrites it under the same row id, so its stale old-value postings survive
+/// until that segment is rewritten and filtered. Only the segments that actually
+/// cover a deleted-from fragment are pulled in -- clean segments in between are
+/// left untouched -- so an edit to old data does not force a full reindex.
+///
+/// The deletion check is conservative (any current deletion vector on a covered
+/// fragment), so a segment built after those deletions may be rewritten as a
+/// harmless no-op; it never leaves a stale segment behind (PR #7359).
+fn select_segments_to_merge<'a>(
+    dataset: &Dataset,
+    old_indices: &[&'a IndexMetadata],
+    options: &OptimizeOptions,
+) -> Vec<&'a IndexMetadata> {
+    let num_to_merge = options
+        .num_indices_to_merge
+        .unwrap_or(1)
+        .min(old_indices.len());
+    let tail_start = old_indices.len() - num_to_merge;
+
+    // Address-style row ids mask stale postings at search time, and append mode
+    // (num_to_merge == 0) defers cleanup to a real merge; both keep the plain tail.
+    if num_to_merge == 0 || !dataset.manifest.uses_stable_row_ids() {
+        return old_indices[tail_start..].to_vec();
+    }
+
+    let deleted_frags: RoaringBitmap = dataset
+        .get_fragments()
+        .iter()
+        .filter(|f| f.metadata().deletion_file.is_some())
+        .map(|f| f.id() as u32)
+        .collect();
+    if deleted_frags.is_empty() {
+        return old_indices[tail_start..].to_vec();
+    }
+
+    let mut selected = Vec::new();
+    for (i, idx) in old_indices.iter().enumerate() {
+        let covers_deleted = idx
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .is_some_and(|eff| !eff.is_disjoint(&deleted_frags));
+        if i >= tail_start || covers_deleted {
+            selected.push(*idx);
+        }
+    }
+    selected
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn merge_scalar_indices<'a>(
     dataset: Arc<Dataset>,
@@ -248,17 +300,12 @@ async fn merge_scalar_indices<'a>(
         ));
     }
 
-    let num_to_merge = options
-        .num_indices_to_merge
-        .unwrap_or(1)
-        .min(old_indices.len());
+    let selected_old_indices = select_segments_to_merge(dataset.as_ref(), old_indices, options);
 
     // No new data + ≤1 old selected = rewriting one segment to itself.
-    if unindexed.is_empty() && num_to_merge <= 1 {
+    if unindexed.is_empty() && selected_old_indices.len() <= 1 {
         return Ok(None);
     }
-
-    let selected_old_indices = &old_indices[old_indices.len() - num_to_merge..];
 
     // For the delta case (`selected` empty) the reference is purely
     // for reading params; fall back to the last old index then.
@@ -317,11 +364,11 @@ async fn merge_scalar_indices<'a>(
         match index_type {
             IndexType::BTree => {
                 let (_, old_data_filters) =
-                    build_per_segment_filters(dataset.as_ref(), selected_old_indices).await?;
+                    build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
                 crate::index::scalar::btree::open_and_merge_segments(
                     dataset.as_ref(),
                     field_path,
-                    selected_old_indices,
+                    &selected_old_indices,
                     new_data_stream,
                     &new_store,
                     &old_data_filters,
@@ -645,16 +692,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         let index_type = indices[0].index_type();
         match index_type {
             IndexType::Inverted => {
-                let num_to_merge = options
-                    .num_indices_to_merge
-                    .unwrap_or(1)
-                    .min(old_indices.len());
-                if unindexed.is_empty() && num_to_merge <= 1 {
+                let selected_old_indices =
+                    select_segments_to_merge(dataset.as_ref(), old_indices, options);
+                if unindexed.is_empty() && selected_old_indices.len() <= 1 {
                     return Ok(None);
                 }
-
-                let selected_start = old_indices.len().saturating_sub(num_to_merge);
-                let selected_old_indices = &old_indices[selected_start..];
                 let reference_idx = selected_old_indices
                     .first()
                     .copied()
@@ -710,7 +752,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 let mut frag_bitmap = base_unindexed_bitmap;
                 let mut effective_old_frags = RoaringBitmap::new();
                 let mut selected_indices = Vec::with_capacity(selected_old_indices.len());
-                for idx in selected_old_indices {
+                for idx in &selected_old_indices {
                     if let Some(effective) = idx.effective_fragment_bitmap(&dataset.fragment_bitmap)
                     {
                         frag_bitmap |= &effective;
@@ -2091,6 +2133,193 @@ mod tests {
             .unwrap();
         let fts_count = scan.count_rows().await.unwrap();
         assert_eq!(fts_count, 25, "FTS index returned stale rows");
+    }
+
+    /// Multi-segment variant (Jack Ye's repro, PR #7359): with one BTree segment
+    /// per fragment, default optimize merges only the tail segment. A stable-row-id
+    /// update to a row in an older segment's fragment must still drop that
+    /// segment's stale postings -- the merge has to reach back to cover it.
+    #[tokio::test]
+    async fn test_optimize_btree_drops_stale_rows_across_segments_after_update() {
+        use crate::dataset::UpdateBuilder;
+        use crate::index::CreateIndexBuilder;
+        use arrow_array::Int32Array;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("num", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from_iter_values(0..100)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        // Two fragments (0..49, 50..99) -> one BTree segment each.
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["num"], IndexType::BTree, &params)
+                    .name("num_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("num_idx", "num", segments)
+            .await
+            .unwrap();
+
+        // Update the first 25 rows (in the first/older segment's fragment).
+        let res = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 25")
+            .unwrap()
+            .set("num", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = res.new_dataset.as_ref().clone();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("num = 0")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            0,
+            "stale entry leaked from the older, unmerged segment"
+        );
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("num >= 0")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            75
+        );
+    }
+
+    /// Same multi-segment gap for FTS, which takes the separate Inverted dispatch
+    /// path. One Inverted segment per fragment; an update to the older segment's
+    /// fragment must not leave its old-token postings searchable.
+    #[tokio::test]
+    async fn test_optimize_fts_drops_stale_rows_across_segments_after_update() {
+        use crate::dataset::UpdateBuilder;
+        use crate::index::CreateIndexBuilder;
+        use arrow_array::Int32Array;
+        use lance_index::scalar::FullTextSearchQuery;
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|i| if i < 50 { "alpha" } else { "beta" }),
+                )),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = InvertedIndexParams::default();
+        let fragments = dataset.get_fragments();
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["body"], IndexType::Inverted, &params)
+                    .name("body_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("body_idx", "body", segments)
+            .await
+            .unwrap();
+
+        // Update the first 25 rows (older segment's fragment): body -> "beta".
+        let res = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id < 25")
+            .unwrap()
+            .set("body", "'beta'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = res.new_dataset.as_ref().clone();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+            .unwrap();
+        assert_eq!(
+            scan.count_rows().await.unwrap(),
+            25,
+            "FTS stale rows leaked from the older, unmerged segment"
+        );
     }
 
     /// `optimize_indices` builds the stable-row-id allow-list by subtracting each
