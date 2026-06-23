@@ -8,7 +8,7 @@ use crate::dataset::ROW_ID;
 use crate::dataset::WriteDestination;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
-use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest};
+use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
 use lance_core::ROW_ADDR;
@@ -28,7 +28,7 @@ use arrow_array::{
     ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray,
     types::Int32Type,
 };
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datafusion::utils::reader_to_stream;
@@ -1625,6 +1625,121 @@ async fn test_merge_insert_with_reordered_columns_and_index() {
     ));
     let (final_dataset, _) = merge_job2.execute(reader_to_stream(reader2)).await.unwrap();
     final_dataset.validate().await.unwrap();
+}
+
+/// With stable row ids, updating a top-level struct column keeps a scalar index on a
+/// nested child field correct. The update API rejects nested column references, so a
+/// nested field can only be changed by setting its whole struct column; that update must
+/// not wrongly extend the child-field index over the rewritten fragment (which would
+/// leave the updated value unscanned and silently dropped).
+#[tokio::test]
+async fn test_update_struct_column_keeps_nested_index() {
+    let struct_fields = Fields::from(vec![ArrowField::new("x", DataType::Int32, true)]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+    ]));
+    let s_arr = StructArray::new(
+        struct_fields.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(s_arr) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_update_nested_index",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // BTree index on the NESTED field `s.x`.
+    dataset
+        .create_index(
+            &["s.x"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let pre = dataset
+        .scan()
+        .filter("s.x = 20")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(pre.num_rows(), 1, "precondition: s.x=20 should match id=2");
+
+    // Nested column references are rejected by `set`, so update the whole struct column
+    // `s` for id=2, changing s.x 20 -> 999.
+    let update_result = UpdateBuilder::new(Arc::new(dataset.clone()))
+        .update_where("id = 2")
+        .unwrap()
+        .set("s", "named_struct('x', cast(999 as int))")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    let dataset = update_result.new_dataset;
+
+    // The nested `s.x` index must NOT be extended to the rewritten fragment: its
+    // effective coverage stays {0}, so the rewritten fragment is left unindexed and
+    // fully scanned.
+    let sx_idx = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|i| i.fields.len() == 1)
+        .expect("nested s.x index")
+        .clone();
+    let effective = sx_idx
+        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .expect("index has a fragment bitmap");
+    assert_eq!(
+        effective.iter().collect::<Vec<_>>(),
+        vec![0],
+        "nested-field index must not be extended to the rewritten fragment"
+    );
+
+    // The updated value must be found, and the stale value gone.
+    let new = dataset
+        .scan()
+        .filter("s.x = 999")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        new.num_rows(),
+        1,
+        "updated value s.x=999 must be found after the struct-column update"
+    );
+    let old = dataset
+        .scan()
+        .filter("s.x = 20")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(old.num_rows(), 0, "s.x=20 should no longer match any row");
 }
 
 /// DataReplacement should invalidate index fragment bitmaps for replaced fields.
