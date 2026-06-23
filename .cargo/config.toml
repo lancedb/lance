@@ -9,10 +9,13 @@ debug = true
 codegen-units = 16
 lto = "thin"
 
+# Fast optimized profile for local investigations where LTO does not affect the
+# bottleneck. This gives agents a named profile instead of changing LTO flags ad hoc.
 [profile.release-no-lto]
 inherits = "release"
 lto = false
-# Prioritize compile time when LTO is not relevant to the measurement.
+# More codegen units split each crate into more parallel LLVM codegen jobs, which
+# shortens local builds at the cost of some cross-unit optimization.
 codegen-units = 16
 
 [profile.bench]
