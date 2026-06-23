@@ -100,6 +100,15 @@ impl EvaluatedIndex {
             applicable_fragments,
         })
     }
+
+    /// Drop `fragments` from the covered set so they are read in full and re-filtered on the flat
+    /// path rather than trusting the (possibly stale) index result for them.
+    fn without_fragments(mut self, fragments: &RoaringBitmap) -> Self {
+        if !fragments.is_empty() {
+            self.applicable_fragments -= fragments;
+        }
+        self
+    }
 }
 
 /// A fragment along with ranges of row offsets to read
@@ -1505,6 +1514,10 @@ pub struct FilteredReadOptions {
     pub io_buffer_size_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
+    /// Fragments whose index entries may be stale because an overlay committed after the index
+    /// was built touches an indexed field. They are dropped from the index's covered set so they
+    /// fall to the flat path and are re-evaluated against their current (overlay-merged) values.
+    pub overlay_stale_fragments: RoaringBitmap,
 }
 
 impl FilteredReadOptions {
@@ -1534,10 +1547,20 @@ impl FilteredReadOptions {
             full_filter: None,
             io_buffer_size_bytes: None,
             only_indexed_fragments: false,
+            overlay_stale_fragments: RoaringBitmap::new(),
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
         }
+    }
+
+    /// Drop the given fragments from the scalar index's covered set, forcing them onto the flat
+    /// path where the full filter is re-evaluated against their current (overlay-merged) values.
+    /// Used to mask data overlay files: a fragment with a newer overlay on an indexed field can
+    /// no longer be trusted to the index.
+    pub fn with_overlay_stale_fragments(mut self, fragments: RoaringBitmap) -> Self {
+        self.overlay_stale_fragments = fragments;
+        self
     }
 
     /// Include deleted rows in the scan
@@ -2117,9 +2140,10 @@ impl FilteredReadExec {
                     let index_search_result = index_search.next().await.ok_or_else(|| {
                         Error::internal("Index search did not yield any results".to_string())
                     })??;
-                    evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
-                        &index_search_result,
-                    )?));
+                    evaluated_index = Some(Arc::new(
+                        EvaluatedIndex::try_from_arrow(&index_search_result)?
+                            .without_fragments(&options.overlay_stale_fragments),
+                    ));
                 }
 
                 // Load fragments to compute the plan

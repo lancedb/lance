@@ -83,11 +83,12 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
+use crate::dataset::overlay::overlay_exclusion_offsets;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
-use crate::index::scalar_logical::scalar_index_fragment_bitmap;
+use crate::index::scalar_logical::{load_named_scalar_segments, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -2949,6 +2950,22 @@ impl Scanner {
             read_options = read_options.with_only_indexed_fragments();
         }
 
+        // Mask data overlay files: a fragment with an overlay committed after an index it relies
+        // on touched an indexed field can no longer be trusted to that index. Drop such fragments
+        // from the index's covered set so they are re-evaluated on the flat path.
+        if let Some(index_query) = filter_plan.index_query.as_ref() {
+            let candidate_frags = read_options
+                .fragments
+                .clone()
+                .unwrap_or_else(|| self.dataset.fragments().clone());
+            let stale_frags = self
+                .overlay_stale_index_frags(index_query, &candidate_frags)
+                .await?;
+            if !stale_frags.is_empty() {
+                read_options = read_options.with_overlay_stale_fragments(stale_frags);
+            }
+        }
+
         let result_format = self.index_expr_result_format();
         let index_input = filter_plan.index_query.clone().map(|index_query| {
             Arc::new(ScalarIndexExec::new(
@@ -3840,9 +3857,20 @@ impl Scanner {
                     "Refine factor cannot be zero".to_string(),
                 ));
             }
+            // Mask data overlay files: drop fragments with a newer overlay on the vector field
+            // from the index's coverage so the ANN prefilter blocks their (stale) rows, and
+            // re-score them on the flat path below.
+            let (effective_segments, stale_frags) =
+                self.mask_overlay_stale_segments(&index_segments)?;
+
             let ann_node = match vector_type {
-                DataType::FixedSizeList(_, _) => self.ann(&q, &index_segments, filter_plan).await?,
-                DataType::List(_) => self.multivec_ann(&q, &index_segments, filter_plan).await?,
+                DataType::FixedSizeList(_, _) => {
+                    self.ann(&q, &effective_segments, filter_plan).await?
+                }
+                DataType::List(_) => {
+                    self.multivec_ann(&q, &effective_segments, filter_plan)
+                        .await?
+                }
                 _ => unreachable!(),
             };
 
@@ -3860,7 +3888,14 @@ impl Scanner {
 
             if !self.fast_search {
                 knn_node = self
-                    .knn_combined(&q, &index_name, &index_segments, knn_node, filter_plan)
+                    .knn_combined(
+                        &q,
+                        &index_name,
+                        &effective_segments,
+                        &stale_frags,
+                        knn_node,
+                        filter_plan,
+                    )
                     .await?;
             }
 
@@ -3995,10 +4030,11 @@ impl Scanner {
         q: &Query,
         index_name: &str,
         indexed_segments: &[IndexMetadata],
+        stale_frags: &RoaringBitmap,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fallback_fragments = if let Some(target_fragments) = &self.fragments {
+        let mut fallback_fragments = if let Some(target_fragments) = &self.fragments {
             let indexed_fragments = self.get_indexed_frags(indexed_segments);
             target_fragments
                 .iter()
@@ -4010,6 +4046,18 @@ impl Scanner {
         } else {
             self.dataset.unindexed_fragments(index_name).await?
         };
+
+        // Fragments masked off the index by a newer overlay are blocked from the ANN
+        // via the prefilter; add them here so their current vectors are re-scored on the flat
+        // path and can re-enter the top-k. They are indexed fragments, so they cannot already be
+        // in the unindexed fallback set above.
+        if !stale_frags.is_empty() {
+            for fragment in self.dataset.fragments().iter() {
+                if stale_frags.contains(fragment.id as u32) {
+                    fallback_fragments.push(fragment.clone());
+                }
+            }
+        }
 
         if !fallback_fragments.is_empty() {
             let q = q.clone();
@@ -4121,16 +4169,113 @@ impl Scanner {
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
+        // Fragments with a newer overlay on an indexed field hold values the index has not
+        // seen, so their index entries may be stale. Treat them as not covered: they fall to
+        // the flat path and are re-evaluated against their current (overlay-merged) values.
+        let stale_frags = self
+            .overlay_stale_index_frags(index_expr, &fragments)
+            .await?;
         let mut relevant_frags = Vec::with_capacity(fragments.len());
         let mut missing_frags = Vec::with_capacity(fragments.len());
         for fragment in fragments.iter() {
-            if covered_frags.contains(fragment.id as u32) {
+            if covered_frags.contains(fragment.id as u32)
+                && !stale_frags.contains(fragment.id as u32)
+            {
                 relevant_frags.push(fragment.clone());
             } else {
                 missing_frags.push(fragment.clone());
             }
         }
         Ok((relevant_frags, missing_frags))
+    }
+
+    /// Fragment ids whose indexed values may be stale because an overlay committed *after* an
+    /// index was built touches a field that index covers.
+    ///
+    /// Such a fragment must be excluded from index results and re-evaluated against its current
+    /// values on the flat path — the same path already used for fragments the index never
+    /// covered. The check is field-aware (an overlay touching only unindexed fields excludes
+    /// nothing) and version-gated (an overlay with `committed_version <= index.dataset_version`
+    /// is already incorporated by the index), via [`overlay_exclusion_offsets`].
+    async fn overlay_stale_index_frags(
+        &self,
+        index_expr: &ScalarIndexExpr,
+        fragments: &[Fragment],
+    ) -> Result<RoaringBitmap> {
+        // Overlays are rare; skip all index loading when none of the candidate fragments has one.
+        if fragments
+            .iter()
+            .all(|fragment| fragment.overlays.is_empty())
+        {
+            return Ok(RoaringBitmap::new());
+        }
+        let frag_by_id: std::collections::HashMap<u32, &Fragment> =
+            fragments.iter().map(|f| (f.id as u32, f)).collect();
+
+        // Collect the leaf index searches referenced by the (boolean) index query.
+        let mut searches = Vec::new();
+        let mut stack = vec![index_expr];
+        while let Some(expr) = stack.pop() {
+            match expr {
+                ScalarIndexExpr::Not(inner) => stack.push(inner),
+                ScalarIndexExpr::And(lhs, rhs) | ScalarIndexExpr::Or(lhs, rhs) => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                ScalarIndexExpr::Query(search) => searches.push(search),
+            }
+        }
+
+        let mut stale = RoaringBitmap::new();
+        for search in searches {
+            let segments = load_named_scalar_segments(
+                self.dataset.as_ref(),
+                &search.column,
+                &search.index_name,
+            )
+            .await?;
+            for segment in &segments {
+                collect_stale_overlay_frags(segment, &frag_by_id, &mut stale)?;
+            }
+        }
+        Ok(stale)
+    }
+
+    /// Mask data overlay files for a vector index. Returns the index segments with stale
+    /// fragments removed from their coverage bitmaps — so the ANN prefilter (built from those
+    /// bitmaps) blocks the stale rows — together with the set of stale fragment ids, which the
+    /// caller re-scores against their current vectors on the flat path.
+    fn mask_overlay_stale_segments(
+        &self,
+        segments: &[IndexMetadata],
+    ) -> Result<(Vec<IndexMetadata>, RoaringBitmap)> {
+        let fragments = self.dataset.fragments();
+        if fragments
+            .iter()
+            .all(|fragment| fragment.overlays.is_empty())
+        {
+            return Ok((segments.to_vec(), RoaringBitmap::new()));
+        }
+        let frag_by_id: std::collections::HashMap<u32, &Fragment> =
+            fragments.iter().map(|f| (f.id as u32, f)).collect();
+        let mut stale = RoaringBitmap::new();
+        for segment in segments {
+            collect_stale_overlay_frags(segment, &frag_by_id, &mut stale)?;
+        }
+        if stale.is_empty() {
+            return Ok((segments.to_vec(), RoaringBitmap::new()));
+        }
+        let effective = segments
+            .iter()
+            .map(|segment| {
+                let mut segment = segment.clone();
+                if let Some(bitmap) = segment.fragment_bitmap.as_mut() {
+                    *bitmap -= &stale;
+                }
+                segment
+            })
+            .collect();
+        Ok((effective, stale))
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -13374,5 +13519,452 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             scanner
         })
         .await;
+    }
+}
+
+/// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
+/// stale because an overlay committed after the segment was built touches a field the segment
+/// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
+fn collect_stale_overlay_frags(
+    segment: &IndexMetadata,
+    frag_by_id: &std::collections::HashMap<u32, &Fragment>,
+    stale: &mut RoaringBitmap,
+) -> Result<()> {
+    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
+        return Ok(());
+    };
+    for frag_id in coverage.iter() {
+        if stale.contains(frag_id) {
+            continue;
+        }
+        let Some(fragment) = frag_by_id.get(&frag_id) else {
+            continue;
+        };
+        if fragment.overlays.is_empty() {
+            continue;
+        }
+        if !overlay_exclusion_offsets(&fragment.overlays, &segment.fields, segment.dataset_version)?
+            .is_empty()
+        {
+            stale.insert(frag_id);
+        }
+    }
+    Ok(())
+}
+
+/// End-to-end tests for data-overlay index masking: a scalar index masks data overlay files so that
+/// queries stay correct while overlays remain (stale index hits are dropped and new
+/// matches are added by re-evaluating overlay-covered rows on the flat path).
+#[cfg(test)]
+mod overlay_index_masking {
+    use std::sync::Arc;
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_io::utils::CachedFileSize;
+    use lance_table::format::DataFile;
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use object_store::path::Path;
+    use roaring::RoaringBitmap;
+
+    use lance_file::writer::{FileWriter, FileWriterOptions};
+
+    use crate::Dataset;
+    use crate::dataset::transaction::{DataOverlayGroup, Operation};
+    use crate::dataset::{WriteDestination, WriteParams};
+    use crate::index::DatasetIndexExt;
+
+    /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
+    /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
+    /// with a store-relative `data/<name>.lance` path and committed against the dataset.
+    async fn create_base_dataset() -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("age", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..12)),
+                Arc::new(Int32Array::from_iter_values((0..12).map(|v| v * 10))),
+            ],
+        )
+        .unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 6,
+            max_rows_per_group: 6,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap()
+    }
+
+    async fn build_age_index(dataset: &mut Dataset) {
+        dataset
+            .create_index(
+                &["age"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Write an overlay file covering `fields` of `fragment_id` with `coverage` and the given
+    /// per-field value columns, then commit it as a `DataOverlay` transaction. `name` makes
+    /// the overlay file unique.
+    async fn commit_overlay(
+        dataset: Dataset,
+        name: &str,
+        fragment_id: u64,
+        fields: &[i32],
+        coverage: OverlayCoverage,
+        columns: Vec<ArrayRef>,
+    ) -> Dataset {
+        let read_version = dataset.version().version;
+        let overlay_schema = dataset.schema().project_by_ids(fields, true);
+
+        let filename = format!("{name}.lance");
+        let path = Path::from(format!("data/{filename}"));
+        let obj_writer = dataset.object_store.create(&path).await.unwrap();
+        let mut writer =
+            FileWriter::try_new(obj_writer, overlay_schema, FileWriterOptions::default()).unwrap();
+        let (major, minor) = writer.version().to_numbers();
+        for (i, array) in columns.into_iter().enumerate() {
+            writer.write_column(i, array).await.unwrap();
+        }
+        let summary = writer.finish().await.unwrap();
+
+        let mut data_file = DataFile::new_unstarted(filename, major, minor);
+        data_file.fields = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.column_indices = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+
+        let overlay = DataOverlayFile {
+            data_file,
+            coverage,
+            committed_version: 0,
+        };
+        Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id,
+                    overlays: vec![overlay],
+                }],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Sorted `id` values returned by a filtered scan.
+    async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
+        let batch = dataset
+            .scan()
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        if batch.num_rows() == 0 {
+            return Vec::new();
+        }
+        let mut ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
+        Arc::new(Int32Array::from_iter(values))
+    }
+
+    fn fsl(rows: Vec<Vec<f32>>, dim: i32) -> ArrayRef {
+        let flat: Vec<f32> = rows.into_iter().flatten().collect();
+        let item = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        Arc::new(
+            arrow_array::FixedSizeListArray::try_new(
+                item,
+                dim,
+                Arc::new(arrow_array::Float32Array::from(flat)),
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A newer overlay on the indexed field drops stale index hits (the old value no longer
+    /// matches) and surfaces new matches (the new value is found even though the index never
+    /// saw it). Mirrors the spec's Bob 25 -> 26 worked example.
+    #[tokio::test]
+    async fn test_overlay_stale_drop_and_new_match() {
+        let mut dataset = create_base_dataset().await;
+        build_age_index(&mut dataset).await;
+
+        // Fragment 0, offset 1 is id=1, age=10. The overlay (committed after the index)
+        // changes its age to 999.
+        let dataset = commit_overlay(
+            dataset,
+            "age_overlay",
+            0,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(999)])],
+        )
+        .await;
+
+        // Stale-drop: the index still holds age=10 for id=1, but its current value is 999,
+        // so it must not be returned.
+        assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+        // New-match: the index never saw age=999, but re-evaluation finds it.
+        assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+        // An untouched indexed value is unaffected.
+        assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+    }
+
+    /// An overlay touching only a non-indexed field excludes nothing from the index on `age`.
+    #[tokio::test]
+    async fn test_overlay_on_unrelated_field_excludes_nothing() {
+        let mut dataset = create_base_dataset().await;
+        build_age_index(&mut dataset).await;
+
+        // Overlay field 0 (`id`), not the indexed `age`. The age index stays fully trusted.
+        let dataset = commit_overlay(
+            dataset,
+            "id_overlay",
+            0,
+            &[0],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(777)])],
+        )
+        .await;
+
+        // The age index is still trusted: age=10 finds the offset-1 row, whose id now reads
+        // through the overlay as 777. The fragment was not routed to the flat path on account
+        // of an overlay that touches no indexed field.
+        assert_eq!(ids_matching(&dataset, "age = 10").await, vec![777]);
+        // An untouched row is unaffected.
+        assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+        // The overlaid id is the new value on read, and the old one is gone.
+        assert_eq!(ids_matching(&dataset, "id = 777").await, vec![777]);
+        assert_eq!(ids_matching(&dataset, "id = 1").await, Vec::<i32>::new());
+    }
+
+    /// An overlay whose `committed_version <= index.dataset_version` is already incorporated by
+    /// the index (the index was built reading merged values) and is not excluded.
+    #[tokio::test]
+    async fn test_overlay_older_than_index_not_excluded() {
+        let dataset = create_base_dataset().await;
+
+        // Commit the overlay first (age of id=1 becomes 999), then build the index on top.
+        let mut dataset = commit_overlay(
+            dataset,
+            "age_overlay_old",
+            0,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(999)])],
+        )
+        .await;
+        build_age_index(&mut dataset).await;
+
+        // The index incorporates the overlay, so it returns the merged value directly.
+        assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+        assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    }
+
+    /// A covered offset whose overlay value is NULL overrides the cell to NULL, so the stale
+    /// index hit for its old value is dropped.
+    #[tokio::test]
+    async fn test_overlay_null_override() {
+        let mut dataset = create_base_dataset().await;
+        build_age_index(&mut dataset).await;
+
+        // id=1 (age=10) is overridden to NULL.
+        let dataset = commit_overlay(
+            dataset,
+            "age_overlay_null",
+            0,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([None])],
+        )
+        .await;
+
+        assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+        assert_eq!(ids_matching(&dataset, "age IS NULL").await, vec![1]);
+    }
+
+    /// Overlays on a non-first fragment are masked correctly, and a query spanning both
+    /// fragments returns the right rows.
+    #[tokio::test]
+    async fn test_overlay_multi_fragment() {
+        let mut dataset = create_base_dataset().await;
+        build_age_index(&mut dataset).await;
+
+        // Fragment 1 holds ids 6..12 (ages 60..110). Offset 2 within fragment 1 is id=8,
+        // age=80; change it to 60 (a value that also legitimately exists at id=6).
+        let dataset = commit_overlay(
+            dataset,
+            "age_overlay_frag1",
+            1,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([2])),
+            vec![i32_array([Some(60)])],
+        )
+        .await;
+
+        // id=8 no longer has age=80 (stale-drop on fragment 1).
+        assert_eq!(ids_matching(&dataset, "age = 80").await, Vec::<i32>::new());
+        // Both id=6 (base) and id=8 (overlay) now have age=60 (new-match added to base hit).
+        assert_eq!(ids_matching(&dataset, "age = 60").await, vec![6, 8]);
+        // A value in the untouched fragment 0 is still served correctly.
+        assert_eq!(ids_matching(&dataset, "age = 30").await, vec![3]);
+    }
+
+    /// A vector index masks overlays: a row whose vector was moved (by a newer overlay) away
+    /// from the query is dropped from results, and a row moved *onto* the query is found by
+    /// re-scoring its current vector on the flat path — even though the index never saw it.
+    #[tokio::test]
+    async fn test_vector_index_rescore_on_overlay() {
+        use arrow_array::cast::AsArray;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::MetricType;
+
+        use crate::index::vector::VectorIndexParams;
+
+        const DIM: i32 = 8;
+        let query = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let far = vec![0.0_f32, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+        // 64 rows over two fragments. Every base vector is orthogonal to the query except id=35,
+        // which equals the query (so a stale index ranks it first). All sit in fragment 1's range
+        // (32..64) for the rows we overlay; fragment 0 (0..32) holds far, never-overlaid rows.
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(64);
+        for i in 0..64 {
+            if i == 35 {
+                vectors.push(query.clone());
+            } else {
+                let mut v = vec![0.0_f32; DIM as usize];
+                v[1] = (i + 2) as f32; // orthogonal to the query, distinct, far
+                vectors.push(v);
+            }
+        }
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    DIM,
+                ),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..64)),
+                fsl(vectors, DIM),
+            ],
+        )
+        .unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 32,
+            max_rows_per_group: 32,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Single-partition IVF_FLAT: the ANN searches every indexed row with exact distances.
+        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        // Overlay fragment 1 (ids 32..64): move id=35 (offset 3) onto `far`, and id=40
+        // (offset 8) onto the query. The index, built before the overlay, still believes id=35
+        // is the query and has never seen id=40 near it.
+        let dataset = commit_overlay(
+            dataset,
+            "vec_overlay",
+            1,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([3, 8])),
+            vec![fsl(vec![far.clone(), query.clone()], DIM)],
+        )
+        .await;
+
+        let results = dataset
+            .scan()
+            .nearest("vec", &arrow_array::Float32Array::from(query.clone()), 3)
+            .unwrap()
+            .minimum_nprobes(1)
+            .project(&["id"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let ids: Vec<i32> = results
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        // id=40 was moved onto the query and is found by re-scoring (new-match recall).
+        assert!(
+            ids.contains(&40),
+            "expected id=40 (re-scored to query) in {ids:?}"
+        );
+        // id=35's stale index entry (the query) must not resurface: its current vector is far.
+        assert!(
+            !ids.contains(&35),
+            "stale vector for id=35 should be dropped, got {ids:?}"
+        );
     }
 }

@@ -45,9 +45,40 @@ use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
 use lance_table::format::DataFile;
+use lance_table::format::overlay::DataOverlayFile;
 use lance_table::utils::stream::ReadBatchFut;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
+
+/// The physical offsets within a fragment whose value for an indexed field may be
+/// stale relative to an index built at `index_version`, and so must be excluded
+/// from that index's results and re-evaluated against current values on the flat
+/// path.
+///
+/// The set is the union, over every overlay whose `committed_version` is newer
+/// than `index_version`, of that overlay's coverage **restricted to the indexed
+/// fields**. The restriction makes exclusion field-aware: an overlay that touches
+/// only non-indexed fields contributes nothing. An overlay whose
+/// `committed_version <= index_version` is already incorporated by the index and
+/// is ignored.
+pub fn overlay_exclusion_offsets(
+    overlays: &[DataOverlayFile],
+    indexed_field_ids: &[i32],
+    index_version: u64,
+) -> Result<RoaringBitmap> {
+    let mut excluded = RoaringBitmap::new();
+    for overlay in overlays {
+        if overlay.committed_version <= index_version {
+            continue;
+        }
+        for (field_pos, field_id) in overlay.data_file.fields.iter().enumerate() {
+            if indexed_field_ids.contains(field_id) {
+                excluded |= &*overlay.coverage_for_field(field_pos)?;
+            }
+        }
+    }
+    Ok(excluded)
+}
 
 /// The plan for merging one field's overlays into one batch: which source (base or
 /// a particular overlay) supplies each output row, and which overlay values must be
@@ -1060,5 +1091,89 @@ mod tests {
         assert!(!spliced.is_null(0));
         assert!(spliced.is_null(1));
         assert!(!spliced.is_null(2));
+    }
+
+    /// A dense overlay covering `offsets` for `field_ids`, committed at `version`.
+    fn dense_overlay(
+        field_ids: Vec<i32>,
+        offsets: impl IntoIterator<Item = u32>,
+        version: u64,
+    ) -> lance_table::format::overlay::DataOverlayFile {
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", field_ids, None),
+            coverage: OverlayCoverage::dense(bitmap(offsets)),
+            committed_version: version,
+        }
+    }
+
+    #[test]
+    fn test_exclusion_offsets_version_gate() {
+        // index built at version 5; only overlays committed > 5 are excluded.
+        let overlays = vec![
+            dense_overlay(vec![3], [0, 1], 4),
+            dense_overlay(vec![3], [2, 7], 6),
+        ];
+        let excluded = overlay_exclusion_offsets(&overlays, &[3], 5).unwrap();
+        assert_eq!(excluded, bitmap([2, 7]));
+        // An overlay exactly at the index version is already incorporated.
+        let overlays = vec![dense_overlay(vec![3], [9], 5)];
+        assert!(
+            overlay_exclusion_offsets(&overlays, &[3], 5)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_exclusion_offsets_is_field_aware() {
+        // An overlay touching only an unrelated field excludes nothing.
+        let overlays = vec![dense_overlay(vec![2], [0, 1, 2], 9)];
+        assert!(
+            overlay_exclusion_offsets(&overlays, &[3], 1)
+                .unwrap()
+                .is_empty()
+        );
+        // The union spans only the indexed fields the overlay actually carries.
+        let overlays = vec![dense_overlay(vec![2, 3], [4], 9)];
+        assert_eq!(
+            overlay_exclusion_offsets(&overlays, &[3], 1).unwrap(),
+            bitmap([4])
+        );
+    }
+
+    #[test]
+    fn test_exclusion_offsets_sparse_per_field() {
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        // Sparse overlay: field 2 covers {2,3}, field 4 covers {1}.
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![2, 4], None),
+            coverage: OverlayCoverage::sparse(vec![bitmap([2, 3]), bitmap([1])]),
+            committed_version: 9,
+        };
+        let overlays = vec![overlay];
+        // Only the bitmap for the indexed field (4) contributes.
+        assert_eq!(
+            overlay_exclusion_offsets(&overlays, &[4], 1).unwrap(),
+            bitmap([1])
+        );
+        assert_eq!(
+            overlay_exclusion_offsets(&overlays, &[2], 1).unwrap(),
+            bitmap([2, 3])
+        );
+    }
+
+    #[test]
+    fn test_exclusion_offsets_unions_multiple_overlays() {
+        let overlays = vec![
+            dense_overlay(vec![3], [1], 6),
+            dense_overlay(vec![3], [4, 5], 7),
+        ];
+        assert_eq!(
+            overlay_exclusion_offsets(&overlays, &[3], 1).unwrap(),
+            bitmap([1, 4, 5])
+        );
     }
 }
