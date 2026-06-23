@@ -147,7 +147,10 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         println!("Error: Matrix must have at least 1 row and at least 1 column.");
         return (vec![], vec![], vec![]); 
     }
-    assert_eq!(a.len(), m * n, "Data length of matrix must match the product of the specified number of rows and number of columns.", a.len(), m, n);
+    if a.len() != m * n {
+        println!("Data length of matrix must match the product of the specified number of rows and number of columns.");
+        return (vec![], vec![], vec![]);
+    }
     assert!(a.iter().all(|x| x.is_finite()), "Matrix must not contain null or infinite entries.");
 
     let ata = compute_ata(a, m, n);
