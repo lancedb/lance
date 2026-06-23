@@ -2032,6 +2032,114 @@ async fn test_merge_insert_nested_index_stable_row_id() {
     );
 }
 
+/// With stable row ids, a merge_insert full-row update invalidates EVERY column index
+/// for the rewritten rows — not only indices on columns that actually changed — because
+/// merge_insert treats the whole schema as modified (it does not detect which columns
+/// changed). Here `col1` is updated and `col2` is left unchanged, yet both `col1_idx`
+/// and `col2_idx` drop the rewritten fragment from their coverage.
+#[tokio::test]
+async fn test_merge_insert_flat_index_stable_row_id_multiple_indexes() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("col1", DataType::Int32, false),
+        ArrowField::new("col2", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://test_mi_flat_multi_index",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    for col in ["col1", "col2"] {
+        dataset
+            .create_index(
+                &[col],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Full-row update of id=1: col1 10 -> 999, col2 left unchanged (100).
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![999])),
+            Arc::new(Int32Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+    let merge_job = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(vec![Ok(source)], schema.clone()));
+    let (dataset, _stats) = merge_job.execute(reader_to_stream(reader)).await.unwrap();
+
+    // The update produced a second fragment holding the rewritten row id=1.
+    assert_eq!(
+        dataset.fragment_bitmap.iter().collect::<Vec<_>>(),
+        vec![0, 1],
+        "update should have produced a second fragment"
+    );
+
+    let indices = dataset.load_indices().await.unwrap();
+    let covered = |name: &str| {
+        indices
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap()
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>()
+    };
+
+    // The index on the CHANGED column is invalidated (the rewritten fragment is not
+    // covered) -- expected.
+    assert_eq!(
+        covered("col1_idx"),
+        vec![0],
+        "col1 index must drop the rewritten fragment (col1 changed)"
+    );
+
+    // ALL column indexes are invalidated, not only the changed ones: the index on the
+    // UNCHANGED column `col2` also drops the rewritten fragment.
+    //
+    // TODO(stable-row-id optimization): merge_insert treats the whole schema as modified
+    // because it does not detect which columns actually changed, so every index is
+    // invalidated for the rewritten rows. With stable row ids the moved rows keep their
+    // row ids and col2's values are unchanged, so `col2_idx` could instead be EXTENDED to
+    // the rewritten fragment (preserving its coverage) rather than invalidated, avoiding
+    // an unnecessary reindex. See `register_pure_rewrite_rows_update_frags_in_indices`.
+    assert_eq!(
+        covered("col2_idx"),
+        vec![0],
+        "col2 index is also invalidated even though col2 was not changed (see TODO)"
+    );
+}
 
 /// DataReplacement should invalidate index fragment bitmaps for replaced fields.
 #[tokio::test]
