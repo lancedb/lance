@@ -20,8 +20,13 @@ pub const FLAG_TABLE_CONFIG: u64 = 8;
 pub const FLAG_BASE_PATHS: u64 = 16;
 /// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
 pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
+/// Fragments contain data overlay files, which supply new values for a subset of
+/// cells without rewriting base data files. A reader that does not understand
+/// overlays must refuse the dataset, since ignoring an overlay would silently
+/// return stale base values.
+pub const FLAG_DATA_OVERLAY_FILES: u64 = 64;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 64;
+pub const FLAG_UNKNOWN: u64 = 128;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -71,6 +76,18 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_BASE_PATHS;
     }
 
+    // Overlay files change cell values on read, so a reader that ignores them
+    // would return stale base values. Both readers and writers must understand
+    // them.
+    let has_overlays = manifest
+        .fragments
+        .iter()
+        .any(|frag| !frag.overlays.is_empty());
+    if has_overlays {
+        manifest.reader_feature_flags |= FLAG_DATA_OVERLAY_FILES;
+        manifest.writer_feature_flags |= FLAG_DATA_OVERLAY_FILES;
+    }
+
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
@@ -103,6 +120,7 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(super::FLAG_DATA_OVERLAY_FILES));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -120,12 +138,14 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(super::FLAG_DATA_OVERLAY_FILES));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
                 | super::FLAG_BASE_PATHS
+                | super::FLAG_DATA_OVERLAY_FILES
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
     }

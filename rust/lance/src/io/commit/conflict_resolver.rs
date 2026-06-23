@@ -137,6 +137,21 @@ impl<'a> TransactionRebase<'a> {
                     conflicting_mem_wal_merged_gens: Vec::new(),
                 })
             }
+            Operation::DataOverlay { groups } => {
+                let modified_fragment_ids =
+                    groups.iter().map(|g| g.fragment_id).collect::<HashSet<_>>();
+                let initial_fragments =
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await;
+                Ok(Self {
+                    transaction,
+                    affected_rows,
+                    initial_fragments,
+                    modified_fragment_ids,
+                    conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_merged_gens: Vec::new(),
+                })
+            }
             Operation::Merge { fragments, .. } => {
                 let modified_fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
                 let initial_fragments =
@@ -219,6 +234,9 @@ impl<'a> TransactionRebase<'a> {
             Operation::DataReplacement { .. } => {
                 self.check_data_replacement_txn(other_transaction, other_version)
             }
+            Operation::DataOverlay { .. } => {
+                self.check_data_overlay_txn(other_transaction, other_version)
+            }
             Operation::Merge { .. } => self.check_merge_txn(other_transaction, other_version),
             Operation::Restore { .. } => self.check_restore_txn(other_transaction, other_version),
             Operation::ReserveFragments { .. } => {
@@ -251,6 +269,10 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::Append { .. }
                 | Operation::UpdateConfig { .. }
+                // A concurrent overlay is inert against the rows we delete
+                // (deletions take precedence over overlays) and otherwise
+                // preserves physical offsets, so it never conflicts.
+                | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
@@ -398,6 +420,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
+                // A concurrent overlay preserves physical offsets and is newer
+                // than this update, so it wins its covered cells without conflict.
+                | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Append { .. } => {
                     // If current transaction has primary key conflict detection,
@@ -514,6 +539,10 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
+                // An overlay committed after this index's version is newer than
+                // the index; the query path excludes its covered cells via the
+                // version gate, so the build does not conflict.
+                | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
@@ -688,6 +717,20 @@ impl<'a> TransactionRebase<'a> {
                         .iter()
                         .map(|f| f.id)
                         .chain(deleted_fragment_ids.iter().copied())
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::DataOverlay { groups } => {
+                    // Rewriting a fragment changes its physical row addresses, so
+                    // an overlay addressed by physical offset on that fragment is
+                    // invalidated and must be re-applied against the new base.
+                    if groups
+                        .iter()
+                        .map(|g| g.fragment_id)
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -874,6 +917,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
@@ -907,7 +951,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
-            | Operation::DataReplacement { .. } => Ok(()),
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. } => Ok(()),
         }
     }
 
@@ -923,6 +968,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
+                // Both a column replacement and an overlay preserve physical row
+                // addresses; the overlay is newer and wins its covered cells.
+                | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Merge { .. } => {
                     // Merge rewrites the whole fragment list; always conflict
@@ -1055,6 +1103,57 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
+    /// Conflict checks for our DataOverlay transaction against a concurrent one.
+    ///
+    /// Overlays are intentionally permissive (see the Data Overlay Files spec):
+    /// they stack with other overlays and tolerate appends, deletes, column
+    /// rewrites, and index builds, because overlay coverage is addressed by
+    /// physical offset and the version gate keeps indexes correct. The only
+    /// concurrent operations that invalidate an overlay are those that rewrite
+    /// rows or consume the overlays on one of our fragments (Rewrite / Merge),
+    /// and the whole-dataset replacements (Overwrite / Restore).
+    fn check_data_overlay_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        match &other_transaction.operation {
+            Operation::Append { .. }
+            | Operation::Delete { .. }
+            | Operation::Update { .. }
+            | Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::Project { .. }
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateBases { .. }
+            | Operation::Clone { .. }
+            | Operation::UpdateMemWalState { .. }
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. } => Ok(()),
+            Operation::Rewrite { groups, .. } => {
+                // A rewrite (compaction / fold) of a fragment we are overlaying
+                // changes its physical row addresses, so our offsets would be
+                // invalid. Conflict only if it touches one of our fragments.
+                let touches_our_fragment = groups
+                    .iter()
+                    .flat_map(|g| g.old_fragments.iter())
+                    .any(|f| self.modified_fragment_ids.contains(&f.id));
+                if touches_our_fragment {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::Merge { .. } => {
+                // Merge rewrites the whole fragment list; always conflict.
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
+            Operation::Overwrite { .. } | Operation::Restore { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+        }
+    }
+
     fn check_merge_txn(
         &mut self,
         other_transaction: &Transaction,
@@ -1072,7 +1171,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Delete { .. }
             | Operation::Rewrite { .. }
             | Operation::Merge { .. }
-            | Operation::DataReplacement { .. } => {
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version))
             }
             Operation::Overwrite { .. }
@@ -1096,6 +1196,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
@@ -1124,6 +1225,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
@@ -1148,6 +1250,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::CreateIndex { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Rewrite { .. }
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
@@ -1212,6 +1315,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::CreateIndex { .. }
                 | Operation::Rewrite { .. }
                 | Operation::DataReplacement { .. }
+                | Operation::DataOverlay { .. }
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
@@ -1284,6 +1388,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Overwrite { .. }
                 | Operation::Delete { .. }
                 | Operation::DataReplacement { .. }
+                | Operation::DataOverlay { .. }
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::Clone { .. }
@@ -1377,6 +1482,7 @@ impl<'a> TransactionRebase<'a> {
             Operation::Append { .. }
             | Operation::Overwrite { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
@@ -3255,6 +3361,7 @@ mod tests {
             Operation::DataReplacement { replacements } => {
                 Box::new(replacements.iter().map(|r| r.0))
             }
+            Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
         }
     }
 

@@ -243,6 +243,7 @@ impl TestDatasetGenerator {
         Fragment {
             id: 0,
             files,
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(batch.num_rows()),
