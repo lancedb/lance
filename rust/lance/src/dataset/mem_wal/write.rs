@@ -1720,6 +1720,12 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
+                // Inject `_tombstone = false` to match the extended memtable
+                // schema, mirroring `put`.
+                let batches = batches
+                    .into_iter()
+                    .map(|b| ensure_tombstone_column(b, &writer_state.schema))
+                    .collect::<Result<Vec<_>>>()?;
                 self.put_memtable_no_wait(batches, state, writer_state, backpressure)
                     .await
             }
