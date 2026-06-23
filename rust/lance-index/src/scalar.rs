@@ -960,6 +960,17 @@ impl OldIndexDataFilter {
                 .collect(),
         }
     }
+
+    /// Apply this filter in place to a set of existing (old) row ids/addresses,
+    /// retaining only the rows the filter selects to keep. Used by index types
+    /// that merge old postings directly (e.g. bitmap) instead of re-scanning a
+    /// row-id array through [`Self::filter_row_ids`].
+    pub fn retain_old_rows(&self, rows: &mut RowAddrTreeMap) {
+        match self {
+            Self::Fragments { to_keep, .. } => rows.retain_fragments(to_keep.iter()),
+            Self::RowIds(valid_row_ids) => *rows &= valid_row_ids,
+        }
+    }
 }
 
 impl UpdateCriteria {
