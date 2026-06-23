@@ -65,7 +65,7 @@ async fn open_fts_segment(
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
     let index = dataset
-        .open_generic_index(column, &segment.uuid, metrics)
+        .open_scalar_index(column, &segment.uuid, metrics)
         .await?;
     let inverted = index
         .as_any()
