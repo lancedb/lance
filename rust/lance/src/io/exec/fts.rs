@@ -37,7 +37,10 @@ use super::PreFilterSource;
 use super::utils::{IndexMetrics, build_prefilter};
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{
+    AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
+    FREQS_COLLECTED_METRIC, MetricsCollector,
+};
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -159,6 +162,10 @@ fn default_text_tokenizer() -> Box<dyn LanceTokenizer> {
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
+    and_candidates_seen: Count,
+    and_candidates_pruned_before_return: Count,
+    and_full_scores: Count,
+    freqs_collected: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -167,6 +174,11 @@ impl FtsIndexMetrics {
         Self {
             index_metrics: IndexMetrics::new(metrics, partition),
             partitions_searched: metrics.new_count(PARTITIONS_SEARCHED_METRIC, partition),
+            and_candidates_seen: metrics.new_count(AND_CANDIDATES_SEEN_METRIC, partition),
+            and_candidates_pruned_before_return: metrics
+                .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
+            and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
+            freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -187,6 +199,22 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_metrics.record_comparisons(num_comparisons);
+    }
+
+    fn record_and_candidates_seen(&self, num_candidates: usize) {
+        self.and_candidates_seen.add(num_candidates);
+    }
+
+    fn record_and_candidates_pruned_before_return(&self, num_candidates: usize) {
+        self.and_candidates_pruned_before_return.add(num_candidates);
+    }
+
+    fn record_and_full_scores(&self, num_scores: usize) {
+        self.and_full_scores.add(num_scores);
+    }
+
+    fn record_freqs_collected(&self, num_collections: usize) {
+        self.freqs_collected.add(num_collections);
     }
 }
 

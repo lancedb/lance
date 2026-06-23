@@ -1302,6 +1302,66 @@ async fn test_scanner_count_rows_with_indexed_filter() {
 }
 
 #[tokio::test]
+async fn test_scanner_count_rows_with_indexed_filter_stable_row_ids() {
+    // Indexed-filter count under stable row ids, with deletions in both
+    // fragments. The rule fires and the cross-fragment count stays correct.
+    let tmp = tempdir().unwrap();
+    let uri = tmp.path().to_str().unwrap();
+    let mut ds = gen_batch()
+        .col("x", array::step::<Int64Type>())
+        .col("y", array::step_custom::<Int64Type>(0, 2))
+        .col("category", array::cycle::<Int64Type>(vec![1, 2, 3]))
+        .into_dataset_with_params(
+            uri,
+            FragmentCount::from(2),
+            FragmentRowCount::from(50),
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 50,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    ds.create_index(
+        &["x"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    // Delete one row from each fragment (x=10 in frag 0, x=70 in frag 1).
+    ds.delete("x = 10 OR x = 70").await.unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.filter("x < 100").unwrap();
+    scanner
+        .aggregate(AggregateExpr::builder().count_star().build())
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+
+    assert_plan_node_equals(
+        plan.clone(),
+        "AggregateExec: mode=Final, gby=[], aggr=[count(Int32(1))]
+  CountFromMask
+    ScalarIndexQuery: query=[x < 100]@x_idx(BTree)",
+    )
+    .await
+    .unwrap();
+
+    let stream = execute_plan(plan, LanceExecutionOptions::default()).unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    // 100 rows match `x < 100`, minus the two deletions.
+    assert_eq!(
+        batches[0].column(0).as_primitive::<Int64Type>().value(0),
+        98,
+    );
+}
+
+#[tokio::test]
 async fn test_scanner_count_rows_with_partial_index_coverage() {
     // Index covers the first two fragments, then a third fragment is
     // appended. The rule cannot answer the count from the index alone for

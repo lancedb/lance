@@ -551,12 +551,6 @@ impl Index for BitmapIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "BitmapIndex is not a vector index".into(),
-        ))
-    }
-
     async fn prewarm(&self) -> Result<()> {
         let page_lookup_file = self.lazy_reader.get().await?;
         let total_rows = page_lookup_file.num_rows();
