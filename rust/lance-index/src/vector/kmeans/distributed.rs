@@ -22,6 +22,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use half::f16;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_fsl_owned;
 
 use crate::vector::kmeans::{KMeans, KMeansParams, train_kmeans};
 use crate::{Error, Result};
@@ -146,9 +147,27 @@ impl PartialStats {
     }
 
     /// Validate and adopt an externally-built RecordBatch.
+    ///
+    /// This is the trust boundary for partial stats arriving over the wire
+    /// (Arrow IPC, file, etc.). Validation is strict and exhaustive:
+    ///
+    /// * required metadata: `version`, `k`, `dim`, `distance_type`, `centroids_fingerprint`
+    /// * row count equals `k`
+    /// * column names match the canonical schema
+    /// * column dtypes match: `UInt32`, `UInt64`, `FixedSizeList<Float64, dim>`,
+    ///   `Float64`, `Float64`, `Float32`
+    /// * every column has `null_count() == 0` (downstream `merge_*` /
+    ///   `finalize_*` read raw `.values()` slices and ignore null bitmaps,
+    ///   so a stray null bit would silently corrupt aggregates)
+    /// * the inner Float64 buffer of `sum` also has `null_count() == 0`
+    /// * `cluster_id` column equals `0..k` (a partial-stats batch is sorted by
+    ///   cluster id, so the first column is fully redundant — but a mismatch
+    ///   indicates a malformed sender, so we reject rather than silently drop)
     pub fn from_record_batch(batch: RecordBatch) -> Result<Self> {
         let schema = batch.schema();
         let md = schema.metadata();
+
+        // --- Metadata ---
         let version = md.get(META_VERSION).map(String::as_str).unwrap_or("");
         if version != PARTIAL_STATS_VERSION {
             return Err(Error::index(format!(
@@ -156,20 +175,77 @@ impl PartialStats {
                 version, PARTIAL_STATS_VERSION
             )));
         }
-        // Spot-check schema columns; full structural check happens in merge/finalize.
-        for (idx, name) in [
-            COL_CLUSTER_ID,
-            COL_COUNT,
-            COL_SUM,
-            COL_SQ_NORM_SUM,
-            COL_LOSS,
-            COL_RADIUS,
-        ]
-        .iter()
-        .enumerate()
-        {
+        let k: usize = md
+            .get(META_K)
+            .ok_or_else(|| Error::index(format!("PartialStats missing metadata `{}`", META_K)))?
+            .parse()
+            .map_err(|e| {
+                Error::index(format!("PartialStats metadata `{}` invalid: {}", META_K, e))
+            })?;
+        let dim: usize = md
+            .get(META_DIM)
+            .ok_or_else(|| Error::index(format!("PartialStats missing metadata `{}`", META_DIM)))?
+            .parse()
+            .map_err(|e| {
+                Error::index(format!(
+                    "PartialStats metadata `{}` invalid: {}",
+                    META_DIM, e
+                ))
+            })?;
+        let dt_str = md
+            .get(META_DT)
+            .map(String::as_str)
+            .ok_or_else(|| Error::index(format!("PartialStats missing metadata `{}`", META_DT)))?;
+        if !matches!(dt_str, "l2" | "dot" | "cosine" | "hamming") {
+            return Err(Error::index(format!(
+                "PartialStats metadata `{}` has unknown value {:?}",
+                META_DT, dt_str
+            )));
+        }
+        let fp_str = md
+            .get(META_FP)
+            .ok_or_else(|| Error::index(format!("PartialStats missing metadata `{}`", META_FP)))?;
+        fingerprint_from_hex(fp_str).map_err(|e| {
+            Error::index(format!(
+                "PartialStats metadata `{}` invalid: {}",
+                META_FP, e
+            ))
+        })?;
+
+        // --- Row count ---
+        if batch.num_rows() != k {
+            return Err(Error::index(format!(
+                "PartialStats row count {} does not match metadata k={}",
+                batch.num_rows(),
+                k
+            )));
+        }
+
+        // --- Column names + dtypes ---
+        let expected: [(&str, DataType); 6] = [
+            (COL_CLUSTER_ID, DataType::UInt32),
+            (COL_COUNT, DataType::UInt64),
+            (
+                COL_SUM,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float64, true)),
+                    dim as i32,
+                ),
+            ),
+            (COL_SQ_NORM_SUM, DataType::Float64),
+            (COL_LOSS, DataType::Float64),
+            (COL_RADIUS, DataType::Float32),
+        ];
+        if schema.fields().len() != expected.len() {
+            return Err(Error::index(format!(
+                "PartialStats schema has {} columns, expected {}",
+                schema.fields().len(),
+                expected.len()
+            )));
+        }
+        for (idx, (name, want_dt)) in expected.iter().enumerate() {
             let field = schema.field(idx);
-            if field.name() != *name {
+            if field.name() != name {
                 return Err(Error::index(format!(
                     "PartialStats schema mismatch at col {}: got {}, expected {}",
                     idx,
@@ -177,7 +253,76 @@ impl PartialStats {
                     name
                 )));
             }
+            // For FixedSizeList we compare the inner length but allow the inner
+            // field name (e.g. "item" vs "element") to differ — that is purely
+            // cosmetic and varies by Arrow producer.
+            let ok = match (field.data_type(), want_dt) {
+                (
+                    DataType::FixedSizeList(got_inner, got_n),
+                    DataType::FixedSizeList(want_inner, want_n),
+                ) => got_n == want_n && got_inner.data_type() == want_inner.data_type(),
+                (got, want) => got == want,
+            };
+            if !ok {
+                return Err(Error::index(format!(
+                    "PartialStats column `{}` has dtype {}, expected {}",
+                    name,
+                    field.data_type(),
+                    want_dt
+                )));
+            }
         }
+
+        // --- Null counts ---
+        //
+        // The writer emits dense buffers for every column (see `build_schema`
+        // and `compute_partial_stats`). The downstream `merge_partial_stats`,
+        // `pairwise_*` helpers, and `finalize_centroids` all read `.values()`
+        // directly and ignore null bitmaps, so a null bit in any of these
+        // columns would silently corrupt the aggregate. Reject up front
+        // instead of letting raw buffer slots leak through.
+        for (idx, (name, _)) in expected.iter().enumerate() {
+            let col = batch.column(idx);
+            if col.null_count() != 0 {
+                return Err(Error::index(format!(
+                    "PartialStats column `{}` has {} nulls; expected dense buffer",
+                    name,
+                    col.null_count()
+                )));
+            }
+        }
+        // The `sum` column is a FixedSizeList<Float64>. Its top-level validity
+        // is already covered above; also ensure the inner Float64 buffer is
+        // dense, since `pairwise_sum_fsl_f64` reads it via `.values()` slice.
+        let sum_inner_nulls = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or_else(|| Error::index("PartialStats column `sum` is not FixedSizeList"))?
+            .values()
+            .null_count();
+        if sum_inner_nulls != 0 {
+            return Err(Error::index(format!(
+                "PartialStats column `sum` has {} nulls in its inner Float64 buffer",
+                sum_inner_nulls
+            )));
+        }
+
+        // --- cluster_id values must equal 0..k ---
+        let cluster_id = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::index("PartialStats column 0 is not UInt32 after dtype check"))?;
+        for (i, v) in cluster_id.values().iter().enumerate() {
+            if (*v as usize) != i {
+                return Err(Error::index(format!(
+                    "PartialStats `cluster_id` row {} = {}, expected sequential 0..k",
+                    i, v
+                )));
+            }
+        }
+
         Ok(Self { batch })
     }
 
@@ -250,7 +395,7 @@ impl PartialStats {
 ///
 /// Used as `lance.partial_stats.centroids_fingerprint` so reducers can detect
 /// mixing partials from different training rounds.
-pub(crate) fn compute_centroids_fingerprint(centroids: &FixedSizeListArray) -> [u8; 8] {
+pub fn compute_centroids_fingerprint(centroids: &FixedSizeListArray) -> [u8; 8] {
     use sha2::{Digest, Sha256};
     let buffers = centroids.values().to_data().buffers().to_vec();
     let mut hasher = Sha256::new();
@@ -598,6 +743,19 @@ pub fn finalize_centroids(
         return Err(Error::index("no training data assigned"));
     }
 
+    // Reject stats from a different round. Without this guard, accidentally
+    // finalizing against the wrong `prev` (e.g. a stale cached batch) would
+    // silently produce incorrect centroids. The fingerprint is short (8 bytes
+    // of SHA-256) but already used to gate `merge_partial_stats`; reusing it
+    // here closes the same trust boundary on the finalize path.
+    let expected_fp = compute_centroids_fingerprint(prev);
+    if stats.centroids_fingerprint() != expected_fp {
+        return Err(Error::index(
+            "finalize_centroids: PartialStats fingerprint does not match prev centroids \
+             (stale stats from a different training round?)",
+        ));
+    }
+
     let k = stats.k();
     let dim = stats.dim();
     let counts = stats
@@ -605,13 +763,13 @@ pub fn finalize_centroids(
         .column(1)
         .as_any()
         .downcast_ref::<UInt64Array>()
-        .unwrap();
+        .ok_or_else(|| Error::index("finalize_centroids: count column is not UInt64"))?;
     let sums_arr = stats
         .batch
         .column(2)
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
-        .unwrap();
+        .ok_or_else(|| Error::index("finalize_centroids: sum column is not FixedSizeList"))?;
     let sums = sums_arr.values().as_primitive::<Float64Type>().values();
 
     match prev.value_type() {
@@ -702,40 +860,148 @@ fn samples_schema(value_type: DataType, dim: usize) -> SchemaRef {
 /// Algorithm-R reservoir sample of `target` rows from `data`.
 ///
 /// Output schema: `vec: FixedSizeList<element_type, dim>`.
-/// If `data.len() <= target`, returns all rows verbatim.
+/// If `data.len() <= target`, returns all rows verbatim. Internally a thin
+/// wrapper over [`StreamingReservoir`] so single-batch and streaming callers
+/// share the same RNG consumption.
 pub fn local_reservoir_sample(
     data: &FixedSizeListArray,
     target: usize,
     rng_seed: u64,
 ) -> Result<RecordBatch> {
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    let mut reservoir = StreamingReservoir::new(target, rng_seed);
+    reservoir.feed(data)?;
+    reservoir.into_record_batch()
+}
 
-    let dim = data.value_length() as usize;
-    let n = data.len();
-    let take = target.min(n);
-    let mut rng = StdRng::seed_from_u64(rng_seed);
+/// Streaming Algorithm-R reservoir sampler over a sequence of FSL chunks.
+///
+/// Layer-1 (`local_reservoir_sample`) and Layer-2 (`sample_round_0`) share
+/// this implementation so a same-seed run consumes the RNG identically
+/// regardless of how the input was chunked.
+pub struct StreamingReservoir {
+    rng: rand::rngs::StdRng,
+    target: usize,
+    seen: usize,
+    /// Materialized rows currently held by the reservoir, all sliced from
+    /// previously-fed batches. We re-arrow them at the end.
+    held: Vec<FixedSizeListArray>,
+    /// Parallel index into `held`: `(batch_idx, row_idx_within_batch)` pairs
+    /// for each row currently in the reservoir.
+    indices: Vec<(usize, usize)>,
+    value_type: Option<DataType>,
+    dim: Option<usize>,
+}
 
-    let indices: Vec<usize> = if n <= target {
-        (0..n).collect()
-    } else {
-        let mut chosen: Vec<usize> = (0..target).collect();
-        for i in target..n {
-            let j = rng.random_range(0..=i);
-            if j < target {
-                chosen[j] = i;
+impl StreamingReservoir {
+    pub fn new(target: usize, rng_seed: u64) -> Self {
+        use rand::SeedableRng;
+        Self {
+            rng: rand::rngs::StdRng::seed_from_u64(rng_seed),
+            target,
+            seen: 0,
+            held: Vec::new(),
+            indices: Vec::new(),
+            value_type: None,
+            dim: None,
+        }
+    }
+
+    /// Feed a chunk of vectors. Updates the reservoir per Algorithm-R; rows
+    /// not selected are dropped immediately. Schema-consistency across chunks
+    /// is enforced (every chunk must agree on `(value_type, dim)`).
+    pub fn feed(&mut self, chunk: &FixedSizeListArray) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        let chunk_value_type = chunk.value_type();
+        let chunk_dim = chunk.value_length() as usize;
+        match (&self.value_type, self.dim) {
+            (None, _) => {
+                self.value_type = Some(chunk_value_type);
+                self.dim = Some(chunk_dim);
+            }
+            (Some(prev_type), Some(prev_dim)) => {
+                if prev_type != &chunk_value_type || prev_dim != chunk_dim {
+                    return Err(Error::index(format!(
+                        "StreamingReservoir: schema mismatch across chunks (prev=FSL<{:?},{}> got=FSL<{:?},{}>)",
+                        prev_type, prev_dim, chunk_value_type, chunk_dim
+                    )));
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        let batch_idx = self.held.len();
+        self.held.push(chunk.clone());
+
+        let n = chunk.len();
+        for row_idx in 0..n {
+            if self.indices.len() < self.target {
+                self.indices.push((batch_idx, row_idx));
+            } else {
+                use rand::Rng;
+                // i = self.seen + row_idx is the global 0-based index of this row.
+                let global_idx = self.seen + row_idx;
+                let j = self.rng.random_range(0..=global_idx);
+                if j < self.target {
+                    self.indices[j] = (batch_idx, row_idx);
+                }
             }
         }
-        chosen
-    };
-
-    let schema = samples_schema(data.value_type(), dim);
-    if take == 0 {
-        let empty = arrow_array::array::new_empty_array(schema.field(0).data_type());
-        return RecordBatch::try_new(schema, vec![empty]).map_err(arrow_error_to_lance);
+        self.seen += n;
+        Ok(())
     }
-    let take_array = UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
-    let taken = arrow::compute::take(data, &take_array, None).map_err(arrow_error_to_lance)?;
-    RecordBatch::try_new(schema, vec![taken]).map_err(arrow_error_to_lance)
+
+    /// Finalize the reservoir, producing one [`RecordBatch`] of selected rows.
+    ///
+    /// If the reservoir never saw any rows, returns an empty batch with a
+    /// `Float32` placeholder schema (callers that care about value type
+    /// should feed at least one chunk first).
+    pub fn into_record_batch(self) -> Result<RecordBatch> {
+        let value_type = self.value_type.unwrap_or(DataType::Float32);
+        let dim = self.dim.unwrap_or(0);
+        let schema = samples_schema(value_type, dim);
+
+        if self.indices.is_empty() {
+            let empty = arrow_array::array::new_empty_array(schema.field(0).data_type());
+            return RecordBatch::try_new(schema, vec![empty]).map_err(arrow_error_to_lance);
+        }
+
+        // Take per source batch to keep concat cheap, then concatenate.
+        let mut per_batch_indices: HashMap<usize, Vec<u32>> = HashMap::new();
+        for (b, r) in &self.indices {
+            per_batch_indices.entry(*b).or_default().push(*r as u32);
+        }
+
+        let mut taken: Vec<FixedSizeListArray> = Vec::with_capacity(self.held.len());
+        for (b_idx, batch) in self.held.iter().enumerate() {
+            let Some(rows) = per_batch_indices.get(&b_idx) else {
+                continue;
+            };
+            let take_array = UInt32Array::from(rows.clone());
+            let arr =
+                arrow::compute::take(batch, &take_array, None).map_err(arrow_error_to_lance)?;
+            let fsl = arr
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    Error::index("StreamingReservoir: take produced non-FSL output".to_string())
+                })?
+                .clone();
+            taken.push(fsl);
+        }
+
+        let arrays: Vec<&dyn Array> = taken.iter().map(|a| a as &dyn Array).collect();
+        let combined = arrow::compute::concat(&arrays).map_err(arrow_error_to_lance)?;
+        let fsl = combined
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .cloned()
+            .ok_or_else(|| Error::index("StreamingReservoir: concat result is not FSL"))?;
+
+        RecordBatch::try_new(schema, vec![Arc::new(fsl)]).map_err(arrow_error_to_lance)
+    }
 }
 
 fn concat_samples(samples: Vec<RecordBatch>) -> Result<FixedSizeListArray> {
@@ -785,6 +1051,15 @@ pub fn select_initial_centroids(
 /// to obtain a high-quality initial set of centroids. For `k > 256`, the existing
 /// kmeans engine automatically falls back to hierarchical kmeans (see
 /// `train_kmeans` in this crate).
+///
+/// Cosine handling: `train_kmeans` does not implement Cosine in its inner kernels
+/// (`argmin_value_float_with_bias` panics). To match the Layer-1 contract in
+/// `compute_partial_stats` (caller normalizes, kernel runs as L2), this function
+/// L2-normalizes the combined samples up front and dispatches the inner k-means
+/// with `DistanceType::L2` whenever the requested `distance_type` is Cosine. The
+/// resulting centroids — means in normalized space — are then re-normalized so
+/// the returned array satisfies the Cosine invariant that subsequent rounds
+/// expect (unit-norm centroids, distance computed as L2).
 pub fn bootstrap_centroids(
     samples: Vec<RecordBatch>,
     k: usize,
@@ -793,10 +1068,22 @@ pub fn bootstrap_centroids(
 ) -> Result<FixedSizeListArray> {
     let combined = concat_samples(samples)?;
     let dim = combined.value_length() as usize;
+
+    // Cosine: normalize inputs once, then run inner kmeans as L2 (mirrors the
+    // assignment dispatch in `compute_partial_stats`).
+    let is_cosine = matches!(distance_type, DistanceType::Cosine);
+    let (combined, inner_dt) = if is_cosine {
+        (
+            normalize_fsl_owned(combined).map_err(arrow_error_to_lance)?,
+            DistanceType::L2,
+        )
+    } else {
+        (combined, distance_type)
+    };
     let params = KMeansParams::default()
-        .with_distance_type(distance_type)
+        .with_distance_type(inner_dt)
         .with_seed(rng_seed);
-    match combined.value_type() {
+    let centroids = match combined.value_type() {
         DataType::Float32 => {
             let arr = combined.values().as_primitive::<Float32Type>().clone();
             let model = train_kmeans::<Float32Type>(&arr, params, dim, k, 256)?;
@@ -828,13 +1115,22 @@ pub fn bootstrap_centroids(
             "bootstrap_centroids: unsupported dtype {}",
             other
         ))),
+    }?;
+
+    // Cosine: the inner kmeans operates on normalized samples and returns
+    // arithmetic means, which are not generally unit-norm. Re-normalize so
+    // callers (and Layer-1 `compute_partial_stats`) get unit-norm centroids.
+    if is_cosine {
+        normalize_fsl_owned(centroids).map_err(arrow_error_to_lance)
+    } else {
+        Ok(centroids)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{ArrayRef, FixedSizeListArray};
     use arrow_schema::DataType;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_linalg::distance::DistanceType;
@@ -883,6 +1179,226 @@ mod tests {
         let new_schema = Arc::new((*batch.schema()).clone().with_metadata(md));
         let bad = RecordBatch::try_new(new_schema, batch.columns().to_vec()).unwrap();
         assert!(PartialStats::from_record_batch(bad).is_err());
+    }
+
+    #[test]
+    fn test_from_record_batch_rejects_malformed_inputs() {
+        // baseline: a valid empty PartialStats batch
+        let valid = PartialStats::empty(4, 8, DistanceType::L2, [0u8; 8]).into_record_batch();
+        assert!(PartialStats::from_record_batch(valid.clone()).is_ok());
+
+        // helper: clone with mutated metadata
+        let mutate_meta = |key: &str, value: Option<&str>| -> RecordBatch {
+            let mut md = valid.schema().metadata().clone();
+            match value {
+                Some(v) => {
+                    md.insert(key.into(), v.into());
+                }
+                None => {
+                    md.remove(key);
+                }
+            }
+            let s = Arc::new((*valid.schema()).clone().with_metadata(md));
+            RecordBatch::try_new(s, valid.columns().to_vec()).unwrap()
+        };
+
+        // missing each required metadata key
+        for key in [META_K, META_DIM, META_DT, META_FP] {
+            assert!(
+                PartialStats::from_record_batch(mutate_meta(key, None)).is_err(),
+                "missing `{}` should be rejected",
+                key
+            );
+        }
+
+        // unparsable k / dim / fingerprint
+        assert!(PartialStats::from_record_batch(mutate_meta(META_K, Some("nope"))).is_err());
+        assert!(PartialStats::from_record_batch(mutate_meta(META_DIM, Some("-1"))).is_err());
+        assert!(PartialStats::from_record_batch(mutate_meta(META_FP, Some("zz"))).is_err());
+
+        // unknown distance_type
+        assert!(PartialStats::from_record_batch(mutate_meta(META_DT, Some("manhattan"))).is_err());
+
+        // dim mismatch: metadata says dim=4 but the FSL column is dim=8
+        let bad_dim = mutate_meta(META_DIM, Some("4"));
+        assert!(PartialStats::from_record_batch(bad_dim).is_err());
+
+        // k mismatch: metadata says k=999 but the batch has 4 rows
+        let bad_k = mutate_meta(META_K, Some("999"));
+        assert!(PartialStats::from_record_batch(bad_k).is_err());
+
+        // wrong dtype on the `count` column (UInt32 instead of UInt64)
+        let mut cols = valid.columns().to_vec();
+        cols[1] = Arc::new(UInt32Array::from(vec![0u32; 4]));
+        let mut fields: Vec<_> = valid
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields[1] = Field::new(COL_COUNT, DataType::UInt32, false);
+        let bad_count_schema =
+            Arc::new(Schema::new(fields).with_metadata(valid.schema().metadata().clone()));
+        let bad_count = RecordBatch::try_new(bad_count_schema, cols).unwrap();
+        assert!(PartialStats::from_record_batch(bad_count).is_err());
+
+        // non-sequential cluster_id values
+        let cols = valid.columns().to_vec();
+        let mut bad_ids = vec![0u32; 4];
+        bad_ids[2] = 99;
+        let mut cols = cols;
+        cols[0] = Arc::new(UInt32Array::from(bad_ids));
+        let bad_ids_batch = RecordBatch::try_new(valid.schema(), cols).unwrap();
+        assert!(PartialStats::from_record_batch(bad_ids_batch).is_err());
+    }
+
+    #[test]
+    fn test_from_record_batch_rejects_nulls_in_dense_columns() {
+        use arrow::buffer::NullBuffer;
+        let k = 4usize;
+        let dim = 8usize;
+        let valid = PartialStats::empty(k, dim, DistanceType::L2, [0u8; 8]).into_record_batch();
+
+        // RecordBatch::try_new itself rejects nulls in fields declared
+        // nullable=false (which the canonical schema uses for every top-level
+        // column). To smuggle a null past that check and let
+        // `from_record_batch` see it, rebuild the schema so just the mutated
+        // column's field is nullable=true. The validator still must reject.
+        let make_schema_for_replaced = |idx: usize| -> SchemaRef {
+            let mut fields: Vec<Field> = valid
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect();
+            let field = &fields[idx];
+            fields[idx] = Field::new(field.name(), field.data_type().clone(), true);
+            Arc::new(Schema::new(fields).with_metadata(valid.schema().metadata().clone()))
+        };
+
+        let replace_col = |idx: usize, replacement: ArrayRef| -> RecordBatch {
+            let mut cols = valid.columns().to_vec();
+            cols[idx] = replacement;
+            RecordBatch::try_new(make_schema_for_replaced(idx), cols).unwrap()
+        };
+
+        let bad_count: ArrayRef =
+            Arc::new(UInt64Array::from(vec![None, Some(0), Some(0), Some(0)]));
+        assert!(
+            PartialStats::from_record_batch(replace_col(1, bad_count)).is_err(),
+            "null in `count` must be rejected"
+        );
+
+        let bad_sq_norm: ArrayRef = Arc::new(Float64Array::from(vec![
+            None,
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+        ]));
+        assert!(
+            PartialStats::from_record_batch(replace_col(3, bad_sq_norm)).is_err(),
+            "null in `sq_norm_sum` must be rejected"
+        );
+
+        let bad_loss: ArrayRef = Arc::new(Float64Array::from(vec![
+            None,
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+        ]));
+        assert!(
+            PartialStats::from_record_batch(replace_col(4, bad_loss)).is_err(),
+            "null in `loss` must be rejected"
+        );
+
+        let bad_radius: ArrayRef = Arc::new(Float32Array::from(vec![
+            None,
+            Some(0.0_f32),
+            Some(0.0),
+            Some(0.0),
+        ]));
+        assert!(
+            PartialStats::from_record_batch(replace_col(5, bad_radius)).is_err(),
+            "null in `radius` must be rejected"
+        );
+
+        // sum: top-level FSL row null. Build with a full inner buffer (k*dim
+        // values) and a top-level NullBuffer that flips row 0.
+        let dense_inner = Float64Array::from(vec![0.0_f64; k * dim]);
+        let mut top_validity = vec![true; k];
+        top_validity[0] = false;
+        let nulls = NullBuffer::from(top_validity);
+        let sum_field = Arc::new(Field::new("item", DataType::Float64, true));
+        let bad_sum_top: ArrayRef = Arc::new(FixedSizeListArray::new(
+            sum_field.clone(),
+            dim as i32,
+            Arc::new(dense_inner),
+            Some(nulls),
+        ));
+        assert!(
+            PartialStats::from_record_batch(replace_col(2, bad_sum_top)).is_err(),
+            "top-level null in `sum` must be rejected"
+        );
+
+        // sum: a null in the inner Float64 buffer. Build a Float64 array of
+        // length k*dim with a single null in the first cell, then wrap into
+        // a fully-valid FSL (top-level all valid). Inner field already
+        // declares nullable=true so the canonical schema accepts the buffer.
+        let mut inner_builder = Float64Builder::new();
+        inner_builder.append_null();
+        for _ in 1..(k * dim) {
+            inner_builder.append_value(0.0);
+        }
+        let inner_with_null = inner_builder.finish();
+        let bad_sum_inner: ArrayRef = Arc::new(FixedSizeListArray::new(
+            sum_field,
+            dim as i32,
+            Arc::new(inner_with_null),
+            None,
+        ));
+        let bad_inner_batch = RecordBatch::try_new(valid.schema(), {
+            let mut cols = valid.columns().to_vec();
+            cols[2] = bad_sum_inner;
+            cols
+        })
+        .unwrap();
+        assert!(
+            PartialStats::from_record_batch(bad_inner_batch).is_err(),
+            "inner Float64 null in `sum` must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_finalize_centroids_rejects_fingerprint_mismatch() {
+        let prev1 = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32, 0.0, 1.0, 1.0]),
+            2,
+        )
+        .unwrap();
+        let prev2 = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![10.0_f32, 10.0, 20.0, 20.0]),
+            2,
+        )
+        .unwrap();
+        // build stats against prev1 with at least one assigned point so the
+        // total_count check doesn't short-circuit before fingerprint check
+        let data = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32, 0.0, 1.0, 1.0]),
+            2,
+        )
+        .unwrap();
+        let stats = super::compute_partial_stats(&prev1, &data, DistanceType::L2).unwrap();
+        // applying the stats to a different `prev` must error
+        let err = finalize_centroids(&stats, &prev2)
+            .expect_err("stats from prev1 must not finalize against prev2");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("fingerprint"),
+            "error should mention fingerprint mismatch, got: {}",
+            msg
+        );
+        // sanity: applying to the same prev still works
+        finalize_centroids(&stats, &prev1).unwrap();
     }
 
     #[test]
@@ -1255,5 +1771,38 @@ mod tests {
         let centroids = bootstrap_centroids(vec![s], 32, DistanceType::L2, 13).unwrap();
         assert_eq!(centroids.len(), 32);
         assert_eq!(centroids.value_length(), 8);
+    }
+
+    #[test]
+    fn test_bootstrap_centroids_is_deterministic_with_seed() {
+        let s = local_reservoir_sample(&random_fsl_f32(7, 5_000, 8), 4_000, 11).unwrap();
+        let a = bootstrap_centroids(vec![s.clone()], 32, DistanceType::L2, 7).unwrap();
+        let b = bootstrap_centroids(vec![s], 32, DistanceType::L2, 7).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.value_length(), b.value_length());
+        let av = a.values().as_primitive::<Float32Type>().values().to_vec();
+        let bv = b.values().as_primitive::<Float32Type>().values().to_vec();
+        assert_eq!(av, bv, "same-seed bootstrap_centroids must be byte-equal");
+    }
+
+    #[test]
+    fn test_bootstrap_centroids_cosine_does_not_panic() {
+        let s = local_reservoir_sample(&random_fsl_f32(7, 2_000, 8), 1_500, 21).unwrap();
+        let centroids = bootstrap_centroids(vec![s], 16, DistanceType::Cosine, 23).unwrap();
+        assert_eq!(centroids.len(), 16);
+        assert_eq!(centroids.value_length(), 8);
+
+        // Every centroid row must have unit L2 norm (within ε), because the
+        // inner kmeans was run on normalized data and didn't denormalize.
+        let values = centroids.values().as_primitive::<Float32Type>().values();
+        for (i, row) in values.chunks_exact(8).enumerate() {
+            let norm = row.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-3,
+                "centroid {} has L2 norm {} (expected ≈ 1.0)",
+                i,
+                norm
+            );
+        }
     }
 }

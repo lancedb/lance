@@ -23,6 +23,19 @@ use tokio::sync::Mutex;
 use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder, row_offsets_to_row_addresses};
 use crate::{Error, Result};
 
+/// Construct a [`SmallRng`] from an optional seed.
+///
+/// `Some(seed)` produces a deterministic RNG (used by reproducible-sampling
+/// callers, e.g. distributed round-0). `None` falls back to the OS source —
+/// matching the historical behavior of the callers that don't need
+/// reproducibility.
+fn seeded_rng(seed: Option<u64>) -> SmallRng {
+    match seed {
+        Some(s) => SmallRng::seed_from_u64(s),
+        None => SmallRng::from_os_rng(),
+    }
+}
+
 /// Helper function to extract a column from a RecordBatch, supporting nested field paths.
 ///
 /// This function handles:
@@ -89,6 +102,7 @@ async fn estimate_multivector_vectors_per_row(
     column: &str,
     num_rows: usize,
     fragments: Option<&[u32]>,
+    seed: Option<u64>,
 ) -> Result<usize> {
     if num_rows == 0 {
         return Ok(1030);
@@ -96,26 +110,34 @@ async fn estimate_multivector_vectors_per_row(
 
     let projection = dataset.schema().project(&[column])?;
 
-    // Try a few random samples first (fast path).
-    let sample_batch_size = std::cmp::min(64, num_rows);
-    for _ in 0..8 {
-        let batch = dataset
-            .sample(sample_batch_size, &projection, fragments)
-            .await?;
-        let array = get_column_from_batch(&batch, column)?;
-        let list_array = array.as_list::<i32>();
-        for i in 0..list_array.len() {
-            if list_array.is_null(i) {
-                continue;
-            }
-            let len = list_array.value_length(i) as usize;
-            if len > 0 {
-                return Ok(len);
+    // Random-sample fast path: 8 small `Dataset::sample` rounds. This is fast
+    // when most rows are populated, but `Dataset::sample` itself uses
+    // `rand::rng()` and is non-deterministic. When the caller asks for
+    // determinism (e.g. distributed round-0), skip this path entirely and
+    // fall through to the scanner-based prefix below, which is already
+    // deterministic.
+    if seed.is_none() {
+        let sample_batch_size = std::cmp::min(64, num_rows);
+        for _ in 0..8 {
+            let batch = dataset
+                .sample(sample_batch_size, &projection, fragments)
+                .await?;
+            let array = get_column_from_batch(&batch, column)?;
+            let list_array = array.as_list::<i32>();
+            for i in 0..list_array.len() {
+                if list_array.is_null(i) {
+                    continue;
+                }
+                let len = list_array.value_length(i) as usize;
+                if len > 0 {
+                    return Ok(len);
+                }
             }
         }
     }
 
-    // Fallback: scan a small prefix to find a non-null example. This avoids rare
+    // Fallback (and only path when `seed.is_some()`): scan a small prefix to
+    // find a non-null example. This is deterministic and avoids rare
     // flakiness when values are extremely sparse.
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
@@ -338,7 +360,7 @@ pub async fn maybe_sample_training_data(
             // Set a minimum sample size of 128 to avoid too small samples,
             // it's not a problem because 128 multivectors is just about 64 MiB
             let vectors_per_row =
-                estimate_multivector_vectors_per_row(dataset, column, num_rows, fragment_ids)
+                estimate_multivector_vectors_per_row(dataset, column, num_rows, fragment_ids, None)
                     .await?;
             sample_size_hint.div_ceil(vectors_per_row).max(128)
         }
@@ -412,7 +434,10 @@ impl PartitionLoadLock {
 ///
 /// Handles both regular vector columns (FixedSizeList) and multivector columns
 /// (List\<FixedSizeList\>), flattening the latter.
-fn vector_column_to_fsl(batch: &RecordBatch, column: &str) -> Result<FixedSizeListArray> {
+pub(crate) fn vector_column_to_fsl(
+    batch: &RecordBatch,
+    column: &str,
+) -> Result<FixedSizeListArray> {
     let array = get_column_from_batch(batch, column)?;
     match array.data_type() {
         arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),
@@ -454,6 +479,118 @@ async fn scan_all_training_data(
     Ok(batch)
 }
 
+/// Streaming counterpart of [`scan_all_training_data`]: yields the same
+/// projected/optionally-null-filtered rows as a `DatasetRecordBatchStream`
+/// without materializing them in memory. Used by Layer-2 distributed paths
+/// that consume training rows incrementally.
+pub(crate) async fn scan_all_training_data_stream(
+    dataset: &Dataset,
+    column: &str,
+    is_nullable: bool,
+    fragment_ids: Option<&[u32]>,
+) -> Result<crate::dataset::scanner::DatasetRecordBatchStream> {
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    if let Some(fragment_ids) = fragment_ids {
+        scanner.with_fragments(resolve_scan_fragments(dataset, fragment_ids)?);
+    }
+    if is_nullable {
+        let column_expr = lance_datafusion::logical_expr::field_path_to_expr(column)?;
+        scanner.filter_expr(column_expr.is_not_null());
+    }
+    let stream = scanner.try_into_stream().await?;
+    Ok(stream)
+}
+
+/// Streaming counterpart of [`maybe_sample_training_data`].
+///
+/// Mirrors the same `should_sample` branching as the non-streaming variant
+/// but yields a [`Pin<Box<dyn Stream<...>>>`] of [`RecordBatch`] without ever
+/// materializing the full sample in memory. The optional `seed` is forwarded
+/// through to the random-range / fragment-shuffle samplers so callers (e.g.
+/// distributed round-0) can reproduce the same byte-for-byte stream for a
+/// given `(dataset, column, fragments, sample_size_hint, seed)` tuple.
+///
+/// This intentionally does **not** use the `sample_fsl_uniform` chunked-take
+/// fast path used by [`maybe_sample_training_data`]; that path returns an
+/// already-materialized FSL and would require buffering the whole sample
+/// before re-emitting it. The streaming callers either (a) consume every row
+/// (Layer-2 partial stats) or (b) reservoir-sample (Layer-2 round 0), so the
+/// loss of the dense-path optimisation is irrelevant.
+pub(crate) async fn sample_training_data_stream(
+    dataset: &Dataset,
+    column: &str,
+    sample_size_hint: usize,
+    fragment_ids: Option<&[u32]>,
+    seed: Option<u64>,
+) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
+    let num_rows = count_rows(dataset, fragment_ids).await?;
+
+    let vector_field = dataset.schema().field(column).ok_or(Error::index(format!(
+        "Sample training data (stream): column {} does not exist in schema",
+        column
+    )))?;
+
+    if sample_size_hint == 0 {
+        info!("No sampling required (stream): yielding empty stream");
+        return Ok(Box::pin(stream::empty()));
+    }
+
+    let is_nullable = vector_field.nullable;
+
+    let sample_size_hint = match vector_field.data_type() {
+        arrow::datatypes::DataType::List(_) => {
+            let vectors_per_row =
+                estimate_multivector_vectors_per_row(dataset, column, num_rows, fragment_ids, seed)
+                    .await?;
+            sample_size_hint.div_ceil(vectors_per_row).max(128)
+        }
+        _ => sample_size_hint,
+    };
+
+    let byte_width = vector_field
+        .data_type()
+        .byte_width_opt()
+        .unwrap_or(4 * 1024);
+
+    let should_sample = num_rows > sample_size_hint;
+    if !should_sample {
+        info!(
+            "Sample training data (stream): scanning all {} rows for column {}",
+            num_rows, column
+        );
+        let s = scan_all_training_data_stream(dataset, column, is_nullable, fragment_ids).await?;
+        let mapped = s.map_err(Error::from);
+        return Ok(Box::pin(mapped));
+    }
+
+    info!(
+        "Sample training data (stream): sampling {} rows from {} rows for column {}",
+        sample_size_hint, num_rows, column
+    );
+
+    if let Some(fragment_ids) = fragment_ids {
+        return sample_training_data_scan_from_fragments(
+            dataset,
+            column,
+            sample_size_hint,
+            num_rows,
+            fragment_ids,
+            seed,
+        );
+    }
+
+    let scan = sample_training_data_scan(
+        dataset,
+        column,
+        sample_size_hint,
+        num_rows,
+        byte_width,
+        seed,
+    )?;
+    Ok(Box::pin(scan.map_err(Error::from)))
+}
+
 /// Sample training data from the dataset.
 ///
 /// Dispatches to the most efficient strategy based on column type and nullability:
@@ -492,6 +629,7 @@ async fn sample_training_data(
             sample_size_hint,
             num_rows,
             fragment_ids,
+            None,
         )?;
         return match vector_field.data_type() {
             DataType::FixedSizeList(_, _) => {
@@ -514,13 +652,25 @@ async fn sample_training_data(
             .await
         }
         DataType::FixedSizeList(_, _) => {
-            let scan =
-                sample_training_data_scan(dataset, column, sample_size_hint, num_rows, byte_width)?;
+            let scan = sample_training_data_scan(
+                dataset,
+                column,
+                sample_size_hint,
+                num_rows,
+                byte_width,
+                None,
+            )?;
             sample_nullable_fsl(column, sample_size_hint, byte_width, vector_field, scan).await
         }
         _ => {
-            let scan =
-                sample_training_data_scan(dataset, column, sample_size_hint, num_rows, byte_width)?;
+            let scan = sample_training_data_scan(
+                dataset,
+                column,
+                sample_size_hint,
+                num_rows,
+                byte_width,
+                None,
+            )?;
             sample_nullable_fallback(column, sample_size_hint, is_nullable, scan).await
         }
     }
@@ -533,9 +683,10 @@ fn sample_training_data_scan(
     sample_size_hint: usize,
     num_rows: usize,
     byte_width: usize,
+    seed: Option<u64>,
 ) -> Result<crate::dataset::scanner::DatasetRecordBatchStream> {
     let block_size = dataset.object_store.as_ref().block_size();
-    let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width);
+    let ranges = random_ranges(num_rows, sample_size_hint, block_size, byte_width, seed);
     Ok(dataset.take_scan(
         Box::pin(futures::stream::iter(ranges).map(Ok)),
         Arc::new(dataset.schema().project(&[column])?),
@@ -556,6 +707,7 @@ fn sample_training_data_scan_from_fragments(
     sample_size_hint: usize,
     num_rows: usize,
     fragment_ids: &[u32],
+    seed: Option<u64>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     if fragment_ids.is_empty() {
         return Err(Error::invalid_input(
@@ -590,7 +742,7 @@ fn sample_training_data_scan_from_fragments(
             projection,
             selected_fragments,
             HashSet::<u64>::with_capacity(sample_size_hint.min(num_rows)),
-            SmallRng::from_os_rng(),
+            seeded_rng(seed),
         ),
         move |(dataset, projection, selected_fragments, mut seen_offsets, mut rng)| async move {
             if seen_offsets.len() >= num_rows {
@@ -786,7 +938,7 @@ async fn sample_fsl_uniform(
     byte_width: usize,
     vector_field: &lance_core::datatypes::Field,
 ) -> Result<FixedSizeListArray> {
-    let indices = generate_random_indices(num_rows, sample_size_hint);
+    let indices = generate_random_indices(num_rows, sample_size_hint, None);
     let projection = Arc::new(dataset.schema().project(&[column])?);
 
     let mut values_buf = MutableBuffer::with_capacity(sample_size_hint * byte_width);
@@ -942,9 +1094,9 @@ fn filter_non_null_rows(array: ArrayRef, batch: RecordBatch) -> Result<RecordBat
 /// Uses two strategies depending on sparsity:
 /// - Sparse (`k * 2 < num_rows`): HashSet rejection sampling, O(k) expected.
 /// - Dense: Fisher-Yates partial shuffle, O(num_rows) allocation.
-fn generate_random_indices(num_rows: usize, k: usize) -> Vec<u64> {
+fn generate_random_indices(num_rows: usize, k: usize, seed: Option<u64>) -> Vec<u64> {
     assert!(k <= num_rows);
-    let mut rng = SmallRng::from_os_rng();
+    let mut rng = seeded_rng(seed);
     let mut indices = if k * 2 < num_rows {
         let mut set = std::collections::HashSet::with_capacity(k);
         while set.len() < k {
@@ -984,9 +1136,10 @@ fn random_ranges(
     sample_size_hint: usize,
     block_size: usize,
     byte_width: usize,
+    seed: Option<u64>,
 ) -> impl Iterator<Item = std::ops::Range<u64>> + Send {
     let rows_per_batch = 1.max(block_size / byte_width);
-    let mut rng = SmallRng::from_os_rng();
+    let mut rng = seeded_rng(seed);
     let num_bins = num_rows.div_ceil(rows_per_batch);
 
     let bins_iter: Box<dyn Iterator<Item = usize> + Send> = if sample_size_hint * 5 >= num_rows {
@@ -1058,7 +1211,7 @@ mod tests {
         assert_eq!(bin_size, 10);
 
         let mut ranges =
-            random_ranges(num_rows, sample_size, block_size, byte_width).collect::<Vec<_>>();
+            random_ranges(num_rows, sample_size, block_size, byte_width, None).collect::<Vec<_>>();
         ranges.sort_by_key(|r| r.start);
         let expected = (0..num_rows as u64).step_by(bin_size).map(|start| {
             let end = std::cmp::min(start + bin_size as u64, num_rows as u64);
@@ -1180,7 +1333,7 @@ mod tests {
     #[case::exact(100, 100)]
     #[test]
     fn test_generate_random_indices(#[case] num_rows: usize, #[case] k: usize) {
-        let indices = generate_random_indices(num_rows, k);
+        let indices = generate_random_indices(num_rows, k, None);
         assert_eq!(indices.len(), k);
         assert!(indices.windows(2).all(|w| w[0] < w[1]));
         assert!(indices.iter().all(|&i| (i as usize) < num_rows));
@@ -1251,10 +1404,48 @@ mod tests {
             .await
             .unwrap();
 
-        let n = estimate_multivector_vectors_per_row(&dataset, "mv", nrows, None)
+        let n = estimate_multivector_vectors_per_row(&dataset, "mv", nrows, None, None)
             .await
             .unwrap();
         assert_eq!(n, 1030);
+    }
+
+    #[tokio::test]
+    async fn test_estimate_multivector_vectors_per_row_seeded_is_deterministic() {
+        let nrows: usize = 64;
+        let dims: u32 = 4;
+
+        // Each multivector row holds between 2 and 3 inner vectors. No
+        // random-null thinning, so every row is populated and the scanner
+        // prefix will hit a non-empty row on its first batch.
+        let mv = array::cycle_vec_var(
+            array::rand_vec::<Float32Type>(Dimension::from(dims)),
+            Dimension::from(2),
+            Dimension::from(3),
+        );
+
+        let data = gen_batch()
+            .col("mv", mv)
+            .into_batch_rows(RowCount::from(nrows as u64))
+            .unwrap();
+
+        let dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let a = estimate_multivector_vectors_per_row(&dataset, "mv", nrows, None, Some(7))
+            .await
+            .unwrap();
+        let b = estimate_multivector_vectors_per_row(&dataset, "mv", nrows, None, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(a, b, "seeded estimator must be deterministic");
+        // Length came from the populated 2..3 range; sanity-check the value.
+        assert!(
+            (2..=3).contains(&a),
+            "expected inner length in [2,3], got {a}"
+        );
     }
 
     // Creates a dataset with three fragments holding 100, 200, and 150 rows.

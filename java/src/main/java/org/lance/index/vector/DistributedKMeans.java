@@ -39,8 +39,10 @@ import java.util.Objects;
  * <p>Mirrors {@code lance::index::vector::ivf::distributed}. Callers (Spark, custom RPC) own
  * broadcast, tree-reduce, and convergence; this class exposes only the math.
  *
- * <p>Partial stats and centroid sample batches cross the JNI boundary as Arrow IPC byte arrays.
- * Final centroid arrays are returned flat as {@code float[]} of length {@code k * dim}.
+ * <p>Every payload that crosses the JNI boundary — sampled rows, partial stats, and centroid arrays
+ * — moves as Arrow IPC byte arrays. The centroid-returning helpers ({@link #finalizeCentroids},
+ * {@link #selectInitialCentroids}, {@link #bootstrapCentroids}) return a {@link VectorSchemaRoot}
+ * whose child vector preserves the original Float16/Float32/Float64 element dtype.
  */
 public final class DistributedKMeans {
 
@@ -107,35 +109,56 @@ public final class DistributedKMeans {
     return readIpc(nativeReducePartialStats(serialized.toArray(new byte[0][])), allocator);
   }
 
-  /** Compute new centroids; returns flat {@code k * dim} float array. */
-  public static float[] finalizeCentroids(VectorSchemaRoot stats, VectorSchemaRoot prev) {
+  /**
+   * Compute new centroids; the returned VectorSchemaRoot has a single FixedSizeList column whose
+   * inner dtype matches {@code prev} (Float16/Float32/Float64).
+   */
+  public static VectorSchemaRoot finalizeCentroids(
+      VectorSchemaRoot stats, VectorSchemaRoot prev, BufferAllocator allocator) {
     Objects.requireNonNull(stats, "stats");
     Objects.requireNonNull(prev, "prev");
-    return nativeFinalizeCentroids(writeIpc(stats), writeIpc(prev));
+    Objects.requireNonNull(allocator, "allocator");
+    return readIpc(nativeFinalizeCentroids(writeIpc(stats), writeIpc(prev)), allocator);
   }
 
-  /** Driver-side: pick {@code k} rows uniformly at random from worker samples. */
-  public static float[] selectInitialCentroids(
-      List<VectorSchemaRoot> samples, int k, long rngSeed) {
+  /**
+   * Driver-side: pick {@code k} rows uniformly at random from worker samples. The returned
+   * VectorSchemaRoot has a single FixedSizeList column whose inner dtype matches the samples.
+   */
+  public static VectorSchemaRoot selectInitialCentroids(
+      List<VectorSchemaRoot> samples, int k, long rngSeed, BufferAllocator allocator) {
     Objects.requireNonNull(samples, "samples");
+    Objects.requireNonNull(allocator, "allocator");
     List<byte[]> serialized = new ArrayList<>(samples.size());
     for (VectorSchemaRoot s : samples) {
       serialized.add(writeIpc(s));
     }
-    return nativeSelectInitialCentroids(serialized.toArray(new byte[0][]), k, rngSeed);
+    return readIpc(
+        nativeSelectInitialCentroids(serialized.toArray(new byte[0][]), k, rngSeed), allocator);
   }
 
-  /** Driver-side: bootstrap centroids by running single-machine kmeans on worker samples. */
-  public static float[] bootstrapCentroids(
-      List<VectorSchemaRoot> samples, int k, DistanceType distanceType, long rngSeed) {
+  /**
+   * Driver-side: bootstrap centroids by running single-machine kmeans on worker samples. The
+   * returned VectorSchemaRoot has a single FixedSizeList column whose inner dtype matches the
+   * samples.
+   */
+  public static VectorSchemaRoot bootstrapCentroids(
+      List<VectorSchemaRoot> samples,
+      int k,
+      DistanceType distanceType,
+      long rngSeed,
+      BufferAllocator allocator) {
     Objects.requireNonNull(samples, "samples");
     Objects.requireNonNull(distanceType, "distanceType");
+    Objects.requireNonNull(allocator, "allocator");
     List<byte[]> serialized = new ArrayList<>(samples.size());
     for (VectorSchemaRoot s : samples) {
       serialized.add(writeIpc(s));
     }
-    return nativeBootstrapCentroids(
-        serialized.toArray(new byte[0][]), k, distanceType.toString(), rngSeed);
+    return readIpc(
+        nativeBootstrapCentroids(
+            serialized.toArray(new byte[0][]), k, distanceType.toString(), rngSeed),
+        allocator);
   }
 
   // -- helpers -------------------------------------------------------------
@@ -186,10 +209,10 @@ public final class DistributedKMeans {
 
   private static native byte[] nativeReducePartialStats(byte[][] stats);
 
-  private static native float[] nativeFinalizeCentroids(byte[] stats, byte[] prev);
+  private static native byte[] nativeFinalizeCentroids(byte[] stats, byte[] prev);
 
-  private static native float[] nativeSelectInitialCentroids(byte[][] samples, int k, long rngSeed);
+  private static native byte[] nativeSelectInitialCentroids(byte[][] samples, int k, long rngSeed);
 
-  private static native float[] nativeBootstrapCentroids(
+  private static native byte[] nativeBootstrapCentroids(
       byte[][] samples, int k, String distanceType, long rngSeed);
 }

@@ -3,9 +3,15 @@
 
 //! JNI shim for the distributed IVF centroid-training primitives.
 //!
-//! Mirrors `python/src/indices.rs`. Native methods take Arrow-IPC `byte[]` for
-//! `RecordBatch` arguments (centroids, partial stats, samples) and return
-//! either an IPC `byte[]` (for stats) or a flat `float[]` (for centroids).
+//! Mirrors `python/src/indices.rs`. Callers (Spark, custom RPC) own broadcast,
+//! tree-reduce, and convergence; this module exposes only the math. Every
+//! native that crosses the JNI boundary moves data as Arrow-IPC `byte[]`,
+//! including the three centroid-returning helpers (`finalizeCentroids`,
+//! `selectInitialCentroids`, `bootstrapCentroids`). Float16/Float32/Float64
+//! centroids all round-trip without dtype collapse — Java callers reconstruct
+//! a `VectorSchemaRoot` whose child vector preserves the original element
+//! type. The legacy `float[]` interface was removed to avoid silently
+//! downcasting Float16/Float64 outputs to Float32.
 
 use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
@@ -13,12 +19,12 @@ use crate::error::{Error, Result};
 
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
-use arrow_array::cast::AsArray;
-use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, RecordBatch};
+use arrow_array::{Array, FixedSizeListArray, RecordBatch};
+use arrow_schema::{Field, Schema};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JIntArray, JObject, JObjectArray, JString};
-use jni::sys::{jbyteArray, jfloatArray};
+use jni::sys::jbyteArray;
+use std::sync::Arc;
 
 use lance::index::vector::ivf::distributed as l2;
 use lance_index::vector::kmeans::distributed as l1;
@@ -60,22 +66,38 @@ fn ipc_to_centroids_fsl(env: &mut JNIEnv, jba: &JByteArray) -> Result<FixedSizeL
             batch.num_columns()
         )));
     }
-    Ok(batch
+    let fsl = batch
         .column(0)
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .ok_or_else(|| Error::input_error("centroids column must be FixedSizeList".to_string()))?
-        .clone())
+        .clone();
+    if !matches!(
+        fsl.value_type(),
+        arrow_schema::DataType::Float16
+            | arrow_schema::DataType::Float32
+            | arrow_schema::DataType::Float64
+    ) {
+        return Err(Error::input_error(format!(
+            "centroids inner dtype must be Float16/Float32/Float64, got {}",
+            fsl.value_type()
+        )));
+    }
+    Ok(fsl)
 }
 
-fn fsl_to_jfloat_array<'a>(
-    env: &mut JNIEnv<'a>,
-    fsl: &FixedSizeListArray,
-) -> Result<jni::objects::JFloatArray<'a>> {
-    let values = fsl.values().as_primitive::<Float32Type>().values().to_vec();
-    let arr = env.new_float_array(values.len() as i32)?;
-    env.set_float_array_region(&arr, 0, &values)?;
-    Ok(arr)
+/// Wrap a centroid FSL into a single-column Arrow-IPC payload. The schema
+/// preserves the original inner dtype so Float16/Float32/Float64 round-trip
+/// across the JNI boundary unchanged. Java callers reconstruct a
+/// `VectorSchemaRoot` and dispatch on the child vector's type.
+fn fsl_to_centroids_ipc(fsl: &FixedSizeListArray) -> Result<Vec<u8>> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "vec",
+        fsl.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(fsl.clone())]).map_err(arrow_err)?;
+    record_batch_to_ipc(&batch)
 }
 
 fn read_optional_fragment_ids(env: &mut JNIEnv, arr: &JIntArray) -> Result<Option<Vec<u32>>> {
@@ -121,6 +143,12 @@ pub extern "system" fn Java_org_lance_index_vector_DistributedKMeans_nativeSampl
         let column: String = env.get_string(&column_jstr)?.into();
         let dt = parse_distance_type(&mut env, &distance_type_jstr)?;
         let frags = read_optional_fragment_ids(&mut env, &fragment_ids_arr)?;
+        if target < 0 {
+            return Err(Error::input_error(format!(
+                "target must be >= 0, got {}",
+                target
+            )));
+        }
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&dataset_obj, NATIVE_DATASET) }?;
         let batch = RT.block_on(l2::sample_round_0(
@@ -245,25 +273,23 @@ pub extern "system" fn Java_org_lance_index_vector_DistributedKMeans_nativeFinal
     _class: JClass<'local>,
     stats_ipc: JByteArray<'local>,
     prev_ipc: JByteArray<'local>,
-) -> jfloatArray {
-    let mut inner = || -> Result<FixedSizeListArray> {
+) -> jbyteArray {
+    let mut inner = || -> Result<Vec<u8>> {
         let stats =
             l1::PartialStats::from_record_batch(ipc_to_record_batch(&mut env, &stats_ipc)?)?;
         let prev = ipc_to_centroids_fsl(&mut env, &prev_ipc)?;
-        Ok(l1::finalize_centroids(&stats, &prev)?)
+        let fsl = l1::finalize_centroids(&stats, &prev)?;
+        fsl_to_centroids_ipc(&fsl)
     };
-    let fsl = crate::ok_or_throw_with_return!(
-        env,
-        inner(),
-        jni::objects::JFloatArray::default().into_raw()
-    );
-    match fsl_to_jfloat_array(&mut env, &fsl) {
-        Ok(arr) => arr.into_raw(),
-        Err(e) => {
-            e.throw(&mut env);
-            jni::objects::JFloatArray::default().into_raw()
+    crate::ok_or_throw_with_return!(env, inner(), JByteArray::default().into_raw()).pipe(|bytes| {
+        match env.byte_array_from_slice(&bytes) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new("java/lang/RuntimeException", e.to_string());
+                JByteArray::default().into_raw()
+            }
         }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -273,29 +299,26 @@ pub extern "system" fn Java_org_lance_index_vector_DistributedKMeans_nativeSelec
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     samples_arr: JObjectArray<'local>,
-    k: i64,
+    k: i32,
     rng_seed: i64,
-) -> jfloatArray {
-    let mut inner = || -> Result<FixedSizeListArray> {
-        let batches = read_byte_array_2d(&mut env, &samples_arr)?;
-        Ok(l1::select_initial_centroids(
-            batches,
-            k as usize,
-            rng_seed as u64,
-        )?)
-    };
-    let fsl = crate::ok_or_throw_with_return!(
-        env,
-        inner(),
-        jni::objects::JFloatArray::default().into_raw()
-    );
-    match fsl_to_jfloat_array(&mut env, &fsl) {
-        Ok(arr) => arr.into_raw(),
-        Err(e) => {
-            e.throw(&mut env);
-            jni::objects::JFloatArray::default().into_raw()
+) -> jbyteArray {
+    let mut inner = || -> Result<Vec<u8>> {
+        if k < 0 {
+            return Err(Error::input_error(format!("k must be >= 0, got {}", k)));
         }
-    }
+        let batches = read_byte_array_2d(&mut env, &samples_arr)?;
+        let fsl = l1::select_initial_centroids(batches, k as usize, rng_seed as u64)?;
+        fsl_to_centroids_ipc(&fsl)
+    };
+    crate::ok_or_throw_with_return!(env, inner(), JByteArray::default().into_raw()).pipe(|bytes| {
+        match env.byte_array_from_slice(&bytes) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new("java/lang/RuntimeException", e.to_string());
+                JByteArray::default().into_raw()
+            }
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -305,30 +328,26 @@ pub extern "system" fn Java_org_lance_index_vector_DistributedKMeans_nativeBoots
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     samples_arr: JObjectArray<'local>,
-    k: i64,
+    k: i32,
     distance_type_jstr: JString<'local>,
     rng_seed: i64,
-) -> jfloatArray {
-    let mut inner = || -> Result<FixedSizeListArray> {
+) -> jbyteArray {
+    let mut inner = || -> Result<Vec<u8>> {
+        if k < 0 {
+            return Err(Error::input_error(format!("k must be >= 0, got {}", k)));
+        }
         let dt = parse_distance_type(&mut env, &distance_type_jstr)?;
         let batches = read_byte_array_2d(&mut env, &samples_arr)?;
-        Ok(l1::bootstrap_centroids(
-            batches,
-            k as usize,
-            dt,
-            rng_seed as u64,
-        )?)
+        let fsl = l1::bootstrap_centroids(batches, k as usize, dt, rng_seed as u64)?;
+        fsl_to_centroids_ipc(&fsl)
     };
-    let fsl = crate::ok_or_throw_with_return!(
-        env,
-        inner(),
-        jni::objects::JFloatArray::default().into_raw()
-    );
-    match fsl_to_jfloat_array(&mut env, &fsl) {
-        Ok(arr) => arr.into_raw(),
-        Err(e) => {
-            e.throw(&mut env);
-            jni::objects::JFloatArray::default().into_raw()
+    crate::ok_or_throw_with_return!(env, inner(), JByteArray::default().into_raw()).pipe(|bytes| {
+        match env.byte_array_from_slice(&bytes) {
+            Ok(arr) => arr.into_raw(),
+            Err(e) => {
+                let _ = env.throw_new("java/lang/RuntimeException", e.to_string());
+                JByteArray::default().into_raw()
+            }
         }
-    }
+    })
 }
