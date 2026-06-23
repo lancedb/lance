@@ -1281,6 +1281,47 @@ impl DirectoryNamespace {
             .uri)
     }
 
+    /// Resolves the branch URI for a `create_table_version` commit.
+    /// `BranchContents` is the source of truth, so check the ref first: a
+    /// registered branch commits directly. With no ref, accept the commit only on
+    /// an empty chain (the `create_branch` bootstrap, whose first commit precedes
+    /// its ref); reject a chain that already holds committed versions as a zombie.
+    async fn resolve_branch_for_commit(&self, table_uri: &str, branch: &str) -> Result<String> {
+        let main = self
+            .configured_builder(table_uri)
+            .load()
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::TableNotFound {
+                    message: format!("table at '{}' not found: {}", table_uri, e),
+                })
+            })?;
+        let branch_uri = main.branch_location().find_branch(Some(branch))?.uri;
+        match main.branches().get(branch).await {
+            Ok(_) => Ok(branch_uri),
+            Err(lance_core::Error::RefNotFound { .. }) => {
+                if self.branch_has_committed_versions(&branch_uri).await? {
+                    return Err(NamespaceError::TableNotFound {
+                        message: format!(
+                            "branch '{}' not found for table at '{}'",
+                            branch, table_uri
+                        ),
+                    }
+                    .into());
+                }
+                Ok(branch_uri)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn branch_has_committed_versions(&self, branch_uri: &str) -> Result<bool> {
+        let versions = self
+            .list_table_versions_from_storage(branch_uri, false, Some(1))
+            .await?;
+        Ok(!versions.is_empty())
+    }
+
     fn validate_dir_only_properties(
         properties: Option<&HashMap<String, String>>,
         operation: &str,
@@ -3140,7 +3181,7 @@ impl LanceNamespace for DirectoryNamespace {
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
         let table_uri = match branch {
-            Some(b) => self.resolve_branch_location(&table_uri, b).await?,
+            Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
             None => table_uri,
         };
 
@@ -12447,5 +12488,32 @@ mod tests {
         request.id = Some(vec!["nonexistent".to_string()]);
         let result = namespace.alter_table_drop_columns(request).await;
         assert!(result.is_err(), "Should fail when table does not exist");
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_on_managed_dataset_succeeds() {
+        use lance::dataset::builder::DatasetBuilder;
+
+        let temp = TempStdDir::default();
+        let ns = create_managed_namespace(temp.to_str().unwrap()).await;
+        let table_id = vec!["t".to_string()];
+        let mut main = create_managed_table(&ns, &table_id).await;
+
+        let fork_version = main.version().version;
+        let branch = main
+            .create_branch("exp", fork_version, None)
+            .await
+            .expect("create_branch failed");
+        assert_eq!(branch.manifest.branch.as_deref(), Some("exp"));
+        assert_eq!(scan_id_column(&branch).await, vec![1, 2]);
+
+        let reopened = DatasetBuilder::from_namespace(ns.clone(), table_id.clone())
+            .await
+            .unwrap()
+            .with_branch("exp", None)
+            .load()
+            .await
+            .expect("reopen branch failed");
+        assert_eq!(scan_id_column(&reopened).await, vec![1, 2]);
     }
 }
