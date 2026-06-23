@@ -797,6 +797,31 @@ def test_session_contains(tmp_path):
     assert not session.contains("subdir/nonexistent.lance")
 
 
+def test_session_delete_file(tmp_path):
+    """Test that LanceFileSession.delete_file() removes files and is idempotent."""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    with session.open_writer("test.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+    with session.open_writer("subdir/nested.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    # Deleting an existing file removes it.
+    assert session.contains("test.lance")
+    session.delete_file("test.lance")
+    assert not session.contains("test.lance")
+
+    # Nested paths work too.
+    assert session.contains("subdir/nested.lance")
+    session.delete_file("subdir/nested.lance")
+    assert not session.contains("subdir/nested.lance")
+
+    # Deleting a missing path is a no-op rather than an error (idempotent).
+    session.delete_file("test.lance")
+    session.delete_file("never_existed.lance")
+
+
 def test_struct_null_regression():
     import lance
 

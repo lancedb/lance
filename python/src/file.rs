@@ -659,6 +659,33 @@ impl LanceFileSession {
         })?
     }
 
+    /// Delete a file from the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// `contains`/`upload_file`/`download_file`. Deleting a missing object is a
+    /// no-op (idempotent) rather than an error, so this is safe to call on
+    /// best-effort cleanup paths. On Azure it talks to the blob endpoint only
+    /// and never probes the hierarchical-namespace (DFS) endpoint.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path` to delete.
+    pub fn delete_file(&self, path: String) -> PyResult<()> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            match self.object_store.inner.delete(&full_path).await {
+                Ok(()) => Ok(()),
+                // Deleting an object that does not exist is a no-op.
+                Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(e) => Err(PyIOError::new_err(format!(
+                    "Failed to delete remote file: {}",
+                    e
+                ))),
+            }
+        })?
+    }
+
     /// Download a file from object store to local filesystem
     ///
     /// Parameters

@@ -389,6 +389,22 @@ class LanceFileSession:
         common_prefixes, objects = self._session.list_with_delimiter(path)
         return ListResult(common_prefixes=common_prefixes, objects=objects)
 
+    def delete_file(self, path: str) -> None:
+        """
+        Delete a file (relative to this session's base path).
+
+        Deleting a path that does not exist is a no-op (idempotent) rather than
+        an error, so this is safe to call on best-effort cleanup paths. On Azure
+        it talks to the blob endpoint only and never probes the
+        hierarchical-namespace (DFS) endpoint.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to delete.
+        """
+        self._session.delete_file(path)
+
     def upload_file(self, local_path: Union[str, Path], remote_path: str) -> None:
         """
         Upload a file from local filesystem to the object store.
