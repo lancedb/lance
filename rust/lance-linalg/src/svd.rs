@@ -139,7 +139,7 @@ fn gram_schmidt(cols: &mut Vec<Vec<f64>>) {
 }
 
 fn multiply_A_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
-    (0..m).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum()).collect();
+    (0..m).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum()).collect()
 }
 
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
