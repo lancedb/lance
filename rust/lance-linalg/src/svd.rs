@@ -1,9 +1,25 @@
 const EPS: f64 = 2.220_446_049_250_313e-16;
 const MAX_JACOBI_SWEEPS: usize = 200;
 
+fn create_identity_matrix(n: usize) -> Vec<f64> {
+    let mut m = vec![0f64; n * n];
+    for i in 0..n {
+        m[i * n + i] = 1.0;
+    }
+    m
+}
+
+fn jacobi_rotate(s: &mut [f64], n: usize, p: usize, q: usize, c: f64, sn: f64) {
+
+}
+
+fn apply_givens_right(v: &mut [f64], n: usize, p: usize, q: usize, c: f64, sn: f64) {
+
+}
+
 fn jacobi_eigen(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     let mut s = a.to_vec();
-    let mut v = eye(n);
+    let mut v = create_identity_matrix(n);
 
     for _ in 0..MAX_JACOBI_SWEEPS {
         let mut max_val = 0.0f64;
