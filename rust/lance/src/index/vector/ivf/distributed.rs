@@ -25,7 +25,8 @@ use crate::index::vector::utils::{
 /// Round-0 worker entrypoint: reservoir-sample a Lance dataset slice.
 ///
 /// Streams the worker's projected training rows through a single
-/// [`StreamingReservoir`] so peak memory is bounded by the output sample
+/// [`StreamingReservoir`](lance_index::vector::kmeans::distributed::StreamingReservoir)
+/// so peak memory is bounded by the output sample
 /// (target rows) rather than the worker's full fragment slice. The same
 /// `rng_seed` is forwarded to both the upstream sampling stream and the
 /// reservoir, making same-seed runs byte-deterministic for a given
