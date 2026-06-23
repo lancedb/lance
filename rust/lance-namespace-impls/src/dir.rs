@@ -1281,12 +1281,19 @@ impl DirectoryNamespace {
             .uri)
     }
 
-    /// Resolves the branch URI for a `create_table_version` commit.
+    /// Resolves a branch to its `(uri, object-store path)` for a
+    /// `create_table_version` commit, so the commit write and the zombie check
+    /// share one path.
+    ///
     /// `BranchContents` is the source of truth, so check the ref first: a
     /// registered branch commits directly. With no ref, accept the commit only on
     /// an empty chain (the `create_branch` bootstrap, whose first commit precedes
     /// its ref); reject a chain that already holds committed versions as a zombie.
-    async fn resolve_branch_for_commit(&self, table_uri: &str, branch: &str) -> Result<String> {
+    async fn resolve_branch_for_commit(
+        &self,
+        table_uri: &str,
+        branch: &str,
+    ) -> Result<(String, Path)> {
         let main = self
             .configured_builder(table_uri)
             .load()
@@ -1296,11 +1303,14 @@ impl DirectoryNamespace {
                     message: format!("table at '{}' not found: {}", table_uri, e),
                 })
             })?;
-        let branch_uri = main.branch_location().find_branch(Some(branch))?.uri;
+        let branch_location = main.branch_location().find_branch(Some(branch))?;
         match main.branches().get(branch).await {
-            Ok(_) => Ok(branch_uri),
+            Ok(_) => Ok((branch_location.uri, branch_location.path)),
             Err(lance_core::Error::RefNotFound { .. }) => {
-                if self.branch_has_committed_versions(&branch_uri).await? {
+                if self
+                    .branch_has_committed_versions(&branch_location.path)
+                    .await?
+                {
                     return Err(NamespaceError::TableNotFound {
                         message: format!(
                             "branch '{}' not found for table at '{}'",
@@ -1309,17 +1319,17 @@ impl DirectoryNamespace {
                     }
                     .into());
                 }
-                Ok(branch_uri)
+                Ok((branch_location.uri, branch_location.path))
             }
             Err(e) => Err(e),
         }
     }
 
-    async fn branch_has_committed_versions(&self, branch_uri: &str) -> Result<bool> {
-        let versions = self
-            .list_table_versions_from_storage(branch_uri, false, Some(1))
-            .await?;
-        Ok(!versions.is_empty())
+    async fn branch_has_committed_versions(&self, branch_path: &Path) -> Result<bool> {
+        Ok(!self
+            .list_versions_under(branch_path, false, Some(1))
+            .await?
+            .is_empty())
     }
 
     fn validate_dir_only_properties(
@@ -1393,6 +1403,20 @@ impl DirectoryNamespace {
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
         let table_path = self.object_store_path_from_uri(table_uri)?;
+        self.list_versions_under(&table_path, descending, limit)
+            .await
+    }
+
+    /// List committed manifest versions under `table_path`'s `_versions/`
+    /// directory. Takes the object-store `Path` directly because converting a URI
+    /// back to a path (via `object_store_path_from_uri`) can diverge from the real
+    /// storage location on Windows and miss the manifests.
+    async fn list_versions_under(
+        &self,
+        table_path: &Path,
+        descending: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<TableVersion>> {
         let versions_dir = table_path.clone().join(VERSIONS_DIR);
         let manifest_metas: Vec<_> = self
             .object_store
@@ -1402,8 +1426,8 @@ impl DirectoryNamespace {
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
-                        "Failed to list manifest files for table at '{}': {}",
-                        table_uri, e
+                        "Failed to list manifest files under '{}': {}",
+                        versions_dir, e
                     ),
                 })
             })?;
@@ -3180,15 +3204,16 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("create_table_version");
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let table_uri = match branch {
+        let (table_uri, table_path) = match branch {
             Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
-            None => table_uri,
+            None => {
+                let table_path = self.object_store_path_from_uri(&table_uri)?;
+                (table_uri, table_path)
+            }
         };
 
         let staging_manifest_path = &request.manifest_path;
         let version = request.version as u64;
-
-        let table_path = self.object_store_path_from_uri(&table_uri)?;
 
         // Determine naming scheme from request, default to V2
         let naming_scheme = match request.naming_scheme.as_deref() {
