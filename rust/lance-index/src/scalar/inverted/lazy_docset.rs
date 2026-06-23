@@ -24,8 +24,8 @@ use lance_core::ROW_ID;
 use lance_core::Result;
 use tokio::sync::OnceCell;
 
-use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
 use crate::scalar::RowIdRemapper;
+use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
 use crate::scalar::{IndexReader, IndexStore};
 use lance_select::mask::RowAddrMask;
 

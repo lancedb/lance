@@ -36,7 +36,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchResult, UpdateCriteria,
+        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchResult,
+        UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME,

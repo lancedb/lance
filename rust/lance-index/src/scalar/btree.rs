@@ -17,6 +17,8 @@ use super::{
 };
 use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
+use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
+use crate::{pbold, scalar::btree::flat::FlatIndex};
 use crate::{
     progress::{IndexBuildProgress, noop_progress},
     scalar::{
@@ -27,8 +29,6 @@ use crate::{
         },
     },
 };
-use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
-use crate::{pbold, scalar::btree::flat::FlatIndex};
 use arrow_arith::numeric::add;
 use arrow_array::{
     Array, ArrayAccessor, ArrowNativeTypeOp, PrimitiveArray, RecordBatch, UInt32Array,
@@ -6294,11 +6294,12 @@ mod tests {
         // Remap row 0 -> row 5000 (outside the original [0, 1000) range so no collision).
         // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
         // the FragReuseIndex through to the rebuilt BTreeIndex.
-        let frag_reuse_index: Arc<dyn crate::scalar::RowIdRemapper> = Arc::new(FragReuseIndex::new(
-            Uuid::new_v4(),
-            vec![HashMap::from([(0u64, Some(5000u64))])],
-            FragReuseIndexDetails { versions: vec![] },
-        ));
+        let frag_reuse_index: Arc<dyn crate::scalar::RowIdRemapper> =
+            Arc::new(FragReuseIndex::new(
+                Uuid::new_v4(),
+                vec![HashMap::from([(0u64, Some(5000u64))])],
+                FragReuseIndexDetails { versions: vec![] },
+            ));
         let reconstructed = state
             .reconstruct(
                 test_store.clone(),

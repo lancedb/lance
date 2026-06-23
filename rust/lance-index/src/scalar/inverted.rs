@@ -114,13 +114,11 @@ use lance_core::Error;
 
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
-use crate::{
-    scalar::{
-        CreatedIndex, RowIdRemapper, ScalarIndex,
-        expression::{FtsQueryParser, ScalarQueryParser},
-        registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-        },
+use crate::scalar::{
+    CreatedIndex, RowIdRemapper, ScalarIndex,
+    expression::{FtsQueryParser, ScalarQueryParser},
+    registry::{
+        BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
     },
 };
 

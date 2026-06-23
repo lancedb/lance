@@ -15,9 +15,7 @@ use lance_core::{
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
-use crate::{
-    scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser},
-};
+use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
 
