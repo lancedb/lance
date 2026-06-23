@@ -76,10 +76,6 @@ impl Index for JsonIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        unimplemented!()
-    }
-
     fn index_type(&self) -> IndexType {
         // TODO: This causes the index to appear as btree in list_indices call.  Need better logic
         // in list_indices to use details instead of index_type.

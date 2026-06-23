@@ -47,8 +47,12 @@ fn max_conn_reset_retries() -> u16 {
     })
 }
 
-/// Maximum part size in GCS and S3: 5GB.
-const MAX_UPLOAD_PART_SIZE: usize = 1024 * 1024 * 1024 * 5;
+/// Maximum body size for a single S3 PUT: strictly less than 5 GiB.
+/// AWS rejects single-PUT bodies of exactly 5 GiB (= 5 * 1024^3) with
+/// `EntityTooLarge`, so we clamp `LANCE_INITIAL_UPLOAD_SIZE` one byte
+/// below that threshold to keep the buffer-fills-to-clamp single-PUT
+/// path safe. See lance#6750 for the related txn-file write fix.
+const MAX_UPLOAD_PART_SIZE: usize = 1024 * 1024 * 1024 * 5 - 1;
 
 /// Clamps a requested upload part size to the valid [5MB, 5GB] range.
 /// Returns the clamped value and whether clamping was necessary.
@@ -895,6 +899,19 @@ mod tests {
         );
         assert_eq!(
             clamp_initial_upload_size(usize::MAX),
+            (MAX_UPLOAD_PART_SIZE, true)
+        );
+    }
+
+    /// Regression for the foot-gun where `LANCE_INITIAL_UPLOAD_SIZE=5368709120`
+    /// (exactly 5 GiB, Pucheng's setting) caused a single-PUT of 5 GiB on
+    /// shutdown — which S3 rejects with `EntityTooLarge`. After tightening
+    /// `MAX_UPLOAD_PART_SIZE` to 5 GiB - 1, raw 5 GiB must clamp DOWN.
+    #[test]
+    fn clamp_initial_upload_size_at_5gib_clamps_down() {
+        let exactly_5_gib: usize = 5 * 1024 * 1024 * 1024;
+        assert_eq!(
+            clamp_initial_upload_size(exactly_5_gib),
             (MAX_UPLOAD_PART_SIZE, true)
         );
     }

@@ -110,12 +110,6 @@ impl Index for LabelListIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "LabeListIndex is not a vector index".into(),
-        ))
-    }
-
     async fn prewarm(&self) -> Result<()> {
         self.values_index.prewarm().await
     }

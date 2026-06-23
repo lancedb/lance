@@ -37,7 +37,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::FragReuseIndex;
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -546,12 +545,6 @@ impl Index for ZoneMapIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "ZoneMapIndex is not a vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
