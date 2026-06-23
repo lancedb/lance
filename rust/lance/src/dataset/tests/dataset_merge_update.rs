@@ -1047,7 +1047,8 @@ async fn test_datafile_replacement_error() {
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
         },
-        Some(2),
+        // read at the current version (after the Merge above)
+        Some(dataset.manifest.version),
         None,
         None,
         Arc::new(Default::default()),
