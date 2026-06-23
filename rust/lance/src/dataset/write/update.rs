@@ -34,6 +34,16 @@ use lance_table::format::{Fragment, RowIdMeta};
 use roaring::RoaringTreemap;
 use snafu::ResultExt;
 
+/// Collect a field id and all of its descendant field ids (pre-order). A struct
+/// column update rewrites the whole subtree, so an index on any descendant must be
+/// treated as modified.
+fn collect_subtree_field_ids(field: &lance_core::datatypes::Field, out: &mut Vec<u32>) {
+    out.push(field.id as u32);
+    for child in &field.children {
+        collect_subtree_field_ids(child, out);
+    }
+}
+
 /// Build an update operation.
 ///
 /// This operation is similar to SQL's UPDATE statement. It allows you to change
@@ -386,10 +396,14 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        // Updated columns are top-level (nested references are rejected by `set`), but a
+        // struct-column update rewrites all of its descendants. Collect the full field
+        // subtree so an index on a nested child field is recognized as modified and not
+        // wrongly extended over the rewritten fragment.
         let mut fields_for_preserving_frag_bitmap = Vec::new();
         for column_name in self.updates.keys() {
-            if let Ok(field_id) = dataset.schema().field_id(column_name) {
-                fields_for_preserving_frag_bitmap.push(field_id as u32);
+            if let Some(field) = dataset.schema().field(column_name) {
+                collect_subtree_field_ids(field, &mut fields_for_preserving_frag_bitmap);
             }
         }
 
