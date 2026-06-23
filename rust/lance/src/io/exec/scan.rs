@@ -99,6 +99,7 @@ async fn read_v2_fragment_unordered(
     if let Some(file_reader_options) = config.file_reader_options {
         frag_config = frag_config.with_file_reader_options(file_reader_options);
     }
+    let range = file_fragment.range;
     let reader = open_file(
         file_fragment.fragment,
         project_schema,
@@ -107,16 +108,29 @@ async fn read_v2_fragment_unordered(
         Some((scan_scheduler, priority as u32)),
     )
     .await?;
-    let batch_stream = if let Some(range) = file_fragment.range {
-        reader.read_range(range, config.batch_size as u32)?
-    } else {
-        reader.read_all(config.batch_size as u32)?
-    };
-    let mut batches = batch_stream.buffered(1);
-    while let Some(batch) = batches.next().await {
-        if tx.send(batch.map_err(DataFusionError::from)).await.is_err() {
-            return Ok(());
+    let mut batches = None;
+    loop {
+        let permit = match tx.clone().reserve_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return Ok(()),
+        };
+        if batches.is_none() {
+            let batch_stream = if let Some(range) = range.clone() {
+                reader.read_range(range, config.batch_size as u32)?
+            } else {
+                reader.read_all(config.batch_size as u32)?
+            };
+            batches = Some(batch_stream.buffered(1).boxed());
         }
+        let Some(batch) = batches
+            .as_mut()
+            .expect("v2 unordered scan batches initialized")
+            .next()
+            .await
+        else {
+            break;
+        };
+        permit.send(batch.map_err(DataFusionError::from));
     }
     Ok(())
 }
@@ -129,7 +143,11 @@ fn v2_unordered_scan_stream(init: V2UnorderedScanInit) -> BoxStream<'static, Res
                 match state {
                     V2UnorderedScanState::Init(ref mut init) => {
                         let init = init.take()?;
-                        let channel_capacity = init.worker_count.saturating_mul(2).max(1);
+                        let channel_capacity = init
+                            .config
+                            .batch_readahead
+                            .max(1)
+                            .min(init.worker_count.saturating_mul(2).max(1));
                         let (tx, rx) = mpsc::channel(channel_capacity);
                         let semaphore = Arc::new(Semaphore::new(init.worker_count.max(1)));
                         for (priority, file_fragment) in init.file_fragments.into_iter().enumerate()
