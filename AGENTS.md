@@ -42,8 +42,7 @@ Key technical traits: async-first (tokio), Arrow-native, versioned writes with m
 * Coverage HTML: `cargo +nightly llvm-cov -q -p <crate> --branch --html`
 * Coverage for file: `python ci/coverage.py -p <crate> -f <file_path>`
 * Use repository-defined Cargo profiles instead of ad hoc LTO overrides.
-* Use `release` or `bench` for CPU-bound benchmarks and performance numbers intended for comparison.
-* Use `release-with-debug` for optimized profiling that needs debug symbols.
+* Use `release-with-debug` for benchmarks and profiling so optimized builds keep debug symbols without a rebuild.
 * Use `release-no-lto` only for local debugging, IO-bound benchmarks, or compile-time-sensitive performance investigation where LTO would not affect the measured bottleneck.
 
 ### Python / Java
