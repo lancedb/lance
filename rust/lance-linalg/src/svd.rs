@@ -53,6 +53,47 @@ fn mat_mul_atb(a: &[f64], m: usize, n: usize) -> Vec<f64> {
     c
 }
 
+fn gram_schmidt(cols: &mut Vec<Vec<f64>>) {
+    let n_cols = cols.len();
+    for i in 0..ncols {
+        for j in 0..i {
+            let dot: f64 = cols[i].iter().zip(cols[j].iter()).map(|(&a, &b)| a * b).sum();
+            let cj = cols[j].clone();
+            for (a, b) in cols[i].iter_mut().zip(cj.iter()) {
+                *a -= dot * b;
+            }
+        }
+
+        let norm = cols[i].iter().map(|&x| x * x).sum::<f64>().sqrt();
+        if norm > EPS {
+            for x in cols[i].iter_mut() {
+                *x /= norm;
+            }
+        } else {
+            let dim = cols[i].len();
+            'search: for k in 0..dim {
+                let mut e = vec![0.0f64; dim];
+                e[k] = 1.0;
+                for j in 0..i {
+                    let dot: f64 = e.iter().zip(cols[j].iter()).map(|(&a, &b)| a * b).sum();
+                    let cj = cols[j].clone();
+                    for (a, b) in e.iter_mut().zip(cj.iter()) {
+                        *a -= dot * b;
+                    }
+                }
+                let n2 = e.iter().map(|&x| x * x).sum::<f64>().sqrt();
+                if n2 > EPS {
+                    for x in e.iter_mut() {
+                        *x /= n2;
+                    }
+                    cols[i] = e;
+                    break 'search;
+                }
+            }
+        }
+    }
+}
+
 fn mat_vec_mul(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
     (0..m).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum()).collect();
 }
@@ -89,4 +130,9 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
             u_cols.push(vec![0.0; m]);
         }
     }
+
+    for _ in k..m {
+        u_cols.push(vec![0.0; m]);
+    }
+    gram_schmidt(&mut u_cols);
 }
