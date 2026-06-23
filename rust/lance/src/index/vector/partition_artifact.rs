@@ -37,8 +37,6 @@ const PARTITION_ARTIFACT_DEFAULT_BUCKETS: usize = 256;
 const PARTITION_ARTIFACT_BUCKET_PREFIX: &str = "bucket-";
 const PARTITION_ARTIFACT_FILE_VERSION: &str = "2.2";
 const PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS: usize = 32 * 1024;
-const PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS_ENV: &str =
-    "LANCE_PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS";
 
 /// Top-level manifest for a precomputed partition artifact.
 ///
@@ -144,7 +142,6 @@ pub struct PartitionArtifactBuilder {
     buffers: Vec<BucketBuffer>,
     partitions: Vec<PartitionArtifactPartition>,
     bucket_row_counts: Vec<u64>,
-    bucket_buffer_rows: usize,
     stats: PartitionArtifactBuilderStats,
 }
 
@@ -216,12 +213,6 @@ impl PartitionArtifactBuilder {
             ),
         ]));
 
-        let bucket_buffer_rows = std::env::var(PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS_ENV)
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|rows| *rows > 0)
-            .unwrap_or(PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS);
-
         Ok(Self {
             object_store,
             root_dir,
@@ -240,7 +231,6 @@ impl PartitionArtifactBuilder {
                 num_partitions
             ],
             bucket_row_counts: vec![0; num_buckets],
-            bucket_buffer_rows,
             stats: PartitionArtifactBuilderStats::default(),
         })
     }
@@ -284,7 +274,7 @@ impl PartitionArtifactBuilder {
             let start = row_idx * self.pq_code_width;
             let end = start + self.pq_code_width;
             buffer.pq_values.extend_from_slice(&pq_values[start..end]);
-            if buffer.len() >= self.bucket_buffer_rows {
+            if buffer.len() >= PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS {
                 self.flush_bucket(bucket_id).await?;
             }
         }
@@ -538,8 +528,7 @@ impl PartitionArtifactBuilder {
 
     fn log_stats(&self) {
         eprintln!(
-            "partition artifact builder stages: bucket_buffer_rows={} append_batches={} append_rows={} append_s={:.3} validate_s={:.3} extract_s={:.3} scatter_s={:.3} flushes={} flushed_rows={} single_flushes={} multi_flushes={} flush_s={:.3} final_batch_s={:.3} writer_s={:.3} finish_flush_s={:.3} writer_finish_s={:.3} manifest_s={:.3}",
-            self.bucket_buffer_rows,
+            "partition artifact builder stages: append_batches={} append_rows={} append_s={:.3} validate_s={:.3} extract_s={:.3} scatter_s={:.3} flushes={} flushed_rows={} single_flushes={} multi_flushes={} flush_s={:.3} final_batch_s={:.3} writer_s={:.3} finish_flush_s={:.3} writer_finish_s={:.3} manifest_s={:.3}",
             self.stats.append_batches,
             self.stats.append_rows,
             self.stats.append_time.as_secs_f64(),
