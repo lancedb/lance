@@ -1,72 +1,75 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Deriving a trigram pre-filter from a regular expression.
+//! Deriving an ngram pre-filter from a regular expression.
 //!
 //! This is the query-side counterpart of the ngram index that lets us
 //! accelerate `regexp_like` / `regexp_match` predicates the same way the index
 //! already accelerates `contains`. The idea (the same one Postgres `pg_trgm`
 //! and Russ Cox's Google Code Search use) is to derive, from the regex, a
-//! boolean condition over trigram presence that is *necessary* for any string
+//! boolean condition over token presence that is *necessary* for any string
 //! to match, evaluate it against the inverted index, and let the scan recheck
 //! the true regex on the surviving rows.
 //!
-//! The derived condition is a [`TrigramQuery`] -- an AND/OR tree of trigram
-//! tokens. `AND` maps onto posting-list intersection and `OR` onto union, which
+//! The derived condition is a [`NGramQuery`] -- an AND/OR tree of ngram tokens.
+//! `AND` maps onto posting-list intersection and `OR` onto union, which
 //! is exactly the set algebra the ngram index is built for.
 //!
 //! # Soundness
 //!
 //! The single invariant that matters is that the condition must never require a
-//! trigram that a matching string could lack -- otherwise we would drop real
+//! token that a matching string could lack -- otherwise we would drop real
 //! matches (a false negative, far worse than a false positive, which the recheck
 //! removes). Everything here is therefore a conservative *over*-approximation:
-//! when in doubt we emit [`TrigramQuery::All`] ("no constraint, recheck
+//! when in doubt we emit [`NGramQuery::All`] ("no constraint, recheck
 //! everything"). Concretely:
 //!
-//! * Every trigram requirement is produced by [`trigrams_of_string`], which runs
-//!   the *same* tokenizer the index was built with, so a string shorter than a
-//!   trigram (or with no alphanumeric run) contributes no requirement.
+//! * Every token requirement is produced by [`ngrams_of_string`], which runs the
+//!   same tokenizer the index was built with, so a string that yields no tokens
+//!   contributes no requirement.
 //! * Character classes and case-insensitive folds are treated as a single
 //!   unknown character (`All`), because the index's normalization does not agree
 //!   with Unicode case folding (e.g. `(?i)c` also matches `ℂ`, which the index
 //!   does not fold to `c`). Literal runs -- the common case -- are fully used.
 //! * When the exact / prefix / suffix string sets grow past a bound we first fold
-//!   their trigrams into the running condition and only then drop the strings, so
-//!   collapsing precision never removes a necessary trigram.
+//!   their tokens into the running condition and only then drop the strings, so
+//!   collapsing precision never removes a necessary token.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use regex_syntax::hir::{Class, Hir, HirKind};
 use roaring::RoaringTreemap;
 
-use super::{NGRAM_N, NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
+use super::{
+    NGRAM_N, NGRAM_TOKENIZER, NGramTokenization, ngram_to_token, query_tokens_for_text,
+    tokenize_visitor,
+};
 
 /// Maximum number of strings kept in an `exact` / `prefix` / `suffix` set before
-/// it is folded into the trigram condition and dropped.
+/// it is folded into the ngram condition and dropped.
 const MAX_SET_SIZE: usize = 16;
 /// Maximum length (in characters) of a string kept in a set. Longer strings are
 /// trimmed to a sound shorter affix.
 const MAX_STRING_LEN: usize = 32;
 
-/// A boolean condition over trigram presence that is *necessary* for a regex to
+/// A boolean condition over ngram-token presence that is *necessary* for a regex to
 /// match. `All` means "no constraint" and `None` means "unsatisfiable"; by
 /// construction these only ever appear at the root of the tree.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TrigramQuery {
+pub enum NGramQuery {
     /// No constraint: every row is a candidate (the scan must recheck all rows).
     All,
     /// Unsatisfiable: no row can match.
     None,
-    /// The given trigram token must be present.
-    Trigram(u32),
+    /// The given ngram token must be present.
+    Token(u32),
     /// Every child condition must hold (posting-list intersection).
     And(Vec<Self>),
     /// At least one child condition must hold (posting-list union).
     Or(Vec<Self>),
 }
 
-impl TrigramQuery {
+impl NGramQuery {
     /// Build an `AND` of conditions, applying identity (`All`), absorbing
     /// (`None`), flattening, sorting and de-duplication so the result is
     /// canonical and free of nested `All`/`None`.
@@ -112,7 +115,7 @@ impl TrigramQuery {
 }
 
 /// Information about the set of strings a sub-expression can match, used to
-/// build a necessary trigram condition bottom-up. For every string `s` the
+/// build a necessary ngram condition bottom-up. For every string `s` the
 /// sub-expression matches: `s` is in `exact` (when it is `Some`), `s` starts
 /// with some member of `prefix` and ends with some member of `suffix`, and `s`
 /// satisfies `match_q`.
@@ -126,8 +129,8 @@ struct RegexInfo {
     prefix: BTreeSet<String>,
     /// Strings that every match must end with (empty = unknown).
     suffix: BTreeSet<String>,
-    /// A necessary trigram condition for the sub-expression.
-    match_q: TrigramQuery,
+    /// A necessary ngram condition for the sub-expression.
+    match_q: NGramQuery,
 }
 
 impl RegexInfo {
@@ -139,19 +142,19 @@ impl RegexInfo {
             exact: Some(empty.clone()),
             prefix: empty.clone(),
             suffix: empty,
-            match_q: TrigramQuery::All,
+            match_q: NGramQuery::All,
         }
     }
 
     /// A fixed literal string.
-    fn literal(s: &str) -> Self {
+    fn literal(s: &str, tokenization: NGramTokenization) -> Self {
         let set = BTreeSet::from([s.to_string()]);
         Self {
             emptyable: s.is_empty(),
             exact: Some(set.clone()),
             prefix: set.clone(),
             suffix: set,
-            match_q: trigrams_of_string(s),
+            match_q: ngrams_of_string(s, tokenization),
         }
     }
 
@@ -162,20 +165,20 @@ impl RegexInfo {
             exact: None,
             prefix: BTreeSet::new(),
             suffix: BTreeSet::new(),
-            match_q: TrigramQuery::All,
+            match_q: NGramQuery::All,
         }
     }
 
     /// Enforce the size/length bounds, folding any information about to be
     /// discarded into `match_q` first so that precision loss never drops a
     /// necessary trigram. Idempotent.
-    fn bound(&mut self) {
+    fn bound(&mut self, tokenization: NGramTokenization) {
         let oversized_exact = self.exact.as_ref().is_some_and(|exact| {
             exact.len() > MAX_SET_SIZE || exact.iter().any(|s| s.chars().count() > MAX_STRING_LEN)
         });
         if oversized_exact {
             let exact = self.exact.take().expect("checked above");
-            self.fold_into_match(&exact);
+            self.fold_into_match(&exact, tokenization);
         }
 
         self.prefix = self
@@ -185,7 +188,7 @@ impl RegexInfo {
             .collect();
         if self.prefix.len() > MAX_SET_SIZE {
             let prefix = std::mem::take(&mut self.prefix);
-            self.fold_into_match(&prefix);
+            self.fold_into_match(&prefix, tokenization);
         }
 
         self.suffix = self
@@ -195,40 +198,52 @@ impl RegexInfo {
             .collect();
         if self.suffix.len() > MAX_SET_SIZE {
             let suffix = std::mem::take(&mut self.suffix);
-            self.fold_into_match(&suffix);
+            self.fold_into_match(&suffix, tokenization);
         }
     }
 
     /// AND the trigrams of `set` (a complete set of possible affixes/strings)
     /// into `match_q`. Sound because the set is exhaustive for its role.
-    fn fold_into_match(&mut self, set: &BTreeSet<String>) {
-        let folded = trigrams_of_set(set.iter());
-        let current = std::mem::replace(&mut self.match_q, TrigramQuery::All);
-        self.match_q = TrigramQuery::and(vec![current, folded]);
+    fn fold_into_match(&mut self, set: &BTreeSet<String>, tokenization: NGramTokenization) {
+        let folded = ngrams_of_set(set.iter(), tokenization);
+        let current = std::mem::replace(&mut self.match_q, NGramQuery::All);
+        self.match_q = NGramQuery::and(vec![current, folded]);
     }
 }
 
-/// AND together the trigrams of `s`. Reuses the index's own tokenizer so the
+/// AND together the ngram tokens of `s`. Reuses the index's own tokenizer so the
 /// tokens are normalized (lowercase, ASCII-folded, alphanumeric-bounded)
-/// exactly as they were stored. Returns `All` if `s` yields no trigram (too
-/// short, or no run of three alphanumeric characters).
-fn trigrams_of_string(s: &str) -> TrigramQuery {
-    let mut tokens = Vec::new();
-    tokenize_visitor(&NGRAM_TOKENIZER, s, |ngram| {
-        tokens.push(TrigramQuery::Trigram(ngram_to_token(ngram, NGRAM_N)));
-    });
-    TrigramQuery::and(tokens)
+/// exactly as they were stored. Returns `All` if `s` yields no tokens.
+fn ngrams_of_string(s: &str, tokenization: NGramTokenization) -> NGramQuery {
+    let tokens = match tokenization {
+        NGramTokenization::Trigram => {
+            let mut tokens = Vec::new();
+            tokenize_visitor(&NGRAM_TOKENIZER, s, |ngram| {
+                tokens.push(ngram_to_token(ngram, NGRAM_N));
+            });
+            tokens
+        }
+        NGramTokenization::Sparse => query_tokens_for_text(tokenization, s),
+    };
+    let tokens = tokens.into_iter().map(NGramQuery::Token).collect();
+    NGramQuery::and(tokens)
 }
 
-/// OR together the trigram conditions of each string in `set`. An empty set
+/// OR together the ngram conditions of each string in `set`. An empty set
 /// means "unknown" and yields `All` (no constraint); if any member yields `All`
 /// the whole OR is `All`.
-fn trigrams_of_set<'a>(set: impl IntoIterator<Item = &'a String>) -> TrigramQuery {
-    let queries: Vec<_> = set.into_iter().map(|s| trigrams_of_string(s)).collect();
+fn ngrams_of_set<'a>(
+    set: impl IntoIterator<Item = &'a String>,
+    tokenization: NGramTokenization,
+) -> NGramQuery {
+    let queries: Vec<_> = set
+        .into_iter()
+        .map(|s| ngrams_of_string(s, tokenization))
+        .collect();
     if queries.is_empty() {
-        return TrigramQuery::All;
+        return NGramQuery::All;
     }
-    TrigramQuery::or(queries)
+    NGramQuery::or(queries)
 }
 
 /// Concatenate every string in `a` with every string in `b`.
@@ -274,21 +289,21 @@ fn singleton_char(class: &Class) -> Option<char> {
 }
 
 /// Compute the [`RegexInfo`] for `hir` bottom-up.
-fn analyze(hir: &Hir) -> RegexInfo {
+fn analyze(hir: &Hir, tokenization: NGramTokenization) -> RegexInfo {
     let mut info = match hir.kind() {
         // Zero-width: the empty match. Anchors (^, $, \b) carry no trigram.
         HirKind::Empty | HirKind::Look(_) => RegexInfo::empty_string(),
         HirKind::Literal(lit) => match std::str::from_utf8(&lit.0) {
-            Ok(s) => RegexInfo::literal(s),
+            Ok(s) => RegexInfo::literal(s, tokenization),
             // A literal that is not valid UTF-8 cannot be reasoned about here.
             Err(_) => RegexInfo::any_char(),
         },
         HirKind::Class(class) => match singleton_char(class) {
-            Some(ch) => RegexInfo::literal(ch.encode_utf8(&mut [0u8; 4])),
+            Some(ch) => RegexInfo::literal(ch.encode_utf8(&mut [0u8; 4]), tokenization),
             None => RegexInfo::any_char(),
         },
         HirKind::Repetition(rep) => {
-            let inner = analyze(&rep.sub);
+            let inner = analyze(&rep.sub, tokenization);
             let at_least_one = rep.min >= 1;
             RegexInfo {
                 emptyable: !at_least_one || inner.emptyable,
@@ -310,22 +325,22 @@ fn analyze(hir: &Hir) -> RegexInfo {
                 match_q: if at_least_one {
                     inner.match_q
                 } else {
-                    TrigramQuery::All
+                    NGramQuery::All
                 },
             }
         }
-        HirKind::Capture(cap) => analyze(&cap.sub),
-        HirKind::Concat(subs) => analyze_concat(subs),
-        HirKind::Alternation(subs) => analyze_alternation(subs),
+        HirKind::Capture(cap) => analyze(&cap.sub, tokenization),
+        HirKind::Concat(subs) => analyze_concat(subs, tokenization),
+        HirKind::Alternation(subs) => analyze_alternation(subs, tokenization),
     };
-    info.bound();
+    info.bound(tokenization);
     info
 }
 
-fn analyze_concat(subs: &[Hir]) -> RegexInfo {
+fn analyze_concat(subs: &[Hir], tokenization: NGramTokenization) -> RegexInfo {
     let mut acc = RegexInfo::empty_string();
     for sub in subs {
-        acc = concat_info(acc, analyze(sub));
+        acc = concat_info(acc, analyze(sub, tokenization), tokenization);
     }
     acc
 }
@@ -333,14 +348,14 @@ fn analyze_concat(subs: &[Hir]) -> RegexInfo {
 /// Combine two adjacent sub-expressions. This is the subtle part: it recovers
 /// trigrams that straddle the junction via the cross product of `acc.suffix` and
 /// `next.prefix`.
-fn concat_info(acc: RegexInfo, next: RegexInfo) -> RegexInfo {
+fn concat_info(acc: RegexInfo, next: RegexInfo, tokenization: NGramTokenization) -> RegexInfo {
     let emptyable = acc.emptyable && next.emptyable;
 
     // Trigrams spanning the junction (computed from the pre-merge affixes).
     let boundary = if acc.suffix.is_empty() || next.prefix.is_empty() {
-        TrigramQuery::All
+        NGramQuery::All
     } else {
-        trigrams_of_set(cross_concat(&acc.suffix, &next.prefix).iter())
+        ngrams_of_set(cross_concat(&acc.suffix, &next.prefix).iter(), tokenization)
     };
 
     // exact = acc.exact x next.exact, only while both are finite and small.
@@ -366,7 +381,7 @@ fn concat_info(acc: RegexInfo, next: RegexInfo) -> RegexInfo {
         None => next.suffix.clone(),
     };
 
-    let match_q = TrigramQuery::and(vec![acc.match_q, next.match_q, boundary]);
+    let match_q = NGramQuery::and(vec![acc.match_q, next.match_q, boundary]);
 
     let mut info = RegexInfo {
         emptyable,
@@ -375,12 +390,12 @@ fn concat_info(acc: RegexInfo, next: RegexInfo) -> RegexInfo {
         suffix,
         match_q,
     };
-    info.bound();
+    info.bound(tokenization);
     info
 }
 
-fn analyze_alternation(subs: &[Hir]) -> RegexInfo {
-    let infos: Vec<RegexInfo> = subs.iter().map(analyze).collect();
+fn analyze_alternation(subs: &[Hir], tokenization: NGramTokenization) -> RegexInfo {
+    let infos: Vec<RegexInfo> = subs.iter().map(|sub| analyze(sub, tokenization)).collect();
 
     let emptyable = infos.iter().any(|i| i.emptyable);
 
@@ -413,7 +428,7 @@ fn analyze_alternation(subs: &[Hir]) -> RegexInfo {
         BTreeSet::new()
     };
 
-    let match_q = TrigramQuery::or(infos.into_iter().map(|i| i.match_q).collect());
+    let match_q = NGramQuery::or(infos.into_iter().map(|i| i.match_q).collect());
 
     RegexInfo {
         emptyable,
@@ -424,87 +439,87 @@ fn analyze_alternation(subs: &[Hir]) -> RegexInfo {
     }
 }
 
-/// Derive a necessary trigram condition from a regular expression pattern.
+/// Derive a necessary ngram condition from a regular expression pattern.
 ///
-/// Returns [`TrigramQuery::All`] when no useful condition can be derived (an
-/// unparsable pattern, or one with no trigram-able literal structure such as
+/// Returns [`NGramQuery::All`] when no useful condition can be derived (an
+/// unparsable pattern, or one with no usable literal structure such as
 /// `a.b` or `.*`); callers must treat that as "recheck everything".
-pub fn regex_to_trigram_query(pattern: &str) -> TrigramQuery {
+pub fn regex_to_ngram_query(pattern: &str, tokenization: NGramTokenization) -> NGramQuery {
     // An unparsable pattern cannot be accelerated; rechecking is still safe.
     let Ok(hir) = regex_syntax::parse(pattern) else {
-        return TrigramQuery::All;
+        return NGramQuery::All;
     };
-    let info = analyze(&hir);
+    let info = analyze(&hir, tokenization);
 
     let mut conditions = vec![info.match_q];
     if let Some(exact) = &info.exact {
         if exact.is_empty() {
             // The expression matches nothing.
-            return TrigramQuery::None;
+            return NGramQuery::None;
         }
-        conditions.push(trigrams_of_set(exact.iter()));
+        conditions.push(ngrams_of_set(exact.iter(), tokenization));
     }
-    conditions.push(trigrams_of_set(info.prefix.iter()));
-    conditions.push(trigrams_of_set(info.suffix.iter()));
-    TrigramQuery::and(conditions)
+    conditions.push(ngrams_of_set(info.prefix.iter(), tokenization));
+    conditions.push(ngrams_of_set(info.suffix.iter(), tokenization));
+    NGramQuery::and(conditions)
 }
 
-/// Whether a regular expression yields any trigram condition the index can use
+/// Whether a regular expression yields any ngram condition the index can use
 /// to prune candidates. When it does not (e.g. `a.b`, `.*`, or a case-insensitive
 /// pattern), callers should leave the predicate to a full scan rather than route
 /// it to the index, which would otherwise have to ask the scan to recheck every
 /// row -- a path the index result type (`AtLeast`) does not support.
 pub fn regex_can_use_index(pattern: &str) -> bool {
-    regex_to_trigram_query(pattern) != TrigramQuery::All
+    regex_to_ngram_query(pattern, NGramTokenization::Trigram) != NGramQuery::All
 }
 
-/// Collect the distinct trigram tokens referenced anywhere in the tree.
-pub fn collect_tokens(query: &TrigramQuery, out: &mut HashSet<u32>) {
+/// Collect the distinct ngram tokens referenced anywhere in the tree.
+pub fn collect_tokens(query: &NGramQuery, out: &mut HashSet<u32>) {
     match query {
-        TrigramQuery::Trigram(token) => {
+        NGramQuery::Token(token) => {
             out.insert(*token);
         }
-        TrigramQuery::And(items) | TrigramQuery::Or(items) => {
+        NGramQuery::And(items) | NGramQuery::Or(items) => {
             for item in items {
                 collect_tokens(item, out);
             }
         }
-        TrigramQuery::All | TrigramQuery::None => {}
+        NGramQuery::All | NGramQuery::None => {}
     }
 }
 
-/// Evaluate the tree against a map of `trigram token -> posting list`. A token
-/// missing from the map contributes an empty set (sound: a required trigram that
+/// Evaluate the tree against a map of `ngram token -> posting list`. A token
+/// missing from the map contributes an empty set (sound: a required token that
 /// is absent everywhere yields no rows; an absent OR branch contributes
 /// nothing). `All` / `None` are handled by the caller before evaluation.
-pub fn eval_trigram_query(
-    query: &TrigramQuery,
+pub fn eval_ngram_query(
+    query: &NGramQuery,
     bitmaps: &HashMap<u32, RoaringTreemap>,
 ) -> RoaringTreemap {
     match query {
-        TrigramQuery::Trigram(token) => bitmaps.get(token).cloned().unwrap_or_default(),
-        TrigramQuery::And(items) => {
+        NGramQuery::Token(token) => bitmaps.get(token).cloned().unwrap_or_default(),
+        NGramQuery::And(items) => {
             let mut iter = items.iter();
             let mut acc = match iter.next() {
-                Some(first) => eval_trigram_query(first, bitmaps),
+                Some(first) => eval_ngram_query(first, bitmaps),
                 None => return RoaringTreemap::new(),
             };
             for item in iter {
                 if acc.is_empty() {
                     break;
                 }
-                acc &= &eval_trigram_query(item, bitmaps);
+                acc &= &eval_ngram_query(item, bitmaps);
             }
             acc
         }
-        TrigramQuery::Or(items) => {
+        NGramQuery::Or(items) => {
             let mut acc = RoaringTreemap::new();
             for item in items {
-                acc |= &eval_trigram_query(item, bitmaps);
+                acc |= &eval_ngram_query(item, bitmaps);
             }
             acc
         }
-        TrigramQuery::All | TrigramQuery::None => RoaringTreemap::new(),
+        NGramQuery::All | NGramQuery::None => RoaringTreemap::new(),
     }
 }
 
@@ -512,13 +527,13 @@ pub fn eval_trigram_query(
 mod tests {
     use super::*;
 
-    /// A single trigram condition, hashed the same way the index hashes it.
-    fn tri(trigram: &str) -> TrigramQuery {
-        TrigramQuery::Trigram(ngram_to_token(trigram, NGRAM_N))
+    /// A single fixed-trigram token, hashed the same way the index hashes it.
+    fn tri(trigram: &str) -> NGramQuery {
+        NGramQuery::Token(ngram_to_token(trigram, NGRAM_N))
     }
 
-    fn q(pattern: &str) -> TrigramQuery {
-        regex_to_trigram_query(pattern)
+    fn q(pattern: &str) -> NGramQuery {
+        regex_to_ngram_query(pattern, NGramTokenization::Trigram)
     }
 
     #[test]
@@ -530,34 +545,28 @@ mod tests {
     fn test_multi_trigram_literal() {
         assert_eq!(
             q("foobar"),
-            TrigramQuery::and(vec![tri("foo"), tri("oob"), tri("oba"), tri("bar")])
+            NGramQuery::and(vec![tri("foo"), tri("oob"), tri("oba"), tri("bar")])
         );
     }
 
     #[test]
     fn test_wildcard_splits_into_and() {
         // `.*` breaks the literal run; both sides are required.
-        assert_eq!(
-            q("foo.*bar"),
-            TrigramQuery::and(vec![tri("foo"), tri("bar")])
-        );
+        assert_eq!(q("foo.*bar"), NGramQuery::and(vec![tri("foo"), tri("bar")]));
     }
 
     #[test]
     fn test_alternation_is_or() {
-        assert_eq!(
-            q("(cat|dog)"),
-            TrigramQuery::or(vec![tri("cat"), tri("dog")])
-        );
+        assert_eq!(q("(cat|dog)"), NGramQuery::or(vec![tri("cat"), tri("dog")]));
     }
 
     #[test]
     fn test_anchors_are_transparent() {
         assert_eq!(
             q("^rhino"),
-            TrigramQuery::and(vec![tri("rhi"), tri("hin"), tri("ino")])
+            NGramQuery::and(vec![tri("rhi"), tri("hin"), tri("ino")])
         );
-        assert_eq!(q("nose$"), TrigramQuery::and(vec![tri("nos"), tri("ose")]));
+        assert_eq!(q("nose$"), NGramQuery::and(vec![tri("nos"), tri("ose")]));
     }
 
     #[test]
@@ -567,18 +576,18 @@ mod tests {
         // trigram straddling the `(o)` group boundary in "foobar".
         assert_eq!(
             q("fo(o)bar"), // spellchecker:disable-line
-            TrigramQuery::and(vec![tri("foo"), tri("oob"), tri("oba"), tri("bar")])
+            NGramQuery::and(vec![tri("foo"), tri("oob"), tri("oba"), tri("bar")])
         );
     }
 
     #[test]
     fn test_no_trigram_yields_all() {
         // No run of three literal characters anywhere.
-        assert_eq!(q("a.b"), TrigramQuery::All);
-        assert_eq!(q(".*"), TrigramQuery::All);
+        assert_eq!(q("a.b"), NGramQuery::All);
+        assert_eq!(q(".*"), NGramQuery::All);
         // Every alternation branch is shorter than a trigram, so we must not
         // require either two-character branch as a (non-existent) trigram.
-        assert_eq!(q("fo|ba"), TrigramQuery::All); // spellchecker:disable-line
+        assert_eq!(q("fo|ba"), NGramQuery::All); // spellchecker:disable-line
     }
 
     #[test]
@@ -586,12 +595,12 @@ mod tests {
         // Unicode case folding (e.g. `(?i)c` also matches U+2102) does not agree
         // with the index's normalization, so case-insensitive patterns are left
         // unaccelerated (correct via recheck) rather than risk a false negative.
-        assert_eq!(q("(?i)Cat"), TrigramQuery::All);
+        assert_eq!(q("(?i)Cat"), NGramQuery::All);
     }
 
     #[test]
     fn test_unparsable_pattern_yields_all() {
-        assert_eq!(q("("), TrigramQuery::All);
+        assert_eq!(q("("), NGramQuery::All);
     }
 
     #[test]
@@ -605,7 +614,7 @@ mod tests {
         let result = q(&pattern);
         // Each branch shares the trigram `aa0`/`aa1`/... and `zz`-ish endings;
         // the important property is that it is a sound non-empty condition.
-        assert_ne!(result, TrigramQuery::None);
+        assert_ne!(result, NGramQuery::None);
     }
 
     #[test]
@@ -630,34 +639,34 @@ mod tests {
         // `baz` is absent from the index.
 
         // AND intersects.
-        let and = TrigramQuery::and(vec![tri("foo"), tri("bar")]);
+        let and = NGramQuery::and(vec![tri("foo"), tri("bar")]);
         assert_eq!(
-            eval_trigram_query(&and, &bitmaps),
+            eval_ngram_query(&and, &bitmaps),
             RoaringTreemap::from_iter([2u64, 3])
         );
 
         // OR unions.
-        let or = TrigramQuery::or(vec![tri("foo"), tri("bar")]);
+        let or = NGramQuery::or(vec![tri("foo"), tri("bar")]);
         assert_eq!(
-            eval_trigram_query(&or, &bitmaps),
+            eval_ngram_query(&or, &bitmaps),
             RoaringTreemap::from_iter([1u64, 2, 3, 4])
         );
 
         // A missing token is empty: it zeroes an AND but is harmless in an OR.
-        let and_missing = TrigramQuery::and(vec![tri("foo"), tri("baz")]);
-        assert!(eval_trigram_query(&and_missing, &bitmaps).is_empty());
-        let or_missing = TrigramQuery::or(vec![tri("foo"), tri("baz")]);
+        let and_missing = NGramQuery::and(vec![tri("foo"), tri("baz")]);
+        assert!(eval_ngram_query(&and_missing, &bitmaps).is_empty());
+        let or_missing = NGramQuery::or(vec![tri("foo"), tri("baz")]);
         assert_eq!(
-            eval_trigram_query(&or_missing, &bitmaps),
+            eval_ngram_query(&or_missing, &bitmaps),
             RoaringTreemap::from_iter([1u64, 2, 3])
         );
     }
 
     #[test]
     fn test_collect_tokens() {
-        let query = TrigramQuery::and(vec![
+        let query = NGramQuery::and(vec![
             tri("foo"),
-            TrigramQuery::or(vec![tri("bar"), tri("baz")]),
+            NGramQuery::or(vec![tri("bar"), tri("baz")]),
         ]);
         let mut tokens = HashSet::new();
         collect_tokens(&query, &mut tokens);
