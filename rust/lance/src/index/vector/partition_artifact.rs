@@ -14,9 +14,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, ROW_ID, Result};
-use lance_encoding::compression_config::{BssMode, CompressionFieldParams, CompressionParams};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::encoder::default_encoding_strategy_with_params;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{FileWriter, FileWriterOptions};
@@ -581,33 +579,17 @@ pub(crate) struct PartitionArtifactShuffleReader {
 /// The artifact uses a fixed file version so external backends and Lance
 /// finalization agree on the on-disk layout.
 fn file_writer_options() -> Result<FileWriterOptions> {
-    let format_version = PARTITION_ARTIFACT_FILE_VERSION
-        .parse::<LanceFileVersion>()
-        .map_err(|error| {
-            Error::invalid_input(format!(
-                "invalid partition artifact file version '{}': {}",
-                PARTITION_ARTIFACT_FILE_VERSION, error
-            ))
-        })?;
-    let mut compression_params = CompressionParams::new();
-    let no_compression = CompressionFieldParams {
-        compression: Some("none".to_string()),
-        bss: Some(BssMode::Off),
-        ..Default::default()
-    };
-    compression_params
-        .columns
-        .insert(ROW_ID.to_string(), no_compression.clone());
-    compression_params
-        .columns
-        .insert(PQ_CODE_COLUMN.to_string(), no_compression);
-
     Ok(FileWriterOptions {
-        encoding_strategy: Some(Arc::from(default_encoding_strategy_with_params(
-            format_version,
-            compression_params,
-        )?)),
-        format_version: Some(format_version),
+        format_version: Some(
+            PARTITION_ARTIFACT_FILE_VERSION
+                .parse::<LanceFileVersion>()
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "invalid partition artifact file version '{}': {}",
+                        PARTITION_ARTIFACT_FILE_VERSION, error
+                    ))
+                })?,
+        ),
         ..Default::default()
     })
 }
