@@ -25,9 +25,20 @@
 //! `libhdfs` can be discovered.
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Display, Formatter};
+use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::FutureExt;
+use futures::stream::BoxStream;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, RenameTargetMode, path::Path,
+};
 use object_store_opendal::OpendalStore;
+use opendal::raw::percent_decode_path;
 use opendal::{Operator, services::Hdfs};
 use url::Url;
 
@@ -85,6 +96,7 @@ impl HdfsStoreProvider {
         let mut config = HashMap::from([
             ("name_node".to_string(), name_node),
             ("root".to_string(), "/".to_string()),
+            ("rename_overwrite".to_string(), "false".to_string()),
         ]);
 
         let user = storage_options
@@ -135,6 +147,146 @@ impl HdfsStoreProvider {
     }
 }
 
+struct HdfsObjectStore {
+    inner: OpendalStore,
+    operator: Operator,
+}
+
+impl HdfsObjectStore {
+    fn new(operator: Operator) -> Self {
+        Self {
+            inner: OpendalStore::new(operator.clone()),
+            operator,
+        }
+    }
+
+    fn format_opendal_error(err: opendal::Error, path: &Path) -> object_store::Error {
+        match err.kind() {
+            opendal::ErrorKind::NotFound => object_store::Error::NotFound {
+                path: path.to_string(),
+                source: Box::new(err),
+            },
+            opendal::ErrorKind::AlreadyExists => object_store::Error::AlreadyExists {
+                path: path.to_string(),
+                source: Box::new(err),
+            },
+            opendal::ErrorKind::Unsupported => object_store::Error::NotSupported {
+                source: Box::new(err),
+            },
+            opendal::ErrorKind::ConditionNotMatch => object_store::Error::Precondition {
+                path: path.to_string(),
+                source: Box::new(err),
+            },
+            kind => object_store::Error::Generic {
+                store: kind.into_static(),
+                source: Box::new(err),
+            },
+        }
+    }
+}
+
+impl Debug for HdfsObjectStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HdfsObjectStore")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl Display for HdfsObjectStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for HdfsObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        if !matches!(options.target_mode, RenameTargetMode::Create) {
+            return self.inner.rename_opts(from, to, options).await;
+        }
+
+        self.operator
+            .rename(
+                &percent_decode_path(from.as_ref()),
+                &percent_decode_path(to.as_ref()),
+            )
+            .into_send()
+            .await
+            .map_err(|err| Self::format_opendal_error(err, to))
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectStoreProvider for HdfsStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
@@ -150,7 +302,7 @@ impl ObjectStoreProvider for HdfsStoreProvider {
         let operator = Operator::from_iter::<Hdfs>(config)
             .map_err(|error| Self::operator_error(error, &name_node, has_user))?
             .finish();
-        let opendal_store = Arc::new(OpendalStore::new(operator));
+        let opendal_store = Arc::new(HdfsObjectStore::new(operator));
 
         Ok(ObjectStore {
             scheme: "hdfs".to_string(),
@@ -215,6 +367,7 @@ mod tests {
 
         assert_eq!(config.get("name_node").unwrap(), "hdfs://namenode:9000");
         assert_eq!(config.get("root").unwrap(), "/");
+        assert_eq!(config.get("rename_overwrite").unwrap(), "false");
     }
 
     #[test]
@@ -252,6 +405,7 @@ mod tests {
             "/tmp/krb5cc"
         );
         assert_eq!(config.get("atomic_write_dir").unwrap(), "/tmp/atomic");
+        assert_eq!(config.get("rename_overwrite").unwrap(), "false");
     }
 
     #[test]

@@ -48,8 +48,6 @@ use url::Url;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
 pub mod external_manifest;
-#[cfg(feature = "hdfs")]
-mod hdfs_rename;
 
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams};
@@ -1097,11 +1095,7 @@ pub async fn commit_handler_from_url(
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
         #[cfg(feature = "hdfs")]
-        "hdfs" => {
-            let params = options.clone().unwrap_or_default();
-            let client = hdfs_rename::connect_hdrs_client(&url, &params).await?;
-            Ok(Arc::new(hdfs_rename::HdfsRenameCommitHandler::new(client)))
-        }
+        "hdfs" => Ok(Arc::new(RenameCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -1987,6 +1981,16 @@ mod tests {
                 "{url} should route to ConditionalPutCommitHandler",
             );
         }
+    }
+
+    #[cfg(feature = "hdfs")]
+    #[tokio::test]
+    async fn test_commit_handler_from_url_hdfs_uses_rename() {
+        let handler = commit_handler_from_url("hdfs://namenode:9000/ds", &None)
+            .await
+            .unwrap();
+
+        assert_eq!(format!("{:?}", handler), "RenameCommitHandler");
     }
 
     /// A [CommitLock] whose lease records whether it was released, so we can
