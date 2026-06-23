@@ -135,4 +135,11 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         u_cols.push(vec![0.0; m]);
     }
     gram_schmidt(&mut u_cols);
+
+    let mut u = vec![0f64; m * m];
+    for (ci, col) in u_cols.iter().enumerate() {
+        for (ri, &value) in col.iter().enumerate() {
+            u[ri * m + ci] = value;
+        }
+    }
 }
