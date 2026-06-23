@@ -233,7 +233,7 @@ impl L2 for f16 {
                 kernel::l2_f16_avx512(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 => unsafe {
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
                 kernel::l2_f16_avx2(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]

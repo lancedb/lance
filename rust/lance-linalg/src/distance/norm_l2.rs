@@ -64,7 +64,7 @@ impl Normalize for f16 {
                 kernel::norm_l2_f16_avx512(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
-            SimdSupport::Avx2 => unsafe {
+            SimdSupport::Avx2 | SimdSupport::Avx512 => unsafe {
                 kernel::norm_l2_f16_avx2(vector.as_ptr(), vector.len() as u32)
             },
             #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
