@@ -1281,9 +1281,7 @@ impl DirectoryNamespace {
             .uri)
     }
 
-    /// Resolves a branch to its `(uri, object-store path)` for a
-    /// `create_table_version` commit, so the commit write and the zombie check
-    /// share one path.
+    /// Resolves a branch to its `(uri, object-store path)` for `create_table_version`.
     ///
     /// `BranchContents` is the source of truth, so check the ref first: a
     /// registered branch commits directly. With no ref, accept the commit only on
@@ -1407,10 +1405,9 @@ impl DirectoryNamespace {
             .await
     }
 
-    /// List committed manifest versions under `table_path`'s `_versions/`
-    /// directory. Takes the object-store `Path` directly because converting a URI
-    /// back to a path (via `object_store_path_from_uri`) can diverge from the real
-    /// storage location on Windows and miss the manifests.
+    /// List committed manifest versions under `table_path/_versions/`.
+    /// `table_path` must be an object-store `Path`; converting a URI to a path
+    /// can miss manifests on Windows.
     async fn list_versions_under(
         &self,
         table_path: &Path,
@@ -5684,8 +5681,6 @@ mod tests {
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
 
-        // Stage a real (loadable) manifest under tree/ghost/_versions/ without
-        // create_branch, so the path exists but has no BranchContents ref.
         let dataset = open_dataset(&namespace, "users").await;
         let store = dataset.object_store(None).await.unwrap();
         let manifest = store
@@ -5710,15 +5705,15 @@ mod tests {
             .bytes()
             .await
             .unwrap();
-        let zombie = Path::from(format!(
-            "{}/tree/ghost/_versions/{}",
-            dataset.branch_location().path,
-            manifest.location.filename().unwrap()
-        ));
+        let zombie = dataset
+            .branch_location()
+            .find_branch(Some("ghost"))
+            .unwrap()
+            .path
+            .join(VERSIONS_DIR)
+            .join(manifest.location.filename().unwrap());
         store.inner.put(&zombie, bytes.into()).await.unwrap();
 
-        // The directory is physically present, but the source of truth has no
-        // such branch -- this is what makes every op below reject it.
         assert!(dataset.branches().get("ghost").await.is_err());
 
         fn rejected<T: std::fmt::Debug>(label: &str, r: Result<T>) {
