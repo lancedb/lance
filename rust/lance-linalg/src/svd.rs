@@ -145,14 +145,15 @@ fn multiply_A_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     if m == 0 || n == 0 {
         println!("Error: Matrix must have at least 1 row and at least 1 column.");
-        return (vec![], vec![], vec![]); 
     }
     if a.len() != m * n {
         println!("Data length of matrix must match the product of the specified number of rows and number of columns.");
-        return (vec![], vec![], vec![]);
     }
     if !a.iter().all(|x| x.is_finite()) {
         println!("Matrix must not contain null or infinite entries.");
+    }
+
+    if m == 0 || n == 0 || a.len() != m * n || !a.iter().all(|x| x.is_finite()) {
         return (vec![], vec![], vec![]);
     }
 
