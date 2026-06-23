@@ -23,6 +23,9 @@ pub unsafe extern "C" fn memtest_get_stats(stats: *mut MemtestStats) {
     if stats.is_null() {
         return;
     }
+    if (stats as usize).wrapping_rem(std::mem::align_of::<MemtestStats>()) != 0 {
+        return;
+    }
 
     (*stats).total_allocations = STATS
         .total_allocations
@@ -46,4 +49,30 @@ pub unsafe extern "C" fn memtest_get_stats(stats: *mut MemtestStats) {
 #[unsafe(no_mangle)]
 pub extern "C" fn memtest_reset_stats() {
     STATS.reset();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_stats_null() {
+        unsafe {
+            memtest_get_stats(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn test_get_stats_misaligned() {
+        unsafe {
+            let align = std::mem::align_of::<MemtestStats>();
+            let size = std::mem::size_of::<MemtestStats>();
+            let buf_size = size.saturating_add(align).saturating_add(align);
+            let mut buf = vec![0u8; buf_size];
+            let base = buf.as_mut_ptr() as usize;
+            let offset = if base.wrapping_rem(align) == 0 { 1 } else { 0 };
+            let misaligned = buf.as_mut_ptr().add(offset) as *mut MemtestStats;
+            memtest_get_stats(misaligned);
+        }
+    }
 }

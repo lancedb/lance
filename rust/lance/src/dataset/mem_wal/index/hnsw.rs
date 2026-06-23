@@ -26,6 +26,21 @@ pub use super::RowPosition;
 
 const MEM_HNSW_DIM_PLACEHOLDER: usize = 0;
 
+/// Write-optimized default HNSW build parameters for MemTable indexes.
+///
+/// MemTable HNSW graphs are rebuilt on every flush, so build speed matters more
+/// than for a static base-table index. A dbpedia-1M (1536-d) sweep showed
+/// `num_edges = 16, ef_construction = 100` is the best fast-write/good-recall
+/// point: ~27% faster to flush than the generic `HnswBuildParams::default()`
+/// (`num_edges = 20, ef_construction = 150`) with an equal-or-better recall
+/// ceiling (~0.95 at ef=256, the SQ8-quantization limit). Lower `num_edges`
+/// (e.g. 12) flushes faster still but drops the recall ceiling below 0.95.
+pub fn mem_wal_hnsw_default() -> HnswBuildParams {
+    HnswBuildParams::default()
+        .num_edges(16)
+        .ef_construction(100)
+}
+
 /// Configuration for an in-memory HNSW index.
 #[derive(Debug, Clone)]
 pub struct HnswIndexConfig {
@@ -44,7 +59,7 @@ impl HnswIndexConfig {
             field_id,
             column,
             distance_type,
-            build_params: HnswBuildParams::default(),
+            build_params: mem_wal_hnsw_default(),
         }
     }
 

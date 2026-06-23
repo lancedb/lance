@@ -247,3 +247,5 @@ message JsonIndexDetails {
 message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
+
+message FMIndexIndexDetails {}

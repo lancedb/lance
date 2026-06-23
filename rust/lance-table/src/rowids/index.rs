@@ -5,8 +5,8 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use super::{RowIdSequence, U64Segment};
-use deepsize::DeepSizeOf;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use rangemap::RangeInclusiveMap;
@@ -120,7 +120,7 @@ impl RowIdIndex {
 }
 
 impl DeepSizeOf for RowIdIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.0
             .iter()
             .map(|(_, (row_id_segment, address_segment))| {

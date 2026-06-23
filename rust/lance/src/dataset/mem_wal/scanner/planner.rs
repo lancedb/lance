@@ -5,21 +5,18 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::Expr;
-use lance_core::{Result, is_system_column};
+use lance_core::Result;
 use tracing::instrument;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{DeduplicateExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, ROW_ADDRESS_COLUMN};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
+use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
 };
@@ -36,7 +33,13 @@ pub struct LsmScanPlanner {
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Over-fetch multiple for the per-source limit pushdown: block-listed
+    /// sources scan `(offset + limit) * factor` rows so cross-gen dedup drops
+    /// still leave enough live rows. Clamped to `>= 1.0`.
+    overfetch_factor: f64,
 }
 
 impl LsmScanPlanner {
@@ -52,6 +55,8 @@ impl LsmScanPlanner {
             base_schema,
             session: None,
             flushed_cache: None,
+            warmer: None,
+            overfetch_factor: 1.0,
         }
     }
 
@@ -64,8 +69,21 @@ impl LsmScanPlanner {
 
     /// Inject a cache of opened flushed-generation datasets, making repeated
     /// queries against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
+        self
+    }
+
+    /// Set the over-fetch multiple for the per-source limit pushdown
+    /// (see the field docs). Clamped to `>= 1.0` at use.
+    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
+        self.overfetch_factor = factor;
         self
     }
 
@@ -80,27 +98,16 @@ impl LsmScanPlanner {
     /// * `with_memtable_gen` - Whether to include _memtable_gen in output
     /// * `keep_row_address` - Whether to include _rowaddr in output
     ///
-    /// # Query Plan Optimization
+    /// # Query plan
     ///
-    /// The planner uses an optimized execution strategy:
-    /// 1. Each data source is scanned and locally sorted by (pk ASC, _rowaddr DESC)
-    /// 2. Sources are ordered by _memtable_gen DESC (newest first) in the UnionExec
-    /// 3. K pre-sorted streams are merged using SortPreservingMergeExec
-    /// 4. DeduplicateExec performs streaming deduplication on the merged output
-    ///
-    /// Key insight: DataFusion's SortPreservingMergeExec uses stream index as a
-    /// tiebreaker when sort keys are equal. By ordering inputs with highest _memtable_gen
-    /// first (lowest stream index), the merge naturally prefers newer rows.
-    ///
-    /// This avoids needing a `_memtable_gen` column entirely - generation ordering is implicit
-    /// in the stream ordering. The `_memtable_gen` column is only added (via MemtableGenTagExec)
-    /// when `with_memtable_gen=true`.
-    ///
-    /// This is more efficient than the naive approach of Union + global Sort because:
-    /// - Local sorts are smaller and can often fit in memory
-    /// - SortPreservingMergeExec is O(N log K) where K is the number of sources
-    /// - Memory usage is bounded by the sum of K sort buffers rather than all data
-    /// - No extra column for _memtable_gen in the common case
+    /// Each source is independently newest-per-PK (active via the fused
+    /// [`MemTableDedupScanExec`](super::super::memtable::scanner), flushed via
+    /// its within-generation deletion vector) and a cross-generation block-list
+    /// ([`PkBlockFilterExec`]) drops any PK superseded by a newer generation.
+    /// Each PK therefore survives in exactly one source, so a plain
+    /// `UnionExec` carries at most one row per PK — no cross-source dedup,
+    /// sort, or merge needed. `_memtable_gen` / `_rowaddr` are output-only and
+    /// only produced when the caller opts in.
     #[instrument(name = "lsm_plan_scan", level = "debug", skip_all, fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
@@ -128,104 +135,109 @@ impl LsmScanPlanner {
             return self.empty_plan(projection, with_memtable_gen, keep_row_address);
         }
 
-        // 2. Build scan plan for each source with local sorting
-        // Order of operations: scan -> local sort -> (optional) tag with generation
-        //
-        // IMPORTANT: Sources are collected in generation order (base=0, then memtables 1,2,3...)
-        // We reverse this to get _memtable_gen DESC order for the merge tiebreaker.
+        // Cross-generation block-list keyed by source: a hit drops any row
+        // whose PK lives in a newer generation, applied before the union.
+        // `Box::pin` keeps the future off `clippy::large_futures`.
+        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
+            &sources,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        ))
+        .await?;
+
+        // Reverse so the union lists the newest generation first. This is
+        // cosmetic — correctness comes from the per-source dedup and the
+        // cross-gen block-list, not from output ordering.
         let sources: Vec<_> = sources.into_iter().rev().collect();
 
-        let mut sorted_plans = Vec::new();
+        // Per-source limit pushdown: an unordered LIMIT needs only
+        // `offset + limit` live rows from EACH source to fill the global
+        // limit after dedup (any-N semantics), so cap every on-disk source
+        // instead of scanning whole generations and trimming above the
+        // union. Block-listed sources over-fetch by `overfetch_factor` so
+        // cross-gen dedup drops still leave `n_needed` live rows; the
+        // PkBlockFilter warns when that was not enough. The active memtable
+        // is in-memory and within-gen append duplicates are resolved by its
+        // own dedup, so it is never capped here.
+        let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
+        let overfetch = self.overfetch_factor.max(1.0);
+
+        let mut source_plans = Vec::new();
         for source in sources {
             let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            let scan = self.build_source_scan(&source, projection, filter).await?;
+            let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+            let blocked = block_lists
+                .get(&(source.shard_id(), source.generation()))
+                .cloned();
+            let fetch = match (n_needed, is_active) {
+                (Some(n), false) => Some(if blocked.is_some() {
+                    ((n as f64) * overfetch).ceil() as usize
+                } else {
+                    n
+                }),
+                _ => None,
+            };
+            let scan = self
+                .build_source_scan(&source, projection, filter, fetch)
+                .await?;
 
-            // Sort locally by (pk ASC, _rowaddr DESC)
-            let local_sort_exprs = self.build_local_sort_exprs(&scan)?;
-            let lex_ordering = LexOrdering::new(local_sort_exprs).ok_or_else(|| {
-                lance_core::Error::internal(
-                    "Failed to create LexOrdering from sort expressions".to_string(),
-                )
-            })?;
-            let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, scan));
-
-            // When `_rowaddr` will be surfaced to the caller, NULL it for
-            // non-base arms post-sort: only base values are meaningful (e.g.
-            // for `take_rows`); other arms carry per-source addresses that
-            // collide with base IDs. The schema is preserved so union/dedup
-            // still match (dedup picks rows by upstream order, not value).
-            // Skipped when `_rowaddr` would be stripped by dedup anyway, to
-            // avoid adding a no-op projection to the plan.
-            let after_sort: Arc<dyn ExecutionPlan> = if !is_base && keep_row_address {
-                null_columns(sorted, &[ROW_ADDRESS_COLUMN])?
-            } else {
-                sorted
+            // Drop cross-generation stale rows (PKs superseded by a newer gen).
+            // With a limit, `k = n_needed` arms the under-fetch warning; with
+            // no limit `k = 0` keeps it silent.
+            let scan = match blocked {
+                Some(set) => Arc::new(PkBlockFilterExec::new(
+                    scan,
+                    self.pk_columns.clone(),
+                    set,
+                    n_needed.unwrap_or(0),
+                )) as Arc<dyn ExecutionPlan>,
+                None => scan,
             };
 
-            // Only tag with generation if user wants _memtable_gen in output
+            // Post-block-list cap: each source contributes at most `n_needed`
+            // live rows toward the global limit.
+            let scan: Arc<dyn ExecutionPlan> = match n_needed {
+                Some(n) if !is_active => Arc::new(
+                    datafusion::physical_plan::limit::LocalLimitExec::new(scan, n),
+                ),
+                _ => scan,
+            };
+
+            // When `_rowaddr` is surfaced, NULL it for non-base arms: only base
+            // values are meaningful (e.g. for `take_rows`); per-source addresses
+            // collide with base IDs.
+            let scan: Arc<dyn ExecutionPlan> = if !is_base && keep_row_address {
+                null_columns(scan, &[ROW_ADDRESS_COLUMN])?
+            } else {
+                scan
+            };
+
+            // Tag with generation only if the caller wants `_memtable_gen`.
             let plan: Arc<dyn ExecutionPlan> = if with_memtable_gen {
-                Arc::new(MemtableGenTagExec::new(after_sort, source.generation()))
+                Arc::new(MemtableGenTagExec::new(scan, source.generation()))
             } else {
-                after_sort
+                scan
             };
 
-            sorted_plans.push(plan);
+            source_plans.push(plan);
         }
 
-        // 3. Merge pre-sorted streams
-        // Merge using (pk ASC) only - NOT _rowaddr, because _rowaddr is different across tables
-        // for the same pk, which would break the stream index tiebreaker.
-        //
-        // DataFusion's SortPreservingMergeExec uses stream index as a tiebreaker when
-        // sort keys are equal (see merge.rs line 349: `ac.cmp(bc).then_with(|| a.cmp(&b))`).
-        // By ordering inputs with highest _memtable_gen first (lowest stream index), the merge
-        // naturally prefers newer rows when PKs are equal.
-        //
-        // Local sort uses (pk ASC, _rowaddr DESC) to order within each source, but the merge
-        // only considers pk for comparison. This ensures:
-        // 1. For the same pk, newer generation (lower stream index) comes first
-        // 2. Within the same pk and generation, higher _rowaddr comes first
-        let merged: Arc<dyn ExecutionPlan> = if sorted_plans.len() == 1 {
-            sorted_plans.remove(0)
+        // Union, then coalesce into a single partition (UnionExec emits one
+        // per arm; downstream consumers only read partition 0).
+        let mut plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
+            source_plans.remove(0)
         } else {
-            // Use SortPreservingMergeExec to merge K pre-sorted streams
-            // IMPORTANT: Only merge by pk columns, not _rowaddr!
-            let merge_sort_exprs = self.build_merge_sort_exprs(&sorted_plans[0])?;
-            let lex_ordering = LexOrdering::new(merge_sort_exprs).ok_or_else(|| {
-                lance_core::Error::internal(
-                    "Failed to create LexOrdering from sort expressions".to_string(),
-                )
-            })?;
-
-            // UnionExec to combine all partitions (ordered by _memtable_gen DESC)
             #[allow(deprecated)]
-            let union = Arc::new(UnionExec::new(sorted_plans));
-
-            // SortPreservingMergeExec merges pre-sorted partitions
-            Arc::new(SortPreservingMergeExec::new(lex_ordering, union))
+            let union = Arc::new(UnionExec::new(source_plans));
+            Arc::new(CoalescePartitionsExec::new(union))
         };
 
-        // 4. Add deduplication (input is already sorted by pk, newer rows first)
-        let dedup = DeduplicateExec::new_sorted(
-            merged,
-            self.pk_columns.clone(),
-            with_memtable_gen,
-            keep_row_address,
+        // Project to the canonical output schema, dropping `_rowaddr` /
+        // `_memtable_gen` unless the caller opted in.
+        plan = project_to_canonical(
+            plan,
+            &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
         )?;
-        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(dedup);
-
-        // 5. Surface user-requested system columns at the requested position.
-        // Skipped otherwise so the plan shape stays unchanged for callers
-        // that don't opt in.
-        let user_wants_system = projection
-            .map(|p| p.iter().any(|c| is_system_column(c)))
-            .unwrap_or(false);
-        if user_wants_system {
-            plan = project_to_canonical(
-                plan,
-                &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
-            )?;
-        }
 
         // 6. Add limit if specified
         if let Some(limit) = limit {
@@ -267,90 +279,13 @@ impl LsmScanPlanner {
         Arc::new(Schema::new(fields))
     }
 
-    /// Build sort expressions for local sorting within a single source.
-    ///
-    /// Sort order: (pk_columns ASC, _rowaddr DESC)
-    /// Note: _memtable_gen is not included because it's constant within each source.
-    fn build_local_sort_exprs(
-        &self,
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> Result<Vec<PhysicalSortExpr>> {
-        let schema = plan.schema();
-        let mut sort_exprs = Vec::new();
-
-        // Sort by PK columns (ASC) to group duplicates together
-        for col in &self.pk_columns {
-            let (idx, _) = schema.column_with_name(col).ok_or_else(|| {
-                lance_core::Error::invalid_input(format!("Column '{}' not found in schema", col))
-            })?;
-            sort_exprs.push(PhysicalSortExpr {
-                expr: Arc::new(Column::new(col, idx)),
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            });
-        }
-
-        // Sort by _rowaddr DESC (higher address = newer within generation)
-        let (addr_idx, _) = schema.column_with_name(ROW_ADDRESS_COLUMN).ok_or_else(|| {
-            lance_core::Error::invalid_input(format!(
-                "Column '{}' not found in schema",
-                ROW_ADDRESS_COLUMN
-            ))
-        })?;
-        sort_exprs.push(PhysicalSortExpr {
-            expr: Arc::new(Column::new(ROW_ADDRESS_COLUMN, addr_idx)),
-            options: SortOptions {
-                descending: true,
-                nulls_first: false,
-            },
-        });
-
-        Ok(sort_exprs)
-    }
-
-    /// Build sort expressions for merging streams.
-    ///
-    /// Sort order: (pk_columns ASC) only
-    ///
-    /// IMPORTANT: This does NOT include _rowaddr because _rowaddr values are different
-    /// across different tables for the same pk. Including _rowaddr would break the
-    /// stream index tiebreaker mechanism that ensures newer generations win.
-    ///
-    /// When pk is equal across streams, SortPreservingMergeExec uses stream index as
-    /// tiebreaker (lower index wins). Since streams are ordered by generation DESC
-    /// (newest first), this ensures newer rows come before older rows for the same pk.
-    fn build_merge_sort_exprs(
-        &self,
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> Result<Vec<PhysicalSortExpr>> {
-        let schema = plan.schema();
-        let mut sort_exprs = Vec::new();
-
-        // Sort by PK columns (ASC) only - NOT _rowaddr!
-        for col in &self.pk_columns {
-            let (idx, _) = schema.column_with_name(col).ok_or_else(|| {
-                lance_core::Error::invalid_input(format!("Column '{}' not found in schema", col))
-            })?;
-            sort_exprs.push(PhysicalSortExpr {
-                expr: Arc::new(Column::new(col, idx)),
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            });
-        }
-
-        Ok(sort_exprs)
-    }
-
     /// Build scan plan for a single data source.
     async fn build_source_scan(
         &self,
         source: &LsmDataSource,
         projection: Option<&[String]>,
         filter: Option<&Expr>,
+        fetch: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
@@ -369,13 +304,22 @@ impl LsmScanPlanner {
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
+                // Per-source limit pushdown (post-filter rows): bounds the
+                // physical scan instead of trimming above the union.
+                if let Some(fetch) = fetch {
+                    scanner.limit(Some(fetch as i64), None)?;
+                }
 
                 scanner.create_plan().await
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset =
-                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
-                        .await?;
+                let dataset = open_flushed_dataset(
+                    path,
+                    self.session.as_ref(),
+                    self.flushed_cache.as_ref(),
+                    self.warmer.as_ref(),
+                )
+                .await?;
                 let mut scanner = dataset.scan();
 
                 let cols =
@@ -385,6 +329,12 @@ impl LsmScanPlanner {
 
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
+                }
+                // Per-source limit pushdown: flushed generations are
+                // within-gen live (dedup-on-flush deletion vectors), so any
+                // `fetch` post-filter rows are valid contributions.
+                if let Some(fetch) = fetch {
+                    scanner.limit(Some(fetch as i64), None)?;
                 }
 
                 scanner.create_plan().await
@@ -405,12 +355,14 @@ impl LsmScanPlanner {
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.with_row_address();
 
-                // Apply filter - enables BTree index optimization for MemTable
+                // The dedup scan applies the filter post-dedup; pushing it
+                // into the raw scan would resurrect older versions of PKs
+                // whose newest version fails the predicate.
                 if let Some(expr) = filter {
                     scanner.filter_expr(expr.clone());
                 }
 
-                scanner.create_plan().await
+                scanner.create_dedup_plan(&self.pk_columns).await
             }
         }
     }
@@ -490,7 +442,7 @@ mod integration_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use uuid::Uuid;
@@ -533,13 +485,36 @@ mod integration_tests {
         .unwrap()
     }
 
-    /// Create a dataset at the given URI with the provided batches.
+    /// Create a dataset at the given URI with the provided batches. Also writes
+    /// the standalone PK sidecar (on `id`) so a flushed-generation source can be
+    /// probed by the block-list; harmless for a base table (never probed).
     async fn create_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        Dataset::write(reader, uri, Some(WriteParams::default()))
+        let has_id = schema.column_with_name("id").is_some();
+        let reader = RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, uri, Some(WriteParams::default()))
             .await
-            .unwrap()
+            .unwrap();
+        if has_id {
+            super::super::block_list::write_pk_sidecar(uri, &batches, &["id"])
+                .await
+                .unwrap();
+        }
+        dataset
+    }
+
+    /// Build an in-memory memtable's `(batch_store, index_store)` with the PK
+    /// index enabled and populated (mirrors production — the block-list needs
+    /// the PK index to dedup in-memory generations).
+    fn pk_indexed(batches: &[RecordBatch]) -> (Arc<BatchStore>, Arc<IndexStore>) {
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        for b in batches {
+            let (bp, off, _) = batch_store.append(b.clone()).unwrap();
+            index.insert_with_batch_position(b, off, Some(bp)).unwrap();
+        }
+        (batch_store, Arc::new(index))
     }
 
     /// Setup a multi-level LSM structure with:
@@ -590,10 +565,8 @@ mod integration_tests {
             .with_flushed_generation(2, "gen_2".to_string());
 
         // Create active memtable
-        let batch_store = Arc::new(BatchStore::with_capacity(100));
-        let index_store = Arc::new(IndexStore::new());
-        let active_batch = create_test_batch(&schema, &[5, 6, 7], "active");
-        let _ = batch_store.append(active_batch);
+        let (batch_store, index_store) =
+            pk_indexed(&[create_test_batch(&schema, &[5, 6, 7], "active")]);
 
         let active_memtable = InMemoryMemTables {
             active: InMemoryMemTableRef {
@@ -632,24 +605,22 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan structure showing all levels (gen DESC order: active -> gen2 -> gen1 -> base):
-        // - DeduplicateExec at top (with_memtable_gen=false means no MemtableGenTagExec)
-        // - SortPreservingMergeExec merging by pk only (enables stream index tiebreaker)
-        // - UnionExec combining 4 sorted streams
-        // - Each stream: SortExec -> MemTableScanExec or LanceRead
+        // Verify the plan (gen DESC order: active -> gen2 -> gen1 -> base):
+        // - plain UnionExec at top
+        // - active arm: MemTableDedupScanExec (newest gen, not block-listed)
+        // - older arms: PkBlockFilterExec (cross-gen block-list) -> LanceRead
         assert_plan_node_equals(
             plan,
-            "DeduplicateExec: pk=[id], with_memtable_gen=false, keep_addr=false, input_sorted=true
-  SortPreservingMergeExec: [id@0 ASC NULLS LAST]
+            "ProjectionExec:...
+  CoalescePartitionsExec
     UnionExec
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...gen_2...
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...gen_1...
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...base/data...refine_filter=--",
+    MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+    PkBlockFilterExec: pk_cols=[id]...
+      LanceRead:...gen_2...
+    PkBlockFilterExec: pk_cols=[id]...
+      LanceRead:...gen_1...
+    PkBlockFilterExec: pk_cols=[id]...
+      LanceRead:...base/data...refine_filter=--",
         )
         .await
         .unwrap();
@@ -669,32 +640,27 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // Verify plan structure with MemtableGenTagExec at each level (gen DESC order):
-        // - DeduplicateExec at top (with_memtable_gen=true)
-        // - SortPreservingMergeExec merging by pk only
-        // - UnionExec combining 4 streams
-        // - Each stream: MemtableGenTagExec -> SortExec -> data source
-        //   - gen3 (active): MemtableGenTagExec: gen=gen3 -> MemTableScanExec
-        //   - gen2 (flushed): MemtableGenTagExec: gen=gen2 -> LanceRead
-        //   - gen1 (flushed): MemtableGenTagExec: gen=gen1 -> LanceRead
-        //   - base: MemtableGenTagExec: gen=base -> LanceRead
+        // Verify the plan with `_memtable_gen` tags (gen DESC order):
+        // - plain UnionExec at top
+        // - each arm: MemtableGenTagExec -> (PkBlockFilterExec ->) data source
+        //   - gen3 (active): MemtableGenTagExec -> MemTableDedupScanExec
+        //   - gen2/gen1/base: MemtableGenTagExec -> PkBlockFilterExec -> LanceRead
         assert_plan_node_equals(
             plan,
-            "DeduplicateExec: pk=[id], with_memtable_gen=true, keep_addr=false, input_sorted=true
-  SortPreservingMergeExec: [id@0 ASC NULLS LAST]
+            "ProjectionExec:...
+  CoalescePartitionsExec
     UnionExec
-      MemtableGenTagExec: gen=gen3
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
-      MemtableGenTagExec: gen=gen2
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_2...
-      MemtableGenTagExec: gen=gen1
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_1...
-      MemtableGenTagExec: gen=base
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...base/data...refine_filter=--",
+    MemtableGenTagExec: gen=gen3
+      MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+    MemtableGenTagExec: gen=gen2
+      PkBlockFilterExec: pk_cols=[id]...
+        LanceRead:...gen_2...
+    MemtableGenTagExec: gen=gen1
+      PkBlockFilterExec: pk_cols=[id]...
+        LanceRead:...gen_1...
+    MemtableGenTagExec: gen=base
+      PkBlockFilterExec: pk_cols=[id]...
+        LanceRead:...base/data...refine_filter=--",
         )
         .await
         .unwrap();
@@ -760,6 +726,65 @@ mod integration_tests {
         assert_eq!(results.get(&7), Some(&"active_7".to_string()));
     }
 
+    /// The filtered-read plan applies the cross-generation block-list (older
+    /// generations whose PKs are superseded by a newer one are filtered), while
+    /// results stay newest-per-PK.
+    #[tokio::test]
+    async fn test_lsm_scan_filtered_read_applies_block_list() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns);
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        // base/gen1/gen2 all hold PKs superseded by a newer generation, so each
+        // is wrapped in a `PkBlockFilterExec`; the newest (active) arm is not.
+        let plan = scanner.create_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_str.contains("PkBlockFilterExec"),
+            "filtered-read plan must apply the cross-gen block-list, got:\n{}",
+            plan_str
+        );
+
+        // Results stay correct (newest-per-PK across generations).
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut results: HashMap<i32, String> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(results.len(), 7);
+        assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
+        assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
+        assert_eq!(results.get(&5), Some(&"active_5".to_string()));
+        assert_eq!(results.get(&6), Some(&"active_6".to_string()));
+    }
+
     /// Regression for the concurrent-read-vs-flush hole: a sealed
     /// (frozen-awaiting-flush) memtable is not yet recorded as a flushed
     /// generation, but its rows must still be in the scan's read union and
@@ -798,21 +823,21 @@ mod integration_tests {
             .with_flushed_generation(2, "gen_2".to_string());
 
         // Frozen gen3 (sealed, NOT in the manifest) and active gen4.
-        let frozen_store = Arc::new(BatchStore::with_capacity(100));
-        let _ = frozen_store.append(create_test_batch(&schema, &[6, 7], "frozen"));
+        let (frozen_store, frozen_index) =
+            pk_indexed(&[create_test_batch(&schema, &[6, 7], "frozen")]);
         let frozen = InMemoryMemTableRef {
             batch_store: frozen_store,
-            index_store: Arc::new(IndexStore::new()),
+            index_store: frozen_index,
             schema: schema.clone(),
             generation: 3,
         };
 
-        let active_store = Arc::new(BatchStore::with_capacity(100));
-        let _ = active_store.append(create_test_batch(&schema, &[7, 8], "active"));
+        let (active_store, active_index) =
+            pk_indexed(&[create_test_batch(&schema, &[7, 8], "active")]);
         let in_memory = InMemoryMemTables {
             active: InMemoryMemTableRef {
                 batch_store: active_store,
-                index_store: Arc::new(IndexStore::new()),
+                index_store: active_index,
                 schema: schema.clone(),
                 generation: 4,
             },
@@ -928,16 +953,12 @@ mod integration_tests {
 
         let plan = scanner.create_plan().await.unwrap();
 
-        // With only one source, should skip UnionExec and SortPreservingMergeExec
-        // Plan structure:
-        // - DeduplicateExec at top
-        // - SortExec (no merge needed)
-        // - LanceRead for base table only
+        // A single source collapses to just its scan: no union, no block-list
+        // (nothing supersedes the base), no dedup.
         assert_plan_node_equals(
             plan,
-            "DeduplicateExec: pk=[id], with_memtable_gen=false, keep_addr=false, input_sorted=true
-  SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-    LanceRead:...base/data...refine_filter=--",
+            "ProjectionExec:...
+  LanceRead:...base/data...refine_filter=--",
         )
         .await
         .unwrap();
@@ -1030,25 +1051,24 @@ mod integration_tests {
         let plan = scanner.create_plan().await.unwrap();
 
         // Verify plan with keep_addr=true (no _memtable_gen, so no MemtableGenTagExec).
-        // Non-base arms wrap their SortExec in a ProjectionExec that NULLs
-        // `_rowaddr` post-sort: per-source addresses are not meaningful to
-        // the caller. The base arm leaves `_rowaddr` real.
+        // Non-base arms wrap their scan in a ProjectionExec that NULLs `_rowaddr`:
+        // per-source addresses are not meaningful to the caller. The base arm
+        // leaves `_rowaddr` real. Older generations are block-list filtered.
         assert_plan_node_equals(
             plan,
-            "DeduplicateExec: pk=[id], with_memtable_gen=false, keep_addr=true, input_sorted=true
-  SortPreservingMergeExec: [id@0 ASC NULLS LAST]
+            "ProjectionExec:...
+  CoalescePartitionsExec
     UnionExec
-      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
-      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_2...
-      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...gen_1...
-      SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-        LanceRead:...base/data...refine_filter=--",
+    ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+      MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+    ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+      PkBlockFilterExec: pk_cols=[id]...
+        LanceRead:...gen_2...
+    ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+      PkBlockFilterExec: pk_cols=[id]...
+        LanceRead:...gen_1...
+    PkBlockFilterExec: pk_cols=[id]...
+      LanceRead:...base/data...refine_filter=--",
         )
         .await
         .unwrap();
@@ -1102,24 +1122,23 @@ mod integration_tests {
         // `take_rows`). MemtableGenTagExec sits above the NULL projection.
         assert_plan_node_equals(
             plan,
-            "DeduplicateExec: pk=[id], with_memtable_gen=true, keep_addr=true, input_sorted=true
-  SortPreservingMergeExec: [id@0 ASC NULLS LAST]
+            "ProjectionExec:...
+  CoalescePartitionsExec
     UnionExec
-      MemtableGenTagExec: gen=gen3
-        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-            MemTableScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
-      MemtableGenTagExec: gen=gen2
-        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-            LanceRead:...gen_2...
-      MemtableGenTagExec: gen=gen1
-        ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
-          SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-            LanceRead:...gen_1...
-      MemtableGenTagExec: gen=base
-        SortExec: expr=[id@0 ASC NULLS LAST, _rowaddr@2 DESC NULLS LAST]...
-          LanceRead:...base/data...refine_filter=--",
+    MemtableGenTagExec: gen=gen3
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        MemTableDedupScanExec: projection=[id, name, _rowaddr], with_row_id=false, with_row_address=true
+    MemtableGenTagExec: gen=gen2
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        PkBlockFilterExec: pk_cols=[id]...
+          LanceRead:...gen_2...
+    MemtableGenTagExec: gen=gen1
+      ProjectionExec: expr=[id@0 as id, name@1 as name, NULL as _rowaddr]
+        PkBlockFilterExec: pk_cols=[id]...
+          LanceRead:...gen_1...
+    MemtableGenTagExec: gen=base
+      PkBlockFilterExec: pk_cols=[id]...
+        LanceRead:...base/data...refine_filter=--",
         )
         .await
         .unwrap();
@@ -1187,6 +1206,8 @@ mod integration_tests {
         let mut index_store = IndexStore::new();
         // Add BTree index on id column (field_id=0)
         index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
+        // Reuse it as the PK index so the block-list can dedup this generation.
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
 
         let active_batch = create_test_batch(&schema, &[5, 6, 7], "active");
         let _ = batch_store.append(active_batch.clone());
@@ -1225,11 +1246,19 @@ mod integration_tests {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm_with_btree_index().await;
 
-        // Create scanner with filter on the indexed column
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
-            .filter("id = 5")
-            .unwrap();
-        if let Some((shard_id, memtable)) = active_memtable {
+        // Use a range filter that is semantically `id = 5` but is NOT a
+        // point-lookup shape, so it exercises the union/block-list/dedup/
+        // pushdown structure asserted below. (The `id = 5` *equality* shape now
+        // routes to the fast point-lookup node — verified separately at the end
+        // of this test.)
+        let mut scanner = LsmScanner::new(
+            base_dataset.clone(),
+            shard_snapshots.clone(),
+            pk_columns.clone(),
+        )
+        .filter("id >= 5 AND id <= 5")
+        .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable.clone() {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
 
@@ -1241,20 +1270,27 @@ mod integration_tests {
         let plan_str = format!("{}", displayable(plan.as_ref()).indent(true));
 
         // 1. Verify overall structure
-        assert!(
-            plan_str.contains("DeduplicateExec: pk=[id]"),
-            "Should have DeduplicateExec at top"
-        );
-        assert!(
-            plan_str.contains("SortPreservingMergeExec"),
-            "Should use SortPreservingMergeExec for merging"
-        );
         assert!(plan_str.contains("UnionExec"), "Should have UnionExec");
-
-        // 2. Verify BTree index optimization for active memtable
         assert!(
-            plan_str.contains("BTreeIndexExec: predicate=Eq"),
-            "Active memtable should use BTreeIndexExec instead of MemTableScanExec"
+            plan_str.contains("PkBlockFilterExec"),
+            "older generations should be block-list filtered"
+        );
+        assert!(
+            !plan_str.contains("DeduplicateExec"),
+            "filtered read must not use a cross-source DeduplicateExec"
+        );
+
+        // 2. The active arm uses the fused dedup scan: it deduplicates to
+        //    newest-per-PK *before* applying the predicate, so it deliberately
+        //    forgoes the in-memory BTree skip (the dedup must see every
+        //    version). See MemTableDedupScanExec.
+        assert!(
+            plan_str.contains("MemTableDedupScanExec"),
+            "Active memtable should use the fused dedup scan"
+        );
+        assert!(
+            !plan_str.contains("BTreeIndexExec"),
+            "Active filtered read no longer uses the BTree skip"
         );
 
         // 3. Verify filter pushdown to flushed and base datasets
@@ -1308,6 +1344,51 @@ mod integration_tests {
             Some(&"active_5".to_string()),
             "Should get newest version (active) for id=5"
         );
+
+        // Equality shape `id = 5` routes to the fast point-lookup node and must
+        // return the identical newest (active) row across the LSM levels.
+        let mut routed = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .filter("id = 5")
+            .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            routed = routed.with_in_memory_memtables(shard_id, memtable);
+        }
+        let routed_plan = routed.create_plan().await.unwrap();
+        assert!(
+            format!("{}", displayable(routed_plan.as_ref()).indent(true)).contains("OneShotStream"),
+            "id = 5 must route to the fast point-lookup node"
+        );
+        let routed_batches: Vec<RecordBatch> = routed
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut routed_results: HashMap<i32, String> = HashMap::new();
+        for batch in routed_batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                routed_results.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        assert_eq!(routed_results.len(), 1);
+        assert_eq!(
+            routed_results.get(&5),
+            Some(&"active_5".to_string()),
+            "routed point lookup must also return newest (active) id=5"
+        );
     }
 
     #[tokio::test]
@@ -1359,6 +1440,95 @@ mod integration_tests {
         assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
     }
 
+    /// End-to-end regression for the active within-generation phantom: a PK
+    /// inserted then updated in one memtable so its newest version fails the
+    /// predicate must NOT leak the older version that still passes.
+    #[tokio::test]
+    async fn test_lsm_scan_active_within_gen_phantom_suppressed() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_str().unwrap();
+
+        // Base has an unrelated matching row, to prove real matches survive.
+        let base_uri = format!("{}/base", base_path);
+        let base_dataset = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[1], "base")]).await,
+        );
+
+        let shard_id = Uuid::new_v4();
+        let shard_snapshot = ShardSnapshot::new(shard_id).with_current_generation(1);
+
+        // Active memtable: id=10 inserted ("keep") then updated to NULL within
+        // the same generation; id=20 ("active_20") is a control that matches.
+        let active_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 20, 10])),
+                Arc::new(StringArray::from(vec![
+                    Some("keep"),
+                    Some("active_20"),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let (batch_store, index_store) = pk_indexed(&[active_batch]);
+
+        let in_memory = InMemoryMemTables {
+            active: InMemoryMemTableRef {
+                batch_store,
+                index_store,
+                schema: schema.clone(),
+                generation: 1,
+            },
+            frozen: vec![],
+        };
+
+        let scanner = LsmScanner::new(base_dataset, vec![shard_snapshot], vec!["id".to_string()])
+            .filter("name IS NOT NULL")
+            .unwrap()
+            .with_in_memory_memtables(shard_id, in_memory);
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut results: HashMap<i32, Option<String>> = HashMap::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let names = batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let name = (!names.is_null(i)).then(|| names.value(i).to_string());
+                results.insert(ids.value(i), name);
+            }
+        }
+
+        // id=10's newest version is NULL, so it must be absent. Pre-fix the
+        // predicate dropped the NULL before dedup and the stale "keep" leaked.
+        assert!(
+            !results.contains_key(&10),
+            "id=10 newest is NULL; stale 'keep' must not leak under name IS NOT NULL, got {:?}",
+            results
+        );
+        assert_eq!(results.get(&1), Some(&Some("base_1".to_string())));
+        assert_eq!(results.get(&20), Some(&Some("active_20".to_string())));
+        assert_eq!(results.len(), 2);
+    }
+
     #[tokio::test]
     async fn test_lsm_scan_without_base_table() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
@@ -1393,7 +1563,7 @@ mod integration_tests {
             plan_str
         );
         assert!(
-            plan_str.contains("MemTableScanExec"),
+            plan_str.contains("MemTableDedupScanExec"),
             "Plan must scan the active memtable, got: {}",
             plan_str
         );

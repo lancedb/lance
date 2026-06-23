@@ -749,3 +749,150 @@ def one_pass_assign_ivf_pq_on_accelerator(
         data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
+
+
+# =============================================================================
+# Hamming Distance Clustering
+# =============================================================================
+
+
+def hamming_clustering_for_ivf_partition(
+    dataset: "LanceDataset",
+    index_name: str,
+    partition_id: int,
+    hamming_threshold: int,
+) -> pa.RecordBatchReader:
+    """
+    Perform hamming clustering on a partition of an IVF_FLAT index.
+
+    Loads a partition from an IVF_FLAT index on a hash column, computes
+    pairwise hamming distances between all hashes in the partition,
+    filters by threshold, and clusters the results using union-find.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column with an IVF_FLAT index.
+    index_name : str
+        Name of the IVF_FLAT index on the hash column
+    partition_id : int
+        The partition ID within the IVF_FLAT index
+    hamming_threshold : int
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
+
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    """
+    return dataset._ds.hamming_clustering_for_ivf_partition(
+        index_name, partition_id, hamming_threshold
+    )
+
+
+def get_ivf_partition_info(
+    dataset: "LanceDataset",
+    index_name: str,
+) -> List[dict]:
+    """
+    Get partition information for an IVF_FLAT index.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column with an IVF_FLAT index.
+    index_name : str
+        Name of the IVF_FLAT index
+
+    Returns
+    -------
+    list[dict]
+        List of partition info dicts with 'partition_id' and 'size'
+    """
+    return dataset._ds.get_ivf_partition_info(index_name)
+
+
+def hamming_clustering_for_sample(
+    dataset: "LanceDataset",
+    column: str,
+    sample_size: Optional[int] = None,
+    hamming_threshold: int = 10,
+) -> pa.RecordBatchReader:
+    """
+    Perform pairwise hamming distance clustering on a sample of the dataset.
+
+    Randomly samples rows from the dataset, computes pairwise hamming distances
+    between all hashes in the sample, filters by threshold, and clusters the
+    results using union-find.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column.
+    column : str
+        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    sample_size : int, optional
+        Number of rows to sample. If None, uses all rows.
+    hamming_threshold : int, default 10
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
+
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    """
+    return dataset._ds.hamming_clustering_for_sample(
+        column, sample_size, hamming_threshold
+    )
+
+
+def hamming_clustering_for_range(
+    dataset: "LanceDataset",
+    column: str,
+    fragment_id: int,
+    start_row: int,
+    num_rows: int,
+    hamming_threshold: int = 10,
+) -> pa.RecordBatchReader:
+    """
+    Perform pairwise hamming distance clustering on a contiguous range of rows.
+
+    Reads a contiguous range of rows from a specific fragment, computes pairwise
+    hamming distances between all hashes in the range, filters by threshold,
+    and clusters the results using union-find.
+
+    Unlike sampling, this reads sequential rows which is useful for distributed
+    processing where each worker handles a specific range of a fragment.
+
+    Parameters
+    ----------
+    dataset : LanceDataset
+        The Lance dataset containing the hash column.
+    column : str
+        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    fragment_id : int
+        The fragment ID to read from
+    start_row : int
+        The starting row offset within the fragment
+    num_rows : int
+        Number of rows to read from the start position
+    hamming_threshold : int, default 10
+        Maximum hamming distance to consider as similar
+
+    Returns
+    -------
+    pa.RecordBatchReader
+        A reader yielding batches with columns:
+
+        - 'representative': uint64 - The representative row ID for each cluster
+        - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    """
+    return dataset._ds.hamming_clustering_for_range(
+        column, fragment_id, start_row, num_rows, hamming_threshold
+    )

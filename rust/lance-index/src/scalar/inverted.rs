@@ -7,6 +7,7 @@ mod encoding;
 mod index;
 mod iter;
 pub mod json;
+mod lazy_docset;
 pub mod parser;
 pub mod query;
 mod scorer;
@@ -78,7 +79,7 @@ fn scorer_terms(
 /// per-segment stat aggregation, term deduplication, and fuzzy-expansion
 /// union. Keeps a single source of truth for BM25 IDF arithmetic across
 /// segments.
-pub fn build_global_bm25_scorer(
+pub async fn build_global_bm25_scorer(
     indices: &[Arc<InvertedIndex>],
     query_tokens: &Tokens,
     params: &FtsSearchParams,
@@ -88,7 +89,7 @@ pub fn build_global_bm25_scorer(
         lance_core::Error::invalid_input("FTS index requires at least one segment")
     })?;
     let (mut total_tokens, mut num_docs, first_token_docs) =
-        first_index.bm25_stats_for_terms(&terms);
+        first_index.bm25_stats_for_terms(&terms).await?;
     let mut token_docs = HashMap::with_capacity(terms.len());
     for (term, count) in terms.iter().cloned().zip(first_token_docs.into_iter()) {
         token_docs.insert(term, count);
@@ -96,7 +97,7 @@ pub fn build_global_bm25_scorer(
 
     for index in indices.iter().skip(1) {
         let (segment_total_tokens, segment_num_docs, segment_token_docs) =
-            index.bm25_stats_for_terms(&terms);
+            index.bm25_stats_for_terms(&terms).await?;
         total_tokens += segment_total_tokens;
         num_docs += segment_num_docs;
         for (term, count) in terms.iter().zip(segment_token_docs.into_iter()) {
@@ -150,11 +151,11 @@ impl InvertedIndexPlugin {
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
                 .with_progress(progress);
-        inverted_index.update(data, index_store, None).await?;
+        let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: current_fts_format_version().index_version(),
-            files: Some(index_store.list_files_with_sizes().await?),
+            files,
         })
     }
 

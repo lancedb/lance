@@ -15,7 +15,6 @@ use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -28,22 +27,24 @@ use crate::io::exec::TakeExec;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{FreshnessPolarity, LsmGlobalPkDedupExec, LsmSourceTagExec};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
-    DISTANCE_COLUMN, build_scanner_projection, canonical_internal_schema, canonical_output_schema,
-    null_columns, project_to_canonical, wants_row_id,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
+    project_to_canonical, wants_row_id,
 };
 use crate::session::Session;
 
 /// Plans vector search queries over LSM data.
 ///
-/// Each source independently runs KNN, then results are unioned and run
-/// through a single global PK dedup that picks the row with the largest
-/// `(generation, freshness)` tuple per primary key. Generation is the
-/// source identity (base = 0, memtable gens 1..N, active = N+1) and
-/// freshness is the per-source row order normalized so larger = newer
-/// (see [`LsmSourceTagExec`]).
+/// Each source is independently newest-per-PK before the union — the active
+/// memtable via an over-fetched KNN + a newest-per-PK recency filter
+/// ([`super::exec::NewestPkFilterExec`], which drops a hit that isn't the newest
+/// visible version of its PK), flushed generations via their within-generation
+/// deletion vector — and the cross-generation block-list
+/// ([`super::exec::PkBlockFilterExec`]) drops any PK superseded by a newer
+/// generation. So each PK reaches the union from exactly one source and a
+/// distance-ordered merge yields the global top-k; no cross-source dedup is
+/// needed.
 ///
 /// # Query Plan Structure
 ///
@@ -51,22 +52,19 @@ use crate::session::Session;
 /// TakeExec (optional: fetch user-projected cols from base dataset)
 ///   SortPreservingMergeExec: order_by=[_distance ASC], fetch=k
 ///     SortExec: order_by=[_distance ASC], fetch=k          (per partition, parallel)
-///       ProjectionExec (drops _memtable_gen, _freshness)
-///         LsmGlobalPkDedupExec: pk=[…], gen=_memtable_gen, freshness=_freshness
-///           CoalescePartitionsExec
-///             UnionExec
-///               ProjectionExec (canonical internal schema)
-///                 ProjectionExec (null_columns _rowid)        (non-base only)
-///                   LsmSourceTagExec: gen=N+1, polarity=InsertOrder        (active)
-///                     KNNExec: active memtable, k=k
-///               ProjectionExec (canonical internal schema)
-///                 ProjectionExec (null_columns _rowid)
-///                   LsmSourceTagExec: gen=N, polarity=ReverseWrite        (flushed)
-///                     KNNExec: flushed gen N, k=k (fast_search)
-///               … one per flushed gen …
-///               ProjectionExec (canonical internal schema)
-///                 LsmSourceTagExec: gen=0, polarity=InsertOrder            (base)
-///                   KNNExec: base table, k=k (fast_search)[.refine()?]
+///       UnionExec
+///         ProjectionExec (canonical output schema)
+///           SortExec(_distance, fetch=k)
+///             NewestPkFilterExec: newest-per-PK recency        (active)
+///               KNNExec: active memtable, fetch=ceil(k*overfetch)
+///         ProjectionExec (canonical output schema)
+///           ProjectionExec (null_columns _rowid)
+///             PkBlockFilterExec: block-list                   (flushed)
+///               KNNExec: flushed gen N, fetch=ceil(k*overfetch) (fast_search)
+///         … one per flushed gen …
+///         ProjectionExec (canonical output schema)
+///           PkBlockFilterExec: block-list                     (base)
+///             KNNExec: base table, k (fast_search)[.refine()?]
 /// ```
 ///
 /// # Index-Only Search (fast_search)
@@ -76,18 +74,10 @@ use crate::session::Session;
 /// - Each flushed memtable has its own vector index built during flush.
 /// - The active memtable covers any unindexed data.
 /// - Searching unindexed data in base/flushed would be redundant.
-///
-/// # Dedup semantics
-///
-/// `LsmGlobalPkDedupExec` keeps the row whose `(generation, freshness)`
-/// tuple is largest, so newer generations always win and ties within a
-/// generation fall to the source-local freshness (larger row offset for
-/// active memtables; smaller `_rowid` for flushed memtables, flipped by
-/// `LsmSourceTagExec` so the comparison stays uniform).
 pub struct LsmVectorSearchPlanner {
     /// Data source collector.
     collector: LsmDataSourceCollector,
-    /// Primary key column names (used by the global dedup).
+    /// Primary key column names (used by within-source dedup and block-list).
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
@@ -95,18 +85,17 @@ pub struct LsmVectorSearchPlanner {
     vector_column: String,
     /// Distance metric type (L2, Cosine, Dot, etc.).
     distance_type: lance_linalg::distance::DistanceType,
-    /// Base dataset reference for post-rerank take.
-    ///
-    /// After the global PK dedup and sort, a `TakeExec` against this
-    /// dataset materializes any user-projected columns that were not
-    /// part of the per-source KNN output. Rows from memtables already
-    /// carry all columns; the take only fetches additional data for
-    /// base-table rows (which have a real `_rowid`).
+    /// Base dataset for the post-rerank take: after the cross-source distance
+    /// merge, `TakeExec` materializes user-projected columns that weren't in
+    /// the per-source KNN output. Memtable rows already carry all columns;
+    /// the take only fetches additional data for base rows (real `_rowid`).
     dataset: Option<Arc<Dataset>>,
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
 impl LsmVectorSearchPlanner {
@@ -135,6 +124,7 @@ impl LsmVectorSearchPlanner {
             dataset: None,
             session: None,
             flushed_cache: None,
+            warmer: None,
         }
     }
 
@@ -147,8 +137,14 @@ impl LsmVectorSearchPlanner {
 
     /// Inject a cache of opened flushed-generation datasets, making repeated
     /// searches against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
         self
     }
 
@@ -172,16 +168,36 @@ impl LsmVectorSearchPlanner {
     /// * `k` - Number of nearest neighbors to return
     /// * `nprobes` - Number of IVF partitions to search (for IVF-based indexes)
     /// * `projection` - Columns to include in output (None = all columns)
-    /// * `refine_factor` - When set, the base-table arm of the KNN plan fetches
-    ///   `k * refine_factor` candidates and re-ranks them with exact distances.
-    ///   Useful when the base table uses an approximate index (IVF-PQ) so that
-    ///   cross-source distance comparison is exact. Memtable arms use exact
-    ///   HNSW search and do not need refine.
+    /// * `refine_base_table` - When true, the base-table arm re-ranks its
+    ///   candidates with exact distances (refine factor 1). Useful when the base
+    ///   table uses an approximate index (IVF-PQ) so cross-source distance
+    ///   comparison is exact. Memtable arms use exact HNSW search and never need
+    ///   refine. Auto-enabled whenever stale filtering is on (see below).
+    /// * `overfetch_factor` - A single knob that controls **both** whether stale
+    ///   rows are filtered and how aggressively sources over-fetch to backfill
+    ///   the rows that filtering drops:
+    ///
+    ///   - `factor < 1.0` (e.g. `0.0`): **stale filtering off.** The per-source
+    ///     block-list / [`super::exec::PkBlockFilterExec`] is not built or applied,
+    ///     so rows superseded by a newer generation can surface. The global PK
+    ///     dedup still runs, so it still suppresses stale copies in the cases
+    ///     where both the stale and the fresh row reach it.
+    ///   - `factor == 1.0`: **stale filtering on, no over-fetch.** Each source
+    ///     that has superseded rows fetches exactly `k` candidates, drops the
+    ///     stale ones, and may therefore return fewer than `k` live rows.
+    ///   - `factor > 1.0`: **stale filtering on, with over-fetch.** Such a source
+    ///     fetches `ceil(k * factor)` candidates so that dropping the stale ones
+    ///     still leaves `k` live rows for the merge.
+    ///
+    ///   There is intentionally no separate on/off flag: over-fetch is only ever
+    ///   meaningful while filtering, so the factor encodes both. A true KNN
+    ///   prefilter would remove the need for over-fetch entirely.
     ///
     /// # Returns
     ///
     /// An execution plan that returns the top-K nearest neighbors across all
-    /// LSM levels, with stale results filtered out.
+    /// LSM levels, with stale results filtered out (unless `overfetch_factor`
+    /// disables filtering).
     #[instrument(name = "lsm_vector_search", level = "info", skip_all, fields(k, nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
     pub async fn plan_search(
         &self,
@@ -189,7 +205,8 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
-        refine_factor: Option<u32>,
+        refine_base_table: bool,
+        overfetch_factor: f64,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
 
@@ -197,75 +214,141 @@ impl LsmVectorSearchPlanner {
             return self.empty_plan(projection);
         }
 
+        // The block-list is the sole cross-generation dedup mechanism, so it
+        // runs unconditionally; `overfetch_factor` only tunes the over-fetch
+        // multiple and is clamped to >= 1.0 so blocked sources still yield k
+        // live candidates after the post-filter.
+        let overfetch_factor = overfetch_factor.max(1.0);
+
+        // Per-source PK block sets (`NEWER(G)`; base = union of all gens).
+        // `Box::pin` keeps the future off `clippy::large_futures`.
+        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
+            &sources,
+            self.session.as_ref(),
+            self.flushed_cache.as_ref(),
+        ))
+        .await?;
+
         let canonical_schema = canonical_output_schema(
             projection,
             &self.base_schema,
             &self.pk_columns,
             true, // include _distance — KNN always produces it
         );
-        // The internal schema carries `_memtable_gen` + `_freshness`
-        // through the union and the global dedup; both are dropped
-        // afterwards by a project back to the canonical output schema.
-        let internal_schema =
-            canonical_internal_schema(projection, &self.base_schema, &self.pk_columns, true);
+
+        // Refine the base table when explicitly requested, or whenever the base
+        // is blocked (it then over-fetches its approximate-index candidates, so
+        // distances must be re-ranked to exact before the cross-source merge).
+        // `block_lists` is non-empty exactly when a newer generation exists.
+        let refine_base = refine_base_table || !block_lists.is_empty();
+
+        // Stage per-source over-fetch decisions, then build every KNN plan
+        // concurrently — the builds are independent and a sequential loop was
+        // the dominant serial planning cost at multiple generations.
+        let arm_inputs: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                let generation = source.generation();
+                let is_base = matches!(source, LsmDataSource::BaseTable { .. });
+                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
+                // Over-fetch when the post-source filter can drop candidates: a
+                // blocked source loses superseded rows; the active source's
+                // within-source dedup collapses duplicate-PK HNSW nodes. Block
+                // lookup is per shard — generations are per-shard.
+                let blocked = block_lists.get(&(source.shard_id(), generation));
+                let fetch_k = if blocked.is_some() || is_active {
+                    ((k as f64) * overfetch_factor).ceil() as usize
+                } else {
+                    k
+                };
+                (source, is_base, is_active, blocked, fetch_k)
+            })
+            .collect();
+        let built = futures::future::try_join_all(arm_inputs.iter().map(
+            |(source, is_base, _, _, fetch_k)| {
+                Box::pin(self.build_knn_plan(
+                    source,
+                    query_vector,
+                    *fetch_k,
+                    nprobes,
+                    projection,
+                    *is_base && refine_base,
+                ))
+            },
+        ))
+        .await?;
 
         let mut knn_plans = Vec::new();
-        for source in &sources {
-            let generation = source.generation();
-            let is_base = matches!(source, LsmDataSource::BaseTable { .. });
-            let knn = self
-                .build_knn_plan(source, query_vector, k, nprobes, projection, refine_factor)
-                .await?;
-            // Tag rows with `(_memtable_gen, _freshness)`. Polarity differs
-            // per source — see [`LsmSourceTagExec`] / [`FreshnessPolarity`]:
-            //   * active memtable:  insert order, larger `_rowid` = newer
-            //   * flushed memtable: reverse-written, smaller `_rowid` = newer
-            //   * base table:       no duplicates expected; polarity moot
-            let polarity = match source {
-                LsmDataSource::FlushedMemTable { .. } => FreshnessPolarity::ReverseWrite,
-                LsmDataSource::ActiveMemTable { .. } | LsmDataSource::BaseTable { .. } => {
-                    FreshnessPolarity::InsertOrder
+        // `build_knn_plan` returns each active arm's max-visible snapshot
+        // alongside its plan; the active arm's NewestPkFilterExec needs both it
+        // and `source` (for the batch/index stores), so neither is discarded.
+        for ((source, is_base, is_active, blocked, _), (knn, active_max_visible)) in
+            arm_inputs.iter().zip(built)
+        {
+            let is_base = *is_base;
+            let is_active = *is_active;
+            let blocked = *blocked;
+            // Make each source independently newest-per-PK before the union:
+            //  * active: the append-only HNSW returns one node per inserted
+            //    version *and* leaves stale versions of updated PKs live. The
+            //    recency filter keeps only the hit that is the newest visible
+            //    version of its PK (per the maintained MVCC PK-position index),
+            //    closing the predicate-crossing stale read, then re-sort by
+            //    distance.
+            //  * flushed/base: drop cross-gen superseded rows via the
+            //    block-list (within-gen is handled by the flushed DV).
+            let knn = if is_active {
+                let (batch_store, index_store) = match source {
+                    LsmDataSource::ActiveMemTable {
+                        batch_store,
+                        index_store,
+                        ..
+                    } => (batch_store.clone(), index_store.clone()),
+                    _ => unreachable!("is_active implies ActiveMemTable"),
+                };
+                let filtered: Arc<dyn ExecutionPlan> =
+                    Arc::new(super::exec::NewestPkFilterExec::new(
+                        knn,
+                        self.pk_columns.clone(),
+                        lance_core::ROW_ID,
+                        index_store,
+                        batch_store,
+                        active_max_visible.expect("active arm returns its max_visible snapshot"),
+                    ));
+                sort_by_distance(filtered, k)?
+            } else {
+                match blocked {
+                    Some(set) => Arc::new(super::exec::PkBlockFilterExec::new(
+                        knn,
+                        self.pk_columns.clone(),
+                        set.clone(),
+                        k,
+                    )) as Arc<dyn ExecutionPlan>,
+                    None => knn,
                 }
             };
-            let tagged: Arc<dyn ExecutionPlan> = Arc::new(LsmSourceTagExec::new(
-                knn,
-                generation,
-                polarity,
-                lance_core::ROW_ID,
-            ));
-            // Lance's `fast_search()` always produces `_rowid` whether or
-            // not we asked for it; the active arm also produces `_rowid`
-            // when we ask for it (to drive freshness). For non-base arms
-            // the per-source value would collide with base row ids in the
-            // canonical output, so NULL it before stitching into the
-            // internal schema. The dedup has already consumed it via
-            // `_freshness`.
+            // Lance's `fast_search()` and the active scan both produce a
+            // per-source `_rowid` that would collide with base row ids in the
+            // canonical output, so NULL it on non-base arms. The base arm keeps
+            // its real `_rowid` to drive the post-rerank take.
             let after_null = if is_base {
-                tagged
+                knn
             } else {
-                null_columns(tagged, &[lance_core::ROW_ID])?
+                null_columns(knn, &[lance_core::ROW_ID])?
             };
-            // Normalize each source to the internal canonical schema
-            // (canonical user cols + `_memtable_gen` + `_freshness`).
-            let normalized = project_to_canonical(after_null, &internal_schema)?;
+            // Normalize each source to the canonical output schema.
+            let normalized = project_to_canonical(after_null, &canonical_schema)?;
             knn_plans.push(normalized);
         }
 
+        // No cross-source dedup needed (see struct doc): SortExec(per partition)
+        // + SortPreservingMerge does the p-way distance-ordered top-k merge.
         #[allow(deprecated)]
-        let union: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
-
-        // LsmGlobalPkDedupExec declares one output partition but only
-        // reads partition 0 of its input — coalesce first or partitions
-        // past the base table get silently dropped.
-        let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
-        let deduped: Arc<dyn ExecutionPlan> = Arc::new(LsmGlobalPkDedupExec::new(
-            coalesced,
-            self.pk_columns.clone(),
-            super::exec::MEMTABLE_GEN_COLUMN,
-            super::exec::FRESHNESS_COLUMN,
-        ));
-        // Drop `_memtable_gen` and `_freshness` — they're internal-only.
-        let merged: Arc<dyn ExecutionPlan> = project_to_canonical(deduped, &canonical_schema)?;
+        // The downstream `SortPreservingMergeExec` already spawns one driver
+        // task per input partition (one per union arm) via `spawn_buffered`, so
+        // each arm's per-arm CPU (HNSW search, distance refine) runs on its own
+        // task without an extra repartition.
+        let merged: Arc<dyn ExecutionPlan> = Arc::new(UnionExec::new(knn_plans));
 
         let distance_idx = merged.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
             lance_core::Error::invalid_input(format!(
@@ -328,10 +411,15 @@ impl LsmVectorSearchPlanner {
             merged_sorted
         };
 
+        // Under-fetch is warned per-source inside `PkBlockFilterExec`.
         Ok(result)
     }
 
     /// Build KNN plan for a single data source.
+    ///
+    /// Returns the plan and, for the active memtable, the `max_visible_batch_position`
+    /// snapshot its scanner latched — threaded into the recency filter so it keys
+    /// on the same snapshot the search saw (`None` for base / flushed sources).
     async fn build_knn_plan(
         &self,
         source: &LsmDataSource,
@@ -339,8 +427,8 @@ impl LsmVectorSearchPlanner {
         k: usize,
         nprobes: usize,
         projection: Option<&[String]>,
-        refine_factor: Option<u32>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+        refine: bool,
+    ) -> Result<(Arc<dyn ExecutionPlan>, Option<usize>)> {
         match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
@@ -360,17 +448,21 @@ impl LsmVectorSearchPlanner {
                 scanner.distance_metric(self.distance_type);
                 // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
-                // Re-rank base candidates with exact distances when set, so
-                // they're directly comparable to MemTable distances in the merge.
-                if let Some(factor) = refine_factor {
-                    scanner.refine(factor);
+                // Re-rank base candidates with exact distances so they're
+                // directly comparable to memtable distances in the merge.
+                if refine {
+                    scanner.refine(1);
                 }
-                scanner.create_plan().await
+                Ok((scanner.create_plan().await?, None))
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset =
-                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
-                        .await?;
+                let dataset = open_flushed_dataset(
+                    path,
+                    self.session.as_ref(),
+                    self.flushed_cache.as_ref(),
+                    self.warmer.as_ref(),
+                )
+                .await?;
                 let mut scanner = dataset.scan();
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
@@ -381,7 +473,7 @@ impl LsmVectorSearchPlanner {
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
                 scanner.fast_search();
-                scanner.create_plan().await
+                Ok((scanner.create_plan().await?, None))
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -399,8 +491,8 @@ impl LsmVectorSearchPlanner {
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 // Expose `_rowid` (BatchStore row offset, monotonic with
-                // insert order) so [`WithinSourceDedupExec`] can collapse
-                // duplicate-PK rows to the newest insert. The value is
+                // insert order) so `NewestPkFilterExec` can compare each hit's
+                // position against the PK-position index. The value is
                 // per-source and NULL'd before reaching the canonical merge.
                 // (VectorIndexExec only plumbs `with_row_id`, not
                 // `with_row_address`, but the two yield identical values
@@ -410,7 +502,9 @@ impl LsmVectorSearchPlanner {
                 scanner.nearest(&self.vector_column, query_arr, k);
                 scanner.nprobes(nprobes);
                 scanner.distance_metric(self.distance_type);
-                scanner.create_plan().await
+                let plan = scanner.create_plan().await?;
+                // Capture the scanner's own latched snapshot for the recency filter.
+                Ok((plan, Some(scanner.max_visible_batch_position())))
             }
         }
     }
@@ -422,6 +516,29 @@ impl LsmVectorSearchPlanner {
         let schema = canonical_output_schema(projection, &self.base_schema, &self.pk_columns, true);
         Ok(Arc::new(EmptyExec::new(schema)))
     }
+}
+
+/// Sort a single-partition plan by `_distance` ascending and cap at `k`.
+///
+/// Used to re-order the active arm after its within-source dedup (which emits
+/// rows unordered) so the cross-source distance merge sees a sorted stream.
+fn sort_by_distance(plan: Arc<dyn ExecutionPlan>, k: usize) -> Result<Arc<dyn ExecutionPlan>> {
+    let idx = plan.schema().index_of(DISTANCE_COLUMN).map_err(|_| {
+        lance_core::Error::invalid_input(format!(
+            "Column '{}' not found in schema",
+            DISTANCE_COLUMN
+        ))
+    })?;
+    let sort_expr = vec![PhysicalSortExpr {
+        expr: Arc::new(Column::new(DISTANCE_COLUMN, idx)),
+        options: SortOptions {
+            descending: false,
+            nulls_first: false,
+        },
+    }];
+    let ordering = LexOrdering::new(sort_expr)
+        .ok_or_else(|| lance_core::Error::internal("Failed to create LexOrdering".to_string()))?;
+    Ok(Arc::new(SortExec::new(ordering, plan).with_fetch(Some(k))))
 }
 
 /// Convert a (typically single-row) FixedSizeList query into the array shape
@@ -507,10 +624,19 @@ mod tests {
 
     async fn create_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        Dataset::write(reader, uri, Some(WriteParams::default()))
+        let has_id = schema.column_with_name("id").is_some();
+        let reader = RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, uri, Some(WriteParams::default()))
             .await
-            .unwrap()
+            .unwrap();
+        // Also write the standalone PK sidecar (on `id`) so a flushed-generation
+        // source can be probed by the block-list (harmless for a base table).
+        if has_id {
+            crate::dataset::mem_wal::scanner::block_list::write_pk_sidecar(uri, &batches, &["id"])
+                .await
+                .unwrap();
+        }
+        dataset
     }
 
     #[tokio::test]
@@ -532,7 +658,7 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 10, 8, None, None).await;
+        let plan = planner.plan_search(&query, 10, 8, None, false, 1.0).await;
 
         // Plan construction must succeed. Execution against empty data is a
         // separate concern handled by integration tests.
@@ -581,6 +707,7 @@ mod tests {
         // Active memtable with HNSW index over the "vector" column.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -620,7 +747,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, None)
+            .plan_search(&query, 3, 1, None, false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -699,6 +826,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -741,7 +869,7 @@ mod tests {
         let query = create_query_vector();
         let projection = vec!["vector".to_string()];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -778,6 +906,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -823,7 +952,7 @@ mod tests {
             "_rowid".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
             .await
             .expect(
                 "planner must accept `_distance`/`_rowid` in projection without breaking the plan",
@@ -873,15 +1002,11 @@ mod tests {
     #[tokio::test]
     async fn test_vector_search_strips_internal_columns_and_preserves_active_rows() {
         // Two regressions in one test:
-        // (1) `LsmGlobalPkDedupExec` consumes `_memtable_gen` and `_freshness`
-        //     but the user-visible output must NOT contain them — the
-        //     post-dedup `project_to_canonical` is what strips them, so a
-        //     refactor that drops that projection would leak these columns.
-        // (2) `LsmGlobalPkDedupExec` declares one output partition but only
-        //     reads partition 0 of its input. Without a `CoalescePartitionsExec`
-        //     ahead of it, every union partition past partition 0 is silently
-        //     dropped — i.e. active-memtable rows disappear when the union
-        //     puts them in a non-zero partition.
+        // (1) The plan must not leak internal columns (`_memtable_gen`,
+        //     `_freshness`) into the user-visible output.
+        // (2) Active-memtable rows must reach the output — the UnionExec puts
+        //     them in non-zero partitions, and any downstream node that only
+        //     reads partition 0 would silently drop them.
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
@@ -895,6 +1020,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -934,18 +1060,25 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, None)
+            .plan_search(&query, 3, 1, None, false, 1.0)
             .await
             .expect("planner should produce a plan");
 
-        // Plan must include the new global dedup (proves the pipeline is wired).
+        // Each arm is independently newest-per-PK (active within-source dedup,
+        // flushed DV) and the block-list handles cross-gen, merged by a
+        // distance SPM. No global PK dedup or source tag node is involved.
         let plan_str = format!(
             "{}",
             datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
         );
         assert!(
-            plan_str.contains("LsmGlobalPkDedupExec"),
-            "expected new global-dedup pipeline, got:\n{}",
+            !plan_str.contains("LsmGlobalPkDedupExec") && !plan_str.contains("LsmSourceTagExec"),
+            "vector plan must not contain a global PK dedup or source tag node, got:\n{}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("NewestPkFilterExec") && plan_str.contains("SortPreservingMergeExec"),
+            "expected per-arm dedup + distance merge, got:\n{}",
             plan_str
         );
 
@@ -957,10 +1090,7 @@ mod tests {
 
         let out_schema = batches[0].schema();
         assert!(out_schema.field_with_name(DISTANCE_COLUMN).is_ok());
-        for internal in [
-            super::super::exec::MEMTABLE_GEN_COLUMN,
-            super::super::exec::FRESHNESS_COLUMN,
-        ] {
+        for internal in [super::super::exec::MEMTABLE_GEN_COLUMN, "_freshness"] {
             assert!(
                 out_schema.field_with_name(internal).is_err(),
                 "`{}` leaked into output: {:?}",
@@ -973,11 +1103,11 @@ mod tests {
             );
         }
 
-        // (2) Active-memtable rows must survive: collector emits base as
-        // partition 0 of the union and the active memtable as partition 1+.
-        // The active memtable holds ids 1..=4; the base holds id 10. At
-        // least one id in 1..=4 must appear in the output, otherwise the
-        // CoalescePartitionsExec was skipped and partitions 1+ were dropped.
+        // (2) Active-memtable rows must survive: the union emits base as
+        // partition 0 and the active memtable as partition 1+. The active
+        // memtable holds ids 1..=4; the base holds id 10. At least one id in
+        // 1..=4 must appear, otherwise the SortPreservingMerge dropped the
+        // non-zero partitions.
         let mut all_ids: Vec<i32> = Vec::new();
         for batch in &batches {
             let id_col = batch
@@ -1030,6 +1160,7 @@ mod tests {
         // "right" vector close to the query, plus an unrelated pk=2.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1076,7 +1207,10 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, 1.0)
+            .await
+            .unwrap();
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -1096,14 +1230,14 @@ mod tests {
         let pk1_count = ids.iter().filter(|i| **i == 1).count();
         assert_eq!(
             pk1_count, 1,
-            "pk=1 must appear exactly once after cross-source dedup; got ids={:?}",
+            "pk=1 must appear exactly once in the merged top-k; got ids={:?}",
             ids,
         );
     }
 
     #[tokio::test]
     async fn test_vector_search_system_columns_real_only_for_base() {
-        // Covers tests 1+2+3 from the PR review:
+        // Covers three properties of the per-source system columns:
         //   1. base-hit `_rowid`/`_rowaddr` carry real values
         //   2. flushed-memtable arm runs without erroring
         //   3. `_rowaddr` symmetry with `_rowid` (same code path, both are
@@ -1146,6 +1280,7 @@ mod tests {
         // Active memtable: id=3 with HNSW index.
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1196,7 +1331,7 @@ mod tests {
             "vector".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), None)
+            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -1272,7 +1407,7 @@ mod tests {
         ];
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, Some(&projection), None)
+            .plan_search(&query, 5, 1, Some(&projection), false, 1.0)
             .await
             .expect("empty plan must accept system columns in projection");
 
@@ -1317,7 +1452,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 8, None, None)
+            .plan_search(&query, 10, 8, None, false, 1.0)
             .await
             .expect("planner should produce a plan without a base table");
 
@@ -1372,9 +1507,9 @@ mod tests {
     #[tokio::test]
     async fn test_vector_search_dedup_within_active_memtable() {
         // Regression: same PK inserted twice into one active memtable with
-        // *different* vectors. HNSW indexes each as a distinct node, so
-        // without WithinSourceDedupExec a KNN can return both candidates
-        // for the same PK and pollute top-k. The newer insert must win.
+        // *different* vectors. HNSW indexes each as a distinct node, so without
+        // the recency filter a KNN can return both candidates for the same PK
+        // and pollute top-k. The newer insert must win.
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
@@ -1386,6 +1521,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
         index_store.add_hnsw(
             "vector_hnsw".to_string(),
             1,
@@ -1444,7 +1580,22 @@ mod tests {
         // the older row's vector is far from the query but still a graph
         // node. After dedup we should see pk=1 exactly once.
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 5, 1, None, None).await.unwrap();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, 1.0)
+            .await
+            .unwrap();
+
+        // The active arm collapses duplicate-PK HNSW nodes itself via the
+        // recency filter — there is no cross-source dedup fallback.
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_str.contains("NewestPkFilterExec"),
+            "active vector arm must self-dedup, got:\n{}",
+            plan_str
+        );
 
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
@@ -1467,6 +1618,740 @@ mod tests {
             pk1_count, 1,
             "pk=1 must appear exactly once after within-source dedup; got ids={:?}",
             ids,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_active_stale_update_out_of_neighborhood() {
+        // BUG REPRODUCTION (vector case: a PK update that moves out of the neighborhood).
+        //
+        // Within a *single* active memtable, pk=1 is first inserted ON the query
+        // (distance ~0), then updated to a FAR vector. The append-only HNSW keeps
+        // both nodes live. A result-set dedup only collapses duplicate PKs that
+        // are BOTH present in the over-fetched candidate set.
+        //
+        // Here the fresh (far) pk=1 is evicted from the candidate set — there are
+        // enough nearer filler rows that it ranks below the fetch cutoff — so the
+        // dedup never sees it and the STALE near pk=1 leaks as the nearest hit.
+        // This is the predicate-crossing hole: the row that *would* suppress the
+        // stale version isn't in the result set, so result-set dedup can't help.
+        //
+        // Desired (NewestPkFilterExec) behaviour: pk=1's newest row-position is
+        // the far one, computed predicate-independently over the whole memtable,
+        // so the stale near node is dropped and pk=1 must NOT surface at ~0.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+
+        // First append: stale pk=1 ON the query, plus five filler rows strictly
+        // farther than pk=1 but far nearer than the eventual fresh pk=1.
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let stale_then_fillers = batch_rows(
+            &schema,
+            &[
+                (1, q),
+                (10, [0.11, 0.21, 0.31, 0.41]),
+                (11, [0.13, 0.23, 0.33, 0.43]),
+                (12, [0.15, 0.25, 0.35, 0.45]),
+                (13, [0.17, 0.27, 0.37, 0.47]),
+                (14, [0.19, 0.29, 0.39, 0.49]),
+            ],
+        );
+        let (bp0, off0, _) = batch_store.append(stale_then_fillers.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&stale_then_fillers, off0, Some(bp0))
+            .unwrap();
+
+        // Second append: the UPDATE — pk=1 moved far from the query. This is the
+        // newest version (largest row position) but it sits well outside top-k.
+        let fresh_pk1 = batch_rows(&schema, &[(1, [9.0, 9.0, 9.0, 9.0])]);
+        let (bp1, off1, _) = batch_store.append(fresh_pk1.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&fresh_pk1, off1, Some(bp1))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        // k=3, no over-fetch: the candidate set is {pk1@near, two nearest
+        // fillers}; fresh pk1@far ranks 7th and never enters the candidates.
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 3, 1, None, false, 1.0)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        assert!(
+            !rows.iter().any(|&(id, d)| id == 1 && d.abs() < 1e-3),
+            "stale near pk=1 leaked: its live vector is far from the query, so it \
+             must not appear at distance ~0. results={:?}",
+            rows
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_stale_read_when_fresh_falls_out_of_top_k() {
+        // Regression for the cross-generation stale-read gap that the
+        // PkBlockFilterExec block-list closes.
+        //
+        // Scenario:
+        //   * Base (gen 0): stale pk=1 sitting on the query (distance ~0).
+        //   * Active (gen 1): pk=1 updated to a far vector, plus pk=2 closer
+        //     to the query than fresh pk=1. With k=1 the active arm surfaces
+        //     pk=2 and drops fresh pk=1, so without the block-list the stale
+        //     base copy of pk=1 wins top-1.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // Base table (gen 0): the stale copy of pk=1 sits exactly on the query.
+        let base_batch = create_test_batch_with_vector(&schema, 1, [0.1, 0.2, 0.3, 0.4]);
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Active memtable (gen 1): pk=1 updated to a far vector, plus a pk=2
+        // that is closer to the query than fresh pk=1 — so with k=1 the
+        // active arm surfaces pk=2 and drops fresh pk=1.
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let fresh_pk1 = create_test_batch_with_vector(&schema, 1, [9.0, 9.0, 9.0, 9.0]);
+        let pk2 = create_test_batch_with_vector(&schema, 2, [1.0, 1.0, 1.0, 1.0]);
+        let (_, _, bp1) = batch_store.append(fresh_pk1.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&fresh_pk1, 0, Some(bp1))
+            .unwrap();
+        let (_, _, bp2) = batch_store.append(pk2.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&pk2, 1, Some(bp2))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 1, 1, None, false, 1.0)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut rows: Vec<(i32, f32)> = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dist = b
+                .column_by_name(DISTANCE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), dist.value(i)));
+            }
+        }
+
+        // pk=1 was updated to a far vector; it must never be served at the
+        // stale ~0 distance of the superseded base-table copy.
+        assert!(
+            rows.iter().all(|&(id, d)| !(id == 1 && d.abs() < 1e-3)),
+            "stale read: pk=1 was updated to a far vector in gen 1, but the \
+             stale base-table copy (distance ~0) was served because fresh \
+             pk=1 fell out of the active arm's top-k and never deduped it; \
+             got {:?}",
+            rows
+        );
+        // Positive check: with the stale copy suppressed, the nearest *live*
+        // neighbor is pk=2 — the top-1 result, not an empty or dropped-everything
+        // result.
+        assert_eq!(
+            rows.len(),
+            1,
+            "k=1 must return exactly one row, got {:?}",
+            rows
+        );
+        assert_eq!(
+            rows[0].0, 2,
+            "expected nearest live neighbor pk=2, got {:?}",
+            rows
+        );
+
+        // The block-list is now unconditional: a sub-1.0 overfetch_factor is
+        // clamped to 1.0 and the stale base copy of pk=1 stays suppressed (the
+        // factor only tunes the over-fetch multiple, it cannot disable filtering).
+        let still_filtered = planner
+            .plan_search(&query, 1, 1, None, false, 0.0)
+            .await
+            .unwrap();
+        let still_filtered_rows = {
+            let stream = still_filtered
+                .execute(0, SessionContext::new().task_ctx())
+                .unwrap();
+            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            collect_id_dist(&batches)
+        };
+        assert!(
+            still_filtered_rows
+                .iter()
+                .all(|&(id, d)| !(id == 1 && d.abs() < 1e-3)),
+            "block-list is unconditional: stale pk=1 must stay suppressed even \
+             with overfetch_factor < 1.0; got {:?}",
+            still_filtered_rows
+        );
+    }
+
+    /// Build a multi-row (id, vector) batch with explicit vectors, so a test can
+    /// place some rows on the query and others nearby.
+    fn batch_rows(schema: &ArrowSchema, rows: &[(i32, [f32; 4])]) -> RecordBatch {
+        use arrow_array::builder::Float32Builder;
+        let mut vb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        for (_, v) in rows {
+            for x in v {
+                vb.values().append_value(*x);
+            }
+            vb.append(true);
+        }
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+        )
+        .unwrap()
+    }
+
+    /// Collect (id, distance) pairs from a KNN result stream.
+    fn collect_id_dist(batches: &[RecordBatch]) -> Vec<(i32, f32)> {
+        let mut rows = Vec::new();
+        for b in batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dist = b
+                .column_by_name(DISTANCE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), dist.value(i)));
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_overfetch_backfills_when_top_k_all_stale() {
+        // A source whose entire top-k is stale must still yield k live results
+        // from its next-nearest rows: the over-fetch backfills the dropped rows.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        // Base (gen 0): pk 1,2,3 sit ON the query (stale); pk 4,5,6 are nearby
+        // and live. The nearest 3 base rows are all about to be superseded.
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let near = [0.12, 0.22, 0.32, 0.42];
+        let base_batch = batch_rows(
+            &schema,
+            &[(1, q), (2, q), (3, q), (4, near), (5, near), (6, near)],
+        );
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Active (gen 1): pk 1,2,3 re-inserted with a far vector (the fresh value).
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let far = [9.0, 9.0, 9.0, 9.0];
+        let active_batch = batch_rows(&schema, &[(1, far), (2, far), (3, far)]);
+        let (_, _, bp) = batch_store.append(active_batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&active_batch, 0, Some(bp))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        // Over-fetch (2.5x) so the post-filter can backfill the all-stale top-k.
+        let plan = planner
+            .plan_search(&query, 3, 1, None, false, 2.5)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        // No under-fill: still exactly k=3 rows, the next-nearest live ones.
+        assert_eq!(rows.len(), 3, "expected k=3 live results, got {:?}", rows);
+        let ids: std::collections::HashSet<i32> = rows.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from([4, 5, 6]),
+            "expected the next-nearest live rows {{4,5,6}}, got {:?}",
+            rows
+        );
+        // No stale read: no pk in 1..=3 served at the superseded ~0 distance.
+        assert!(
+            rows.iter()
+                .all(|&(id, d)| !((1..=3).contains(&id) && d.abs() < 1e-3)),
+            "stale read: a superseded base row was served; got {:?}",
+            rows
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_flushed_superseded_by_newer_flushed() {
+        // An older flushed generation's stale row must be suppressed by a newer
+        // flushed generation (cross-flushed blocking, no base/active involved).
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let far = [9.0, 9.0, 9.0, 9.0];
+        let near = [0.12, 0.22, 0.32, 0.42];
+
+        // gen 1 (older): stale pk=1 sitting on the query.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 = create_dataset(&gen1_uri, vec![batch_rows(&schema, &[(1, q)])]).await;
+        gen1.create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+
+        // gen 2 (newer): fresh pk=1 (far) + an unrelated nearby pk=2.
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
+        let mut gen2 =
+            create_dataset(&gen2_uri, vec![batch_rows(&schema, &[(1, far), (2, near)])]).await;
+        gen2.create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(3)
+            .with_flushed_generation(1, "gen_1".to_string())
+            .with_flushed_generation(2, "gen_2".to_string());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot]);
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 1, 1, None, false, 1.0)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        // gen1's stale pk=1 (distance ~0) is blocked by gen2; the nearest live
+        // neighbor is the unrelated pk=2.
+        assert_eq!(rows.len(), 1, "expected one result, got {:?}", rows);
+        assert_eq!(
+            rows[0].0, 2,
+            "expected nearest live row pk=2, got {:?}",
+            rows
+        );
+    }
+
+    fn create_multicol_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id1", DataType::Int32, false),
+            Field::new("id2", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                false,
+            ),
+        ]))
+    }
+
+    fn multicol_batch(schema: &ArrowSchema, rows: &[((i32, i32), [f32; 4])]) -> RecordBatch {
+        use arrow_array::builder::Float32Builder;
+        let mut vb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        for (_, v) in rows {
+            for x in v {
+                vb.values().append_value(*x);
+            }
+            vb.append(true);
+        }
+        let id1: Vec<i32> = rows.iter().map(|((a, _), _)| *a).collect();
+        let id2: Vec<i32> = rows.iter().map(|((_, b), _)| *b).collect();
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(id1)),
+                Arc::new(Int32Array::from(id2)),
+                Arc::new(vb.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_stale_read_with_composite_pk() {
+        // The block-list must key on the full composite PK: a base row updated in
+        // the active memtable (matched on (id1,id2)) must be suppressed.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+
+        let schema = create_multicol_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let q = [0.1, 0.2, 0.3, 0.4];
+        let far = [9.0, 9.0, 9.0, 9.0];
+        let near = [0.12, 0.22, 0.32, 0.42];
+
+        // Base: composite pk (1,1) on the query (stale).
+        let base_batch = multicol_batch(&schema, &[((1, 1), q)]);
+        let mut base_dataset = create_dataset(&base_uri, vec![base_batch]).await;
+        let ivf_flat = VectorIndexParams::ivf_flat(1, lance_linalg::distance::DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &ivf_flat, true)
+            .await
+            .unwrap();
+        let base_dataset = Arc::new(base_dataset);
+
+        // Active: (1,1) re-inserted far (fresh) + an unrelated nearby (2,2).
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id1".to_string(), 0), ("id2".to_string(), 1)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        let active_batch = multicol_batch(&schema, &[((1, 1), far), ((2, 2), near)]);
+        let (_, _, bp) = batch_store.append(active_batch.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&active_batch, 0, Some(bp))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id1".to_string(), "id2".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 1, 1, None, false, 1.0)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        // The stale composite-key (1,1) at distance ~0 must not be served; the
+        // nearest live neighbor is (2,2).
+        let mut rows: Vec<(i32, i32, f32)> = Vec::new();
+        for b in &batches {
+            let id1 = b
+                .column_by_name("id1")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let id2 = b
+                .column_by_name("id2")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dist = b
+                .column_by_name(DISTANCE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((id1.value(i), id2.value(i), dist.value(i)));
+            }
+        }
+        assert_eq!(rows.len(), 1, "expected one result, got {:?}", rows);
+        assert_eq!(
+            (rows[0].0, rows[0].1),
+            (2, 2),
+            "expected nearest live composite key (2,2), got {:?}",
+            rows
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_same_l0_override_newest_wins() {
+        // Ported from the #6844 spec. The DANGEROUS within-memtable direction:
+        // a PK is re-inserted in the SAME active memtable with a *farther* vector,
+        // while the stale earlier copy sits ON the query. Newest-wins must keep
+        // the newer far copy and exclude the stale near one — unlike
+        // `test_vector_search_dedup_within_active_memtable`, which keeps the newer
+        // copy only because it is also the closer one (a weaker check).
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let on_query = [0.1, 0.2, 0.3, 0.4]; // == query: the STALE copy of id=1
+        let far = [9.0, 9.0, 9.0, 9.0]; // the FRESH (newer) copy of id=1
+        let other = [1.0, 1.0, 1.0, 1.0]; // unrelated id=2, not on the query
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        // Batch 0 @ positions 0,1: stale id=1 on the query, plus id=2.
+        let b0 = batch_rows(&schema, &[(1, on_query), (2, other)]);
+        let (_, _, bp0) = batch_store.append(b0.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b0, 0, Some(bp0))
+            .unwrap();
+        // Batch 1 @ position 2: id=1 re-inserted with the newer far vector.
+        let b1 = batch_rows(&schema, &[(1, far)]);
+        let (_, _, bp1) = batch_store.append(b1.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b1, 2, Some(bp1))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 5, 1, None, false, 1.0)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let rows = collect_id_dist(&batches);
+
+        let id1: Vec<f32> = rows
+            .iter()
+            .filter(|&&(id, _)| id == 1)
+            .map(|&(_, d)| d)
+            .collect();
+        assert_eq!(
+            id1.len(),
+            1,
+            "newest-wins: id=1 must appear exactly once after a same-L0 override, got {:?}",
+            rows
+        );
+        assert!(
+            id1[0] > 1.0,
+            "newest-wins: surviving id=1 must be the newer far vector, not the stale near one — got distance {}",
+            id1[0]
+        );
+        assert!(
+            rows.iter().all(|&(_, d)| d.abs() >= 1e-3),
+            "newest-wins: the stale on-query copy (distance ~0) must be excluded, got {:?}",
+            rows
         );
     }
 }

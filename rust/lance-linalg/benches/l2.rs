@@ -7,12 +7,14 @@ use arrow_array::{
     Float32Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use num_traits::{AsPrimitive, Float};
 use rand::Rng;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 use lance_arrow::{ArrowFloatType, FloatArray};
 use lance_linalg::distance::l2_u8::l2_u8;

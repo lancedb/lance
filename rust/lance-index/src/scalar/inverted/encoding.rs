@@ -244,6 +244,39 @@ fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
     dst.push(value as u8);
 }
 
+/// Encode a monotonically increasing sequence of `group_starts` (the first
+/// row of each posting-list cache group) as varint-encoded deltas. The first
+/// value is stored as-is and each subsequent value as its delta from the
+/// previous one; since deltas are group sizes (1..=cap) they fit in ~1 byte,
+/// keeping the buffer tiny even for indexes with millions of tokens. See
+/// issue #7040.
+pub(super) fn encode_group_starts(group_starts: &[u32]) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(group_starts.len());
+    let mut previous = 0u32;
+    for &start in group_starts {
+        debug_assert!(start >= previous, "group_starts must be monotonic");
+        encode_varint_u32(&mut dst, start - previous);
+        previous = start;
+    }
+    dst
+}
+
+/// Decode the buffer produced by [`encode_group_starts`] back into the
+/// absolute `group_starts` values.
+pub(super) fn decode_group_starts(src: &[u8]) -> Result<Vec<u32>> {
+    let mut group_starts = Vec::new();
+    let mut offset = 0;
+    let mut previous = 0u32;
+    while offset < src.len() {
+        let delta = decode_varint_u32(src, &mut offset)?;
+        previous = previous
+            .checked_add(delta)
+            .ok_or_else(|| Error::index("group_starts delta decode overflowed u32".to_owned()))?;
+        group_starts.push(previous);
+    }
+    Ok(group_starts)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PositionBlockBuilder {
     codec: PositionStreamCodec,
@@ -771,6 +804,31 @@ mod tests {
     use arrow::array::Array;
     use itertools::Itertools;
     use rand::Rng;
+
+    #[test]
+    fn test_group_starts_codec_roundtrip() {
+        for case in [
+            vec![],
+            vec![0u32],
+            vec![0, 1, 2, 3],
+            // realistic: monotonic with varied group sizes and a large jump
+            vec![0, 64, 128, 129, 4096, 1_000_000],
+        ] {
+            let encoded = encode_group_starts(&case);
+            let decoded = decode_group_starts(&encoded).unwrap();
+            assert_eq!(decoded, case, "roundtrip mismatch for {case:?}");
+        }
+    }
+
+    #[test]
+    fn test_decode_group_starts_rejects_overflow() {
+        // A crafted buffer whose deltas sum past u32::MAX must error rather
+        // than wrap. Encodes u32::MAX followed by a +1 delta.
+        let mut buf = Vec::new();
+        encode_varint_u32(&mut buf, u32::MAX);
+        encode_varint_u32(&mut buf, 1);
+        assert!(decode_group_starts(&buf).is_err());
+    }
 
     #[test]
     fn test_compress_posting_list() -> Result<()> {

@@ -93,12 +93,29 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param nprobes number of IVF partitions to probe
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
-   * @param refineFactor when positive, the base-table arm over-fetches {@code k * refineFactor}
-   *     candidates and re-ranks them with exact distances. Pass {@code 0} or negative to disable.
+   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances
+   *     (refine factor 1). Useful when the base table uses an approximate index (IVF-PQ).
+   *     Auto-enabled whenever stale filtering is on (see {@code overfetchFactor}).
+   * @param overfetchFactor single knob controlling both stale-read filtering and over-fetch:
+   *     <ul>
+   *       <li>{@code < 1.0} (e.g. {@code 0.0}): stale filtering off — rows superseded by a newer
+   *           generation may surface (the global primary-key dedup still runs).
+   *       <li>{@code == 1.0}: filtering on, no over-fetch — a source with superseded rows fetches
+   *           exactly {@code k} candidates and may return fewer than {@code k} live rows.
+   *       <li>{@code > 1.0}: filtering on, with over-fetch — such a source fetches {@code ceil(k *
+   *           overfetchFactor)} candidates so dropping the stale ones still leaves {@code k} live
+   *           rows.
+   *     </ul>
+   *     There is no separate on/off flag: over-fetch is only meaningful while filtering.
    * @return an executable plan
    */
   public ExecutionPlan planSearch(
-      Float4Vector query, int k, int nprobes, List<String> columns, int refineFactor) {
+      Float4Vector query,
+      int k,
+      int nprobes,
+      List<String> columns,
+      boolean refineBaseTable,
+      double overfetchFactor) {
     Preconditions.checkNotNull(query, "query must not be null");
     Preconditions.checkArgument(k > 0, "k must be positive, got %s", k);
     Preconditions.checkArgument(nprobes > 0, "nprobes must be positive, got %s", nprobes);
@@ -115,7 +132,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
                 k,
                 nprobes,
                 Optional.ofNullable(columns),
-                refineFactor);
+                refineBaseTable,
+                overfetchFactor);
         plan.allocator = allocator;
         return plan;
       }
@@ -123,7 +141,24 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
   }
 
   /**
-   * Plan a KNN vector search without refine.
+   * Plan a KNN vector search with stale filtering on and no over-fetch ({@code overfetchFactor =
+   * 1.0}).
+   *
+   * @param query a flat float32 vector of length {@code vectorDim}
+   * @param k number of nearest neighbours to return
+   * @param nprobes number of IVF partitions to probe
+   * @param columns columns to project; pass {@code null} to return all columns plus {@code
+   *     _distance}
+   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances.
+   * @return an executable plan
+   */
+  public ExecutionPlan planSearch(
+      Float4Vector query, int k, int nprobes, List<String> columns, boolean refineBaseTable) {
+    return planSearch(query, k, nprobes, columns, refineBaseTable, 1.0);
+  }
+
+  /**
+   * Plan a KNN vector search with stale filtering on (no refine, no over-fetch).
    *
    * @param query a flat float32 vector of length {@code vectorDim}
    * @param k number of nearest neighbours to return
@@ -133,12 +168,12 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @return an executable plan
    */
   public ExecutionPlan planSearch(Float4Vector query, int k, int nprobes, List<String> columns) {
-    return planSearch(query, k, nprobes, columns, 0);
+    return planSearch(query, k, nprobes, columns, false, 1.0);
   }
 
   /** Plan a KNN vector search with default {@code nprobes} of 20. */
   public ExecutionPlan planSearch(Float4Vector query, int k) {
-    return planSearch(query, k, 20, null, 0);
+    return planSearch(query, k, 20, null, false, 1.0);
   }
 
   private native ExecutionPlan nativePlanSearch(
@@ -147,7 +182,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
       int k,
       int nprobes,
       Optional<List<String>> columns,
-      int refineFactor);
+      boolean refineBaseTable,
+      double overfetchFactor);
 
   /**
    * Close the planner and release native resources. If the planner is already closed, invoking this

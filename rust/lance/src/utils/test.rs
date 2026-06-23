@@ -21,8 +21,10 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+mod failing_store;
 mod throttle_store;
 
+pub use failing_store::FailingProxyStore;
 pub use throttle_store::ThrottledStoreWrapper;
 
 /// A dataset generator that can generate random layouts. This is used to test
@@ -381,7 +383,11 @@ impl Default for NoContextTestFixture {
 
 impl NoContextTestFixture {
     pub fn new() -> Self {
+        // `enable_time` is required because `Dataset::write` runs the commit
+        // through `tokio::time::timeout` (CommitBuilder's default timeout),
+        // which panics without a timer driver.
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
 

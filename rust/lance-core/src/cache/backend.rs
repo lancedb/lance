@@ -22,6 +22,9 @@ use super::CacheCodec;
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 
+/// Iterator over cache keys currently known to a backend.
+pub type CacheKeyIterator<'a> = Box<dyn Iterator<Item = InternalCacheKey> + Send + 'a>;
+
 /// Structured cache key passed to [`CacheBackend`] methods.
 ///
 /// CacheBackend impls receive these ready-made from [`LanceCache`](super::LanceCache)
@@ -115,6 +118,15 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
 
     /// Remove all entries.
     async fn clear(&self);
+
+    /// Return an iterator over cache keys currently known to this backend.
+    ///
+    /// Backends that cannot enumerate keys cheaply or accurately should return
+    /// `None`. An empty iterator means key inventory is supported and the
+    /// cache currently has no entries.
+    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
+        None
+    }
 
     /// Number of entries currently stored (may flush pending operations).
     async fn num_entries(&self) -> usize;

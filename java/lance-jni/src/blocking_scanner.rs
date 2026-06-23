@@ -30,6 +30,7 @@ use crate::{
     RT,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::IntoJava,
+    utils::parse_approx_mode,
 };
 
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
@@ -245,7 +246,11 @@ pub(crate) struct ScannerOptions<'a> {
     pub batch_readahead: jint,
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
+    pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
+    pub include_deleted_rows: jboolean,
+    pub strict_batch_size: jboolean,
+    pub disable_scoring_autoprojection: jboolean,
 }
 
 /// Build a scanner with options applied - shared by blocking and async scanners
@@ -317,7 +322,9 @@ pub(crate) fn build_scanner_with_options<'a>(
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Float32Array::from(key_array);
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        let _ = scanner.nearest(&column, &key, k);
+        scanner
+            .nearest(&column, &key, k)
+            .map_err(|err| Error::input_error(err.to_string()))?;
 
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
@@ -351,6 +358,9 @@ pub(crate) fn build_scanner_with_options<'a>(
             .call_method(&java_obj, "getQueryParallelism", "()I", &[])?
             .i()?;
         scanner.query_parallelism(query_parallelism);
+
+        let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
+        scanner.approx_mode(parse_approx_mode(&approx_mode_str)?);
         Ok(())
     })?;
 
@@ -360,6 +370,10 @@ pub(crate) fn build_scanner_with_options<'a>(
         scanner.full_text_search(full_text_query)?;
         Ok(())
     })?;
+
+    if options.fast_search == JNI_TRUE {
+        scanner.fast_search();
+    }
 
     scanner.batch_readahead(options.batch_readahead as usize);
 
@@ -385,6 +399,16 @@ pub(crate) fn build_scanner_with_options<'a>(
     let substrait_aggregate_opt = env.get_bytes_opt(&options.substrait_aggregate_obj)?;
     if let Some(substrait_aggregate) = substrait_aggregate_opt {
         scanner.aggregate(AggregateExpr::substrait(substrait_aggregate))?;
+    }
+
+    if options.include_deleted_rows == JNI_TRUE {
+        scanner.include_deleted_rows();
+    }
+
+    scanner.strict_batch_size(options.strict_batch_size == JNI_TRUE);
+
+    if options.disable_scoring_autoprojection == JNI_TRUE {
+        scanner.disable_scoring_autoprojection();
     }
 
     Ok(scanner)
@@ -413,8 +437,12 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     batch_readahead: jint,             // int
     column_orderings: JObject<'local>, // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,        // boolean
+    fast_search: jboolean,             // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
     collect_stats: jboolean,           // boolean
+    include_deleted_rows: jboolean,    // boolean
+    strict_batch_size: jboolean,       // boolean
+    disable_scoring_autoprojection: jboolean, // boolean
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -436,8 +464,12 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             batch_readahead,
             column_orderings,
             use_scalar_index,
+            fast_search,
             substrait_aggregate_obj,
             collect_stats,
+            include_deleted_rows,
+            strict_batch_size,
+            disable_scoring_autoprojection,
         )
     )
 }
@@ -461,8 +493,12 @@ fn inner_create_scanner<'local>(
     batch_readahead: jint,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
+    fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     collect_stats: jboolean,
+    include_deleted_rows: jboolean,
+    strict_batch_size: jboolean,
+    disable_scoring_autoprojection: jboolean,
 ) -> Result<JObject<'local>> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
@@ -485,7 +521,11 @@ fn inner_create_scanner<'local>(
         batch_readahead,
         column_orderings,
         use_scalar_index,
+        fast_search,
         substrait_aggregate_obj,
+        include_deleted_rows,
+        strict_batch_size,
+        disable_scoring_autoprojection,
     };
 
     let scanner = build_scanner_with_options(env, &dataset, options)?;

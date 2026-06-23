@@ -52,9 +52,9 @@ fn bench_not(c: &mut Criterion) {
         for label in ["Exact", "AtMost", "AtLeast"] {
             let id = BenchmarkId::new(label, n);
             let make = move || match label {
-                "Exact" => NullableIndexExprResult::Exact(allow_run(n)),
-                "AtMost" => NullableIndexExprResult::AtMost(allow_run(n)),
-                "AtLeast" => NullableIndexExprResult::AtLeast(allow_run(n)),
+                "Exact" => NullableIndexExprResult::exact(allow_run(n)),
+                "AtMost" => NullableIndexExprResult::at_most(allow_run(n)),
+                "AtLeast" => NullableIndexExprResult::at_least(allow_run(n)),
                 _ => unreachable!(),
             };
             group.bench_function(id, |b| {
@@ -75,33 +75,35 @@ type PairFn = Box<dyn Fn() -> (NullableIndexExprResult, NullableIndexExprResult)
 /// cases that today drop information (Exact/AtMost, Exact/AtLeast,
 /// AtMost/AtLeast).
 fn pair_cases(n: u64) -> Vec<(&'static str, PairFn)> {
-    use NullableIndexExprResult::*;
     let lhs = move || allow_run(n);
     let rhs = move || allow_middle(n);
+    let exact = |m| NullableIndexExprResult::exact(m);
+    let at_most = |m| NullableIndexExprResult::at_most(m);
+    let at_least = |m| NullableIndexExprResult::at_least(m);
     vec![
         (
             "Exact_Exact",
-            Box::new(move || (Exact(lhs()), Exact(rhs()))),
+            Box::new(move || (exact(lhs()), exact(rhs()))),
         ),
         (
             "AtMost_AtMost",
-            Box::new(move || (AtMost(lhs()), AtMost(rhs()))),
+            Box::new(move || (at_most(lhs()), at_most(rhs()))),
         ),
         (
             "AtLeast_AtLeast",
-            Box::new(move || (AtLeast(lhs()), AtLeast(rhs()))),
+            Box::new(move || (at_least(lhs()), at_least(rhs()))),
         ),
         (
             "Exact_AtMost",
-            Box::new(move || (Exact(lhs()), AtMost(rhs()))),
+            Box::new(move || (exact(lhs()), at_most(rhs()))),
         ),
         (
             "Exact_AtLeast",
-            Box::new(move || (Exact(lhs()), AtLeast(rhs()))),
+            Box::new(move || (exact(lhs()), at_least(rhs()))),
         ),
         (
             "AtMost_AtLeast",
-            Box::new(move || (AtMost(lhs()), AtLeast(rhs()))),
+            Box::new(move || (at_most(lhs()), at_least(rhs()))),
         ),
     ]
 }

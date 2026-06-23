@@ -8,6 +8,7 @@ use arrow_array::{BooleanArray, ListArray, RecordBatch, UInt64Array};
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
+use datafusion::functions::regex::regexplike::RegexpLikeFunc;
 use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -17,10 +18,9 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::Expr;
-use datafusion_expr::expr::ScalarFunction;
-use deepsize::DeepSizeOf;
+use datafusion_expr::{Expr, expr::ScalarFunction};
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
@@ -36,6 +36,7 @@ pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
 pub mod expression;
+pub mod fmindex;
 pub mod inverted;
 pub mod json;
 pub mod label_list;
@@ -68,6 +69,7 @@ pub enum BuiltinIndexType {
     BloomFilter,
     RTree,
     Inverted,
+    Fm,
 }
 
 impl BuiltinIndexType {
@@ -81,6 +83,7 @@ impl BuiltinIndexType {
             Self::Inverted => "inverted",
             Self::BloomFilter => "bloomfilter",
             Self::RTree => "rtree",
+            Self::Fm => "fm",
         }
     }
 }
@@ -98,6 +101,7 @@ impl TryFrom<IndexType> for BuiltinIndexType {
             IndexType::Inverted => Ok(Self::Inverted),
             IndexType::BloomFilter => Ok(Self::BloomFilter),
             IndexType::RTree => Ok(Self::RTree),
+            IndexType::Fm => Ok(Self::Fm),
             _ => Err(Error::index("Invalid index type".to_string())),
         }
     }
@@ -183,9 +187,12 @@ pub trait IndexWriter: Send {
         ))
     }
     /// Finishes writing the file and closes the file
-    async fn finish(&mut self) -> Result<()>;
+    async fn finish(&mut self) -> Result<IndexFile>;
     /// Finishes writing the file and closes the file with additional metadata
-    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()>;
+    async fn finish_with_metadata(
+        &mut self,
+        metadata: HashMap<String, String>,
+    ) -> Result<IndexFile>;
 }
 
 /// Trait for reading an index (or parts of an index) from storage
@@ -208,6 +215,23 @@ pub trait IndexReader: Send + Sync {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch>;
+    /// Read multiple ranges and concatenate into a single batch.
+    /// Default impl runs `read_range`s in parallel via `try_join_all`.
+    async fn read_ranges(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        if ranges.is_empty() {
+            return self.read_range(0..0, projection).await;
+        }
+        let futures = ranges
+            .iter()
+            .map(|r| self.read_range(r.clone(), projection));
+        let batches = futures::future::try_join_all(futures).await?;
+        let schema = batches[0].schema();
+        Ok(arrow_select::concat::concat_batches(&schema, &batches)?)
+    }
     /// Read a range of rows as a stream of record batches.
     ///
     /// This allows the caller to process rows incrementally without loading the
@@ -233,6 +257,11 @@ pub trait IndexReader: Send + Sync {
     fn num_rows(&self) -> usize;
     /// Return the metadata of the file
     fn schema(&self) -> &lance_core::datatypes::Schema;
+    /// Best-effort on-disk byte size of the file when the reader already knows it
+    /// without extra I/O, else `None`. Used to size prewarm chunks.
+    fn file_size_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Trait abstracting I/O away from index logic
@@ -258,10 +287,26 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
-    async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
+    async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<IndexFile>;
+
+    /// Copy an index file from this store to a new name in another store, leaving the source intact
+    async fn copy_index_file_to(
+        &self,
+        name: &str,
+        new_name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<IndexFile> {
+        if name == new_name {
+            self.copy_index_file(name, dest_store).await
+        } else {
+            Err(Error::not_supported(format!(
+                "copying index file {name} to {new_name} is not supported by this index store"
+            )))
+        }
+    }
 
     /// Rename an index file
-    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()>;
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile>;
 
     /// Delete an index file (used in the tmp spill store to keep tmp size down)
     async fn delete_index_file(&self, name: &str) -> Result<()>;
@@ -605,9 +650,15 @@ impl AnyQuery for LabelListQuery {
 pub enum TextQuery {
     /// Retrieve all row ids where the text contains the given string
     StringContains(String),
-    // TODO: In the future we should be able to do string-insensitive contains
-    // as well as partial matches (e.g. LIKE 'foo%') and potentially even
-    // some regular expressions
+    /// Retrieve all row ids whose text matches the given regular expression.
+    ///
+    /// The pattern is a full regular expression (as accepted by `regexp_like`).
+    /// The index returns a candidate superset that the scan rechecks, so any
+    /// pattern is sound; patterns with no usable trigram structure simply fall
+    /// back to rechecking every row.
+    Regex(String),
+    // TODO: In the future we should be able to do case-insensitive contains
+    // as well as partial matches (e.g. LIKE 'foo%').
 }
 
 impl AnyQuery for TextQuery {
@@ -626,6 +677,17 @@ impl AnyQuery for TextQuery {
                 args: vec![
                     Expr::Column(Column::new_unqualified(col)),
                     Expr::Literal(ScalarValue::Utf8(Some(substr.clone())), None),
+                ],
+            }),
+            // `regexp_like` returns Boolean directly, so the reconstructed
+            // expression can be used as-is for the recheck filter (no IsNotNull
+            // wrapper, unlike `regexp_match`). It is the semantic equivalent of
+            // the original predicate for the "does it match" question.
+            Self::Regex(pattern) => Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(RegexpLikeFunc::new().into()),
+                args: vec![
+                    Expr::Column(Column::new_unqualified(col)),
+                    Expr::Literal(ScalarValue::Utf8(Some(pattern.clone())), None),
                 ],
             }),
         }
@@ -849,7 +911,7 @@ pub struct CreatedIndex {
     ///
     /// This enables skipping HEAD calls when opening indices and provides
     /// visibility into index storage size via describe_indices().
-    pub files: Option<Vec<IndexFile>>,
+    pub files: Vec<IndexFile>,
 }
 
 /// The criteria that specifies how to update an index
@@ -896,6 +958,17 @@ impl OldIndexDataFilter {
                 .iter()
                 .map(|id| id.map(|id| valid_row_ids.contains(id)))
                 .collect(),
+        }
+    }
+
+    /// Apply this filter in place to a set of existing (old) row ids/addresses,
+    /// retaining only the rows the filter selects to keep. Used by index types
+    /// that merge old postings directly (e.g. bitmap) instead of re-scanning a
+    /// row-id array through [`Self::filter_row_ids`].
+    pub fn retain_old_rows(&self, rows: &mut RowAddrTreeMap) {
+        match self {
+            Self::Fragments { to_keep, .. } => rows.retain_fragments(to_keep.iter()),
+            Self::RowIds(valid_row_ids) => *rows &= valid_row_ids,
         }
     }
 }

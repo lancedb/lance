@@ -11,7 +11,7 @@ use arrow_array::types::Float32Type;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use lance_core::{Error, ROW_ID, Result};
-use lance_linalg::distance::{DistanceType, Dot, L2, cosine_distance};
+use lance_linalg::distance::{DistanceType, cosine_distance, dot_f32, l2_f32};
 
 use super::graph::ScoredPoint;
 
@@ -79,8 +79,8 @@ pub trait VectorSource: Send + Sync {
 /// distance kernels.
 pub fn compute_f32_distance(query: &[f32], vector: &[f32], distance_type: DistanceType) -> f32 {
     match distance_type {
-        DistanceType::L2 => f32::l2(query, vector),
-        DistanceType::Dot => f32::dot(query, vector),
+        DistanceType::L2 => l2_f32(query, vector),
+        DistanceType::Dot => dot_f32(query, vector),
         DistanceType::Cosine => cosine_distance(query, vector),
         DistanceType::Hamming => f32::INFINITY,
     }

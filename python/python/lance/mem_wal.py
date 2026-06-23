@@ -525,7 +525,8 @@ class LsmVectorSearchPlanner:
         k: int = 10,
         nprobes: int = 20,
         columns: Optional[List[str]] = None,
-        refine_factor: Optional[int] = None,
+        refine_base_table: bool = False,
+        overfetch_factor: float = 1.0,
     ) -> ExecutionPlan:
         """Plan a KNN vector search.
 
@@ -540,11 +541,28 @@ class LsmVectorSearchPlanner:
         columns : list of str, optional
             Columns to project.  Returns all columns + ``_distance`` if
             omitted.
-        refine_factor : int, optional
-            When set, the base-table arm fetches ``k * refine_factor``
-            candidates and re-ranks with exact distances.  Useful when
-            the base index is approximate (e.g. IVF-PQ).  Memtable arms
-            use exact HNSW and are unaffected.
+        refine_base_table : bool, optional
+            When true, the base-table arm re-ranks its candidates with exact
+            distances.  Useful when the base index is approximate (e.g.
+            IVF-PQ).  Memtable arms use exact HNSW and are unaffected.
+            Auto-enabled whenever stale filtering is on (see ``overfetch_factor``).
+        overfetch_factor : float, optional
+            Single knob controlling **both** stale-read filtering and over-fetch
+            (default: ``1.0``):
+
+            - ``< 1.0`` (e.g. ``0.0``): stale filtering **off**.  Rows superseded
+              by a newer generation may surface.  (The global primary-key dedup
+              still runs, so it suppresses stale copies whenever both the stale
+              and the fresh row reach it.)
+            - ``== 1.0``: filtering **on**, no over-fetch.  Each source with
+              superseded rows fetches exactly ``k`` candidates and drops the stale
+              ones, so it may return fewer than ``k`` live rows.
+            - ``> 1.0``: filtering **on**, with over-fetch.  Such a source fetches
+              ``ceil(k * overfetch_factor)`` candidates so dropping the stale ones
+              still leaves ``k`` live rows.
+
+            There is no separate on/off flag: over-fetch is only meaningful while
+            filtering, so the factor encodes both.
 
         Returns
         -------
@@ -553,7 +571,14 @@ class LsmVectorSearchPlanner:
             `to_table`, `to_reader`, or `to_batches`.
         """
         return ExecutionPlan(
-            self._raw.plan_search(query, k, nprobes, columns, refine_factor)
+            self._raw.plan_search(
+                query,
+                k,
+                nprobes,
+                columns,
+                refine_base_table,
+                overfetch_factor,
+            )
         )
 
 

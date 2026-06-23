@@ -275,6 +275,29 @@ public class MergeInsertTest {
     return stream;
   }
 
+  @Test
+  public void testMergeInsertWithoutIndex() throws Exception {
+    // Verify that merge insert with useIndex=false still completes and
+    // produces results consistent with the default (useIndex=true).
+
+    try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withUseIndex(false),
+                sourceStream);
+
+        Assertions.assertEquals(
+            "{0=Source 0, 1=Source 1, 2=Source 2, 3=Person 3, 4=Person 4, 7=Source 7, 8=Source 8, 9=Source 9}",
+            readAll(result.dataset()).toString(),
+            "merge insert with useIndex=false should produce correct upsert results");
+      }
+    }
+  }
+
   private TreeMap<Integer, String> readAll(Dataset dataset) throws Exception {
     try (ArrowReader reader = dataset.newScan().scanBatches()) {
       TreeMap<Integer, String> map = new TreeMap<>();

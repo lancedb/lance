@@ -17,11 +17,11 @@ use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
-use deepsize::DeepSizeOf;
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_index::mem_wal::MergedGeneration;
@@ -476,7 +476,7 @@ pub enum UpdateMode {
 pub struct UpdatedFragmentOffsets(pub HashMap<u64, RoaringBitmap>);
 
 impl DeepSizeOf for UpdatedFragmentOffsets {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.0.iter().fold(0_usize, |acc, (frag_id, bitmap)| {
             acc + frag_id.deep_size_of_children(context)
                 + (bitmap.len() as usize).saturating_mul(std::mem::size_of::<u32>())
@@ -1361,7 +1361,7 @@ pub struct RewrittenIndex {
 }
 
 impl DeepSizeOf for RewrittenIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.new_index_details
             .type_url
             .deep_size_of_children(context)

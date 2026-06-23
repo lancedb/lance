@@ -22,7 +22,7 @@ pub mod segment;
 mod serde;
 pub mod version;
 
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
