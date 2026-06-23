@@ -686,6 +686,41 @@ impl LanceFileSession {
         })?
     }
 
+    /// Read a byte range from a file in the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// the other session methods. This issues a single ranged GET; on Azure it
+    /// talks to the blob endpoint only and never probes the
+    /// hierarchical-namespace (DFS) endpoint. Reading a missing object raises
+    /// `OSError`, consistent with `download_file`.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path` to read from.
+    /// offset : int
+    ///     Byte offset at which to start reading.
+    /// length : int
+    ///     Number of bytes to read.
+    ///
+    /// Returns
+    /// -------
+    /// bytes
+    ///     The requested byte range.
+    pub fn read_range(&self, path: String, offset: usize, length: usize) -> PyResult<Vec<u8>> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            let bytes = self
+                .object_store
+                .read_one_range(&full_path, offset..offset + length)
+                .await
+                .map_err(|e| {
+                    PyIOError::new_err(format!("Failed to read range from remote file: {}", e))
+                })?;
+            Ok(bytes.to_vec())
+        })?
+    }
+
     /// Download a file from object store to local filesystem
     ///
     /// Parameters

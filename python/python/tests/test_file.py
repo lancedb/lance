@@ -797,6 +797,29 @@ def test_session_contains(tmp_path):
     assert not session.contains("subdir/nonexistent.lance")
 
 
+def test_session_read_range(tmp_path):
+    """Test that LanceFileSession.read_range() returns the requested bytes."""
+    session = LanceFileSession(str(tmp_path))
+
+    payload = bytes(range(256))
+    local = tmp_path / "src.bin"
+    local.write_bytes(payload)
+    session.upload_file(str(local), "data/file.bin")
+
+    # A range in the middle of the file.
+    assert session.read_range("data/file.bin", 10, 5) == payload[10:15]
+    # From the start.
+    assert session.read_range("data/file.bin", 0, 4) == payload[0:4]
+    # Up to the end.
+    assert session.read_range("data/file.bin", 250, 6) == payload[250:256]
+    # A zero-length read yields empty bytes.
+    assert session.read_range("data/file.bin", 100, 0) == b""
+
+    # Reading a missing object raises OSError (consistent with download_file).
+    with pytest.raises(OSError):
+        session.read_range("data/missing.bin", 0, 4)
+
+
 def test_session_delete_file(tmp_path):
     """Test that LanceFileSession.delete_file() removes files and is idempotent."""
     session = LanceFileSession(str(tmp_path))

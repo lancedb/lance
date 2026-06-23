@@ -389,6 +389,30 @@ class LanceFileSession:
         common_prefixes, objects = self._session.list_with_delimiter(path)
         return ListResult(common_prefixes=common_prefixes, objects=objects)
 
+    def read_range(self, path: str, offset: int, length: int) -> bytes:
+        """
+        Read a byte range from a file (relative to this session's base path).
+
+        Issues a single ranged read. On Azure it talks to the blob endpoint only
+        and never probes the hierarchical-namespace (DFS) endpoint. Reading a
+        missing object raises ``OSError``, consistent with ``download_file``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to read from.
+        offset : int
+            Byte offset at which to start reading.
+        length : int
+            Number of bytes to read.
+
+        Returns
+        -------
+        bytes
+            The requested byte range.
+        """
+        return self._session.read_range(path, offset, length)
+
     def delete_file(self, path: str) -> None:
         """
         Delete a file (relative to this session's base path).
