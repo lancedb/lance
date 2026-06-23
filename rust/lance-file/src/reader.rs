@@ -3,6 +3,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     io::Cursor,
     ops::Range,
     pin::Pin,
@@ -48,6 +49,44 @@ use crate::{
     io::LanceEncodingsIo,
     writer::PAGE_BUFFER_ALIGNMENT,
 };
+
+/// An error wrapper that adds file path context to errors that occur while reading a file.
+///
+/// This wraps I/O errors, decoding errors, and other failures with the path of the file
+/// being read so that error messages include the file location:
+///
+/// ```text
+/// failed to read file 'data.lance'
+///
+/// Caused by:
+///     0: failed to decode field 'age' (id=10)
+///     1: number out of range
+/// ```
+#[derive(Debug)]
+pub struct ReadFileError {
+    /// The path of the file being read
+    pub path: Path,
+    /// The underlying error
+    pub source: Error,
+}
+
+impl fmt::Display for ReadFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to read file '{}'", self.path)
+    }
+}
+
+impl std::error::Error for ReadFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<ReadFileError> for Error {
+    fn from(err: ReadFileError) -> Self {
+        Self::wrapped(Box::new(err))
+    }
+}
 
 /// Default chunk size for reading large pages (8MiB)
 /// Pages larger than this will be split into multiple chunks during read
@@ -439,6 +478,8 @@ pub struct FileReader {
     decoder_plugins: Arc<DecoderPlugins>,
     cache: Arc<LanceCache>,
     options: FileReaderOptions,
+    /// The path of the file being read, used for error context
+    path: Option<Path>,
 }
 #[derive(Debug)]
 struct Footer {
@@ -467,6 +508,7 @@ impl FileReader {
             metadata: self.metadata.clone(),
             options: self.options.clone(),
             num_rows: self.num_rows,
+            path: self.path.clone(),
         }
     }
 
@@ -516,6 +558,18 @@ impl FileReader {
 
         FileStatistics {
             columns: column_stats,
+        }
+    }
+
+    /// Wrap an error with file path context if the path is known.
+    fn wrap_err(&self, source: Error) -> Error {
+        match &self.path {
+            Some(path) => ReadFileError {
+                path: path.clone(),
+                source,
+            }
+            .into(),
+            None => source,
         }
     }
 
@@ -963,6 +1017,7 @@ impl FileReader {
             decoder_plugins,
             cache,
             options,
+            path: Some(path),
         })
     }
 
@@ -1231,15 +1286,18 @@ impl FileReader {
                 Ok(())
             }
         };
-        match &params {
+        let result = match &params {
             ReadBatchParams::Indices(indices) => {
                 for idx in indices {
                     match idx {
                         None => {
-                            return Err(Error::invalid_input("Null value in indices array"));
+                            return Err(
+                                self.wrap_err(Error::invalid_input("Null value in indices array"))
+                            );
                         }
                         Some(idx) => {
-                            verify_bound(&params, idx as u64, true)?;
+                            verify_bound(&params, idx as u64, true)
+                                .map_err(|e| self.wrap_err(e))?;
                         }
                     }
                 }
@@ -1247,7 +1305,7 @@ impl FileReader {
                 self.take_rows(indices, batch_size, projection).await
             }
             ReadBatchParams::Range(range) => {
-                verify_bound(&params, range.end as u64, false)?;
+                verify_bound(&params, range.end as u64, false).map_err(|e| self.wrap_err(e))?;
                 self.read_range(
                     range.start as u64..range.end as u64,
                     batch_size,
@@ -1259,14 +1317,14 @@ impl FileReader {
             ReadBatchParams::Ranges(ranges) => {
                 let mut ranges_u64 = Vec::with_capacity(ranges.len());
                 for range in ranges.as_ref() {
-                    verify_bound(&params, range.end, false)?;
+                    verify_bound(&params, range.end, false).map_err(|e| self.wrap_err(e))?;
                     ranges_u64.push(range.start..range.end);
                 }
                 self.read_ranges(ranges_u64, batch_size, projection, filter)
                     .await
             }
             ReadBatchParams::RangeFrom(range) => {
-                verify_bound(&params, range.start as u64, true)?;
+                verify_bound(&params, range.start as u64, true).map_err(|e| self.wrap_err(e))?;
                 self.read_range(
                     range.start as u64..self.num_rows,
                     batch_size,
@@ -1276,7 +1334,7 @@ impl FileReader {
                 .await
             }
             ReadBatchParams::RangeTo(range) => {
-                verify_bound(&params, range.end as u64, false)?;
+                verify_bound(&params, range.end as u64, false).map_err(|e| self.wrap_err(e))?;
                 self.read_range(0..range.end as u64, batch_size, projection, filter)
                     .await
             }
@@ -1284,7 +1342,8 @@ impl FileReader {
                 self.read_range(0..self.num_rows, batch_size, projection, filter)
                     .await
             }
-        }
+        };
+        result.map_err(|e| self.wrap_err(e))
     }
 
     /// Reads data from the file as a stream of record batches
@@ -1486,15 +1545,18 @@ impl FileReader {
                 Ok(())
             }
         };
-        match &params {
+        let result = match &params {
             ReadBatchParams::Indices(indices) => {
                 for idx in indices {
                     match idx {
                         None => {
-                            return Err(Error::invalid_input("Null value in indices array"));
+                            return Err(
+                                self.wrap_err(Error::invalid_input("Null value in indices array"))
+                            );
                         }
                         Some(idx) => {
-                            verify_bound(&params, idx as u64, true)?;
+                            verify_bound(&params, idx as u64, true)
+                                .map_err(|e| self.wrap_err(e))?;
                         }
                     }
                 }
@@ -1502,7 +1564,7 @@ impl FileReader {
                 self.take_rows_blocking(indices, batch_size, projection, filter)
             }
             ReadBatchParams::Range(range) => {
-                verify_bound(&params, range.end as u64, false)?;
+                verify_bound(&params, range.end as u64, false).map_err(|e| self.wrap_err(e))?;
                 self.read_range_blocking(
                     range.start as u64..range.end as u64,
                     batch_size,
@@ -1513,13 +1575,13 @@ impl FileReader {
             ReadBatchParams::Ranges(ranges) => {
                 let mut ranges_u64 = Vec::with_capacity(ranges.len());
                 for range in ranges.as_ref() {
-                    verify_bound(&params, range.end, false)?;
+                    verify_bound(&params, range.end, false).map_err(|e| self.wrap_err(e))?;
                     ranges_u64.push(range.start..range.end);
                 }
                 self.read_ranges_blocking(ranges_u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFrom(range) => {
-                verify_bound(&params, range.start as u64, true)?;
+                verify_bound(&params, range.start as u64, true).map_err(|e| self.wrap_err(e))?;
                 self.read_range_blocking(
                     range.start as u64..self.num_rows,
                     batch_size,
@@ -1528,13 +1590,14 @@ impl FileReader {
                 )
             }
             ReadBatchParams::RangeTo(range) => {
-                verify_bound(&params, range.end as u64, false)?;
+                verify_bound(&params, range.end as u64, false).map_err(|e| self.wrap_err(e))?;
                 self.read_range_blocking(0..range.end as u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFull => {
                 self.read_range_blocking(0..self.num_rows, batch_size, projection, filter)
             }
-        }
+        };
+        result.map_err(|e| self.wrap_err(e))
     }
 
     /// Reads data from the file as a stream of record batches
@@ -2607,5 +2670,72 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.contains('2'), "error should mention the index: {msg}");
+    }
+
+    #[test]
+    fn test_read_file_error_display() {
+        use lance_core::Error;
+        use object_store::path::Path;
+
+        let source = Error::invalid_input("corrupt data");
+        let err = super::ReadFileError {
+            path: Path::from("data/test.lance"),
+            source,
+        };
+        assert_eq!(err.to_string(), "failed to read file 'data/test.lance'");
+    }
+
+    #[test]
+    fn test_read_file_error_source_chain() {
+        use lance_core::Error;
+        use lance_encoding::decoder::DecodeFieldError;
+        use object_store::path::Path;
+
+        let inner = Error::invalid_input("number out of range");
+        let field_err = DecodeFieldError {
+            field_name: "age".to_string(),
+            field_id: 10,
+            source: inner,
+        };
+        let lance_err: Error = field_err.into();
+        let file_err = super::ReadFileError {
+            path: Path::from("data/test.lance"),
+            source: lance_err,
+        };
+
+        // Verify display
+        assert_eq!(
+            file_err.to_string(),
+            "failed to read file 'data/test.lance'"
+        );
+
+        // Verify the source chain is preserved
+        let source = std::error::Error::source(&file_err);
+        assert!(source.is_some());
+        let source_msg = source.unwrap().to_string();
+        assert!(
+            source_msg.contains("failed to decode field 'age' (id=10)"),
+            "expected source to contain field error, got: {}",
+            source_msg
+        );
+    }
+
+    #[test]
+    fn test_read_file_error_converts_to_lance_error() {
+        use lance_core::Error;
+        use object_store::path::Path;
+
+        let inner = Error::invalid_input("bad data");
+        let file_err = super::ReadFileError {
+            path: Path::from("tables/users.lance"),
+            source: inner,
+        };
+        let lance_err: Error = file_err.into();
+        let msg = lance_err.to_string();
+        assert!(
+            msg.contains("failed to read file 'tables/users.lance'"),
+            "expected error to contain file path, got: {}",
+            msg
+        );
     }
 }
