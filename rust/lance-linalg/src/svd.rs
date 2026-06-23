@@ -143,7 +143,10 @@ fn multiply_A_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 }
 
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    assert!(m > 0 && n > 0, "Matrix must have at least 1 row and at least 1 column.");
+    if m == 0 || n == 0 {
+        println!("Error: Matrix must have at least 1 row and at least 1 column.");
+        return (vec![], vec![], vec![]); 
+    }
     assert_eq!(a.len(), m * n, "Data length of matrix must match the product of the specified number of rows and number of columns.", a.len(), m, n);
     assert!(a.iter().all(|x| x.is_finite()), "Matrix must not contain null or infinite entries.");
 
