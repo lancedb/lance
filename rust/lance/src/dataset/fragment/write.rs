@@ -250,6 +250,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             params,
             version,
             target_bases_info,
+            Vec::new(),
         )
         .await
     }
