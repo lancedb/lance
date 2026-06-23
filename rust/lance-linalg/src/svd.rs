@@ -144,6 +144,7 @@ fn multiply_A_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     assert!(m > 0 && n > 0, "Matrix must have at least 1 row and at least 1 column.");
+    assert_eq!(a.len(), m * n, "Data length of matrix does not match the product of the specified number of rows and number of columns", a.len(), m, n);
 
     let ata = compute_ata(a, m, n);
     let (eigenvalues, v) = jacobi_eigen(&ata, n);
