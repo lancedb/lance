@@ -709,6 +709,9 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     and_candidates_pruned_before_return: usize,
     and_window_stats: AndWindowStats,
+    // Experiment: run AND through the same candidate generation path as OR,
+    // then validate that every posting iterator matches before scoring.
+    and_use_or_candidate_path: bool,
     docs: &'a DocSet,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -773,6 +776,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_last_doc: None,
             and_candidates_pruned_before_return: 0,
             and_window_stats: AndWindowStats::default(),
+            and_use_or_candidate_path: false,
             docs,
             scorer,
             shared_threshold: None,
@@ -840,6 +844,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // row_ids post-wand.
         let docs_has_row_ids = self.docs.has_row_ids();
 
+        let and_use_or_candidate_path = self.operator == Operator::And;
+        if and_use_or_candidate_path {
+            self.enable_and_or_candidate_path();
+        }
+
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         let mut and_candidates_seen = 0;
@@ -874,13 +883,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
             // in the DocSet (slot kept so posting-list doc_ids stay aligned)
             // and must not surface in results.
             if docs_has_row_ids && row_id == RowAddress::TOMBSTONE_ROW {
-                if self.operator == Operator::Or {
+                if self.operator == Operator::Or || and_use_or_candidate_path {
                     self.push_back_leads(doc.doc_id() + 1);
                 }
                 continue;
             }
             if docs_has_row_ids && !mask.selected(row_id) {
-                if self.operator == Operator::Or {
+                if self.operator == Operator::Or || and_use_or_candidate_path {
                     self.push_back_leads(doc.doc_id() + 1);
                 }
                 continue;
@@ -902,9 +911,18 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 score
             } else {
                 self.advance_all_tail(doc.doc_id(), None, None);
+                if self.lead.len() < self.num_terms {
+                    if and_use_or_candidate_path {
+                        self.push_back_leads(doc.doc_id() + 1);
+                    }
+                    continue;
+                }
                 if params.phrase_slop.is_some()
                     && !self.check_positions(params.phrase_slop.unwrap() as i32)
                 {
+                    if and_use_or_candidate_path {
+                        self.push_back_leads(doc.doc_id() + 1);
+                    }
                     continue;
                 }
                 and_full_scores += 1;
@@ -941,7 +959,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 let kth = candidates.peek().unwrap().0.0.score.0;
                 self.update_threshold(kth, params.wand_factor);
             }
-            if self.operator == Operator::Or {
+            if self.operator == Operator::Or || and_use_or_candidate_path {
                 self.push_back_leads(doc.doc_id() + 1);
             }
         }
@@ -1166,7 +1184,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     // contribution from the current `lead` set; additional score can still come
     // from `tail` iterators that are advanced to the same doc later.
     fn next(&mut self) -> Result<Option<(DocInfo, f32)>> {
-        if self.operator == Operator::And {
+        if self.operator == Operator::And && !self.and_use_or_candidate_path {
             let candidate = self.next_and_candidate();
             if candidate.is_some() {
                 self.and_window_stats.candidates_returned += 1;
@@ -1232,6 +1250,21 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         Ok(None)
     }
+
+    fn enable_and_or_candidate_path(&mut self) {
+        if self.and_use_or_candidate_path {
+            return;
+        }
+        self.and_use_or_candidate_path = true;
+        self.up_to = None;
+        self.and_last_doc = None;
+
+        let lead = std::mem::take(&mut self.lead);
+        for posting in lead {
+            self.push_head(posting);
+        }
+    }
+
     fn next_and_candidate(&mut self) -> Option<DocInfo> {
         if self.lead.len() < self.num_terms {
             return None;
@@ -2536,7 +2569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_and_candidate_prune_records_scoring_counters() {
+    fn test_and_or_candidate_path_records_scoring_counters() {
         let total_docs = 2 * BLOCK_SIZE as u32 + 1;
         let mut docs = DocSet::default();
         for doc_id in 0..total_docs {
@@ -2593,8 +2626,8 @@ mod tests {
         let full_scores = metrics.full_scores.load(Ordering::Relaxed);
         assert_eq!(metrics.comparisons.load(Ordering::Relaxed), 1);
         assert_eq!(candidates_seen, 1);
-        assert!(candidates_pruned > 0);
-        assert_eq!(candidates_pruned_before_return, candidates_pruned);
+        assert_eq!(candidates_pruned, 0);
+        assert_eq!(candidates_pruned_before_return, 0);
         assert_eq!(full_scores, 1);
         assert_eq!(metrics.freqs_collected.load(Ordering::Relaxed), 1);
     }
@@ -2648,6 +2681,61 @@ mod tests {
 
         let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
         assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(1)]));
+    }
+
+    #[test]
+    fn test_and_or_candidate_path_filters_partial_matches() {
+        let mut docs = DocSet::default();
+        for doc_id in 0..3 {
+            docs.append(doc_id, 1);
+        }
+
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("a"),
+                0,
+                0,
+                1.0,
+                generate_posting_list_with_freqs(
+                    vec![0, 2],
+                    vec![100, 1],
+                    100.0,
+                    Some(vec![100.0]),
+                    true,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("b"),
+                1,
+                1,
+                1.0,
+                generate_posting_list_with_freqs(
+                    vec![1, 2],
+                    vec![100, 1],
+                    100.0,
+                    Some(vec![100.0]),
+                    true,
+                ),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+        let metrics = CountAndSearchStats::default();
+        let result = wand
+            .search(
+                &FtsSearchParams::new().with_limit(Some(1)),
+                Arc::new(RowAddrMask::default()),
+                &metrics,
+            )
+            .unwrap();
+
+        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
+        assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(2)]));
+        assert_eq!(metrics.candidates_seen.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.full_scores.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.freqs_collected.load(Ordering::Relaxed), 1);
     }
 
     #[test]
