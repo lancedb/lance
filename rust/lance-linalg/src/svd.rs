@@ -142,4 +142,14 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
             u[ri * m + ci] = value;
         }
     }
+
+    let mut vt = vec![0f64; n * n];
+    for new_row in 0..n {
+        let old_col = order[new_row];
+        for c in 0..n {
+            vt[new_row * n + c] = v[c * n + old_col];
+        }
+    }
+
+    (u, sigma, vt)
 }
