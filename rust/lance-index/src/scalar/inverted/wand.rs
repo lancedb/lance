@@ -659,6 +659,14 @@ struct AndWindowStats {
     candidates_returned: usize,
 }
 
+#[derive(Default)]
+struct AndSearchStats {
+    pruned_before_return_start: usize,
+    candidates_seen: usize,
+    full_scores: usize,
+    freqs_collected: usize,
+}
+
 impl Eq for TailPosting {}
 
 impl PartialOrd for TailPosting {
@@ -842,18 +850,18 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
-        let mut and_candidates_seen = 0;
-        let mut and_full_scores = 0;
-        let mut freqs_collected = 0;
-        let pruned_before_return_start = self.and_candidates_pruned_before_return;
+        let mut and_search_stats = (self.operator == Operator::And).then_some(AndSearchStats {
+            pruned_before_return_start: self.and_candidates_pruned_before_return,
+            ..Default::default()
+        });
         loop {
             self.raise_to_shared_floor(params.wand_factor);
             let Some((doc, mut score)) = self.next()? else {
                 break;
             };
             num_comparisons += 1;
-            if self.operator == Operator::And {
-                and_candidates_seen += 1;
+            if let Some(and_stats) = and_search_stats.as_mut() {
+                and_stats.candidates_seen += 1;
             }
 
             // Either a real row_id (so we can run the mask check
@@ -907,14 +915,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 {
                     continue;
                 }
-                and_full_scores += 1;
+                if let Some(and_stats) = and_search_stats.as_mut() {
+                    and_stats.full_scores += 1;
+                }
                 self.score(doc_length)
             };
 
             if candidates.len() < limit {
                 let freqs = self.iter_term_freqs().collect();
-                if self.operator == Operator::And {
-                    freqs_collected += 1;
+                if let Some(and_stats) = and_search_stats.as_mut() {
+                    and_stats.freqs_collected += 1;
                 }
                 candidates.push(Reverse((
                     ScoredDoc::new(row_id, score),
@@ -928,8 +938,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
                 let freqs = self.iter_term_freqs().collect();
-                if self.operator == Operator::And {
-                    freqs_collected += 1;
+                if let Some(and_stats) = and_search_stats.as_mut() {
+                    and_stats.freqs_collected += 1;
                 }
                 candidates.pop();
                 candidates.push(Reverse((
@@ -956,13 +966,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
             );
         }
         metrics.record_comparisons(num_comparisons);
-        let and_candidates_pruned_before_return = self
-            .and_candidates_pruned_before_return
-            .saturating_sub(pruned_before_return_start);
-        metrics.record_and_candidates_seen(and_candidates_seen);
-        metrics.record_and_candidates_pruned_before_return(and_candidates_pruned_before_return);
-        metrics.record_and_full_scores(and_full_scores);
-        metrics.record_freqs_collected(freqs_collected);
+        if let Some(and_stats) = and_search_stats {
+            let and_candidates_pruned_before_return = self
+                .and_candidates_pruned_before_return
+                .saturating_sub(and_stats.pruned_before_return_start);
+            metrics.record_and_candidates_seen(and_stats.candidates_seen);
+            metrics.record_and_candidates_pruned_before_return(and_candidates_pruned_before_return);
+            metrics.record_and_full_scores(and_stats.full_scores);
+            metrics.record_freqs_collected(and_stats.freqs_collected);
+        }
 
         // The heap entry's `row_id` slot is either a real row_id
         // (DocSet had row_ids) or the doc_id widened to u64
@@ -2009,6 +2021,44 @@ mod tests {
         }
     }
 
+    struct PanicOnAndMetrics {
+        comparisons: AtomicUsize,
+    }
+
+    impl PanicOnAndMetrics {
+        fn new() -> Self {
+            Self {
+                comparisons: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MetricsCollector for PanicOnAndMetrics {
+        fn record_parts_loaded(&self, _: usize) {}
+
+        fn record_index_loads(&self, _: usize) {}
+
+        fn record_comparisons(&self, n: usize) {
+            self.comparisons.fetch_add(n, Ordering::Relaxed);
+        }
+
+        fn record_and_candidates_seen(&self, _: usize) {
+            panic!("OR search should not record AND candidate metrics");
+        }
+
+        fn record_and_candidates_pruned_before_return(&self, _: usize) {
+            panic!("OR search should not record AND prune metrics");
+        }
+
+        fn record_and_full_scores(&self, _: usize) {
+            panic!("OR search should not record AND scoring metrics");
+        }
+
+        fn record_freqs_collected(&self, _: usize) {
+            panic!("OR search should not record AND frequency metrics");
+        }
+    }
+
     fn generate_posting_list(
         doc_ids: Vec<u32>,
         max_score: f32,
@@ -2349,6 +2399,46 @@ mod tests {
             or_scored <= 2 * BLOCK_SIZE,
             "expected pruning to skip a block, but scored {or_scored} of {total}",
         );
+    }
+
+    #[rstest]
+    fn test_or_search_does_not_record_and_metrics(#[values(false, true)] is_compressed: bool) {
+        let mut docs = DocSet::default();
+        for row_id in 0..6 {
+            docs.append(row_id, 1);
+        }
+
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("alpha"),
+                0,
+                0,
+                1.0,
+                generate_posting_list(vec![0, 1, 4], 1.0, None, is_compressed),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("beta"),
+                1,
+                1,
+                1.0,
+                generate_posting_list(vec![1, 2, 5], 1.0, None, is_compressed),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
+        let metrics = PanicOnAndMetrics::new();
+        let candidates = wand
+            .search(
+                &FtsSearchParams::default(),
+                Arc::new(RowAddrMask::default()),
+                &metrics,
+            )
+            .unwrap();
+
+        assert_eq!(sorted_candidate_row_ids(candidates), vec![0, 1, 2, 4, 5]);
+        assert!(metrics.comparisons.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

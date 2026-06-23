@@ -769,6 +769,33 @@ impl InvertedIndex {
         if limit == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
+
+        fn push_scored_candidate(
+            candidates: &mut BinaryHeap<Reverse<ScoredDoc>>,
+            limit: usize,
+            addr: CandidateAddr,
+            score: f32,
+        ) -> Result<()> {
+            // resolve_deferred_candidates ran upstream, so every candidate
+            // carries a real row_id at this point.
+            let row_id = match addr {
+                CandidateAddr::RowId(r) => r,
+                CandidateAddr::Pending(_) => {
+                    return Err(Error::internal(
+                        "bm25_search post-condition: deferred candidate left unresolved",
+                    ));
+                }
+            };
+
+            if candidates.len() < limit {
+                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+            } else if candidates.peek().unwrap().0.score.0 < score {
+                candidates.pop();
+                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+            }
+            Ok(())
+        }
+
         let mask = prefilter.mask();
 
         let mut candidates = BinaryHeap::new();
@@ -870,10 +897,6 @@ impl InvertedIndex {
                 grouped_expansions,
                 candidates: part_candidates,
             } = res;
-            let grouped_positions = grouped_expansions
-                .iter()
-                .map(|group| group.position)
-                .collect::<HashSet<_>>();
             let mut idf_by_position = Vec::with_capacity(tokens_by_position.len());
             for token in &tokens_by_position {
                 let idf_weight = match idf_cache.get(token) {
@@ -886,53 +909,61 @@ impl InvertedIndex {
                 };
                 idf_by_position.push(idf_weight);
             }
-            for DocCandidate {
-                addr,
-                posting_doc_id,
-                freqs,
-                doc_length,
-            } in part_candidates
-            {
-                // resolve_deferred_candidates ran upstream, so every
-                // candidate carries a real row_id at this point.
-                let row_id = match addr {
-                    CandidateAddr::RowId(r) => r,
-                    CandidateAddr::Pending(_) => {
-                        return Err(Error::internal(
-                            "bm25_search post-condition: deferred candidate left unresolved",
-                        ));
+
+            if grouped_expansions.is_empty() {
+                for DocCandidate {
+                    addr,
+                    freqs,
+                    doc_length,
+                    ..
+                } in part_candidates
+                {
+                    let mut score = 0.0;
+                    for (term_index, freq) in freqs.into_iter() {
+                        debug_assert!((term_index as usize) < idf_by_position.len());
+                        score += idf_by_position[term_index as usize]
+                            * scorer.doc_weight(freq, doc_length);
                     }
-                };
-                let mut score = 0.0;
-                for (term_index, freq) in freqs.into_iter() {
-                    if grouped_positions.contains(&term_index) {
-                        continue;
-                    }
-                    debug_assert!((term_index as usize) < idf_by_position.len());
-                    score +=
-                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
+                    push_scored_candidate(&mut candidates, limit, addr, score)?;
                 }
-                for group in &grouped_expansions {
-                    for term in &group.terms {
-                        let Some(freq) = term.frequency(posting_doc_id) else {
+            } else {
+                let grouped_positions = grouped_expansions
+                    .iter()
+                    .map(|group| group.position)
+                    .collect::<HashSet<_>>();
+                for DocCandidate {
+                    addr,
+                    posting_doc_id,
+                    freqs,
+                    doc_length,
+                } in part_candidates
+                {
+                    let mut score = 0.0;
+                    for (term_index, freq) in freqs.into_iter() {
+                        if grouped_positions.contains(&term_index) {
                             continue;
-                        };
-                        let idf_weight = match idf_cache.get(&term.token) {
-                            Some(weight) => *weight,
-                            None => {
-                                let weight = scorer.query_weight(&term.token);
-                                idf_cache.insert(term.token.clone(), weight);
-                                weight
-                            }
-                        };
-                        score += idf_weight * scorer.doc_weight(freq, doc_length);
+                        }
+                        debug_assert!((term_index as usize) < idf_by_position.len());
+                        score += idf_by_position[term_index as usize]
+                            * scorer.doc_weight(freq, doc_length);
                     }
-                }
-                if candidates.len() < limit {
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
-                } else if candidates.peek().unwrap().0.score.0 < score {
-                    candidates.pop();
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                    for group in &grouped_expansions {
+                        for term in &group.terms {
+                            let Some(freq) = term.frequency(posting_doc_id) else {
+                                continue;
+                            };
+                            let idf_weight = match idf_cache.get(&term.token) {
+                                Some(weight) => *weight,
+                                None => {
+                                    let weight = scorer.query_weight(&term.token);
+                                    idf_cache.insert(term.token.clone(), weight);
+                                    weight
+                                }
+                            };
+                            score += idf_weight * scorer.doc_weight(freq, doc_length);
+                        }
+                    }
+                    push_scored_candidate(&mut candidates, limit, addr, score)?;
                 }
             }
         }
@@ -1587,12 +1618,14 @@ impl InvertedPartition {
             .map(|index| tokens.position(index))
             .collect::<Vec<_>>();
         let mut token_ids = Vec::with_capacity(tokens.len());
-        let mut matched_positions = HashSet::new();
+        let mut matched_positions = required_positions.as_ref().map(|_| HashSet::new());
         for (index, token) in tokens.into_iter().enumerate() {
             let token_id = self.map(&token);
             if let Some(token_id) = token_id {
                 let position = token_positions[index];
-                matched_positions.insert(position);
+                if let Some(matched_positions) = matched_positions.as_mut() {
+                    matched_positions.insert(position);
+                }
                 token_ids.push((token_id, token, position));
             } else if is_phrase_query || is_and_query {
                 // if the token is not found, we can't do phrase or AND query
@@ -1602,8 +1635,9 @@ impl InvertedPartition {
         if token_ids.is_empty() {
             return Ok(LoadedPostings::empty());
         }
-        if let Some(required_positions) = required_positions
-            && !required_positions.is_subset(&matched_positions)
+        if let Some(required_positions) = required_positions.as_ref()
+            && let Some(matched_positions) = matched_positions.as_ref()
+            && !required_positions.is_subset(matched_positions)
         {
             return Ok(LoadedPostings::empty());
         }
