@@ -44,7 +44,7 @@ use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DeletionFile, Fragment};
+use lance_table::format::{DataFile, DataOverlayFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
@@ -1219,6 +1219,167 @@ impl FileFragment {
         Ok(plans)
     }
 
+    /// Read just the values at the given `ranks` (0-based positions within an
+    /// overlay field's value column) via a `take`, rather than the whole column.
+    /// A value column has one row per covered offset; position `r` holds the
+    /// value for the offset whose rank is `r`. Used by overlay compaction so a
+    /// cell that a newer overlay already supplies is never fetched from an older
+    /// overlay.
+    async fn read_overlay_value_column_at(
+        &self,
+        overlay: &DataOverlayFile,
+        field: &lance_core::datatypes::Field,
+        ranks: &[u32],
+        read_config: &FragReadConfig,
+    ) -> Result<ArrayRef> {
+        if ranks.is_empty() {
+            return Ok(arrow_array::new_empty_array(&field.data_type()));
+        }
+        let single_field = Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+        let reader = self
+            .open_reader(&overlay.data_file, Some(&single_field), read_config)
+            .await?
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "overlay data file {} does not contain field {} (id {})",
+                    overlay.data_file.path, field.name, field.id
+                ))
+            })?;
+        let mut tasks = reader
+            .take_all_tasks(ranks, ranks.len() as u32, reader.projection().clone(), None)
+            .await?;
+        let mut chunks: Vec<ArrayRef> = Vec::new();
+        while let Some(task) = tasks.next().await {
+            let batch = task.task.await?;
+            chunks.push(batch.column(0).clone());
+        }
+        let chunk_refs: Vec<&dyn arrow_array::Array> = chunks.iter().map(|a| a.as_ref()).collect();
+        Ok(arrow_select::concat::concat(&chunk_refs)?)
+    }
+
+    /// Resolve, for a single field, the post-image of every offset this
+    /// fragment's overlays cover, reading each winning cell **at most once**.
+    ///
+    /// The overlays are walked newest-first; for each overlay only the offsets
+    /// not already claimed by a newer overlay are read (via a rank `take`), so
+    /// overlapping coverage never fetches the same cell from more than one
+    /// source. The returned [`ResolvedFieldOverlay`]'s `coverage` is the union of
+    /// every overlay's coverage for the field, and its `values` are in ascending
+    /// offset order (i.e. rank order within `coverage`).
+    pub(crate) async fn read_overlay_field_winners(
+        &self,
+        field: &lance_core::datatypes::Field,
+        read_config: &FragReadConfig,
+    ) -> Result<ResolvedFieldOverlay> {
+        let overlays = &self.metadata.overlays;
+        let order = overlay_indices_newest_first(overlays);
+        let mut claimed = RoaringBitmap::new();
+        let mut taken: Vec<ArrayRef> = Vec::new();
+        // offset -> (index into `taken`, position within that taken array)
+        let mut sources_by_offset: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+        for overlay_idx in order {
+            let overlay = &overlays[overlay_idx];
+            let Some(field_pos) = overlay
+                .data_file
+                .fields
+                .iter()
+                .position(|&id| id == field.id)
+            else {
+                continue;
+            };
+            let coverage = overlay.coverage_for_field(field_pos)?;
+            let winners: Vec<u32> = (&*coverage - &claimed).iter().collect();
+            claimed |= &*coverage;
+            if winners.is_empty() {
+                continue;
+            }
+            let ranks: Vec<u32> = winners
+                .iter()
+                .map(|&offset| coverage.rank(offset) as u32 - 1)
+                .collect();
+            let values = self
+                .read_overlay_value_column_at(overlay, field, &ranks, read_config)
+                .await?;
+            let taken_idx = taken.len();
+            for (pos, &offset) in winners.iter().enumerate() {
+                sources_by_offset.insert(offset, (taken_idx, pos));
+            }
+            taken.push(values);
+        }
+        if sources_by_offset.is_empty() {
+            return Ok(ResolvedFieldOverlay {
+                coverage: RoaringBitmap::new(),
+                values: arrow_array::new_empty_array(&field.data_type()),
+            });
+        }
+        // A BTreeMap iterates in ascending key (offset) order, which is exactly
+        // the rank order of the union coverage.
+        let coverage: RoaringBitmap = sources_by_offset.keys().copied().collect();
+        let indices: Vec<(usize, usize)> = sources_by_offset.values().copied().collect();
+        let sources: Vec<&dyn arrow_array::Array> = taken.iter().map(|a| a.as_ref()).collect();
+        let values = arrow_select::interleave::interleave(&sources, &indices)?;
+        Ok(ResolvedFieldOverlay { coverage, values })
+    }
+
+    /// The live (non-tombstoned) data file in this fragment that stores
+    /// `field_id`, if any. A tombstoned column is recorded as field id `-2`, so
+    /// it never matches a real field id here.
+    pub(crate) fn base_data_file_for_field(&self, field_id: i32) -> Option<&DataFile> {
+        self.metadata
+            .files
+            .iter()
+            .find(|f| f.fields.contains(&field_id))
+    }
+
+    /// Read a field's full base column for every physical row (counting deleted
+    /// rows) **without** merging overlays. Returns an all-null column when no
+    /// base data file holds the field (an overlay over a column the base never
+    /// materialized).
+    pub(crate) async fn read_base_field_full(
+        &self,
+        field: &lance_core::datatypes::Field,
+        read_config: &FragReadConfig,
+    ) -> Result<ArrayRef> {
+        let physical_rows = self.physical_rows().await?;
+        if physical_rows == 0 {
+            return Ok(arrow_array::new_empty_array(&field.data_type()));
+        }
+        let single_field = Schema {
+            fields: vec![field.clone()],
+            metadata: Default::default(),
+        };
+        let reader = match self.base_data_file_for_field(field.id) {
+            Some(data_file) => {
+                self.open_reader(data_file, Some(&single_field), read_config)
+                    .await?
+            }
+            None => None,
+        };
+        let Some(reader) = reader else {
+            return Ok(arrow_array::new_null_array(
+                &field.data_type(),
+                physical_rows,
+            ));
+        };
+        let mut tasks = reader
+            .read_range_tasks(
+                0..physical_rows as u64,
+                physical_rows as u32,
+                reader.projection().clone(),
+            )
+            .await?;
+        let mut chunks: Vec<ArrayRef> = Vec::new();
+        while let Some(task) = tasks.next().await {
+            let batch = task.task.await?;
+            chunks.push(batch.column(0).clone());
+        }
+        let chunk_refs: Vec<&dyn arrow_array::Array> = chunks.iter().map(|a| a.as_ref()).collect();
+        Ok(arrow_select::concat::concat(&chunk_refs)?)
+    }
+
     /// Count the rows in this fragment.
     pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         match filter {
@@ -2115,6 +2276,18 @@ struct LoadedFieldOverlay {
 struct FieldOverlayPlan {
     field_name: String,
     overlays_newest_first: Vec<LoadedFieldOverlay>,
+}
+
+/// The post-image of a single field over every offset this fragment's overlays
+/// cover, produced by [`FileFragment::read_overlay_field_winners`] for overlay
+/// compaction. `values` is in ascending offset order — i.e. rank order within
+/// `coverage` — so a covered offset `o`'s value sits at `coverage`'s rank of `o`.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedFieldOverlay {
+    /// Union of every overlay's coverage for the field.
+    pub coverage: RoaringBitmap,
+    /// The winning value for each covered offset, indexed by rank in `coverage`.
+    pub values: ArrayRef,
 }
 
 /// Resolve overlays for one base batch: route each projected field against the
