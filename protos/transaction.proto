@@ -254,7 +254,12 @@ message Transaction {
     // Only tracks keys from INSERT operations during merge insert, not updates.
     optional KeyExistenceFilter inserted_rows = 8;
     // Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
+    // Deprecated: use updated_fragment_offset_bitmaps (field 10) instead.
     map<uint64, UInt32List> updated_fragment_offsets = 9;
+    // Per-fragment matched offsets as portable RoaringBitmap bytes (replaces field 9).
+    // Writers emit field 10 only. Readers prefer field 10; fall back to field 9 for
+    // manifests written before this change.
+    map<uint64, bytes> updated_fragment_offset_bitmaps = 10;
   }
 
   // The mode of update operation
