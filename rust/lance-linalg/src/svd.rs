@@ -10,11 +10,39 @@ fn create_identity_matrix(n: usize) -> Vec<f64> {
 }
 
 fn jacobi_rotate(s: &mut [f64], n: usize, p: usize, q: usize, c: f64, sn: f64) {
+    let s_pp = s[p * n + p];
+    let s_qq = s[q * n + q];
+    let s_pq = s[p * n + q];
 
+    s[p * n + p] = c * c * s_pp - 2.0 * sn * c * s_pq + sn * sn * s_qq;
+    s[q * n + q] = sn * sn * s_pp + 2.0 * sn * c * s_pq + c * c * s_qq;
+    s[p * n + q] = 0.0;
+    s[q * n + p] = 0.0;
+
+    for r in 0..n {
+        if r == p || r == q {
+            continue;
+        }
+        let s_rp = s[r * n + p];
+        let s_rq = s[r * n + q];
+        let new_rp = c * s_rp - sn * s_rq;
+        let new_rq = sn * s_rp + c * s_rq;
+
+        s[r * n + p] = new_rp;
+        s[p * n + r] = new_rp;
+        s[r * n + q] = new_rq;
+        s[q * n + r] = new_rq;
+    }
 }
 
 fn apply_givens_right(v: &mut [f64], n: usize, p: usize, q: usize, c: f64, sn: f64) {
+    for r in 0..n {
+        let vp = v[r * n + p];
+        let vq = v[r * n + q];
 
+        v[r * n + p] = c * vp - sn * vq;
+        v[r * n + q] = sn * vp + c * vq;
+    }
 }
 
 fn jacobi_eigen(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
