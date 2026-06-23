@@ -51,6 +51,7 @@ pub use sharding::{
     evaluate_sharding_spec, evaluate_sharding_spec_with_embedded_columns,
     evaluate_sharding_spec_with_source_columns,
 };
-pub use wal::{WalAppendResult, WalAppender, WalReadEntry, WalTailer};
+pub use wal::{BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer};
 pub use write::ShardWriter;
 pub use write::ShardWriterConfig;
+pub use write::WriteResult;
