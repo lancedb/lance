@@ -840,9 +840,11 @@ def test_session_delete_file(tmp_path):
     session.delete_file("subdir/nested.lance")
     assert not session.contains("subdir/nested.lance")
 
-    # Deleting a missing path is a no-op rather than an error (idempotent).
-    session.delete_file("test.lance")
-    session.delete_file("never_existed.lance")
+    # Deleting a missing path raises OSError (consistent with download_file).
+    with pytest.raises(OSError):
+        session.delete_file("test.lance")
+    with pytest.raises(OSError):
+        session.delete_file("never_existed.lance")
 
 
 def test_struct_null_regression():

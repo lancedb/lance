@@ -415,8 +415,8 @@ class LanceFileSession:
         """
         Delete a file (relative to this session's base path).
 
-        Deleting a path that does not exist is a no-op (idempotent) rather than
-        an error, so this is safe to call on best-effort cleanup paths.
+        Deleting a path that does not exist raises ``OSError``, consistent with
+        ``download_file``.
 
         Parameters
         ----------
