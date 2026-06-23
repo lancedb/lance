@@ -98,7 +98,7 @@ fn compute_ata(a: &[f64], m: usize, n: usize) -> Vec<f64> {
 }
 
 fn gram_schmidt(cols: &mut Vec<Vec<f64>>) {
-    let n_cols = cols.len();
+    let ncols = cols.len();
     for i in 0..ncols {
         for j in 0..i {
             let dot: f64 = cols[i].iter().zip(cols[j].iter()).map(|(&a, &b)| a * b).sum();
