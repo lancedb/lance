@@ -404,10 +404,11 @@ impl PartitionArtifactBuilder {
                     _ => {}
                 }
                 partition.num_rows += end - offset;
-                partition.ranges.push(PartitionArtifactRange {
-                    offset: file_offset + offset as u64,
-                    num_rows: (end - offset) as u64,
-                });
+                append_partition_range(
+                    partition,
+                    file_offset + offset as u64,
+                    (end - offset) as u64,
+                );
                 offset = end;
             }
 
@@ -453,10 +454,7 @@ impl PartitionArtifactBuilder {
             _ => {}
         }
         partition.num_rows += total_rows;
-        partition.ranges.push(PartitionArtifactRange {
-            offset: file_offset,
-            num_rows: total_rows as u64,
-        });
+        append_partition_range(partition, file_offset, total_rows as u64);
 
         let pq_codes = FixedSizeListArray::try_new_from_values(
             UInt8Array::from(pq_values),
@@ -782,14 +780,16 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
         }
 
         let reader = self.open_file_reader(path).await?;
-        let ranges = partition
-            .ranges
-            .iter()
-            .map(|range| Range {
-                start: range.offset,
-                end: range.offset + range.num_rows,
-            })
-            .collect::<Vec<_>>();
+        let ranges = merge_adjacent_ranges(
+            partition
+                .ranges
+                .iter()
+                .map(|range| Range {
+                    start: range.offset,
+                    end: range.offset + range.num_rows,
+                })
+                .collect::<Vec<_>>(),
+        );
         let schema = Arc::new(reader.schema().as_ref().into());
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             schema,
@@ -817,6 +817,39 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
     }
 }
 
+fn append_partition_range(partition: &mut PartitionArtifactPartition, offset: u64, num_rows: u64) {
+    if num_rows == 0 {
+        return;
+    }
+    if let Some(last) = partition.ranges.last_mut()
+        && last.offset + last.num_rows == offset
+    {
+        last.num_rows += num_rows;
+        return;
+    }
+    partition
+        .ranges
+        .push(PartitionArtifactRange { offset, num_rows });
+}
+
+fn merge_adjacent_ranges(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
+
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && last.end == range.start
+        {
+            last.end = range.end;
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -833,6 +866,29 @@ mod tests {
     use crate::Error;
 
     use super::*;
+
+    #[test]
+    fn partition_artifact_ranges_are_coalesced() {
+        let mut partition = PartitionArtifactPartition {
+            path: None,
+            num_rows: 0,
+            ranges: Vec::new(),
+        };
+
+        append_partition_range(&mut partition, 0, 10);
+        append_partition_range(&mut partition, 10, 5);
+        append_partition_range(&mut partition, 20, 3);
+        append_partition_range(&mut partition, 23, 7);
+
+        assert_eq!(partition.ranges.len(), 2);
+        assert_eq!(partition.ranges[0].offset, 0);
+        assert_eq!(partition.ranges[0].num_rows, 15);
+        assert_eq!(partition.ranges[1].offset, 20);
+        assert_eq!(partition.ranges[1].num_rows, 10);
+
+        let merged = merge_adjacent_ranges(vec![0..10, 10..15, 20..23, 23..30]);
+        assert_eq!(merged, vec![0..15, 20..30]);
+    }
 
     #[tokio::test]
     async fn partition_artifact_builder_compacts_runs_into_single_partition_range() {
@@ -1100,7 +1156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_artifact_builder_records_multiple_ranges_for_repeated_flushes() {
+    async fn partition_artifact_builder_coalesces_repeated_flush_ranges() {
         let tempdir = tempfile::tempdir().unwrap();
         let root_dir = tempdir.path().join("artifact");
         fs::create_dir_all(&root_dir).unwrap();
@@ -1135,14 +1191,8 @@ mod tests {
         let manifest: PartitionArtifactManifest =
             serde_json::from_slice(&fs::read(root_dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest.partitions[0].num_rows, num_rows);
-        assert_eq!(manifest.partitions[0].ranges.len(), 2);
-        assert_eq!(
-            manifest.partitions[0].ranges[0].num_rows,
-            PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS as u64
-        );
-        assert_eq!(
-            manifest.partitions[0].ranges[1].offset,
-            PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS as u64
-        );
+        assert_eq!(manifest.partitions[0].ranges.len(), 1);
+        assert_eq!(manifest.partitions[0].ranges[0].offset, 0);
+        assert_eq!(manifest.partitions[0].ranges[0].num_rows, num_rows as u64);
     }
 }
