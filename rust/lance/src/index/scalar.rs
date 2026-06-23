@@ -48,7 +48,7 @@ use lance_index::scalar::label_list::{
 use lance_index::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
+use lance_index::scalar::{CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
     lance_format::LanceIndexStore,
@@ -327,51 +327,6 @@ pub(super) async fn build_scalar_index(
         .await?;
 
     Ok(created_index)
-}
-
-/// Build a canonical bitmap index segment over a caller-selected fragment set.
-///
-/// This is intentionally separate from `build_scalar_index(..., fragment_ids=Some(...))`.
-/// The latter is the legacy distributed scalar-index shard path. Here fragment ids only
-/// restrict the scanned rows; the bitmap plugin receives no shard id and writes the
-/// canonical bitmap layout for the staged segment root.
-#[instrument(level = "debug", skip_all)]
-pub(super) async fn build_bitmap_index_segment(
-    dataset: &Dataset,
-    column: &str,
-    uuid: Uuid,
-    fragment_ids: Vec<u32>,
-    progress: Arc<dyn IndexBuildProgress>,
-) -> Result<CreatedIndex> {
-    let field = dataset
-        .schema()
-        .field(column)
-        .ok_or(Error::invalid_input_source(
-            format!("No column with name {}", column).into(),
-        ))?;
-    let field: arrow_schema::Field = field.into();
-
-    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
-    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
-    let training_request =
-        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
-    let criteria = training_request.criteria();
-
-    progress.stage_start("load_data", None, "rows").await?;
-    let training_data =
-        load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
-    progress.stage_complete("load_data").await?;
-
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
-    plugin
-        .train_index(
-            training_data,
-            &index_store,
-            training_request,
-            None,
-            progress,
-        )
-        .await
 }
 
 /// Fetches the scalar index plugin for a given index metadata

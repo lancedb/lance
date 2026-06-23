@@ -73,7 +73,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_select::{NullableRowAddrSet, RowSetOps};
+use lance_select::NullableRowAddrSet;
 use log::{debug, warn};
 use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
@@ -1871,7 +1871,7 @@ impl BTreeIndex {
 
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
         for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
-            if filter_keeps_nothing(old_data_filter) {
+            if old_data_filter.as_ref().is_some_and(|f| f.keeps_nothing()) {
                 continue;
             }
             let stream = segment.data_stream().await?;
@@ -1936,16 +1936,6 @@ fn filter_row_ids(
         Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
-}
-
-/// True if `filter` would keep no rows at all (its keep-set is empty), letting
-/// the merge skip reading the segment entirely.
-fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
-    match filter {
-        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
-        Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
-        None => false,
-    }
 }
 
 fn remap_row_ids(

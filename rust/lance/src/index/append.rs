@@ -248,7 +248,7 @@ async fn merge_scalar_indices<'a>(
 
     // Scalar Index that expos an N:1 segment-merge primitive reachable without
     // rescanning the dataset
-    let has_segment_merge_primitive = matches!(index_type, IndexType::BTree);
+    let has_segment_merge_primitive = matches!(index_type, IndexType::BTree | IndexType::Bitmap);
 
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
@@ -294,6 +294,33 @@ async fn merge_scalar_indices<'a>(
                     &old_data_filters,
                 )
                 .await?
+            }
+            IndexType::Bitmap => {
+                if selected_old_indices.len() == 1 {
+                    // Memory optimization: a single segment can absorb the new data
+                    // via `BitmapIndex::update` without loading all into memory at once.
+                    let old_data_filter = build_old_data_filter(
+                        dataset.as_ref(),
+                        &effective_old_frags,
+                        &deleted_old_frags,
+                    )
+                    .await?;
+                    reference_index
+                        .update(new_data_stream, &new_store, old_data_filter)
+                        .await?
+                } else {
+                    let (_, old_data_filters) =
+                        build_per_segment_filters(dataset.as_ref(), selected_old_indices).await?;
+                    crate::index::scalar::bitmap::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        selected_old_indices,
+                        new_data_stream,
+                        &new_store,
+                        &old_data_filters,
+                    )
+                    .await?
+                }
             }
             _ => {
                 let old_data_filter = build_old_data_filter(
@@ -1842,6 +1869,360 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(rows, 2, "value 'd' lives in appended fragment");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_bitmap_multi_segment_consolidation() {
+        async fn query_count(dataset: &Dataset, value: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("category = '{}'", value))
+                .unwrap()
+                .project(&["category"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "category",
+            DataType::Utf8,
+            false,
+        )]));
+        let make_batch = |labels: &[&str]| {
+            let arr = StringArray::from_iter_values(labels.iter().copied());
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap()
+        };
+
+        // Three fragments, each committed as its own Bitmap segment so optimize
+        // sees a multi-segment logical index.
+        // frag0={a,b}, frag1={a,c}, frag2={b,c}.
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(make_batch(&["a", "b"])),
+                Ok(make_batch(&["a", "c"])),
+                Ok(make_batch(&["b", "c"])),
+            ],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+        let frag0_id = fragments[0].id() as u32;
+        let mut staged_segments = Vec::new();
+        for fragment in &fragments {
+            staged_segments.push(
+                crate::index::create::CreateIndexBuilder::new(
+                    &mut dataset,
+                    &["category"],
+                    IndexType::Bitmap,
+                    &params,
+                )
+                .name("cat_idx".into())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("cat_idx", "category", staged_segments)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            3
+        );
+
+        dataset.delete("category IN ('a', 'b')").await.unwrap();
+        let live_frag_ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        assert!(
+            !live_frag_ids.contains(&frag0_id),
+            "frag0 should be retired after deleting all its rows"
+        );
+        assert_eq!(live_frag_ids.len(), 2);
+
+        // Append a fourth fragment, leave it unindexed.
+        let appended = RecordBatchIterator::new(vec![Ok(make_batch(&["a", "d"]))], schema.clone());
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // merge(3) selects all three old segments (one now backed only by the
+        // retired frag0) and consolidates them, together with the unindexed
+        // fragment, into a single segment.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(3))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+
+        // Live rows after the delete + append: frag1={c}, frag2={c}, frag3={a,d}.
+        // The retired frag0's 'a'/'b' rows must not resurface.
+        assert_eq!(query_count(&dataset, "a").await, 1);
+        assert_eq!(query_count(&dataset, "b").await, 0);
+        assert_eq!(query_count(&dataset, "c").await, 2);
+        assert_eq!(query_count(&dataset, "d").await, 1);
+
+        // The segments collapsed into a single one covering only the still-live
+        // fragments (frag1, frag2, frag3); the retired frag0 was filtered out of
+        // the consolidated coverage.
+        let segments_after = dataset.load_indices_by_name("cat_idx").await.unwrap();
+        assert_eq!(segments_after.len(), 1);
+        let coverage = segments_after[0].fragment_bitmap.as_ref().unwrap();
+        assert_eq!(coverage.len(), 3);
+        assert!(
+            !coverage.contains(frag0_id),
+            "retired frag0 must not appear in the consolidated coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_bitmap_no_stale_postings() {
+        async fn query_count(dataset: &Dataset, value: &str) -> usize {
+            dataset
+                .scan()
+                .filter(&format!("cat = '{}'", value))
+                .unwrap()
+                .project(&["cat"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap()
+                .num_rows()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("cat", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        // A scalar index on the join key forces merge_insert down the in-place
+        // RewriteColumns path, keeping the fragment live.
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                Some("key_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["cat"],
+                IndexType::Bitmap,
+                Some("cat_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Reordered source columns (cat, key) force the in-place RewriteColumns
+        // path; the indexed `cat` value changes 'a' -> 'b' on the same row,
+        // pruning the cat index's coverage of the still-live fragment.
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("cat", DataType::Utf8, false),
+            Field::new("key", DataType::Int32, false),
+        ]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["b"])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let merge_job =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["key".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .try_build()
+                .unwrap();
+        let source_reader = Box::new(RecordBatchIterator::new(
+            [Ok(source_batch)],
+            source_schema.clone(),
+        ));
+        merge_job
+            .execute(reader_to_stream(source_reader))
+            .await
+            .unwrap();
+
+        let cat_only = || OptimizeOptions::append().index_names(vec!["cat_idx".to_string()]);
+
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset.optimize_indices(&cat_only()).await.unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            2,
+            "append must create a delta segment over the rewritten fragment"
+        );
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2).index_names(vec!["cat_idx".to_string()]))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert_eq!(
+            query_count(&dataset, "a").await,
+            0,
+            "stale 'a' posting must be filtered out of the consolidated segment"
+        );
+        assert_eq!(
+            query_count(&dataset, "b").await,
+            1,
+            "the updated 'b' row must remain queryable"
+        );
+        assert_eq!(
+            dataset.load_indices_by_name("cat_idx").await.unwrap().len(),
+            1,
+            "the segments must collapse into a single consolidated segment"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_bitmap_merge_remaps_deferred_compaction() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("cat", DataType::Int32, false)]));
+        let make = |range: std::ops::Range<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(range))],
+            )
+            .unwrap()
+        };
+
+        // Two fragments: [0, 50) and [50, 100).
+        let reader =
+            RecordBatchIterator::new(vec![Ok(make(0..50)), Ok(make(50..100))], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["cat"],
+                IndexType::Bitmap,
+                Some("cat_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Deferred-remap compaction fuses the two fragments into one and leaves a
+        // pending FragReuseIndex; the bitmap segment is not eagerly remapped, so
+        // its on-disk postings still reference the pre-compaction fragments.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Append a third fragment, left unindexed.
+        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(make(100..150))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Merge the deferred-remapped old segment with the new delta.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        // A value from the compacted fragments must still be found via the index;
+        // a missing remap would point the posting at a retired fragment address.
+        let hit = dataset
+            .scan()
+            .filter("cat = 25")
+            .unwrap()
+            .project(&["cat"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(
+            hit, 1,
+            "compacted-then-merged row must remain queryable via the bitmap index"
+        );
+        let total = dataset
+            .scan()
+            .filter("cat >= 0")
+            .unwrap()
+            .project(&["cat"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows();
+        assert_eq!(total, 150, "no rows may be lost across compaction + merge");
     }
 
     #[tokio::test]

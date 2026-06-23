@@ -572,6 +572,11 @@ impl RowAddrTreeMap {
             .retain(|frag_id, _| frag_id_set.contains(frag_id));
     }
 
+    /// Retain only the rows whose fragment id is contained in `keep`.
+    pub fn retain_fragments_in(&mut self, keep: &RoaringBitmap) {
+        self.inner.retain(|frag_id, _| keep.contains(*frag_id));
+    }
+
     /// Compute the serialized size of the set.
     pub fn serialized_size(&self) -> usize {
         // Starts at 4 because of the u32 num_entries
