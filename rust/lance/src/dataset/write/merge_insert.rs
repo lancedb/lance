@@ -953,9 +953,12 @@ impl MergeInsertJob {
                 WhenNotMatchedBySource::Keep
             )
         {
-            // keeping unmatched rows, no deletion
+            // keeping unmatched rows, no deletion. Use the indexed-scan path
+            // only when EVERY join column is indexed; a partially-indexed
+            // composite key under-matches there (the probe can't resolve the
+            // full tuple), so fall through to the correct full-table join.
             let indexed_keys = self.indexed_join_keys().await?;
-            if !indexed_keys.is_empty() {
+            if indexed_keys.len() == self.params.on.len() {
                 return self
                     .create_indexed_scan_joined_stream(source, indexed_keys)
                     .await;
@@ -1693,7 +1696,11 @@ impl MergeInsertJob {
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
             ) {
-            !self.indexed_join_keys().await?.is_empty()
+            // Only when EVERY join column is indexed. A partially-indexed
+            // composite key cannot be fully resolved by the index probe and the
+            // indexed-scan path then under-matches (e.g. a delete silently
+            // no-ops), so it must fall through to the correct full path.
+            self.indexed_join_keys().await?.len() == self.params.on.len()
         } else {
             false
         };
