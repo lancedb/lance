@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array};
@@ -103,6 +104,26 @@ impl BucketBuffer {
     }
 }
 
+#[derive(Default, Debug)]
+struct PartitionArtifactBuilderStats {
+    append_batches: usize,
+    append_rows: usize,
+    append_time: Duration,
+    validate_time: Duration,
+    extract_time: Duration,
+    scatter_time: Duration,
+    flushes: usize,
+    flushed_rows: usize,
+    single_partition_flushes: usize,
+    multi_partition_flushes: usize,
+    flush_time: Duration,
+    final_batch_time: Duration,
+    writer_time: Duration,
+    finish_flush_time: Duration,
+    writer_finish_time: Duration,
+    manifest_time: Duration,
+}
+
 /// Writes partition-addressable encoded rows for a later Lance finalization.
 ///
 /// The builder uses bucket-local buffering to keep append-time memory bounded.
@@ -121,6 +142,7 @@ pub struct PartitionArtifactBuilder {
     buffers: Vec<BucketBuffer>,
     partitions: Vec<PartitionArtifactPartition>,
     bucket_row_counts: Vec<u64>,
+    stats: PartitionArtifactBuilderStats,
 }
 
 impl PartitionArtifactBuilder {
@@ -209,6 +231,7 @@ impl PartitionArtifactBuilder {
                 num_partitions
             ],
             bucket_row_counts: vec![0; num_buckets],
+            stats: PartitionArtifactBuilderStats::default(),
         })
     }
 
@@ -218,8 +241,12 @@ impl PartitionArtifactBuilder {
     /// Rows are redistributed into bucket-local in-memory buffers and flushed to
     /// temporary files once they become large enough.
     pub async fn append_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let append_start = Instant::now();
+        let validate_start = Instant::now();
         validate_input_batch(batch, self.pq_code_width)?;
+        self.stats.validate_time += validate_start.elapsed();
 
+        let extract_start = Instant::now();
         let row_ids = batch[ROW_ID].as_primitive::<arrow::datatypes::UInt64Type>();
         let part_ids = batch[PART_ID_COLUMN].as_primitive::<arrow::datatypes::UInt32Type>();
         let pq_codes = batch[PQ_CODE_COLUMN].as_fixed_size_list();
@@ -227,7 +254,9 @@ impl PartitionArtifactBuilder {
             .values()
             .as_primitive::<arrow::datatypes::UInt8Type>();
         let pq_values = pq_values.values().as_ref();
+        self.stats.extract_time += extract_start.elapsed();
 
+        let scatter_start = Instant::now();
         for row_idx in 0..batch.num_rows() {
             let partition_id = part_ids.value(row_idx) as usize;
             if partition_id >= self.num_partitions {
@@ -239,7 +268,9 @@ impl PartitionArtifactBuilder {
             let bucket_id = partition_id % self.num_buckets;
             let buffer = &mut self.buffers[bucket_id];
             buffer.row_ids.push(row_ids.value(row_idx));
-            buffer.partition_ids.push(partition_id as u32);
+            if self.num_buckets != self.num_partitions {
+                buffer.partition_ids.push(partition_id as u32);
+            }
             let start = row_idx * self.pq_code_width;
             let end = start + self.pq_code_width;
             buffer.pq_values.extend_from_slice(&pq_values[start..end]);
@@ -247,6 +278,10 @@ impl PartitionArtifactBuilder {
                 self.flush_bucket(bucket_id).await?;
             }
         }
+        self.stats.scatter_time += scatter_start.elapsed();
+        self.stats.append_batches += 1;
+        self.stats.append_rows += batch.num_rows();
+        self.stats.append_time += append_start.elapsed();
         Ok(())
     }
 
@@ -260,14 +295,18 @@ impl PartitionArtifactBuilder {
         metadata_file: &str,
         total_loss: Option<f64>,
     ) -> Result<Vec<String>> {
+        let finish_flush_start = Instant::now();
         for bucket_id in 0..self.num_buckets {
             self.flush_bucket(bucket_id).await?;
         }
+        self.stats.finish_flush_time += finish_flush_start.elapsed();
+        let writer_finish_start = Instant::now();
         for writer in self.final_writers.iter_mut() {
             if let Some(writer) = writer.as_mut() {
                 writer.finish().await?;
             }
         }
+        self.stats.writer_finish_time += writer_finish_start.elapsed();
 
         let mut artifact_files = Vec::with_capacity(self.num_buckets + 1);
         for bucket_id in 0..self.num_buckets {
@@ -283,12 +322,15 @@ impl PartitionArtifactBuilder {
             total_loss,
             partitions: self.partitions.clone(),
         };
+        let manifest_start = Instant::now();
         write_json(
             self.object_store.as_ref(),
             &self.root_dir.child(PARTITION_ARTIFACT_MANIFEST_FILE_NAME),
             &manifest,
         )
         .await?;
+        self.stats.manifest_time += manifest_start.elapsed();
+        self.log_stats();
 
         let mut files = vec![PARTITION_ARTIFACT_MANIFEST_FILE_NAME.to_string()];
         files.extend(artifact_files);
@@ -305,70 +347,144 @@ impl PartitionArtifactBuilder {
         if self.buffers[bucket_id].is_empty() {
             return Ok(());
         }
+        let flush_start = Instant::now();
 
         let buffer = &mut self.buffers[bucket_id];
-        let row_ids = UInt64Array::from(mem::take(&mut buffer.row_ids));
+        let row_ids = mem::take(&mut buffer.row_ids);
         let part_ids = mem::take(&mut buffer.partition_ids);
-        let pq_values = UInt8Array::from(mem::take(&mut buffer.pq_values));
+        let pq_values = mem::take(&mut buffer.pq_values);
         let total_rows = row_ids.len();
+        self.stats.flushes += 1;
+        self.stats.flushed_rows += total_rows;
 
-        let mut permutation = (0..total_rows).collect::<Vec<_>>();
-        permutation.sort_unstable_by_key(|&idx| part_ids[idx]);
+        let result = if self.num_buckets == self.num_partitions {
+            debug_assert!(part_ids.is_empty());
+            self.stats.single_partition_flushes += 1;
+            self.flush_single_partition_bucket(bucket_id, row_ids, pq_values, total_rows)
+                .await
+        } else {
+            self.stats.multi_partition_flushes += 1;
 
-        let mut sorted_row_ids = Vec::with_capacity(total_rows);
-        let mut sorted_partition_ids = Vec::with_capacity(total_rows);
-        let mut sorted_pq_values = Vec::with_capacity(total_rows * self.pq_code_width);
-        for idx in permutation {
-            sorted_row_ids.push(row_ids.value(idx));
-            sorted_partition_ids.push(part_ids[idx]);
-            let start = idx * self.pq_code_width;
-            let end = start + self.pq_code_width;
-            sorted_pq_values.extend_from_slice(&pq_values.values()[start..end]);
-        }
+            let row_ids = UInt64Array::from(row_ids);
+            let pq_values = UInt8Array::from(pq_values);
+            let mut permutation = (0..total_rows).collect::<Vec<_>>();
+            permutation.sort_unstable_by_key(|&idx| part_ids[idx]);
 
+            let mut sorted_row_ids = Vec::with_capacity(total_rows);
+            let mut sorted_partition_ids = Vec::with_capacity(total_rows);
+            let mut sorted_pq_values = Vec::with_capacity(total_rows * self.pq_code_width);
+            for idx in permutation {
+                sorted_row_ids.push(row_ids.value(idx));
+                sorted_partition_ids.push(part_ids[idx]);
+                let start = idx * self.pq_code_width;
+                let end = start + self.pq_code_width;
+                sorted_pq_values.extend_from_slice(&pq_values.values()[start..end]);
+            }
+
+            let file_offset = self.bucket_row_counts[bucket_id];
+            let final_relative_path = self.final_bucket_relative_path(bucket_id);
+            let mut offset = 0usize;
+            while offset < sorted_partition_ids.len() {
+                let partition_id = sorted_partition_ids[offset] as usize;
+                let mut end = offset + 1;
+                while end < sorted_partition_ids.len()
+                    && sorted_partition_ids[end] == sorted_partition_ids[offset]
+                {
+                    end += 1;
+                }
+                let partition = &mut self.partitions[partition_id];
+                match &partition.path {
+                    Some(existing) if existing != &final_relative_path => {
+                        return Err(Error::io(format!(
+                            "partition {} is split across multiple bucket files: '{}' vs '{}'",
+                            partition_id, existing, final_relative_path
+                        )));
+                    }
+                    None => partition.path = Some(final_relative_path.clone()),
+                    _ => {}
+                }
+                partition.num_rows += end - offset;
+                append_partition_range(
+                    partition,
+                    file_offset + offset as u64,
+                    (end - offset) as u64,
+                );
+                offset = end;
+            }
+
+            let pq_codes = FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(sorted_pq_values),
+                self.pq_code_width as i32,
+            )?;
+            self.write_bucket_batch(
+                bucket_id,
+                UInt64Array::from(sorted_row_ids),
+                pq_codes,
+                total_rows,
+            )
+            .await
+        };
+        self.stats.flush_time += flush_start.elapsed();
+        result
+    }
+
+    /// Flush a bucket that maps exactly to one partition.
+    ///
+    /// When the number of buckets equals the number of partitions, all rows in
+    /// one bucket already belong to the same partition. Sorting by partition id
+    /// would only add CPU work and another PQ-code copy.
+    async fn flush_single_partition_bucket(
+        &mut self,
+        bucket_id: usize,
+        row_ids: Vec<u64>,
+        pq_values: Vec<u8>,
+        total_rows: usize,
+    ) -> Result<()> {
         let file_offset = self.bucket_row_counts[bucket_id];
         let final_relative_path = self.final_bucket_relative_path(bucket_id);
-        let mut offset = 0usize;
-        while offset < sorted_partition_ids.len() {
-            let partition_id = sorted_partition_ids[offset] as usize;
-            let mut end = offset + 1;
-            while end < sorted_partition_ids.len()
-                && sorted_partition_ids[end] == sorted_partition_ids[offset]
-            {
-                end += 1;
+        let partition = &mut self.partitions[bucket_id];
+        match &partition.path {
+            Some(existing) if existing != &final_relative_path => {
+                return Err(Error::io(format!(
+                    "partition {} is split across multiple bucket files: '{}' vs '{}'",
+                    bucket_id, existing, final_relative_path
+                )));
             }
-            let partition = &mut self.partitions[partition_id];
-            match &partition.path {
-                Some(existing) if existing != &final_relative_path => {
-                    return Err(Error::io(format!(
-                        "partition {} is split across multiple bucket files: '{}' vs '{}'",
-                        partition_id, existing, final_relative_path
-                    )));
-                }
-                None => partition.path = Some(final_relative_path.clone()),
-                _ => {}
-            }
-            partition.num_rows += end - offset;
-            partition.ranges.push(PartitionArtifactRange {
-                offset: file_offset + offset as u64,
-                num_rows: (end - offset) as u64,
-            });
-            offset = end;
+            None => partition.path = Some(final_relative_path),
+            _ => {}
         }
+        partition.num_rows += total_rows;
+        append_partition_range(partition, file_offset, total_rows as u64);
 
         let pq_codes = FixedSizeListArray::try_new_from_values(
-            UInt8Array::from(sorted_pq_values),
+            UInt8Array::from(pq_values),
             self.pq_code_width as i32,
         )?;
+        self.write_bucket_batch(bucket_id, UInt64Array::from(row_ids), pq_codes, total_rows)
+            .await
+    }
+
+    /// Write a finalized bucket batch and update the bucket row count.
+    async fn write_bucket_batch(
+        &mut self,
+        bucket_id: usize,
+        row_ids: UInt64Array,
+        pq_codes: FixedSizeListArray,
+        total_rows: usize,
+    ) -> Result<()> {
+        let final_batch_start = Instant::now();
         let final_batch = RecordBatch::try_new(
             self.final_schema.clone(),
-            vec![
-                Arc::new(UInt64Array::from(sorted_row_ids)),
-                Arc::new(pq_codes),
-            ],
+            vec![Arc::new(row_ids), Arc::new(pq_codes)],
         )?;
-        let writer = self.ensure_final_writer(bucket_id).await?;
-        writer.write_batch(&final_batch).await?;
+        self.stats.final_batch_time += final_batch_start.elapsed();
+
+        let writer_start = Instant::now();
+        {
+            let writer = self.ensure_final_writer(bucket_id).await?;
+            writer.write_batch(&final_batch).await?;
+        }
+        self.stats.writer_time += writer_start.elapsed();
         self.bucket_row_counts[bucket_id] += total_rows as u64;
         Ok(())
     }
@@ -406,6 +522,28 @@ impl PartitionArtifactBuilder {
         format!(
             "{PARTITION_ARTIFACT_PARTITIONS_DIR}/{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
         )
+    }
+
+    fn log_stats(&self) {
+        eprintln!(
+            "partition artifact builder stages: append_batches={} append_rows={} append_s={:.3} validate_s={:.3} extract_s={:.3} scatter_s={:.3} flushes={} flushed_rows={} single_flushes={} multi_flushes={} flush_s={:.3} final_batch_s={:.3} writer_s={:.3} finish_flush_s={:.3} writer_finish_s={:.3} manifest_s={:.3}",
+            self.stats.append_batches,
+            self.stats.append_rows,
+            self.stats.append_time.as_secs_f64(),
+            self.stats.validate_time.as_secs_f64(),
+            self.stats.extract_time.as_secs_f64(),
+            self.stats.scatter_time.as_secs_f64(),
+            self.stats.flushes,
+            self.stats.flushed_rows,
+            self.stats.single_partition_flushes,
+            self.stats.multi_partition_flushes,
+            self.stats.flush_time.as_secs_f64(),
+            self.stats.final_batch_time.as_secs_f64(),
+            self.stats.writer_time.as_secs_f64(),
+            self.stats.finish_flush_time.as_secs_f64(),
+            self.stats.writer_finish_time.as_secs_f64(),
+            self.stats.manifest_time.as_secs_f64(),
+        );
     }
 }
 
@@ -642,14 +780,16 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
         }
 
         let reader = self.open_file_reader(path).await?;
-        let ranges = partition
-            .ranges
-            .iter()
-            .map(|range| Range {
-                start: range.offset,
-                end: range.offset + range.num_rows,
-            })
-            .collect::<Vec<_>>();
+        let ranges = merge_adjacent_ranges(
+            partition
+                .ranges
+                .iter()
+                .map(|range| Range {
+                    start: range.offset,
+                    end: range.offset + range.num_rows,
+                })
+                .collect::<Vec<_>>(),
+        );
         let schema = Arc::new(reader.schema().as_ref().into());
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             schema,
@@ -677,6 +817,39 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
     }
 }
 
+fn append_partition_range(partition: &mut PartitionArtifactPartition, offset: u64, num_rows: u64) {
+    if num_rows == 0 {
+        return;
+    }
+    if let Some(last) = partition.ranges.last_mut()
+        && last.offset + last.num_rows == offset
+    {
+        last.num_rows += num_rows;
+        return;
+    }
+    partition
+        .ranges
+        .push(PartitionArtifactRange { offset, num_rows });
+}
+
+fn merge_adjacent_ranges(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    if ranges.len() < 2 {
+        return ranges;
+    }
+
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && last.end == range.start
+        {
+            last.end = range.end;
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -693,6 +866,29 @@ mod tests {
     use crate::Error;
 
     use super::*;
+
+    #[test]
+    fn partition_artifact_ranges_are_coalesced() {
+        let mut partition = PartitionArtifactPartition {
+            path: None,
+            num_rows: 0,
+            ranges: Vec::new(),
+        };
+
+        append_partition_range(&mut partition, 0, 10);
+        append_partition_range(&mut partition, 10, 5);
+        append_partition_range(&mut partition, 20, 3);
+        append_partition_range(&mut partition, 23, 7);
+
+        assert_eq!(partition.ranges.len(), 2);
+        assert_eq!(partition.ranges[0].offset, 0);
+        assert_eq!(partition.ranges[0].num_rows, 15);
+        assert_eq!(partition.ranges[1].offset, 20);
+        assert_eq!(partition.ranges[1].num_rows, 10);
+
+        let merged = merge_adjacent_ranges(vec![0..10, 10..15, 20..23, 23..30]);
+        assert_eq!(merged, vec![0..15, 20..30]);
+    }
 
     #[tokio::test]
     async fn partition_artifact_builder_compacts_runs_into_single_partition_range() {
@@ -960,7 +1156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_artifact_builder_records_multiple_ranges_for_repeated_flushes() {
+    async fn partition_artifact_builder_coalesces_repeated_flush_ranges() {
         let tempdir = tempfile::tempdir().unwrap();
         let root_dir = tempdir.path().join("artifact");
         fs::create_dir_all(&root_dir).unwrap();
@@ -995,14 +1191,8 @@ mod tests {
         let manifest: PartitionArtifactManifest =
             serde_json::from_slice(&fs::read(root_dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest.partitions[0].num_rows, num_rows);
-        assert_eq!(manifest.partitions[0].ranges.len(), 2);
-        assert_eq!(
-            manifest.partitions[0].ranges[0].num_rows,
-            PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS as u64
-        );
-        assert_eq!(
-            manifest.partitions[0].ranges[1].offset,
-            PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS as u64
-        );
+        assert_eq!(manifest.partitions[0].ranges.len(), 1);
+        assert_eq!(manifest.partitions[0].ranges[0].offset, 0);
+        assert_eq!(manifest.partitions[0].ranges[0].num_rows, num_rows as u64);
     }
 }

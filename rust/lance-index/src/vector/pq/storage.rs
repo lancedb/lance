@@ -434,10 +434,20 @@ where
         return original.clone();
     }
 
+    debug_assert_eq!(original.len(), num_rows * num_columns);
     let mut transposed_codes = vec![T::default_value(); original.len()];
-    for (vec_idx, codes) in original.values().chunks_exact(num_columns).enumerate() {
-        for (sub_vec_idx, code) in codes.iter().enumerate() {
-            transposed_codes[sub_vec_idx * num_rows + vec_idx] = *code;
+    let original_values = original.values();
+    let element_size = std::mem::size_of::<T::Native>().max(1);
+    let tile_rows = (32 * 1024 / (num_columns * element_size).max(1)).clamp(16, 1024);
+
+    for row_start in (0..num_rows).step_by(tile_rows) {
+        let row_end = (row_start + tile_rows).min(num_rows);
+        for column_idx in 0..num_columns {
+            let dst_base = column_idx * num_rows + row_start;
+            for row_idx in row_start..row_end {
+                transposed_codes[dst_base + row_idx - row_start] =
+                    original_values[row_idx * num_columns + column_idx];
+            }
         }
     }
 
