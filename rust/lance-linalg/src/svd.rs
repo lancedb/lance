@@ -35,7 +35,7 @@ fn jacobi_rotate(s: &mut [f64], n: usize, p: usize, q: usize, c: f64, sn: f64) {
     }
 }
 
-fn apply_givens_right(v: &mut [f64], n: usize, p: usize, q: usize, c: f64, sn: f64) {
+fn apply_givens_rotation_from_right(v: &mut [f64], n: usize, p: usize, q: usize, c: f64, sn: f64) {
     for r in 0..n {
         let vp = v[r * n + p];
         let vq = v[r * n + q];
@@ -77,14 +77,14 @@ fn jacobi_eigen(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
         let (sn, c) = theta.sin_cos();
 
         jacobi_rotate(&mut s, n, p, q, c, sn);
-        apply_givens_right(&mut v, n, p, q, c, sn);
+        apply_givens_rotation_from_right(&mut v, n, p, q, c, sn);
     }
 
     let eigenvalues: Vec<f64> = (0..n).map(|i| s[i * n + i]).collect();
     (eigenvalues, v)
 }
 
-fn mat_mul_atb(a: &[f64], m: usize, n: usize) -> Vec<f64> {
+fn compute_ata(a: &[f64], m: usize, n: usize) -> Vec<f64> {
     let mut c = vec![0f64; n * n];
     for i in 0..n {
         for l in 0..m {
@@ -138,12 +138,12 @@ fn gram_schmidt(cols: &mut Vec<Vec<f64>>) {
     }
 }
 
-fn mat_vec_mul(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
+fn multiply_A_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
     (0..m).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum()).collect();
 }
 
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let ata = mat_mul_atb(a, m, n);
+    let ata = compute_ata(a, m, n);
     let (eigenvalues, v) = jacobi_eigen(&ata, n);
     
     let k = m.min(n);
@@ -166,7 +166,7 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     for index in 0..k {
         let ei = order[index];
         let vi: Vec<f64> = (0..n).map(|r| v[r * n + ei]).collect();
-        let av = mat_vec_mul(a, &vi, m, n);
+        let av = multiply_A_by_vector(a, &vi, m, n);
         if sigma[index] > EPS * 10.0 {
             u_cols.push(av.iter().map(|&x| x / sigma[index]).collect());
         } else {
