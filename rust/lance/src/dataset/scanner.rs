@@ -5632,13 +5632,15 @@ mod test {
     }
 
     // Regression for #6580: a scan with `filter` + `project` of a
-    // `List<Struct>` column used to panic in `merge_with_schema` (called from
-    // `TakeStream::map_batch`) because the filtered batch arrived as a sliced
-    // view of a larger batch and the cloned list offsets did not start at
-    // zero. The trigger requires (a) a `List<Struct>` projection where the
-    // struct is split across `filtered_read` and `TakeExec` and (b) a
-    // sparse-tail selectivity pattern so the trailing filter result lands deep
-    // inside the values buffer of its source batch.
+    // `(Large)List<Struct>` column used to panic in `merge_with_schema`
+    // (called from `TakeStream::map_batch`) because the filtered batch arrived
+    // as a sliced view of a larger batch and the cloned list offsets did not
+    // start at zero. The trigger requires (a) a `(Large)List<Struct>`
+    // projection where the struct is split across `filtered_read` and
+    // `TakeExec` and (b) a sparse-tail selectivity pattern so the trailing
+    // filter result lands deep inside the values buffer of its source batch.
+    // Parametrized over `List`/`LargeList` since the fix touches both offset
+    // widths in `merge_with_schema`.
     #[rstest]
     #[tokio::test]
     async fn test_filter_project_list_struct_sparse_tail(
@@ -5651,8 +5653,9 @@ mod test {
             LanceFileVersion::V2_2
         )]
         data_storage_version: LanceFileVersion,
+        #[values(false, true)] large_list: bool,
     ) {
-        use arrow_array::{ListArray, UInt16Array};
+        use arrow_array::{LargeListArray, ListArray, UInt16Array};
         use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 
         let struct_fields = Fields::from(vec![
@@ -5664,10 +5667,15 @@ mod test {
             DataType::Struct(struct_fields.clone()),
             true,
         ));
+        let items_dtype = if large_list {
+            DataType::LargeList(item_field.clone())
+        } else {
+            DataType::List(item_field.clone())
+        };
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
             ArrowField::new("grp", DataType::UInt16, false),
-            ArrowField::new("items", DataType::List(item_field.clone()), false),
+            ArrowField::new("items", items_dtype, false),
         ]));
 
         let make_batch = |start: i32, n: usize, group: u16| -> RecordBatch {
@@ -5677,7 +5685,7 @@ mod test {
             let mut offsets = Vec::with_capacity(n + 1);
             let mut a_vals: Vec<i32> = Vec::new();
             let mut b_vals: Vec<i32> = Vec::new();
-            offsets.push(0i32);
+            offsets.push(0i64);
             for i in 0..n {
                 // Variable-length lists (1..=18) so offsets don't land on
                 // batch-row boundaries.
@@ -5686,7 +5694,7 @@ mod test {
                     a_vals.push(j as i32);
                     b_vals.push(-(j as i32));
                 }
-                offsets.push(a_vals.len() as i32);
+                offsets.push(a_vals.len() as i64);
             }
             let struct_arr = Arc::new(StructArray::new(
                 struct_fields.clone(),
@@ -5696,18 +5704,28 @@ mod test {
                 ],
                 None,
             ));
-            let items = ListArray::new(
-                item_field.clone(),
-                OffsetBuffer::new(ScalarBuffer::from(offsets)),
-                struct_arr,
-                None,
-            );
+            let items: ArrayRef = if large_list {
+                Arc::new(LargeListArray::new(
+                    item_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                    struct_arr,
+                    None,
+                ))
+            } else {
+                let offsets_i32: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
+                Arc::new(ListArray::new(
+                    item_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(offsets_i32)),
+                    struct_arr,
+                    None,
+                ))
+            };
             RecordBatch::try_new(
                 schema.clone(),
                 vec![
                     Arc::new(ids) as ArrayRef,
                     Arc::new(groups) as ArrayRef,
-                    Arc::new(items) as ArrayRef,
+                    items,
                 ],
             )
             .unwrap()
