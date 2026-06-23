@@ -151,7 +151,10 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         println!("Data length of matrix must match the product of the specified number of rows and number of columns.");
         return (vec![], vec![], vec![]);
     }
-    assert!(a.iter().all(|x| x.is_finite()), "Matrix must not contain null or infinite entries.");
+    if !a.iter().all(|x| x.is_finite()) {
+        println!("Matrix must not contain null or infinite entries.");
+        return (vec![], vec![], vec![]);
+    }
 
     let ata = compute_ata(a, m, n);
     let (eigenvalues, v) = jacobi_eigen(&ata, n);
