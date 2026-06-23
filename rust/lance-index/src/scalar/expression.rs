@@ -179,6 +179,18 @@ impl MultiQueryParser {
     pub fn add(&mut self, other: Box<dyn ScalarQueryParser>) {
         self.parsers.push(other);
     }
+
+    /// Pick the first underlying parser whose `is_valid_reference` accepts `expr`.
+    pub fn select(
+        &self,
+        expr: &Expr,
+        data_type: &DataType,
+    ) -> Option<(&dyn ScalarQueryParser, DataType)> {
+        self.parsers.iter().find_map(|p| {
+            p.is_valid_reference(expr, data_type)
+                .map(|dt| (p.as_ref(), dt))
+        })
+    }
 }
 
 impl ScalarQueryParser for MultiQueryParser {
@@ -781,20 +793,28 @@ impl ScalarQueryParser for LabelListQueryParser {
     }
 }
 
-/// A parser for indices that handle string contains queries
+/// A parser for indices that handle string `contains` queries, and -- when
+/// `supports_regex` is set -- `regexp_like` / `regexp_match` queries.
 #[derive(Debug, Clone)]
 pub struct TextQueryParser {
     index_name: String,
     index_type: String,
     needs_recheck: bool,
+    supports_regex: bool,
 }
 
 impl TextQueryParser {
-    pub fn new(index_name: String, index_type: String, needs_recheck: bool) -> Self {
+    pub fn new(
+        index_name: String,
+        index_type: String,
+        needs_recheck: bool,
+        supports_regex: bool,
+    ) -> Self {
         Self {
             index_name,
             index_type,
             needs_recheck,
+            supports_regex,
         }
     }
 }
@@ -837,30 +857,155 @@ impl ScalarQueryParser for TextQueryParser {
         func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression> {
-        if args.len() != 2 {
+        // The first argument is the indexed column; the second is the substring
+        // / pattern. `contains` takes exactly two arguments; the regex functions
+        // optionally take a third flags argument.
+        if args.len() < 2 {
             return None;
         }
-        let scalar = maybe_scalar(&args[1], data_type)?;
-        match scalar {
-            ScalarValue::Utf8(Some(scalar_str)) | ScalarValue::LargeUtf8(Some(scalar_str)) => {
-                if func.name() == "contains" {
-                    let query = TextQuery::StringContains(scalar_str);
-                    Some(IndexedExpression::index_query_with_recheck(
-                        column.to_string(),
-                        self.index_name.clone(),
-                        self.index_type.clone(),
-                        Arc::new(query),
-                        self.needs_recheck,
-                    ))
-                } else {
+        // A non-string pattern cannot be handled.
+        let (ScalarValue::Utf8(Some(pattern)) | ScalarValue::LargeUtf8(Some(pattern))) =
+            maybe_scalar(&args[1], data_type)?
+        else {
+            return None;
+        };
+
+        let query = match func.name() {
+            "contains" if args.len() == 2 => TextQuery::StringContains(pattern),
+            "regexp_like" | "regexp_match" if self.supports_regex => {
+                let pattern = match args.get(2) {
+                    Some(flags_expr) => apply_regex_flags(&pattern, flags_expr)?,
+                    None => pattern,
+                };
+                // If the pattern yields no usable trigram (e.g. `a.b`), leave it
+                // to a full scan instead of routing it to the index, which could
+                // only answer with an unsupported "recheck everything" result.
+                if !crate::scalar::ngram::regex_can_use_index(&pattern) {
+                    return None;
+                }
+                TextQuery::Regex(pattern)
+            }
+            _ => return None,
+        };
+
+        Some(IndexedExpression::index_query_with_recheck(
+            column.to_string(),
+            self.index_name.clone(),
+            self.index_type.clone(),
+            Arc::new(query),
+            self.needs_recheck,
+        ))
+    }
+
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        // Infix LIKE is accelerated only by the ngram index (via its regex
+        // machinery). A plain-literal `regexp_like(col, 'foo')` is rewritten to
+        // `col LIKE '%foo%'` before it reaches the index, so this is the path
+        // that accelerates those. ILIKE is skipped because its case folding does
+        // not match the index's normalization.
+        if !self.supports_regex || like.case_insensitive {
+            return None;
+        }
+        let pattern_str = match pattern {
+            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+            _ => return None,
+        };
+        // Translate the LIKE pattern into a loose regex used only for candidate
+        // generation; the original LIKE stays as the recheck filter, so the
+        // regex only needs to be a sound superset.
+        let regex = like_to_regex(pattern_str, like.escape_char)?;
+        if !crate::scalar::ngram::regex_can_use_index(&regex) {
+            return None;
+        }
+        Some(IndexedExpression {
+            scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: column.to_string(),
+                index_name: self.index_name.clone(),
+                index_type: self.index_type.clone(),
+                query: Arc::new(TextQuery::Regex(regex)),
+                needs_recheck: self.needs_recheck,
+                fragment_bitmap: None,
+            })),
+            refine_expr: Some(Expr::Like(like.clone())),
+        })
+    }
+}
+
+/// Translate a LIKE pattern into a regular expression used purely for ngram
+/// candidate generation: `%` becomes `.*`, `_` becomes `.`, and literal
+/// characters are regex-escaped. Returns `None` when no literal run is long
+/// enough to yield a trigram (the index could not help, so a full scan is left
+/// to handle it).
+fn like_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
+    let mut regex = String::new();
+    let mut run = 0usize;
+    let mut longest_run = 0usize;
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        let literal = if Some(c) == escape {
+            // The next character is escaped, i.e. a literal.
+            chars.next()
+        } else {
+            match c {
+                '%' => {
+                    regex.push_str(".*");
+                    run = 0;
                     None
                 }
+                '_' => {
+                    regex.push('.');
+                    run = 0;
+                    None
+                }
+                other => Some(other),
             }
-            _ => {
-                // If the scalar is not a string, we cannot handle it
-                None
+        };
+        if let Some(lit) = literal {
+            if regex_syntax::is_meta_character(lit) {
+                regex.push('\\');
+            }
+            regex.push(lit);
+            // Only runs of alphanumeric characters can produce a trigram.
+            if lit.is_alphanumeric() {
+                run += 1;
+                longest_run = longest_run.max(run);
+            } else {
+                run = 0;
             }
         }
+    }
+    (longest_run >= 3).then_some(regex)
+}
+
+/// Fold the supported `regexp_like` / `regexp_match` flags into an inline prefix
+/// on the pattern (e.g. flags `"i"` -> `"(?i)pattern"`). Returns `None` for a
+/// non-literal flags argument or an unrecognized flag, so the caller leaves the
+/// predicate to a full recheck rather than risk changing its semantics.
+fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
+    let (Expr::Literal(ScalarValue::Utf8(Some(flags)), _)
+    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)) = flags_expr
+    else {
+        return None;
+    };
+    let mut inline = String::new();
+    for flag in flags.chars() {
+        // Only flags expressible as an inline `(?...)` group in the regex crate
+        // (which the recheck uses) are safe to fold.
+        if ['i', 's', 'm', 'x'].contains(&flag) {
+            inline.push(flag);
+        } else {
+            return None;
+        }
+    }
+    if inline.is_empty() {
+        Some(pattern.to_string())
+    } else {
+        Some(format!("(?{inline}){pattern}"))
     }
 }
 
@@ -1452,8 +1597,8 @@ fn maybe_indexed_column<'b>(
 ) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
     // First try to extract the full nested column path for get_field expressions
     if let Some(nested_path) = extract_nested_column_path(expr)
-        && let Some((data_type, parser)) = index_info.get_index(&nested_path)
-        && let Some(data_type) = parser.is_valid_reference(expr, data_type)
+        && let Some((data_type, multi)) = index_info.get_index(&nested_path)
+        && let Some((parser, data_type)) = multi.select(expr, data_type)
     {
         return Some((nested_path, data_type, parser));
     }
@@ -1461,12 +1606,9 @@ fn maybe_indexed_column<'b>(
     match expr {
         Expr::Column(col) => {
             let col = col.name.as_str();
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col.to_string(), data_type, parser))
-            } else {
-                None
-            }
+            let (data_type, multi) = index_info.get_index(col)?;
+            let (parser, data_type) = multi.select(expr, data_type)?;
+            Some((col.to_string(), data_type, parser))
         }
         Expr::ScalarFunction(udf) => {
             if udf.args.is_empty() {
@@ -1474,12 +1616,9 @@ fn maybe_indexed_column<'b>(
             }
             // For non-get_field functions, fall back to old behavior
             let col = maybe_column(&udf.args[0])?;
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col.to_string(), data_type, parser))
-            } else {
-                None
-            }
+            let (data_type, multi) = index_info.get_index(col)?;
+            let (parser, data_type) = multi.select(expr, data_type)?;
+            Some((col.to_string(), data_type, parser))
         }
         _ => None,
     }
@@ -1813,7 +1952,18 @@ fn visit_node(
         Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
         Expr::IsTrue(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, true)),
         Expr::IsNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, false)),
-        Expr::IsNotNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, true)),
+        Expr::IsNotNull(expr) => {
+            // `regexp_match(col, pat)` returns a list and is coerced to
+            // `IsNotNull(regexp_match(...))` before it reaches here. Unwrap that
+            // so the regex acceleration applies; everything else is a genuine
+            // IS NOT NULL check.
+            if let Expr::ScalarFunction(scalar_fn) = expr.as_ref()
+                && scalar_fn.func.name() == "regexp_match"
+            {
+                return Ok(visit_scalar_fn(scalar_fn, index_info));
+            }
+            Ok(visit_is_null(expr.as_ref(), index_info, true))
+        }
         Expr::Not(expr) => visit_not(expr.as_ref(), index_info, depth),
         Expr::BinaryExpr(binary_expr) => visit_binary_expr(binary_expr, index_info, depth),
         Expr::ScalarFunction(scalar_fn) => Ok(visit_scalar_fn(scalar_fn, index_info)),
@@ -1833,7 +1983,7 @@ fn visit_node(
 pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
     /// as well as a query parser that can parse queries for that column
-    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)>;
 
     /// The set of fragments covered by `(column, index_name)`.
     ///
@@ -2015,11 +2165,18 @@ mod tests {
 
     struct ColInfo {
         data_type: DataType,
-        parser: Box<dyn ScalarQueryParser>,
+        parser: Box<MultiQueryParser>,
     }
 
     impl ColInfo {
         fn new(data_type: DataType, parser: Box<dyn ScalarQueryParser>) -> Self {
+            Self {
+                data_type,
+                parser: Box::new(MultiQueryParser::single(parser)),
+            }
+        }
+
+        fn with_multi(data_type: DataType, parser: Box<MultiQueryParser>) -> Self {
             Self { data_type, parser }
         }
     }
@@ -2041,7 +2198,7 @@ mod tests {
     }
 
     impl IndexInformationProvider for MockIndexInfoProvider {
-        fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+        fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
             self.indexed_columns
                 .get(col)
                 .map(|col_info| (&col_info.data_type, col_info.parser.as_ref()))
@@ -2691,6 +2848,59 @@ mod tests {
     }
 
     #[test]
+    fn test_like_to_regex() {
+        // `%` -> `.*`, `_` -> `.`, with a literal run of at least three chars.
+        assert_eq!(like_to_regex("%foo%", None).as_deref(), Some(".*foo.*"));
+        assert_eq!(like_to_regex("foo%bar", None).as_deref(), Some("foo.*bar"));
+        assert_eq!(like_to_regex("foo_bar", None).as_deref(), Some("foo.bar"));
+        assert_eq!(like_to_regex("foobar", None).as_deref(), Some("foobar"));
+
+        // Regex metacharacters in the literal portion are escaped.
+        assert_eq!(
+            like_to_regex("%a.bcd%", None).as_deref(),
+            Some(".*a\\.bcd.*")
+        );
+
+        // No literal run of three alphanumeric characters -> no index help.
+        assert_eq!(like_to_regex("%ab%", None), None);
+        assert_eq!(like_to_regex("%a%b%c%", None), None);
+        assert_eq!(like_to_regex("%", None), None);
+
+        // The escape character makes the following character a literal.
+        assert_eq!(
+            like_to_regex(r"%foo\%bar%", Some('\\')).as_deref(),
+            Some(".*foo%bar.*")
+        );
+    }
+
+    #[test]
+    fn test_apply_regex_flags() {
+        fn flags(s: &str) -> Expr {
+            Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
+        }
+
+        // Empty flags leave the pattern untouched (no inline group emitted).
+        assert_eq!(apply_regex_flags("foo", &flags("")).as_deref(), Some("foo"));
+        // Supported flags are folded into an inline `(?...)` prefix.
+        assert_eq!(
+            apply_regex_flags("foo", &flags("i")).as_deref(),
+            Some("(?i)foo")
+        );
+        assert_eq!(
+            apply_regex_flags("foo", &flags("is")).as_deref(),
+            Some("(?is)foo")
+        );
+        // An unrecognized flag bails out so the caller leaves the predicate to a
+        // full recheck rather than risk changing its semantics.
+        assert_eq!(apply_regex_flags("foo", &flags("g")), None);
+        // A non-string (hence non-literal-flags) argument cannot be folded.
+        assert_eq!(
+            apply_regex_flags("foo", &Expr::Literal(ScalarValue::Int32(Some(1)), None)),
+            None
+        );
+    }
+
+    #[test]
     fn test_extract_like_leading_prefix() {
         // Simple prefix patterns (no recheck needed)
         assert_eq!(
@@ -3156,5 +3366,76 @@ mod tests {
         assert!(round_tripped.is_at_most());
         assert_eq!(round_tripped.upper, RowAddrMask::from_allowed(upper_addrs));
         assert_eq!(round_tripped_frags, fragments_covered);
+    }
+
+    /// Regression test: when two JSON indices target different paths on the same
+    /// column, a query against one path must be routed to its own index instead
+    /// of being intercepted by whichever parser was registered first.
+    #[test]
+    fn test_multi_json_indices_route_by_path() {
+        // Build a MultiQueryParser containing two JSON sub-parsers: one for
+        // path "$.a" and one for path "$.b".
+        let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
+            "$.a".to_string(),
+            Box::new(SargableQueryParser::new(
+                "json_a_idx".to_string(),
+                "Json".to_string(),
+                false,
+            )),
+        )));
+        multi.add(Box::new(JsonQueryParser::new(
+            "$.b".to_string(),
+            Box::new(SargableQueryParser::new(
+                "json_b_idx".to_string(),
+                "Json".to_string(),
+                false,
+            )),
+        )));
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "json",
+            ColInfo::with_multi(DataType::LargeBinary, Box::new(multi)),
+        )]);
+
+        // Query against path "$.b" must hit the "$.b" index.
+        let expected_b = IndexedExpression::index_query(
+            "json".to_string(),
+            "json_b_idx".to_string(),
+            "Json".to_string(),
+            Arc::new(JsonQuery::new(
+                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "foo".to_string(),
+                )))),
+                "$.b".to_string(),
+            )),
+        );
+        check(
+            &index_info,
+            "json_extract(json, '$.b') = 'foo'",
+            Some(expected_b),
+            false,
+        );
+
+        // Query against path "$.a" must hit the "$.a" index.
+        let expected_a = IndexedExpression::index_query(
+            "json".to_string(),
+            "json_a_idx".to_string(),
+            "Json".to_string(),
+            Arc::new(JsonQuery::new(
+                Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "foo".to_string(),
+                )))),
+                "$.a".to_string(),
+            )),
+        );
+        check(
+            &index_info,
+            "json_extract(json, '$.a') = 'foo'",
+            Some(expected_a),
+            false,
+        );
+
+        // Query against an unindexed path must not bind to either index.
+        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
     }
 }

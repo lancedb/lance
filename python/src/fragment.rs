@@ -23,7 +23,7 @@ use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform};
+use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
@@ -119,7 +119,7 @@ impl FileFragment {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyLance<Fragment>> {
         let params = if let Some(kw_params) = kwargs {
-            get_write_params(kw_params)?
+            get_write_params(kw_params, dataset_uri)?
         } else {
             None
         };
@@ -435,10 +435,10 @@ fn do_write_fragments(
 ) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
-    let params = kwargs
-        .and_then(|params| get_write_params(params).transpose())
-        .transpose()?
-        .unwrap_or_default();
+    let params = match kwargs {
+        Some(params) => get_write_params(params, &dest.table_root_uri()?)?.unwrap_or_default(),
+        None => WriteParams::default(),
+    };
 
     rt().block_on(
         Some(reader.py()),

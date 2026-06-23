@@ -18,9 +18,13 @@ mod arena_skiplist;
 mod btree;
 mod fts;
 mod hnsw;
+mod pk_key;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use datafusion::common::ScalarValue;
 
 use super::memtable::batch_store::StoredBatch;
 use arrow_array::RecordBatch;
@@ -44,6 +48,32 @@ pub type RowPosition = u64;
 pub use btree::{BTreeIndexConfig, BTreeMemIndex};
 pub use fts::{FtsIndexConfig, FtsMemIndex, FtsQueryExpr, SearchOptions};
 pub use hnsw::{HnswIndexConfig, HnswMemIndex};
+pub use pk_key::encode_pk_tuple;
+
+use pk_key::encode_pk_batch;
+
+/// Synthetic column the composite PK index is keyed on: the order-preserving
+/// encoded tuple (see [`encode_pk_tuple`]), stored as `Binary` so a
+/// [`BTreeMemIndex`]'s byte backend indexes it directly.
+const PK_KEY_COLUMN: &str = "__pk_key__";
+
+/// The memtable's primary-key index, used to answer "newest visible version of
+/// this key" for dedup. Single-column PKs reuse the column's compact typed
+/// [`BTreeMemIndex`] (no second copy); composite PKs key a `BTreeMemIndex` on
+/// the order-preserving encoded tuple ([`encode_pk_tuple`]) instead. Either way
+/// the lookup is a single seek on one `BTreeMemIndex`.
+enum PkIndex {
+    /// Arity 1: aliases a `btree_indexes` entry, so the insert loop maintains it.
+    Single(Arc<BTreeMemIndex>),
+    /// Arity >= 2: a `BTreeMemIndex` over the encoded-tuple `Binary` key,
+    /// maintained explicitly in the insert paths (the original batch lacks the
+    /// synthetic key column). `columns` are the PK columns in order, resolved
+    /// against each batch's schema at insert time.
+    Composite {
+        index: Arc<BTreeMemIndex>,
+        columns: Vec<String>,
+    },
+}
 
 // ============================================================================
 // Index Store
@@ -195,12 +225,17 @@ impl MemIndexConfig {
 /// therefore safe for scanners to read. Scanners snapshot this at plan
 /// construction time so every plan keys on a stable MVCC cursor.
 pub struct IndexStore {
-    /// BTree indexes keyed by index name.
-    btree_indexes: HashMap<String, BTreeMemIndex>,
+    /// BTree indexes keyed by index name. `Arc` so the primary-key BTrees can be
+    /// shared into [`Self::pk_btrees`] without a second copy or a second insert.
+    btree_indexes: HashMap<String, Arc<BTreeMemIndex>>,
     /// HNSW vector indexes keyed by index name.
     hnsw_indexes: HashMap<String, HnswMemIndex>,
     /// FTS indexes keyed by index name.
     fts_indexes: HashMap<String, FtsMemIndex>,
+    /// The primary-key index (single-column or composite), or `None` without a
+    /// primary key. Queried via [`Self::pk_newest_visible`] (see
+    /// [`Self::enable_pk_index`]).
+    pk_index: Option<PkIndex>,
     /// Maximum batch position that is durable in the WAL and therefore
     /// visible to scanners. Advanced unconditionally after a WAL append
     /// succeeds; not gated on whether any indexes are configured.
@@ -213,6 +248,7 @@ impl Default for IndexStore {
             btree_indexes: HashMap::new(),
             hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
+            pk_index: None,
             max_visible_batch_position: AtomicUsize::new(0),
         }
     }
@@ -230,6 +266,16 @@ impl std::fmt::Debug for IndexStore {
                 &self.hnsw_indexes.keys().collect::<Vec<_>>(),
             )
             .field("fts_indexes", &self.fts_indexes.keys().collect::<Vec<_>>())
+            .field(
+                "pk_index",
+                &match &self.pk_index {
+                    None => "none".to_string(),
+                    Some(PkIndex::Single(b)) => format!("single({})", b.column_name()),
+                    Some(PkIndex::Composite { columns, .. }) => {
+                        format!("composite({})", columns.join(", "))
+                    }
+                },
+            )
             .field(
                 "max_visible_batch_position",
                 &self.max_visible_batch_position.load(Ordering::Acquire),
@@ -264,7 +310,7 @@ impl IndexStore {
         for config in configs {
             match config {
                 MemIndexConfig::BTree(c) => {
-                    let index = BTreeMemIndex::new(c.field_id, c.column.clone());
+                    let index = Arc::new(BTreeMemIndex::new(c.field_id, c.column.clone()));
                     registry.btree_indexes.insert(c.name.clone(), index);
                 }
                 MemIndexConfig::Hnsw(c) => {
@@ -293,7 +339,7 @@ impl IndexStore {
     /// the production memtable path goes through [`Self::from_configs`].
     pub fn add_btree(&mut self, name: String, field_id: i32, column: String) {
         self.btree_indexes
-            .insert(name, BTreeMemIndex::new(field_id, column));
+            .insert(name, Arc::new(BTreeMemIndex::new(field_id, column)));
     }
 
     /// Add an HNSW vector index with default build parameters.
@@ -362,6 +408,158 @@ impl IndexStore {
             .insert(name, FtsMemIndex::with_params(field_id, column, params));
     }
 
+    /// Maintain a primary-key index so the memtable can answer "newest visible
+    /// version of this key" (see [`Self::pk_newest_visible`]).
+    ///
+    /// Single-column PKs reuse an existing BTree on the field, else auto-create
+    /// one under a `__pk__*` name so the normal insert loop maintains it (no
+    /// second copy). Composite (arity >= 2) PKs key a `BTreeMemIndex` on the
+    /// order-preserving encoded tuple (synthetic `PK_KEY_COLUMN`), maintained
+    /// explicitly in the insert paths. Call once at construction, after
+    /// [`Self::from_configs`] and before any inserts; a no-op when `pk_columns`
+    /// is empty.
+    pub fn enable_pk_index(&mut self, pk_columns: &[(String, i32)]) {
+        self.pk_index = match pk_columns {
+            [] => None,
+            [(column, field_id)] => {
+                let btree = match self
+                    .btree_indexes
+                    .values()
+                    .find(|b| b.field_id() == *field_id)
+                {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        let btree = Arc::new(BTreeMemIndex::new(*field_id, column.clone()));
+                        self.btree_indexes
+                            .insert(format!("__pk__{column}"), btree.clone());
+                        btree
+                    }
+                };
+                Some(PkIndex::Single(btree))
+            }
+            multi => Some(PkIndex::Composite {
+                // Synthetic field id (-1): the composite index is held directly,
+                // never resolved by field id.
+                index: Arc::new(BTreeMemIndex::new(-1, PK_KEY_COLUMN.to_string())),
+                columns: multi.iter().map(|(c, _)| c.clone()).collect(),
+            }),
+        };
+    }
+
+    /// Whether the memtable has a primary-key index.
+    pub fn has_pk_index(&self) -> bool {
+        self.pk_index.is_some()
+    }
+
+    /// Sorted `(value, row_id)` training batches for the flushed on-disk PK
+    /// BTree (the sidecar dedup index). Single-column emits the typed PK value;
+    /// composite emits the order-preserving `Binary` encoded tuple. Empty when
+    /// there is no primary key. Row positions line up 1:1 with the forward-
+    /// written data file, so they are the flushed row ids directly.
+    pub fn pk_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
+        match &self.pk_index {
+            None => Ok(Vec::new()),
+            Some(PkIndex::Single(btree)) => btree.to_training_batches(batch_size),
+            Some(PkIndex::Composite { index, .. }) => index.to_training_batches(batch_size),
+        }
+    }
+
+    /// Resolve the PK columns' positions in `batch` (composite insert helper).
+    fn pk_batch_indices(batch: &RecordBatch, columns: &[String]) -> Result<Vec<usize>> {
+        columns
+            .iter()
+            .map(|c| {
+                batch
+                    .schema()
+                    .column_with_name(c)
+                    .map(|(i, _)| i)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!("PK column '{c}' not found in batch"))
+                    })
+            })
+            .collect()
+    }
+
+    /// Maintain the composite PK index for `batch` (no-op for single/no PK):
+    /// encode the PK columns into the synthetic `PK_KEY_COLUMN` `Binary` column
+    /// and feed that to the keyed `BTreeMemIndex`.
+    fn insert_composite_pk(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+        if let Some(PkIndex::Composite { index, columns }) = &self.pk_index {
+            let pk_indices = Self::pk_batch_indices(batch, columns)?;
+            let encoded = encode_pk_batch(batch, &pk_indices)?;
+            let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                PK_KEY_COLUMN,
+                arrow_schema::DataType::Binary,
+                false,
+            )]));
+            let key_batch = RecordBatch::try_new(schema, vec![Arc::new(encoded)])
+                .map_err(|e| Error::invalid_input(e.to_string()))?;
+            index.insert(&key_batch, row_offset)?;
+        }
+        Ok(())
+    }
+
+    /// The newest row position of the primary-key tuple `values` (in PK order)
+    /// visible at `max_visible_row`, or `None`. A single seek either way:
+    /// single-column probes the typed BTree; composite probes the encoded-tuple
+    /// index. Collision-free, since `position` is the row identity.
+    pub fn pk_newest_visible(
+        &self,
+        values: &[ScalarValue],
+        max_visible_row: RowPosition,
+    ) -> Option<RowPosition> {
+        match &self.pk_index {
+            None => None,
+            Some(PkIndex::Single(btree)) => btree.get_newest_visible(&values[0], max_visible_row),
+            Some(PkIndex::Composite { index, .. }) => {
+                // An unsupported PK type would have failed at insert, so the
+                // index can't hold a tuple this fails to encode. The probe key is
+                // the same `Binary`-encoded tuple the insert path indexed.
+                let key = encode_pk_tuple(values).ok()?;
+                index.get_newest_visible(&ScalarValue::Binary(Some(key)), max_visible_row)
+            }
+        }
+    }
+
+    /// Whether `position` is the newest visible row of `values` — the recency
+    /// check the active index-search arms apply to drop predicate-crossing
+    /// stale hits. Callers gate on [`Self::has_pk_index`] first, since this is
+    /// `false` (drop) when the memtable has no primary-key index.
+    pub fn pk_is_newest(
+        &self,
+        values: &[ScalarValue],
+        position: RowPosition,
+        max_visible_row: RowPosition,
+    ) -> bool {
+        self.pk_newest_visible(values, max_visible_row) == Some(position)
+    }
+
+    /// Whether `key` has any version visible at `max_visible_row` — the
+    /// cross-source block-list's existence query, snapshot-bounded so a
+    /// not-yet-visible write can't shadow an older visible copy.
+    ///
+    /// `key` is already in the index's key space: the typed PK value for a
+    /// single-column key, the `Binary`-encoded tuple for a composite one (built
+    /// by `block_list::on_disk_pk_key`, the same key the flushed on-disk index is
+    /// probed with). Both arities forward it straight to the keyed BTree.
+    pub fn pk_contains_key(&self, key: &ScalarValue, max_visible_row: RowPosition) -> bool {
+        match &self.pk_index {
+            None => false,
+            Some(PkIndex::Single(btree)) | Some(PkIndex::Composite { index: btree, .. }) => {
+                btree.get_newest_visible(key, max_visible_row).is_some()
+            }
+        }
+    }
+
+    /// Whether the primary-key index holds no rows (or doesn't exist).
+    pub fn pk_is_empty(&self) -> bool {
+        match &self.pk_index {
+            None => true,
+            Some(PkIndex::Single(btree)) => btree.is_empty(),
+            Some(PkIndex::Composite { index, .. }) => index.is_empty(),
+        }
+    }
+
     /// Insert a batch into all indexes.
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         self.insert_with_batch_position(batch, row_offset, None)
@@ -384,6 +582,9 @@ impl IndexStore {
         for index in self.fts_indexes.values() {
             index.insert(batch, row_offset)?;
         }
+        // Single-column PK aliases a `btree_indexes` entry (maintained above);
+        // a composite PK has its own index, maintained here.
+        self.insert_composite_pk(batch, row_offset)?;
 
         // Update global watermark after all indexes have been updated
         if let Some(bp) = batch_position {
@@ -438,6 +639,12 @@ impl IndexStore {
             for stored in batches {
                 index.insert(&stored.data, stored.row_offset)?;
             }
+        }
+
+        // Single-column PK aliases a `btree_indexes` entry (maintained above);
+        // a composite PK has its own index, maintained here.
+        for stored in batches {
+            self.insert_composite_pk(&stored.data, stored.row_offset)?;
         }
 
         // Update global watermark to the max batch position
@@ -552,6 +759,14 @@ impl IndexStore {
                 .map(|(name, _idx_type, duration)| (name.to_string(), duration))
                 .collect();
 
+            // Single-column PK aliases a `btree_indexes` entry — its thread above
+            // already maintained it (and joined). A composite PK has its own
+            // index; maintain it here before the watermark advances so the
+            // visible prefix is fully indexed.
+            for stored in batches {
+                self.insert_composite_pk(&stored.data, stored.row_offset)?;
+            }
+
             // Update global watermark to the max batch position
             let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
             self.advance_max_visible_batch_position(max_bp);
@@ -562,7 +777,7 @@ impl IndexStore {
 
     /// Get a BTree index by name.
     pub fn get_btree(&self, name: &str) -> Option<&BTreeMemIndex> {
-        self.btree_indexes.get(name)
+        self.btree_indexes.get(name).map(Arc::as_ref)
     }
 
     /// Get an HNSW vector index by name.
@@ -583,6 +798,7 @@ impl IndexStore {
         self.btree_indexes
             .values()
             .find(|idx| idx.field_id() == field_id)
+            .map(Arc::as_ref)
     }
 
     /// Get an HNSW vector index by field ID.
@@ -607,6 +823,7 @@ impl IndexStore {
         self.btree_indexes
             .values()
             .find(|idx| idx.column_name() == column)
+            .map(Arc::as_ref)
     }
 
     /// Get an HNSW vector index by column name.
@@ -692,6 +909,73 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Single-column `id` batch for primary-key lookup tests.
+    fn id_batch(ids: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pk_newest_visible_single_column() {
+        let mut store = IndexStore::new();
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+        // id=1 at positions 0 and 2 (an update), id=2 at position 1.
+        store.insert(&id_batch(&[1, 2]), 0).unwrap();
+        store.insert(&id_batch(&[1]), 2).unwrap();
+
+        let one = [ScalarValue::Int32(Some(1))];
+        // Watermark above the update sees the newest position; below it, the older.
+        assert_eq!(store.pk_newest_visible(&one, 5), Some(2));
+        assert_eq!(store.pk_newest_visible(&one, 1), Some(0));
+        assert!(store.pk_is_newest(&one, 2, 5));
+        assert!(!store.pk_is_newest(&one, 0, 5));
+        // Absent key (probed by the typed value, as the block-list does).
+        assert!(!store.pk_contains_key(&ScalarValue::Int32(Some(9)), 5));
+    }
+
+    #[test]
+    fn pk_newest_visible_composite_seeks_encoded_tuple() {
+        let mut store = IndexStore::new();
+        store.enable_pk_index(&[("id".to_string(), 0), ("name".to_string(), 1)]);
+        // Rows: (1,"a")@0, (1,"b")@1, (1,"a")@2 — an update of (1,"a").
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(StringArray::from(vec!["a", "b", "a"])),
+            ],
+        )
+        .unwrap();
+        store.insert(&batch, 0).unwrap();
+
+        let tuple_1a = [ScalarValue::Int32(Some(1)), ScalarValue::from("a")];
+        let tuple_1b = [ScalarValue::Int32(Some(1)), ScalarValue::from("b")];
+        // (1,"a")'s newest visible row is its re-write at position 2.
+        assert_eq!(store.pk_newest_visible(&tuple_1a, 5), Some(2));
+        assert!(store.pk_is_newest(&tuple_1a, 2, 5));
+        assert!(!store.pk_is_newest(&tuple_1a, 0, 5));
+        // (1,"b") only exists at position 1.
+        assert_eq!(store.pk_newest_visible(&tuple_1b, 5), Some(1));
+        // Watermark below the re-write: the older (1,"a")@0 is the newest visible.
+        assert_eq!(store.pk_newest_visible(&tuple_1a, 1), Some(0));
+        // An absent tuple (probed by its Binary-encoded key, as the block-list
+        // does).
+        let tuple_2a = [ScalarValue::Int32(Some(2)), ScalarValue::from("a")];
+        let key_2a = ScalarValue::Binary(Some(encode_pk_tuple(&tuple_2a).unwrap()));
+        assert!(!store.pk_contains_key(&key_2a, 5));
     }
 
     #[test]

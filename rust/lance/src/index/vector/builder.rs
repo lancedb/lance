@@ -1045,7 +1045,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 continue;
             }
 
-            let part_storage = existing_index.load_partition_storage(part_id).await?;
+            let part_storage = existing_index.load_partition_storage(part_id, None).await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
             match Q::quantization_type() {
@@ -2392,7 +2392,7 @@ mod tests {
 
         let indices = dataset.load_indices_by_name("idx").await.unwrap();
         let initial_index = dataset
-            .open_vector_index("vec", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .open_vector_index("vec", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let initial_ivf = initial_index.ivf_model();
@@ -2422,7 +2422,7 @@ mod tests {
         let indices = dataset.load_indices_by_name("idx").await.unwrap();
         assert_eq!(indices.len(), 1, "expected merge-all on split");
         let optimized = dataset
-            .open_vector_index("vec", &indices[0].uuid.to_string(), &NoOpMetricsCollector)
+            .open_vector_index("vec", &indices[0].uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
         let ivf = optimized.ivf_model();

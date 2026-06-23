@@ -13,7 +13,7 @@ use itertools::Itertools;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
-use lance_core::cache::CacheCodecImpl;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 
@@ -692,12 +692,17 @@ impl RowAddrTreeMap {
 }
 
 impl CacheCodecImpl for RowAddrTreeMap {
-    fn serialize(&self, writer: &mut dyn Write) -> Result<()> {
-        self.serialize_into(writer)
+    const TYPE_ID: &'static str = "lance.RowAddrTreeMap";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        // A roaring bitmap has its own stable, portable serialization; it is
+        // the whole body, so write it raw rather than length-prefixed.
+        self.serialize_into(w.raw_writer())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
-        Self::deserialize_from(data.as_ref())
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        Self::deserialize_from(r.body().as_ref())
     }
 }
 

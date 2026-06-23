@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
 use crate::traits::FromJObjectWithEnv;
-use lance_index::vector::Query;
+use lance_index::vector::{ApproxMode, Query};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -74,6 +74,18 @@ pub fn extract_base_store_params(
 
         Ok::<_, Error>(base_store_params)
     })
+}
+
+pub(crate) fn parse_approx_mode(value: &str) -> Result<ApproxMode> {
+    match value {
+        "fast" => Ok(ApproxMode::Fast),
+        "normal" => Ok(ApproxMode::Normal),
+        "accurate" => Ok(ApproxMode::Accurate),
+        _ => Err(Error::input_error(format!(
+            "Invalid approx mode '{}'. Expected one of: fast, normal, accurate",
+            value
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -253,6 +265,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let query_parallelism = env
             .call_method(&java_obj, "getQueryParallelism", "()I", &[])?
             .i()?;
+        let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
+        let approx_mode = parse_approx_mode(&approx_mode_str)?;
 
         Ok(Query {
             column,
@@ -268,6 +282,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             use_index,
             dist_q_c: 0.0,
             query_parallelism,
+            approx_mode,
         })
     })?;
 

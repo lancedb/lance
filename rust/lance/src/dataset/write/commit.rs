@@ -104,6 +104,10 @@ impl<'a> CommitBuilder<'a> {
     }
 
     /// Pass a commit handler to use for the dataset.
+    ///
+    /// Takes precedence over the destination dataset's own handler. If not
+    /// set, a `Dataset` destination commits through its own handler and a
+    /// `Uri` destination resolves one from the uri.
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
         self.commit_handler = Some(commit_handler);
         self
@@ -241,7 +245,9 @@ impl<'a> CommitBuilder<'a> {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
-                dataset.commit_handler.clone(),
+                self.commit_handler
+                    .clone()
+                    .unwrap_or_else(|| dataset.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let commit_handler = if let (Some(_), Some(commit_handler)) =

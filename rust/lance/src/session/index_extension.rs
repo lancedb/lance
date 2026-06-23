@@ -7,6 +7,7 @@ use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_index::{IndexParams, IndexType, vector::VectorIndex};
+use uuid::Uuid;
 
 use crate::Dataset;
 
@@ -35,7 +36,7 @@ pub trait VectorIndexExtension: IndexExtension {
         // if we wrap into an Arc, the mutable reference is lost
         dataset: &Dataset,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         params: &dyn IndexParams,
     ) -> Result<()>;
 
@@ -44,7 +45,7 @@ pub trait VectorIndexExtension: IndexExtension {
         &self,
         dataset: Arc<Dataset>,
         column: &str,
-        uuid: &str,
+        uuid: &Uuid,
         reader: PreviousFileReader,
     ) -> Result<Arc<dyn VectorIndex>>;
 }
@@ -108,10 +109,6 @@ mod test {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         async fn prewarm(&self) -> Result<()> {
@@ -259,7 +256,7 @@ mod test {
             &self,
             dataset: &Dataset,
             _column: &str,
-            uuid: &str,
+            uuid: &Uuid,
             _params: &dyn IndexParams,
         ) -> Result<()> {
             let store = dataset.object_store.clone();
@@ -305,7 +302,7 @@ mod test {
             &self,
             _dataset: Arc<Dataset>,
             _column: &str,
-            _uuid: &str,
+            _uuid: &Uuid,
             _reader: PreviousFileReader,
         ) -> Result<Arc<dyn VectorIndex>> {
             self.load_index_called
@@ -391,7 +388,7 @@ mod test {
         let idx = ds_without_extension.load_indices().await.unwrap();
         assert_eq!(idx.len(), 1);
         // get the index uuid
-        let index_uuid = idx.first().unwrap().uuid.to_string();
+        let index_uuid = idx.first().unwrap().uuid;
 
         // trying to open the index should fail as there is no extension loader
         assert!(

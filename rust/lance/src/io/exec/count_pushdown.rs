@@ -146,23 +146,6 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
         return Ok(None);
     };
 
-    // Stable-row-id mode: `DatasetPreFilter::create_deletion_mask` produces
-    // an AllowList in stable-id space, but `CountFromMaskExec` builds its
-    // fragments-allow list in row-address space. ANDing across the two
-    // yields a silently wrong count (rows in fragments > 0 are dropped
-    // because their stable ids and row addresses share a fragment-id bucket
-    // only by accident). Until the exec can reconcile the two id spaces,
-    // refuse to fire — but warn so we notice the lost optimization
-    // opportunity.
-    if filtered_read.dataset().manifest().uses_stable_row_ids() {
-        warn!(
-            "count_pushdown: skipped because the dataset uses stable row ids; \
-             the count will be computed via a full scan. Reconciling the two id spaces \
-             would let this query be answered from index metadata."
-        );
-        return Ok(None);
-    }
-
     let options = filtered_read.options();
     // A refine filter is a residual the index couldn't fully evaluate — it
     // needs column data to apply, which we can't.
@@ -668,7 +651,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_skips_with_stable_row_ids() {
+    async fn rule_fires_with_stable_row_ids() {
+        // Unfiltered count, stable row ids, with a deletion.
         use crate::dataset::WriteParams;
         let tmp = TempStrDir::default();
         let mut dataset = gen_batch()
@@ -692,8 +676,58 @@ mod tests {
         let (plan, count) = run_count(&mut scanner).await;
         assert_eq!(count, 19);
         assert!(
-            !plan_contains_pushdown(&plan),
-            "rule must not fire under stable row IDs, got plan: {}",
+            plan_contains_pushdown(&plan),
+            "rule should fire under stable row IDs, got plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_fires_with_stable_row_ids_and_filter() {
+        // Indexed filter, stable row ids, deletions spread across fragments --
+        // the case the pre-fix code got wrong (dropped rows in fragments > 0).
+        use crate::dataset::WriteParams;
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset_with_params(
+                tmp.as_str(),
+                FragmentCount::from(3),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        // Delete one row from fragment 1 and one from fragment 2.
+        dataset
+            .delete("ordered = 15 OR ordered = 25")
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        let mut scanner = dataset.scan();
+        // Matches every row across all three fragments; with the two deletions
+        // the live count is 28.
+        scanner.filter("ordered >= 0").unwrap();
+        let (plan, count) = run_count(&mut scanner).await;
+        assert_eq!(count, 28);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "rule should fire under stable row IDs with a filter, got plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }

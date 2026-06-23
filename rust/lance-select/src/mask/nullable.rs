@@ -62,32 +62,52 @@ impl NullableRowAddrSet {
         &self.nulls
     }
 
+    /// Get the raw `selected` bitmap.
+    ///
+    /// This is the backing field, **not** a semantic "TRUE ∪ NULL" set: a NULL
+    /// row may be stored only in `nulls` without appearing in `selected`. Use
+    /// this when you want a zero-copy view of the raw representation (e.g.
+    /// wire serialization that sends `selected` and `nulls` as separate sets).
+    /// For "TRUE rows only", use [`Self::true_rows`].
+    pub fn selected_rows(&self) -> &RowAddrTreeMap {
+        &self.selected
+    }
+
     /// Get the TRUE rows (selected but not null)
     pub fn true_rows(&self) -> RowAddrTreeMap {
         self.selected.clone() - self.nulls.clone()
     }
 
     pub fn union_all(selections: &[Self]) -> Self {
-        let true_rows = selections
-            .iter()
-            .map(|s| s.true_rows())
-            .collect::<Vec<RowAddrTreeMap>>();
-        let true_rows_refs = true_rows.iter().collect::<Vec<&RowAddrTreeMap>>();
-        let selected = RowAddrTreeMap::union_all(&true_rows_refs);
+        let selected = RowAddrTreeMap::union_all(
+            &selections
+                .iter()
+                .map(|s| &s.selected)
+                .collect::<Vec<&RowAddrTreeMap>>(),
+        );
         let nulls = RowAddrTreeMap::union_all(
             &selections
                 .iter()
                 .map(|s| &s.nulls)
                 .collect::<Vec<&RowAddrTreeMap>>(),
         );
-        // TRUE | NULL = TRUE, so remove any TRUE rows from nulls
-        let nulls = nulls - &selected;
+        // TRUE | NULL = TRUE, so remove any TRUE rows from nulls.
+        // A row is TRUE in some input iff it's in that input's (selected - nulls).
+        let any_true = selections
+            .iter()
+            .map(|s| s.selected.clone() - &s.nulls)
+            .fold(RowAddrTreeMap::new(), |acc, t| acc | t);
+        let nulls = nulls - &any_true;
         Self { selected, nulls }
     }
 }
 
 impl PartialEq for NullableRowAddrSet {
     fn eq(&self, other: &Self) -> bool {
+        // Semantic equality: two sets are equal iff they decode to the same
+        // Kleene state on every row. Comparing raw `selected` would be wrong
+        // because a NULL row can be represented either inside or outside the
+        // `selected` bitmap.
         self.true_rows() == other.true_rows() && self.nulls == other.nulls
     }
 }
@@ -471,6 +491,135 @@ mod tests {
         // [T, T, T, T, N, N, T, N, F]
         assert_eq!(&result.true_rows(), &rows(&[1, 2, 3, 4, 7]));
         assert_eq!(result.null_rows(), &rows(&[5, 6, 8]));
+    }
+
+    #[test]
+    fn test_partial_eq_semantic_equivalence() {
+        // Two representations of "row 5 is NULL, nothing is TRUE":
+        //   a: selected={5}, nulls={5}  (NULL row also in selected)
+        //   b: selected={},  nulls={5}  (NULL row only in nulls)
+        // Both decode to the same Kleene state on every row, so they must
+        // compare equal under semantic PartialEq.
+        let a = NullableRowAddrSet::new(rows(&[5]), rows(&[5]));
+        let b = NullableRowAddrSet::new(rows(&[]), rows(&[5]));
+        assert_eq!(a, b);
+        assert_eq!(a.true_rows(), b.true_rows());
+        assert_eq!(a.null_rows(), b.null_rows());
+    }
+
+    #[test]
+    fn test_union_all_true_overrides_null() {
+        // Critical conflict case: row 5 is TRUE in set1 but NULL in set2.
+        // Kleene: TRUE ∨ NULL = TRUE → row 5 must end up TRUE, not NULL.
+        let set1 = nullable_set(&[5], &[]);
+        let set2 = nullable_set(&[5], &[5]);
+
+        let result = NullableRowAddrSet::union_all(&[set1, set2]);
+
+        assert_eq!(result.true_rows(), rows(&[5]));
+        assert!(result.null_rows().is_empty());
+    }
+
+    #[test]
+    fn test_union_all_null_only_input() {
+        // Input where a row is NULL but NOT in `selected` (the type allows
+        // `selected` to be a strict subset of TRUE ∪ NULL).
+        let set1 = NullableRowAddrSet::new(rows(&[]), rows(&[5]));
+        let set2 = NullableRowAddrSet::new(rows(&[1]), rows(&[]));
+
+        let result = NullableRowAddrSet::union_all(&[set1, set2]);
+
+        assert_eq!(result.true_rows(), rows(&[1]));
+        assert_eq!(result.null_rows(), &rows(&[5]));
+    }
+
+    #[test]
+    fn test_union_all_all_null_for_a_row() {
+        // Every input marks row 7 as NULL; nothing makes it TRUE.
+        let set1 = nullable_set(&[7], &[7]);
+        let set2 = nullable_set(&[7], &[7]);
+        let set3 = NullableRowAddrSet::new(rows(&[]), rows(&[7]));
+
+        let result = NullableRowAddrSet::union_all(&[set1, set2, set3]);
+
+        assert!(result.true_rows().is_empty());
+        assert_eq!(result.null_rows(), &rows(&[7]));
+    }
+
+    #[test]
+    fn test_union_all_empty_inputs() {
+        let result = NullableRowAddrSet::union_all(&[]);
+        assert!(result.true_rows().is_empty());
+        assert!(result.null_rows().is_empty());
+    }
+
+    #[test]
+    fn test_union_all_single_input() {
+        // One input → state of every row preserved.
+        let set = nullable_set(&[1, 2, 3, 4], &[2, 4]);
+        let result = NullableRowAddrSet::union_all(std::slice::from_ref(&set));
+
+        assert_eq!(result.true_rows(), rows(&[1, 3]));
+        assert_eq!(result.null_rows(), &rows(&[2, 4]));
+    }
+
+    #[test]
+    fn test_union_all_all_empty_inputs() {
+        let inputs = [
+            NullableRowAddrSet::empty(),
+            NullableRowAddrSet::empty(),
+            NullableRowAddrSet::empty(),
+        ];
+        let result = NullableRowAddrSet::union_all(&inputs);
+        assert!(result.true_rows().is_empty());
+        assert!(result.null_rows().is_empty());
+    }
+
+    #[test]
+    fn test_union_all_disjoint_inputs() {
+        // No row appears in more than one input.
+        let set1 = nullable_set(&[1, 2], &[2]);
+        let set2 = nullable_set(&[10, 11], &[11]);
+        let set3 = nullable_set(&[20], &[]);
+
+        let result = NullableRowAddrSet::union_all(&[set1, set2, set3]);
+
+        assert_eq!(result.true_rows(), rows(&[1, 10, 20]));
+        assert_eq!(result.null_rows(), &rows(&[2, 11]));
+    }
+
+    #[test]
+    fn test_union_all_three_state_row() {
+        // Same row 42 across three inputs in three different states:
+        //   set1: TRUE   set2: NULL   set3: FALSE
+        // Kleene OR: TRUE ∨ NULL ∨ FALSE = TRUE.
+        let set1 = nullable_set(&[42], &[]);
+        let set2 = nullable_set(&[42], &[42]);
+        let set3 = NullableRowAddrSet::empty();
+
+        let result = NullableRowAddrSet::union_all(&[set1, set2, set3]);
+
+        assert_eq!(result.true_rows(), rows(&[42]));
+        assert!(result.null_rows().is_empty());
+    }
+
+    #[test]
+    fn test_union_all_matches_repeated_bitor() {
+        // union_all(a, b, c) must equal ((a | b) | c) — same Kleene operator,
+        // applied pairwise via the independently-implemented BitOrAssign.
+        let set1 = nullable_set(&[1, 2, 3, 4], &[4, 5, 6]);
+        let set2 = nullable_set(&[1, 4, 7, 8], &[2, 5, 8]);
+        let set3 = nullable_set(&[2, 6, 10], &[6, 10]);
+
+        let via_union_all =
+            NullableRowAddrSet::union_all(&[set1.clone(), set2.clone(), set3.clone()]);
+
+        let mut via_bitor = set1;
+        via_bitor |= &set2;
+        via_bitor |= &set3;
+
+        assert_eq!(via_union_all.true_rows(), via_bitor.true_rows());
+        assert_eq!(via_union_all.null_rows(), via_bitor.null_rows());
     }
 
     #[test]

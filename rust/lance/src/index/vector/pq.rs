@@ -180,10 +180,6 @@ impl Index for PQIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
-    }
-
     fn index_type(&self) -> IndexType {
         IndexType::Vector
     }
@@ -911,6 +907,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         };
         let is_empty_threads = Arc::new(Mutex::new(Vec::new()));
         let pre_filter = Arc::new(TestPreFilter::with_thread_capture(

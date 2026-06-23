@@ -31,7 +31,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::{Error, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use roaring::RoaringBitmap;
 
 use crate::frag_reuse::FragReuseIndex;
@@ -40,12 +40,12 @@ use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 
 const FMINDEX_INDEX_VERSION: u32 = 10;
@@ -57,7 +57,7 @@ const SENTINEL_BYTE: u8 = 0xFF;
 const SA_SAMPLE_RATE: usize = 32;
 
 fn fmindex_partition_path(partition_id: u64) -> String {
-    format!("part_{partition_id}_fmindex.lance")
+    format!("part_{partition_id}_fm.lance")
 }
 
 // ── Bitvector with O(1) rank ─────────────────────────────────────────────────
@@ -761,6 +761,7 @@ impl FMIndex {
         (lo, hi)
     }
 
+    #[cfg(test)]
     fn search(&self, pattern: &[u8]) -> RoaringBitmap {
         let (lo, hi) = self.backward_search(pattern);
         if lo >= hi {
@@ -771,6 +772,25 @@ impl FMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             result.insert(self.row_ids[doc_idx] as u32);
+        }
+        result
+    }
+
+    /// Search returning full u64 row addresses (preserving fragment ID in upper bits).
+    fn search_row_addrs(&self, pattern: &[u8]) -> Vec<u64> {
+        let (lo, hi) = self.backward_search(pattern);
+        if lo >= hi {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for i in lo..hi {
+            let text_pos = self.locate(i);
+            let doc_idx = self.doc_for_position(text_pos);
+            let row_addr = self.row_ids[doc_idx];
+            if seen.insert(row_addr) {
+                result.push(row_addr);
+            }
         }
         result
     }
@@ -987,6 +1007,7 @@ impl LazyFMIndex {
         }
     }
 
+    #[cfg(test)]
     fn search(&self, pattern: &[u8]) -> RoaringBitmap {
         let (lo, hi) = self.backward_search(pattern);
         if lo >= hi {
@@ -997,6 +1018,25 @@ impl LazyFMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             result.insert(self.row_ids[doc_idx] as u32);
+        }
+        result
+    }
+
+    /// Search returning full u64 row addresses (preserving fragment ID in upper bits).
+    fn search_row_addrs(&self, pattern: &[u8]) -> Vec<u64> {
+        let (lo, hi) = self.backward_search(pattern);
+        if lo >= hi {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for i in lo..hi {
+            let text_pos = self.locate(i);
+            let doc_idx = self.doc_for_position(text_pos);
+            let row_addr = self.row_ids[doc_idx];
+            if seen.insert(row_addr) {
+                result.push(row_addr);
+            }
         }
         result
     }
@@ -1226,7 +1266,7 @@ impl FMIndexScalarIndex {
             if let Some(id) = f
                 .path
                 .strip_prefix("part_")
-                .and_then(|r| r.strip_suffix("_fmindex.lance"))
+                .and_then(|r| r.strip_suffix("_fm.lance"))
                 .and_then(|s| s.parse::<u64>().ok())
             {
                 pfiles.push((id, f.path.clone()));
@@ -1254,24 +1294,19 @@ impl Index for FMIndexScalarIndex {
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
     }
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "FMIndex is not a vector index".into(),
-        ))
-    }
     async fn prewarm(&self) -> Result<()> {
         Ok(())
     }
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
-            "type": "FMIndex",
+            "type": "Fm",
             "num_partitions": self.partitions.len(),
             "total_bwt_len": self.partitions.iter().map(|p| p.fm.wavelet.len).sum::<usize>(),
             "total_docs": self.partitions.iter().map(|p| p.fm.row_ids.len()).sum::<usize>(),
         }))
     }
     fn index_type(&self) -> IndexType {
-        IndexType::FMIndex
+        IndexType::Fm
     }
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frags = RoaringBitmap::new();
@@ -1294,7 +1329,7 @@ impl ScalarIndex for FMIndexScalarIndex {
         let tq = query
             .as_any()
             .downcast_ref::<TextQuery>()
-            .ok_or_else(|| Error::invalid_input("FMIndex only supports TextQuery"))?;
+            .ok_or_else(|| Error::invalid_input("Fm only supports TextQuery"))?;
         match tq {
             TextQuery::StringContains(pattern) => {
                 let pb = pattern.as_bytes();
@@ -1302,8 +1337,8 @@ impl ScalarIndex for FMIndexScalarIndex {
                 let mut tree = RowAddrTreeMap::new();
                 for p in &self.partitions {
                     p.fm.prewarm().await?;
-                    for rid in p.fm.search(pb).iter() {
-                        tree.insert(rid as u64);
+                    for row_addr in p.fm.search_row_addrs(pb) {
+                        tree.insert(row_addr);
                     }
                 }
                 Ok(SearchResult::Exact(lance_select::NullableRowAddrSet::new(
@@ -1311,6 +1346,12 @@ impl ScalarIndex for FMIndexScalarIndex {
                     Default::default(),
                 )))
             }
+            // Regex queries are routed only to the ngram index (the FM-index's
+            // query parser advertises `supports_regex = false`), so this is
+            // unreachable in practice; reject it explicitly rather than silently.
+            TextQuery::Regex(_) => Err(Error::invalid_input(
+                "FMIndex does not support regular expression queries",
+            )),
         }
     }
     fn can_remap(&self) -> bool {
@@ -1321,16 +1362,15 @@ impl ScalarIndex for FMIndexScalarIndex {
         _: &HashMap<u64, Option<u64>>,
         _: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::not_supported("FMIndex does not support remap"))
+        Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest: &dyn IndexStore,
-        _: Option<OldIndexDataFilter>,
+        _old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let texts = collect_texts(new_data).await?;
-        let files = write_partitioned_fmindex(&texts, dest).await?;
+        let files = write_partitioned_fmindex_stream(new_data, dest).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
@@ -1338,49 +1378,121 @@ impl ScalarIndex for FMIndexScalarIndex {
         })
     }
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None))
+        UpdateCriteria::requires_old_data(
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+        )
     }
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::FMIndex))
+        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Fm))
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-async fn collect_texts(mut stream: SendableRecordBatchStream) -> Result<Vec<(u64, Vec<u8>)>> {
-    let mut texts = Vec::new();
-    let mut next_id = 0u64;
+async fn write_partitioned_fmindex_stream(
+    mut stream: SendableRecordBatchStream,
+    store: &dyn IndexStore,
+) -> Result<Vec<IndexFile>> {
+    let mut files = Vec::new();
+    let mut partition = Vec::with_capacity(PARTITION_SIZE);
+    let mut partition_id = 0;
+
     while let Some(batch) = stream.next().await {
         let batch = batch?;
-        let row_ids: Option<&arrow_array::UInt64Array> = batch
-            .column_by_name("_rowid")
-            .or_else(|| batch.column_by_name("_rowaddr"))
-            .and_then(|c| c.as_any().downcast_ref());
-        let value_col = batch.column(0);
+        // Prefer _rowaddr (global row address) over _rowid to ensure stable,
+        // globally unique identifiers across segments.
+        let row_addrs: &arrow_array::UInt64Array = batch
+            .column_by_name(ROW_ADDR)
+            .or_else(|| batch.column_by_name("_rowid"))
+            .and_then(|c| c.as_any().downcast_ref())
+            .ok_or_else(|| {
+                Error::invalid_input("Fm training data must include _rowaddr or _rowid column")
+            })?;
+        // Use the named value column; fall back to column(0) for legacy streams
+        let value_col = batch
+            .column_by_name(VALUE_COLUMN_NAME)
+            .unwrap_or_else(|| batch.column(0));
         for i in 0..batch.num_rows() {
-            let rid = row_ids.map(|ids| ids.value(i)).unwrap_or_else(|| {
-                let id = next_id;
-                next_id += 1;
-                id
-            });
-            if let Some(bytes) = extract_text_bytes(value_col.as_ref(), i)? {
-                let sanitized: Vec<u8> = bytes
-                    .iter()
-                    .map(|&b| {
-                        if b == SENTINEL_BYTE || b == 0x00 {
-                            b' '
-                        } else {
-                            b
-                        }
-                    })
-                    .collect();
-                texts.push((rid, sanitized));
+            let rid = row_addrs.value(i);
+            if let Some(bytes) = extract_sanitized_text_bytes(value_col.as_ref(), i)? {
+                partition.push((rid, bytes));
+                if partition.len() == PARTITION_SIZE {
+                    files.push(write_fmindex_partition(&partition, store, partition_id).await?);
+                    partition.clear();
+                    partition_id += 1;
+                }
             }
         }
     }
-    Ok(texts)
+
+    if !partition.is_empty() {
+        files.push(write_fmindex_partition(&partition, store, partition_id).await?);
+    } else if files.is_empty() {
+        files.push(write_empty_fmindex_partition(store).await?);
+    }
+
+    Ok(files)
 }
 
+fn sanitize_text_bytes(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .iter()
+        .map(|&b| {
+            if b == SENTINEL_BYTE || b == 0x00 {
+                b' '
+            } else {
+                b
+            }
+        })
+        .collect()
+}
+
+fn extract_sanitized_text_bytes(
+    array: &dyn arrow_array::Array,
+    index: usize,
+) -> Result<Option<Vec<u8>>> {
+    if array.is_null(index) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Utf8 => Ok(Some(sanitize_text_bytes(
+            array
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap()
+                .value(index)
+                .as_bytes(),
+        ))),
+        DataType::LargeUtf8 => Ok(Some(sanitize_text_bytes(
+            array
+                .as_any()
+                .downcast_ref::<arrow_array::LargeStringArray>()
+                .unwrap()
+                .value(index)
+                .as_bytes(),
+        ))),
+        DataType::Binary => Ok(Some(sanitize_text_bytes(
+            array
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .unwrap()
+                .value(index),
+        ))),
+        DataType::LargeBinary => Ok(Some(sanitize_text_bytes(
+            array
+                .as_any()
+                .downcast_ref::<arrow_array::LargeBinaryArray>()
+                .unwrap()
+                .value(index),
+        ))),
+        _ => Err(Error::invalid_input(format!(
+            "Fm does not support data type: {:?}",
+            array.data_type()
+        ))),
+    }
+}
+
+#[cfg(test)]
 fn extract_text_bytes(array: &dyn arrow_array::Array, index: usize) -> Result<Option<Vec<u8>>> {
     if array.is_null(index) {
         return Ok(None);
@@ -1421,7 +1533,7 @@ fn extract_text_bytes(array: &dyn arrow_array::Array, index: usize) -> Result<Op
                 .to_vec(),
         )),
         _ => Err(Error::invalid_input(format!(
-            "FMIndex does not support data type: {:?}",
+            "Fm does not support data type: {:?}",
             array.data_type()
         ))),
     }
@@ -1522,23 +1634,34 @@ async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> 
     writer.finish_with_metadata(metadata).await
 }
 
+#[cfg(test)]
 async fn write_partitioned_fmindex(
     texts: &[(u64, Vec<u8>)],
     store: &dyn IndexStore,
 ) -> Result<Vec<IndexFile>> {
-    let refs: Vec<(u64, &[u8])> = texts.iter().map(|(id, t)| (*id, t.as_slice())).collect();
-    if refs.is_empty() {
-        let fm = FMIndex::build(&[])?;
-        return Ok(vec![
-            write_fmindex(&fm, store, &fmindex_partition_path(0)).await?,
-        ]);
+    if texts.is_empty() {
+        return Ok(vec![write_empty_fmindex_partition(store).await?]);
     }
     let mut files = Vec::new();
-    for (pid, chunk) in refs.chunks(PARTITION_SIZE).enumerate() {
-        let fm = FMIndex::build(chunk)?;
-        files.push(write_fmindex(&fm, store, &fmindex_partition_path(pid as u64)).await?);
+    for (pid, chunk) in texts.chunks(PARTITION_SIZE).enumerate() {
+        files.push(write_fmindex_partition(chunk, store, pid as u64).await?);
     }
     Ok(files)
+}
+
+async fn write_fmindex_partition(
+    texts: &[(u64, Vec<u8>)],
+    store: &dyn IndexStore,
+    partition_id: u64,
+) -> Result<IndexFile> {
+    let refs: Vec<(u64, &[u8])> = texts.iter().map(|(id, t)| (*id, t.as_slice())).collect();
+    let fm = FMIndex::build(&refs)?;
+    write_fmindex(&fm, store, &fmindex_partition_path(partition_id)).await
+}
+
+async fn write_empty_fmindex_partition(store: &dyn IndexStore) -> Result<IndexFile> {
+    let fm = FMIndex::build(&[])?;
+    write_fmindex(&fm, store, &fmindex_partition_path(0)).await
 }
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
@@ -1549,7 +1672,7 @@ pub struct FMIndexPlugin;
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
     fn name(&self) -> &str {
-        "FMIndex"
+        "Fm"
     }
     fn new_training_request(
         &self,
@@ -1566,7 +1689,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             }
         }
         Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None),
+            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         )))
     }
     async fn train_index(
@@ -1577,8 +1700,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         _fids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        let texts = collect_texts(data).await?;
-        let files = write_partitioned_fmindex(&texts, store).await?;
+        let files = write_partitioned_fmindex_stream(data, store).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
@@ -1599,6 +1721,9 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         Some(Box::new(TextQueryParser::new(
             index_name,
             self.name().to_string(),
+            // needs_recheck: the FM-index returns exact substring matches.
+            false,
+            // supports_regex: regex acceleration is only implemented for ngram.
             false,
         )))
     }
@@ -1626,7 +1751,10 @@ impl ScalarIndexPlugin for FMIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::cache::LanceCache;
+    use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, UInt64Array};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+    use lance_core::{ROW_ADDR, cache::LanceCache};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use std::sync::Arc;
@@ -1839,11 +1967,10 @@ mod tests {
 
     #[test]
     fn test_sentinel_sanitization() {
-        // Text containing \xFF should be sanitized to space
+        // Text containing \xFF should be sanitized to space during training.
         let texts: Vec<(u64, &[u8])> = vec![(0, b"hello\xFFworld")];
         let fm = FMIndex::build(&texts).unwrap();
-        // The \xFF is replaced with space during collect_texts, but here we test build directly
-        // which doesn't sanitize. The search should still work.
+        // Build itself does not sanitize, but search should still work.
         let r = fm.search(b"hello");
         assert!(r.contains(0));
     }
@@ -2015,26 +2142,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_plugin_train_and_load() {
-        use arrow_array::{StringArray, UInt64Array};
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-        use futures::stream;
-        use lance_core::ROW_ID;
-
         let docs = vec!["hello world", "hello rust", "goodbye world"];
-        let row_ids: Vec<u64> = vec![0, 1, 2];
+        let row_addrs: Vec<u64> = vec![0, 1, 2];
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(
                 crate::scalar::registry::VALUE_COLUMN_NAME,
                 DataType::Utf8,
                 false,
             ),
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(StringArray::from(docs)),
-                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt64Array::from(row_addrs)),
             ],
         )
         .unwrap();
@@ -2082,6 +2204,88 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_plugin_train_streams_multiple_partitions() {
+        fn training_batch(
+            schema: Arc<arrow_schema::Schema>,
+            start: usize,
+            len: usize,
+        ) -> RecordBatch {
+            let docs = vec!["x"; len];
+            let row_addrs: Vec<u64> = (start..start + len).map(|i| i as u64).collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(docs)),
+                    Arc::new(UInt64Array::from(row_addrs)),
+                ],
+            )
+            .unwrap()
+        }
+
+        let total_rows = PARTITION_SIZE + 5;
+        let first_batch_rows = PARTITION_SIZE - 3;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                crate::scalar::registry::VALUE_COLUMN_NAME,
+                DataType::Utf8,
+                false,
+            ),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batches = vec![
+            Ok(training_batch(schema.clone(), 0, first_batch_rows)),
+            Ok(training_batch(
+                schema.clone(),
+                first_batch_rows,
+                total_rows - first_batch_rows,
+            )),
+        ];
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(batches));
+        let req = FMIndexPlugin
+            .new_training_request("", &arrow_schema::Field::new("val", DataType::Utf8, false))
+            .unwrap();
+        let created = FMIndexPlugin
+            .train_index(
+                Box::pin(stream),
+                store.as_ref(),
+                req,
+                None,
+                Arc::new(crate::progress::NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(created.files.len(), 2);
+
+        let index = FMIndexPlugin
+            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let r = index
+            .search(
+                &TextQuery::StringContains("x".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(total_rows as u64));
+            }
+            _ => panic!("expected exact result"),
+        }
+    }
+
     #[test]
     fn test_build_wavelet_batch() {
         let texts: Vec<(u64, &[u8])> = vec![(0, b"hello world"), (1, b"test data")];
@@ -2093,8 +2297,6 @@ mod tests {
 
     #[test]
     fn test_extract_text_bytes_types() {
-        use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
-
         let utf8 = StringArray::from(vec!["hello"]);
         assert_eq!(
             extract_text_bytes(&utf8, 0).unwrap(),
@@ -2111,6 +2313,11 @@ mod tests {
         assert_eq!(
             extract_text_bytes(&binary, 0).unwrap(),
             Some(b"bytes".to_vec())
+        );
+        let binary_with_sentinels = BinaryArray::from(vec![b"a\xFFb\0c" as &[u8]]);
+        assert_eq!(
+            extract_sanitized_text_bytes(&binary_with_sentinels, 0).unwrap(),
+            Some(b"a b c".to_vec())
         );
 
         let large_binary = LargeBinaryArray::from(vec![b"large" as &[u8]]);
@@ -2153,7 +2360,7 @@ mod tests {
                 .unwrap();
 
             let stats = index.statistics().unwrap();
-            assert_eq!(stats["type"], "FMIndex");
+            assert_eq!(stats["type"], "Fm");
             assert_eq!(stats["total_docs"], 10);
             assert!(stats["total_bwt_len"].as_u64().unwrap() > 0);
         });

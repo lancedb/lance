@@ -290,7 +290,7 @@ async fn build_partial_fixture(dataset: &mut Dataset, bench_case: BenchCase) -> 
         builder = builder
             .name("distributed_merge_only".to_string())
             .fragments(fragments)
-            .index_uuid(fixture_uuid.to_string());
+            .index_uuid(fixture_uuid);
         Box::pin(builder.execute_uncommitted()).await.unwrap();
     }
 
@@ -416,7 +416,7 @@ fn bench_distributed_merge_only(c: &mut Criterion) {
                     || prepare_iteration_target(&source_index_dir_fs, &target_index_dir_fs),
                     |_| {
                         rt.block_on(dataset.merge_index_metadata(
-                            &target_uuid.to_string(),
+                            &target_uuid,
                             IndexType::IvfPq,
                             None,
                             noop_progress(),

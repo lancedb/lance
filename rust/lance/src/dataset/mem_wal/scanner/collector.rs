@@ -229,6 +229,19 @@ impl LsmDataSourceCollector {
             .collect()
     }
 
+    /// True when `generation` for `shard_id` is still pinned in memory as a
+    /// frozen memtable. During the post-flush grace window a generation is both
+    /// committed to the manifest (a flushed source) and held in memory (an
+    /// in-memory source); it must be served only from memory — which preserves
+    /// the per-batch boundaries the flushed dataset has lost, so as-of reads
+    /// stay snapshot-bounded — and its on-disk copy skipped to avoid scanning
+    /// the generation twice. See `ShardWriterConfig::frozen_memtable_grace`.
+    fn flushed_gen_pinned_in_memory(&self, shard_id: &Uuid, generation: u64) -> bool {
+        self.in_memory_memtables
+            .get(shard_id)
+            .is_some_and(|mems| mems.frozen.iter().any(|f| f.generation == generation))
+    }
+
     /// Collect all data sources.
     ///
     /// Returns sources in a consistent order:
@@ -246,6 +259,9 @@ impl LsmDataSourceCollector {
 
         for snapshot in &self.shard_snapshots {
             for flushed in &snapshot.flushed_generations {
+                if self.flushed_gen_pinned_in_memory(&snapshot.shard_id, flushed.generation) {
+                    continue;
+                }
                 let path = self.resolve_flushed_path(&snapshot.shard_id, &flushed.path);
                 sources.push(LsmDataSource::FlushedMemTable {
                     path,
@@ -284,6 +300,9 @@ impl LsmDataSourceCollector {
             }
 
             for flushed in &snapshot.flushed_generations {
+                if self.flushed_gen_pinned_in_memory(&snapshot.shard_id, flushed.generation) {
+                    continue;
+                }
                 let path = self.resolve_flushed_path(&snapshot.shard_id, &flushed.path);
                 sources.push(LsmDataSource::FlushedMemTable {
                     path,
@@ -442,5 +461,54 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    /// During the post-flush grace window a generation is both committed to the
+    /// manifest (a flushed source) and still pinned in memory (a frozen
+    /// source). The collector must emit it once, from memory — so as-of reads
+    /// keep batch-resolved membership — and skip the on-disk copy. Flushed
+    /// generations NOT pinned in memory are still emitted from disk.
+    #[test]
+    fn test_collect_suppresses_flushed_gen_pinned_in_memory() {
+        let shard = Uuid::new_v4();
+        // Manifest lists gens 1 and 2 as flushed; gen 2 is still pinned in
+        // memory (just flushed, within grace), gen 1 has been swept.
+        let snapshot = ShardSnapshot {
+            shard_id: shard,
+            spec_id: 0,
+            current_generation: 3,
+            flushed_generations: vec![
+                FlushedGeneration {
+                    generation: 1,
+                    path: "gen_1".to_string(),
+                },
+                FlushedGeneration {
+                    generation: 2,
+                    path: "gen_2".to_string(),
+                },
+            ],
+        };
+        let mems = InMemoryMemTables {
+            active: memtable_ref(3),
+            frozen: vec![memtable_ref(2)],
+        };
+        let collector = LsmDataSourceCollector::without_base_table("/tmp/x", vec![snapshot])
+            .with_in_memory_memtables(shard, mems);
+
+        let sources = collector.collect().unwrap();
+        // gen 1: on-disk (not pinned). gen 2: in-memory only (pinned, disk
+        // copy suppressed). gen 3: active. No duplicate gen 2.
+        let flushed: Vec<u64> = sources
+            .iter()
+            .filter(|s| !s.is_active_memtable())
+            .map(|s| s.generation().as_u64())
+            .collect();
+        let in_memory: Vec<u64> = sources
+            .iter()
+            .filter(|s| s.is_active_memtable())
+            .map(|s| s.generation().as_u64())
+            .collect();
+        assert_eq!(flushed, vec![1], "only the unpinned flushed gen from disk");
+        assert_eq!(in_memory, vec![2, 3], "pinned gen 2 served from memory");
     }
 }

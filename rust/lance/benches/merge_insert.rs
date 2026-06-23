@@ -15,6 +15,9 @@
 //! computation. The other shapes (`clean`, `with_new_rows_only`,
 //! `with_deletions_only`) skip that branch and serve as controls.
 //!
+//! The `composite_key_indexed` shape covers merge_insert joined on two
+//! indexed key columns, which probes every index and AND-folds the results.
+//!
 //! Run with `cargo bench --bench merge_insert`.
 
 use std::sync::Arc;
@@ -127,6 +130,90 @@ async fn one_merge_insert(ds: Arc<Dataset>, base_existing: i64, base_new: i64) {
     let _ = job.execute_reader(reader).await.unwrap();
 }
 
+// --- Composite-key shape: join on (a, b) with a BTree index on each key ---
+//
+// Exercises the multi-index probe path: one `IsIn` query per indexed key
+// column, AND-folded inside a single `MapIndexExec`, followed by the
+// composite hash join.  `b` is a deterministic function of `a` so source
+// rows can target existing composite keys without tracking extra state.
+
+fn composite_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+    ]))
+}
+
+fn composite_b(a: i64) -> i64 {
+    a * 7 + 3
+}
+
+fn make_composite_batch(start: i64, n: usize) -> RecordBatch {
+    let a = Int64Array::from_iter_values(start..start + n as i64);
+    let b = Int64Array::from_iter_values((start..start + n as i64).map(composite_b));
+    RecordBatch::try_new(composite_schema(), vec![Arc::new(a), Arc::new(b)]).unwrap()
+}
+
+async fn build_composite_key_indexed() -> (TempStrDir, Arc<Dataset>) {
+    let dir = TempStrDir::default();
+    let path = dir.as_str().to_string();
+    let total = ROWS_PER_FRAG * NUM_FRAGS;
+    let mut batches = Vec::new();
+    let mut start = 0i64;
+    while (start as u64) < total {
+        let n = (total - start as u64).min(ROWS_PER_FRAG) as usize;
+        batches.push(make_composite_batch(start, n));
+        start += n as i64;
+    }
+    let params = WriteParams {
+        max_rows_per_file: ROWS_PER_FRAG as usize,
+        max_rows_per_group: ROWS_PER_FRAG as usize,
+        mode: WriteMode::Create,
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), composite_schema());
+    Dataset::write(reader, &path, Some(params)).await.unwrap();
+
+    let mut ds = Dataset::open(&path).await.unwrap();
+    for col in ["a", "b"] {
+        ds.create_index(
+            &[col],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    (dir, Arc::new(ds))
+}
+
+/// Composite-key merge_insert op: 30 updates of existing (a, b) pairs +
+/// 70 inserts of new pairs, joined on both columns.
+async fn one_composite_merge_insert(ds: Arc<Dataset>, base_existing: i64, base_new: i64) {
+    let mut a_vals: Vec<i64> = (0..30).map(|i| base_existing + i).collect();
+    a_vals.extend(base_new..base_new + 70);
+    let b_vals: Vec<i64> = a_vals.iter().copied().map(composite_b).collect();
+    let batch = RecordBatch::try_new(
+        composite_schema(),
+        vec![
+            Arc::new(Int64Array::from(a_vals)),
+            Arc::new(Int64Array::from(b_vals)),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(std::iter::once(Ok(batch)), composite_schema());
+
+    let mut builder =
+        MergeInsertBuilder::try_new(ds, vec!["a".to_string(), "b".to_string()]).unwrap();
+    builder
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll);
+    let job = builder.try_build().unwrap();
+    let _ = job.execute_reader(reader).await.unwrap();
+}
+
 async fn build_clean() -> (TempStrDir, Arc<Dataset>) {
     let dir = TempStrDir::default();
     let path = dir.as_str().to_string();
@@ -161,10 +248,12 @@ async fn build_with_new_rows_and_deletions() -> (TempStrDir, Arc<Dataset>) {
     (dir, Arc::new(ds))
 }
 
-fn bench_one_shape<F, Fut>(c: &mut Criterion, name: &str, builder: F)
+fn bench_one_shape<F, Fut, M, MFut>(c: &mut Criterion, name: &str, builder: F, merge: M)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = (TempStrDir, Arc<Dataset>)>,
+    M: Fn(Arc<Dataset>, i64, i64) -> MFut + Copy,
+    MFut: std::future::Future<Output = ()>,
 {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (_dir, ds) = rt.block_on(builder());
@@ -183,29 +272,40 @@ where
                 bench_ds.restore().await.unwrap();
                 let arc = Arc::new(bench_ds);
                 // base_existing in the indexed range, base_new beyond all data so it's an insert.
-                one_merge_insert(arc, 100, total + 1_000_000).await;
+                merge(arc, 100, total + 1_000_000).await;
             })
         })
     });
 }
 
 fn bench_merge_insert(c: &mut Criterion) {
-    bench_one_shape(c, "merge_insert/clean", build_clean);
+    bench_one_shape(c, "merge_insert/clean", build_clean, one_merge_insert);
     bench_one_shape(
         c,
         "merge_insert/with_new_rows_only",
         build_with_new_rows_only,
+        one_merge_insert,
     );
     bench_one_shape(
         c,
         "merge_insert/with_deletions_only",
         build_with_deletions_only,
+        one_merge_insert,
     );
     // The shape that exercises the AllowList(Full) - BlockList(Partial) path.
     bench_one_shape(
         c,
         "merge_insert/with_new_rows_and_deletions",
         build_with_new_rows_and_deletions,
+        one_merge_insert,
+    );
+    // Composite key joined on (a, b), both BTree-indexed: exercises the
+    // AND-folded multi-index probe inside MapIndexExec.
+    bench_one_shape(
+        c,
+        "merge_insert/composite_key_indexed",
+        build_composite_key_indexed,
+        one_composite_merge_insert,
     );
 }
 

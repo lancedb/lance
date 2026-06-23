@@ -18,9 +18,10 @@ write:
 3. Lance plans and builds index artifacts from the worker outputs supplied by the caller
 4. the built artifacts are committed into the dataset manifest
 
-For vector indices, the worker outputs are segments stored directly
-under `indices/<segment_uuid>/`. Lance can turn these outputs into one or more
-physical segments and then commit them as one logical index.
+For vector indices and segment-native scalar indices, the worker outputs are
+segments stored directly under `indices/<segment_uuid>/`. Lance can turn these
+outputs into one or more physical segments and then commit them as one logical
+index.
 
 ![Distributed Vector Segment Build](../images/distributed_vector_segment_build.svg)
 
@@ -81,7 +82,7 @@ launching workers and driving the overall workflow.
 
 ## Current Model
 
-The current model for distributed vector indexing has two layers of parallelism.
+The current model for distributed indexing has two layers of parallelism.
 
 ### Worker Build
 
@@ -104,6 +105,12 @@ or merged into larger segments:
 3. commit the final segment list with `commit_existing_index_segments(...)`
 
 Within a single commit, built segments must have disjoint fragment coverage.
+
+`merge_existing_index_segments(...)` currently supports vector, inverted,
+bitmap, BTree, and zone map segments. Other scalar index families can still
+commit multiple compatible segments directly when their build path supports
+fragment-scoped segments, but cannot be merged into a larger physical segment
+until they add a merge implementation.
 
 ### Vector Model Scope
 
@@ -138,7 +145,7 @@ trained segments as separate physical segments.
 
 ## Internal Finalize Model
 
-Internally, Lance models distributed vector segment build as:
+Internally, Lance models distributed segment build as:
 
 1. **build** one uncommitted segment per worker
 2. **optionally merge** caller-defined groups of existing segments

@@ -47,8 +47,10 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
+use super::scanner::GenerationWarmer;
 use super::wal::{
-    TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, WalTailer, empty_flush_result,
+    BatchDurableWatcher, TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, WalTailer,
+    empty_flush_result,
 };
 
 use super::manifest::ShardManifestStore;
@@ -177,6 +179,21 @@ pub struct ShardWriterConfig {
     /// Default: 60 seconds
     pub stats_log_interval: Option<Duration>,
 
+    /// How long a frozen memtable lingers in memory after its flush commits,
+    /// before it is evicted and served only from the on-disk flushed dataset.
+    ///
+    /// `Duration::ZERO` (the default) disables retention: evict on commit, no
+    /// sweep ticker. Correct for single-shot queries, which can't observe a
+    /// generation evicted mid-read.
+    ///
+    /// A non-zero value is required only for queries split across reads (e.g.
+    /// fresh tier and base table read separately, then deduped): the flushed
+    /// dataset loses the per-batch boundaries that bound as-of membership
+    /// (see [`crate::dataset::mem_wal::scanner::FreshTierWatermark`]), so a
+    /// generation evicted between a query's reads can serve a stale row. Set it
+    /// above the worst-case multi-part query latency, with margin.
+    pub frozen_memtable_grace: Duration,
+
     /// Whether to maintain an in-memory MemTable on top of the WAL.
     ///
     /// When `true` (default), the writer maintains an in-memory `MemTable`,
@@ -216,6 +233,11 @@ pub struct ShardWriterConfig {
     ///
     /// Default: empty.
     pub hnsw_params: HashMap<String, HnswBuildParams>,
+
+    /// Optional warmer fired pre-commit for each new generation (zero cold reads
+    /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
+    /// WAL pod). Default: `None`.
+    pub warmer: Option<Arc<dyn GenerationWarmer>>,
 }
 
 impl Default for ShardWriterConfig {
@@ -236,8 +258,10 @@ impl Default for ShardWriterConfig {
             async_index_buffer_rows: 10_000,
             async_index_interval: Duration::from_secs(1),
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
+            frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
             hnsw_params: HashMap::new(),
+            warmer: None,
         }
     }
 }
@@ -332,6 +356,13 @@ impl ShardWriterConfig {
     /// Set stats logging interval. Use None to disable periodic stats logging.
     pub fn with_stats_log_interval(mut self, interval: Option<Duration>) -> Self {
         self.stats_log_interval = interval;
+        self
+    }
+
+    /// Set how long a flushed memtable lingers in memory before eviction. MUST
+    /// exceed the maximum query elapsed time — see `frozen_memtable_grace`.
+    pub fn with_frozen_memtable_grace(mut self, grace: Duration) -> Self {
+        self.frozen_memtable_grace = grace;
         self
     }
 
@@ -708,6 +739,15 @@ pub struct WriteResult {
     pub batch_positions: std::ops::Range<usize>,
 }
 
+/// A sealed memtable kept queryable in memory. `flushed_at_ms` is `None` while
+/// the generation is still awaiting (or retrying) its flush, and `Some(t)` once
+/// the flush commits — after which it lingers for `frozen_memtable_grace` so
+/// in-flight as-of reads keep batch-resolved membership, then is swept.
+struct FrozenMemTable {
+    memtable: Arc<MemTable>,
+    flushed_at_ms: Option<u64>,
+}
+
 /// ShardWriter state shared across tasks.
 struct WriterState {
     memtable: MemTable,
@@ -716,12 +756,13 @@ struct WriterState {
     frozen_memtable_bytes: usize,
     /// Flush watchers for frozen memtables (for backpressure).
     frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher)>,
-    /// Sealed-but-undrained memtables, kept queryable so a concurrent reader
-    /// sees no hole between `freeze_memtable` and the flush task's manifest
-    /// commit. Pushed in `freeze_memtable`; removed by generation in
-    /// `flush_memtable` on commit success only (retained on failure until a
-    /// later flush or WAL replay on reopen).
-    frozen_memtables: VecDeque<Arc<MemTable>>,
+    /// Sealed memtables, kept queryable so a concurrent reader sees no hole
+    /// between `freeze_memtable` and the flush task's manifest commit, and for
+    /// `frozen_memtable_grace` beyond it so as-of reads stay batch-resolved.
+    /// Pushed in `freeze_memtable`; stamped `flushed_at_ms` by `flush_memtable`
+    /// on commit success only (retained un-stamped on failure until a later
+    /// flush or WAL replay on reopen); swept after the grace by `SweepExpired`.
+    frozen_memtables: VecDeque<FrozenMemTable>,
     /// Flag to prevent duplicate memtable flush requests.
     flush_requested: bool,
     /// Counter for WAL flush threshold crossings.
@@ -846,6 +887,16 @@ async fn replay_memtable_from_wal(
     Ok(position)
 }
 
+/// Pair each primary-key column name with its field id (both derived from the
+/// schema's primary key, in the same order) for [`IndexStore::enable_pk_index`].
+fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String, i32)> {
+    pk_columns
+        .iter()
+        .cloned()
+        .zip(pk_field_ids.iter().copied())
+        .collect()
+}
+
 /// Shared state for writer operations.
 struct SharedWriterState {
     state: Arc<RwLock<WriterState>>,
@@ -855,6 +906,9 @@ struct SharedWriterState {
     config: ShardWriterConfig,
     schema: Arc<ArrowSchema>,
     pk_field_ids: Vec<i32>,
+    /// Primary-key column names, used to (re)enable the PK-position index on
+    /// each fresh active memtable created at freeze.
+    pk_columns: Vec<String>,
     max_memtable_batches: usize,
     max_memtable_rows: usize,
     index_configs: Vec<MemIndexConfig>,
@@ -870,6 +924,7 @@ impl SharedWriterState {
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
         pk_field_ids: Vec<i32>,
+        pk_columns: Vec<String>,
         max_memtable_batches: usize,
         max_memtable_rows: usize,
         index_configs: Vec<MemIndexConfig>,
@@ -882,6 +937,7 @@ impl SharedWriterState {
             config,
             schema,
             pk_field_ids,
+            pk_columns,
             max_memtable_batches,
             max_memtable_rows,
             index_configs,
@@ -907,13 +963,17 @@ impl SharedWriterState {
             self.max_memtable_batches,
         )?;
 
-        if !self.index_configs.is_empty() {
-            let indexes = Arc::new(IndexStore::from_configs(
+        // Build an IndexStore when there are user indexes *or* a primary key:
+        // the PK dedup index (and its flushed on-disk sidecar) is required for
+        // cross-generation dedup even when no secondary index is configured.
+        if !self.index_configs.is_empty() || !self.pk_columns.is_empty() {
+            let mut indexes = IndexStore::from_configs(
                 &self.index_configs,
                 self.max_memtable_rows,
                 self.max_memtable_batches,
-            )?);
-            new_memtable.set_indexes_arc(indexes);
+            )?;
+            indexes.enable_pk_index(&pk_index_columns(&self.pk_columns, &self.pk_field_ids));
+            new_memtable.set_indexes_arc(Arc::new(indexes));
         }
 
         let mut old_memtable = std::mem::replace(&mut state.memtable, new_memtable);
@@ -949,10 +1009,13 @@ impl SharedWriterState {
 
         let frozen_memtable = Arc::new(old_memtable);
 
-        // Keep this generation queryable until its manifest commit lands
-        // (dropped in `flush_memtable`, success only). Arc refcount, not a
-        // copy — the flush task holds it alive for the whole drain anyway.
-        state.frozen_memtables.push_back(frozen_memtable.clone());
+        // Keep this generation queryable past its manifest commit (swept after
+        // the grace by `SweepExpired`). Arc refcount, not a copy — the flush
+        // task holds it alive for the whole drain anyway.
+        state.frozen_memtables.push_back(FrozenMemTable {
+            memtable: frozen_memtable.clone(),
+            flushed_at_ms: None,
+        });
 
         debug!(
             "Frozen memtable generation {}, pending_count = {}",
@@ -960,7 +1023,7 @@ impl SharedWriterState {
             state.frozen_flush_watchers.len()
         );
 
-        let _ = self.memtable_flush_tx.send(TriggerMemTableFlush {
+        let _ = self.memtable_flush_tx.send(TriggerMemTableFlush::Flush {
             memtable: frozen_memtable,
             done: None,
         });
@@ -1287,11 +1350,9 @@ impl ShardWriter {
     ) -> Result<WriterMode> {
         // Create MemTable with primary key field IDs from schema
         let lance_schema = Schema::try_from(schema.as_ref())?;
-        let pk_field_ids: Vec<i32> = lance_schema
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.id)
-            .collect();
+        let pk_fields = lance_schema.unenforced_primary_key();
+        let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
+        let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
         let mut memtable = MemTable::with_capacity(
             schema.clone(),
             manifest.current_generation,
@@ -1300,14 +1361,18 @@ impl ShardWriter {
             config.max_memtable_batches,
         )?;
 
-        // Create indexes if configured and set them on the MemTable.
-        if !index_configs.is_empty() {
-            let indexes = Arc::new(IndexStore::from_configs(
+        // Create indexes if configured and set them on the MemTable. The
+        // PK-position index is enabled before any WAL replay below so replayed
+        // rows are recorded in it. A primary key alone (no secondary index)
+        // still needs the PK index so flush writes its on-disk dedup sidecar.
+        if !index_configs.is_empty() || !pk_columns.is_empty() {
+            let mut indexes = IndexStore::from_configs(
                 index_configs,
                 config.max_memtable_rows,
                 config.max_memtable_batches,
-            )?);
-            memtable.set_indexes_arc(indexes);
+            )?;
+            indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
+            memtable.set_indexes_arc(Arc::new(indexes));
         }
 
         // Replay any WAL entries written after the last successfully-flushed
@@ -1357,13 +1422,10 @@ impl ShardWriter {
 
         let (memtable_flush_tx, memtable_flush_rx) = mpsc::unbounded_channel();
 
-        let flusher = Arc::new(MemTableFlusher::new(
-            object_store,
-            base_path,
-            base_uri,
-            shard_id,
-            manifest_store,
-        ));
+        let flusher = Arc::new(
+            MemTableFlusher::new(object_store, base_path, base_uri, shard_id, manifest_store)
+                .with_warmer(config.warmer.clone()),
+        );
 
         let backpressure = BackpressureController::new(config.clone());
 
@@ -1378,8 +1440,14 @@ impl ShardWriter {
 
         // Background MemTable flush handler — frozen memtable to Lance file.
         // It rebuilds the same secondary indexes on each flushed generation.
-        let memtable_handler =
-            MemTableFlushHandler::new(state.clone(), flusher, epoch, index_configs.to_vec(), stats);
+        let memtable_handler = MemTableFlushHandler::new(
+            state.clone(),
+            flusher,
+            epoch,
+            index_configs.to_vec(),
+            stats,
+            config.frozen_memtable_grace,
+        );
         task_executor.add_handler(
             "memtable_flusher".to_string(),
             Box::new(memtable_handler),
@@ -1395,6 +1463,7 @@ impl ShardWriter {
             config.clone(),
             schema.clone(),
             pk_field_ids,
+            pk_columns,
             config.max_memtable_batches,
             config.max_memtable_rows,
             index_configs.to_vec(),
@@ -1460,14 +1529,7 @@ impl ShardWriter {
     /// `AlreadyExists`, indicating this writer has been fenced.
     #[instrument(name = "sw_put", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
     pub async fn put(&self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
-        if batches.is_empty() {
-            return Err(Error::invalid_input("Cannot write empty batch list"));
-        }
-        for (i, batch) in batches.iter().enumerate() {
-            if batch.num_rows() == 0 {
-                return Err(Error::invalid_input(format!("Batch {} is empty", i)));
-            }
-        }
+        Self::validate_non_empty(&batches)?;
 
         match &self.mode {
             WriterMode::MemTable {
@@ -1490,6 +1552,51 @@ impl ShardWriter {
         }
     }
 
+    /// Like [`Self::put`], but returns the durability watcher *without* awaiting
+    /// it. The row is visible to reads on this writer the instant this returns;
+    /// the caller awaits durability via the watcher (`None` when `durable_write`
+    /// is off).
+    ///
+    /// This lets a caller hold an *external* lock across only the in-memory
+    /// read-merge-insert and await durability after releasing it, so concurrent
+    /// flushes still coalesce. The insert stays guarded by the internal
+    /// `state_lock`, so `BatchStore`'s single-writer invariant holds regardless.
+    ///
+    /// MemTable mode only; errors in WAL-only mode (no in-memory tier).
+    #[instrument(name = "sw_put_no_wait", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
+    pub async fn put_no_wait(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
+        Self::validate_non_empty(&batches)?;
+
+        match &self.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                backpressure,
+            } => {
+                self.put_memtable_no_wait(batches, state, writer_state, backpressure)
+                    .await
+            }
+            WriterMode::WalOnly { .. } => Err(Error::invalid_input(
+                "put_no_wait is only supported in MemTable mode",
+            )),
+        }
+    }
+
+    fn validate_non_empty(batches: &[RecordBatch]) -> Result<()> {
+        if batches.is_empty() {
+            return Err(Error::invalid_input("Cannot write empty batch list"));
+        }
+        for (i, batch) in batches.iter().enumerate() {
+            if batch.num_rows() == 0 {
+                return Err(Error::invalid_input(format!("Batch {} is empty", i)));
+            }
+        }
+        Ok(())
+    }
+
     async fn put_memtable(
         &self,
         batches: Vec<RecordBatch>,
@@ -1497,6 +1604,26 @@ impl ShardWriter {
         writer_state: &Arc<SharedWriterState>,
         backpressure: &BackpressureController,
     ) -> Result<WriteResult> {
+        let (result, watcher) = self
+            .put_memtable_no_wait(batches, state_lock, writer_state, backpressure)
+            .await?;
+        // Wait for durability if configured (outside the lock).
+        if let Some(mut watcher) = watcher {
+            watcher.wait().await?;
+        }
+        Ok(result)
+    }
+
+    /// In-memory half of [`Self::put_memtable`]: insert under `state_lock`,
+    /// trigger the WAL flush, and return the watcher un-awaited for the caller
+    /// to wait on. `None` when `durable_write` is off. See [`Self::put_no_wait`].
+    async fn put_memtable_no_wait(
+        &self,
+        batches: Vec<RecordBatch>,
+        state_lock: &Arc<RwLock<WriterState>>,
+        writer_state: &Arc<SharedWriterState>,
+        backpressure: &BackpressureController,
+    ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
         // Apply backpressure if needed (before acquiring main lock)
         backpressure
             .maybe_apply_backpressure(|| {
@@ -1510,7 +1637,7 @@ impl ShardWriter {
         let start = std::time::Instant::now();
 
         // Acquire write lock for entire operation (atomic approach)
-        let (batch_positions, mut durable_watcher, batch_store, indexes) = {
+        let (batch_positions, durable_watcher, batch_store, indexes) = {
             let mut state = state_lock.write().await;
 
             // 1. Insert all batches into memtable atomically
@@ -1541,8 +1668,9 @@ impl ShardWriter {
 
         self.stats.record_put(start.elapsed());
 
-        // Wait for durability if configured (outside the lock)
-        if self.config.durable_write {
+        // Trigger the flush here (outside the lock) so the watcher can resolve;
+        // only the `wait()` is the caller's to schedule.
+        let watcher = if self.config.durable_write {
             self.wal_flusher.trigger_flush(
                 WalFlushSource::BatchStore {
                     batch_store,
@@ -1551,10 +1679,12 @@ impl ShardWriter {
                 batch_positions.end,
                 None,
             )?;
-            durable_watcher.wait().await?;
-        }
+            Some(durable_watcher)
+        } else {
+            None
+        };
 
-        Ok(WriteResult { batch_positions })
+        Ok((WriteResult { batch_positions }, watcher))
     }
 
     async fn put_wal_only(
@@ -1789,7 +1919,7 @@ impl ShardWriter {
             frozen: state
                 .frozen_memtables
                 .iter()
-                .map(|m| in_memory_ref(m))
+                .map(|m| in_memory_ref(&m.memtable))
                 .collect(),
         })
     }
@@ -2182,6 +2312,9 @@ struct MemTableFlushHandler {
     /// at all.
     index_configs: Vec<MemIndexConfig>,
     stats: SharedWriteStats,
+    /// How long a frozen memtable lingers in memory after its flush commits
+    /// before `SweepExpired` evicts it. See `ShardWriterConfig::frozen_memtable_grace`.
+    grace: Duration,
 }
 
 impl MemTableFlushHandler {
@@ -2191,6 +2324,7 @@ impl MemTableFlushHandler {
         epoch: u64,
         index_configs: Vec<MemIndexConfig>,
         stats: SharedWriteStats,
+        grace: Duration,
     ) -> Self {
         Self {
             state,
@@ -2198,22 +2332,51 @@ impl MemTableFlushHandler {
             epoch,
             index_configs,
             stats,
+            grace,
         }
+    }
+
+    /// Evict frozen memtables whose post-flush grace has elapsed. Un-stamped
+    /// (not-yet-flushed) entries are always kept.
+    async fn sweep_expired_frozen(&self) {
+        let now = now_millis();
+        let grace_ms = self.grace.as_millis() as u64;
+        let mut state = self.state.write().await;
+        state
+            .frozen_memtables
+            .retain(|frozen| match frozen.flushed_at_ms {
+                Some(flushed_at) => now.saturating_sub(flushed_at) < grace_ms,
+                None => true,
+            });
     }
 }
 
 #[async_trait]
 impl MessageHandler<TriggerMemTableFlush> for MemTableFlushHandler {
-    async fn handle(&mut self, message: TriggerMemTableFlush) -> Result<()> {
-        let TriggerMemTableFlush { memtable, done } = message;
+    fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerMemTableFlush>)> {
+        // Zero grace evicts on commit, so no sweeper is needed.
+        if self.grace.is_zero() {
+            return vec![];
+        }
+        // Sweep often enough that eviction lags the grace by at most ~1/3, so a
+        // generation lives no more than ~grace * 4/3 past its flush commit.
+        let tick = (self.grace / 3).max(Duration::from_millis(100));
+        vec![(tick, Box::new(|| TriggerMemTableFlush::SweepExpired))]
+    }
 
-        let result = self.flush_memtable(memtable).await;
-        if let Some(tx) = done {
-            // Send result through the channel - caller is waiting for it
-            let _ = tx.send(result);
-        } else {
-            // No done channel, propagate errors
-            result?;
+    async fn handle(&mut self, message: TriggerMemTableFlush) -> Result<()> {
+        match message {
+            TriggerMemTableFlush::Flush { memtable, done } => {
+                let result = self.flush_memtable(memtable).await;
+                if let Some(tx) = done {
+                    // Send result through the channel - caller is waiting for it
+                    let _ = tx.send(result);
+                } else {
+                    // No done channel, propagate errors
+                    result?;
+                }
+            }
+            TriggerMemTableFlush::SweepExpired => self.sweep_expired_frozen().await,
         }
         Ok(())
     }
@@ -2307,15 +2470,26 @@ impl MemTableFlushHandler {
                 state.frozen_memtable_bytes =
                     state.frozen_memtable_bytes.saturating_sub(memtable_size);
             }
-            // Drop the queryable handle ONLY on commit success. On failure
-            // keep it: rows must stay in the read union until a later flush
-            // or WAL replay, else a transient flush error reopens the hole.
-            // Keyed by generation, so non-FIFO completion is fine.
+            // Retire the frozen handle on commit success, keyed by generation
+            // (non-FIFO completion is fine). Zero grace evicts here; otherwise
+            // stamp the grace clock so it lingers for multi-part as-of reads
+            // until `SweepExpired`. On failure leave it un-stamped: rows stay in
+            // the read union until a later flush or WAL replay, else a transient
+            // error reopens the hole.
             if flush_result.is_ok() {
                 let flushed_generation = memtable.generation();
-                state
-                    .frozen_memtables
-                    .retain(|m| m.generation() != flushed_generation);
+                if self.grace.is_zero() {
+                    state
+                        .frozen_memtables
+                        .retain(|frozen| frozen.memtable.generation() != flushed_generation);
+                } else {
+                    let now = now_millis();
+                    for frozen in state.frozen_memtables.iter_mut() {
+                        if frozen.memtable.generation() == flushed_generation {
+                            frozen.flushed_at_ms = Some(now);
+                        }
+                    }
+                }
             }
         }
 
@@ -2699,6 +2873,75 @@ mod tests {
         assert_eq!(stats.batch_count, 1);
 
         // Close writer
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_put_no_wait_durable_visible_then_durable() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let batch = create_test_batch(&schema, 0, 10);
+        let (result, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
+        assert_eq!(result.batch_positions, 0..1);
+
+        // Row is visible in memory before durability is awaited.
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(stats.row_count, 10);
+
+        // durable_write is on, so a watcher is returned and resolves once the
+        // triggered flush lands.
+        let mut watcher = watcher.expect("durable_write returns a watcher");
+        watcher.wait().await.unwrap();
+
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_put_no_wait_non_durable_returns_no_watcher() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let batch = create_test_batch(&schema, 0, 10);
+        let (result, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
+        assert_eq!(result.batch_positions, 0..1);
+        assert!(watcher.is_none(), "non-durable put has nothing to await");
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(stats.row_count, 10);
+
         writer.close().await.unwrap();
     }
 
@@ -4198,10 +4441,12 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    /// On a successful flush commit the sealed generation is dropped from
-    /// the queryable set (no leak), and its rows land in the manifest.
+    /// On a successful flush commit the sealed generation's rows land in the
+    /// manifest immediately, but the in-memory handle is NOT dropped — it
+    /// lingers for `frozen_memtable_grace` (so in-flight as-of reads keep
+    /// batch-resolved membership), then is swept by the `SweepExpired` ticker.
     #[tokio::test]
-    async fn test_frozen_dropped_after_successful_flush() {
+    async fn test_frozen_retained_during_grace_then_swept() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
         let config = ShardWriterConfig {
@@ -4213,6 +4458,8 @@ mod tests {
             max_wal_flush_interval: None,
             max_memtable_size: 64 * 1024 * 1024,
             manifest_scan_batch_size: 2,
+            // Short grace so the sweep is observable without a slow test.
+            frozen_memtable_grace: Duration::from_secs(1),
             ..Default::default()
         };
         let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
@@ -4227,13 +4474,7 @@ mod tests {
         writer.force_seal_active().await.unwrap();
         writer.wait_for_flush_drain().await.unwrap();
 
-        let refs = writer.in_memory_memtable_refs().await.unwrap();
-        assert!(
-            refs.frozen.is_empty(),
-            "frozen handle must be dropped once the flush commit lands"
-        );
-        assert_eq!(refs.active.generation, initial_gen + 1);
-
+        // Recorded in the manifest at commit time.
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
         assert!(
             manifest
@@ -4241,6 +4482,72 @@ mod tests {
                 .iter()
                 .any(|g| g.generation == initial_gen),
             "flushed generation must be recorded in the manifest"
+        );
+
+        // Still queryable in memory immediately after commit (within grace).
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        assert_eq!(refs.active.generation, initial_gen + 1);
+        assert!(
+            refs.frozen.iter().any(|f| f.generation == initial_gen),
+            "flushed generation must stay queryable during the grace window"
+        );
+
+        // After the grace elapses (plus a sweep tick) the handle is evicted.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        assert!(
+            refs.frozen.is_empty(),
+            "frozen handle must be swept once the grace elapses"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// With zero grace (the default) a frozen handle is evicted synchronously on
+    /// flush commit — no sweep tick, no lingering window.
+    #[tokio::test]
+    async fn test_frozen_evicted_immediately_with_zero_grace() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            frozen_memtable_grace: Duration::ZERO,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let initial_gen = writer.memtable_stats().await.unwrap().generation;
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        // Rows are durably in the manifest...
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        assert!(
+            manifest
+                .flushed_generations
+                .iter()
+                .any(|g| g.generation == initial_gen),
+            "flushed generation must be recorded in the manifest"
+        );
+
+        // ...and the in-memory handle is already gone, no sweep tick needed.
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        assert!(
+            refs.frozen.is_empty(),
+            "frozen handle must be evicted on commit when grace is zero"
         );
 
         writer.close().await.unwrap();

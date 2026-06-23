@@ -61,6 +61,7 @@ use std::iter::empty;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 
@@ -200,7 +201,8 @@ impl BlockingDataset {
         if namespace_client_managed_versioning
             && let (Some(namespace_client), Some(tid)) = (namespace, table_id)
         {
-            let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
+            let external_store =
+                LanceNamespaceExternalManifestStore::for_table_uri(namespace_client, tid, uri)?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -688,8 +690,11 @@ fn create_dataset<'local>(
     if let Some((namespace, table_id)) = namespace_info {
         // Set up commit handler only if namespace manages versioning
         if namespace_client_managed_versioning {
-            let external_store =
-                LanceNamespaceExternalManifestStore::new(namespace.clone(), table_id.clone());
+            let external_store = LanceNamespaceExternalManifestStore::for_table_uri(
+                namespace.clone(),
+                table_id.clone(),
+                &path_str,
+            )?;
             let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
                 external_manifest_store: Arc::new(external_store),
             });
@@ -951,7 +956,13 @@ fn inner_create_index<'local>(
     let fragment_ids = env
         .get_ints_opt(&fragments_jobj)?
         .map(|vec| vec.into_iter().map(|i| i as u32).collect());
-    let index_uuid = env.get_string_opt(&index_uuid_jobj)?;
+    let index_uuid = env
+        .get_string_opt(&index_uuid_jobj)?
+        .map(|s| {
+            Uuid::parse_str(&s)
+                .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))
+        })
+        .transpose()?;
     let arrow_stream_addr_opt = env.get_long_opt(&arrow_stream_addr_jobj)?;
     let batch_reader = if let Some(arrow_stream_addr) = arrow_stream_addr_opt {
         let stream_ptr = arrow_stream_addr as *mut FFI_ArrowArrayStream;
@@ -974,7 +985,7 @@ fn inner_create_index<'local>(
         | IndexType::NGram
         | IndexType::ZoneMap
         | IndexType::BloomFilter
-        | IndexType::FMIndex
+        | IndexType::Fm
         | IndexType::RTree => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
@@ -1089,7 +1100,9 @@ fn inner_merge_index_metadata(
     index_type_code_jobj: jint,
     batch_readhead_jobj: JObject, // Optional<Integer>
 ) -> Result<()> {
-    let index_uuid = index_uuid.extract(env)?;
+    let index_uuid_str = index_uuid.extract(env)?;
+    let index_uuid = Uuid::parse_str(&index_uuid_str)
+        .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))?;
     let index_type = IndexType::try_from(index_type_code_jobj)?;
     let batch_readhead = env
         .get_int_opt(&batch_readhead_jobj)?

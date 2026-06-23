@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 
@@ -475,8 +476,25 @@ impl StatsCollector {
             Ordering::Relaxed,
         );
     }
+
+    /// Add already-aggregated counts (e.g. a snapshot captured from another
+    /// scheduler) into these counters.
+    fn add(&self, iops: u64, requests: u64, bytes_read: u64) {
+        self.iops.fetch_add(iops, Ordering::Relaxed);
+        self.requests.fetch_add(requests, Ordering::Relaxed);
+        self.bytes_read.fetch_add(bytes_read, Ordering::Relaxed);
+    }
 }
 
+impl IoStatsRecorder for StatsCollector {
+    fn record_request(&self, request: &[Range<u64>]) {
+        // Inherent methods take precedence in resolution, so this delegates to
+        // the inherent `record_request` above rather than recursing.
+        Self::record_request(self, request)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ScanStats {
     pub iops: u64,
     pub requests: u64,
@@ -490,6 +508,57 @@ impl ScanStats {
             requests: stats.requests(),
             bytes_read: stats.bytes_read(),
         }
+    }
+}
+
+/// A shareable, cloneable handle to a set of cumulative I/O counters.
+///
+/// All clones share the same underlying counters.  This serves two purposes:
+///
+/// 1. It backs each [`ScanScheduler`]'s own running totals.
+/// 2. It can be attached to an individual [`FileScheduler`] (via
+///    [`FileScheduler::with_io_stats`]) as a *secondary* sink, so a caller can
+///    measure the exact bytes/IOPS performed through that file handle for a
+///    bounded scope (e.g. a single query) without disturbing the scheduler's
+///    global totals.  Read the result back with [`IoStats::snapshot`].
+#[derive(Debug, Clone)]
+pub struct IoStats(Arc<StatsCollector>);
+
+impl IoStats {
+    pub fn new() -> Self {
+        Self(Arc::new(StatsCollector::new()))
+    }
+
+    /// Record a single completed request.  `request` holds the byte ranges as
+    /// actually submitted to storage (post coalescing/splitting), so the counts
+    /// reflect physical I/O.
+    pub fn record_request(&self, request: &[Range<u64>]) {
+        self.0.record_request(request);
+    }
+
+    /// Take an immutable snapshot of the current cumulative counters.
+    pub fn snapshot(&self) -> ScanStats {
+        ScanStats::new(self.0.as_ref())
+    }
+
+    /// Return this handle as a type-erased [`IoStatsRecorder`], suitable for
+    /// attaching to a file reader (e.g. `FileReader::with_io_stats`).  The
+    /// returned recorder shares the same underlying counters as `self`.
+    pub fn recorder(&self) -> Arc<dyn IoStatsRecorder> {
+        self.0.clone()
+    }
+
+    /// Add a snapshot of already-aggregated statistics into this sink.  Used to
+    /// fold in I/O measured on a separate scheduler (e.g. the one-time reads
+    /// performed while opening an index).
+    pub fn add_scan_stats(&self, stats: &ScanStats) {
+        self.0.add(stats.iops, stats.requests, stats.bytes_read);
+    }
+}
+
+impl Default for IoStats {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -509,7 +578,7 @@ enum IoQueueType {
 pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
-    stats: Arc<StatsCollector>,
+    stats: IoStats,
 }
 
 impl Debug for ScanScheduler {
@@ -606,7 +675,7 @@ impl ScanScheduler {
         Arc::new(Self {
             object_store,
             io_queue,
-            stats: Arc::new(StatsCollector::new()),
+            stats: IoStats::new(),
         })
     }
 
@@ -646,6 +715,7 @@ impl ScanScheduler {
             base_priority,
             max_iop_size,
             bypass_backpressure: false,
+            extra_stats: None,
         })
     }
 
@@ -791,7 +861,7 @@ impl ScanScheduler {
     }
 
     pub fn stats(&self) -> ScanStats {
-        ScanStats::new(self.stats.as_ref())
+        self.stats.snapshot()
     }
 
     #[cfg(test)]
@@ -829,6 +899,10 @@ pub struct FileScheduler {
     base_priority: u64,
     max_iop_size: u64,
     bypass_backpressure: bool,
+    /// Optional secondary statistics sink.  When set, every request submitted
+    /// through this handle is also recorded here, in addition to the
+    /// scheduler's global totals.  Used to measure per-scope I/O.
+    extra_stats: Option<Arc<dyn IoStatsRecorder>>,
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
@@ -899,6 +973,9 @@ impl FileScheduler {
         }
 
         self.root.stats.record_request(&updated_requests);
+        if let Some(extra_stats) = &self.extra_stats {
+            extra_stats.record_request(&updated_requests);
+        }
 
         let bytes_vec_fut = self.root.submit_request(
             self.reader.clone(),
@@ -964,6 +1041,23 @@ impl FileScheduler {
             max_iop_size: self.max_iop_size,
             base_priority: priority,
             bypass_backpressure: self.bypass_backpressure,
+            extra_stats: self.extra_stats.clone(),
+        }
+    }
+
+    /// Returns a copy of this scheduler that additionally records the I/O it
+    /// performs into `stats`, on top of the scheduler's global statistics.
+    ///
+    /// This is the mechanism for measuring exact per-scope (e.g. per-query) I/O:
+    /// attach a recorder here (e.g. via [`IoStats::recorder`]), perform the reads
+    /// through the returned handle, then read the totals back with
+    /// [`IoStats::snapshot`].  The returned handle is cheap to create (a few
+    /// `Arc` clones) and reuses the same underlying reader, so it does not
+    /// re-open the file.
+    pub fn with_io_stats(&self, stats: Arc<dyn IoStatsRecorder>) -> Self {
+        Self {
+            extra_stats: Some(stats),
+            ..self.clone()
         }
     }
 
@@ -1181,6 +1275,59 @@ mod tests {
             );
         }
         assert_eq!(11, scheduler.stats().iops);
+    }
+
+    #[tokio::test]
+    async fn test_io_stats_sink() {
+        let tmp_file = TempObjFile::default();
+        let obj_store = Arc::new(ObjectStore::local());
+
+        const DATA_SIZE: u64 = 1024 * 1024;
+        let mut some_data = vec![0; DATA_SIZE as usize];
+        rand::rng().fill_bytes(&mut some_data);
+        obj_store.put(&tmp_file, &some_data).await.unwrap();
+
+        let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+
+        // Attach a per-scope sink to one file handle.
+        let sink = IoStats::new();
+        let file_scheduler = scheduler
+            .open_file(&tmp_file, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_io_stats(sink.recorder());
+
+        // Three reads within 4KiB coalesce into a single physical IOP.  The sink
+        // and the scheduler's global totals must agree exactly, because both are
+        // recorded from the same post-coalescing request.
+        file_scheduler
+            .submit_request(vec![50_000..51_000, 52_000..53_000, 54_000..55_000], 0)
+            .await
+            .unwrap();
+
+        let global = scheduler.stats();
+        let scoped = sink.snapshot();
+        assert_eq!(1, scoped.iops);
+        assert_eq!(1, scoped.requests);
+        // Coalesced range 50_000..55_000 => 5000 physical bytes.
+        assert_eq!(5000, scoped.bytes_read);
+        assert_eq!(global.iops, scoped.iops);
+        assert_eq!(global.requests, scoped.requests);
+        assert_eq!(global.bytes_read, scoped.bytes_read);
+
+        // A sibling handle without the sink: the global totals advance but the
+        // sink stays put, proving per-scope isolation.
+        let other = scheduler
+            .open_file(&tmp_file, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        other.submit_request(vec![0..1000], 0).await.unwrap();
+
+        let global_after = scheduler.stats();
+        let scoped_after = sink.snapshot();
+        assert_eq!(global.bytes_read + 1000, global_after.bytes_read);
+        assert_eq!(scoped.bytes_read, scoped_after.bytes_read);
+        assert_eq!(scoped.iops, scoped_after.iops);
     }
 
     #[tokio::test]
