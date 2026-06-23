@@ -373,8 +373,7 @@ class LanceFileSession:
         Unlike :meth:`list`, which recurses into the entire subtree, this
         returns only the immediate children of ``path``: the child
         "directories" as ``common_prefixes`` and the direct child files as
-        ``objects``. On Azure this is served entirely from the blob endpoint, so
-        it never probes the hierarchical-namespace (DFS) endpoint.
+        ``objects``.
 
         Parameters
         ----------
@@ -393,9 +392,8 @@ class LanceFileSession:
         """
         Read a byte range from a file (relative to this session's base path).
 
-        Issues a single ranged read. On Azure it talks to the blob endpoint only
-        and never probes the hierarchical-namespace (DFS) endpoint. Reading a
-        missing object raises ``OSError``, consistent with ``download_file``.
+        Issues a single ranged read. Reading a missing object raises
+        ``OSError``, consistent with ``download_file``.
 
         Parameters
         ----------
@@ -418,9 +416,7 @@ class LanceFileSession:
         Delete a file (relative to this session's base path).
 
         Deleting a path that does not exist is a no-op (idempotent) rather than
-        an error, so this is safe to call on best-effort cleanup paths. On Azure
-        it talks to the blob endpoint only and never probes the
-        hierarchical-namespace (DFS) endpoint.
+        an error, so this is safe to call on best-effort cleanup paths.
 
         Parameters
         ----------

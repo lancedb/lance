@@ -579,9 +579,7 @@ impl LanceFileSession {
     /// Returns a tuple `(common_prefixes, objects)` of paths relative to the
     /// session's `base_path`, where `common_prefixes` are the immediate child
     /// "directories" and `objects` are the immediate child files. Unlike
-    /// `list`, this does not recurse into the subtree. On Azure it is served
-    /// entirely from the blob endpoint, so it never probes the
-    /// hierarchical-namespace (DFS) endpoint.
+    /// `list`, this does not recurse into the subtree.
     #[pyo3(signature=(path=None))]
     pub fn list_with_delimiter(
         &self,
@@ -664,8 +662,7 @@ impl LanceFileSession {
     /// The path is interpreted relative to the session's `base_path`, matching
     /// `contains`/`upload_file`/`download_file`. Deleting a missing object is a
     /// no-op (idempotent) rather than an error, so this is safe to call on
-    /// best-effort cleanup paths. On Azure it talks to the blob endpoint only
-    /// and never probes the hierarchical-namespace (DFS) endpoint.
+    /// best-effort cleanup paths.
     ///
     /// Parameters
     /// ----------
@@ -689,10 +686,8 @@ impl LanceFileSession {
     /// Read a byte range from a file in the object store.
     ///
     /// The path is interpreted relative to the session's `base_path`, matching
-    /// the other session methods. This issues a single ranged GET; on Azure it
-    /// talks to the blob endpoint only and never probes the
-    /// hierarchical-namespace (DFS) endpoint. Reading a missing object raises
-    /// `OSError`, consistent with `download_file`.
+    /// the other session methods. This issues a single ranged GET. Reading a
+    /// missing object raises `OSError`, consistent with `download_file`.
     ///
     /// Parameters
     /// ----------

@@ -854,9 +854,7 @@ impl ObjectStore {
     /// Unlike [`Self::list`], which recurses into the entire subtree, this returns
     /// only the immediate children of `prefix`: the child "directories" as
     /// [`ListResult::common_prefixes`] and the direct child files as
-    /// [`ListResult::objects`]. On Azure this is served entirely from the blob
-    /// endpoint (`List Blobs` with `delimiter=/`), so it never probes the
-    /// hierarchical-namespace (DFS) endpoint.
+    /// [`ListResult::objects`].
     pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         Ok(self.inner.list_with_delimiter(prefix).await?)
     }
