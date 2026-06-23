@@ -35,7 +35,7 @@ use lance_core::{Error, ROW_ID, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::registry::{BasicTrainer, VALUE_COLUMN_NAME};
+use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, ScalarIndexParams};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_io::stream::RecordBatchStream as LanceRecordBatchStream;
