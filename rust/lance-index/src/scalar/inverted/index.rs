@@ -10,7 +10,6 @@ use std::{
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
     ops::Range,
     time::Instant,
 };
@@ -1146,23 +1145,19 @@ impl Index for InvertedIndex {
     }
 }
 
-/// Target on-disk size of one prewarm chunk; a partition is streamed in chunks of
-/// ~this size so its peak resident set is one chunk, not the whole `invert.lance`.
-const PREWARM_CHUNK_TARGET_BYTES: u64 = 32 << 20;
+/// Target on-disk size of one prewarm chunk. Keep this large enough that cloud
+/// stores do not spend prewarm time on thousands of tiny range reads, but still
+/// bounded so one large partition is not materialized all at once.
+const PREWARM_CHUNK_TARGET_BYTES: u64 = 128 << 20;
 
 /// Cap on token rows per chunk, bounding the built `Vec` when posting lists are tiny.
-const PREWARM_MAX_CHUNK_TOKENS: usize = 4096;
+const PREWARM_MAX_CHUNK_TOKENS: usize = 256 * 1024;
+
+/// Number of chunks to read/build concurrently inside one partition.
+const PREWARM_CHUNK_CONCURRENCY: usize = 2;
 
 /// Floor on token rows per chunk, so a partition always makes progress.
 const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
-
-/// Fraction of available memory a single whole-file posting prewarm may use.
-/// Prewarm can run partitions concurrently and the decoded cache is larger
-/// than the raw file, so keep this below the full available-memory envelope.
-const PREWARM_WHOLE_FILE_AVAILABLE_MEMORY_DIVISOR: u64 = 4;
-
-/// Fallback available-memory estimate when the host cannot report one.
-const PREWARM_WHOLE_FILE_FALLBACK_AVAILABLE_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Token rows per chunk: byte target / average bytes-per-token, clamped to `[MIN, MAX]`.
 fn prewarm_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
@@ -1172,45 +1167,6 @@ fn prewarm_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
     let bytes_per_token = (file_size_bytes / token_count as u64).max(1); // >= 1: no div-by-zero
     let by_bytes = (PREWARM_CHUNK_TARGET_BYTES / bytes_per_token) as usize;
     by_bytes.clamp(PREWARM_MIN_CHUNK_TOKENS, PREWARM_MAX_CHUNK_TOKENS)
-}
-
-fn prewarm_whole_file_budget_bytes_for_available(available_memory_bytes: u64) -> u64 {
-    available_memory_bytes / PREWARM_WHOLE_FILE_AVAILABLE_MEMORY_DIVISOR
-}
-
-fn should_prewarm_whole_file_for_budget(
-    posting_data_size_bytes: u64,
-    whole_file_budget_bytes: u64,
-) -> bool {
-    posting_data_size_bytes < whole_file_budget_bytes
-}
-
-fn prewarm_whole_file_budget_bytes() -> u64 {
-    let available_memory_bytes = cgroup_memory_limit_bytes()
-        .or_else(proc_mem_total_bytes)
-        .unwrap_or(PREWARM_WHOLE_FILE_FALLBACK_AVAILABLE_MEMORY_BYTES);
-    prewarm_whole_file_budget_bytes_for_available(available_memory_bytes)
-}
-
-fn cgroup_memory_limit_bytes() -> Option<u64> {
-    let value = fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
-    let value = value.trim();
-    if value == "max" {
-        return None;
-    }
-    match value.parse::<u64>() {
-        Ok(limit) if limit > 0 && limit < (u64::MAX >> 1) => Some(limit),
-        _ => None,
-    }
-}
-
-fn proc_mem_total_bytes() -> Option<u64> {
-    let contents = fs::read_to_string("/proc/meminfo").ok()?;
-    contents.lines().find_map(|line| {
-        let value = line.strip_prefix("MemTotal:")?;
-        let kib = value.split_whitespace().next()?.parse::<u64>().ok()?;
-        Some(kib.saturating_mul(1024))
-    })
 }
 
 /// Snap a chunk's exclusive token end back to a posting-group boundary so no group
@@ -1237,6 +1193,25 @@ fn group_aligned_chunk_end(
         .get(first_after_start)
         .map(|&start| start as usize)
         .unwrap_or(token_count)
+}
+
+fn prewarm_chunk_ranges(
+    group_starts: Option<&[u32]>,
+    token_count: usize,
+    chunk_tokens: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut tok_start = 0usize;
+    while tok_start < token_count {
+        let mut tok_end = (tok_start + chunk_tokens).min(token_count);
+        // `tok_start` is always a group boundary; snap `tok_end` back to one too.
+        if let Some(starts) = group_starts {
+            tok_end = group_aligned_chunk_end(starts, token_count, tok_start, tok_end);
+        }
+        ranges.push((tok_start, tok_end));
+        tok_start = tok_end;
+    }
+    ranges
 }
 
 fn group_start_indices_for_chunk(starts: &[u32], tok_start: usize, tok_end: usize) -> Range<usize> {
@@ -2830,75 +2805,36 @@ impl PostingListReader {
         let group_starts = self.group_starts.clone();
         let token_count = self.len();
         let posting_data_size_bytes = self.posting_data_size_bytes();
-        let whole_file_budget_bytes = prewarm_whole_file_budget_bytes();
-        if token_count > 0
-            && chunk_tokens_override.is_none()
-            && should_prewarm_whole_file_for_budget(
-                posting_data_size_bytes,
-                whole_file_budget_bytes,
-            )
-        {
-            let read_build_start = Instant::now();
-            let posting_lists = self
-                .build_whole_file_postings(with_position, &state)
-                .await?;
-            self.publish_chunk_postings(
-                posting_lists,
-                group_starts.as_deref(),
-                0,
-                token_count,
-                token_count,
-                with_position,
-            )
-            .await;
-            let read_build_elapsed = read_build_start.elapsed();
-
-            info!(
-                legacy_layout = self.is_legacy_layout(),
-                with_position,
-                token_count,
-                chunk_count = 1usize,
-                chunk_tokens = token_count,
-                mode = "whole_file",
-                posting_data_size_bytes,
-                whole_file_budget_bytes,
-                read_build_ms = read_build_elapsed.as_secs_f64() * 1000.0,
-                "posting list prewarm timing"
-            );
-
-            return Ok(1);
-        }
-
         let chunk_tokens = chunk_tokens_override
             .unwrap_or_else(|| prewarm_chunk_tokens(token_count, posting_data_size_bytes))
             .max(1);
+        let chunk_ranges = prewarm_chunk_ranges(group_starts.as_deref(), token_count, chunk_tokens);
+        let chunk_count = chunk_ranges.len();
 
-        let mut chunk_count = 0usize;
         let read_build_start = Instant::now();
-        let mut tok_start = 0usize;
-        while tok_start < token_count {
-            let mut tok_end = (tok_start + chunk_tokens).min(token_count);
-            // `tok_start` is always a group boundary; snap `tok_end` back to one too.
-            if let Some(starts) = group_starts.as_ref() {
-                tok_end = group_aligned_chunk_end(starts, token_count, tok_start, tok_end);
-            }
-            chunk_count += 1;
-
-            let posting_lists = self
-                .build_chunk_postings(tok_start, tok_end, with_position, &state)
-                .await?;
-            self.publish_chunk_postings(
-                posting_lists,
-                group_starts.as_deref(),
-                tok_start,
-                tok_end,
-                token_count,
-                with_position,
-            )
-            .await;
-
-            tok_start = tok_end;
-        }
+        stream::iter(chunk_ranges)
+            .map(|(tok_start, tok_end)| {
+                let state = &state;
+                let group_starts = group_starts.as_deref();
+                async move {
+                    let posting_lists = self
+                        .build_chunk_postings(tok_start, tok_end, with_position, state)
+                        .await?;
+                    self.publish_chunk_postings(
+                        posting_lists,
+                        group_starts,
+                        tok_start,
+                        tok_end,
+                        token_count,
+                        with_position,
+                    )
+                    .await;
+                    Result::Ok(())
+                }
+            })
+            .buffer_unordered(PREWARM_CHUNK_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
         let read_build_elapsed = read_build_start.elapsed();
 
         info!(
@@ -2907,9 +2843,8 @@ impl PostingListReader {
             token_count,
             chunk_count,
             chunk_tokens,
-            mode = "chunked",
+            chunk_concurrency = PREWARM_CHUNK_CONCURRENCY,
             posting_data_size_bytes,
-            whole_file_budget_bytes,
             read_build_ms = read_build_elapsed.as_secs_f64() * 1000.0,
             "posting list prewarm timing"
         );
@@ -2999,53 +2934,6 @@ impl PostingListReader {
                 .iter()
                 .enumerate()
                 .all(|(i, (token_id, _))| *token_id as usize == tok_start + i)
-        );
-        Ok(posting_lists)
-    }
-
-    /// Read the whole posting file and build all posting lists off the runtime
-    /// thread. This restores the single range-read behavior for partitions that
-    /// fit within the configured prewarm memory budget.
-    async fn build_whole_file_postings(
-        &self,
-        with_position: bool,
-        state: &ChunkBuildState,
-    ) -> Result<Vec<(u32, PostingList)>> {
-        let token_count = self.len();
-        let chunk_batch = self.read_batch(with_position).await?;
-        let chunk_offsets = state.offsets.clone();
-        let chunk_end_row = self.reader.num_rows();
-        let max_scores = state.max_scores.clone();
-        let lengths = state.lengths.clone();
-        let posting_tail_codec = state.posting_tail_codec;
-        let positions_layout = state.positions_layout;
-        let posting_lists = spawn_blocking(move || {
-            let ctx = PrewarmBuildCtx {
-                max_scores: max_scores.as_deref().map(|v| v.as_slice()),
-                lengths: lengths.as_deref().map(|v| v.as_slice()),
-                posting_tail_codec,
-                positions_layout,
-            };
-            let chunk = PrewarmChunk {
-                tok_start: 0,
-                token_count,
-                offsets: chunk_offsets.as_deref().map(|v| v.as_slice()),
-                end_row: chunk_end_row,
-            };
-            Self::build_prewarm_posting_lists_chunk(chunk_batch, chunk, &ctx)
-        })
-        .await
-        .map_err(|err| {
-            Error::internal(format!(
-                "Failed to build prewarm posting lists in blocking task: {err}"
-            ))
-        })??;
-        debug_assert_eq!(posting_lists.len(), token_count);
-        debug_assert!(
-            posting_lists
-                .iter()
-                .enumerate()
-                .all(|(i, (token_id, _))| *token_id as usize == i)
         );
         Ok(posting_lists)
     }
@@ -6600,14 +6488,7 @@ mod tests {
             "test should use modern posting layout"
         );
 
-        let chunk_count = inverted_list
-            .prewarm_posting_lists_chunked(false, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            chunk_count, 1,
-            "small posting file should use the whole-file prewarm fast path"
-        );
+        inverted_list.prewarm_posting_lists(false).await.unwrap();
 
         // The two tiny tokens land in a single cache group [0, 2) (issue
         // #7040); both postings are read out of that group entry.
@@ -6692,24 +6573,18 @@ mod tests {
     }
 
     #[test]
-    fn test_prewarm_whole_file_budget_helpers() {
-        let available_memory_bytes = 8 * 1024 * 1024 * 1024;
-        let budget = prewarm_whole_file_budget_bytes_for_available(available_memory_bytes);
-        assert_eq!(budget, 2 * 1024 * 1024 * 1024);
-
-        assert!(
-            should_prewarm_whole_file_for_budget(budget - 1, budget),
-            "posting data smaller than the budget should use whole-file prewarm"
+    fn test_prewarm_chunk_ranges_preserve_group_boundaries() {
+        let starts = [0, 3, 7, 10];
+        assert_eq!(
+            prewarm_chunk_ranges(Some(&starts), 13, 5),
+            vec![(0, 3), (3, 7), (7, 10), (10, 13)],
+            "grouped chunk ranges must never split a posting cache group"
         );
-        assert!(
-            !should_prewarm_whole_file_for_budget(budget, budget),
-            "posting data equal to the budget should stay on the bounded chunked path"
+        assert_eq!(
+            prewarm_chunk_ranges(None, 13, 5),
+            vec![(0, 5), (5, 10), (10, 13)],
+            "ungrouped chunk ranges should use plain token ranges"
         );
-        assert!(
-            !should_prewarm_whole_file_for_budget(budget + 1, budget),
-            "posting data larger than the budget should stay on the bounded chunked path"
-        );
-        assert_eq!(prewarm_whole_file_budget_bytes_for_available(3), 0);
     }
 
     /// Prewarming a large partition in multiple chunks must end up holding exactly the
@@ -7720,45 +7595,17 @@ mod tests {
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
 
-        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let cache = Arc::new(LanceCache::with_capacity(4096));
         let index = InvertedIndex::load(store, None, cache.as_ref())
             .await
             .unwrap();
-        let inverted_list = &index.partitions[0].inverted_list;
-        let chunk_count = inverted_list
-            .prewarm_posting_lists_chunked(true, None)
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::new().with_position(true))
             .await
             .unwrap();
-        assert_eq!(
-            chunk_count, 1,
-            "small posting file with positions should use whole-file prewarm"
-        );
 
-        let (start, end) = inverted_list.group_range_for_token(0).unwrap();
-        let group = inverted_list
-            .index_cache
-            .get_with_key(&PostingListGroupKey { start, end })
-            .await
-            .unwrap();
-        assert!(
-            !group.get(0).unwrap().has_position(),
-            "whole-file prewarm must keep posting cache entries positions-free"
-        );
-
-        let positions = inverted_list
-            .index_cache
-            .get_with_key(&PositionKey { token_id: 0 })
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                positions.as_ref().0,
-                CompressedPositionStorage::SharedStream(_)
-            ),
-            "whole-file prewarm should store v2 positions in the dedicated position cache"
-        );
-
-        let actual = inverted_list
+        let actual = index.partitions[0]
+            .inverted_list
             .posting_list(0, true, &NoOpMetricsCollector)
             .await
             .unwrap()
