@@ -24,8 +24,7 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
-    DATASET_CLEANING_EVENT, DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT,
-    TRACE_DATASET_EVENTS,
+    DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
@@ -104,7 +103,7 @@ use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::cleanup::{CleanupPolicy, CleanupPolicyBuilder};
+use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
@@ -514,7 +513,10 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
-            .with_store_params(store_params.unwrap_or_default())
+            // Fall back to the dataset's own store params
+            .with_store_params(
+                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+            )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
@@ -1283,8 +1285,15 @@ impl Dataset {
         &self,
         policy: CleanupPolicy,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
-        info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.uri);
-        cleanup::cleanup_old_versions(self, policy).boxed()
+        async move { self.cleanup(policy).execute().await }.boxed()
+    }
+
+    /// Creates a cleanup operation for this dataset.
+    ///
+    /// The returned operation can be explained without deleting files, or
+    /// executed to re-evaluate the current dataset state and remove files.
+    pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
+        CleanupOperation::new(self, policy)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2230,6 +2239,39 @@ impl Dataset {
             .resolve_latest_location(&self.base, &self.object_store)
             .await?
             .version)
+    }
+
+    /// Return whether the dataset has a newer committed version.
+    pub async fn is_stale(&self) -> Result<bool> {
+        let latest_version = self.latest_version_id().await?;
+        Ok(latest_version != self.manifest.version)
+    }
+
+    /// Return whether the immediate attached successor manifest exists.
+    ///
+    /// This is a fast contiguous-history probe. It does not resolve the latest
+    /// version and may return `false` if intermediate manifests have been
+    /// removed. Callers that need a general freshness check should use
+    /// [`Self::is_stale`].
+    #[doc(hidden)]
+    pub async fn has_successor_version(&self) -> Result<bool> {
+        let Some(next_version) = self.manifest.version.checked_add(1) else {
+            return Ok(false);
+        };
+        if lance_table::format::is_detached_version(next_version) {
+            return Ok(false);
+        }
+
+        let exists = self
+            .commit_handler
+            .version_exists(
+                &self.base,
+                next_version,
+                self.object_store.inner.as_ref(),
+                self.manifest_location.naming_scheme,
+            )
+            .await?;
+        Ok(exists)
     }
 
     pub fn count_fragments(&self) -> usize {

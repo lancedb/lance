@@ -31,14 +31,20 @@ impl BranchLocation {
     }
 
     fn get_root_path(path_str: &str, branch_name: &str) -> Result<String> {
+        // A uri may carry a query string (e.g. `s3+ddb://...?ddbTableName=t`);
+        // the branch suffix sits on the path part, before the query.
+        let (path_part, query) = match path_str.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (path_str, None),
+        };
         let branch_suffix = format!("{}/{}", BRANCH_DIR, branch_name);
         let branch_suffix = branch_suffix.as_str();
-        let root_path_str = path_str
+        let root_path_str = path_part
             .strip_suffix(branch_suffix)
             .or_else(|| {
                 if cfg!(windows) {
                     let windows_suffix = branch_suffix.replace('/', "\\");
-                    path_str.strip_suffix(&windows_suffix)
+                    path_part.strip_suffix(&windows_suffix)
                 } else {
                     None
                 }
@@ -59,7 +65,10 @@ impl BranchLocation {
                 root_path_str, path_str,
             )));
         };
-        Ok(root_path_str)
+        Ok(match query {
+            Some(query) => format!("{}?{}", root_path_str, query),
+            None => root_path_str,
+        })
     }
 
     /// The branch a location under `root` targets: the inverse of
@@ -132,13 +141,23 @@ impl BranchLocation {
     }
 
     fn join_str(base: &str, segment: &str) -> Result<String> {
+        // A uri may carry a query string (e.g. `s3+ddb://...?ddbTableName=t`);
+        // path segments must be appended before it.
+        let (path_part, query) = match base.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (base, None),
+        };
         let normalized_segment = segment.trim_start_matches('/');
-        let is_base_dir = base.ends_with("/");
-        if is_base_dir {
-            Ok(format!("{}{}", base, normalized_segment))
+        let is_base_dir = path_part.ends_with("/");
+        let joined = if is_base_dir {
+            format!("{}{}", path_part, normalized_segment)
         } else {
-            Ok(format!("{}/{}", base, normalized_segment))
-        }
+            format!("{}/{}", path_part, normalized_segment)
+        };
+        Ok(match query {
+            Some(query) => format!("{}?{}", joined, query),
+            None => joined,
+        })
     }
 }
 
@@ -253,6 +272,30 @@ mod tests {
             format!("{}/tree/bugfix/issue-123", main_location.uri)
         );
         assert!(fs::create_dir_all(std::path::Path::new(new_location.uri.as_str())).is_ok());
+    }
+
+    #[test]
+    fn test_branch_location_with_query_uri() {
+        // Uris like `s3+ddb://...?ddbTableName=t` carry the commit handler
+        // config in the query string; branch path segments must be inserted
+        // before it and the query must survive the round trip.
+        let location = BranchLocation {
+            path: Path::parse("bucket/table.lance").unwrap(),
+            uri: "s3+ddb://bucket/table.lance?ddbTableName=t".to_string(),
+            branch: None,
+        };
+        let dev = location.find_branch(Some("dev")).unwrap();
+        assert_eq!(
+            dev.uri,
+            "s3+ddb://bucket/table.lance/tree/dev?ddbTableName=t"
+        );
+        assert_eq!(dev.path.as_ref(), "bucket/table.lance/tree/dev");
+        assert_eq!(dev.branch.as_deref(), Some("dev"));
+
+        let main = dev.find_main().unwrap();
+        assert_eq!(main.uri, "s3+ddb://bucket/table.lance?ddbTableName=t");
+        assert_eq!(main.path.as_ref(), "bucket/table.lance");
+        assert_eq!(main.branch, None);
     }
 
     #[test]

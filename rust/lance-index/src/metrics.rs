@@ -3,6 +3,11 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
+pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
+pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
+pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
+
 /// A trait used by the index to report metrics
 ///
 /// Callers can implement this trait to collect metrics
@@ -43,6 +48,20 @@ pub trait MetricsCollector: Send + Sync {
     ///
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
+
+    /// Record AND candidates returned from WAND alignment to the scoring loop.
+    ///
+    /// This excludes candidates pruned before `next()` returns. Use this with
+    /// `record_and_candidates_pruned_before_return` to recover total aligned
+    /// AND candidates.
+    fn record_and_candidates_seen(&self, _num_candidates: usize) {}
+
+    /// Record AND candidates pruned during WAND alignment before `next()` returns.
+    fn record_and_candidates_pruned_before_return(&self, _num_candidates: usize) {}
+
+    fn record_and_full_scores(&self, _num_scores: usize) {}
+
+    fn record_freqs_collected(&self, _num_collections: usize) {}
 
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.

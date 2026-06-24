@@ -1088,10 +1088,6 @@ impl Index for IVFIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
-    }
-
     fn index_type(&self) -> IndexType {
         if self.sub_index.as_any().downcast_ref::<PQIndex>().is_some() {
             IndexType::IvfPq

@@ -176,11 +176,19 @@ name = "scalar_index"
 harness = false
 
 [[bench]]
+name = "regex_ngram"
+harness = false
+
+[[bench]]
 name = "merge_insert"
 harness = false
 
 [[bench]]
 name = "scan"
+harness = false
+
+[[bench]]
+name = "count_pushdown"
 harness = false
 
 [[bench]]
@@ -294,6 +302,10 @@ harness = false
 
 [[bench]]
 name = "concurrent_append"
+harness = false
+
+[[bench]]
+name = "hamming"
 harness = false
 
 [lints]

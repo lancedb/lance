@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::{ops::Bound, sync::Arc};
 
 use arrow_array::Array;
@@ -11,19 +11,20 @@ use arrow_array::{
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
-use lance_arrow::ipc::{read_ipc_stream_single_at, read_len_prefixed_bytes_at, write_ipc_stream};
 use lance_core::Result;
-use lance_core::cache::CacheCodecImpl;
+use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
+use datafusion_common::ScalarValue;
+
 use crate::metrics::MetricsCollector;
-use crate::scalar::btree::BTREE_VALUES_COLUMN;
+use crate::scalar::btree::{BTREE_VALUES_COLUMN, OrderableScalarValue};
 use crate::scalar::{AnyQuery, SargableQuery};
 
 const VALUES_COL_IDX: usize = 0;
@@ -81,6 +82,46 @@ impl FlatIndex {
 
     fn ids(&self) -> &ArrayRef {
         self.data.column(IDS_COL_IDX)
+    }
+
+    fn values(&self) -> &ArrayRef {
+        self.data.column(VALUES_COL_IDX)
+    }
+
+    /// Which of `needles` are present in this page.
+    ///
+    /// Batched existence sibling of [`Self::search`]: it runs the same `IsIn`
+    /// predicate over the page's `values` column, but returns the matched
+    /// *values* rather than row addresses — so the caller can map each result
+    /// back to the input key it asked about. The page scan stays vectorized;
+    /// only the (small) matched subset is lifted into `ScalarValue`.
+    ///
+    /// Nulls: a null `values` entry never matches a (non-null) primary-key
+    /// needle, so it is simply absent from the result.
+    pub(crate) fn contains_values(
+        &self,
+        needles: &[OrderableScalarValue],
+    ) -> Result<BTreeSet<OrderableScalarValue>> {
+        if needles.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let query = SargableQuery::IsIn(needles.iter().map(|v| v.0.clone()).collect());
+        let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
+        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let predicate = expr.evaluate(&self.data)?;
+        let predicate = predicate.into_array(self.data.num_rows())?;
+        let predicate = predicate
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("Predicate should return boolean array");
+        let matched = arrow_select::filter::filter(self.values(), predicate)?;
+        (0..matched.len())
+            .map(|i| {
+                Ok(OrderableScalarValue(ScalarValue::try_from_array(
+                    &matched, i,
+                )?))
+            })
+            .collect()
     }
 
     pub fn all(&self) -> NullableRowAddrSet {
@@ -196,7 +237,22 @@ impl FlatIndex {
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
         let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        self.eval_expr(&expr)
+    }
 
+    /// Evaluate a predicate compiled once by the caller. Lets a large IsIn that
+    /// spans many pages build the physical expr a single time instead of
+    /// rebuilding the whole IN-list per page (the dominant cost of a big lookup).
+    pub fn search_prebuilt(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableRowAddrSet> {
+        metrics.record_comparisons(self.data.num_rows());
+        self.eval_expr(expr)
+    }
+
+    fn eval_expr(&self, expr: &Arc<dyn PhysicalExpr>) -> Result<NullableRowAddrSet> {
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
@@ -236,32 +292,38 @@ impl FlatIndex {
 }
 
 impl CacheCodecImpl for FlatIndex {
-    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+    const TYPE_ID: &'static str = "lance.scalar.FlatIndex";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         // Format:
-        // [len-prefixed all_addrs_map][len-prefixed null_addrs_map][batch IPC stream]
-        writer.write_all(&(self.all_addrs_map.serialized_size() as u64).to_le_bytes())?;
-        self.all_addrs_map.serialize_into(&mut *writer)?;
+        // RAW_BLOB  : all_addrs_map (roaring tree map)
+        // RAW_BLOB  : null_addrs_map (roaring tree map)
+        // ARROW_IPC : data batch
+        let mut all_addrs_bytes = Vec::with_capacity(self.all_addrs_map.serialized_size());
+        self.all_addrs_map.serialize_into(&mut all_addrs_bytes)?;
+        w.write_raw(&all_addrs_bytes)?;
 
-        writer.write_all(&(self.null_addrs_map.serialized_size() as u64).to_le_bytes())?;
-        self.null_addrs_map.serialize_into(&mut *writer)?;
+        let mut null_addrs_bytes = Vec::with_capacity(self.null_addrs_map.serialized_size());
+        self.null_addrs_map.serialize_into(&mut null_addrs_bytes)?;
+        w.write_raw(&null_addrs_bytes)?;
 
-        write_ipc_stream(self.data.as_ref(), writer)?;
+        w.write_ipc(self.data.as_ref())?;
 
         Ok(())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self>
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self>
     where
         Self: Sized,
     {
-        let mut offset = 0;
-        let all_addrs_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let all_addrs_bytes = r.read_raw()?;
         let all_addrs_map = RowAddrTreeMap::deserialize_from(all_addrs_bytes.as_ref())?;
 
-        let null_addrs_bytes = read_len_prefixed_bytes_at(data, &mut offset)?;
+        let null_addrs_bytes = r.read_raw()?;
         let null_addrs_map = RowAddrTreeMap::deserialize_from(null_addrs_bytes.as_ref())?;
 
-        let batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let batch = r.read_ipc()?;
 
         let df_schema = DFSchema::try_from(batch.schema())?;
 
@@ -309,8 +371,12 @@ mod tests {
 
     fn assert_roundtrips(index: &FlatIndex) {
         let mut buf = Vec::new();
-        index.serialize(&mut buf).unwrap();
-        let restored = FlatIndex::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        index
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, FlatIndex::CURRENT_VERSION);
+        let restored = FlatIndex::deserialize(&mut reader).unwrap();
 
         assert_eq!(restored.data, index.data);
         assert_eq!(restored.all_addrs_map, index.all_addrs_map);
@@ -333,6 +399,41 @@ mod tests {
         // Empty index
         let empty = RecordBatch::new_empty(example_index().data.schema());
         assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
+    }
+
+    /// The data batch must decode zero-copy through the full envelope-bearing
+    /// [`CacheCodec`], even though the two roaring blobs and the envelope push
+    /// the IPC section to a non-aligned starting offset.
+    #[test]
+    fn test_flat_index_data_is_zero_copy() {
+        use lance_core::cache::CacheCodec;
+        const ALIGN: usize = 64;
+
+        let index = example_index();
+        let codec = CacheCodec::from_impl::<FlatIndex>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(index);
+        let mut buf = Vec::new();
+        codec.serialize(&any, &mut buf).unwrap();
+
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = bytes::Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).hit().unwrap();
+        let restored = restored.downcast::<FlatIndex>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.data.columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "data batch buffer was realigned out of the input — misaligned IPC section",
+                );
+            }
+        }
     }
 
     #[tokio::test]

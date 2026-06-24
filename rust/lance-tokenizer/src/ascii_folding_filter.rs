@@ -49,9 +49,10 @@ impl<T: TokenStream> TokenStream for AsciiFoldingFilterTokenStream<'_, T> {
         if !self.tail.advance() {
             return false;
         }
-        if !self.token_mut().text.is_ascii() {
-            to_ascii(&self.tail.token().text, self.buffer);
-            mem::swap(&mut self.tail.token_mut().text, self.buffer);
+        let token = self.tail.token_mut();
+        if !token.text.is_ascii() {
+            to_ascii(&token.text, self.buffer);
+            mem::swap(&mut token.text, self.buffer);
         }
         true
     }
@@ -67,6 +68,7 @@ impl<T: TokenStream> TokenStream for AsciiFoldingFilterTokenStream<'_, T> {
 
 fn to_ascii(text: &str, output: &mut String) {
     output.clear();
+    output.reserve(text.len());
     for ch in text.chars() {
         if ch.is_ascii() {
             output.push(ch);
@@ -148,5 +150,11 @@ mod tests {
     fn test_ascii_folding_sharp_s() {
         let tokens = collect_tokens("straße");
         assert_eq!(tokens[0].text, "strasse");
+    }
+
+    #[test]
+    fn test_ascii_folding_cjk_unchanged() {
+        let tokens = collect_tokens("こんにちは世界");
+        assert_eq!(tokens[0].text, "こんにちは世界");
     }
 }

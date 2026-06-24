@@ -798,6 +798,26 @@ pub trait CommitHandler: Debug + Send + Sync {
         default_resolve_version(base_path, version, object_store).await
     }
 
+    /// Check whether an attached manifest version exists without loading it.
+    ///
+    /// The default implementation probes the deterministic manifest path for
+    /// the given naming scheme. Commit handlers with an external source of
+    /// truth should override this method.
+    async fn version_exists(
+        &self,
+        base_path: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+        naming_scheme: ManifestNamingScheme,
+    ) -> Result<bool> {
+        let path = naming_scheme.manifest_path(base_path, version);
+        match object_store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// List detached manifest locations.
     ///
     /// Returns a stream of detached manifest locations in arbitrary order.

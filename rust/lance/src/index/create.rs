@@ -18,7 +18,7 @@ use crate::{
         vector_index_details, vector_index_details_default,
     },
 };
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
@@ -133,6 +133,11 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
+        self.execute_uncommitted_impl().await
+    }
+
+    fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
+        async move {
         if self.columns.len() != 1 {
             return Err(Error::index(
                 "Only support building index on 1 column at the moment".to_string(),
@@ -481,6 +486,8 @@ impl<'a> CreateIndexBuilder<'a> {
             base_id: None,
             files: Some(created_index.files),
         })
+        }
+        .boxed()
     }
 
     #[instrument(skip_all)]
@@ -1993,6 +2000,23 @@ mod tests {
         let segments = input_segments.clone();
         assert_eq!(segments.len(), input_segments.len());
 
+        crate::index::scalar::inverted::finalize_segment_files_if_needed(
+            &dataset,
+            &input_segments[0],
+        )
+        .await
+        .unwrap();
+        let stale_staging_path = dataset
+            .indices_dir()
+            .join(input_segments[0].uuid.to_string())
+            .join("staging")
+            .join("orphan.lance");
+        dataset
+            .object_store
+            .put(&stale_staging_path, b"stale")
+            .await
+            .unwrap();
+
         dataset
             .commit_existing_index_segments("text_idx", "text", segments)
             .await
@@ -2016,6 +2040,19 @@ mod tests {
 
         let indices = dataset.load_indices_by_name("text_idx").await.unwrap();
         assert_eq!(indices.len(), input_segments.len());
+        let finalized_segment = indices
+            .iter()
+            .find(|index| index.uuid == input_segments[0].uuid)
+            .expect("finalized segment should be committed");
+        assert!(
+            finalized_segment
+                .files
+                .as_ref()
+                .expect("committed segment should track files")
+                .iter()
+                .all(|file| !file.path.starts_with("staging/")),
+            "stale staging files must not be committed in IndexMetadata.files"
+        );
     }
 
     #[tokio::test]

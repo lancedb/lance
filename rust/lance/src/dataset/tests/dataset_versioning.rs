@@ -213,6 +213,77 @@ async fn test_version_id_fast_path() {
 
 #[rstest]
 #[tokio::test]
+async fn test_stale_checks_cover_fast_successor_and_latest_version(
+    #[values(false, true)] enable_v2_manifest_paths: bool,
+) {
+    let expected_scheme = if enable_v2_manifest_paths {
+        ManifestNamingScheme::V2
+    } else {
+        ManifestNamingScheme::V1
+    };
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::UInt32,
+        false,
+    )]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(0..5))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+
+    let original = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(original.manifest_location().naming_scheme, expected_scheme);
+    assert!(!original.is_stale().await.unwrap());
+    assert!(!original.has_successor_version().await.unwrap());
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(UInt32Array::from_iter_values(5..10))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+    let updated = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(original.is_stale().await.unwrap());
+    assert!(original.has_successor_version().await.unwrap());
+    assert_eq!(updated.manifest_location().naming_scheme, expected_scheme);
+    assert!(!updated.is_stale().await.unwrap());
+    assert!(!updated.has_successor_version().await.unwrap());
+
+    let historical = updated.checkout_version(1).await.unwrap();
+    assert_eq!(
+        historical.manifest_location().naming_scheme,
+        expected_scheme
+    );
+    assert!(historical.is_stale().await.unwrap());
+    assert!(historical.has_successor_version().await.unwrap());
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_restore(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,

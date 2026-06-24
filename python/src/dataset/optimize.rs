@@ -58,6 +58,9 @@ fn parse_compaction_options(
             "batch_size" => {
                 opts.batch_size = value.extract()?;
             }
+            "io_buffer_size" => {
+                opts.io_buffer_size = value.extract()?;
+            }
             "compaction_mode" => {
                 let mode_str: Option<String> = value.extract()?;
                 if let Some(mode_str) = mode_str {
@@ -551,26 +554,34 @@ impl PyCompaction {
     ///     new version once committed.
     /// rewrites : List[RewriteResult]
     ///     The results of the compaction tasks to include in the commit.
+    /// options : dict, optional
+    ///     Compaction options to apply at commit time.
+    ///     When absent or ``None``, defaults to ``CompactionOptions::default()``.
     ///
     /// Returns
     /// -------
     /// CompactionMetrics
     #[staticmethod]
+    #[pyo3(signature = (dataset, rewrites, options = None))]
     pub fn commit(
         dataset: Bound<PyAny>,
         rewrites: Vec<PyRewriteResult>,
+        options: Option<Bound<PyDict>>,
     ) -> PyResult<PyCompactionMetrics> {
         let dataset_ref = unwrap_dataset(dataset)?;
         let dataset = dataset_ref.borrow().clone();
+        let config = dataset.ds.manifest.config.clone();
+        let opts = match options {
+            Some(ref dict) => parse_compaction_options(dict, &config)?,
+            None => CompactionOptions::default(),
+        };
         let rewrites: Vec<RewriteResult> = rewrites.into_iter().map(|r| r.0).collect();
         let mut new_ds = dataset.ds.as_ref().clone();
-        // TODO: pass compaction option from plan and execute time
-        let options: CompactionOptions = CompactionOptions::default();
         let fut = commit_compaction(
             &mut new_ds,
             rewrites,
             Arc::new(DatasetIndexRemapperOptions::default()),
-            &options,
+            &opts,
         );
         let metrics = rt()
             .block_on(None, fut)?

@@ -225,11 +225,14 @@ use futures::future::{BoxFuture, MaybeDone, maybe_done};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::cache::LanceCache;
-use lance_core::datatypes::{BLOB_DESC_LANCE_FIELD, Field, Schema};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
+use lance_core::datatypes::{
+    BLOB_DESC_LANCE_FIELD, Field, Schema, validate_fixed_size_list_dimensions,
+};
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
+use prost::Message;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
@@ -297,6 +300,15 @@ pub enum PageEncoding {
     Structural(pb21::PageLayout),
 }
 
+impl DeepSizeOf for PageEncoding {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        match self {
+            Self::Legacy(encoding) => encoding.encoded_len() * 4,
+            Self::Structural(encoding) => encoding.encoded_len() * 4,
+        }
+    }
+}
+
 impl PageEncoding {
     pub fn as_legacy(&self) -> &pb::ArrayEncoding {
         match self {
@@ -334,6 +346,13 @@ pub struct PageInfo {
     pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
 }
 
+impl DeepSizeOf for PageInfo {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.encoding.deep_size_of_children(context)
+            + self.buffer_offsets_and_sizes.deep_size_of_children(context)
+    }
+}
+
 /// Metadata describing a column in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
@@ -346,6 +365,14 @@ pub struct ColumnInfo {
     /// File positions and their sizes of the column-level buffers
     pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     pub encoding: pb::ColumnEncoding,
+}
+
+impl DeepSizeOf for ColumnInfo {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.page_infos.deep_size_of_children(context)
+            + self.buffer_offsets_and_sizes.deep_size_of_children(context)
+            + self.encoding.encoded_len() * 4
+    }
 }
 
 impl ColumnInfo {
@@ -723,6 +750,7 @@ impl CoreFieldDecoderStrategy {
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
+        validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
@@ -832,6 +860,7 @@ impl CoreFieldDecoderStrategy {
         buffers: FileBuffers,
     ) -> Result<Box<dyn crate::previous::decoder::FieldScheduler>> {
         let data_type = field.data_type();
+        validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_primitive_legacy(&data_type) {
             let column_info = column_infos.expect_next()?;
             let scheduler = self.create_primitive_scheduler(field, column_info, buffers)?;
@@ -2886,6 +2915,52 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_zero_dimension_fsl_errors_instead_of_panicking() {
+        // Simulates reading a column whose stored schema declares a
+        // zero-dimension FixedSizeList, as old writers (before #5102) could
+        // persist. The read plan is built by the field-scheduler factories,
+        // which run the dimension guard before touching any column data, so
+        // an empty column iterator is sufficient to reach the guard. The read
+        // must surface a clean error rather than a divide-by-zero panic.
+        use arrow_schema::Field as ArrowField;
+
+        let zero_dim = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            0,
+        );
+        let field = Field::try_from(&ArrowField::new("vec", zero_dim, true)).unwrap();
+        let strategy = CoreFieldDecoderStrategy::default();
+
+        let mut structural_columns = ColumnInfoIter::new(vec![], &[]);
+        let err = strategy
+            .create_structural_field_scheduler(&field, &mut structural_columns)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+
+        let mut legacy_columns = ColumnInfoIter::new(vec![], &[]);
+        let err = strategy
+            .create_legacy_field_scheduler(
+                &field,
+                &mut legacy_columns,
+                FileBuffers {
+                    positions_and_sizes: &[],
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dimension must be a positive integer"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
     #[test]
     fn test_coalesce_indices_to_ranges_with_single_index() {

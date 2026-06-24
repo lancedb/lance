@@ -95,6 +95,26 @@ class CleanupStats:
     index_files_removed: int
     deletion_files_removed: int
 
+class CleanupCandidateFile:
+    path: str
+    kind: str
+    unverified: bool
+    size_bytes: int
+
+class CleanupReferencedBranch:
+    name: str
+    referenced_version: int
+    cleanup_candidate: bool
+
+class CleanupExplanation:
+    read_version: int
+    stats: CleanupStats
+    candidate_files: List[CleanupCandidateFile]
+    candidate_files_truncated: bool
+    candidate_file_limit: int
+    referenced_branches: List[CleanupReferencedBranch]
+    warnings: List[str]
+
 class LanceFileWriter:
     def __init__(
         self,
@@ -135,6 +155,11 @@ class LanceFileSession:
     ) -> LanceFileWriter: ...
     def contains(self, path: str) -> bool: ...
     def list(self, path: Optional[str] = None) -> List[str]: ...
+    def list_with_delimiter(
+        self, path: Optional[str] = None
+    ) -> tuple[List[str], List[str]]: ...
+    def read_range(self, path: str, offset: int, length: int) -> bytes: ...
+    def delete_file(self, path: str) -> None: ...
     def upload_file(self, local_path: str, remote_path: str) -> None: ...
     def download_file(self, remote_path: str, local_path: str) -> None: ...
 
@@ -226,6 +251,8 @@ class _Dataset:
     def replace_field_metadata(self, field_name: str, metadata: Dict[str, str]): ...
     @property
     def data_storage_version(self) -> str: ...
+    @property
+    def has_stable_row_ids(self) -> bool: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
     def describe_indices(self) -> List[IndexDescription]: ...
@@ -342,11 +369,22 @@ class _Dataset:
     def restore(self): ...
     def cleanup_old_versions(
         self,
-        older_than_micros: int,
+        older_than_micros: Optional[int] = None,
+        retain_versions: Optional[int] = None,
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
         delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats: ...
+    def explain_cleanup_old_versions(
+        self,
+        older_than_micros: Optional[int] = None,
+        retain_versions: Optional[int] = None,
+        delete_unverified: Optional[bool] = None,
+        error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
+        include_files: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupExplanation: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
     def tags(self) -> Dict[str, Tag]: ...
@@ -461,6 +499,27 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def hamming_clustering_for_ivf_partition(
+        self,
+        index_name: str,
+        partition_id: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def get_ivf_partition_info(self, index_name: str) -> List[dict]: ...
+    def hamming_clustering_for_sample(
+        self,
+        column: str,
+        sample_size: Optional[int],
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def hamming_clustering_for_range(
+        self,
+        column: str,
+        fragment_id: int,
+        start_row: int,
+        num_rows: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...

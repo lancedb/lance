@@ -8,6 +8,7 @@
 //! This module offers a type-safe builder to construct that struct without
 //! manually wiring metadata.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -17,7 +18,10 @@ use arrow_array::{
 };
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field};
-use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+use lance_arrow::{
+    ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+    BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME,
+};
 
 use crate::{Error, Result};
 
@@ -26,7 +30,94 @@ use crate::{Error, Result};
 /// The default Rust schema preserves the historical minimal shape:
 /// `Struct<data: LargeBinary?, uri: Utf8?>`.
 pub fn blob_field(name: &str, nullable: bool) -> Field {
-    blob_field_with_children(name, nullable, false, false)
+    blob_field_with_options(name, nullable, BlobFieldOptions::default())
+}
+
+/// Options for constructing a blob v2 field.
+#[derive(Clone, Debug, Default)]
+pub struct BlobFieldOptions {
+    /// Maximum payload size to keep inline in the data file before using packed blob storage.
+    pub inline_size_threshold: Option<usize>,
+    /// Maximum payload size to store in packed blob storage before using dedicated blob storage.
+    ///
+    /// A zero threshold is invalid because dedicated blob storage is selected when
+    /// the payload size is greater than this value.
+    pub dedicated_size_threshold: Option<NonZeroUsize>,
+}
+
+impl BlobFieldOptions {
+    /// Set the maximum payload size to keep inline in the data file.
+    pub fn with_inline_size_threshold(mut self, threshold: usize) -> Self {
+        self.inline_size_threshold = Some(threshold);
+        self
+    }
+
+    /// Set the maximum payload size to store in packed blob storage.
+    pub fn with_dedicated_size_threshold(mut self, threshold: NonZeroUsize) -> Self {
+        self.dedicated_size_threshold = Some(threshold);
+        self
+    }
+}
+
+/// Construct the Arrow field for a blob v2 column with storage layout options.
+///
+/// Blob v2 expects a struct column tagged with
+/// `ARROW:extension:name = "lance.blob.v2"`. Child fields are recognized by name.
+///
+/// ```
+/// # use lance::{BlobFieldOptions, blob_field_with_options};
+/// let field = blob_field_with_options(
+///     "blob",
+///     true,
+///     BlobFieldOptions::default().with_inline_size_threshold(16 * 1024),
+/// );
+/// assert_eq!(
+///     field
+///         .metadata()
+///         .get("lance-encoding:blob-inline-size-threshold")
+///         .map(String::as_str),
+///     Some("16384"),
+/// );
+/// ```
+pub fn blob_field_with_options(name: &str, nullable: bool, options: BlobFieldOptions) -> Field {
+    blob_field_with_children(name, nullable, false, false, options)
+}
+
+fn blob_field_with_children(
+    name: &str,
+    nullable: bool,
+    include_position_size: bool,
+    include_source_id: bool,
+    options: BlobFieldOptions,
+) -> Field {
+    let mut metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    if let Some(threshold) = options.inline_size_threshold {
+        metadata.insert(
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+            threshold.to_string(),
+        );
+    }
+    if let Some(threshold) = options.dedicated_size_threshold {
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            threshold.get().to_string(),
+        );
+    }
+    let mut fields = vec![
+        Field::new("data", DataType::LargeBinary, true),
+        Field::new("uri", DataType::Utf8, true),
+    ];
+    if include_position_size {
+        fields.push(Field::new("position", DataType::UInt64, true));
+        fields.push(Field::new("size", DataType::UInt64, true));
+    }
+    if include_source_id {
+        fields.push(Field::new("source_id", DataType::Utf8, true));
+    }
+
+    Field::new(name, DataType::Struct(fields.into()), nullable).with_metadata(metadata)
 }
 
 /// Builder for blob v2 input struct columns.
@@ -64,14 +155,26 @@ impl BlobArrayBuilder {
 
     /// Construct an Arrow field matching the shape this builder will produce.
     ///
-    /// Use this instead of [`blob_field`] when constructing arrays with
-    /// source identity or URI slice metadata.
+    /// Use this instead of [`blob_field`] when constructing arrays with source
+    /// identity or URI slice metadata.
     pub fn field(&self, name: &str, nullable: bool) -> Field {
+        self.field_with_options(name, nullable, BlobFieldOptions::default())
+    }
+
+    /// Construct an Arrow field matching the shape this builder will produce,
+    /// including storage layout options.
+    pub fn field_with_options(
+        &self,
+        name: &str,
+        nullable: bool,
+        options: BlobFieldOptions,
+    ) -> Field {
         blob_field_with_children(
             name,
             nullable,
             self.has_position_size || self.has_source_id,
             self.has_source_id,
+            options,
         )
     }
 
@@ -263,30 +366,6 @@ impl BlobArrayBuilder {
     }
 }
 
-fn blob_field_with_children(
-    name: &str,
-    nullable: bool,
-    include_position_size: bool,
-    include_source_id: bool,
-) -> Field {
-    let metadata = [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
-        .into_iter()
-        .collect();
-    let mut fields = vec![
-        Field::new("data", DataType::LargeBinary, true),
-        Field::new("uri", DataType::Utf8, true),
-    ];
-    if include_position_size {
-        fields.push(Field::new("position", DataType::UInt64, true));
-        fields.push(Field::new("size", DataType::UInt64, true));
-    }
-    if include_source_id {
-        fields.push(Field::new("source_id", DataType::Utf8, true));
-    }
-
-    Field::new(name, DataType::Struct(fields.into()), nullable).with_metadata(metadata)
-}
-
 fn validate_source_id(source_id: &str) -> Result<()> {
     if source_id.is_empty() {
         Err(Error::invalid_input("source_id cannot be empty"))
@@ -297,6 +376,8 @@ fn validate_source_id(source_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
@@ -315,6 +396,31 @@ mod tests {
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name(), "data");
         assert_eq!(fields[1].name(), "uri");
+    }
+
+    #[test]
+    fn test_field_metadata_with_options() {
+        let field = blob_field_with_options(
+            "blob",
+            true,
+            BlobFieldOptions::default()
+                .with_inline_size_threshold(16 * 1024)
+                .with_dedicated_size_threshold(NonZeroUsize::new(2 * 1024 * 1024).unwrap()),
+        );
+        assert_eq!(
+            field
+                .metadata()
+                .get(BLOB_INLINE_SIZE_THRESHOLD_META_KEY)
+                .unwrap(),
+            "16384"
+        );
+        assert_eq!(
+            field
+                .metadata()
+                .get(BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY)
+                .unwrap(),
+            "2097152"
+        );
     }
 
     #[test]
@@ -364,6 +470,7 @@ mod tests {
         b.push_uri_with_source_id("image:2", "s3://bucket/key", Some(3), Some(4))
             .unwrap();
 
+        let field = b.field("blob", true);
         let arr = b.finish().unwrap();
         let struct_arr = arr.as_struct();
         assert_eq!(struct_arr.columns().len(), 5);
@@ -377,6 +484,14 @@ mod tests {
         assert_eq!(position.value(1), 3);
         assert_eq!(size.value(1), 4);
         assert_eq!(source_id.value(1), "image:2");
+
+        let DataType::Struct(fields) = field.data_type() else {
+            panic!("expected struct blob field");
+        };
+        assert_eq!(
+            fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            vec!["data", "uri", "position", "size", "source_id"]
+        );
     }
 
     #[test]
@@ -395,6 +510,33 @@ mod tests {
         assert_eq!(
             fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
             vec!["data", "uri", "position", "size"]
+        );
+    }
+
+    #[test]
+    fn test_builder_field_with_options() {
+        let mut b = BlobArrayBuilder::new(1);
+        b.push_bytes_with_source_id("image:1", b"hi").unwrap();
+
+        let field = b.field_with_options(
+            "blob",
+            true,
+            BlobFieldOptions::default().with_inline_size_threshold(16 * 1024),
+        );
+
+        assert_eq!(
+            field
+                .metadata()
+                .get(BLOB_INLINE_SIZE_THRESHOLD_META_KEY)
+                .map(String::as_str),
+            Some("16384")
+        );
+        let DataType::Struct(fields) = field.data_type() else {
+            panic!("expected struct blob field");
+        };
+        assert_eq!(
+            fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            vec!["data", "uri", "position", "size", "source_id"]
         );
     }
 }

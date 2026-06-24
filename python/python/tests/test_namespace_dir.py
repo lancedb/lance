@@ -29,6 +29,8 @@ from lance_namespace import (
     CountTableRowsRequest,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
+    CreateTableBranchRequest,
+    CreateTableBranchResponse,
     CreateTableIndexRequest,
     CreateTableIndexResponse,
     CreateTableRequest,
@@ -37,6 +39,8 @@ from lance_namespace import (
     CreateTableVersionResponse,
     DeclareTableRequest,
     DeclareTableResponse,
+    DeleteTableBranchRequest,
+    DeleteTableBranchResponse,
     DeregisterTableRequest,
     DeregisterTableResponse,
     DescribeNamespaceRequest,
@@ -54,6 +58,8 @@ from lance_namespace import (
     InsertIntoTableResponse,
     ListNamespacesRequest,
     ListNamespacesResponse,
+    ListTableBranchesRequest,
+    ListTableBranchesResponse,
     ListTableIndicesRequest,
     ListTableIndicesResponse,
     ListTablesRequest,
@@ -71,6 +77,8 @@ from lance_namespace.errors import (
     InvalidInputError,
     NamespaceNotEmptyError,
     NamespaceNotFoundError,
+    TableBranchAlreadyExistsError,
+    TableBranchNotFoundError,
     TableNotFoundError,
 )
 
@@ -150,6 +158,21 @@ class CustomNamespace(LanceNamespace):
         self, request: CreateTableVersionRequest
     ) -> CreateTableVersionResponse:
         return self._inner.create_table_version(request)
+
+    def create_table_branch(
+        self, request: CreateTableBranchRequest
+    ) -> CreateTableBranchResponse:
+        return self._inner.create_table_branch(request)
+
+    def list_table_branches(
+        self, request: ListTableBranchesRequest
+    ) -> ListTableBranchesResponse:
+        return self._inner.list_table_branches(request)
+
+    def delete_table_branch(
+        self, request: DeleteTableBranchRequest
+    ) -> DeleteTableBranchResponse:
+        return self._inner.delete_table_branch(request)
 
     def create_table_index(
         self, request: CreateTableIndexRequest
@@ -562,6 +585,110 @@ class TestTableOperations:
         with pytest.raises(InvalidInputError) as exc_info:
             temp_ns_client.register_table(register_req)
         assert "Path traversal is not allowed" in str(exc_info.value)
+
+
+class TestTableBranchOperations:
+    """Branch CRUD through the python bindings - mirrors the Rust branch
+    CRUD tests."""
+
+    def test_branch_crud_round_trip(self, temp_ns_client):
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        table_id = ["workspace", "branched_table"]
+        temp_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="dev")
+        )
+        listed = temp_ns_client.list_table_branches(
+            ListTableBranchesRequest(id=table_id)
+        )
+        assert "dev" in listed.branches
+        assert listed.branches["dev"].parent_version == 1
+
+        # Duplicate creation and deleting a missing branch surface the typed
+        # branch errors (codes 23 and 22), not InternalError.
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="dev2")
+        )
+        with pytest.raises(TableBranchAlreadyExistsError):
+            temp_ns_client.create_table_branch(
+                CreateTableBranchRequest(id=table_id, name="dev2")
+            )
+
+        temp_ns_client.delete_table_branch(
+            DeleteTableBranchRequest(id=table_id, name="dev")
+        )
+        listed = temp_ns_client.list_table_branches(
+            ListTableBranchesRequest(id=table_id)
+        )
+        assert "dev" not in listed.branches
+        with pytest.raises(TableBranchNotFoundError):
+            temp_ns_client.delete_table_branch(
+                DeleteTableBranchRequest(id=table_id, name="dev")
+            )
+
+    def test_create_branch_from_other_branch(self, temp_ns_client):
+        """Forking from a non-main source branch records the right parent."""
+        create_ns_req = CreateNamespaceRequest(id=["workspace"])
+        temp_ns_client.create_namespace(create_ns_req)
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        table_id = ["workspace", "fork_table"]
+        temp_ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="dev")
+        )
+        temp_ns_client.create_table_branch(
+            CreateTableBranchRequest(id=table_id, name="child", from_branch="dev")
+        )
+        listed = temp_ns_client.list_table_branches(
+            ListTableBranchesRequest(id=table_id)
+        )
+        assert listed.branches["child"].parent_branch == "dev"
+
+
+class _ForeignCodeError(Exception):
+    """Not a LanceNamespaceError, but carries the same integer code as
+    TABLE_NOT_FOUND."""
+
+    code = 4
+
+
+class _RaisingNamespace(LanceNamespace):
+    """A namespace whose describe_table raises the configured exception."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+
+    def namespace_id(self) -> str:
+        return "raising"
+
+    def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
+        raise self._exc
+
+
+class TestPythonNamespaceErrorMapping:
+    """The Rust adapter must trust the `code` attribute only on the
+    lance_namespace exception hierarchy."""
+
+    def test_namespace_error_identity_preserved(self):
+        ns = _RaisingNamespace(TableNotFoundError("no such table"))
+        with pytest.raises(TableNotFoundError, match="no such table"):
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+        # Branch error codes (22/23) survive the round trip too.
+        ns = _RaisingNamespace(TableBranchNotFoundError("no such branch"))
+        with pytest.raises(TableBranchNotFoundError, match="no such branch"):
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+    def test_foreign_code_attribute_not_trusted(self):
+        # The foreign exception must surface as itself, not be reinterpreted
+        # as a namespace error via its `code` attribute.
+        ns = _RaisingNamespace(_ForeignCodeError("boom"))
+        with pytest.raises(_ForeignCodeError, match="boom"):
+            lance.dataset(namespace_client=ns, table_id=["t"])
 
 
 class TestChildNamespaceOperations:
@@ -977,6 +1104,49 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
             _get_ops_metric(inner_ns_client, "describe_table_version")
             == describe_count_before_v1 + 1
         ), "describe_table_version should be called once when opening version 1"
+
+
+def test_dataset_namespace_open_does_not_pass_version_to_describe_table():
+    """Dataset versions are applied to dataset open, not namespace describe_table."""
+
+    class VersionRejectingNamespace(CustomNamespace):
+        def __init__(self, inner: lance.namespace.DirectoryNamespace):
+            super().__init__(inner)
+            self.describe_versions = []
+
+        def describe_table(
+            self, request: DescribeTableRequest
+        ) -> DescribeTableResponse:
+            self.describe_versions.append(request.version)
+            assert request.version is None
+            return super().describe_table(request)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        inner_ns_client = lance.namespace.DirectoryNamespace(root=tmpdir)
+        ns_client = VersionRejectingNamespace(inner_ns_client)
+        table_id = ["test_table"]
+
+        table1 = pa.Table.from_pylist([{"a": 1}, {"a": 2}])
+        ds = lance.write_dataset(
+            table1, namespace_client=ns_client, table_id=table_id, mode="create"
+        )
+        assert ds.count_rows() == 2
+        assert ds.version == 1
+
+        table2 = pa.Table.from_pylist([{"a": 3}])
+        ds = lance.write_dataset(
+            table2, namespace_client=ns_client, table_id=table_id, mode="append"
+        )
+        assert ds.count_rows() == 3
+        assert ds.version == 2
+
+        version_one = lance.dataset(
+            namespace_client=ns_client, table_id=table_id, version=1
+        )
+        assert version_one.count_rows() == 2
+        assert version_one.version == 1
+        assert ns_client.describe_versions
+        assert all(version is None for version in ns_client.describe_versions)
 
 
 @pytest.mark.skipif(

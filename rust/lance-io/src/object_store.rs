@@ -25,7 +25,7 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -578,10 +578,17 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// The amount of parallelism to use for I/O operations.
+    ///
+    /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.
+    /// Always at least 1: callers feed this straight into `buffered` / `buffer_unordered`, and a
+    /// window of 0 makes those streams never poll their input — e.g. a metadata-only `count_rows`
+    /// would hang rather than return.
     pub fn io_parallelism(&self) -> usize {
         std::env::var("LANCE_IO_THREADS")
             .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
+            .max(1)
     }
 
     /// Get the IO tracker for this object store
@@ -840,6 +847,16 @@ impl ObjectStore {
             .chain(output.objects.iter().map(|o| &o.location))
             .filter_map(|s| s.filename().map(|f| f.to_string()))
             .collect())
+    }
+
+    /// Non-recursive, path-segment delimited list of a single directory level.
+    ///
+    /// Unlike [`Self::list`], which recurses into the entire subtree, this returns
+    /// only the immediate children of `prefix`: the child "directories" as
+    /// [`ListResult::common_prefixes`] and the direct child files as
+    /// [`ListResult::objects`].
+    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
     pub fn list(
@@ -1156,6 +1173,35 @@ mod tests {
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
+    }
+
+    #[test]
+    fn test_io_parallelism_clamped_to_nonzero() {
+        // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
+        // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
+        let store = ObjectStore::local();
+
+        // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
+        // only reads it, and a concurrent reader observes a valid clamped value, never 0.
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
+        assert_eq!(
+            store.io_parallelism(),
+            1,
+            "LANCE_IO_THREADS=0 must clamp to 1"
+        );
+
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
+        assert_eq!(
+            store.io_parallelism(),
+            8,
+            "a positive override must pass through unchanged"
+        );
+
+        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
+        assert!(
+            store.io_parallelism() >= 1,
+            "the configured default parallelism must be at least 1"
+        );
     }
 
     #[tokio::test]
