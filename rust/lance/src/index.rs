@@ -1472,6 +1472,24 @@ impl DatasetIndexExt for Dataset {
             .read_partition(partition_id, with_vector)
             .await
     }
+
+    async fn open_vector_index_handle(&self, index_name: &str) -> Result<LogicalVectorIndex> {
+        let metadatas = self.load_indices_by_name(index_name).await?;
+        if metadatas.is_empty() {
+            return Err(Error::index_not_found(format!("name={index_name}")));
+        }
+        let column = self
+            .schema()
+            .field_by_id(metadatas[0].fields[0])
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "Index '{}' references unknown field id {}",
+                    index_name, metadatas[0].fields[0]
+                ))
+            })?;
+        self.open_logical_vector_index(&column.name, index_name)
+            .await
+    }
 }
 
 fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
@@ -2627,6 +2645,7 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
     use arrow::array::AsArray;
     use arrow::datatypes::{Float32Type, Int32Type};
+    use arrow_array::Array;
     use arrow_array::Int32Array;
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
@@ -2646,6 +2665,7 @@ mod tests {
         hnsw::builder::HnswBuildParams,
         ivf::IvfBuildParams,
         kmeans::{KMeansParams, train_kmeans},
+        pq::PQBuildParams,
         sq::builder::SQBuildParams,
     };
     use lance_io::{assert_io_eq, assert_io_lt, utils::tracking_store::IoStats};
@@ -2991,6 +3011,286 @@ mod tests {
                 row_count_by_segment[&segment_id] as usize
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_logical_ivf_view_read_centroids_single_segment() {
+        const DIMENSION: i32 = 8;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_fragmented_vector_dataset(test_uri, DIMENSION).await;
+        let params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::new(2));
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        let centroids = logical_index
+            .as_ivf()
+            .unwrap()
+            .read_centroids()
+            .await
+            .unwrap();
+
+        assert_eq!(centroids.len(), 2, "should have 2 partitions");
+        assert_eq!(centroids.value_length(), DIMENSION, "inner length is dim");
+        assert_eq!(
+            centroids.value_type(),
+            arrow_schema::DataType::Float32,
+            "element type should match indexed column"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logical_ivf_view_read_centroids_segmented_concatenates() {
+        const DIMENSION: i32 = 8;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_fragmented_vector_dataset(test_uri, DIMENSION).await;
+        create_segmented_vector_index(&mut dataset, "vector_idx", "vector", DIMENSION).await;
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        let ivf_view = logical_index.as_ivf().unwrap();
+        let num_segments = logical_index.num_segments();
+        // Each segment in `create_segmented_vector_index` is built with 2 partitions.
+        let expected_len = 2 * num_segments;
+
+        let centroids = ivf_view.read_centroids().await.unwrap();
+        assert_eq!(
+            centroids.len(),
+            expected_len,
+            "concatenation length equals sum of per-segment partition counts"
+        );
+        assert_eq!(centroids.value_length(), DIMENSION);
+    }
+
+    #[tokio::test]
+    async fn test_logical_ivf_view_read_pq_codebook_round_trip() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ivf_pq", test_dir.as_str());
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(32.into()),
+            )
+            .into_reader_rows(RowCount::from(300), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(4, 8, 8, MetricType::L2, 50);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vec_pq".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vec_pq")
+            .await
+            .unwrap();
+        let (codebook, num_bits) = logical_index
+            .as_ivf()
+            .unwrap()
+            .read_pq_codebook()
+            .await
+            .unwrap();
+
+        // PQ codebook is stored as a FixedSizeList of `2^num_bits` rows of
+        // length = full vector dimension (the same layout
+        // `PQBuildParams::with_codebook` consumes).
+        // num_bits=8 → 2^8 = 256 rows.
+        assert_eq!(num_bits, 8);
+        assert_eq!(codebook.len(), 256);
+        // Inner list length equals indexed dimension (32 here).
+        assert_eq!(codebook.value_length(), 32);
+        assert_eq!(
+            codebook.value_type(),
+            arrow_schema::DataType::Float32,
+            "PQ codebooks are always loaded as Float32"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logical_ivf_view_read_pq_codebook_rejects_non_pq() {
+        const DIMENSION: i32 = 8;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_fragmented_vector_dataset(test_uri, DIMENSION).await;
+        let params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::new(2));
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_flat".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_flat")
+            .await
+            .unwrap();
+        let err = logical_index
+            .as_ivf()
+            .unwrap()
+            .read_pq_codebook()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for IVF_FLAT, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_vector_index_handle_round_trip_flat() {
+        const DIMENSION: i32 = 8;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_fragmented_vector_dataset(test_uri, DIMENSION).await;
+        let params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::new(2));
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let handle = dataset
+            .open_vector_index_handle("vector_idx")
+            .await
+            .unwrap();
+        assert_eq!(handle.name(), "vector_idx");
+        assert_eq!(handle.column(), "vector");
+
+        let ivf = handle.as_ivf().unwrap();
+        let centroids = ivf.read_centroids().await.unwrap();
+        assert_eq!(centroids.len(), 2);
+        assert_eq!(centroids.value_length(), DIMENSION);
+
+        let err = ivf.read_pq_codebook().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "IVF_FLAT must reject read_pq_codebook, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_vector_index_handle_round_trip_pq() {
+        const DIMENSION: i32 = 8;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_fragmented_vector_dataset(test_uri, DIMENSION).await;
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::new(2, 8),
+        );
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_pq".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let handle = dataset.open_vector_index_handle("vector_pq").await.unwrap();
+        let ivf = handle.as_ivf().unwrap();
+        let centroids = ivf.read_centroids().await.unwrap();
+        assert_eq!(centroids.len(), 2);
+        assert_eq!(centroids.value_length(), DIMENSION);
+
+        let (codebook, num_bits) = ivf.read_pq_codebook().await.unwrap();
+        assert_eq!(num_bits, 8);
+        // 2^num_bits codebook rows.
+        assert_eq!(codebook.len(), 256);
+        // Inner list length equals the full indexed vector dimension (matches
+        // the layout `PQBuildParams::with_codebook` consumes).
+        assert_eq!(codebook.value_length(), DIMENSION);
+        assert_eq!(codebook.value_type(), arrow_schema::DataType::Float32);
+    }
+
+    #[tokio::test]
+    async fn test_open_vector_index_handle_multi_segment_centroid_concat() {
+        const DIMENSION: i32 = 8;
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = write_fragmented_vector_dataset(test_uri, DIMENSION).await;
+        create_segmented_vector_index(&mut dataset, "vector_idx", "vector", DIMENSION).await;
+
+        let handle = dataset
+            .open_vector_index_handle("vector_idx")
+            .await
+            .unwrap();
+        assert!(
+            handle.num_segments() >= 2,
+            "need >= 2 segments to test concat, got {}",
+            handle.num_segments()
+        );
+        // Each segment in `create_segmented_vector_index` is built with 2 partitions.
+        let expected_len = 2 * handle.num_segments();
+        let centroids = handle.as_ivf().unwrap().read_centroids().await.unwrap();
+        assert_eq!(centroids.len(), expected_len);
+        assert_eq!(centroids.value_length(), DIMENSION);
+    }
+
+    #[tokio::test]
+    async fn test_open_vector_index_handle_unknown_name_returns_index_not_found() {
+        const DIMENSION: i32 = 8;
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = write_fragmented_vector_dataset(test_uri, DIMENSION).await;
+
+        let err = dataset
+            .open_vector_index_handle("missing")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::IndexNotFound { .. }),
+            "expected IndexNotFound, got {:?}",
+            err
+        );
     }
 
     #[tokio::test]

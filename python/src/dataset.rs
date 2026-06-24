@@ -60,7 +60,7 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexExt, IndexSegment, vector::VectorIndexParams};
+use lance::index::{DatasetIndexExt, IndexSegment, LogicalVectorIndex, vector::VectorIndexParams};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -484,6 +484,76 @@ impl MergeInsertBuilder {
             .collect::<PyResult<_>>()?;
         slf.builder.mark_generations_as_merged(gens);
         Ok(slf)
+    }
+}
+
+/// Map a `lance::Error` returned by an index lookup API into the closest
+/// matching Python exception:
+///   - `IndexNotFound` -> `ValueError` (matches the spec error contract for
+///     open_vector_index_handle).
+///   - `NotSupported`  -> `NotImplementedError` (PQ codebook on a non-PQ index).
+///   - everything else -> `RuntimeError`.
+#[pyclass(name = "_VectorIndexHandle", module = "_lib")]
+pub struct PyVectorIndexHandle {
+    inner: Arc<LogicalVectorIndex>,
+}
+
+#[pymethods]
+impl PyVectorIndexHandle {
+    #[getter]
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    #[getter]
+    fn column(&self) -> &str {
+        self.inner.column()
+    }
+
+    #[getter]
+    fn num_segments(&self) -> usize {
+        self.inner.num_segments()
+    }
+
+    fn as_ivf(&self) -> PyVectorIvfIndexHandle {
+        PyVectorIvfIndexHandle {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+#[pyclass(name = "_IvfIndexHandle", module = "_lib")]
+pub struct PyVectorIvfIndexHandle {
+    inner: Arc<LogicalVectorIndex>,
+}
+
+#[pymethods]
+impl PyVectorIvfIndexHandle {
+    fn read_centroids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let view = self.inner.as_ivf().map_err(map_index_lookup_error)?;
+        let centroids = rt()
+            .block_on(Some(py), view.read_centroids())?
+            .map_err(map_index_lookup_error)?;
+        centroids.into_data().to_pyarrow(py)
+    }
+
+    fn read_pq_codebook<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let view = self.inner.as_ivf().map_err(map_index_lookup_error)?;
+        let result = rt().block_on(Some(py), view.read_pq_codebook())?;
+        match result {
+            Ok((codebook, _num_bits)) => Ok(Some(codebook.into_data().to_pyarrow(py)?)),
+            Err(lance::Error::NotSupported { .. }) => Ok(None),
+            Err(e) => Err(map_index_lookup_error(e)),
+        }
+    }
+}
+
+fn map_index_lookup_error(err: lance::Error) -> PyErr {
+    use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
+    match err {
+        lance::Error::IndexNotFound { .. } => PyValueError::new_err(err.to_string()),
+        lance::Error::NotSupported { .. } => PyNotImplementedError::new_err(err.to_string()),
+        _ => PyRuntimeError::new_err(err.to_string()),
     }
 }
 
@@ -2993,6 +3063,19 @@ impl Dataset {
             stream,
         )));
         Ok(PyArrowType(reader))
+    }
+
+    fn open_vector_index_handle(
+        &self,
+        py: Python<'_>,
+        index_name: &str,
+    ) -> PyResult<PyVectorIndexHandle> {
+        let handle = rt()
+            .block_on(Some(py), self.ds.open_vector_index_handle(index_name))?
+            .map_err(map_index_lookup_error)?;
+        Ok(PyVectorIndexHandle {
+            inner: Arc::new(handle),
+        })
     }
 
     #[pyo3(signature = (*, min_version=None, progress=None))]

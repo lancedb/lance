@@ -29,10 +29,12 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class VectorIndexTest {
@@ -394,5 +396,186 @@ public class VectorIndexTest {
       }
     }
     return true;
+  }
+
+  @Test
+  public void testOpenVectorIndexHandleIvfFlatReadsCentroidsAndCodebookEmpty(@TempDir Path tempDir)
+      throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("handle_ivf_flat"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivfParams =
+            new IvfBuildParams.Builder().setNumPartitions(2).setMaxIters(1).build();
+        VectorIndexParams params =
+            new VectorIndexParams.Builder(ivfParams).setDistanceType(DistanceType.L2).build();
+        IndexParams indexParams = IndexParams.builder().setVectorIndexParams(params).build();
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_FLAT,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        try (org.lance.index.vector.VectorIndexHandle handle =
+            dataset.openVectorIndexHandle(TestVectorDataset.indexName)) {
+          assertEquals(TestVectorDataset.indexName, handle.getName());
+          assertEquals(TestVectorDataset.vectorColumnName, handle.getColumn());
+
+          org.lance.index.vector.IvfHandle ivf = handle.asIvf().orElseThrow();
+          org.lance.index.vector.IvfCentroids centroids = ivf.readCentroids();
+          assertEquals(2, centroids.getNumPartitions());
+          assertEquals(32, centroids.getDimension());
+          assertEquals("FLOAT32", centroids.getElementType());
+          assertEquals(2 * 32, centroids.getFlat().length);
+
+          assertTrue(
+              ivf.readPqCodebook().isEmpty(),
+              "IVF_FLAT should return Optional.empty for PQ codebook");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testOpenVectorIndexHandleIvfPqReadsCodebook(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("handle_ivf_pq"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivfParams =
+            new IvfBuildParams.Builder().setNumPartitions(2).setMaxIters(1).build();
+        PQBuildParams pqParams =
+            new PQBuildParams.Builder()
+                .setNumSubVectors(2)
+                .setNumBits(8)
+                .setMaxIters(2)
+                .setSampleRate(256)
+                .build();
+        VectorIndexParams params =
+            VectorIndexParams.withIvfPqParams(DistanceType.L2, ivfParams, pqParams);
+        IndexParams indexParams = IndexParams.builder().setVectorIndexParams(params).build();
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_PQ,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        try (org.lance.index.vector.VectorIndexHandle handle =
+            dataset.openVectorIndexHandle(TestVectorDataset.indexName)) {
+          org.lance.index.vector.IvfHandle ivf = handle.asIvf().orElseThrow();
+          Optional<org.lance.index.vector.PqCodebook> result = ivf.readPqCodebook();
+          assertTrue(result.isPresent(), "IVF_PQ should produce a PQ codebook");
+          org.lance.index.vector.PqCodebook codebook = result.get();
+          assertEquals(8, codebook.getNumBits());
+          assertEquals(32, codebook.getDimension());
+          assertEquals(256 * 32, codebook.getFlat().length);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testOpenVectorIndexHandleUnknownNameThrows(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("handle_unknown"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        assertThrows(
+            IllegalArgumentException.class, () -> dataset.openVectorIndexHandle("missing"));
+      }
+    }
+  }
+
+  @Test
+  public void testOpenVectorIndexHandleMultiSegmentConcat(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("handle_multi"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        List<Fragment> fragments = dataset.getFragments();
+        assertTrue(
+            fragments.size() >= 2,
+            "Expected dataset to have at least two fragments for multi-segment test");
+
+        int numPartitions = 2;
+        IvfBuildParams ivfTrainParams =
+            new IvfBuildParams.Builder().setNumPartitions(numPartitions).setMaxIters(1).build();
+        float[] centroids =
+            VectorTrainer.trainIvfCentroids(
+                dataset, TestVectorDataset.vectorColumnName, ivfTrainParams);
+        IvfBuildParams ivfParams =
+            new IvfBuildParams.Builder()
+                .setNumPartitions(numPartitions)
+                .setMaxIters(1)
+                .setCentroids(centroids)
+                .build();
+        VectorIndexParams vectorIndexParams =
+            new VectorIndexParams.Builder(ivfParams).setDistanceType(DistanceType.L2).build();
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        Index firstSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_FLAT,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(0).getId()))
+                    .build());
+        Index secondSegment =
+            dataset.createIndex(
+                IndexOptions.builder(
+                        Collections.singletonList(TestVectorDataset.vectorColumnName),
+                        IndexType.IVF_FLAT,
+                        indexParams)
+                    .withIndexName(TestVectorDataset.indexName)
+                    .withFragmentIds(Collections.singletonList(fragments.get(1).getId()))
+                    .build());
+        dataset.commitExistingIndexSegments(
+            TestVectorDataset.indexName,
+            TestVectorDataset.vectorColumnName,
+            List.of(firstSegment, secondSegment));
+
+        try (org.lance.index.vector.VectorIndexHandle handle =
+            dataset.openVectorIndexHandle(TestVectorDataset.indexName)) {
+          int segments = handle.getNumSegments();
+          assertTrue(segments >= 1, "Expected at least one segment");
+          org.lance.index.vector.IvfHandle ivf = handle.asIvf().orElseThrow();
+          org.lance.index.vector.IvfCentroids c = ivf.readCentroids();
+          // Each segment in this test is built with `numPartitions` partitions.
+          assertEquals(numPartitions * segments, c.getNumPartitions());
+          assertEquals(32, c.getDimension());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testVectorIndexHandleUseAfterCloseThrows(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("handle_close"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivfParams =
+            new IvfBuildParams.Builder().setNumPartitions(2).setMaxIters(1).build();
+        VectorIndexParams params =
+            new VectorIndexParams.Builder(ivfParams).setDistanceType(DistanceType.L2).build();
+        IndexParams indexParams = IndexParams.builder().setVectorIndexParams(params).build();
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_FLAT,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        org.lance.index.vector.VectorIndexHandle handle =
+            dataset.openVectorIndexHandle(TestVectorDataset.indexName);
+        handle.close();
+        // Idempotent close.
+        handle.close();
+        assertThrows(IllegalStateException.class, handle::asIvf);
+      }
+    }
   }
 }

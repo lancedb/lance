@@ -253,4 +253,20 @@ pub trait DatasetIndexExt {
         partition_id: usize,
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream>;
+
+    /// Open a snapshot handle of a committed vector index by name.
+    ///
+    /// The returned [`LogicalVectorIndex`](crate::index::LogicalVectorIndex)
+    /// is a fully-materialized snapshot: after this call, the handle is
+    /// independent of `self` and will not observe later commits, drops, or
+    /// version changes.
+    ///
+    /// # Errors
+    /// - [`Error::IndexNotFound`] — no logical index with this name.
+    /// - [`Error::Index`] — the named index exists but its first segment
+    ///   references a column that no longer resolves in the current schema.
+    async fn open_vector_index_handle(
+        &self,
+        index_name: &str,
+    ) -> Result<crate::index::LogicalVectorIndex>;
 }

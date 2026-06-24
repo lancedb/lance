@@ -3378,3 +3378,91 @@ def test_fts_filter_vector_search(tmp_path):
 
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+def test_open_vector_index_handle_pq(tmp_path):
+    tbl = create_table(nvec=300, ndim=32)
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=8,
+        name="vec_idx",
+    )
+
+    handle = ds.open_vector_index_handle("vec_idx")
+    assert handle.name == "vec_idx"
+    assert handle.column == "vector"
+    assert handle.num_segments == 1
+
+    ivf = handle.as_ivf()
+    centroids = ivf.read_centroids()
+    assert isinstance(centroids, pa.FixedSizeListArray)
+    assert len(centroids) == 4
+    assert centroids.type.list_size == 32
+
+    codebook = ivf.read_pq_codebook()
+    assert codebook is not None
+    assert isinstance(codebook, pa.FixedSizeListArray)
+    assert len(codebook) == 256  # 2 ** num_bits, num_bits=8 default
+    assert codebook.type.list_size == 32
+    assert codebook.type.value_type == pa.float32()
+
+
+def test_open_vector_index_handle_flat_codebook_is_none(tmp_path):
+    tbl = create_table(nvec=300, ndim=32)
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_index(
+        "vector",
+        index_type="IVF_FLAT",
+        num_partitions=4,
+        name="vec_flat",
+    )
+
+    handle = ds.open_vector_index_handle("vec_flat")
+    ivf = handle.as_ivf()
+    centroids = ivf.read_centroids()
+    assert isinstance(centroids, pa.FixedSizeListArray)
+    assert len(centroids) == 4
+
+    assert ivf.read_pq_codebook() is None
+
+
+def test_open_vector_index_handle_unknown_raises_value_error(tmp_path):
+    tbl = create_table(nvec=100, ndim=8)
+    ds = lance.write_dataset(tbl, tmp_path)
+    with pytest.raises(ValueError):
+        ds.open_vector_index_handle("missing")
+
+
+@pytest.mark.parametrize("num_fragments", [1, 3])
+def test_open_vector_index_handle_multi_segment(tmp_path, num_fragments):
+    tbl = create_table(nvec=600, ndim=32)
+    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=600 // num_fragments)
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=8,
+        name="vec_multi",
+    )
+    if num_fragments > 1:
+        # Append more fragments and optimize them as a separate segment so the
+        # handle observes >1 segment.
+        more = create_table(nvec=600, ndim=32)
+        ds = lance.write_dataset(
+            more, tmp_path, mode="append", max_rows_per_file=600 // num_fragments
+        )
+        ds.optimize.optimize_indices(num_indices_to_merge=0)
+
+    handle = ds.open_vector_index_handle("vec_multi")
+    assert handle.num_segments >= 1
+
+    ivf = handle.as_ivf()
+    centroids = ivf.read_centroids()
+    assert isinstance(centroids, pa.FixedSizeListArray)
+    # Outer length = sum of per-segment partition counts
+    # (4 partitions per segment in this test).
+    assert len(centroids) == 4 * handle.num_segments
+    assert centroids.type.list_size == 32

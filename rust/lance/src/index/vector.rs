@@ -221,6 +221,53 @@ impl<'a> LogicalIvfView<'a> {
             ))),
         }
     }
+
+    /// Read the union of every segment's IVF centroids in commit order.
+    ///
+    /// The result is a single `FixedSizeListArray` whose length equals the sum
+    /// of per-segment partition counts and whose `value_length` equals the
+    /// indexed vector dimension. The element type matches the indexed column
+    /// (`Float16` / `Float32` / `Float64` / `UInt8`).
+    pub async fn read_centroids(&self) -> Result<arrow_array::FixedSizeListArray> {
+        use arrow_array::Array;
+
+        let arrays: Vec<arrow_array::ArrayRef> = self
+            .indices()
+            .map(|index| {
+                let c = index
+                    .ivf_model()
+                    .centroids_array()
+                    .expect("IVF segment must have centroids by construction");
+                Arc::new(c.clone()) as arrow_array::ArrayRef
+            })
+            .collect();
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        let concatenated = arrow_select::concat::concat(&refs)?;
+        Ok(lance_arrow::as_fixed_size_list_array(concatenated.as_ref()).clone())
+    }
+
+    /// Read the trained PQ codebook for an `IVF_PQ` / `IVF_HNSW_PQ` index.
+    ///
+    /// All segments of one logical index are constructed with the same
+    /// codebook, so this returns the codebook from the first segment along
+    /// with its trained `num_bits` (log2 of the codebook row count) so
+    /// language bindings can populate POJOs without re-walking the segment
+    /// list.
+    pub async fn read_pq_codebook(&self) -> Result<(arrow_array::FixedSizeListArray, u32)> {
+        use lance_index::vector::quantizer::Quantizer;
+
+        let first = self
+            .indices()
+            .next()
+            .expect("LogicalVectorIndex has >= 1 segment by construction");
+        match first.quantizer() {
+            Quantizer::Product(pq) => Ok((pq.codebook, pq.num_bits)),
+            _ => Err(Error::not_supported(format!(
+                "LogicalIvfView '{}': index does not use product quantization",
+                self.logical_index.name()
+            ))),
+        }
+    }
 }
 
 /// Parameters of each index stage.
