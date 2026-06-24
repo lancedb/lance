@@ -12,7 +12,7 @@ use std::time::Instant;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::cache::CacheKey;
 use lance_core::datatypes::Field;
@@ -278,8 +278,7 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     prune_stale_segment_coverage(dataset, field_id, &mut segments, false, false).await?;
 
-    let mut new_indices = Vec::with_capacity(segments.len());
-    for segment in segments {
+    let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
         let (uuid, fragment_bitmap, fields, index_details, index_version, dataset_version) =
             segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
@@ -299,12 +298,12 @@ pub(crate) async fn build_index_metadata_from_segments(
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
         }
-        let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         if is_inverted_index {
             retain_committed_inverted_files(&mut files);
         }
-        new_indices.push(IndexMetadata {
+        Ok::<_, Error>(IndexMetadata {
             uuid,
             name: index_name.to_string(),
             fields,
@@ -315,8 +314,11 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
-        });
-    }
+        })
+    }))
+    .buffered(dataset.object_store.io_parallelism())
+    .try_collect::<Vec<_>>()
+    .await?;
 
     Ok(new_indices)
 }
