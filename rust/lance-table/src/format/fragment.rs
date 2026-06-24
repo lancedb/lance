@@ -239,18 +239,28 @@ impl TryFrom<pb::DataFile> for DataFile {
 ///
 /// The coverage bitmaps index **physical** row offsets (positions in the base
 /// data files, counting deleted rows), so they are stable across deletions, like
-/// deletion vectors. Bitmaps are stored as serialized 32-bit Roaring bitmaps; use
-/// [`DataOverlayFile::coverage_for_field`] to obtain the parsed bitmap that
+/// deletion vectors. Bitmaps are parsed from their 32-bit Roaring encoding once
+/// when the fragment is loaded and held behind an `Arc` so cloning a fragment is
+/// cheap; use [`DataOverlayFile::coverage_for_field`] to obtain the one that
 /// applies to a given field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "OverlayCoverageBytes", try_from = "OverlayCoverageBytes")]
 pub enum OverlayCoverage {
     /// A single bitmap that applies to every field in the overlay's
     /// `data_file.fields` (a dense / rectangular overlay): every covered offset
     /// has a value for every field.
-    Shared(Vec<u8>),
+    Shared(Arc<RoaringBitmap>),
     /// One bitmap per field, in the same order as the overlay's
     /// `data_file.fields` (a sparse overlay): different fields may cover
     /// different offset sets.
+    PerField(Vec<Arc<RoaringBitmap>>),
+}
+
+/// Serialized form of [`OverlayCoverage`] — each bitmap as its 32-bit Roaring
+/// byte encoding. The in-memory form parses these once at load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OverlayCoverageBytes {
+    Shared(Vec<u8>),
     PerField(Vec<Vec<u8>>),
 }
 
@@ -269,15 +279,58 @@ fn serialize_roaring(bitmap: &RoaringBitmap) -> Vec<u8> {
     bytes
 }
 
+impl From<OverlayCoverage> for OverlayCoverageBytes {
+    fn from(coverage: OverlayCoverage) -> Self {
+        match coverage {
+            OverlayCoverage::Shared(bitmap) => Self::Shared(serialize_roaring(&bitmap)),
+            OverlayCoverage::PerField(bitmaps) => {
+                Self::PerField(bitmaps.iter().map(|b| serialize_roaring(b)).collect())
+            }
+        }
+    }
+}
+
+impl TryFrom<OverlayCoverageBytes> for OverlayCoverage {
+    type Error = Error;
+
+    fn try_from(bytes: OverlayCoverageBytes) -> Result<Self> {
+        Ok(match bytes {
+            OverlayCoverageBytes::Shared(b) => Self::Shared(Arc::new(deserialize_roaring(&b)?)),
+            OverlayCoverageBytes::PerField(bs) => Self::PerField(
+                bs.iter()
+                    .map(|b| deserialize_roaring(b).map(Arc::new))
+                    .collect::<Result<_>>()?,
+            ),
+        })
+    }
+}
+
+impl DeepSizeOf for OverlayCoverage {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        // RoaringBitmap does not expose its allocation size; its serialized size
+        // is a cheap, close proxy for the heap it holds.
+        let bitmap_heap = |bitmap: &RoaringBitmap| {
+            std::mem::size_of::<RoaringBitmap>() + bitmap.serialized_size()
+        };
+        match self {
+            Self::Shared(bitmap) => bitmap_heap(bitmap),
+            Self::PerField(bitmaps) => {
+                bitmaps.capacity() * std::mem::size_of::<Arc<RoaringBitmap>>()
+                    + bitmaps.iter().map(|b| bitmap_heap(b)).sum::<usize>()
+            }
+        }
+    }
+}
+
 impl OverlayCoverage {
-    /// Build a dense coverage from a single bitmap.
-    pub fn dense(bitmap: &RoaringBitmap) -> Self {
-        Self::Shared(serialize_roaring(bitmap))
+    /// Build a dense coverage from a single bitmap shared across every field.
+    pub fn dense(bitmap: RoaringBitmap) -> Self {
+        Self::Shared(Arc::new(bitmap))
     }
 
     /// Build a sparse coverage from one bitmap per field.
-    pub fn sparse(bitmaps: &[RoaringBitmap]) -> Self {
-        Self::PerField(bitmaps.iter().map(serialize_roaring).collect())
+    pub fn sparse(bitmaps: Vec<RoaringBitmap>) -> Self {
+        Self::PerField(bitmaps.into_iter().map(Arc::new).collect())
     }
 }
 
@@ -307,33 +360,42 @@ impl DataOverlayFile {
     /// `field_pos` within `data_file.fields`.
     ///
     /// For a dense overlay the same shared bitmap is returned for every field;
-    /// for a sparse overlay the per-field bitmap at `field_pos` is returned.
-    pub fn coverage_for_field(&self, field_pos: usize) -> Result<RoaringBitmap> {
+    /// for a sparse overlay the per-field bitmap at `field_pos` is returned. The
+    /// bitmap is already parsed, so this is a cheap `Arc` clone.
+    pub fn coverage_for_field(&self, field_pos: usize) -> Result<Arc<RoaringBitmap>> {
         match &self.coverage {
-            OverlayCoverage::Shared(bytes) => deserialize_roaring(bytes),
+            OverlayCoverage::Shared(bitmap) => Ok(bitmap.clone()),
             OverlayCoverage::PerField(bitmaps) => {
-                let bytes = bitmaps.get(field_pos).ok_or_else(|| {
+                bitmaps.get(field_pos).cloned().ok_or_else(|| {
                     Error::invalid_input(format!(
                         "overlay field_coverage has {} bitmaps but field position {} was requested",
                         bitmaps.len(),
                         field_pos
                     ))
-                })?;
-                deserialize_roaring(bytes)
+                })
             }
         }
     }
 }
 
+/// Overlays are stored newest-last: a later list position is newer, and ties in
+/// `committed_version` are broken by position. Loading stable-sorts by
+/// `committed_version` so resolution can rely on the ordering without
+/// re-checking; the stable sort preserves the position tiebreak for equal
+/// versions.
+fn sort_overlays_newest_last(overlays: &mut [DataOverlayFile]) {
+    overlays.sort_by_key(|overlay| overlay.committed_version);
+}
+
 impl From<&DataOverlayFile> for pb::DataOverlayFile {
     fn from(overlay: &DataOverlayFile) -> Self {
         let coverage = match &overlay.coverage {
-            OverlayCoverage::Shared(bytes) => {
-                pb::data_overlay_file::Coverage::SharedOffsetBitmap(bytes.clone())
+            OverlayCoverage::Shared(bitmap) => {
+                pb::data_overlay_file::Coverage::SharedOffsetBitmap(serialize_roaring(bitmap))
             }
             OverlayCoverage::PerField(bitmaps) => {
                 pb::data_overlay_file::Coverage::FieldCoverage(pb::FieldCoverage {
-                    offset_bitmaps: bitmaps.clone(),
+                    offset_bitmaps: bitmaps.iter().map(|b| serialize_roaring(b)).collect(),
                 })
             }
         };
@@ -354,11 +416,14 @@ impl TryFrom<pb::DataOverlayFile> for DataOverlayFile {
             .ok_or_else(|| Error::invalid_input("DataOverlayFile is missing its data_file"))?;
         let coverage = match proto.coverage {
             Some(pb::data_overlay_file::Coverage::SharedOffsetBitmap(bytes)) => {
-                OverlayCoverage::Shared(bytes)
+                OverlayCoverage::Shared(Arc::new(deserialize_roaring(&bytes)?))
             }
-            Some(pb::data_overlay_file::Coverage::FieldCoverage(fc)) => {
-                OverlayCoverage::PerField(fc.offset_bitmaps)
-            }
+            Some(pb::data_overlay_file::Coverage::FieldCoverage(fc)) => OverlayCoverage::PerField(
+                fc.offset_bitmaps
+                    .iter()
+                    .map(|b| deserialize_roaring(b).map(Arc::new))
+                    .collect::<Result<_>>()?,
+            ),
             None => {
                 return Err(Error::invalid_input(
                     "DataOverlayFile is missing its coverage",
@@ -515,11 +580,15 @@ impl DataFileFieldInterner {
                 .into_iter()
                 .map(|f| self.intern_data_file(f))
                 .collect::<Result<_>>()?,
-            overlays: p
-                .overlays
-                .into_iter()
-                .map(DataOverlayFile::try_from)
-                .collect::<Result<_>>()?,
+            overlays: {
+                let mut overlays = p
+                    .overlays
+                    .into_iter()
+                    .map(DataOverlayFile::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                sort_overlays_newest_last(&mut overlays);
+                overlays
+            },
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
@@ -822,11 +891,15 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .into_iter()
                 .map(DataFile::try_from)
                 .collect::<Result<_>>()?,
-            overlays: p
-                .overlays
-                .into_iter()
-                .map(DataOverlayFile::try_from)
-                .collect::<Result<_>>()?,
+            overlays: {
+                let mut overlays = p
+                    .overlays
+                    .into_iter()
+                    .map(DataOverlayFile::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                sort_overlays_newest_last(&mut overlays);
+                overlays
+            },
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
@@ -903,7 +976,7 @@ mod tests {
 
         let overlay = DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("overlay-0.lance", vec![3], None),
-            coverage: OverlayCoverage::dense(&bitmap),
+            coverage: OverlayCoverage::dense(bitmap.clone()),
             committed_version: 7,
         };
         let mut fragment = Fragment::new(0);
@@ -921,9 +994,9 @@ mod tests {
 
         // Dense coverage applies to every field.
         let recovered = round_tripped.overlays[0].coverage_for_field(0).unwrap();
-        assert_eq!(recovered, bitmap);
+        assert_eq!(*recovered, bitmap);
         assert_eq!(
-            round_tripped.overlays[0].coverage_for_field(5).unwrap(),
+            *round_tripped.overlays[0].coverage_for_field(5).unwrap(),
             bitmap
         );
     }
@@ -935,7 +1008,10 @@ mod tests {
         let embedding_coverage = RoaringBitmap::from_iter([1u32]);
         let overlay = DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("overlay-1.lance", vec![2, 4], None),
-            coverage: OverlayCoverage::sparse(&[name_coverage.clone(), embedding_coverage.clone()]),
+            coverage: OverlayCoverage::sparse(vec![
+                name_coverage.clone(),
+                embedding_coverage.clone(),
+            ]),
             committed_version: 3,
         };
         let mut fragment = Fragment::new(1);
@@ -943,12 +1019,70 @@ mod tests {
 
         let round_tripped = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
         assert_eq!(
-            round_tripped.overlays[0].coverage_for_field(0).unwrap(),
+            *round_tripped.overlays[0].coverage_for_field(0).unwrap(),
             name_coverage
         );
         assert_eq!(
-            round_tripped.overlays[0].coverage_for_field(1).unwrap(),
+            *round_tripped.overlays[0].coverage_for_field(1).unwrap(),
             embedding_coverage
+        );
+    }
+
+    #[test]
+    fn test_data_overlay_missing_fields_error() {
+        // A DataOverlayFile proto missing its coverage or data_file is rejected.
+        let no_coverage = pb::DataOverlayFile {
+            data_file: Some(pb::DataFile::from(&DataFile::new_legacy_from_fields(
+                "overlay.lance",
+                vec![3],
+                None,
+            ))),
+            coverage: None,
+            committed_version: 1,
+        };
+        let err = DataOverlayFile::try_from(no_coverage).unwrap_err();
+        assert!(err.to_string().contains("missing its coverage"), "{err}");
+
+        let no_data_file = pb::DataOverlayFile {
+            data_file: None,
+            coverage: Some(pb::data_overlay_file::Coverage::SharedOffsetBitmap(
+                serialize_roaring(&RoaringBitmap::from_iter([0u32])),
+            )),
+            committed_version: 1,
+        };
+        let err = DataOverlayFile::try_from(no_data_file).unwrap_err();
+        assert!(err.to_string().contains("missing its data_file"), "{err}");
+    }
+
+    #[test]
+    fn test_overlays_sorted_newest_last_on_load() {
+        // Overlays load stable-sorted by committed_version (newest last), with
+        // list position preserved as the tiebreak for equal versions.
+        let mk = |version: u64, field: i32| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![field], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: version,
+        };
+        let mut fragment = Fragment::new(0);
+        // Written out of order: v5, v2, v2 (second), v3.
+        fragment.overlays = vec![mk(5, 1), mk(2, 2), mk(2, 3), mk(3, 4)];
+
+        let loaded = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
+        let versions: Vec<u64> = loaded
+            .overlays
+            .iter()
+            .map(|o| o.committed_version)
+            .collect();
+        assert_eq!(versions, vec![2, 2, 3, 5]);
+        // Stable: the two v2 overlays keep their original relative order (field 2
+        // before field 3).
+        assert_eq!(
+            loaded.overlays[0].data_file.fields.as_ref(),
+            [2i32].as_slice()
+        );
+        assert_eq!(
+            loaded.overlays[1].data_file.fields.as_ref(),
+            [3i32].as_slice()
         );
     }
 

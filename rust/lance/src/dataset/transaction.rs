@@ -6344,7 +6344,7 @@ mod tests {
         bitmap.insert(4);
         let overlay = DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("overlay-0.lance", vec![3], None),
-            coverage: OverlayCoverage::dense(&bitmap),
+            coverage: OverlayCoverage::dense(bitmap.clone()),
             committed_version: 6,
         };
         let pb_overlay = pb::DataOverlayFile::from(&overlay);
@@ -6370,7 +6370,10 @@ mod tests {
                 assert_eq!(groups[0].fragment_id, 7);
                 assert_eq!(groups[0].overlays.len(), 1);
                 assert_eq!(groups[0].overlays[0].committed_version, 6);
-                assert_eq!(groups[0].overlays[0].coverage_for_field(0).unwrap(), bitmap);
+                assert_eq!(
+                    *groups[0].overlays[0].coverage_for_field(0).unwrap(),
+                    bitmap
+                );
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }

@@ -24,9 +24,18 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// cells without rewriting base data files. A reader that does not understand
 /// overlays must refuse the dataset, since ignoring an overlay would silently
 /// return stale base values.
+///
+/// Data overlay files are not yet a released feature: in release builds this flag
+/// is treated as unknown (so a release reader/writer refuses an overlay dataset)
+/// unless [`ENABLE_DATA_OVERLAY_FILES_ENV`] is set, which lets benchmarks opt in.
+/// Debug builds always understand it so tests exercise the path.
 pub const FLAG_DATA_OVERLAY_FILES: u64 = 64;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 128;
+
+/// Environment variable that opts a release build into reading and writing data
+/// overlay files before the feature is generally released.
+pub const ENABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_DATA_OVERLAY_FILES";
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -94,12 +103,33 @@ pub fn apply_feature_flags(
     Ok(())
 }
 
+/// Whether this build understands data overlay files: always in debug builds,
+/// and in release builds only when [`ENABLE_DATA_OVERLAY_FILES_ENV`] is set.
+fn data_overlay_files_enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os(ENABLE_DATA_OVERLAY_FILES_ENV).is_some()
+}
+
+/// The feature-flag bits this build understands, given whether overlay support
+/// is enabled. Split out from [`supported_flags`] so the policy is testable
+/// without toggling the build profile or environment.
+fn supported_flags_when(overlay_enabled: bool) -> u64 {
+    let mut supported = FLAG_UNKNOWN - 1;
+    if !overlay_enabled {
+        supported &= !FLAG_DATA_OVERLAY_FILES;
+    }
+    supported
+}
+
+fn supported_flags() -> u64 {
+    supported_flags_when(data_overlay_files_enabled())
+}
+
 pub fn can_read_dataset(reader_flags: u64) -> bool {
-    reader_flags < FLAG_UNKNOWN
+    reader_flags & !supported_flags() == 0
 }
 
 pub fn can_write_dataset(writer_flags: u64) -> bool {
-    writer_flags < FLAG_UNKNOWN
+    writer_flags & !supported_flags() == 0
 }
 
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
@@ -127,6 +157,19 @@ mod tests {
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
         ));
         assert!(!can_read_dataset(super::FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_data_overlay_flag_release_gating() {
+        // Release default (overlays disabled): the overlay flag is treated as
+        // unknown so the dataset is refused, while other known flags still pass.
+        let supported = supported_flags_when(false);
+        assert_eq!(supported & FLAG_DATA_OVERLAY_FILES, 0);
+        assert_eq!(FLAG_DELETION_FILES & !supported, 0);
+        assert_ne!(FLAG_DATA_OVERLAY_FILES & !supported, 0);
+        // Enabled (debug or env opt-in): the overlay flag is understood.
+        let supported = supported_flags_when(true);
+        assert_eq!(FLAG_DATA_OVERLAY_FILES & !supported, 0);
     }
 
     #[test]
