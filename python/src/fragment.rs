@@ -395,9 +395,21 @@ impl FileFragment {
     /// scan), avoiding a redundant predicate evaluation.
     fn delete_rows(&self, offsets: Vec<u32>) -> PyResult<Option<Self>> {
         let old_fragment = self.fragment.clone();
+        // The core deletion path only errors once the deletion count reaches
+        // physical_rows, so out-of-range offsets must be rejected here.
         let updated_fragment = rt()
-            .block_on(None, async { old_fragment.extend_deletions(offsets).await })?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            .block_on(None, async {
+                let physical_rows = old_fragment.physical_rows().await?;
+                if let Some(&offset) = offsets.iter().find(|&&o| o as usize >= physical_rows) {
+                    return Err(Error::invalid_input(format!(
+                        "delete_rows offset {offset} is out of range for fragment {} \
+                         with {physical_rows} rows",
+                        old_fragment.id()
+                    )));
+                }
+                old_fragment.extend_deletions(offsets).await
+            })?
+            .infer_error()?;
 
         match updated_fragment {
             Some(frag) => Ok(Some(Self::new(frag))),

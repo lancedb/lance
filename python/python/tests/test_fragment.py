@@ -827,3 +827,11 @@ def test_fragment_delete_rows(tmp_path: Path):
     # Deleting every row removes the fragment entirely (returns None).
     frag = lance.dataset(tmp_path).get_fragment(0)
     assert frag.delete_rows(range(100)) is None
+
+    # Offsets outside the fragment's physical rows are rejected, not silently
+    # written to the deletion file.
+    frag = lance.dataset(tmp_path).get_fragment(0)
+    with pytest.raises(ValueError, match="out of range"):
+        frag.delete_rows([100])
+    with pytest.raises(ValueError, match="out of range"):
+        frag.delete_rows([0, 50, 1000])
