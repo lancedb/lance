@@ -2833,7 +2833,7 @@ impl PostingListReader {
                 }
             })
             .buffer_unordered(PREWARM_CHUNK_CONCURRENCY)
-            .try_collect::<Vec<_>>()
+            .try_collect::<()>()
             .await?;
         let read_build_elapsed = read_build_start.elapsed();
 
