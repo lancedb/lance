@@ -6828,7 +6828,7 @@ mod tests {
 
     #[derive(Debug)]
     struct CountingStore {
-        inner: Arc<LanceIndexStore>,
+        inner: Arc<dyn IndexStore>,
         posting_file: String,
         counter: Arc<PostingMetadataCounter>,
     }
@@ -6855,7 +6855,11 @@ mod tests {
             self.inner.io_parallelism()
         }
         fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
-            self.inner.with_io_priority(io_priority)
+            Arc::new(Self {
+                inner: self.inner.with_io_priority(io_priority),
+                posting_file: self.posting_file.clone(),
+                counter: self.counter.clone(),
+            })
         }
         async fn new_index_file(
             &self,
