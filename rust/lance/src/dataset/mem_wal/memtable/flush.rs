@@ -443,9 +443,18 @@ impl MemTableFlusher {
                 if let MemIndexConfig::Hnsw(hnsw_config) = config
                     && let Some(mem_index) = registry.get_hnsw(&hnsw_config.name)
                 {
-                    let mut index_meta = self
+                    // `None` → the generation has no indexable vectors (e.g. all
+                    // tombstones); flush the data without an HNSW index for it.
+                    let Some(mut index_meta) = self
                         .create_hnsw_index(&gen_path, hnsw_config, mem_index)
-                        .await?;
+                        .await?
+                    else {
+                        info!(
+                            "Skipped empty HNSW index '{}' on flushed generation {} (no vectors)",
+                            hnsw_config.name, generation
+                        );
+                        continue;
+                    };
 
                     let schema = dataset.schema();
                     let field_idx = schema
@@ -782,12 +791,21 @@ impl MemTableFlusher {
     /// * `gen_path` - Path to the flushed generation folder
     /// * `config` - HNSW index configuration
     /// * `mem_index` - In-memory HNSW index (snapshotted, not consumed)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(None)` when the memtable holds no indexable vectors — e.g. a
+    /// generation of only tombstones (delete nulls the vector column and the
+    /// HNSW skips nulls), or an all-null vector column. The generation still
+    /// flushes its data; it simply carries no HNSW index, and an index-only
+    /// (`fast_search`) query over it returns empty — no brute-force scan.
+    /// Erroring here would fail the whole flush drain.
     async fn create_hnsw_index(
         &self,
         gen_path: &Path,
         config: &super::super::index::HnswIndexConfig,
         mem_index: &super::super::index::HnswMemIndex,
-    ) -> Result<IndexMetadata> {
+    ) -> Result<Option<IndexMetadata>> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::Float32Type;
         use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch as ArrowRecordBatch};
@@ -824,16 +842,16 @@ impl MemTableFlusher {
         let distance_type = mem_index.distance_type();
         let dim = mem_index.dim();
         if dim == 0 {
-            return Err(Error::invalid_input(
-                "HnswMemIndex has no inserted vectors; nothing to flush",
-            ));
+            // No vector was ever inserted (e.g. an all-tombstone generation):
+            // skip the index, keep the data flush.
+            return Ok(None);
         }
         // Forward-written data: HNSW row ids line up 1:1 with the data file, so
         // no position reversal (pass `None`).
         let Some((hnsw, flat_storage_batch)) = mem_index.to_lance_hnsw(None)? else {
-            return Err(Error::invalid_input(
-                "HnswMemIndex is empty; nothing to flush",
-            ));
+            // Every vector in the generation is null → empty graph; skip the
+            // index rather than failing the flush.
+            return Ok(None);
         };
 
         // Train SQ8 on the full memtable in one pass: learn global min/max
@@ -1014,7 +1032,7 @@ impl MemTableFlusher {
             files: None,
         };
 
-        Ok(index_meta)
+        Ok(Some(index_meta))
     }
 
     /// Update the shard manifest with the new flushed generation.
