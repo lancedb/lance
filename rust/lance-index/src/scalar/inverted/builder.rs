@@ -2364,8 +2364,8 @@ mod tests {
             self.inner.io_parallelism()
         }
 
-        fn with_io_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
-            self.inner.with_io_priority(base_priority)
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(io_priority)
         }
 
         async fn new_index_file(
@@ -2462,8 +2462,8 @@ mod tests {
             self.inner.io_parallelism()
         }
 
-        fn with_io_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
-            self.inner.with_io_priority(base_priority)
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(io_priority)
         }
 
         async fn new_index_file(
@@ -2593,7 +2593,7 @@ mod tests {
             1
         }
 
-        fn with_io_priority(&self, _base_priority: u64) -> Arc<dyn IndexStore> {
+        fn with_io_priority(&self, _io_priority: u64) -> Arc<dyn IndexStore> {
             // No backing scheduler, so priority is meaningless here.
             self.clone_arc()
         }

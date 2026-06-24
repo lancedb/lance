@@ -45,16 +45,8 @@ pub struct LanceIndexStore {
     /// When set, used to avoid HEAD calls when opening files
     file_sizes: HashMap<String, u64>,
     format_version: LanceFileVersion,
-    /// Base priority for all I/O this store submits to `scheduler`.
-    ///
-    /// The scheduler's backpressure deadlock-break rule ("the lowest-priority
-    /// in-flight request is always admitted") needs priorities to be totally
-    /// ordered. When many partitions read concurrently through one shared
-    /// scheduler (e.g. FTS prewarm fanning out over partitions), giving each
-    /// partition's store a distinct `base_priority` keeps that total order so
-    /// one request can always advance and drain the byte budget. Mirrors how a
-    /// filtered read scan gives each fragment a distinct reader priority.
-    base_priority: u64,
+    /// Base I/O priority for all requests this store submits to `scheduler`.
+    io_priority: u64,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -98,7 +90,7 @@ impl LanceIndexStore {
             scheduler,
             file_sizes: HashMap::new(),
             format_version,
-            base_priority: 0,
+            io_priority: 0,
         }
     }
 
@@ -111,9 +103,9 @@ impl LanceIndexStore {
         self
     }
 
-    /// The base priority all this store's I/O is submitted at.
-    pub fn base_priority(&self) -> u64 {
-        self.base_priority
+    /// The base I/O priority all this store's requests are submitted at.
+    pub fn io_priority(&self) -> u64 {
+        self.io_priority
     }
 
     fn index_file_path(&self, name: &str) -> Result<Path> {
@@ -448,11 +440,11 @@ impl IndexStore for LanceIndexStore {
         }))
     }
 
-    fn with_io_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
         // The `scheduler` is shared (`Arc`), so this clone is cheap and the new
         // priority only affects requests this clone submits.
         Arc::new(Self {
-            base_priority,
+            io_priority,
             ..self.clone()
         })
     }
@@ -467,7 +459,7 @@ impl IndexStore for LanceIndexStore {
             .unwrap_or_else(CachedFileSize::unknown);
         let file_scheduler = self
             .scheduler
-            .open_file_with_priority(&path, self.base_priority, &cached_size)
+            .open_file_with_priority(&path, self.io_priority, &cached_size)
             .await?;
         match current_reader::FileReader::try_open(
             file_scheduler,

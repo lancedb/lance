@@ -6854,8 +6854,8 @@ mod tests {
         fn io_parallelism(&self) -> usize {
             self.inner.io_parallelism()
         }
-        fn with_io_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
-            self.inner.with_io_priority(base_priority)
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(io_priority)
         }
         async fn new_index_file(
             &self,
@@ -8247,7 +8247,7 @@ mod tests {
                     .as_any()
                     .downcast_ref::<LanceIndexStore>()
                     .expect("partition store should be a LanceIndexStore")
-                    .base_priority()
+                    .io_priority()
             })
             .collect();
 
