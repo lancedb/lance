@@ -62,9 +62,9 @@ dependencies = [
 
 [[package]]
 name = "all_asserts"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "514ce16346f9fc96702fd52f2ae7e383b185516ee6f556efd7c3176be8fe7bea"
+checksum = "62ec8a4dbfbd8acfe181f030be8174b00d3d7dc3447f7dc53ead6cc96e89fe52"
 
 [[package]]
 name = "alloca"
