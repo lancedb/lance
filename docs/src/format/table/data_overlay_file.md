@@ -1,5 +1,13 @@
 # Data Overlay Files
 
+!!! warning "Experimental"
+
+    This feature is currently experimental and not yet supported in any library.
+
+<!-- TODO: When overlay file support is implemented, update this note to state
+     the released version that first supports the feature (and drop the
+     "experimental" framing once it is stable). -->
+
 !!! note "Overlay files require feature flag 64 (data overlay files)"
 
     A reader or writer that does not understand overlay files must refuse a
@@ -344,6 +352,10 @@ fall to the flat path. After a rebuild at version 4, no overlay remains and the
 
 ### When to overlay vs. rewrite a column vs. move rows
 
+<!-- TODO: Replace the rough heuristic below with concrete thresholds once we
+     have benchmarked the crossover points between overlays, column rewrites,
+     and row moves. -->
+
 *(To be expanded.)* The choice between appending an overlay, rewriting a full
 column (data evolution), and moving updated rows to a new fragment depends on the
 fraction of rows changed, the fraction of columns changed, column width, the
@@ -354,6 +366,9 @@ fragment.
 
 ### Writer support
 
+<!-- TODO: Fill in as writer implementation progresses, including the status of
+     single-file sparse overlays (independent-length columns). -->
+
 *(To be expanded.)* Dense (rectangular) overlays write with the existing
 equal-length file writer today. Sparse overlays stored as a **single** file
 require the writer to emit columns of independent lengths, which the current v2
@@ -362,6 +377,9 @@ Until that support lands, a writer can express a sparse update as multiple dense
 overlays in one transaction.
 
 ### Scheduling compaction
+
+<!-- TODO: Fill in with a concrete cost/benefit policy once compaction is
+     implemented and benchmarked. -->
 
 *(To be expanded.)* The overlay→overlay and overlay→base modes have very
 different costs; a cost/benefit scheduler decides when each is worthwhile, using
