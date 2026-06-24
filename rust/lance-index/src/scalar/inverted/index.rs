@@ -1092,7 +1092,7 @@ impl InvertedIndex {
 
                 let format = token_set_format;
                 let partitions = partitions.into_iter().enumerate().map(|(priority, id)| {
-                    let store = store.with_base_priority(priority as u64);
+                    let store = store.with_io_priority(priority as u64);
                     let frag_reuse_index_clone = frag_reuse_index.clone();
                     let index_cache_for_part =
                         index_cache.with_key_prefix(format!("part-{}", id).as_str());
@@ -6853,6 +6853,9 @@ mod tests {
         }
         fn io_parallelism(&self) -> usize {
             self.inner.io_parallelism()
+        }
+        fn with_io_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(base_priority)
         }
         async fn new_index_file(
             &self,

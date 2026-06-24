@@ -448,7 +448,7 @@ impl IndexStore for LanceIndexStore {
         }))
     }
 
-    fn with_base_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
+    fn with_io_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
         // The `scheduler` is shared (`Arc`), so this clone is cheap and the new
         // priority only affects requests this clone submits.
         Arc::new(Self {
