@@ -25,12 +25,17 @@ class Blob:
     uri: Optional[str] = None
     position: Optional[int] = None
     size: Optional[int] = None
+    source_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.data is not None and self.uri is not None:
             raise ValueError("Blob cannot have both data and uri")
         if self.uri == "":
             raise ValueError("Blob uri cannot be empty")
+        if self.source_id == "":
+            raise ValueError("Blob source_id cannot be empty")
+        if self.source_id is not None and self.data is None and self.uri is None:
+            raise ValueError("Blob source_id cannot be set without data or uri")
         if (self.position is not None or self.size is not None) and self.uri is None:
             raise ValueError("External packed blob must have a uri")
         if (self.position is None) != (self.size is None):
@@ -43,18 +48,23 @@ class Blob:
             )
 
     @staticmethod
-    def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
-        return Blob(data=bytes(data))
+    def from_bytes(
+        data: Union[bytes, bytearray, memoryview], source_id: Optional[str] = None
+    ) -> "Blob":
+        return Blob(data=bytes(data), source_id=source_id)
 
     @staticmethod
     def from_uri(
-        uri: str, position: Optional[int] = None, size: Optional[int] = None
+        uri: str,
+        position: Optional[int] = None,
+        size: Optional[int] = None,
+        source_id: Optional[str] = None,
     ) -> "Blob":
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
         if (position is not None and position < 0) or (size is not None and size < 0):
             raise ValueError("External blob position and size must be non-negative")
-        return Blob(uri=uri, position=position, size=size)
+        return Blob(uri=uri, position=position, size=size, source_id=source_id)
 
     @staticmethod
     def empty() -> "Blob":
@@ -69,15 +79,17 @@ class BlobType(pa.ExtensionType):
     descriptor format, and reads will return descriptors by default.
     """
 
-    def __init__(self) -> None:
-        storage_type = pa.struct(
-            [
-                pa.field("data", pa.large_binary(), nullable=True),
-                pa.field("uri", pa.utf8(), nullable=True),
-                pa.field("position", pa.uint64(), nullable=True),
-                pa.field("size", pa.uint64(), nullable=True),
-            ]
-        )
+    def __init__(self, storage_type: Optional[pa.DataType] = None) -> None:
+        if storage_type is None:
+            storage_type = pa.struct(
+                [
+                    pa.field("data", pa.large_binary(), nullable=True),
+                    pa.field("uri", pa.utf8(), nullable=True),
+                    pa.field("position", pa.uint64(), nullable=True),
+                    pa.field("size", pa.uint64(), nullable=True),
+                    pa.field("source_id", pa.utf8(), nullable=True),
+                ]
+            )
         pa.ExtensionType.__init__(self, storage_type, "lance.blob.v2")
 
     def __arrow_ext_serialize__(self) -> bytes:
@@ -87,7 +99,7 @@ class BlobType(pa.ExtensionType):
     def __arrow_ext_deserialize__(
         cls, storage_type: pa.DataType, serialized: bytes
     ) -> "BlobType":
-        return BlobType()
+        return BlobType(storage_type)
 
     def __arrow_ext_class__(self):
         return BlobArray
@@ -121,6 +133,7 @@ class BlobArray(pa.ExtensionArray):
         uri_values: list[Optional[str]] = []
         position_values: list[Optional[int]] = []
         size_values: list[Optional[int]] = []
+        source_id_values: list[Optional[str]] = []
         null_mask: list[bool] = []
 
         for v in values:
@@ -129,6 +142,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(None)
                 position_values.append(None)
                 size_values.append(None)
+                source_id_values.append(None)
                 null_mask.append(True)
                 continue
 
@@ -137,6 +151,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(v.uri)
                 position_values.append(v.position)
                 size_values.append(v.size)
+                source_id_values.append(v.source_id)
                 null_mask.append(False)
                 continue
 
@@ -147,6 +162,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(v)
                 position_values.append(None)
                 size_values.append(None)
+                source_id_values.append(None)
                 null_mask.append(False)
                 continue
 
@@ -155,6 +171,7 @@ class BlobArray(pa.ExtensionArray):
                 uri_values.append(None)
                 position_values.append(None)
                 size_values.append(None)
+                source_id_values.append(None)
                 null_mask.append(False)
                 continue
 
@@ -167,10 +184,11 @@ class BlobArray(pa.ExtensionArray):
         uri_arr = pa.array(uri_values, type=pa.utf8())
         position_arr = pa.array(position_values, type=pa.uint64())
         size_arr = pa.array(size_values, type=pa.uint64())
+        source_id_arr = pa.array(source_id_values, type=pa.utf8())
         mask_arr = pa.array(null_mask, type=pa.bool_())
         storage = pa.StructArray.from_arrays(
-            [data_arr, uri_arr, position_arr, size_arr],
-            names=["data", "uri", "position", "size"],
+            [data_arr, uri_arr, position_arr, size_arr, source_id_arr],
+            names=["data", "uri", "position", "size", "source_id"],
             mask=mask_arr,
         )
         return pa.ExtensionArray.from_storage(BlobType(), storage)  # type: ignore[return-value]
