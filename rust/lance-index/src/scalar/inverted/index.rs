@@ -1091,8 +1091,16 @@ impl InvertedIndex {
                 };
 
                 let format = token_set_format;
-                let partitions = partitions.into_iter().map(|id| {
-                    let store = store.clone();
+                let partitions = partitions.into_iter().enumerate().map(|(idx, id)| {
+                    // Give each partition's store a distinct base priority so all
+                    // its reads are totally ordered against the other partitions'
+                    // in the shared scheduler. Without this, every partition opens
+                    // at priority 0; the scheduler's backpressure deadlock-break
+                    // ("admit the lowest-priority in-flight request") then has no
+                    // unique lowest request to advance and can wedge when many
+                    // partitions read concurrently (e.g. prewarm). Mirrors how a
+                    // filtered read scan prioritizes each fragment by its index.
+                    let store = store.with_base_priority(idx as u64);
                     let frag_reuse_index_clone = frag_reuse_index.clone();
                     let index_cache_for_part =
                         index_cache.with_key_prefix(format!("part-{}", id).as_str());
@@ -8218,6 +8226,46 @@ mod tests {
                 "expected a non-zero posting-data size estimate, got {est}"
             );
         }
+    }
+
+    /// Each partition must read through the shared scheduler at a distinct base
+    /// priority. Tied priorities (every partition at 0) break the scheduler's
+    /// backpressure deadlock-break — which admits the lowest-priority in-flight
+    /// request — because there is no unique lowest request to advance, so a
+    /// concurrent multi-partition read (e.g. prewarm) can wedge. Distinct
+    /// per-partition priorities keep the in-flight set totally ordered.
+    #[tokio::test]
+    async fn test_partitions_load_with_distinct_priorities() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let (index, _cache) = build_multi_partition_index(&store, 5).await;
+
+        let mut priorities: Vec<u64> = index
+            .partitions
+            .iter()
+            .map(|part| {
+                part.store
+                    .as_any()
+                    .downcast_ref::<LanceIndexStore>()
+                    .expect("partition store should be a LanceIndexStore")
+                    .base_priority()
+            })
+            .collect();
+
+        // Distinct and dense (0..N): every partition reads at its own priority,
+        // so the shared scheduler sees a total order across all partitions. The
+        // partitions may finish loading in any order, so sort before comparing —
+        // what matters is that the priorities form a contiguous, collision-free
+        // set, not which partition ended up at which slot.
+        priorities.sort_unstable();
+        assert_eq!(
+            priorities,
+            (0..index.partitions.len() as u64).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

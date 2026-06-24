@@ -45,6 +45,16 @@ pub struct LanceIndexStore {
     /// When set, used to avoid HEAD calls when opening files
     file_sizes: HashMap<String, u64>,
     format_version: LanceFileVersion,
+    /// Base priority for all I/O this store submits to `scheduler`.
+    ///
+    /// The scheduler's backpressure deadlock-break rule ("the lowest-priority
+    /// in-flight request is always admitted") needs priorities to be totally
+    /// ordered. When many partitions read concurrently through one shared
+    /// scheduler (e.g. FTS prewarm fanning out over partitions), giving each
+    /// partition's store a distinct `base_priority` keeps that total order so
+    /// one request can always advance and drain the byte budget. Mirrors how a
+    /// filtered read scan gives each fragment a distinct reader priority.
+    base_priority: u64,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -88,6 +98,22 @@ impl LanceIndexStore {
             scheduler,
             file_sizes: HashMap::new(),
             format_version,
+            base_priority: 0,
+        }
+    }
+
+    /// Return a clone of this store whose I/O is submitted at `base_priority`.
+    ///
+    /// The underlying `scheduler` is shared (it is an `Arc`), so the clone is
+    /// cheap and the priority only affects requests this clone submits. Used to
+    /// give each concurrently-read partition a distinct priority so the
+    /// scheduler's backpressure deadlock-break stays well-ordered. Exposed as a
+    /// concrete `Self` here; the `IndexStore::with_base_priority` trait method
+    /// wraps it in an `Arc<dyn IndexStore>`.
+    pub fn cloned_with_priority(&self, base_priority: u64) -> Self {
+        Self {
+            base_priority,
+            ..self.clone()
         }
     }
 
@@ -98,6 +124,11 @@ impl LanceIndexStore {
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
         self.file_sizes = file_sizes;
         self
+    }
+
+    /// The base priority all this store's I/O is submitted at.
+    pub fn base_priority(&self) -> u64 {
+        self.base_priority
     }
 
     fn index_file_path(&self, name: &str) -> Result<Path> {
@@ -432,6 +463,10 @@ impl IndexStore for LanceIndexStore {
         }))
     }
 
+    fn with_base_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
+        Arc::new(self.cloned_with_priority(base_priority))
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
@@ -440,7 +475,10 @@ impl IndexStore for LanceIndexStore {
             .get(name)
             .map(|&size| CachedFileSize::new(size))
             .unwrap_or_else(CachedFileSize::unknown);
-        let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
+        let file_scheduler = self
+            .scheduler
+            .open_file_with_priority(&path, self.base_priority, &cached_size)
+            .await?;
         match current_reader::FileReader::try_open(
             file_scheduler,
             None,

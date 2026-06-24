@@ -287,6 +287,17 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
 
+    /// Return a store that submits its I/O at the given base priority.
+    ///
+    /// Stores backed by a shared [`lance_io::scheduler::ScanScheduler`] use this
+    /// to give concurrently-read partitions distinct priorities, keeping the
+    /// scheduler's backpressure deadlock-break totally ordered (mirrors how a
+    /// filtered read scan prioritizes each fragment). The default returns the
+    /// store unchanged for backends where priority is meaningless.
+    fn with_base_priority(&self, _base_priority: u64) -> Arc<dyn IndexStore> {
+        self.clone_arc()
+    }
+
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
