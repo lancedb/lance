@@ -1541,7 +1541,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
         for mut tail_posting in tail.into_vec() {
             tail_posting.posting.shallow_next(target);
             let upper_bound = match tail_posting.posting.block_first_doc() {
-                Some(block_doc) if block_doc <= target => tail_posting.posting.block_max_score(),
+                Some(block_doc) if block_doc <= target => {
+                    tail_posting
+                        .posting
+                        .block_max_score_up_to_with_stats(up_to)
+                        .score
+                }
                 _ => 0.0,
             };
             if let Some(mut evicted) =
@@ -2582,6 +2587,68 @@ mod tests {
         assert_eq!(wand.tail.len(), 1);
         assert!(wand.head_doc().is_none());
         assert!(!wand.advance_tail_to_next_or_window());
+    }
+
+    #[test]
+    fn test_or_headless_tail_window_scans_past_final_top_tail() {
+        let total = 3 * BLOCK_SIZE as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..total {
+            docs.append(doc_id as u64, 1);
+        }
+
+        let future_docs = (0..BLOCK_SIZE as u32)
+            .chain(2 * BLOCK_SIZE as u32..3 * BLOCK_SIZE as u32)
+            .collect::<Vec<_>>();
+        let mut future_freqs = vec![1; future_docs.len()];
+        future_freqs[0] = 4;
+        future_freqs[BLOCK_SIZE] = 20;
+        let postings = vec![
+            PostingIterator::with_query_weight(
+                String::from("future"),
+                0,
+                0,
+                1.0,
+                generate_posting_list_with_freqs(
+                    future_docs,
+                    future_freqs,
+                    20.0,
+                    Some(vec![4.0, 20.0]),
+                    true,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("final_tail"),
+                1,
+                1,
+                1.0,
+                generate_posting_list_with_freqs(vec![0], vec![6], 6.0, Some(vec![6.0]), true),
+                docs.len(),
+            ),
+            PostingIterator::with_query_weight(
+                String::from("booster"),
+                2,
+                2,
+                1.0,
+                generate_posting_list_with_freqs(vec![0], vec![7], 7.0, Some(vec![7.0]), true),
+                docs.len(),
+            ),
+        ];
+
+        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
+        let result = wand
+            .search(
+                &FtsSearchParams::new().with_limit(Some(1)),
+                Arc::new(RowAddrMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(
+            sorted_candidate_row_ids(result),
+            vec![(2 * BLOCK_SIZE) as u64]
+        );
     }
 
     #[test]
