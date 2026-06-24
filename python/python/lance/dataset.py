@@ -994,6 +994,16 @@ class LanceDataset(pa.dataset.Dataset):
         """Returns index information for all indices in the dataset."""
         return self._ds.describe_indices()
 
+    def remap_row_addrs(self, addrs: "pa.Array") -> "Optional[pa.Array]":
+        """Remap row addresses across compactions still recorded in the
+        fragment-reuse index. Rows a compaction dropped become null. The index
+        retains only recent rounds (older ones are pruned as index remap catches
+        up), so remap promptly: an address whose round was pruned is returned
+        unchanged, not remapped. Returns ``None`` when there is no fragment-reuse
+        index.
+        """
+        return self._ds.remap_row_addrs(addrs)
+
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
             "LanceDataset.index_statistics() is deprecated, "

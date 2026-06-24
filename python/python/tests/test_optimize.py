@@ -574,3 +574,34 @@ def test_compaction_generates_rewrite_transaction(tmp_path: Path):
         t is not None and t.operation.__class__.__name__ == "Rewrite"
         for t in transactions
     )
+
+
+def test_remap_row_addrs(tmp_path: Path):
+    # Dataset.remap_row_addrs follows rows across a compaction via the
+    # fragment-reuse index: an address valid before the compaction maps to the
+    # row's new address after it. None when there is no fragment-reuse index.
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"id": range(1_000), "v": range(1_000)})
+    ds = lance.write_dataset(data, base_dir, max_rows_per_file=100)  # 10 fragments
+
+    # No fragment-reuse index yet -> None (nothing to remap against).
+    addrs = pa.array([0, 1 << 32, (5 << 32) | 7], pa.uint64())
+    assert ds.remap_row_addrs(addrs) is None
+
+    before = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
+
+    ds.optimize.compact_files(
+        target_rows_per_fragment=1_000, defer_index_remap=True, num_threads=1
+    )
+    ds = lance.dataset(base_dir)
+    assert any(idx.name == "__lance_frag_reuse" for idx in ds.describe_indices())
+
+    after = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    new = dict(zip(after["id"].to_pylist(), after["_rowaddr"].to_pylist()))
+
+    sample = [0, 137, 999]
+    remapped = ds.remap_row_addrs(
+        pa.array([old[i] for i in sample], pa.uint64())
+    ).to_pylist()
+    assert remapped == [new[i] for i in sample]

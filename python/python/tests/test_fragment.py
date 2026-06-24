@@ -800,3 +800,30 @@ def test_fragment_update_columns_error_on_metadata_column(tmp_path):
         "metadata column" in str(exc_info.value).lower()
         or "cannot be updated" in str(exc_info.value).lower()
     )
+
+
+def test_fragment_delete_rows(tmp_path: Path):
+    # LanceFragment.delete_rows deletes by local row offset (not a predicate):
+    # exactly the given rows are removed, the rest survive, and the fragment is
+    # gone when every row is deleted.
+    data = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+    frag = dataset.get_fragment(0)
+
+    new_meta = frag.delete_rows([0, 5, 99])
+    assert new_meta is not None
+    op = LanceOperation.Delete(
+        updated_fragments=[new_meta],
+        deleted_fragment_ids=[],
+        predicate="delete_rows([0, 5, 99])",
+    )
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
+
+    assert dataset.count_rows() == 97
+    remaining = set(dataset.to_table(columns=["a"])["a"].to_pylist())
+    assert {0, 5, 99}.isdisjoint(remaining)
+    assert {1, 98}.issubset(remaining)
+
+    # Deleting every row removes the fragment entirely (returns None).
+    frag = lance.dataset(tmp_path).get_fragment(0)
+    assert frag.delete_rows(range(100)) is None
