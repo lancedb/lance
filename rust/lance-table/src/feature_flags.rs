@@ -173,6 +173,40 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_feature_flags_sets_overlay_flag() {
+        use crate::format::{
+            DataFile, DataOverlayFile, DataStorageFormat, Fragment, OverlayCoverage,
+        };
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use roaring::RoaringBitmap;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut fragment = Fragment::new(0);
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![0], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: 1,
+        }];
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.reader_feature_flags & FLAG_DATA_OVERLAY_FILES, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_DATA_OVERLAY_FILES, 0);
+    }
+
+    #[test]
     fn test_write_check() {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));

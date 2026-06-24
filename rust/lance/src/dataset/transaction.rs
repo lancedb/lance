@@ -1363,15 +1363,7 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
-            // Data overlays are intentionally permissive, like DataReplacement.
-            // Two overlays stack (the higher committed_version wins each covered
-            // cell), and overlays are compatible with appends, deletes, column
-            // rewrites, and concurrent overlays. Only an operation that rewrites
-            // rows or otherwise invalidates physical offsets (Rewrite, which
-            // covers compaction and overlay->base folds) conflicts, since the
-            // overlay's physical offsets would no longer be valid.
-            (Self::DataOverlay { .. }, Self::Rewrite { .. })
-            | (Self::Rewrite { .. }, Self::DataOverlay { .. }) => true,
+            (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
         }
     }
@@ -2338,10 +2330,16 @@ impl Transaction {
                 let new_version = current_manifest.map_or(1, |m| m.version + 1);
 
                 let existing_fragments = maybe_existing_fragments?;
-                let overlays_by_fragment: HashMap<u64, &Vec<DataOverlayFile>> = groups
-                    .iter()
-                    .map(|g| (g.fragment_id, &g.overlays))
-                    .collect();
+                // Multiple groups may target the same fragment; merge them in
+                // order rather than letting a HashMap collapse drop all but the
+                // last group's overlays.
+                let mut overlays_by_fragment: HashMap<u64, Vec<&DataOverlayFile>> = HashMap::new();
+                for group in groups {
+                    overlays_by_fragment
+                        .entry(group.fragment_id)
+                        .or_default()
+                        .extend(group.overlays.iter());
+                }
 
                 // Every group must target an existing fragment.
                 for fragment_id in overlays_by_fragment.keys() {
@@ -2357,12 +2355,13 @@ impl Transaction {
                     if let Some(new_overlays) = overlays_by_fragment.get(&fragment.id) {
                         // Appended (not replaced) so concurrently-written overlays
                         // survive; later entries are newer.
-                        fragment.overlays.extend(new_overlays.iter().cloned().map(
-                            |mut overlay| {
+                        fragment
+                            .overlays
+                            .extend(new_overlays.iter().map(|&overlay| {
+                                let mut overlay = overlay.clone();
                                 overlay.committed_version = new_version;
                                 overlay
-                            },
-                        ));
+                            }));
                     }
                     final_fragments.push(fragment);
                 }
@@ -4003,7 +4002,8 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::{
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        OverlayCoverage, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
+        RowIdMeta,
     };
     use lance_table::rowids::segment::U64Segment;
     use lance_table::rowids::write_row_ids;
@@ -6377,5 +6377,136 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    fn overlay_with_field(field: i32, committed_version: u64) -> DataOverlayFile {
+        DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![field], None),
+            coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+            committed_version,
+        }
+    }
+
+    #[test]
+    fn test_data_overlay_build_manifest_appends_and_stamps() {
+        // A fragment already carrying an overlay (committed at v3) gets a new
+        // overlay appended and stamped to the new dataset version; the existing
+        // overlay is preserved with its version.
+        let mut fragment = Fragment::new(0);
+        fragment.overlays = vec![overlay_with_field(1, 3)];
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![fragment]),
+            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id: 0,
+                    overlays: vec![overlay_with_field(2, 0)],
+                }],
+            },
+            None,
+        );
+
+        let (result, _) = txn
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let frag = &result.fragments[0];
+        assert_eq!(frag.overlays.len(), 2);
+        assert_eq!(frag.overlays[0].committed_version, 3);
+        assert_eq!(frag.overlays[1].committed_version, result.version);
+        assert!(result.version > manifest.version);
+    }
+
+    #[test]
+    fn test_data_overlay_build_manifest_merges_duplicate_groups() {
+        // Two groups targeting the same fragment must both survive (a HashMap
+        // collapse would have dropped the first).
+        let manifest = sample_manifest();
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataOverlay {
+                groups: vec![
+                    DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![overlay_with_field(1, 0)],
+                    },
+                    DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![overlay_with_field(2, 0)],
+                    },
+                ],
+            },
+            None,
+        );
+
+        let (result, _) = txn
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let overlays = &result.fragments[0].overlays;
+        assert_eq!(overlays.len(), 2);
+        assert_eq!(overlays[0].data_file.fields.as_ref(), [1i32].as_slice());
+        assert_eq!(overlays[1].data_file.fields.as_ref(), [2i32].as_slice());
+    }
+
+    #[test]
+    fn test_data_overlay_build_manifest_rejects_unknown_fragment() {
+        let manifest = sample_manifest();
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id: 99,
+                    overlays: vec![overlay_with_field(1, 0)],
+                }],
+            },
+            None,
+        );
+        let err = txn
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn test_data_overlay_operation_eq() {
+        let overlay = |field: i32| Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: 0,
+                overlays: vec![overlay_with_field(field, 1)],
+            }],
+        };
+        // Reflexive and value-based (the arm previously returned false for self).
+        assert_eq!(overlay(1), overlay(1));
+        assert_ne!(overlay(1), overlay(2));
+        // Not equal to a different operation kind (previously returned true vs Rewrite).
+        let rewrite = Operation::Rewrite {
+            groups: vec![],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+        assert_ne!(overlay(1), rewrite);
     }
 }

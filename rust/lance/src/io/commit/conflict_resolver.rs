@@ -1119,8 +1119,6 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         match &other_transaction.operation {
             Operation::Append { .. }
-            | Operation::Delete { .. }
-            | Operation::Update { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
@@ -1130,6 +1128,29 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
+            // A concurrent Update or Delete that *removes* one of our overlaid
+            // fragments leaves the overlay orphaned — it is addressed by physical
+            // offset into a fragment that would no longer exist — so conflict and
+            // retry against the new fragment list. Fragments merely updated in
+            // place (deletion vectors, column rewrites) preserve physical offsets,
+            // so the overlay stays valid and does not conflict.
+            Operation::Update {
+                removed_fragment_ids,
+                ..
+            }
+            | Operation::Delete {
+                deleted_fragment_ids: removed_fragment_ids,
+                ..
+            } => {
+                if removed_fragment_ids
+                    .iter()
+                    .any(|id| self.modified_fragment_ids.contains(id))
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
             Operation::Rewrite { groups, .. } => {
                 // A rewrite (compaction / fold) of a fragment we are overlaying
                 // changes its physical row addresses, so our offsets would be
@@ -2883,6 +2904,129 @@ mod tests {
                         )
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_data_overlay_conflicts() {
+        use crate::dataset::transaction::DataOverlayGroup;
+        use ConflictResult::*;
+        use lance_table::format::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        // Our transaction overlays fragment 1.
+        let overlay_op = |fragment_id: u64| Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 0,
+                }],
+            }],
+        };
+        let update_removing = |removed_fragment_ids: Vec<u64>| Operation::Update {
+            removed_fragment_ids,
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let delete = |updated: Vec<Fragment>, deleted: Vec<u64>| Operation::Delete {
+            updated_fragments: updated,
+            deleted_fragment_ids: deleted,
+            predicate: "x > 2".to_string(),
+        };
+        let rewrite_of = |old: &Fragment| Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![old.clone()],
+                new_fragments: vec![],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+
+        let fragment0 = Fragment::new(0);
+        let fragment1 = Fragment::new(1);
+
+        // Each case is checked against our overlay on fragment 1.
+        let cases: Vec<(Operation, ConflictResult)> = vec![
+            // Permissive: preserves physical offsets / leaves fragment 1 in place.
+            (
+                Operation::Append {
+                    fragments: vec![fragment0.clone()],
+                },
+                Compatible,
+            ),
+            (
+                Operation::CreateIndex {
+                    new_indices: vec![],
+                    removed_indices: vec![],
+                },
+                Compatible,
+            ),
+            (
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        1,
+                        DataFile::new_legacy_from_fields("r.lance", vec![0], None),
+                    )],
+                },
+                Compatible,
+            ),
+            // Another overlay on the same fragment stacks rather than conflicts.
+            (overlay_op(1), Compatible),
+            // Delete/Update that only updates fragment 1 in place is compatible.
+            (delete(vec![fragment1.clone()], vec![]), Compatible),
+            (update_removing(vec![2]), Compatible),
+            // ...but removing our overlaid fragment 1 orphans the overlay -> conflict.
+            (delete(vec![], vec![1]), Retryable),
+            (update_removing(vec![1]), Retryable),
+            // Rewriting fragment 1 invalidates its physical offsets -> conflict;
+            // a rewrite of a different fragment does not.
+            (rewrite_of(&fragment1), Retryable),
+            (rewrite_of(&fragment0), Compatible),
+            // Merge rewrites the whole fragment list; Restore replaces the dataset.
+            (
+                Operation::Merge {
+                    fragments: vec![fragment1.clone()],
+                    schema: lance_core::datatypes::Schema::default(),
+                },
+                Retryable,
+            ),
+            (Operation::Restore { version: 1 }, NotCompatible),
+        ];
+
+        for (other, expected) in cases {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, overlay_op(1), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(&overlay_op(1))
+                    .collect::<HashSet<_>>(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+            };
+            let other_txn = Transaction::new(0, other.clone(), None);
+            let result = rebase.check_txn(&other_txn, 1);
+            match expected {
+                Compatible => assert!(
+                    result.is_ok(),
+                    "overlay should be compatible with {other:?}, got {result:?}"
+                ),
+                Retryable => assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "overlay should retryably conflict with {other:?}, got {result:?}"
+                ),
+                NotCompatible => assert!(
+                    matches!(result, Err(Error::IncompatibleTransaction { .. })),
+                    "overlay should be incompatible with {other:?}, got {result:?}"
+                ),
             }
         }
     }

@@ -1087,6 +1087,41 @@ mod tests {
     }
 
     #[test]
+    fn test_overlay_coverage_serde_json_roundtrip() {
+        // The custom serde impl round-trips through JSON for dense/sparse,
+        // including empty bitmaps and a zero-bitmap sparse coverage.
+        for coverage in [
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1u32, 5, 100])),
+            OverlayCoverage::dense(RoaringBitmap::new()),
+            OverlayCoverage::sparse(vec![
+                RoaringBitmap::from_iter([2u32, 3]),
+                RoaringBitmap::new(),
+            ]),
+            OverlayCoverage::sparse(vec![]),
+        ] {
+            let json = serde_json::to_string(&coverage).unwrap();
+            let back: OverlayCoverage = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, coverage);
+        }
+    }
+
+    #[test]
+    fn test_coverage_for_field_out_of_bounds() {
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![2, 4], None),
+            coverage: OverlayCoverage::sparse(vec![
+                RoaringBitmap::from_iter([1u32]),
+                RoaringBitmap::from_iter([2u32]),
+            ]),
+            committed_version: 1,
+        };
+        assert!(overlay.coverage_for_field(0).is_ok());
+        assert!(overlay.coverage_for_field(1).is_ok());
+        let err = overlay.coverage_for_field(5).unwrap_err();
+        assert!(err.to_string().contains("field position"), "{err}");
+    }
+
+    #[test]
     fn test_new_fragment() {
         let path = "foobar.lance";
 
