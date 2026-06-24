@@ -18,6 +18,12 @@ use crate::traits::{Reader, Writer};
 
 /// Session-scoped scratch store for reclaimable intermediate files.
 pub trait SpillStore: Send + Sync + std::fmt::Debug + 'static {
+    /// Object store backing the scratch directory.
+    fn object_store(&self) -> Arc<ObjectStore>;
+
+    /// Root directory for files owned by this scratch store.
+    fn root_path(&self) -> Path;
+
     /// Create one empty scratch file. The file is deleted when the returned
     /// handle is dropped.
     fn create_spill_file(&self) -> Result<Box<dyn SpillFile>>;
@@ -75,6 +81,14 @@ impl LocalSpillStore {
 }
 
 impl SpillStore for LocalSpillStore {
+    fn object_store(&self) -> Arc<ObjectStore> {
+        self.object_store.clone()
+    }
+
+    fn root_path(&self) -> Path {
+        self.temp_dir.obj_path()
+    }
+
     fn create_spill_file(&self) -> Result<Box<dyn SpillFile>> {
         let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
         let path = self

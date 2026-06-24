@@ -789,6 +789,58 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         })
     }
 
+    async fn train_index_with_scratch(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        scratch_store: Option<Arc<dyn IndexStore>>,
+    ) -> Result<CreatedIndex> {
+        let request = (request as Box<dyn std::any::Any>)
+            .downcast::<JsonTrainingRequest>()
+            .unwrap();
+        let path = request.parameters.path.clone();
+
+        let (data_stream, inferred_type) =
+            Self::extract_json_with_type_info(data, path.clone()).await?;
+        let converted_stream =
+            Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
+
+        let registry = self.registry()?;
+        let target_plugin = registry.get_plugin_by_name(&request.parameters.target_index_type)?;
+        let target_request = target_plugin.new_training_request(
+            request
+                .parameters
+                .target_index_parameters
+                .as_deref()
+                .unwrap_or("{}"),
+            &Field::new("", inferred_type, true),
+        )?;
+
+        let target_index = target_plugin
+            .train_index_with_scratch(
+                converted_stream,
+                index_store,
+                target_request,
+                fragment_ids,
+                progress,
+                scratch_store,
+            )
+            .await?;
+
+        let index_details = crate::pb::JsonIndexDetails {
+            path,
+            target_details: Some(target_index.index_details),
+        };
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&index_details)?,
+            index_version: JSON_INDEX_VERSION,
+            files: target_index.files,
+        })
+    }
+
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,

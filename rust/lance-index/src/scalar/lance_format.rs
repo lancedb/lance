@@ -517,8 +517,7 @@ impl IndexStore for LanceIndexStore {
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
         let new_path = self.index_file_path(new_name)?;
-        self.object_store.copy(&path, &new_path).await?;
-        self.object_store.delete(&path).await?;
+        self.object_store.rename(&path, &new_path).await?;
         let size_bytes = match self.file_sizes.get(name) {
             Some(size_bytes) => *size_bytes,
             None => self.object_store.size(&new_path).await?,

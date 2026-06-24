@@ -31,7 +31,7 @@ use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
-use super::local::LocalObjectReader;
+use super::local::{LocalObjectReader, to_local_path};
 #[cfg(target_os = "linux")]
 use crate::uring::{UringCurrentThreadReader, UringReader};
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -810,8 +810,32 @@ impl ObjectStore {
     }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
+        let local_size = if self.is_local() {
+            std::fs::metadata(to_local_path(path)).ok().map(|m| m.len())
+        } else {
+            None
+        };
         self.inner.delete(path).await?;
+        if let (Some(disk_quota), Some(size)) = (self.disk_quota.as_ref(), local_size) {
+            disk_quota.release(size);
+        }
         Ok(())
+    }
+
+    /// Rename a local file without copying so disk quota does not double during
+    /// scratch-file moves. Non-local stores keep the existing copy/delete path.
+    pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        if self.is_local() {
+            let from_path = to_local_path(from);
+            let to_path = to_local_path(to);
+            if let Some(parent) = std::path::Path::new(&to_path).parent() {
+                std::fs::create_dir_all(parent).map_err(Error::from)?;
+            }
+            std::fs::rename(from_path, to_path).map_err(Error::from)?;
+            return Ok(());
+        }
+        self.copy(from, to).await?;
+        self.delete(from).await
     }
 
     /// AWS S3 and GCS reject a single-shot server-side copy whose source is
@@ -1592,6 +1616,39 @@ mod tests {
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_local_delete_releases_disk_quota() {
+        let quota = DiskQuota::new(8);
+        let store = ObjectStore::local_with_disk_quota(quota.clone());
+        let tmp = TempStdDir::default();
+        let path = Path::from_absolute_path(tmp.join("spill.bin")).unwrap();
+
+        store.put(&path, b"12345678").await.unwrap();
+        assert_eq!(quota.used_bytes(), 8);
+
+        store.delete(&path).await.unwrap();
+        assert_eq!(quota.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_local_rename_preserves_disk_quota() {
+        let quota = DiskQuota::new(8);
+        let store = ObjectStore::local_with_disk_quota(quota.clone());
+        let tmp = TempStdDir::default();
+        let from = Path::from_absolute_path(tmp.join("spill.tmp")).unwrap();
+        let to = Path::from_absolute_path(tmp.join("spill.bin")).unwrap();
+
+        store.put(&from, b"12345678").await.unwrap();
+        store.rename(&from, &to).await.unwrap();
+
+        assert_eq!(quota.used_bytes(), 8);
+        assert!(!tmp.join("spill.tmp").exists());
+        assert!(tmp.join("spill.bin").exists());
+
+        store.delete(&to).await.unwrap();
+        assert_eq!(quota.used_bytes(), 0);
     }
 
     /// Inner store that forwards everything to `InMemory` except single-shot

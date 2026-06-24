@@ -294,6 +294,12 @@ pub(super) async fn build_scalar_index(
     let field: arrow_schema::Field = field.into();
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
+    let spill_store = dataset.session().spill_store();
+    let scratch_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+        spill_store.object_store(),
+        spill_store.root_path().join(uuid.to_string()),
+        Arc::new(lance_core::cache::LanceCache::no_cache()),
+    ));
 
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
     let training_request =
@@ -317,12 +323,13 @@ pub(super) async fn build_scalar_index(
     progress.stage_complete("load_data").await?;
 
     let created_index = plugin
-        .train_index(
+        .train_index_with_scratch(
             training_data,
             &index_store,
             training_request,
             fragment_ids,
             progress,
+            Some(scratch_store),
         )
         .await?;
 

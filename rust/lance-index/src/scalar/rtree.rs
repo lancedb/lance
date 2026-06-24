@@ -974,6 +974,57 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         })
     }
 
+    async fn train_index_with_scratch(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        scratch_store: Option<Arc<dyn IndexStore>>,
+    ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::invalid_input_source(
+                "RTree index does not support fragment training".into(),
+            ));
+        }
+
+        Self::validate_schema(&data.schema())?;
+
+        let request = request
+            .as_any()
+            .downcast_ref::<RTreeTrainingRequest>()
+            .unwrap();
+        let page_size = request
+            .parameters
+            .page_size
+            .unwrap_or(DEFAULT_RTREE_PAGE_SIZE);
+
+        let bbox_data = Self::convert_bbox_stream(data)?;
+        let fallback_tmpdir;
+        let spill_store = match scratch_store {
+            Some(scratch_store) => scratch_store,
+            None => {
+                fallback_tmpdir = Arc::new(TempDir::default());
+                Arc::new(LanceIndexStore::new(
+                    Arc::new(ObjectStore::local()),
+                    fallback_tmpdir.obj_path(),
+                    Arc::new(LanceCache::no_cache()),
+                ))
+            }
+        };
+        let (bbox_data, stats) =
+            Self::process_and_analyze_bbox_stream(bbox_data, page_size, spill_store).await?;
+
+        let files = Self::train_rtree_index(bbox_data, stats, page_size, index_store).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
+            index_version: RTREE_INDEX_VERSION,
+            files,
+        })
+    }
+
     fn provides_exact_answer(&self) -> bool {
         false
     }

@@ -122,6 +122,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex>;
 
+    /// Train a new index with a caller-provided scratch store for temporary
+    /// build files. Plugins that do not need scratch storage can ignore it.
+    async fn train_index_with_scratch(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+        _scratch_store: Option<Arc<dyn IndexStore>>,
+    ) -> Result<CreatedIndex> {
+        self.train_index(data, index_store, request, fragment_ids, progress)
+            .await
+    }
+
     /// A short name for the index
     ///
     /// This is a friendly name for display purposes and also can be used as an alias for

@@ -731,6 +731,15 @@ impl NGramIndexBuilder {
         Self::from_state(NGramIndexBuildState::starting(), options)
     }
 
+    pub fn try_new_with_spill_store(
+        options: NGramIndexBuilderOptions,
+        spill_store: Arc<dyn IndexStore>,
+    ) -> Result<Self> {
+        let mut builder = Self::from_state(NGramIndexBuildState::starting(), options)?;
+        builder.spill_store = spill_store;
+        Ok(builder)
+    }
+
     fn clone_worker(&self, worker_number: usize) -> Self {
         let mut bitmaps = Vec::with_capacity(36 * 36 * 36 + 1);
         // Token 0 is always the NULL bitmap
@@ -1265,7 +1274,12 @@ impl NGramIndexBuilder {
             offset += batch_size;
         }
 
-        writer.finish().await
+        let index_file = writer.finish().await?;
+        drop(reader);
+        self.spill_store
+            .delete_index_file(&Self::spill_filename(index_to_copy))
+            .await?;
+        Ok(index_file)
     }
 }
 
@@ -1354,6 +1368,39 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         })
     }
 
+    async fn train_index_with_scratch(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        _request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        scratch_store: Option<Arc<dyn IndexStore>>,
+    ) -> Result<CreatedIndex> {
+        if fragment_ids.is_some() {
+            return Err(Error::invalid_input_source(
+                "NGram index does not support fragment training".into(),
+            ));
+        }
+
+        let mut builder = match scratch_store {
+            Some(scratch_store) => NGramIndexBuilder::try_new_with_spill_store(
+                NGramIndexBuilderOptions::default(),
+                scratch_store,
+            )?,
+            None => NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?,
+        };
+        let spill_files = builder.train(data).await?;
+        let file = builder.write_index(index_store, spill_files, None).await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
+                .unwrap(),
+            index_version: NGRAM_INDEX_VERSION,
+            files: vec![file],
+        })
+    }
+
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -1383,7 +1430,7 @@ mod tests {
     use itertools::Itertools;
     use lance_core::{ROW_ID, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
-    use lance_io::object_store::ObjectStore;
+    use lance_io::{object_store::ObjectStore, object_writer::DiskQuota};
     use lance_select::RowAddrTreeMap;
     use lance_tokenizer::TextAnalyzer;
 
@@ -1880,5 +1927,41 @@ mod tests {
         let (index, _tmpdir) = do_train(builder, data).await;
 
         assert_eq!(index.tokens.len(), 29012);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_index_uses_quota_backed_spill_store() {
+        let (data, schema) = lance_datagen::gen_batch()
+            .col(
+                VALUE_COLUMN_NAME,
+                lance_datagen::array::rand_utf8(ByteCount::from(50), false),
+            )
+            .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
+            .into_reader_stream(RowCount::from(128), BatchCount::from(32));
+
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            data.map_err(|arrow_err| DataFusionError::ArrowError(Box::new(arrow_err), None)),
+        ));
+
+        let quota = DiskQuota::new(16 * 1024 * 1024);
+        let tmpdir = Arc::new(TempDir::default());
+        let spill_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local_with_disk_quota(quota.clone())),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let builder = NGramIndexBuilder::try_new_with_spill_store(
+            NGramIndexBuilderOptions {
+                tokens_per_spill: 100,
+            },
+            spill_store,
+        )
+        .unwrap();
+
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        assert_eq!(index.tokens.len(), 29012);
+        assert_eq!(quota.used_bytes(), 0);
     }
 }
