@@ -102,21 +102,6 @@ impl LanceIndexStore {
         }
     }
 
-    /// Return a clone of this store whose I/O is submitted at `base_priority`.
-    ///
-    /// The underlying `scheduler` is shared (it is an `Arc`), so the clone is
-    /// cheap and the priority only affects requests this clone submits. Used to
-    /// give each concurrently-read partition a distinct priority so the
-    /// scheduler's backpressure deadlock-break stays well-ordered. Exposed as a
-    /// concrete `Self` here; the `IndexStore::with_base_priority` trait method
-    /// wraps it in an `Arc<dyn IndexStore>`.
-    pub fn cloned_with_priority(&self, base_priority: u64) -> Self {
-        Self {
-            base_priority,
-            ..self.clone()
-        }
-    }
-
     /// Set cached file sizes to avoid HEAD calls when opening files.
     ///
     /// The map should contain relative paths (e.g., "index.idx") as keys
@@ -464,7 +449,12 @@ impl IndexStore for LanceIndexStore {
     }
 
     fn with_base_priority(&self, base_priority: u64) -> Arc<dyn IndexStore> {
-        Arc::new(self.cloned_with_priority(base_priority))
+        // The `scheduler` is shared (`Arc`), so this clone is cheap and the new
+        // priority only affects requests this clone submits.
+        Arc::new(Self {
+            base_priority,
+            ..self.clone()
+        })
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {

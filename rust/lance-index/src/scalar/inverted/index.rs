@@ -1091,16 +1091,8 @@ impl InvertedIndex {
                 };
 
                 let format = token_set_format;
-                let partitions = partitions.into_iter().enumerate().map(|(idx, id)| {
-                    // Give each partition's store a distinct base priority so all
-                    // its reads are totally ordered against the other partitions'
-                    // in the shared scheduler. Without this, every partition opens
-                    // at priority 0; the scheduler's backpressure deadlock-break
-                    // ("admit the lowest-priority in-flight request") then has no
-                    // unique lowest request to advance and can wedge when many
-                    // partitions read concurrently (e.g. prewarm). Mirrors how a
-                    // filtered read scan prioritizes each fragment by its index.
-                    let store = store.with_base_priority(idx as u64);
+                let partitions = partitions.into_iter().enumerate().map(|(priority, id)| {
+                    let store = store.with_base_priority(priority as u64);
                     let frag_reuse_index_clone = frag_reuse_index.clone();
                     let index_cache_for_part =
                         index_cache.with_key_prefix(format!("part-{}", id).as_str());
