@@ -1487,11 +1487,28 @@ impl MergeInsertJob {
         // whether the source side contributed a row.  This is NULL-safe: even when every
         // ON column is NULL the sentinel lets us distinguish a source-only row from a
         // target-only row (where the sentinel is filled with NULL by the outer join).
+        // Detect partial schema: source doesn't include all target columns.
+        // When true, we project the scan to only _rowid + _rowaddr + on-columns
+        // so that the full table scan avoids reading heavy data columns (embeddings, etc.)
+        // for matching. Missing columns are filled later in the write exec.
+        let is_partial_schema = source_field_names.len() < self.dataset.schema().fields.len()
+            && !self.params.on.is_empty();
+        let scan_aliased = if is_partial_schema {
+            // Project scan to only the columns needed for the join:
+            // _rowid, _rowaddr, and the on-columns.
+            let mut needed: Vec<String> = self.params.on.iter().map(|c| c.clone()).collect();
+            needed.push("_rowid".to_string());
+            needed.push("_rowaddr".to_string());
+            let needed_refs: Vec<&str> = needed.iter().map(|s| s.as_str()).collect();
+            scan.select_columns(&needed_refs)?.alias("target")?
+        } else {
+            scan.alias("target")?
+        };
+
         let source_df = source_df
             .with_column(MERGE_SOURCE_SENTINEL, logical_expr::lit(true))
             .map_err(crate::Error::from)?;
         let source_df_aliased = source_df.alias("source")?;
-        let scan_aliased = scan.alias("target")?;
         let join_type = self.create_plan_join_type();
         let dataset_schema: Schema = self.dataset.schema().into();
         let mut df = scan_aliased
@@ -1516,14 +1533,21 @@ impl MergeInsertJob {
         // unqualified name matches the dataset field and becomes a normal
         // data column from the write exec's perspective.
         //
+        // Skip this for partial-schema updates with projection pushdown:
+        // the scan was projected to only join columns so target.* references
+        // to non-join columns would fail. The write exec fills missing
+        // columns from the dataset instead.
+        //
         // We iterate the dataset schema in order so that the resulting
         // physical plan is deterministic and easy to inspect in tests.
-        for field in dataset_schema.fields() {
-            if !source_field_names.contains(field.name()) {
-                df = df.with_column(
-                    field.name(),
-                    logical_expr::col(format!("target.\"{}\"", field.name())),
-                )?;
+        if !is_partial_schema {
+            for field in dataset_schema.fields() {
+                if !source_field_names.contains(field.name()) {
+                    df = df.with_column(
+                        field.name(),
+                        logical_expr::col(format!("target.\"{}\"", field.name())),
+                    )?;
+                }
             }
         }
 
