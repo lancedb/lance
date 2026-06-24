@@ -572,6 +572,142 @@ impl FullSchemaMergeInsertExec {
         (total_bytes as usize, total_files)
     }
 
+    /// For partial-schema merge_insert: read full existing data for matched
+    /// rows and merge the source (new) column values into the existing data.
+    async fn merge_existing_data_for_partial_schema(
+        dataset: Arc<Dataset>,
+        source_stream: SendableRecordBatchStream,
+        full_schema: Arc<Schema>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        use futures::StreamExt;
+        use lance_core::ROW_ID;
+
+        let source_batches: Vec<RecordBatch> = source_stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        if source_batches.is_empty() {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                futures::stream::empty(),
+            )));
+        }
+
+        let mut all_row_ids: Vec<u64> = Vec::new();
+        for batch in &source_batches {
+            if let Some(col) = batch.column_by_name(ROW_ID) {
+                if let Some(ids) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+                    all_row_ids.extend(ids.values());
+                }
+            }
+        }
+
+        let existing_lookup: std::collections::HashMap<u64, RecordBatch> =
+            if !all_row_ids.is_empty() {
+                let existing: RecordBatch = dataset
+                    .take_rows(&all_row_ids, dataset.schema().clone())
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+                let mut lookup = std::collections::HashMap::new();
+                if let Some(col) = existing.column_by_name(ROW_ID) {
+                    if let Some(ids) = col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+                        for (i, &row_id) in ids.values().iter().enumerate() {
+                            if row_id != 0 {
+                                lookup.insert(row_id, existing.slice(i, 1));
+                            }
+                        }
+                    }
+                }
+                lookup
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        let source_schema = source_batches[0].schema();
+        let missing_fields: Vec<arrow_schema::Field> = full_schema
+            .fields()
+            .iter()
+            .filter(|f| source_schema.field_with_name(f.name()).is_err())
+            .map(|f| f.as_ref().clone())
+            .collect();
+
+        let merged: Vec<DFResult<RecordBatch>> = source_batches
+            .into_iter()
+            .map(|batch| {
+                Self::merge_batch_with_existing(
+                    &batch,
+                    &existing_lookup,
+                    &missing_fields,
+                    &full_schema,
+                )
+            })
+            .collect();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            full_schema,
+            futures::stream::iter(merged),
+        )))
+    }
+
+    fn merge_batch_with_existing(
+        source_batch: &RecordBatch,
+        existing_lookup: &std::collections::HashMap<u64, RecordBatch>,
+        _missing_fields: &[arrow_schema::Field],
+        full_schema: &Arc<Schema>,
+    ) -> DFResult<RecordBatch> {
+        use lance_core::ROW_ID;
+
+        let num_rows = source_batch.num_rows();
+        let row_ids: Vec<u64> = source_batch
+            .column_by_name(ROW_ID)
+            .and_then(|col| {
+                col.as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .map(|a| a.values().to_vec())
+            })
+            .unwrap_or_else(|| vec![0u64; num_rows]);
+
+        let mut output_columns: Vec<Arc<dyn arrow_array::Array>> =
+            Vec::with_capacity(full_schema.fields().len());
+
+        for field in full_schema.fields() {
+            let name = field.name();
+
+            if let Some(col) = source_batch.column_by_name(name) {
+                output_columns.push(Arc::clone(col));
+                continue;
+            }
+
+            let dtype = field.data_type();
+            let mut parts: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(num_rows);
+            for row_idx in 0..num_rows {
+                let row_id = row_ids[row_idx];
+                if let Some(existing) = existing_lookup.get(&row_id) {
+                    if let Some(col) = existing.column_by_name(name) {
+                        if col.len() > 0 {
+                            parts.push(col.slice(0, 1));
+                            continue;
+                        }
+                    }
+                }
+                parts.push(Arc::new(arrow_array::new_null_array(dtype, 1)));
+            }
+            let refs: Vec<&dyn arrow_array::Array> = parts.iter().map(|a| a.as_ref()).collect();
+            let merged = arrow::compute::concat(&refs)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            output_columns.push(merged);
+        }
+
+        Ok(RecordBatch::try_new(
+            Arc::clone(full_schema),
+            output_columns,
+        )?)
+    }
+
     fn split_updates_and_inserts(
         &self,
         input_stream: SendableRecordBatchStream,
@@ -864,6 +1000,13 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let write_data_stream =
             self.create_filtered_write_stream(input_stream, merge_state.clone())?;
 
+        // Detect partial schema: the input may have fewer columns than the
+        // dataset if create_plan skipped the target."column" synthetic loop.
+        let dataset_schema: Schema = self.dataset.schema().into();
+        let is_partial_schema =
+            write_data_stream.schema().fields().len() < dataset_schema.fields().len();
+        let full_write_schema = Arc::new(dataset_schema);
+
         // Use flat_map to handle the async write operation
         let dataset = self.dataset.clone();
         let merge_stats_holder = self.merge_stats.clone();
@@ -878,6 +1021,20 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         };
 
         let result_stream = stream::once(async move {
+            // For partial schema: read existing data for matched rows and
+            // merge source columns with existing data before writing.
+            let write_data_stream = if is_partial_schema {
+                let merged = Self::merge_existing_data_for_partial_schema(
+                    dataset.clone(),
+                    write_data_stream,
+                    full_write_schema.clone(),
+                )
+                .await?;
+                merged
+            } else {
+                write_data_stream
+            };
+
             // Step 2: Write new fragments using the filtered data (inserts + updates)
             let (mut new_fragments, _) = write_fragments_internal(
                 Some(&dataset),
