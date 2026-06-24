@@ -250,6 +250,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FFILanceTableProvider>()?;
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
+    m.add_class::<crate::dataset::PyVectorIndexHandle>()?;
+    m.add_class::<crate::dataset::PyVectorIvfIndexHandle>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<PyDeletionFile>()?;

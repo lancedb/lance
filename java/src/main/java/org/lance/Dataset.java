@@ -2065,6 +2065,29 @@ public class Dataset implements Closeable {
   private native MemWalIndexDetails nativeMemWalIndexDetails();
 
   /**
+   * Open a snapshot handle of a committed vector index by name.
+   *
+   * <p>The returned {@link org.lance.index.vector.VectorIndexHandle} is a fully-materialized
+   * snapshot: after this call the handle is independent of this {@code Dataset} and will not
+   * observe later commits, drops, or version changes. The caller owns the handle and must close it.
+   *
+   * @param indexName the vector index name
+   * @return a fresh, open {@link org.lance.index.vector.VectorIndexHandle}
+   * @throws IllegalArgumentException if no index with this name exists
+   */
+  public org.lance.index.vector.VectorIndexHandle openVectorIndexHandle(String indexName) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeOpenVectorIndexHandle(indexName);
+    }
+  }
+
+  private native org.lance.index.vector.VectorIndexHandle nativeOpenVectorIndexHandle(
+      String indexName);
+
+  /**
    * Get a {@link ShardWriter} for the specified shard.
    *
    * <p>{@link #initializeMemWal} must be called before using this method.

@@ -1003,6 +1003,24 @@ class LanceDataset(pa.dataset.Dataset):
         )
         return json.loads(self._ds.index_statistics(index_name))
 
+    def open_vector_index_handle(self, index_name: str) -> "LanceVectorIndexHandle":
+        """Open a snapshot handle of a committed vector index.
+
+        The returned handle is decoupled from this dataset after construction;
+        subsequent dataset commits or drops do not affect the handle.
+
+        Parameters
+        ----------
+        index_name : str
+            The name of a vector index on this dataset.
+
+        Raises
+        ------
+        ValueError
+            If no index with this name exists.
+        """
+        return LanceVectorIndexHandle(self._ds.open_vector_index_handle(index_name))
+
     @property
     def has_index(self):
         return len(self.describe_indices()) > 0
@@ -7838,3 +7856,59 @@ class VectorSearchQuery:
 
     def inner(self):
         return self._inner
+
+
+class LanceVectorIndexHandle:
+    """Snapshot handle for a committed vector index.
+
+    Returned by :meth:`LanceDataset.open_vector_index_handle`. The handle is
+    decoupled from the source dataset after construction; subsequent dataset
+    commits or drops do not affect this handle.
+    """
+
+    def __init__(self, native):
+        self._native = native
+
+    @property
+    def name(self) -> str:
+        return self._native.name
+
+    @property
+    def column(self) -> str:
+        return self._native.column
+
+    @property
+    def num_segments(self) -> int:
+        return self._native.num_segments
+
+    def as_ivf(self) -> "LanceIvfIndexHandle":
+        """Return an IVF view on this handle."""
+        return LanceIvfIndexHandle(self._native.as_ivf())
+
+
+class LanceIvfIndexHandle:
+    """IVF view of a :class:`LanceVectorIndexHandle`."""
+
+    def __init__(self, native):
+        self._native = native
+
+    def read_centroids(self) -> "pa.FixedSizeListArray":
+        """Read the trained IVF centroids of this index.
+
+        Returns the union of every segment's centroids in commit order. The
+        outer length equals the sum of per-segment partition counts; the inner
+        list size equals the indexed vector dimension; the element type
+        matches the indexed column.
+        """
+        return self._native.read_centroids()
+
+    def read_pq_codebook(self) -> "Optional[pa.FixedSizeListArray]":
+        """Read the trained PQ codebook, or ``None`` if non-PQ.
+
+        For ``IVF_PQ`` / ``IVF_HNSW_PQ`` indices this returns a
+        ``pa.FixedSizeListArray`` with ``2 ** num_bits`` rows of length equal
+        to the indexed vector dimension, all in ``float32``. For non-PQ
+        indices (``IVF_FLAT`` / ``IVF_SQ`` / ``IVF_HNSW_FLAT`` /
+        ``IVF_HNSW_SQ`` / ``IVF_RQ``) it returns ``None``.
+        """
+        return self._native.read_pq_codebook()

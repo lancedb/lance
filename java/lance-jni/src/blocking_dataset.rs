@@ -15,6 +15,9 @@ use crate::utils::{
 };
 use crate::{RT, traits::IntoJava};
 use arrow::array::RecordBatchReader;
+use arrow::array::{
+    Array, FixedSizeListArray, Float16Array, Float32Array, Float64Array, UInt8Array,
+};
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -24,7 +27,7 @@ use arrow::record_batch::RecordBatchIterator;
 use arrow_schema::DataType;
 use arrow_schema::Schema as ArrowSchema;
 use chrono::{DateTime, Utc};
-use jni::objects::{JMap, JString, JValue};
+use jni::objects::{JMap, JString, JValue, JValueGen};
 use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{JNIEnv, objects::JObject};
@@ -41,7 +44,7 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
-use lance::index::{DatasetIndexExt, IndexSegment};
+use lance::index::{DatasetIndexExt, IndexSegment, LogicalVectorIndex};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
@@ -3722,4 +3725,249 @@ fn inner_get_zonemap_stats<'local>(
     }
 
     Ok(array_list)
+}
+
+/// Convert an Arrow `FixedSizeList<float-like>` to a row-major `Vec<f32>` paired
+/// with the element-type discriminator string used by `IvfCentroids`.
+/// UInt8 / Float16 / Float64 values are widened to f32 to match the Java POJO contract.
+fn fixed_size_list_to_f32_with_type(arr: &FixedSizeListArray) -> Result<(Vec<f32>, &'static str)> {
+    let values = arr.values();
+    match arr.value_type() {
+        DataType::Float32 => {
+            let primitive = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    Error::runtime_error("Float32 centroids failed to downcast".to_string())
+                })?;
+            Ok((primitive.values().to_vec(), "FLOAT32"))
+        }
+        DataType::Float16 => {
+            let primitive = values
+                .as_any()
+                .downcast_ref::<Float16Array>()
+                .ok_or_else(|| {
+                    Error::runtime_error("Float16 centroids failed to downcast".to_string())
+                })?;
+            Ok((
+                primitive.values().iter().map(|v| v.to_f32()).collect(),
+                "FLOAT16",
+            ))
+        }
+        DataType::Float64 => {
+            let primitive = values
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    Error::runtime_error("Float64 centroids failed to downcast".to_string())
+                })?;
+            Ok((
+                primitive.values().iter().map(|v| *v as f32).collect(),
+                "FLOAT64",
+            ))
+        }
+        DataType::UInt8 => {
+            let primitive = values
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| {
+                    Error::runtime_error("UInt8 centroids failed to downcast".to_string())
+                })?;
+            Ok((
+                primitive.values().iter().map(|v| *v as f32).collect(),
+                "UINT8",
+            ))
+        }
+        other => Err(Error::runtime_error(format!(
+            "Unsupported IVF centroid element type: {other:?}"
+        ))),
+    }
+}
+
+fn ivf_centroids_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    centroids: &FixedSizeListArray,
+) -> Result<JObject<'a>> {
+    let (flat, element_type) = fixed_size_list_to_f32_with_type(centroids)?;
+    let num_partitions = centroids.len() as i32;
+    let dimension = centroids.value_length();
+    let jarray = env.new_float_array(flat.len() as i32)?;
+    env.set_float_array_region(&jarray, 0, &flat)?;
+    let element_type_jstr = env.new_string(element_type)?;
+    Ok(env.new_object(
+        "org/lance/index/vector/IvfCentroids",
+        "([FIILjava/lang/String;)V",
+        &[
+            JValueGen::Object(&JObject::from(jarray)),
+            JValueGen::Int(num_partitions),
+            JValueGen::Int(dimension),
+            JValueGen::Object(&JObject::from(element_type_jstr)),
+        ],
+    )?)
+}
+
+fn pq_codebook_to_java<'a>(
+    env: &mut JNIEnv<'a>,
+    codebook: &FixedSizeListArray,
+    num_bits: i32,
+) -> Result<JObject<'a>> {
+    let values = codebook
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            Error::runtime_error(format!(
+                "Expected Float32 PQ codebook, got {:?}",
+                codebook.value_type()
+            ))
+        })?;
+    let flat: Vec<f32> = values.values().to_vec();
+    let dimension = codebook.value_length();
+    let jarray = env.new_float_array(flat.len() as i32)?;
+    env.set_float_array_region(&jarray, 0, &flat)?;
+    Ok(env.new_object(
+        "org/lance/index/vector/PqCodebook",
+        "([FII)V",
+        &[
+            JValueGen::Object(&JObject::from(jarray)),
+            JValueGen::Int(num_bits),
+            JValueGen::Int(dimension),
+        ],
+    )?)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeOpenVectorIndexHandle<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject<'local>,
+    index_name_jstr: JString<'local>,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_open_vector_index_handle(&mut env, jdataset, index_name_jstr)
+    )
+}
+
+fn inner_open_vector_index_handle<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject<'local>,
+    index_name_jstr: JString<'local>,
+) -> Result<JObject<'local>> {
+    let index_name: String = env.get_string(&index_name_jstr)?.into();
+    let logical = {
+        let guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(&jdataset, NATIVE_DATASET) }?;
+        // Map `IndexNotFound` to an input error so the Java surface throws
+        // `IllegalArgumentException` for unknown index names, matching the
+        // `Dataset.openVectorIndexHandle` contract.
+        RT.block_on(guard.inner.open_vector_index_handle(&index_name))
+            .map_err(|e| match e {
+                lance::Error::IndexNotFound { .. } => Error::input_error(e.to_string()),
+                other => other.into(),
+            })?
+    };
+    let name_jstr = env.new_string(logical.name())?;
+    let column_jstr = env.new_string(logical.column())?;
+    let num_segments = logical.num_segments() as i32;
+    let boxed: Box<Arc<LogicalVectorIndex>> = Box::new(Arc::new(logical));
+    let handle_ptr = Box::into_raw(boxed) as jlong;
+    let result = env.new_object(
+        "org/lance/index/vector/VectorIndexHandle",
+        "(JLjava/lang/String;Ljava/lang/String;I)V",
+        &[
+            JValueGen::Long(handle_ptr),
+            JValueGen::Object(&JObject::from(name_jstr)),
+            JValueGen::Object(&JObject::from(column_jstr)),
+            JValueGen::Int(num_segments),
+        ],
+    );
+    match result {
+        Ok(obj) => Ok(obj),
+        Err(e) => {
+            // SAFETY: handle_ptr was just produced by Box::into_raw and Java
+            // never received it because env.new_object failed. Reclaiming the
+            // Box here prevents leaking the Arc<LogicalVectorIndex>.
+            unsafe {
+                let _ = Box::from_raw(handle_ptr as *mut Arc<LogicalVectorIndex>);
+            }
+            Err(e.into())
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_vector_VectorIndexHandle_nativeRelease<'local>(
+    _env: JNIEnv<'local>,
+    _class: JObject<'local>,
+    handle_ptr: jlong,
+) {
+    if handle_ptr == 0 {
+        return;
+    }
+    // SAFETY: handle_ptr was produced by Box::into_raw in inner_open_vector_index_handle,
+    // and Java guarantees nativeRelease is called at most once per handle.
+    unsafe {
+        let _ = Box::from_raw(handle_ptr as *mut Arc<LogicalVectorIndex>);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_vector_IvfHandle_nativeReadCentroids<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JObject<'local>,
+    handle_ptr: jlong,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_handle_read_centroids(&mut env, handle_ptr))
+}
+
+fn inner_handle_read_centroids<'local>(
+    env: &mut JNIEnv<'local>,
+    handle_ptr: jlong,
+) -> Result<JObject<'local>> {
+    if handle_ptr == 0 {
+        return Err(Error::input_error(
+            "VectorIndexHandle is closed".to_string(),
+        ));
+    }
+    // SAFETY: handle_ptr was produced by Box::into_raw and is still owned by Java.
+    let logical: &Arc<LogicalVectorIndex> =
+        unsafe { &*(handle_ptr as *const Arc<LogicalVectorIndex>) };
+    let centroids = RT.block_on(async {
+        let view = logical.as_ivf()?;
+        view.read_centroids().await
+    })?;
+    ivf_centroids_to_java(env, &centroids)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_vector_IvfHandle_nativeReadPqCodebook<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JObject<'local>,
+    handle_ptr: jlong,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_handle_read_pq_codebook(&mut env, handle_ptr))
+}
+
+fn inner_handle_read_pq_codebook<'local>(
+    env: &mut JNIEnv<'local>,
+    handle_ptr: jlong,
+) -> Result<JObject<'local>> {
+    if handle_ptr == 0 {
+        return Err(Error::input_error(
+            "VectorIndexHandle is closed".to_string(),
+        ));
+    }
+    // SAFETY: handle_ptr was produced by Box::into_raw and is still owned by Java.
+    let logical: &Arc<LogicalVectorIndex> =
+        unsafe { &*(handle_ptr as *const Arc<LogicalVectorIndex>) };
+    let result: std::result::Result<(FixedSizeListArray, i32), lance::Error> = RT.block_on(async {
+        let view = logical.as_ivf()?;
+        let (codebook, num_bits) = view.read_pq_codebook().await?;
+        Ok::<_, lance::Error>((codebook, num_bits as i32))
+    });
+    match result {
+        Ok((codebook, num_bits)) => pq_codebook_to_java(env, &codebook, num_bits),
+        Err(lance::Error::NotSupported { .. }) => Ok(JObject::null()),
+        Err(e) => Err(e.into()),
+    }
 }
