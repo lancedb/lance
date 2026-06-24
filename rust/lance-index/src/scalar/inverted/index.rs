@@ -1174,21 +1174,36 @@ fn group_aligned_chunk_end(
     tok_start: usize,
     desired_end: usize,
 ) -> usize {
-    let fit = starts
-        .iter()
-        .map(|&s| s as usize)
-        .chain(std::iter::once(token_count))
-        .filter(|&b| b > tok_start && b <= desired_end)
-        .max();
-    if let Some(end) = fit {
-        return end;
+    if desired_end >= token_count {
+        return token_count;
     }
+
+    let first_after_start = starts.partition_point(|&start| start as usize <= tok_start);
+    let first_after_desired = starts.partition_point(|&start| start as usize <= desired_end);
+    if first_after_desired > first_after_start {
+        return starts[first_after_desired - 1] as usize;
+    }
+
     // Oversized group: extend to its end so it runs as one chunk.
     starts
-        .iter()
-        .map(|&s| s as usize)
-        .find(|&b| b > tok_start)
+        .get(first_after_start)
+        .map(|&start| start as usize)
         .unwrap_or(token_count)
+}
+
+fn group_start_indices_for_chunk(starts: &[u32], tok_start: usize, tok_end: usize) -> Range<usize> {
+    let first = starts.partition_point(|&start| (start as usize) < tok_start);
+    let end = starts.partition_point(|&start| (start as usize) < tok_end);
+    first..end
+}
+
+fn group_range_for_start_index(starts: &[u32], token_count: usize, group_idx: usize) -> (u32, u32) {
+    let start = starts[group_idx];
+    let end = starts
+        .get(group_idx + 1)
+        .copied()
+        .unwrap_or(token_count as u32);
+    (start, end)
 }
 
 impl InvertedIndex {
@@ -2922,12 +2937,9 @@ impl PostingListReader {
                 // in it; `chunk_postings[i]` is token `tok_start + i`. The last
                 // group's `end` derives from `token_count`, matching the read path
                 // so both produce identical `PostingListGroupKey`s.
-                for (k, &start) in starts.iter().enumerate() {
+                for group_idx in group_start_indices_for_chunk(starts, tok_start, tok_end) {
+                    let (start, end) = group_range_for_start_index(starts, token_count, group_idx);
                     let start_usize = start as usize;
-                    if start_usize < tok_start || start_usize >= tok_end {
-                        continue;
-                    }
-                    let end = starts.get(k + 1).copied().unwrap_or(token_count as u32);
                     let lo = start_usize - tok_start;
                     let hi = end as usize - tok_start;
                     let group = PostingListGroup::new(chunk_postings[lo..hi].to_vec());
@@ -6472,6 +6484,65 @@ mod tests {
             alpha.blocks.values().as_ptr(),
             beta.blocks.values().as_ptr(),
             "prewarm should not leave cached posting lists sharing the same values buffer"
+        );
+    }
+
+    #[test]
+    fn test_group_aligned_chunk_end_boundary_cases() {
+        let starts = [0, 3, 7, 10];
+        let token_count = 13;
+
+        assert_eq!(
+            group_aligned_chunk_end(&starts, token_count, 0, 5),
+            3,
+            "chunk should snap back to the largest group boundary that fits"
+        );
+        assert_eq!(
+            group_aligned_chunk_end(&starts, token_count, 3, 6),
+            7,
+            "oversized groups should run as one chunk"
+        );
+        assert_eq!(
+            group_aligned_chunk_end(&starts, token_count, 7, 10),
+            10,
+            "an exact next group boundary should be selected"
+        );
+        assert_eq!(
+            group_aligned_chunk_end(&starts, token_count, 10, 12),
+            13,
+            "the last group should extend to token_count"
+        );
+        assert_eq!(
+            group_aligned_chunk_end(&starts, token_count, 7, 13),
+            13,
+            "token_count should act as the final boundary"
+        );
+    }
+
+    #[test]
+    fn test_group_start_indices_for_chunk_boundary_cases() {
+        let starts = [0, 3, 7, 10];
+        let token_count = 13;
+        let ranges_for_chunk = |tok_start, tok_end| {
+            group_start_indices_for_chunk(&starts, tok_start, tok_end)
+                .map(|group_idx| group_range_for_start_index(&starts, token_count, group_idx))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ranges_for_chunk(0, 7),
+            vec![(0, 3), (3, 7)],
+            "publish should include only groups that start in the chunk"
+        );
+        assert_eq!(
+            ranges_for_chunk(7, 13),
+            vec![(7, 10), (10, 13)],
+            "publish should include the final group ending at token_count"
+        );
+        assert_eq!(
+            ranges_for_chunk(3, 10),
+            vec![(3, 7), (7, 10)],
+            "publish selection should work for an interior chunk"
         );
     }
 
