@@ -22,7 +22,9 @@
 // Remove after upgrading pyo3 to 0.23
 #![allow(clippy::useless_conversion)]
 
-#[cfg(feature = "mimalloc")]
+// mimalloc is the default; jemalloc takes precedence when explicitly enabled so
+// that `--features jemalloc` works without also passing `--no-default-features`.
+#[cfg(all(feature = "mimalloc", not(feature = "jemalloc")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
