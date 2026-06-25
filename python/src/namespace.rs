@@ -392,6 +392,44 @@ impl PyDirectoryNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    // Table branch operations
+
+    fn create_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn list_table_branches<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_branches(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // Data manipulation operations
 
     fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
@@ -1054,6 +1092,44 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    // Table branch operations
+
+    fn create_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.create_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn list_table_branches<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.list_table_branches(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    fn delete_table_branch<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = depythonize(request)?;
+        let response = crate::rt()
+            .block_on(Some(py), self.inner.delete_table_branch(request))?
+            .infer_error()?;
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     // Data manipulation operations
 
     fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
@@ -1472,6 +1548,30 @@ fn get_dict_with_model_dump_class(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> 
     Ok(class)
 }
 
+/// Convert a Python namespace exception into a lance error, preserving the
+/// namespace error identity when the exception is a `lance_namespace`
+/// `LanceNamespaceError` carrying an error `code`, so callers can react to
+/// e.g. TableNotFound the same way they do for native clients. Foreign
+/// exceptions that happen to carry an integer `code` (e.g. SystemExit) must
+/// not be reinterpreted, so the extraction is gated on the exception type.
+fn namespace_error_from_py(method_name: &'static str, e: PyErr) -> lance_core::Error {
+    Python::attach(|py| {
+        let value = e.value(py);
+        let is_namespace_error = py
+            .import("lance_namespace.errors")
+            .and_then(|module| module.getattr("LanceNamespaceError"))
+            .and_then(|class| value.is_instance(&class))
+            .unwrap_or(false);
+        if is_namespace_error
+            && let Ok(code) = value.getattr("code").and_then(|code| code.extract::<u32>())
+        {
+            return lance_namespace::error::NamespaceError::from_code(code, value.to_string())
+                .into();
+        }
+        lance_core::Error::io(format!("Python error in {}: {}", method_name, e))
+    })
+}
+
 /// Helper to call a Python namespace method with JSON serialization.
 /// For methods that take a request and return a response.
 /// Uses DictWithModelDump to pass a dict that also has model_dump() method,
@@ -1519,7 +1619,7 @@ where
     })
     .await
     .map_err(|e| lance_core::Error::io(format!("Task join error for {}: {}", method_name, e)))?
-    .map_err(|e: PyErr| lance_core::Error::io(format!("Python error in {}: {}", method_name, e)))?;
+    .map_err(|e: PyErr| namespace_error_from_py(method_name, e))?;
 
     serde_json::from_str(&response_json).map_err(|e| {
         lance_core::Error::io(format!(

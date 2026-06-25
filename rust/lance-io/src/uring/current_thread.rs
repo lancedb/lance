@@ -14,10 +14,10 @@ use crate::traits::Reader;
 use crate::uring::DEFAULT_URING_QUEUE_DEPTH;
 use crate::utils::tracking_store::IOTracker;
 use bytes::{Bytes, BytesMut};
-use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt};
 use io_uring::{IoUring, opcode, types};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use object_store::path::Path;
 
@@ -258,7 +258,7 @@ pub struct UringCurrentThreadReader {
 }
 
 impl DeepSizeOf for UringCurrentThreadReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // Skip file handle (just a system resource)
         // Only count the path's deep size
         self.handle.path.as_ref().deep_size_of_children(context)

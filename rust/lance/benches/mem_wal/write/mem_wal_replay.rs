@@ -148,6 +148,7 @@ async fn setup_dataset(schema: &Arc<ArrowSchema>, name: &str, dataset_prefix: &s
         reader,
         &dataset_uri,
         Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
             mode: lance::dataset::WriteMode::Create,
             ..Default::default()
         }),

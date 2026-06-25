@@ -7,7 +7,9 @@ use arrow_array::{
     Float16Array, Float32Array, Float64Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use half::{bf16, f16};
 use num_traits::Float;
 use rand::Rng;
@@ -17,7 +19,7 @@ use lance_linalg::distance::{norm_l2, norm_l2_f64_simd, norm_l2_impl};
 use lance_testing::datagen::generate_random_array_with_seed;
 
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 const DIMENSION: usize = 1024;
 const TOTAL: usize = 1024 * 1024; // 1M vectors

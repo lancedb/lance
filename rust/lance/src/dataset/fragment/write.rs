@@ -12,6 +12,7 @@ use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
+use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
@@ -165,7 +166,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             writer.write_batches(batch_chunk.iter()).await?;
         }
 
-        fragment.physical_rows = Some(writer.finish().await? as usize);
+        let write_summary = writer.finish().await?;
+        fragment.physical_rows = Some(write_summary.num_rows as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
             return Err(Error::invalid_input("Input data was empty."));
@@ -186,6 +188,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         fragment.files[0].fields = field_ids;
         fragment.files[0].column_indices = column_indices;
+        fragment.files[0].file_size_bytes = CachedFileSize::new(write_summary.size_bytes);
 
         progress.complete(&fragment).await?;
 

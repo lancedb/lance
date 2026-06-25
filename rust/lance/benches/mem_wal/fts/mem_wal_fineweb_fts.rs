@@ -382,7 +382,15 @@ async fn build_seed_dataset(
         lo = hi;
     }
     let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
-    let mut dataset = Dataset::write(reader, uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     if indexed {
         dataset
             .create_index(
@@ -818,7 +826,15 @@ async fn build_reference_dataset(
         lo = hi;
     }
     let reader = RecordBatchIterator::new(batches.into_iter(), schema.clone());
-    let mut dataset = Dataset::write(reader, ref_uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        ref_uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     dataset
         .create_index(
             &[TEXT_COL],

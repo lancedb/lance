@@ -27,6 +27,7 @@ use jni::sys::{jdouble, jint, jlong};
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
     FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    write_pk_sidecar,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
@@ -35,6 +36,7 @@ use lance::dataset::mem_wal::{
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{MemWalIndexDetails, ShardManifest, ShardingField, ShardingSpec};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
@@ -43,7 +45,9 @@ use crate::RT;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{IntoJava, export_vec, import_vec, import_vec_to_rust};
+use crate::traits::{
+    FromJString, IntoJava, export_vec, import_vec, import_vec_from_method, import_vec_to_rust,
+};
 use crate::utils::to_rust_map;
 
 const NATIVE_SHARD_WRITER: &str = "nativeShardWriterHandle";
@@ -174,6 +178,42 @@ fn inner_put(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> 
     let guard =
         unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
     RT.block_on(guard.writer.put(batches))?;
+    Ok(())
+}
+
+/// Test-support: write a primary-key dedup sidecar (`_pk_index/`) for a
+/// flushed-generation dataset already staged at `gen_path`, mirroring what
+/// production flush emits. Lets Java tests stage a *faithful* flushed
+/// generation (dataset + sidecar); production always writes the sidecar during
+/// flush, so a dataset-without-sidecar is not a state the system produces.
+/// Mirrors the Python `_write_pk_sidecar` binding.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_memwal_MemWalTest_nativeWritePkSidecar(
+    mut env: JNIEnv,
+    _class: JClass,
+    gen_path: JString,
+    stream_addr: jlong,
+    pk_columns: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_write_pk_sidecar(&mut env, gen_path, stream_addr, pk_columns)
+    );
+}
+
+fn inner_write_pk_sidecar(
+    env: &mut JNIEnv,
+    gen_path: JString,
+    stream_addr: jlong,
+    pk_columns: JObject,
+) -> Result<()> {
+    let gen_path: String = env.get_string(&gen_path)?.into();
+    let pk_columns = env.get_strings(&pk_columns)?;
+    let stream_ptr = stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
+    let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
+    RT.block_on(write_pk_sidecar(&gen_path, &batches, &pk_refs))?;
     Ok(())
 }
 
@@ -1232,6 +1272,31 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
             Some(Duration::from_millis(v))
         };
         writer_config = writer_config.with_stats_log_interval(interval);
+    }
+    let hnsw_params = import_vec_from_method(
+        env,
+        config,
+        "hnswParams",
+        |env, item| -> Result<(String, HnswBuildParams)> {
+            let index_name = env
+                .call_method(&item, "indexName", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let index_name: String = JString::from(index_name).extract(env)?;
+            let num_edges = env.call_method(&item, "numEdges", "()I", &[])?.i()? as usize;
+            let ef_construction =
+                env.call_method(&item, "efConstruction", "()I", &[])?.i()? as usize;
+            let max_level = env.call_method(&item, "maxLevel", "()I", &[])?.i()? as u16;
+            Ok((
+                index_name,
+                HnswBuildParams::default()
+                    .num_edges(num_edges)
+                    .ef_construction(ef_construction)
+                    .max_level(max_level),
+            ))
+        },
+    )?;
+    for (index_name, params) in hnsw_params {
+        writer_config = writer_config.with_hnsw_params(index_name, params);
     }
     Ok(writer_config)
 }

@@ -48,13 +48,20 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+# Only used by the (disabled) `mem_wal_kv_point_lookup` benchmark's RocksDB arm.
+# Commented out so CI's all-features build never compiles the bundled librocksdb
+# C++ sources (needs libclang). Uncomment with the bench target + feature to run.
+# rocksdb = { version = "0.23", optional = true, default-features = false }
 crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap = "6"
-deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true
+# Fast non-cryptographic hasher for the hot FTS mem-index insert path.
+rustc-hash = "2.1"
+# Compact FST term dictionary for the FTS mem-index partitions.
+fst = "0.4"
 itertools.workspace = true
 moka.workspace = true
 object_store = { workspace = true }
@@ -131,7 +138,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "asyn
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [features]
-default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "geo"]
+default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
@@ -150,10 +157,15 @@ gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
 oss = ["lance-io/oss"]
 tencent = ["lance-io/tencent"]
+goosefs = ["lance-io/goosefs"]
+tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
+# Compile the RocksDB comparison arm of the (disabled) mem_wal_kv_point_lookup
+# bench. Commented out so it stays out of CI's all-features build.
+# bench-rocksdb = ["dep:rocksdb"]
 
 [[bin]]
 name = "lq"
@@ -161,6 +173,10 @@ required-features = ["cli"]
 
 [[bench]]
 name = "scalar_index"
+harness = false
+
+[[bench]]
+name = "regex_ngram"
 harness = false
 
 [[bench]]
@@ -172,11 +188,19 @@ name = "scan"
 harness = false
 
 [[bench]]
+name = "count_pushdown"
+harness = false
+
+[[bench]]
 name = "vector_index"
 harness = false
 
 [[bench]]
 name = "ivf_pq"
+harness = false
+
+[[bench]]
+name = "streaming_ivf_training"
 harness = false
 
 [[bench]]
@@ -259,11 +283,29 @@ path = "benches/mem_wal/fts/mem_wal_fts_bench.rs"
 harness = false
 
 [[bench]]
+name = "mem_wal_fts_read_bench"
+path = "benches/mem_wal/fts/mem_wal_fts_read_bench.rs"
+harness = false
+
+# MemTable KV point-lookup benchmark (Lance vs RocksDB). Disabled as a build
+# target: it needs the optional `rocksdb` dep (bundled librocksdb C++, needs
+# libclang) which CI's all-features build can't compile. To run it, uncomment
+# this entry plus the `rocksdb` dependency and the `bench-rocksdb` feature.
+# [[bench]]
+# name = "mem_wal_kv_point_lookup"
+# path = "benches/mem_wal/kv/mem_wal_kv_point_lookup.rs"
+# harness = false
+
+[[bench]]
 name = "manifest_commit"
 harness = false
 
 [[bench]]
 name = "concurrent_append"
+harness = false
+
+[[bench]]
+name = "hamming"
 harness = false
 
 [lints]

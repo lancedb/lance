@@ -18,6 +18,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_expr::Expr;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
@@ -107,7 +108,7 @@ pub async fn take(
 ) -> Result<RecordBatch> {
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
     if offsets.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(
+        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
             projection.output_schema()?,
         )));
     }
@@ -169,9 +170,11 @@ async fn do_take_rows(
             let row_addr_col = Arc::new(UInt64Array::from(Vec::<u64>::new()));
             let row_addr_field =
                 ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
-            return Ok(empty_batch.try_with_column(row_addr_field, row_addr_col)?);
+            return to_logical_json_batch(
+                empty_batch.try_with_column(row_addr_field, row_addr_col)?,
+            );
         }
-        return Ok(empty_batch);
+        return to_logical_json_batch(empty_batch);
     }
 
     let row_addr_stats = check_row_addrs(&row_addrs);
@@ -388,12 +391,12 @@ async fn do_take_rows(
         }
     }
 
-    Ok(projection.project_batch(batch).await?)
+    to_logical_json_batch(projection.project_batch(batch).await?)
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     if builder.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(
+        return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
             builder.projection.output_schema()?,
         )));
     }
@@ -401,6 +404,10 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     let projection = builder.projection.clone();
 
     do_take_rows(builder, projection).await
+}
+
+fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
+    Ok(convert_lance_json_to_arrow(&batch)?)
 }
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -582,8 +589,13 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Struc
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, LargeBinaryArray, RecordBatchIterator, StringArray};
-    use arrow_schema::{DataType, Schema as ArrowSchema};
+    use arrow_array::{
+        Int32Array, LargeBinaryArray, ListArray, RecordBatchIterator, StringArray, StructArray,
+    };
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
@@ -614,6 +626,72 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    fn nested_arrow_json_batch() -> RecordBatch {
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, false));
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let extra_field =
+            Arc::new(ArrowField::new("extra", DataType::Utf8, true).with_metadata(metadata));
+        let item_fields = Fields::from(vec![uri_field, extra_field]);
+        let values = StructArray::new(
+            item_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a.jpg"), Some("b.jpg")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"codec":"h264"}"#),
+                    None::<&str>,
+                ])) as ArrayRef,
+            ],
+            None,
+        );
+        let item = Arc::new(ArrowField::new("item", DataType::Struct(item_fields), true));
+        let media = ListArray::new(
+            item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+            Arc::new(values),
+            None,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "media",
+            media.data_type().clone(),
+            true,
+        )]));
+
+        RecordBatch::try_new(schema, vec![Arc::new(media) as ArrayRef]).unwrap()
+    }
+
+    fn assert_nested_arrow_json_schema(batch: &RecordBatch) {
+        let schema = batch.schema();
+        let DataType::List(item) = schema.field(0).data_type() else {
+            panic!("expected list field");
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("expected struct item");
+        };
+        assert!(is_arrow_json_field(&fields[1]));
+    }
+
+    fn assert_first_nested_json_value(batch: &RecordBatch) {
+        let media: &ListArray = batch.column(0).as_list();
+        let values = media.values().as_struct();
+        let uri = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let extra = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(uri.value(0), "a.jpg");
+        assert!(extra.value(0).contains("h264"));
     }
 
     #[rstest]
@@ -670,6 +748,41 @@ mod test {
             .unwrap(),
             values
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_nested_arrow_json_returns_logical_schema(
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let data = nested_arrow_json_batch();
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_stable_row_ids: false,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+
+        let values = dataset.take(&[0], projection.clone()).await.unwrap();
+        assert_nested_arrow_json_schema(&values);
+        assert_first_nested_json_value(&values);
+
+        let empty = dataset.take(&[], projection.clone()).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_nested_arrow_json_schema(&empty);
+
+        let values = dataset.take_rows(&[0], projection.clone()).await.unwrap();
+        assert_nested_arrow_json_schema(&values);
+        assert_first_nested_json_value(&values);
+
+        let empty = dataset.take_rows(&[], projection).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_nested_arrow_json_schema(&empty);
     }
 
     #[tokio::test]

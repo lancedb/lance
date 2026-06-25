@@ -9,9 +9,9 @@ use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
 
 use arrow_schema::{DataType, Field};
 use builder::SQBuildParams;
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::*;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use num_traits::*;
@@ -34,7 +34,7 @@ pub struct ScalarQuantizer {
 }
 
 impl DeepSizeOf for ScalarQuantizer {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0
     }
 }

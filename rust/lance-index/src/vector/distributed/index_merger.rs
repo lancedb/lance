@@ -20,9 +20,14 @@ use std::sync::Arc;
 use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::bq::storage::{
-    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, pack_codes,
+    RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
+    pack_codes, rabit_binary_code_field, rabit_ex_code_field,
 };
-use crate::vector::bq::transform::{ADD_FACTORS_FIELD, SCALE_FACTORS_FIELD};
+use crate::vector::bq::transform::{
+    ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
+    SCALE_FACTORS_FIELD,
+};
+use crate::vector::bq::validate_rq_num_bits;
 use crate::vector::flat::index::FlatMetadata;
 use crate::vector::ivf::storage::{IVF_METADATA_KEY, IvfModel as IvfStorageModel};
 use crate::vector::pq::storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, transpose};
@@ -297,20 +302,21 @@ pub async fn init_writer_for_rq(
     rq_meta: &RabitQuantizationMetadata,
     format_version: LanceFileVersion,
 ) -> Result<FileWriter> {
-    let num_bytes = (rq_meta.code_dim as usize).div_ceil(u8::BITS as usize);
-    let arrow_schema = ArrowSchema::new(vec![
+    let mut fields = vec![
         (*ROW_ID_FIELD).clone(),
-        Field::new(
-            RABIT_CODE_COLUMN,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, true)),
-                num_bytes as i32,
-            ),
-            true,
-        ),
+        rabit_binary_code_field(rq_meta.rotated_dim()),
         ADD_FACTORS_FIELD.clone(),
         SCALE_FACTORS_FIELD.clone(),
-    ]);
+    ];
+    if rq_meta.query_estimator == RabitQueryEstimator::RawQuery {
+        fields.push(ERROR_FACTORS_FIELD.clone());
+    }
+    if let Some(ex_code_field) = rabit_ex_code_field(rq_meta.rotated_dim(), rq_meta.num_bits)? {
+        fields.push(ex_code_field);
+        fields.push(EX_ADD_FACTORS_FIELD.clone());
+        fields.push(EX_SCALE_FACTORS_FIELD.clone());
+    }
+    let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
     let mut w = FileWriter::try_new(
         writer,
@@ -707,7 +713,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     aux_paths: &[object_store::path::Path],
     target_dir: &object_store::path::Path,
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<()> {
+) -> Result<lance_table::format::IndexFile> {
     if aux_paths.is_empty() {
         return Err(Error::index(
             "No partial auxiliary files were selected for merge".to_string(),
@@ -789,20 +795,10 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Detect index type (first iteration only)
         if detected_index_type.is_none() {
             // Try to derive precise type from sibling partial index.idx metadata if available
-            // Try resolve sibling index.idx path by trimming the last component of aux path
-            let parent_str = {
-                let s = aux.as_ref();
-                if let Some((p, _)) = s.trim_end_matches('/').rsplit_once('/') {
-                    p.to_string()
-                } else {
-                    s.to_string()
-                }
-            };
-            let idx_path = object_store::path::Path::from(format!(
-                "{}/{}",
-                parent_str,
-                crate::INDEX_FILE_NAME
-            ));
+            let idx_path = aux
+                .parent()
+                .unwrap_or_default()
+                .join(crate::INDEX_FILE_NAME);
             if object_store.exists(&idx_path).await.unwrap_or(false) {
                 let fh2 = sched
                     .open_file(&idx_path, &CachedFileSize::unknown())
@@ -988,12 +984,14 @@ pub async fn merge_partial_vector_auxiliary_files(
                     let rotate_mat_bytes = reader.read_global_buffer(buf_idx).await?;
                     rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
                 }
+                validate_rq_num_bits(rq_meta_parsed.num_bits)?;
 
-                let d0 = (rq_meta_parsed.code_dim as usize)
-                    .checked_div(rq_meta_parsed.num_bits as usize)
-                    .ok_or_else(|| {
-                        Error::index("Invalid RQ metadata: num_bits is zero".to_string())
-                    })?;
+                let d0 = rq_meta_parsed.rotated_dim();
+                if d0 == 0 {
+                    return Err(Error::index(
+                        "Invalid RQ metadata: rotated dimension is zero".to_string(),
+                    ));
+                }
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim
                     && dprev != d0
@@ -1442,6 +1440,25 @@ pub async fn merge_partial_vector_auxiliary_files(
                     )));
                 }
 
+                // Shards written by older lance versions carry sequential ex
+                // codes; normalize every batch to the blocked layout before
+                // concatenation so mixed-version shards merge correctly
+                // (concat_batches combines columns by position and would
+                // otherwise mix the two layouts silently).
+                let batches = match rq_meta.as_ref() {
+                    Some(meta) if meta.num_bits > 1 => batches
+                        .into_iter()
+                        .map(|batch| {
+                            crate::vector::bq::storage::load_blocked_ex_codes(
+                                batch,
+                                meta.rotated_dim(),
+                                meta.num_bits,
+                            )
+                            .map(|(batch, _)| batch)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    _ => batches,
+                };
                 let schema = batches[0].schema();
                 let partition_batch = concat_batches(&schema, batches.iter())?;
                 if let Some(w) = v2w_opt.as_mut() {
@@ -1494,16 +1511,18 @@ pub async fn merge_partial_vector_auxiliary_files(
         }
         let dt2 = distance_type.ok_or_else(|| Error::index("Distance type missing".to_string()))?;
         write_unified_ivf_and_index_metadata(w, &ivf_model, dt2, idx_type_final).await?;
-        w.finish().await?;
+        let summary = w.finish().await?;
         progress.stage_progress("write_auxiliary_index", 1).await?;
         progress.stage_complete("write_auxiliary_index").await?;
+        Ok(lance_table::format::IndexFile {
+            path: INDEX_AUXILIARY_FILE_NAME.to_string(),
+            size_bytes: summary.size_bytes,
+        })
     } else {
-        return Err(Error::index(
+        Err(Error::index(
             "Failed to initialize unified writer".to_string(),
-        ));
+        ))
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1527,6 +1546,8 @@ mod tests {
     use prost::Message;
 
     use crate::vector::bq::RQRotationType;
+    use crate::vector::bq::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQueryEstimator};
+    use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
     lance_testing::define_stage_event_progress!(
         RecordingProgress,
         IndexBuildProgress,
@@ -2057,7 +2078,14 @@ mod tests {
         distance_type: DistanceType,
     ) -> Result<usize> {
         let num_bytes = (metadata.code_dim as usize).div_ceil(u8::BITS as usize);
-        let arrow_schema = ArrowSchema::new(vec![
+        let ex_code_field = rabit_ex_code_field(metadata.code_dim as usize, metadata.num_bits)?;
+        let ex_code_bytes = ex_code_field.as_ref().map(|field| {
+            let DataType::FixedSizeList(_, num_bytes) = field.data_type() else {
+                panic!("RQ ex-code field should be FixedSizeList");
+            };
+            *num_bytes as usize
+        });
+        let mut fields = vec![
             (*ROW_ID_FIELD).clone(),
             Field::new(
                 RABIT_CODE_COLUMN,
@@ -2069,7 +2097,16 @@ mod tests {
             ),
             ADD_FACTORS_FIELD.clone(),
             SCALE_FACTORS_FIELD.clone(),
-        ]);
+        ];
+        if metadata.query_estimator == RabitQueryEstimator::RawQuery {
+            fields.push(ERROR_FACTORS_FIELD.clone());
+        }
+        if let Some(field) = ex_code_field {
+            fields.push(field);
+            fields.push(EX_ADD_FACTORS_FIELD.clone());
+            fields.push(EX_SCALE_FACTORS_FIELD.clone());
+        }
+        let arrow_schema = ArrowSchema::new(fields);
 
         let writer = store.create(aux_path).await?;
         let mut v2w = V2Writer::try_new(
@@ -2098,6 +2135,11 @@ mod tests {
         let mut codes = Vec::with_capacity(total_rows * num_bytes);
         let mut add_factors = Vec::with_capacity(total_rows);
         let mut scale_factors = Vec::with_capacity(total_rows);
+        let mut error_factors = Vec::with_capacity(total_rows);
+        let mut ex_codes =
+            ex_code_bytes.map(|num_bytes| Vec::with_capacity(total_rows * num_bytes));
+        let mut ex_add_factors = Vec::with_capacity(total_rows);
+        let mut ex_scale_factors = Vec::with_capacity(total_rows);
 
         let mut current_row_id = base_row_id;
         for (pid, len) in lengths.iter().enumerate() {
@@ -2109,21 +2151,38 @@ mod tests {
                 }
                 add_factors.push(pid as f32 + row_offset as f32 * 0.1);
                 scale_factors.push(pid as f32 + row_offset as f32 * 0.2);
+                error_factors.push(pid as f32 + row_offset as f32 * 0.3);
+                if let (Some(ex_codes), Some(ex_code_bytes)) = (ex_codes.as_mut(), ex_code_bytes) {
+                    for b in 0..ex_code_bytes {
+                        ex_codes.push((17 + pid + row_offset + b) as u8);
+                    }
+                    ex_add_factors.push(pid as f32 + 10.0 + row_offset as f32 * 0.2);
+                    ex_scale_factors.push(pid as f32 + 1.0 + row_offset as f32 * 0.2);
+                }
             }
         }
 
-        let batch = RecordBatch::try_new(
-            Arc::new(arrow_schema),
-            vec![
-                Arc::new(UInt64Array::from(row_ids)),
-                Arc::new(FixedSizeListArray::try_new_from_values(
-                    UInt8Array::from(codes),
-                    num_bytes as i32,
-                )?),
-                Arc::new(Float32Array::from(add_factors)),
-                Arc::new(Float32Array::from(scale_factors)),
-            ],
-        )?;
+        let mut columns: Vec<Arc<dyn Array>> = vec![
+            Arc::new(UInt64Array::from(row_ids)),
+            Arc::new(FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(codes),
+                num_bytes as i32,
+            )?),
+            Arc::new(Float32Array::from(add_factors)),
+            Arc::new(Float32Array::from(scale_factors)),
+        ];
+        if metadata.query_estimator == RabitQueryEstimator::RawQuery {
+            columns.push(Arc::new(Float32Array::from(error_factors)));
+        }
+        if let (Some(ex_codes), Some(ex_code_bytes)) = (ex_codes, ex_code_bytes) {
+            columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(ex_codes),
+                ex_code_bytes as i32,
+            )?));
+            columns.push(Arc::new(Float32Array::from(ex_add_factors)));
+            columns.push(Arc::new(Float32Array::from(ex_scale_factors)));
+        }
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
 
         v2w.write_batch(&batch).await?;
         v2w.finish().await?;
@@ -2281,6 +2340,7 @@ mod tests {
             code_dim: 16,
             num_bits: 1,
             packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
         };
 
         write_rq_partial_aux(
@@ -2367,6 +2427,7 @@ mod tests {
         assert!(merged_rq_meta.packed);
 
         let mut total_rows = 0usize;
+        let mut checked_code_width = false;
         let mut stream = reader
             .read_stream(
                 lance_io::ReadBatchParams::RangeFull,
@@ -2377,9 +2438,137 @@ mod tests {
             .await
             .unwrap();
         while let Some(batch) = stream.next().await {
-            total_rows += batch.unwrap().num_rows();
+            let batch = batch.unwrap();
+            if !checked_code_width {
+                let schema = batch.schema();
+                let code_field = schema.field_with_name(RABIT_CODE_COLUMN).unwrap();
+                let DataType::FixedSizeList(_, code_bytes) = code_field.data_type() else {
+                    panic!("RQ code field should be FixedSizeList");
+                };
+                assert_eq!(*code_bytes, rq_meta.binary_code_bytes() as i32);
+                checked_code_width = true;
+            }
+            total_rows += batch.num_rows();
         }
+        assert!(checked_code_width);
         let expected_total: usize = expected_lengths.iter().map(|v| *v as usize).sum();
+        assert_eq!(total_rows, expected_total);
+    }
+
+    #[tokio::test]
+    async fn test_merge_ivf_rq_multi_bit_preserves_split_columns() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq_multi_bit");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
+
+        let lengths0 = vec![2_u32, 1_u32];
+        let lengths1 = vec![1_u32, 2_u32];
+
+        let rq_meta = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 4,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+
+        write_rq_partial_aux(
+            &object_store,
+            &aux0,
+            &rq_meta,
+            &lengths0,
+            0,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+        write_rq_partial_aux(
+            &object_store,
+            &aux1,
+            &rq_meta,
+            &lengths1,
+            1_000,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+
+        merge_partial_vector_auxiliary_files(
+            &object_store,
+            &[aux0.clone(), aux1.clone()],
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        let aux_out = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let sched = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let fh = sched
+            .open_file(&aux_out, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let meta = reader.metadata();
+        let rq_meta_json = meta.file_schema.metadata.get(RABIT_METADATA_KEY).unwrap();
+        let merged_rq_meta: RabitQuantizationMetadata = serde_json::from_str(rq_meta_json).unwrap();
+        assert_eq!(merged_rq_meta.num_bits, 4);
+        assert!(merged_rq_meta.packed);
+
+        let mut total_rows = 0usize;
+        let mut checked_split_columns = false;
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                4,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            if !checked_split_columns {
+                let schema = batch.schema();
+                let ex_code_field = schema
+                    .field_with_name(RABIT_BLOCKED_EX_CODE_COLUMN)
+                    .unwrap();
+                let DataType::FixedSizeList(_, ex_code_bytes) = ex_code_field.data_type() else {
+                    panic!("RQ ex-code field should be FixedSizeList");
+                };
+                // code_dim=16 padded to one 64-dim block at ex_bits=3.
+                assert_eq!(*ex_code_bytes, 24);
+                assert!(schema.field_with_name(ERROR_FACTORS_FIELD.name()).is_ok());
+                assert!(schema.field_with_name(EX_ADD_FACTORS_COLUMN).is_ok());
+                assert!(schema.field_with_name(EX_SCALE_FACTORS_COLUMN).is_ok());
+                checked_split_columns = true;
+            }
+            total_rows += batch.num_rows();
+        }
+        assert!(checked_split_columns);
+        let expected_total: usize = lengths0
+            .iter()
+            .zip(lengths1.iter())
+            .map(|(a, b)| (*a + *b) as usize)
+            .sum();
         assert_eq!(total_rows, expected_total);
     }
 

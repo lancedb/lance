@@ -25,6 +25,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -154,6 +155,25 @@ public class LanceField {
 
     return new Field(
         name, new FieldType(nullable, type, dictionaryEncoding, metadata), arrowChildren);
+  }
+
+  Field asArrowFieldWithFieldIds() {
+    List<Field> arrowChildren =
+        children.stream().map(LanceField::asArrowFieldWithFieldIds).collect(Collectors.toList());
+
+    if (type instanceof ArrowType.FixedSizeList) {
+      arrowChildren.addAll(childrenForFixedSizeList());
+    }
+
+    if (id < 0) {
+      throw new IllegalStateException("Lance field id is required for schema override: " + name);
+    }
+    Map<String, String> metadataWithFieldId = new HashMap<>(metadata);
+    metadataWithFieldId.put(LanceSchema.LANCE_FIELD_ID_KEY, Integer.toString(id));
+    return new Field(
+        name,
+        new FieldType(nullable, type, dictionaryEncoding, metadataWithFieldId),
+        arrowChildren);
   }
 
   private List<Field> childrenForFixedSizeList() {

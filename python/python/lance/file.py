@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
@@ -207,6 +208,26 @@ class LanceFileReader:
         return self._reader.num_rows()
 
 
+@dataclass
+class ListResult:
+    """
+    Result of a non-recursive, delimited list (see
+    :meth:`LanceFileSession.list_with_delimiter`).
+
+    Attributes
+    ----------
+    common_prefixes : List[str]
+        The immediate child "directories" of the listed path, relative to the
+        session's base path.
+    objects : List[str]
+        The immediate child files of the listed path, relative to the session's
+        base path.
+    """
+
+    common_prefixes: List[str]
+    objects: List[str]
+
+
 class LanceFileSession:
     """
     A file session for reading and writing Lance files.
@@ -343,6 +364,66 @@ class LanceFileSession:
             List of file paths.
         """
         return self._session.list(path)
+
+    def list_with_delimiter(self, path: Optional[str] = None) -> ListResult:
+        """
+        Non-recursively list a single directory level (relative to this
+        session's base path).
+
+        Unlike :meth:`list`, which recurses into the entire subtree, this
+        returns only the immediate children of ``path``: the child
+        "directories" as ``common_prefixes`` and the direct child files as
+        ``objects``.
+
+        Parameters
+        ----------
+        path : str, optional
+            Path relative to `base_path` to list. If None, lists the base path.
+
+        Returns
+        -------
+        ListResult
+            The immediate child prefixes and objects of `path`.
+        """
+        common_prefixes, objects = self._session.list_with_delimiter(path)
+        return ListResult(common_prefixes=common_prefixes, objects=objects)
+
+    def read_range(self, path: str, offset: int, length: int) -> bytes:
+        """
+        Read a byte range from a file (relative to this session's base path).
+
+        Issues a single ranged read. Reading a missing object raises
+        ``OSError``, consistent with ``download_file``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to read from.
+        offset : int
+            Byte offset at which to start reading.
+        length : int
+            Number of bytes to read.
+
+        Returns
+        -------
+        bytes
+            The requested byte range.
+        """
+        return self._session.read_range(path, offset, length)
+
+    def delete_file(self, path: str) -> None:
+        """
+        Delete a file (relative to this session's base path).
+
+        Deleting a path that does not exist raises ``OSError``, consistent with
+        ``download_file``.
+
+        Parameters
+        ----------
+        path : str
+            Path relative to `base_path` to delete.
+        """
+        self._session.delete_file(path)
 
     def upload_file(self, local_path: Union[str, Path], remote_path: str) -> None:
         """

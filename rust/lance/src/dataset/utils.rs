@@ -2,15 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Result;
-use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_schema::{
+    DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::error::Result as DFResult;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
-    is_arrow_json_field, is_json_field,
+    has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
 use lance_core::ROW_ID;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
@@ -138,7 +140,58 @@ impl Default for CapturedRowIds {
     }
 }
 
-/// Adapter around the existing JSON conversion utilities.
+/// Returns the physical field for a view type, or `None` if no conversion is needed.
+fn physical_field(field: &ArrowField) -> Option<ArrowField> {
+    match field.data_type() {
+        DataType::Utf8View => Some(
+            ArrowField::new(field.name(), DataType::Utf8, field.is_nullable())
+                .with_metadata(field.metadata().clone()),
+        ),
+        DataType::BinaryView => Some(
+            ArrowField::new(field.name(), DataType::Binary, field.is_nullable())
+                .with_metadata(field.metadata().clone()),
+        ),
+        _ => None,
+    }
+}
+
+/// Cast `Utf8View`/`BinaryView` columns in a batch to their classic offset equivalents.
+fn downcast_view_columns(
+    batch: &RecordBatch,
+) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
+    let schema = batch.schema();
+    let mut new_fields: Vec<ArrowField> = Vec::with_capacity(schema.fields().len());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut changed = false;
+
+    for (i, field) in schema.fields().iter().enumerate() {
+        if let Some(phys) = physical_field(field) {
+            changed = true;
+            new_columns.push(arrow_cast::cast(
+                batch.column(i).as_ref(),
+                phys.data_type(),
+            )?);
+            new_fields.push(phys);
+        } else {
+            new_columns.push(batch.column(i).clone());
+            new_fields.push(field.as_ref().clone());
+        }
+    }
+
+    if !changed {
+        return Ok(batch.clone());
+    }
+
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new_with_metadata(
+            new_fields,
+            schema.metadata().clone(),
+        )),
+        new_columns,
+    )
+}
+
+/// Adapter around the existing JSON and view-type conversion utilities.
 #[derive(Debug, Clone)]
 pub struct SchemaAdapter {
     logical_schema: ArrowSchemaRef,
@@ -150,22 +203,23 @@ impl SchemaAdapter {
         Self { logical_schema }
     }
 
-    /// Determine if the logical schema includes Arrow JSON fields that require conversion.
+    /// Determine if the logical schema includes fields that require physical conversion.
     pub fn requires_physical_conversion(&self) -> bool {
         self.logical_schema
             .fields()
             .iter()
-            .any(|field| is_arrow_json_field(field))
+            .any(|field| has_arrow_json_fields(field) || physical_field(field).is_some())
     }
 
     /// Determine if the physical schema includes Lance JSON fields that must be converted back.
     pub fn requires_logical_conversion(schema: &ArrowSchemaRef) -> bool {
-        schema.fields().iter().any(|field| is_json_field(field))
+        schema.fields().iter().any(|field| has_json_fields(field))
     }
 
     pub fn to_physical_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
         if self.requires_physical_conversion() {
-            Ok(convert_json_columns(&batch)?)
+            let batch = convert_json_columns(&batch)?;
+            Ok(downcast_view_columns(&batch)?)
         } else {
             Ok(batch)
         }
@@ -176,7 +230,6 @@ impl SchemaAdapter {
         &self,
         stream: SendableRecordBatchStream,
     ) -> SendableRecordBatchStream {
-        // Check if any fields need conversion
         if !self.requires_physical_conversion() {
             return stream;
         }
@@ -184,8 +237,10 @@ impl SchemaAdapter {
         let arrow_schema = stream.schema();
         let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
         for field in arrow_schema.fields() {
-            if is_arrow_json_field(field) {
+            if has_arrow_json_fields(field) {
                 new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
+            } else if let Some(phys) = physical_field(field) {
+                new_fields.push(Arc::new(phys));
             } else {
                 new_fields.push(Arc::clone(field));
             }
@@ -197,7 +252,10 @@ impl SchemaAdapter {
 
         let converted_stream = stream.map(move |batch_result| {
             batch_result.and_then(|batch| {
-                convert_json_columns(&batch)
+                let batch = convert_json_columns(&batch).map_err(|e| {
+                    datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+                })?;
+                downcast_view_columns(&batch)
                     .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
             })
         });
@@ -213,9 +271,6 @@ impl SchemaAdapter {
         &self,
         stream: SendableRecordBatchStream,
     ) -> SendableRecordBatchStream {
-        use lance_arrow::ARROW_EXT_NAME_KEY;
-        use lance_arrow::json::ARROW_JSON_EXT_NAME;
-
         if !Self::requires_logical_conversion(&stream.schema()) {
             return stream;
         }
@@ -223,19 +278,8 @@ impl SchemaAdapter {
         let arrow_schema = stream.schema();
         let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
         for field in arrow_schema.fields() {
-            if is_json_field(field) {
-                let mut new_field = arrow_schema::Field::new(
-                    field.name(),
-                    arrow_schema::DataType::Utf8,
-                    field.is_nullable(),
-                );
-                let mut metadata = field.metadata().clone();
-                metadata.insert(
-                    ARROW_EXT_NAME_KEY.to_string(),
-                    ARROW_JSON_EXT_NAME.to_string(),
-                );
-                new_field.set_metadata(metadata);
-                new_fields.push(new_field);
+            if has_json_fields(field) {
+                new_fields.push(lance_json_to_arrow_json(field));
             } else {
                 new_fields.push(field.as_ref().clone());
             }

@@ -16,7 +16,7 @@ use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 #[derive(Clone, Copy, Debug)]
 struct FullReadParams {

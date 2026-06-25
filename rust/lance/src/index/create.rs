@@ -8,10 +8,9 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt,
-        api::{IndexSegment, IndexSegmentPlan},
+        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
         build_index_metadata_from_segments,
-        scalar::build_scalar_index,
+        scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
@@ -19,7 +18,7 @@ use crate::{
         vector_index_details, vector_index_details_default,
     },
 };
-use futures::future::{BoxFuture, try_join_all};
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
@@ -28,11 +27,7 @@ use lance_index::{
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
-use std::{
-    collections::{HashMap, HashSet},
-    future::IntoFuture,
-    sync::Arc,
-};
+use std::{collections::HashMap, future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -58,7 +53,7 @@ pub struct CreateIndexBuilder<'a> {
     replace: bool,
     train: bool,
     fragments: Option<Vec<u32>>,
-    index_uuid: Option<String>,
+    index_uuid: Option<Uuid>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
@@ -108,7 +103,7 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    pub fn index_uuid(mut self, uuid: String) -> Self {
+    pub fn index_uuid(mut self, uuid: Uuid) -> Self {
         self.index_uuid = Some(uuid);
         self
     }
@@ -138,6 +133,11 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
+        self.execute_uncommitted_impl().await
+    }
+
+    fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
+        async move {
         if self.columns.len() != 1 {
             return Err(Error::index(
                 "Only support building index on 1 column at the moment".to_string(),
@@ -208,12 +208,14 @@ impl<'a> CreateIndexBuilder<'a> {
                 please specify a different name or use replace=True"
             )));
         }
+        ensure_index_uuid_allowed(
+            self.index_type,
+            self.params,
+            self.fragments.as_ref(),
+            self.index_uuid.as_ref(),
+        )?;
 
-        let index_id = match &self.index_uuid {
-            Some(uuid_str) => Uuid::parse_str(uuid_str)
-                .map_err(|e| Error::index(format!("Invalid UUID string provided: {}", e)))?,
-            None => Uuid::new_v4(),
-        };
+        let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
         let mut output_index_uuid = index_id;
         let created_index = match (self.index_type, self.params.index_name()) {
             (
@@ -221,6 +223,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::BTree
                 | IndexType::Inverted
                 | IndexType::NGram
+                | IndexType::Fm
                 | IndexType::ZoneMap
                 | IndexType::BloomFilter
                 | IndexType::LabelList
@@ -257,17 +260,44 @@ impl<'a> CreateIndexBuilder<'a> {
                     .preprocessed_data
                     .take()
                     .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    &params,
-                    train,
-                    self.fragments.clone(),
-                    preprocesssed_data,
-                    self.progress.clone(),
-                )
-                .await?
+                if self.index_type == IndexType::Bitmap && self.fragments.is_some() {
+                    if !train {
+                        return Err(Error::invalid_input(
+                            "canonical bitmap segment build requires train=true".to_string(),
+                        ));
+                    }
+                    if preprocesssed_data.is_some() {
+                        return Err(Error::invalid_input(
+                            "canonical bitmap segment build does not accept preprocessed data"
+                                .to_string(),
+                        ));
+                    }
+                    let fragments = self.fragments.clone().ok_or_else(|| {
+                        Error::invalid_input(
+                            "canonical bitmap segment build requires fragment ids".to_string(),
+                        )
+                    })?;
+                    build_bitmap_index_segment(
+                        self.dataset,
+                        column,
+                        index_id,
+                        fragments,
+                        self.progress.clone(),
+                    )
+                    .await?
+                } else {
+                    build_scalar_index(
+                        self.dataset,
+                        column,
+                        index_id,
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                        preprocesssed_data,
+                        self.progress.clone(),
+                    )
+                    .await?
+                }
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -281,7 +311,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 build_scalar_index(
                     self.dataset,
                     column,
-                    &index_id.to_string(),
+                    index_id,
                     params,
                     train,
                     self.fragments.clone(),
@@ -307,7 +337,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 build_scalar_index(
                     self.dataset,
                     column,
-                    &index_id.to_string(),
+                    index_id,
                     &params,
                     train,
                     self.fragments.clone(),
@@ -337,16 +367,16 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
                 let index_version = vec_params.index_type().version() as u32;
 
-                if train {
+                let files = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = &self.fragments {
                         // For distributed indexing, build only on specified fragments
                         // This creates temporary index metadata without committing
-                        let segment_uuid = Box::pin(build_distributed_vector_index(
+                        let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
                             self.dataset,
                             column,
                             &index_name,
-                            &index_id.to_string(),
+                            index_id,
                             vec_params,
                             fri,
                             fragments,
@@ -354,18 +384,19 @@ impl<'a> CreateIndexBuilder<'a> {
                         ))
                         .await?;
                         output_index_uuid = segment_uuid;
+                        files
                     } else {
                         // Standard full dataset indexing
                         Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
-                            &index_id.to_string(),
+                            index_id,
                             vec_params,
                             fri,
                             self.progress.clone(),
                         ))
-                        .await?;
+                        .await?
                     }
                 } else {
                     // Create empty vector index
@@ -373,22 +404,15 @@ impl<'a> CreateIndexBuilder<'a> {
                         self.dataset,
                         column,
                         &index_name,
-                        &index_id.to_string(),
+                        index_id,
                         vec_params,
                     )
-                    .await?;
-                }
-                // Capture file sizes after vector index creation
-                let index_dir = self
-                    .dataset
-                    .indices_dir()
-                    .join(output_index_uuid.to_string());
-                let files =
-                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                    .await?
+                };
                 CreatedIndex {
                     index_details: vector_index_details(vec_params),
                     index_version,
-                    files: Some(files),
+                    files,
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -415,7 +439,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     ))?;
 
                 if train {
-                    ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
+                    ext.create_index(self.dataset, column, &index_id, self.params)
                         .await?;
                 } else {
                     todo!("create empty vector index when train=false");
@@ -427,7 +451,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
-                    files: Some(files),
+                    files,
                 }
             }
             (IndexType::FragmentReuse, _) => {
@@ -460,12 +484,22 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: created_index.files,
+            files: Some(created_index.files),
         })
+        }
+        .boxed()
     }
 
     #[instrument(skip_all)]
     async fn execute(mut self) -> Result<IndexMetadata> {
+        // Multi-segment FM-Index path: when num_segments > 1, build one segment
+        // per fragment group and commit them all atomically.
+        if let Some(num_segments) = self.fmindex_num_segments()
+            && num_segments > 1
+        {
+            return self.execute_multi_segment_fmindex(num_segments).await;
+        }
+
         let new_idx = self.execute_uncommitted().await?;
         let index_uuid = new_idx.uuid;
         let removed_indices = if self.replace {
@@ -479,50 +513,12 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = if uses_segment_commit_path(self.index_type, &new_idx.name, self.params) {
-            let field_id = *new_idx.fields.first().ok_or_else(|| {
-                Error::internal(format!(
-                    "Index '{}' is missing field ids after build",
-                    new_idx.name
-                ))
-            })?;
-            let segment_index_type = match self.index_type {
-                IndexType::Vector
-                | IndexType::IvfPq
-                | IndexType::IvfSq
-                | IndexType::IvfFlat
-                | IndexType::IvfRq
-                | IndexType::IvfHnswFlat
-                | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq => self
-                    .params
-                    .as_any()
-                    .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| {
-                        Error::index("Vector index type must take a VectorIndexParams".to_string())
-                    })?
-                    .index_type(),
-                unsupported => {
-                    return Err(Error::internal(format!(
-                        "Segment commit path does not support index type {}",
-                        unsupported
-                    )));
-                }
-            };
-            let segments = self
-                .dataset
-                .create_index_segment_builder()
-                .with_index_type(segment_index_type)
-                .with_segments(vec![new_idx.clone()])
-                .build_all()
-                .await?;
-            let new_indices =
-                build_index_metadata_from_segments(self.dataset, &new_idx.name, field_id, segments)
-                    .await?;
+        let transaction = if uses_segment_commit_path(self.index_type, self.params) {
+            let dataset_version = new_idx.dataset_version;
             TransactionBuilder::new(
-                new_idx.dataset_version,
+                dataset_version,
                 Operation::CreateIndex {
-                    new_indices,
+                    new_indices: vec![new_idx],
                     removed_indices,
                 },
             )
@@ -558,28 +554,282 @@ impl<'a> CreateIndexBuilder<'a> {
                 ))
             })
     }
-}
-
-fn uses_segment_commit_path(
-    index_type: IndexType,
-    index_name: &str,
-    params: &dyn IndexParams,
-) -> bool {
-    if index_name != LANCE_VECTOR_INDEX {
-        return false;
+    /// Extract `num_segments` from FM-Index params if this is an FM-Index build.
+    fn fmindex_num_segments(&self) -> Option<u32> {
+        if self.index_type != IndexType::Fm {
+            return None;
+        }
+        let scalar_params = self.params.as_any().downcast_ref::<ScalarIndexParams>()?;
+        let params_json = scalar_params.params.as_deref()?;
+        let json: serde_json::Value = serde_json::from_str(params_json).ok()?;
+        json.get("num_segments")?.as_u64().map(|n| n as u32)
     }
 
-    matches!(
-        index_type,
-        IndexType::Vector
-            | IndexType::IvfPq
-            | IndexType::IvfSq
-            | IndexType::IvfFlat
-            | IndexType::IvfRq
-            | IndexType::IvfHnswFlat
-            | IndexType::IvfHnswPq
-            | IndexType::IvfHnswSq
-    ) && params.as_any().is::<VectorIndexParams>()
+    /// Build FM-Index with multiple segments, each covering a subset of fragments.
+    async fn execute_multi_segment_fmindex(&mut self, num_segments: u32) -> Result<IndexMetadata> {
+        // Validate column count: same check as execute_uncommitted
+        if self.columns.len() != 1 {
+            return Err(Error::index(
+                "Only support building index on 1 column at the moment".to_string(),
+            ));
+        }
+
+        let column_input = &self.columns[0];
+        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
+            return Err(Error::index(format!(
+                "CreateIndex: column '{column_input}' does not exist"
+            )));
+        };
+        let field = *field_path.last().unwrap();
+        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+        let column = format_field_path(&names);
+
+        let train = if self.train {
+            self.dataset.count_rows(None).await? > 0
+        } else {
+            false
+        };
+
+        let indices = self.dataset.load_indices().await?;
+        let index_name = if let Some(name) = self.name.take() {
+            name
+        } else {
+            let column_path = default_index_name(&names);
+            let base_name = format!("{column_path}_idx");
+            let mut candidate = base_name.clone();
+            let mut counter = 2;
+            while indices
+                .iter()
+                .any(|idx| idx.name == candidate && idx.fields != [field.id])
+            {
+                candidate = format!("{base_name}_{counter}");
+                counter += 1;
+            }
+            candidate
+        };
+        let existing_named_indices = indices
+            .iter()
+            .filter(|idx| idx.name == index_name)
+            .collect::<Vec<_>>();
+        if existing_named_indices
+            .iter()
+            .any(|idx| idx.fields != [field.id])
+        {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        if !existing_named_indices.is_empty() && !self.replace {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists, \
+                please specify a different name or use replace=True"
+            )));
+        }
+
+        let all_fragment_ids: Vec<u32> = self.dataset.fragment_bitmap.as_ref().iter().collect();
+        if !train || all_fragment_ids.is_empty() {
+            let segment_uuid = Uuid::new_v4();
+            let created_index = build_scalar_index(
+                self.dataset,
+                &column,
+                segment_uuid,
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm),
+                false,
+                None,
+                None,
+                self.progress.clone(),
+            )
+            .await?;
+            let metadata = IndexMetadata {
+                uuid: segment_uuid,
+                name: index_name.clone(),
+                fields: vec![field.id],
+                dataset_version: self.dataset.manifest.version,
+                fragment_bitmap: Some(roaring::RoaringBitmap::new()),
+                index_details: Some(Arc::new(created_index.index_details)),
+                index_version: created_index.index_version as i32,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
+                files: Some(created_index.files),
+            };
+            let segments = vec![metadata.into_index_segment()?];
+            let new_indices =
+                build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
+                    .await?;
+
+            // Collect all same-name indices for removal when replace is set
+            let removed_indices = if self.replace {
+                existing_named_indices
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                vec![]
+            };
+
+            let transaction = TransactionBuilder::new(
+                self.dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+            )
+            .transaction_properties(self.transaction_properties.clone())
+            .build();
+
+            self.dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await?;
+
+            let indices = self.dataset.load_indices_by_name(&index_name).await?;
+            return indices.into_iter().next().ok_or_else(|| {
+                Error::internal(format!(
+                    "FM-Index segments for '{}' not found after commit",
+                    index_name
+                ))
+            });
+        }
+
+        let num_segments = (num_segments as usize).min(all_fragment_ids.len()).max(1);
+        let chunk_size = all_fragment_ids.len().div_ceil(num_segments);
+
+        let mut segment_metadatas = Vec::with_capacity(num_segments);
+        for chunk in all_fragment_ids.chunks(chunk_size) {
+            let fragment_ids = chunk.to_vec();
+            let segment_uuid = Uuid::new_v4();
+            let created_index = build_scalar_index(
+                self.dataset,
+                &column,
+                segment_uuid,
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm),
+                true,
+                Some(fragment_ids.clone()),
+                None,
+                self.progress.clone(),
+            )
+            .await?;
+
+            segment_metadatas.push(IndexMetadata {
+                uuid: segment_uuid,
+                name: index_name.clone(),
+                fields: vec![field.id],
+                dataset_version: self.dataset.manifest.version,
+                fragment_bitmap: Some(fragment_ids.into_iter().collect()),
+                index_details: Some(Arc::new(created_index.index_details)),
+                index_version: created_index.index_version as i32,
+                created_at: Some(chrono::Utc::now()),
+                base_id: None,
+                files: Some(created_index.files),
+            });
+        }
+
+        // Convert to IndexSegments and build proper transaction metadata
+        let segments = segment_metadatas
+            .into_iter()
+            .map(IntoIndexSegment::into_index_segment)
+            .collect::<Result<Vec<_>>>()?;
+        let new_indices =
+            build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
+                .await?;
+
+        // Collect all same-name indices for removal when replace is set,
+        // matching the standard execute() path behavior.
+        let removed_indices = if self.replace {
+            existing_named_indices
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+
+        let transaction = TransactionBuilder::new(
+            self.dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            },
+        )
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
+
+        self.dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+
+        let indices = self.dataset.load_indices_by_name(&index_name).await?;
+        indices.into_iter().next().ok_or_else(|| {
+            Error::internal(format!(
+                "FM-Index segments for '{}' not found after commit",
+                index_name
+            ))
+        })
+    }
+}
+
+fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
+    params
+        .as_any()
+        .downcast_ref::<ScalarIndexParams>()
+        .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
+}
+
+/// Validate that a user-supplied `index_uuid` is permitted for this build.
+fn ensure_index_uuid_allowed(
+    index_type: IndexType,
+    params: &dyn IndexParams,
+    fragments: Option<&Vec<u32>>,
+    index_uuid: Option<&Uuid>,
+) -> Result<()> {
+    let is_btree = index_type == IndexType::BTree
+        || params
+            .as_any()
+            .downcast_ref::<ScalarIndexParams>()
+            .map(|params| params.index_type.eq_ignore_ascii_case("btree"))
+            .unwrap_or(false);
+
+    if index_uuid.is_some() && fragments.is_some_and(|fragments| !fragments.is_empty()) && is_btree
+    {
+        return Err(Error::invalid_input(
+            "index_uuid is no longer accepted for BTree distributed index builds; segment UUIDs \
+             are generated by Lance and returned in the index metadata."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn uses_segment_commit_path(index_type: IndexType, params: &dyn IndexParams) -> bool {
+    let params_family = params.index_name();
+
+    if params_family == LANCE_VECTOR_INDEX
+        && matches!(
+            index_type,
+            IndexType::Vector
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfFlat
+                | IndexType::IvfRq
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq
+        )
+        && params.as_any().is::<VectorIndexParams>()
+    {
+        return true;
+    }
+
+    if params_family == LANCE_SCALAR_INDEX {
+        match index_type {
+            IndexType::BTree => return true,
+            IndexType::Scalar if is_btree_scalar_params(params) => return true,
+            _ => {}
+        }
+    }
+
+    false
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
@@ -591,182 +841,31 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
     }
 }
 
-/// Build physical index segments from previously-written uncommitted index outputs.
-///
-/// Use [`DatasetIndexExt::create_index_segment_builder`] and then either:
-///
-/// - call [`Self::with_index_type`] with the concrete segment type first, then
-/// - call [`Self::plan`] and orchestrate individual segment builds externally, or
-/// - call [`Self::build_all`] to build all segments on the current node.
-///
-/// This builder only builds physical segments. Publishing those segments as
-/// a logical index still requires [`DatasetIndexExt::commit_existing_index_segments`].
-/// Together these two APIs form the canonical segment-based index build workflow.
-#[derive(Clone)]
-pub struct IndexSegmentBuilder<'a> {
-    dataset: &'a Dataset,
-    index_type: Option<IndexType>,
-    segments: Vec<IndexMetadata>,
-    target_segment_bytes: Option<u64>,
-}
-
-impl<'a> IndexSegmentBuilder<'a> {
-    pub(crate) fn new(dataset: &'a Dataset) -> Self {
-        Self {
-            dataset,
-            index_type: None,
-            segments: Vec::new(),
-            target_segment_bytes: None,
-        }
-    }
-
-    /// Declare the concrete index type of the staged segments.
-    pub fn with_index_type(mut self, index_type: IndexType) -> Self {
-        self.index_type = Some(index_type);
-        self
-    }
-
-    /// Provide the segment metadata returned by `execute_uncommitted()`.
-    ///
-    /// These segments must already exist in storage and must not have been
-    /// published into a logical index yet.
-    pub fn with_segments(mut self, segments: Vec<IndexMetadata>) -> Self {
-        self.segments = segments;
-        self
-    }
-
-    /// Set the target size, in bytes, for merged physical segments.
-    ///
-    /// When set, input segments will be grouped into larger physical segments
-    /// up to approximately this size. When unset, each input segment becomes
-    /// one physical segment.
-    pub fn with_target_segment_bytes(mut self, bytes: u64) -> Self {
-        self.target_segment_bytes = Some(bytes);
-        self
-    }
-
-    /// Plan how input segments should be grouped into physical segments.
-    pub async fn plan(&self) -> Result<Vec<IndexSegmentPlan>> {
-        if self.segments.is_empty() {
-            return Err(Error::invalid_input(
-                "IndexSegmentBuilder requires at least one segment; \
-                 call with_segments(...) with execute_uncommitted() outputs"
-                    .to_string(),
-            ));
-        }
-        let index_type = self.index_type.ok_or_else(|| {
-            Error::invalid_input(
-                "IndexSegmentBuilder requires an explicit index type; call with_index_type(...)"
-                    .to_string(),
-            )
-        })?;
-        let mut seen_segment_ids = HashSet::with_capacity(self.segments.len());
-        for segment in &self.segments {
-            if !seen_segment_ids.insert(segment.uuid) {
-                return Err(Error::invalid_input(format!(
-                    "IndexSegmentBuilder received duplicate segment uuid {}",
-                    segment.uuid
-                )));
-            }
-        }
-
-        match index_type {
-            IndexType::Inverted => crate::index::scalar::inverted::plan_segments(
-                &self.segments,
-                self.target_segment_bytes,
-            ),
-            IndexType::Vector => {
-                crate::index::vector::ivf::plan_segments(
-                    &self.segments,
-                    Some(index_type),
-                    self.target_segment_bytes,
-                )
-                .await
-            }
-            IndexType::IvfFlat
-            | IndexType::IvfPq
-            | IndexType::IvfSq
-            | IndexType::IvfRq
-            | IndexType::IvfHnswFlat
-            | IndexType::IvfHnswPq
-            | IndexType::IvfHnswSq => {
-                crate::index::vector::ivf::plan_segments(
-                    &self.segments,
-                    Some(index_type),
-                    self.target_segment_bytes,
-                )
-                .await
-            }
-            unsupported => Err(Error::invalid_input(format!(
-                "IndexSegmentBuilder does not support planning segments for index type {}",
-                unsupported
-            ))),
-        }
-    }
-
-    /// Build one segment from a previously-generated plan.
-    pub async fn build(&self, plan: &IndexSegmentPlan) -> Result<IndexSegment> {
-        match plan.requested_index_type().ok_or_else(|| {
-            Error::invalid_input(
-                "IndexSegmentBuilder requires planned segments to declare an index type"
-                    .to_string(),
-            )
-        })? {
-            IndexType::Inverted => {
-                crate::index::scalar::inverted::build_segment(self.dataset, plan).await
-            }
-            IndexType::Vector
-            | IndexType::IvfFlat
-            | IndexType::IvfPq
-            | IndexType::IvfSq
-            | IndexType::IvfRq
-            | IndexType::IvfHnswFlat
-            | IndexType::IvfHnswPq
-            | IndexType::IvfHnswSq => {
-                crate::index::vector::ivf::build_segment(
-                    self.dataset.object_store.as_ref(),
-                    &self.dataset.indices_dir(),
-                    plan,
-                )
-                .await
-            }
-            unsupported => Err(Error::invalid_input(format!(
-                "IndexSegmentBuilder does not support building segments for index type {}",
-                unsupported
-            ))),
-        }
-    }
-
-    /// Plan and build all segments from the provided inputs.
-    pub async fn build_all(&self) -> Result<Vec<IndexSegment>> {
-        let plans = self.plan().await?;
-        try_join_all(plans.iter().map(|plan| self.build(plan))).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dataset::{WriteMode, WriteParams};
-    use crate::index::DatasetIndexExt;
+    use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatchIterator};
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use datafusion::common::ScalarValue;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
-    use lance_index::scalar::{FullTextSearchQuery, inverted::tokenizer::InvertedIndexParams};
+    use lance_index::scalar::{
+        FullTextSearchQuery, SargableQuery, SearchResult, inverted::tokenizer::InvertedIndexParams,
+    };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
-    use serde_json::json;
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use uuid::Uuid;
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
@@ -1164,7 +1263,7 @@ mod tests {
         let params = InvertedIndexParams::default();
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-        let shared_uuid = Uuid::new_v4().to_string();
+        let shared_uuid = Uuid::new_v4();
         let build_progress = Arc::new(RecordingProgress::default());
 
         for &fragment_id in &fragment_ids {
@@ -1172,11 +1271,11 @@ mod tests {
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
                     .name("distributed_index".to_string())
                     .fragments(vec![fragment_id])
-                    .index_uuid(shared_uuid.clone())
+                    .index_uuid(shared_uuid)
                     .progress(build_progress.clone());
 
             let index_metadata = builder.execute_uncommitted().await.unwrap();
-            assert_eq!(index_metadata.uuid.to_string(), shared_uuid);
+            assert_eq!(index_metadata.uuid, shared_uuid);
             assert_eq!(index_metadata.name, "distributed_index");
 
             let fragment_bitmap = index_metadata.fragment_bitmap.as_ref().unwrap();
@@ -1272,109 +1371,275 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_index_metadata_btree_reports_progress() {
+    async fn test_merge_index_metadata_btree_soft_break() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
-
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(256),
-                lance_datagen::BatchCount::from(4),
+                lance_datagen::RowCount::from(8),
+                lance_datagen::BatchCount::from(1),
             );
-        let mut dataset = Dataset::write(
-            reader,
-            &dataset_uri,
-            Some(WriteParams {
-                max_rows_per_file: 64,
-                mode: WriteMode::Overwrite,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
-        let fragments = dataset.get_fragments();
-        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-        let shared_uuid = Uuid::new_v4().to_string();
-        let build_progress = Arc::new(RecordingProgress::default());
-
-        for &fragment_id in &fragment_ids {
-            CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
-                .name("distributed_btree".to_string())
-                .fragments(vec![fragment_id])
-                .index_uuid(shared_uuid.clone())
-                .progress(build_progress.clone())
-                .execute_uncommitted()
-                .await
-                .unwrap();
-        }
-
-        let merge_progress = Arc::new(RecordingProgress::default());
-        dataset
+        let err = dataset
             .merge_index_metadata(
-                &shared_uuid,
+                &Uuid::new_v4(),
                 IndexType::BTree,
-                Some(1),
-                merge_progress.clone(),
+                None,
+                Arc::new(NoopIndexBuildProgress),
             )
             .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no longer supports merge_index_metadata"),
+            "expected BTree merge_index_metadata soft-break error, got: {err}"
+        );
+    }
+
+    /// Assert a committed segment directory holds exactly one canonical BTree
+    /// payload — one `page_data.lance` + one `page_lookup.lance` — and no `part_*`
+    /// shard files. Locks the "every segment has exactly one lookup" invariant.
+    async fn assert_canonical_btree_segment(dataset: &Dataset, uuid: &Uuid) {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
+        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir)
+            .await
             .unwrap();
-
-        let build_tags = build_progress
-            .recorded_events()
-            .iter()
-            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
-            .collect::<Vec<_>>();
-        assert!(
-            build_tags.iter().any(|e| e == "start:load_data"),
-            "expected load_data progress during public distributed build"
+        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "page_lookup.lance").count(),
+            1,
+            "segment must have exactly one canonical page_lookup.lance, got {names:?}"
         );
-
-        let merge_tags = merge_progress
-            .recorded_events()
-            .iter()
-            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
-            .collect::<Vec<_>>();
-        let pages_start = merge_tags
-            .iter()
-            .position(|e| e == "start:merge_pages")
-            .expect("missing merge_pages start");
-        let pages_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:merge_pages")
-            .expect("missing merge_pages complete");
-        let write_start = merge_tags
-            .iter()
-            .position(|e| e == "start:write_lookup_file")
-            .expect("missing write_lookup_file start");
-        let write_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:write_lookup_file")
-            .expect("missing write_lookup_file complete");
-        assert!(pages_start < pages_complete);
-        assert!(pages_complete < write_start);
-        assert!(write_start < write_complete);
-        assert!(
-            merge_tags.iter().any(|e| e == "progress:merge_pages"),
-            "expected merge_pages progress during public merge"
+        assert_eq!(
+            names.iter().filter(|n| **n == "page_data.lance").count(),
+            1,
+            "segment must have exactly one canonical page_data.lance, got {names:?}"
         );
         assert!(
-            merge_tags.iter().any(|e| e == "progress:write_lookup_file"),
-            "expected write_lookup_file progress during public merge"
-        );
-        assert!(
-            !merge_tags.iter().any(|e| e == "start:merge_lookups"),
-            "fragment-based distributed BTREE merge should not use merge_lookups"
+            !names.iter().any(|n| n.starts_with("part_")),
+            "segment must have no part_* shard files, got {names:?}"
         );
     }
 
     #[tokio::test]
-    async fn test_distributed_build_bitmap() {
-        use datafusion::common::ScalarValue;
-        use lance_index::scalar::{SargableQuery, SearchResult, bitmap::BITMAP_LOOKUP_NAME};
-        use lance_select::RowSetOps;
+    async fn test_segmented_btree_multi_fragment_commit_and_search() {
+        let test_dir = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("value", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 4);
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_segments".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let segment_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+
+        dataset
+            .commit_existing_index_segments("value_btree_segments", "value", segments)
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .load_indices_by_name("value_btree_segments")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), fragments.len());
+        for segment_uuid in &segment_uuids {
+            assert_canonical_btree_segment(&dataset, segment_uuid).await;
+        }
+
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_btree_segments",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        let point_query = SargableQuery::Equals(ScalarValue::Int32(Some(33)));
+        let point_matches = match logical
+            .search(&point_query, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            SearchResult::Exact(row_addrs) => row_addrs.true_rows().row_addrs().unwrap().count(),
+            other => panic!("expected exact point result, got {other:?}"),
+        };
+        assert_eq!(point_matches, 1);
+
+        let range_query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(14))),
+            Bound::Excluded(ScalarValue::Int32(Some(35))),
+        );
+        let range_row_addrs = match logical
+            .search(&range_query, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            SearchResult::Exact(row_addrs) => row_addrs,
+            other => panic!("expected exact range result, got {other:?}"),
+        };
+        let searched_fragments = range_row_addrs
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(|row_addr| RowAddress::from(u64::from(row_addr)).fragment_id())
+            .collect::<Vec<_>>();
+        assert_eq!(searched_fragments.len(), 21);
+        assert_eq!(
+            searched_fragments.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1, 2])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_btree_distributed_index_uuid_rejected() {
+        let test_dir = TempStrDir::default();
+        let dataset = gen_batch()
+            .col("value", lance_datagen::array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let mut dataset = dataset;
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        for index_type in [IndexType::BTree, IndexType::Scalar] {
+            let err = CreateIndexBuilder::new(&mut dataset, &["value"], index_type, &params)
+                .name("value_btree_segments".to_string())
+                .fragments(vec![fragment_id])
+                .index_uuid(Uuid::new_v4())
+                .execute_uncommitted()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected invalid input error, got: {err}"
+            );
+            assert!(
+                err.to_string().contains(
+                    "index_uuid is no longer accepted for BTree distributed index builds"
+                ),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_range_based_btree_index_create() {
+        use crate::dataset::scanner::ColumnOrdering;
+        use futures::TryStreamExt;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // Write the dataset with deliberately unsorted ids so the sort step is real.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let ids: Vec<i32> = (0..256).rev().collect();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(ids))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        // The worker scans the dataset's `(id, _rowid)` rows and sorts them by value,
+        // producing the BTree training stream `(value, _rowid)` externally — the "scan,
+        // sort, then hand a pre-sorted reader to the builder" path; no `range_id`.
+        let sorted_batches: Vec<RecordBatch> = {
+            let mut scan = dataset.scan();
+            scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "id".to_string(),
+            )]))
+            .unwrap();
+            scan.with_row_id();
+            scan.project_with_transform(&[("value", "id")]).unwrap();
+            scan.try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap()
+        };
+        let train_schema = sorted_batches[0].schema();
+        let sorted_reader =
+            RecordBatchIterator::new(sorted_batches.into_iter().map(Ok), train_schema);
+
+        // Build one self-contained segment directly from the sorted reader.
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let segment = CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+            .name("id_btree".to_string())
+            .preprocessed_data(Box::new(sorted_reader))
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let segment_uuid = segment.uuid;
+
+        // Commit the segment via the segmented-index API — no merge step.
+        dataset
+            .commit_existing_index_segments("id_btree", "id", vec![segment])
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("id_btree").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].uuid, segment_uuid);
+
+        // Exactly one canonical data + one lookup, no shards.
+        assert_canonical_btree_segment(&dataset, &segment_uuid).await;
+
+        // The committed index answers a range query correctly.
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "id",
+            "id_btree",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(0))),
+            Bound::Excluded(ScalarValue::Int32(Some(64))),
+        );
+        let matched = match logical.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(row_addrs) => row_addrs.true_rows().row_addrs().unwrap().count(),
+            other => panic!("expected exact result, got {other:?}"),
+        };
+        assert_eq!(matched, 64);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_execute_uncommitted_writes_canonical_segment() {
+        use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
 
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -1414,69 +1679,15 @@ mod tests {
             ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-        let shared_uuid = Uuid::new_v4().to_string();
-        let mut shard_metadata = None;
-        let shard_groups = fragment_ids.chunks(2).collect::<Vec<_>>();
+        let selected_fragments = fragment_ids[..2].to_vec();
+        let index =
+            CreateIndexBuilder::new(&mut dataset, &["category"], IndexType::Bitmap, &base_params)
+                .name("bitmap_segment".to_string())
+                .fragments(selected_fragments.clone())
+                .execute_uncommitted()
+                .await
+                .unwrap();
 
-        for (shard_id, fragment_group) in shard_groups.iter().enumerate() {
-            let params = base_params
-                .clone()
-                .with_params(&json!({ "shard_id": shard_id as u32 }));
-            let index_metadata =
-                CreateIndexBuilder::new(&mut dataset, &["category"], IndexType::Bitmap, &params)
-                    .name("distributed_bitmap".to_string())
-                    .fragments(fragment_group.to_vec())
-                    .index_uuid(shared_uuid.clone())
-                    .execute_uncommitted()
-                    .await
-                    .unwrap();
-            if shard_metadata.is_none() {
-                shard_metadata = Some(index_metadata);
-            }
-        }
-
-        dataset
-            .merge_index_metadata(
-                &shared_uuid,
-                IndexType::Bitmap,
-                None,
-                Arc::new(NoopIndexBuildProgress),
-            )
-            .await
-            .unwrap();
-
-        let mut committed_index_metadata = shard_metadata.unwrap();
-        committed_index_metadata.fragment_bitmap = Some(fragment_ids.iter().copied().collect());
-        committed_index_metadata.files = Some(
-            list_index_files_with_sizes(
-                dataset.object_store.as_ref(),
-                &dataset.indices_dir().clone().join(shared_uuid.clone()),
-            )
-            .await
-            .unwrap(),
-        );
-        committed_index_metadata.dataset_version = dataset.manifest.version;
-
-        let transaction = TransactionBuilder::new(
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![committed_index_metadata],
-                removed_indices: vec![],
-            },
-        )
-        .build();
-        dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await
-            .unwrap();
-
-        let dataset = Dataset::open(&dataset_uri).await.unwrap();
-        let indices = dataset
-            .load_indices_by_name("distributed_bitmap")
-            .await
-            .unwrap();
-        assert_eq!(indices.len(), 1);
-        let index = &indices[0];
         assert_eq!(
             index
                 .fragment_bitmap
@@ -1484,37 +1695,15 @@ mod tests {
                 .unwrap()
                 .iter()
                 .collect::<Vec<_>>(),
-            fragment_ids
+            selected_fragments
         );
 
         let files = index.files.as_ref().unwrap();
         assert!(files.iter().any(|file| file.path == BITMAP_LOOKUP_NAME));
         assert!(
             files.iter().all(|file| !file.path.starts_with("part_")),
-            "committed bitmap index should only reference merged files"
+            "staged bitmap segment should only reference canonical files"
         );
-
-        let scalar_index = crate::index::scalar::open_scalar_index(
-            &dataset,
-            "category",
-            index,
-            &NoOpMetricsCollector,
-        )
-        .await
-        .unwrap();
-        assert_eq!(scalar_index.index_type(), IndexType::Bitmap);
-
-        let query_result = scalar_index
-            .search(
-                &SargableQuery::Equals(ScalarValue::Int32(Some(2))),
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap();
-        let SearchResult::Exact(query_rows) = query_result else {
-            panic!("expected exact bitmap result");
-        };
-        assert_eq!(query_rows.true_rows().len(), Some(2));
     }
 
     #[tokio::test]
@@ -1576,17 +1765,11 @@ mod tests {
             input_segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(params.index_type())
-            .with_segments(input_segments.clone())
-            .build_all()
-            .await
-            .unwrap();
+        let segments = input_segments.clone();
         assert_eq!(segments.len(), fragments.len());
         let mut built_segment_ids = segments
             .iter()
-            .map(|segment| segment.uuid())
+            .map(|segment| segment.uuid)
             .collect::<Vec<_>>();
         built_segment_ids.sort();
         let mut input_segment_ids = input_segments
@@ -1627,7 +1810,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_segment_builder_vector_commits_multi_segment_logical_index() {
+    async fn test_commit_existing_index_segments_vector_commits_multi_segment_logical_index() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -1672,13 +1855,7 @@ mod tests {
             input_segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(params.index_type())
-            .with_segments(input_segments)
-            .build_all()
-            .await
-            .unwrap();
+        let segments = input_segments;
         assert_eq!(segments.len(), 2);
 
         dataset
@@ -1725,7 +1902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_segment_builder_vector_segments_without_index_details() {
+    async fn test_commit_existing_index_segments_rejects_vector_segments_without_index_details() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -1771,18 +1948,18 @@ mod tests {
             input_segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(params.index_type())
-            .with_segments(input_segments)
-            .build_all()
+        let err = dataset
+            .commit_existing_index_segments("vector_idx", "vector", input_segments)
             .await
-            .unwrap();
-        assert_eq!(segments.len(), 2);
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing index details"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
-    async fn test_index_segment_builder_fts_commits_multi_segment_logical_index() {
+    async fn test_commit_existing_index_segments_finalizes_fts_segments() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -1820,20 +1997,36 @@ mod tests {
             input_segments.push(segment);
         }
 
-        let segments = dataset
-            .create_index_segment_builder()
-            .with_index_type(IndexType::Inverted)
-            .with_segments(input_segments.clone())
-            .build_all()
-            .await
-            .unwrap();
+        let segments = input_segments.clone();
         assert_eq!(segments.len(), input_segments.len());
 
-        for segment in &segments {
+        crate::index::scalar::inverted::finalize_segment_files_if_needed(
+            &dataset,
+            &input_segments[0],
+        )
+        .await
+        .unwrap();
+        let stale_staging_path = dataset
+            .indices_dir()
+            .join(input_segments[0].uuid.to_string())
+            .join("staging")
+            .join("orphan.lance");
+        dataset
+            .object_store
+            .put(&stale_staging_path, b"stale")
+            .await
+            .unwrap();
+
+        dataset
+            .commit_existing_index_segments("text_idx", "text", segments)
+            .await
+            .unwrap();
+
+        for segment in &input_segments {
             let metadata_path = dataset
                 .indices_dir()
                 .clone()
-                .join(segment.uuid().to_string())
+                .join(segment.uuid.to_string())
                 .join(lance_index::scalar::inverted::METADATA_FILE);
             assert!(
                 dataset
@@ -1845,13 +2038,21 @@ mod tests {
             );
         }
 
-        dataset
-            .commit_existing_index_segments("text_idx", "text", segments)
-            .await
-            .unwrap();
-
         let indices = dataset.load_indices_by_name("text_idx").await.unwrap();
         assert_eq!(indices.len(), input_segments.len());
+        let finalized_segment = indices
+            .iter()
+            .find(|index| index.uuid == input_segments[0].uuid)
+            .expect("finalized segment should be committed");
+        assert!(
+            finalized_segment
+                .files
+                .as_ref()
+                .expect("committed segment should track files")
+                .iter()
+                .all(|file| !file.path.starts_with("staging/")),
+            "stale staging files must not be committed in IndexMetadata.files"
+        );
     }
 
     #[tokio::test]
@@ -1934,127 +2135,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_segment_builder_rejects_duplicate_segment_uuids() {
-        let tmpdir = TempStrDir::default();
-        let dataset_uri = format!("file://{}", tmpdir.as_str());
+    async fn test_btree_merge_existing_index_segments() {
+        use datafusion::common::ScalarValue;
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        use std::ops::Bound;
 
-        let batches = RecordBatchIterator::new(
-            vec![Ok(create_text_batch(0, 10))],
-            create_text_batch(0, 1).schema(),
-        );
-        let mut dataset = Dataset::write(
-            batches,
-            &dataset_uri,
-            Some(WriteParams {
-                max_rows_per_file: 10,
-                mode: WriteMode::Overwrite,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let params = InvertedIndexParams::default();
-        let segment =
-            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
-                .name("text_idx".to_string())
-                .fragments(vec![0])
-                .execute_uncommitted()
-                .await
-                .unwrap();
-
-        let err = dataset
-            .create_index_segment_builder()
-            .with_index_type(IndexType::Inverted)
-            .with_segments(vec![segment.clone(), segment])
-            .build_all()
+        // Open `segment` and count rows whose `id` falls in `[lo, hi)`.
+        async fn count_in_range(
+            dataset: &Dataset,
+            segment: &IndexMetadata,
+            lo: i32,
+            hi: i32,
+        ) -> usize {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
             .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("duplicate segment uuid"),
-            "unexpected error: {err}"
-        );
-    }
+            .unwrap();
+            let query = SargableQuery::Range(
+                Bound::Included(ScalarValue::Int32(Some(lo))),
+                Bound::Excluded(ScalarValue::Int32(Some(hi))),
+            );
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_addrs) => {
+                    row_addrs.true_rows().row_addrs().unwrap().count()
+                }
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
 
-    #[tokio::test]
-    async fn test_index_segment_builder_requires_explicit_index_type() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
-        let batches = RecordBatchIterator::new(
-            vec![Ok(create_text_batch(0, 10))],
-            create_text_batch(0, 1).schema(),
-        );
+        // 128 rows across two 64-row fragments. Stable row ids so the
+        // retired-fragment filter below exercises the exact row-id allow-list.
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(64),
+                lance_datagen::BatchCount::from(2),
+            );
         let mut dataset = Dataset::write(
-            batches,
+            reader,
             &dataset_uri,
             Some(WriteParams {
-                max_rows_per_file: 10,
+                max_rows_per_file: 64,
                 mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
 
-        let params = InvertedIndexParams::default();
-        let segment =
-            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
-                .name("text_idx".to_string())
-                .fragments(vec![0])
-                .execute_uncommitted()
-                .await
-                .unwrap();
-
-        let err = dataset
-            .create_index_segment_builder()
-            .with_segments(vec![segment])
-            .plan()
+        // One staged BTree segment per fragment, committed as a multi-segment
+        // logical index.
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut staged = Vec::new();
+        for fragment in dataset.get_fragments() {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["id"], IndexType::BTree, &params)
+                    .name("id_btree".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("id_btree", "id", staged)
             .await
-            .unwrap_err();
+            .unwrap();
+
+        // Phase 1 — healthy merge: the two per-fragment segments consolidate
+        // into a single canonical segment covering both fragments, and a range
+        // spanning both (ids 50..100) returns every matching row.
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            merged.fragment_bitmap.as_ref().unwrap(),
+            &roaring::RoaringBitmap::from_iter([0u32, 1])
+        );
         assert!(
-            err.to_string().contains("requires an explicit index type"),
-            "unexpected error: {err}"
+            merged
+                .index_details
+                .as_ref()
+                .unwrap()
+                .type_url
+                .ends_with("BTreeIndexDetails")
         );
-    }
+        assert_eq!(count_in_range(&dataset, &merged, 50, 100).await, 50);
 
-    #[tokio::test]
-    async fn test_index_segment_builder_requires_requested_index_type() {
-        let tmpdir = TempStrDir::default();
-        let dataset_uri = format!("file://{}", tmpdir.as_str());
-
-        let batches = RecordBatchIterator::new(
-            vec![Ok(create_text_batch(0, 10))],
-            create_text_batch(0, 1).schema(),
-        );
-        let dataset = Dataset::write(
-            batches,
-            &dataset_uri,
-            Some(WriteParams {
-                max_rows_per_file: 10,
-                mode: WriteMode::Overwrite,
+        // Phase 2 — retire fragment 0: delete >10% of its rows so compaction
+        // rewrites only frag 0 (frag 1 has no deletions and is at target size).
+        // The committed per-fragment segment now claims a fragment the dataset
+        // no longer has.
+        dataset.delete("id < 16").await.unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 64,
                 ..Default::default()
-            }),
+            },
+            None,
         )
         .await
         .unwrap();
+        let live_frags: roaring::RoaringBitmap = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        assert!(!live_frags.contains(0), "compaction should retire frag 0");
 
-        let segment = IndexSegment::new(
-            Uuid::new_v4(),
-            [0_u32],
-            Arc::new(prost_types::Any::default()),
+        // Filtered merge: coverage drops the retired fragment but keeps the
+        // live one, and the merged page data does not leak the retired row ids
+        // (ids < 16 lived only in frag 0, so the range now returns nothing).
+        let merged = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
+            .await
+            .unwrap();
+        let coverage = merged.fragment_bitmap.as_ref().unwrap();
+        assert!(!coverage.contains(0), "must drop retired frag 0");
+        assert!(coverage.contains(1), "must keep live frag 1");
+        assert_eq!(
+            count_in_range(&dataset, &merged, 0, 16).await,
             0,
-        );
-        let plan = IndexSegmentPlan::new(segment, Vec::new(), 0, None);
-        let err = dataset
-            .create_index_segment_builder()
-            .with_index_type(IndexType::Inverted)
-            .build(&plan)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("declare an index type"),
-            "unexpected error: {err}"
+            "must filter retired-fragment row ids"
         );
     }
 
@@ -2094,7 +2307,7 @@ mod tests {
 
         CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
             .name("vector_idx".to_string())
-            .index_uuid(uuid.to_string())
+            .index_uuid(uuid)
             .execute_uncommitted()
             .await
             .unwrap();
@@ -2319,39 +2532,38 @@ mod tests {
         // Load indices after optimization
         let indices_after = dataset.load_indices().await.unwrap();
 
-        // There should be 3 indices:
-        // 1. one scalar index with name "id_idx", and the bitmap is [0,1]
-        // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
-        // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
-        assert_eq!(indices_after.len(), 3, "{:?}", indices_after);
-        let id_idx = indices_after
+        // After unifying scalar optimize, `OptimizeOptions::append()` honors
+        // `Some(0)` for BTree the same way it does for vector: keep the old
+        // segment, add a delta for the unindexed fragment. So we now expect:
+        //   1. id_idx old segment, bitmap [0]
+        //   2. id_idx delta segment, bitmap [1]
+        //   3. vector_idx old segment, bitmap [0]
+        //   4. vector_idx delta segment, bitmap [1]
+        // Previously BTree silently merged into 1 segment because legacy
+        // scalar ignored `num_indices_to_merge`.
+        assert_eq!(indices_after.len(), 4, "{:?}", indices_after);
+        let id_indices = indices_after
             .iter()
-            .find(|idx| idx.name == "id_idx")
-            .unwrap();
+            .filter(|idx| idx.name == "id_idx")
+            .collect::<Vec<_>>();
         let vector_indices = indices_after
             .iter()
             .filter(|idx| idx.name == "vector_idx")
             .collect::<Vec<_>>();
-        assert!(
-            id_idx
-                .fragment_bitmap
-                .as_ref()
-                .unwrap()
-                .contains_range(0..2)
-                && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
-        );
-        assert_eq!(vector_indices.len(), 2);
-        assert!(
-            vector_indices
-                .iter()
-                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
-                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
-        );
-        assert!(
-            vector_indices
-                .iter()
-                .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
-                    && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
-        );
+        for indices in [&id_indices, &vector_indices] {
+            assert_eq!(indices.len(), 2);
+            assert!(
+                indices
+                    .iter()
+                    .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
+                        && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+            );
+            assert!(
+                indices
+                    .iter()
+                    .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
+                        && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
+            );
+        }
     }
 }

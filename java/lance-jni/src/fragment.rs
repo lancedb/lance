@@ -4,7 +4,7 @@
 use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use jni::objects::{JIntArray, JValue, JValueGen};
 use jni::{
     JNIEnv,
@@ -19,7 +19,7 @@ use lance_io::utils::CachedFileSize;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use std::iter::once;
 
-use lance::dataset::fragment::FileFragment;
+use lance::dataset::fragment::write::FragmentCreateBuilder;
 use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -108,6 +108,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    schema_addr: jlong,
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -130,6 +131,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            schema_addr,
         ),
         JObject::default()
     )
@@ -155,6 +157,7 @@ fn inner_create_with_ffi_array<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    schema_addr: jlong,
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -186,6 +189,7 @@ fn inner_create_with_ffi_array<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        schema_addr,
         reader,
     )
 }
@@ -210,6 +214,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    schema_addr: jlong,
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -231,6 +236,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            schema_addr,
         ),
         JObject::null()
     )
@@ -255,6 +261,7 @@ fn inner_create_with_ffi_stream<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    schema_addr: jlong,
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -276,6 +283,7 @@ fn inner_create_with_ffi_stream<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        schema_addr,
         reader,
     )
 }
@@ -298,6 +306,7 @@ fn create_fragment<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    schema_addr: jlong,
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -345,11 +354,19 @@ fn create_fragment<'a>(
         });
     }
 
-    let fragments = RT.block_on(FileFragment::create_fragments(
-        &path_str,
-        source,
-        Some(write_params),
-    ))?;
+    let mut builder = FragmentCreateBuilder::new(&path_str).write_params(&write_params);
+    let schema;
+    if schema_addr != 0 {
+        let c_schema_ptr = schema_addr as *mut FFI_ArrowSchema;
+        let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+        let arrow_schema = ArrowSchema::try_from(&c_schema)?;
+        // Schema::try_from restores Lance field IDs from the LANCE_FIELD_ID_KEY
+        // metadata inserted by LanceSchema.asArrowSchemaWithFieldIds().
+        schema = Schema::try_from(&arrow_schema)?;
+        builder = builder.schema(&schema);
+    }
+
+    let fragments = RT.block_on(builder.write_fragments(source))?;
     export_vec(env, &fragments)
 }
 

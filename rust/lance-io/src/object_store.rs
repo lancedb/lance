@@ -13,9 +13,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use deepsize::DeepSizeOf;
 use futures::{FutureExt, Stream};
 use futures::{StreamExt, TryStreamExt, future, stream::BoxStream};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
@@ -25,7 +25,7 @@ use object_store::ObjectStoreExt as OSObjectStoreExt;
 use object_store::aws::AwsCredentialProvider;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::{ClientOptions, HeaderMap, HeaderValue};
-use object_store::{ObjectMeta, ObjectStore as OSObjectStore, path::Path};
+use object_store::{ListResult, ObjectMeta, ObjectStore as OSObjectStore, path::Path};
 use providers::local::FileStoreProvider;
 use providers::memory::MemoryStoreProvider;
 use tokio::io::AsyncWriteExt;
@@ -36,7 +36,7 @@ use super::local::LocalObjectReader;
 use crate::uring::{UringCurrentThreadReader, UringReader};
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) mod dynamic_credentials;
-#[cfg(any(feature = "oss", feature = "huggingface"))]
+#[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
 pub mod providers;
@@ -47,7 +47,7 @@ pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
-use crate::traits::Writer;
+use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -61,7 +61,15 @@ pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
 const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
-#[cfg(any(feature = "aws", feature = "gcp", feature = "azure"))]
+#[cfg(any(
+    feature = "aws",
+    feature = "gcp",
+    feature = "azure",
+    feature = "oss",
+    feature = "tencent",
+    feature = "huggingface",
+    feature = "tos",
+))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
 pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
@@ -145,7 +153,7 @@ pub struct ObjectStore {
 }
 
 impl DeepSizeOf for ObjectStore {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // We aren't counting `inner` here which is problematic but an ObjectStore
         // shouldn't be too big.  The only exception might be the write cache but, if
         // the writer cache has data, it means we're using it somewhere else that isn't
@@ -570,10 +578,17 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// The amount of parallelism to use for I/O operations.
+    ///
+    /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.
+    /// Always at least 1: callers feed this straight into `buffered` / `buffer_unordered`, and a
+    /// window of 0 makes those streams never poll their input — e.g. a metadata-only `count_rows`
+    /// would hang rather than return.
     pub fn io_parallelism(&self) -> usize {
         std::env::var("LANCE_IO_THREADS")
             .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
+            .max(1)
     }
 
     /// Get the IO tracker for this object store
@@ -771,10 +786,52 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// AWS S3 and GCS reject a single-shot server-side copy whose source is
+    /// larger than this; such sources are streamed through a multipart write.
+    const MAX_SINGLE_COPY_BYTES: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+
     pub async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+        // S3 and GCS cap single-shot server-side copies at 5 GiB and object_store
+        // does not fall back to a multipart copy for larger sources
+        // (https://github.com/apache/arrow-rs-object-store/issues/563). Azure and
+        // other blob stores don't have this limit, so we only pay for the fallback
+        // (an extra size lookup) on S3 and GCS.
+        let multipart_copy_fallback = matches!(self.scheme.as_str(), "s3" | "s3+ddb" | "gs");
+        self.copy_impl(
+            from,
+            to,
+            multipart_copy_fallback,
+            Self::MAX_SINGLE_COPY_BYTES,
+        )
+        .await
+    }
+
+    /// Copy `from` to `to`. When `multipart_copy_fallback` is set, a source
+    /// larger than `max_single_copy` is streamed through a multipart write
+    /// instead of a single-shot server-side copy. Both are parameters so tests
+    /// can drive the streaming path without a multi-gigabyte fixture or an S3
+    /// endpoint.
+    async fn copy_impl(
+        &self,
+        from: &Path,
+        to: &Path,
+        multipart_copy_fallback: bool,
+        max_single_copy: u64,
+    ) -> Result<()> {
         if self.is_local() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             return super::local::copy_file(from, to);
+        }
+        if multipart_copy_fallback {
+            // Reuse the reader for both the size lookup (a single cached HEAD)
+            // and the streamed copy, avoiding a separate HEAD request.
+            let reader = self.open(from).await?;
+            if reader.size().await? as u64 > max_single_copy {
+                let mut writer = self.create(to).await?;
+                writer.copy_from_reader(reader.as_ref()).await?;
+                Writer::shutdown(writer.as_mut()).await?;
+                return Ok(());
+            }
         }
         Ok(self.inner.copy(from, to).await?)
     }
@@ -788,8 +845,18 @@ impl ObjectStore {
             .common_prefixes
             .iter()
             .chain(output.objects.iter().map(|o| &o.location))
-            .map(|s| s.filename().unwrap().to_string())
+            .filter_map(|s| s.filename().map(|f| f.to_string()))
             .collect())
+    }
+
+    /// Non-recursive, path-segment delimited list of a single directory level.
+    ///
+    /// Unlike [`Self::list`], which recurses into the entire subtree, this returns
+    /// only the immediate children of `prefix`: the child "directories" as
+    /// [`ListResult::common_prefixes`] and the direct child files as
+    /// [`ListResult::objects`].
+    pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        Ok(self.inner.list_with_delimiter(prefix).await?)
     }
 
     pub fn list(
@@ -1077,11 +1144,19 @@ fn infer_block_size(scheme: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use lance_core::utils::tempfile::{TempStdDir, TempStdFile, TempStrDir};
     use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result as OSResult,
+    };
     use rstest::rstest;
     use std::env::set_current_dir;
+    use std::fmt::{Display, Formatter};
     use std::fs::{create_dir_all, write};
+    use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1098,6 +1173,35 @@ mod tests {
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
+    }
+
+    #[test]
+    fn test_io_parallelism_clamped_to_nonzero() {
+        // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
+        // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
+        let store = ObjectStore::local();
+
+        // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
+        // only reads it, and a concurrent reader observes a valid clamped value, never 0.
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
+        assert_eq!(
+            store.io_parallelism(),
+            1,
+            "LANCE_IO_THREADS=0 must clamp to 1"
+        );
+
+        unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
+        assert_eq!(
+            store.io_parallelism(),
+            8,
+            "a positive override must pass through unchanged"
+        );
+
+        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
+        assert!(
+            store.io_parallelism() >= 1,
+            "the configured default parallelism must be at least 1"
+        );
     }
 
     #[tokio::test]
@@ -1498,6 +1602,106 @@ mod tests {
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    /// Inner store that forwards everything to `InMemory` except single-shot
+    /// server-side copy (`copy_opts`), which always fails. This lets a test
+    /// prove that `ObjectStore::copy` fell back to a streaming multipart copy
+    /// for an oversized source rather than issuing a single `CopyObject`.
+    #[derive(Debug)]
+    struct CopyFailingStore {
+        inner: InMemory,
+    }
+
+    impl Display for CopyFailingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CopyFailingStore")
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for CopyFailingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            Err(object_store::Error::Generic {
+                store: "CopyFailingStore",
+                source: "single-shot copy disabled in test".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_copy_streams_objects_larger_than_threshold() {
+        // memory:// is non-local but isn't an S3/GCS scheme, so copy() wouldn't
+        // enable the fallback on its own. Drive copy_impl directly with
+        // multipart_copy_fallback = true to exercise the streaming path. The
+        // inner store rejects any single-shot copy, so a successful copy can only
+        // have gone through the streaming branch.
+        let mut store = ObjectStore::memory();
+        store.inner = Arc::new(CopyFailingStore {
+            inner: InMemory::new(),
+        });
+
+        let from = Path::from("source.bin");
+        let contents = b"streaming multipart copy payload well past the tiny threshold";
+        store.put(&from, contents).await.unwrap();
+
+        // Source size (61 bytes) exceeds the threshold -> must stream via a
+        // multipart write rather than a single-shot server-side copy.
+        let streamed = Path::from("streamed.bin");
+        store.copy_impl(&from, &streamed, true, 8).await.unwrap();
+        let copied = store.read_one_all(&streamed).await.unwrap();
+        assert_eq!(copied.as_ref(), contents.as_slice());
+
+        // Source size below the threshold -> single-shot copy, which the inner
+        // store rejects, confirming that the streaming branch (not native copy)
+        // is what made the first copy succeed.
+        let native = Path::from("native.bin");
+        assert!(
+            store
+                .copy_impl(&from, &native, true, u64::MAX)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

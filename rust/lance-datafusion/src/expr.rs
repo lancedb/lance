@@ -17,6 +17,18 @@ const MS_PER_DAY: i64 = 86400000;
 // will always yield "x = 7_u64" regardless of the type of the column "x".  As a result, we
 // need to do that literal coercion ourselves.
 pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarValue> {
+    // A dictionary target coerces the value to the dictionary's value type and
+    // re-wraps it as a dictionary literal. Only an untyped `ScalarValue::Null`
+    // keeps its untyped form, matching the behavior for all other targets; a
+    // *typed* null (e.g. `Utf8(None)`) is coerced and wrapped like any other
+    // value so it produces a `Dictionary(..)` literal that matches the column.
+    if let DataType::Dictionary(key_type, value_type) = ty {
+        if matches!(value, ScalarValue::Null) {
+            return Some(value.clone());
+        }
+        let inner = safe_coerce_scalar(value, value_type)?;
+        return Some(ScalarValue::Dictionary(key_type.clone(), Box::new(inner)));
+    }
     match value {
         ScalarValue::Int8(val) => match ty {
             DataType::Int8 => Some(value.clone()),
@@ -218,11 +230,19 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
         ScalarValue::Utf8(val) => match ty {
             DataType::Utf8 => Some(value.clone()),
             DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(val.clone())),
+            DataType::Utf8View => Some(ScalarValue::Utf8View(val.clone())),
             _ => None,
         },
         ScalarValue::LargeUtf8(val) => match ty {
             DataType::Utf8 => Some(ScalarValue::Utf8(val.clone())),
             DataType::LargeUtf8 => Some(value.clone()),
+            DataType::Utf8View => Some(ScalarValue::Utf8View(val.clone())),
+            _ => None,
+        },
+        ScalarValue::Utf8View(val) => match ty {
+            DataType::Utf8 => Some(ScalarValue::Utf8(val.clone())),
+            DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(val.clone())),
+            DataType::Utf8View => Some(value.clone()),
             _ => None,
         },
         ScalarValue::Boolean(_) => match ty {
@@ -408,6 +428,7 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
         ScalarValue::Binary(value) => match ty {
             DataType::Binary => Some(ScalarValue::Binary(value.clone())),
             DataType::LargeBinary => Some(ScalarValue::LargeBinary(value.clone())),
+            DataType::BinaryView => Some(ScalarValue::BinaryView(value.clone())),
             DataType::FixedSizeBinary(len) => {
                 if let Some(value) = value {
                     if value.len() == *len as usize {
@@ -421,6 +442,15 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             }
             _ => None,
         },
+        ScalarValue::BinaryView(val) => match ty {
+            DataType::Binary => Some(ScalarValue::Binary(val.clone())),
+            DataType::LargeBinary => Some(ScalarValue::LargeBinary(val.clone())),
+            DataType::BinaryView => Some(value.clone()),
+            _ => None,
+        },
+        // A dictionary-encoded literal (e.g. produced by DataFusion's dictionary
+        // cast in the scalar-index path) coerces by unwrapping its underlying value.
+        ScalarValue::Dictionary(_, inner) => safe_coerce_scalar(inner, ty),
         _ => None,
     }
 }
@@ -701,6 +731,156 @@ mod tests {
                 &DataType::Time64(TimeUnit::Nanosecond),
             ),
             Some(ScalarValue::Time64Nanosecond(Some(5000000000)))
+        );
+    }
+
+    #[test]
+    fn test_string_view_coerce() {
+        // Utf8 <-> Utf8View
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8(Some("hi".into())), &DataType::Utf8View),
+            Some(ScalarValue::Utf8View(Some("hi".into())))
+        );
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8View(Some("hi".into())), &DataType::Utf8),
+            Some(ScalarValue::Utf8(Some("hi".into())))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Utf8View(Some("hi".into())),
+                &DataType::LargeUtf8
+            ),
+            Some(ScalarValue::LargeUtf8(Some("hi".into())))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::LargeUtf8(Some("hi".into())),
+                &DataType::Utf8View
+            ),
+            Some(ScalarValue::Utf8View(Some("hi".into())))
+        );
+        // identity
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Utf8View(Some("hi".into())),
+                &DataType::Utf8View
+            ),
+            Some(ScalarValue::Utf8View(Some("hi".into())))
+        );
+        // Binary <-> BinaryView
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Binary(Some(vec![1, 2, 3])),
+                &DataType::BinaryView
+            ),
+            Some(ScalarValue::BinaryView(Some(vec![1, 2, 3])))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::BinaryView(Some(vec![1, 2, 3])),
+                &DataType::Binary
+            ),
+            Some(ScalarValue::Binary(Some(vec![1, 2, 3])))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::BinaryView(Some(vec![1, 2, 3])),
+                &DataType::BinaryView
+            ),
+            Some(ScalarValue::BinaryView(Some(vec![1, 2, 3])))
+        );
+    }
+
+    #[test]
+    fn test_dictionary_coerce() {
+        let dict_ty = DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8));
+
+        // A string literal coerces to a dictionary target by wrapping the
+        // coerced value in a dictionary scalar.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8(Some("com".to_string())), &dict_ty),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+            ))
+        );
+
+        // The inner value is coerced through to the dictionary value type, so a
+        // LargeUtf8 literal lands as a Utf8 value inside the dictionary.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::LargeUtf8(Some("com".to_string())), &dict_ty),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+            ))
+        );
+
+        // A dictionary literal round-trips back to its value type.
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Dictionary(
+                    Box::new(DataType::Int16),
+                    Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+                ),
+                &DataType::Utf8,
+            ),
+            Some(ScalarValue::Utf8(Some("com".to_string())))
+        );
+
+        // A dictionary literal coerces to a dictionary target, adopting the
+        // target's key type.
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+                ),
+                &dict_ty,
+            ),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(Some("com".to_string()))),
+            ))
+        );
+
+        // An untyped null keeps its untyped form for a dictionary target, just
+        // like for every other target type.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Null, &dict_ty),
+            Some(ScalarValue::Null)
+        );
+
+        // A *typed* null (e.g. an API-built `Utf8(None)` literal, or an IN value
+        // already typed as Utf8) is still wrapped in the dictionary type so it
+        // matches the dictionary column. Returning a bare `Utf8(None)` here would
+        // leave `resolve_value` with a literal whose type does not line up with
+        // the column, breaking planning/evaluation the same way non-null strings
+        // used to break.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Utf8(None), &dict_ty),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(None)),
+            ))
+        );
+
+        // The inner null is coerced through to the dictionary value type as well,
+        // so a LargeUtf8 typed null lands as a Utf8 null inside the dictionary.
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::LargeUtf8(None), &dict_ty),
+            Some(ScalarValue::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(ScalarValue::Utf8(None)),
+            ))
+        );
+
+        // A value that cannot be coerced to the dictionary value type fails.
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Utf8(Some("com".to_string())),
+                &DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Int32)),
+            ),
+            None
         );
     }
 }

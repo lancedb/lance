@@ -414,11 +414,11 @@ exact size depends on the quantizer:
 100M * (768 + 8) = ~72.3 GiB
 ```
 
-**RQ (RaBitQ):** Vectors are quantized to binary codes with a configurable number of bits per
-dimension. Each row also stores per-row scale and offset factors (4 bytes each) used for distance correction. Each
-row requires `dimension * num_bits / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For
-example, 100M rows with 768 dimensions and 1 bit per dimension:
+**RQ (RaBitQ):** Vectors are currently quantized to 1-bit binary codes. Each row also stores per-row
+scale and offset factors (4 bytes each) used for distance correction. Each row requires
+`dimension / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For example, 100M
+rows with 768 dimensions and 1 bit per dimension:
 
 ```
-100M * (768 * 1 / 8 + 16) = ~10.8 GiB
+100M * (768 / 8 + 16) = ~10.8 GiB
 ```

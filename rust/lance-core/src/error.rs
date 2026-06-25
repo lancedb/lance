@@ -119,6 +119,12 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Operation timed out: {message}, {location}"))]
+    Timeout {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Encountered internal error. Please file a bug report at https://github.com/lance-format/lance/issues. {message}, {location}"
     ))]
@@ -232,6 +238,16 @@ pub enum Error {
     /// A requested field was not found in a schema.
     #[snafu(transparent)]
     FieldNotFound { source: FieldNotFoundError },
+
+    #[snafu(display(
+        "Spill disk cap of {cap_bytes} bytes exceeded; currently using {used_bytes} bytes, {location}"
+    ))]
+    DiskCapExceeded {
+        cap_bytes: u64,
+        used_bytes: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
@@ -315,6 +331,14 @@ impl Error {
     #[track_caller]
     pub fn internal(message: impl Into<String>) -> Self {
         InternalSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    #[track_caller]
+    pub fn timeout(message: impl Into<String>) -> Self {
+        TimeoutSnafu {
             message: message.into(),
         }
         .build()
@@ -417,6 +441,15 @@ impl Error {
         IncompatibleTransactionSnafu.into_error(source)
     }
 
+    #[track_caller]
+    pub fn disk_cap_exceeded(cap_bytes: u64, used_bytes: u64) -> Self {
+        DiskCapExceededSnafu {
+            cap_bytes,
+            used_bytes,
+        }
+        .build()
+    }
+
     /// Create an External error from a boxed error source.
     pub fn external(source: BoxedError) -> Self {
         Self::External { source }
@@ -498,6 +531,17 @@ impl From<&ArrowError> for Error {
 impl From<std::io::Error> for Error {
     #[track_caller]
     fn from(e: std::io::Error) -> Self {
+        // A lance `Error` may have been wrapped in an `io::Error` (e.g. via
+        // `io::Error::other(Error::...)`) to cross an `AsyncWrite`/`AsyncRead`
+        // boundary. Recover it so typed errors such as `DiskCapExceeded`
+        // survive the round-trip instead of collapsing into an opaque `IO`.
+        if e.get_ref().is_some_and(|inner| inner.is::<Self>()) {
+            return *e
+                .into_inner()
+                .expect("checked Some above")
+                .downcast::<Self>()
+                .expect("checked type above");
+        }
         Self::io_source(box_error(e))
     }
 }
@@ -703,6 +747,33 @@ mod test {
     }
 
     impl std::error::Error for MyCustomError {}
+
+    #[test]
+    fn test_io_error_recovers_wrapped_lance_error() {
+        // A lance Error wrapped in io::Error::other should round-trip back to
+        // the original variant rather than collapsing into Error::IO.
+        let io_err = std::io::Error::other(Error::disk_cap_exceeded(100, 50));
+        let recovered: Error = io_err.into();
+        match recovered {
+            Error::DiskCapExceeded {
+                cap_bytes,
+                used_bytes,
+                ..
+            } => {
+                assert_eq!(cap_bytes, 100);
+                assert_eq!(used_bytes, 50);
+            }
+            other => panic!("expected DiskCapExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_io_error_without_lance_error_stays_io() {
+        // A plain io::Error (no wrapped lance Error) should become Error::IO.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let converted: Error = io_err.into();
+        assert!(matches!(converted, Error::IO { .. }));
+    }
 
     #[test]
     fn test_external_error_creation() {

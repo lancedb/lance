@@ -21,6 +21,7 @@ use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::optimize::{IndexRemapper, IndexRemapperOptions};
 
@@ -121,7 +122,7 @@ impl IndexRemapper for DatasetIndexRemapper {
 #[async_trait]
 pub trait LanceIndexStoreExt {
     /// Create an index store for a new index (will always be absolute with no base id)
-    fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self>
+    fn from_dataset_for_new(dataset: &Dataset, uuid: &Uuid) -> Result<Self>
     where
         Self: Sized;
 
@@ -147,8 +148,8 @@ pub(crate) fn dataset_format_version(dataset: &Dataset) -> LanceFileVersion {
 
 #[async_trait]
 impl LanceIndexStoreExt for LanceIndexStore {
-    fn from_dataset_for_new(dataset: &Dataset, uuid: &str) -> Result<Self> {
-        let index_dir = dataset.indices_dir().join(uuid);
+    fn from_dataset_for_new(dataset: &Dataset, uuid: &Uuid) -> Result<Self> {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         Ok(Self::with_format_version(
@@ -223,7 +224,7 @@ mod tests {
         let built_index = dataset
             .create_index_builder(&["vector"], IndexType::Vector, &params)
             .name("vector_idx".to_string())
-            .index_uuid(first_segment_uuid.to_string())
+            .index_uuid(first_segment_uuid)
             .execute_uncommitted()
             .await
             .unwrap();

@@ -457,7 +457,15 @@ async fn run_prepare(args: &Args) -> Result<()> {
 
     let write_start = Instant::now();
     let reader = RecordBatchIterator::new(batches_with_id.into_iter(), schema);
-    let mut dataset = Dataset::write(reader, &args.uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        reader,
+        &args.uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
     println!(
         "  wrote base dataset in {:.1}s",
         write_start.elapsed().as_secs_f64()

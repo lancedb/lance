@@ -7,19 +7,19 @@
 //! It is a space-efficient data structure that can be used to test whether an element is a member of a set.
 //! It's an inexact filter - they may include false positives that require rechecking.
 
-use crate::scalar::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
-    BloomFilterQuery, BuiltinIndexType, CreatedIndex, ScalarIndexParams, UpdateCriteria,
+    BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
 };
 use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
-mod as_bytes;
-pub mod sbbf;
 use arrow_schema::{DataType, Field};
+use lance_arrow_stats::StatisticsAccumulator;
+use lance_core::utils::bloomfilter::as_bytes;
+use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;
@@ -29,14 +29,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::scalar::FragReuseIndex;
 use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
-use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_core::Result;
 use lance_core::cache::LanceCache;
+use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -58,7 +57,7 @@ struct BloomFilterStatistics {
 }
 
 impl DeepSizeOf for BloomFilterStatistics {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         // Estimate the size of the bloom filter
         // We could try to get the actual size from the Sbbf if it has a method for that,
         // but for now we'll estimate based on the number of bytes it serializes to
@@ -82,7 +81,7 @@ pub struct BloomFilterIndex {
 }
 
 impl DeepSizeOf for BloomFilterIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.zones.deep_size_of_children(context)
     }
 }
@@ -377,12 +376,6 @@ impl Index for BloomFilterIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "BloomFilter is not a vector index".into(),
-        ))
-    }
-
     async fn prewarm(&self) -> Result<()> {
         Ok(())
     }
@@ -458,13 +451,13 @@ impl ScalarIndex for BloomFilterIndex {
         // Write the combined zones back to storage
         let mut builder = BloomFilterIndexBuilder::try_new(params)?;
         builder.blocks = updated_blocks;
-        builder.write_index(dest_store).await?;
+        let file = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -620,7 +613,7 @@ impl BloomFilterIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<()> {
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
         let record_batch = self.bloomfilter_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -638,8 +631,7 @@ impl BloomFilterIndexBuilder {
             .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await?;
-        Ok(())
+        index_file.finish().await
     }
 }
 
@@ -647,7 +639,7 @@ impl BloomFilterIndexBuilder {
 struct BloomFilterProcessor {
     params: BloomFilterIndexBuilderParams,
     sbbf: Option<Sbbf>,
-    cur_zone_has_null: bool,
+    statistics: Option<StatisticsAccumulator>,
 }
 
 impl BloomFilterProcessor {
@@ -655,7 +647,7 @@ impl BloomFilterProcessor {
         let mut processor = Self {
             params,
             sbbf: None,
-            cur_zone_has_null: false,
+            statistics: None,
         };
         processor.reset()?;
         Ok(processor)
@@ -743,6 +735,11 @@ impl ZoneProcessor for BloomFilterProcessor {
         let sbbf = self.sbbf.as_mut().ok_or_else(|| {
             Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
+
+        let statistics = self
+            .statistics
+            .get_or_insert_with(|| StatisticsAccumulator::new(array.data_type()));
+        statistics.update(array)?;
 
         let has_null = match array.data_type() {
             // Signed integers
@@ -946,7 +943,7 @@ impl ZoneProcessor for BloomFilterProcessor {
         };
 
         // Update the current zone's null tracking
-        self.cur_zone_has_null = self.cur_zone_has_null || has_null;
+        debug_assert_eq!(has_null, array.null_count() > 0);
         Ok(())
     }
 
@@ -954,16 +951,21 @@ impl ZoneProcessor for BloomFilterProcessor {
         let bloom_filter = self.sbbf.as_ref().ok_or_else(|| {
             Error::invalid_input("BloomFilterProcessor did not initialize bloom filter")
         })?;
+        let has_null = self
+            .statistics
+            .as_ref()
+            .map(|statistics| statistics.statistics().null_count > 0)
+            .unwrap_or(false);
         Ok(BloomFilterStatistics {
             bound,
-            has_null: self.cur_zone_has_null,
+            has_null,
             bloom_filter: bloom_filter.clone(),
         })
     }
 
     fn reset(&mut self) -> Result<()> {
         self.sbbf = Some(Self::build_filter(&self.params)?);
-        self.cur_zone_has_null = false;
+        self.statistics = None;
         Ok(())
     }
 }
@@ -976,13 +978,12 @@ impl BloomFilterIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<BloomFilterIndexBuilderParams>,
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let mut builder = BloomFilterIndexBuilder::try_new(options.unwrap_or_default())?;
 
         builder.train(batches_source).await?;
 
-        builder.write_index(index_store).await?;
-        Ok(())
+        builder.write_index(index_store).await
     }
 }
 
@@ -1066,12 +1067,12 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
+        let file = Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
