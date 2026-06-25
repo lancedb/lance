@@ -2120,6 +2120,95 @@ mod test {
         Ok(())
     }
 
+    /// Adding an all-null `Map<Utf8, Float64>` column via [`NewColumnTransform::AllNulls`]
+    /// must succeed even though Arrow's Map layout mandates non-null `entries` and `key`.
+    /// Those inner fields are offset-addressed and inert for an all-NULL row, so the
+    /// AllNulls check treats Map fields as leaves (see `Schema::all_fields_nullable`).
+    #[tokio::test]
+    async fn test_add_column_all_nulls_map() -> Result<()> {
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.validate().await?;
+
+        let map_type = DataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", DataType::Utf8, false),
+                    ArrowField::new("value", DataType::Float64, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "cutoffs",
+                    map_type.clone(),
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("cutoffs", map_type.clone(), true),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows as usize);
+        let cutoffs = data.column_by_name("cutoffs").unwrap();
+        assert_eq!(cutoffs.null_count(), num_rows as usize);
+
+        // A non-nullable Map outer field is still rejected -- the leaf check still walks
+        // the top-level field's nullable flag.
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("non_null_cutoffs", map_type, false),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("All-null columns must be nullable."),
+            "unexpected error: {err}"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_add_column_all_nulls_legacy() -> Result<()> {
         let num_rows = 100;

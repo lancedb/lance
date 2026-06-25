@@ -760,8 +760,30 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Whether every field in the schema can hold a NULL — i.e. whether this schema is
+    /// compatible with fields added through the `NewColumnTransform::AllNulls` path (see
+    /// `lance::dataset::schema_evolution`).
+    ///
+    /// Arrow's `Map<K, V>` mandates non-null `entries` and non-null `key` (enforced when
+    /// a Lance [`Field`] is built from an Arrow `Field`), but those inner fields are
+    /// offset-addressed: for an all-NULL Map row the offsets pair collapses to a
+    /// zero-length slice and the structural non-nullability is never exercised. Treat
+    /// Map fields as leaves so the spec-mandated non-null inner fields don't incorrectly
+    /// reject an otherwise well-formed, nullable Map column.
     pub fn all_fields_nullable(&self) -> bool {
-        SchemaFieldIterPreOrder::new(self).all(|f| f.nullable)
+        self.fields.iter().all(Self::field_all_null_compatible)
+    }
+
+    fn field_all_null_compatible(field: &Field) -> bool {
+        if !field.nullable {
+            return false;
+        }
+        // A nullable Map is a leaf for this check: its mandatory non-null `entries`/`key`
+        // are inert when the whole Map value is NULL.
+        if field.logical_type.is_map() {
+            return true;
+        }
+        field.children.iter().all(Self::field_all_null_compatible)
     }
 
     /// Returns the properly formatted path from root to the field.
@@ -2476,6 +2498,22 @@ mod tests {
 
     #[test]
     pub fn test_all_fields_nullable() {
+        // Arrow's canonical Map<Utf8, Float64> layout: non-null `entries` struct with a
+        // non-null `key` and a nullable `value`.
+        fn map_utf8_float64() -> DataType {
+            DataType::Map(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    DataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("key", DataType::Utf8, false),
+                        ArrowField::new("value", DataType::Float64, true),
+                    ])),
+                    false,
+                )),
+                false,
+            )
+        }
+
         let test_cases = vec![
             (
                 vec![], // empty schema
@@ -2535,6 +2573,36 @@ mod tests {
                         DataType::Struct(ArrowFields::from(vec![ArrowField::new(
                             "a",
                             DataType::Int32,
+                            true,
+                        )])),
+                        true,
+                    )
+                    .unwrap(),
+                ],
+                true,
+            ),
+            (
+                // Map<Utf8, Float64> with a nullable outer field. Arrow mandates non-null
+                // `entries` and `key`; treating the Map as a leaf must accept this shape so
+                // all-null Map columns can be added via `NewColumnTransform::AllNulls`.
+                vec![Field::new_arrow("m", map_utf8_float64(), true).unwrap()],
+                true,
+            ),
+            (
+                // Same Map, but the outer field is non-nullable -> rejected (the leaf check
+                // still walks the top-level field's nullable flag).
+                vec![Field::new_arrow("m", map_utf8_float64(), false).unwrap()],
+                false,
+            ),
+            (
+                // A nullable struct containing a nullable Map child: Map-as-leaf must
+                // compose with the existing struct recursion.
+                vec![
+                    Field::new_arrow(
+                        "struct",
+                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                            "m",
+                            map_utf8_float64(),
                             true,
                         )])),
                         true,
