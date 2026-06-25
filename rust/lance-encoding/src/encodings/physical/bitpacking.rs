@@ -56,10 +56,11 @@
 //! both sides — or introducing a real negotiation field with an explicit version bump — would
 //! corrupt every file written under the new mapping.
 //!
-//! There is **no cross-version interop**: files written by this encoder cannot be read by a
-//! pre-dispatch u128 reader, and files written by a pre-dispatch u128 encoder (none exist in
-//! released Lance, since u128 inline bitpacking is itself unreleased) would decode incorrectly
-//! under this reader on any chunk whose `bit_width` falls into the narrow regimes.
+//! There is **no cross-version interop**: a chunk written by this encoder cannot be read by a
+//! reader that lacks the per-chunk dispatch. That is why the writer only emits u128 inline
+//! bitpacking on format version 2.3+ (see [`crate::version::LanceFileVersion::support_u128_bitpacking`]).
+//! A reader that accepts a 2.3 file implements this dispatch; readers limited to older versions
+//! never receive a 128-bit bitpacked page, so there is no chunk they could decode incorrectly.
 //!
 //! ## Sign safety
 //!
@@ -1341,6 +1342,32 @@ mod test {
         let mut metadata = HashMap::new();
         metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
         metadata.insert("lance-encoding:rle-threshold".to_string(), "0".to_string());
+
+        check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+    }
+
+    // End-to-end guard for the version gate: on 2.3 (where u128 bitpacking is enabled) the
+    // chooser must select inline bitpacking for low-magnitude Decimal128 data and the file must
+    // round-trip. `with_min_file_version(V2_3)` runs only the 2.3 reader/writer, so this also
+    // exercises the encode → decode path through the per-chunk u128 dispatch, not just the kernel.
+    #[test_log::test(tokio::test)]
+    async fn test_decimal128_u128_bitpacking_round_trips_on_2_3() {
+        use arrow_array::Decimal128Array;
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("inline_bitpacking")
+            .with_min_file_version(LanceFileVersion::V2_3);
+
+        // 2048 small-magnitude values (bit width well under 128) spanning two 1024-value chunks.
+        let values: Vec<i128> = (0..2048).map(|i| (i % 1000) as i128).collect();
+        let array = Decimal128Array::from(values)
+            .with_precision_and_scale(38, 0)
+            .unwrap();
+        let arrays = vec![Arc::new(array) as Arc<dyn Array>];
+
+        // Disable BSS so bitpacking (not byte-stream split) is the selected encoding.
+        let mut metadata = HashMap::new();
+        metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
 
         check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
     }

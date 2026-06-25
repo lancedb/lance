@@ -104,6 +104,20 @@ impl LanceFileVersion {
             field.data_type().is_nested()
         }
     }
+
+    /// Whether 128-bit bitpacking (e.g. for `Decimal128` columns) may be emitted.
+    ///
+    /// This encoding was introduced in the 2.3 format. Readers for earlier stable versions
+    /// only decode 8/16/32/64-bit inline bitpacking, so emitting a 128-bit bitpacked page on
+    /// an older version would make it unreadable by readers that accept the same file version.
+    ///
+    /// The floor is the concrete `V2_3` (via [`Self::resolve`], so `next` maps to it) rather
+    /// than [`Self::is_unstable`]: once 2.3 stabilizes, readers that accept it will support
+    /// u128 bitpacking, so it must keep being emitted on 2.3 — an `is_unstable` check would
+    /// instead turn it off exactly when 2.3 leaves the unstable channel.
+    pub fn support_u128_bitpacking(&self) -> bool {
+        self.resolve() >= Self::V2_3
+    }
 }
 
 impl std::fmt::Display for LanceFileVersion {

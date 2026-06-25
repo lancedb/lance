@@ -204,7 +204,8 @@ fn bench_encode_decimal128(c: &mut Criterion) {
         let data = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        // u128 bitpacking is gated to 2.3+; use it so the dispatch arms are actually exercised.
+        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_3);
 
         group.bench_function(label, |b| {
             b.iter(|| {
