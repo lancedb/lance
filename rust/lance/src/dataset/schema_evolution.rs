@@ -2120,10 +2120,8 @@ mod test {
         Ok(())
     }
 
-    /// Adding an all-null `Map<Utf8, Float64>` column via [`NewColumnTransform::AllNulls`]
-    /// must succeed even though Arrow's Map layout mandates non-null `entries` and `key`.
-    /// Those inner fields are offset-addressed and inert for an all-NULL row, so the
-    /// AllNulls check treats Map fields as leaves (see `Schema::all_fields_nullable`).
+    /// End-to-end guard that an all-null `Map` column can be added via
+    /// [`NewColumnTransform::AllNulls`] (see `Schema::all_fields_nullable`).
     #[tokio::test]
     async fn test_add_column_all_nulls_map() -> Result<()> {
         let num_rows = 100;
@@ -2187,8 +2185,7 @@ mod test {
         let cutoffs = data.column_by_name("cutoffs").unwrap();
         assert_eq!(cutoffs.null_count(), num_rows as usize);
 
-        // A non-nullable Map outer field is still rejected -- the leaf check still walks
-        // the top-level field's nullable flag.
+        // A non-nullable Map outer field is still rejected.
         let err =
             dataset
                 .add_columns(
