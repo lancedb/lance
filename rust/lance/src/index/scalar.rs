@@ -1775,6 +1775,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dataset_zonemap_value_range() {
+        use crate::index::DatasetIndexExt;
+        use arrow::datatypes::Int64Type;
+        use datafusion::scalar::ScalarValue;
+        use lance_datagen::array;
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // 2 fragments x 5 rows: `id` and `other` both step 0..9.
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .col("other", array::step::<Int64Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Folded straight from the ZoneMap summaries: global [0, 9].
+        assert_eq!(
+            ds.zonemap_value_range("id").await.unwrap(),
+            Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
+        );
+        // `other` has no ZoneMap index -> no precomputed range.
+        assert_eq!(ds.zonemap_value_range("other").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_value_range_none_when_index_misses_fragments() {
+        use crate::index::DatasetIndexExt;
+        use arrow::datatypes::Int64Type;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // Index covers the initial 2 fragments.
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        assert!(ds.zonemap_value_range("id").await.unwrap().is_some());
+
+        // Append a fragment the index doesn't cover. Its rows may hold values
+        // outside the indexed range, so any non-None range would be a subset
+        // unsound to prune with -> must return None until the index is rebuilt.
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_reader_rows(RowCount::from(5), BatchCount::from(1));
+        ds.append(reader, None).await.unwrap();
+
+        assert_eq!(ds.zonemap_value_range("id").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_value_range_folds_multiple_segments() {
+        use crate::index::DatasetIndexExt;
+        use arrow::datatypes::Int64Type;
+        use datafusion::scalar::ScalarValue;
+        use lance_datagen::array;
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // 2 fragments x 5 rows (`id` steps 0..9). Build one ZoneMap segment per
+        // fragment, then commit them as a single multi-segment logical index.
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let columns = ["id"];
+        let mut segments = Vec::new();
+        for fragment_id in [0_u32, 1_u32] {
+            let mut builder = ds
+                .create_index_builder(&columns, IndexType::Scalar, &params)
+                .name("id_idx".to_string())
+                .fragments(vec![fragment_id]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+        // execute_uncommitted yields ready IndexMetadata segments (IntoIndexSegment);
+        // build_all is vector-only, so commit the per-fragment segments directly.
+        ds.commit_existing_index_segments("id_idx", "id", segments)
+            .await
+            .unwrap();
+
+        // Two disjoint segments jointly cover every live fragment -> the fold
+        // spans both and yields the global range, not None.
+        assert_eq!(ds.load_indices_by_name("id_idx").await.unwrap().len(), 2);
+        assert_eq!(
+            ds.zonemap_value_range("id").await.unwrap(),
+            Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
+        );
+    }
+
+    #[tokio::test]
     async fn test_zonemap_index_then_deletion() {
         // Tests the opposite scenario: create index FIRST, then perform deletions
         // Verifies that zonemap index properly handles deletions that occur after index creation

@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::scalar::ScalarValue;
 use futures::FutureExt;
 use itertools::Itertools;
 use lance_core::cache::CacheKey;
@@ -33,6 +34,7 @@ use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
+use lance_index::scalar::zonemap::ZoneMapIndex;
 use lance_index::scalar::{CreatedIndex, ScalarIndex};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
@@ -1451,6 +1453,71 @@ impl DatasetIndexExt for Dataset {
         index_statistics_scalar(self, index_name, metadatas)
             .boxed()
             .await
+    }
+
+    async fn zonemap_value_range(
+        &self,
+        column: &str,
+    ) -> Result<Option<(ScalarValue, ScalarValue)>> {
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::invalid_input(format!(
+                "zonemap_value_range: column '{column}' not found in dataset schema"
+            )));
+        };
+        let field_id = field.id;
+        let field_path = self.schema().field_path(field_id)?;
+
+        // A multi-segment ZoneMap over one column is several index entries that
+        // share a name, each over a disjoint fragment subset; collect them all.
+        // Match the single field, then the details type (the column may also
+        // carry e.g. a BTree).
+        let indices = self.load_indices().await?;
+        let segments: Vec<_> = indices
+            .iter()
+            .filter(|idx| matches!(idx.fields.as_slice(), [only] if *only == field_id))
+            .filter(|idx| {
+                idx.index_details
+                    .as_ref()
+                    .is_some_and(|d| d.type_url.ends_with("ZoneMapIndexDetails"))
+            })
+            .collect();
+        if segments.is_empty() {
+            return Ok(None);
+        }
+
+        // Soundness: the segments must *jointly* cover every live fragment, else
+        // the fold sees only a subset of the data and could prune live rows.
+        // Fragments appended after the index was built, or a segment set that
+        // doesn't span the table, leave a live fragment uncovered -> bail. Extra
+        // dead fragments in the union are fine (the range stays a superset).
+        let mut covered = RoaringBitmap::new();
+        for idx in &segments {
+            let Some(bitmap) = idx.fragment_bitmap.as_ref() else {
+                return Ok(None);
+            };
+            covered |= bitmap.clone();
+        }
+        if !self.fragment_bitmap.as_ref().is_subset(&covered) {
+            return Ok(None);
+        }
+
+        // Open every segment and fold their zones into one global range. Hold
+        // the opened indices so the ZoneMapIndex refs we fold stay borrowed.
+        let mut opened = Vec::with_capacity(segments.len());
+        for idx in &segments {
+            opened.push(
+                self.open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                    .await?,
+            );
+        }
+        let Some(zonemaps) = opened
+            .iter()
+            .map(|index| index.as_any().downcast_ref::<ZoneMapIndex>())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        Ok(ZoneMapIndex::value_range_over(zonemaps))
     }
 
     async fn read_index_partition(

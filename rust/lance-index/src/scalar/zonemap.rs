@@ -150,6 +150,61 @@ impl ZoneMapIndex {
         Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
     }
 
+    /// Global `[min, max]` folded from this index's per-zone summaries, no scan.
+    /// Thin wrapper over [`value_range_over`](Self::value_range_over) for a
+    /// single segment; see it for the full contract.
+    pub fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        Self::value_range_over([self])
+    }
+
+    /// Global `[min, max]` folded across one or more ZoneMap segments — the
+    /// disjoint per-column segments of a multi-segment index — without a scan.
+    ///
+    /// `None` when no zone has a finite bound, or when any zone holds a NaN:
+    /// `ScalarValue`'s total order sorts NaN above every finite value, so a
+    /// NaN-bearing zone records `max = NaN`, hiding its true finite max. We
+    /// can't bound the column above without a scan, and folding the other zones'
+    /// finite maxes would yield a *subset* (pruning live rows) — so we bail
+    /// rather than return an unsound range. Folding the raw zones (not each
+    /// segment's `value_range`) keeps this exact: an all-null segment's zones
+    /// are skipped, a NaN-bearing segment's zone still trips the bail.
+    ///
+    /// Otherwise the range is a superset of the segments' live values —
+    /// conservative under deletion vectors (a deleted extreme still bounds its
+    /// zone): safe to prune with (never drops a matching row), not guaranteed
+    /// tight. Table soundness is the caller's job: the segments must jointly
+    /// cover every live fragment.
+    pub fn value_range_over<'a>(
+        segments: impl IntoIterator<Item = &'a Self>,
+    ) -> Option<(ScalarValue, ScalarValue)> {
+        let mut min: Option<&ScalarValue> = None;
+        let mut max: Option<&ScalarValue> = None;
+        for zone in segments.into_iter().flat_map(|seg| seg.zones.iter()) {
+            // A NaN max means the zone holds a NaN whose total-order rank hides
+            // the zone's real finite max, so no sound finite upper bound exists.
+            if Self::scalar_is_nan(&zone.max) {
+                return None;
+            }
+            if Self::scalar_is_finite_bound(&zone.min)
+                && min.is_none_or(|cur| zone.min.partial_cmp(cur).is_some_and(|o| o.is_lt()))
+            {
+                min = Some(&zone.min);
+            }
+            if Self::scalar_is_finite_bound(&zone.max)
+                && max.is_none_or(|cur| zone.max.partial_cmp(cur).is_some_and(|o| o.is_gt()))
+            {
+                max = Some(&zone.max);
+            }
+        }
+        Some((min?.clone(), max?.clone()))
+    }
+
+    /// A scalar bound usable for the global range: present (not all-null) and,
+    /// for floats, not NaN.
+    fn scalar_is_finite_bound(v: &ScalarValue) -> bool {
+        !v.is_null() && !Self::scalar_is_nan(v)
+    }
+
     /// Evaluates whether a zone could potentially contain values matching the query.
     ///
     /// NaN query values use the explicit `nan_count`. For finite query values,
@@ -1096,6 +1151,163 @@ mod tests {
             )?)
         });
         Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+    }
+
+    /// Build a single-column Int64 ZoneMap from `fragments` (one batch -> one
+    /// fragment), with small zones, then load it back.
+    async fn train_and_load_int64(fragments: Vec<Vec<Option<i64>>>) -> Arc<ZoneMapIndex> {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Int64,
+            true,
+        )]));
+        let batches: Vec<RecordBatch> = fragments
+            .into_iter()
+            .map(|vals| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(arrow_array::Int64Array::from(vals))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let stream = add_row_addr(stream);
+
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(2)),
+        )
+        .await
+        .unwrap();
+
+        ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .expect("Failed to load ZoneMapIndex")
+    }
+
+    /// Float32 analogue of [`train_and_load_int64`], for NaN bound coverage.
+    async fn train_and_load_f32(fragments: Vec<Vec<Option<f32>>>) -> Arc<ZoneMapIndex> {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            DataType::Float32,
+            true,
+        )]));
+        let batches: Vec<RecordBatch> = fragments
+            .into_iter()
+            .map(|vals| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(arrow_array::Float32Array::from(vals))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let stream = add_row_addr(stream);
+
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(2)),
+        )
+        .await
+        .unwrap();
+
+        ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .expect("Failed to load ZoneMapIndex")
+    }
+
+    #[tokio::test]
+    async fn test_value_range_spans_fragments() {
+        // Two fragments, multiple zones each; global min/max straddle both.
+        let index = train_and_load_int64(vec![
+            vec![Some(10), Some(50), Some(30)],
+            vec![Some(5), Some(99), Some(42)],
+        ])
+        .await;
+        assert_eq!(
+            index.value_range(),
+            Some((ScalarValue::Int64(Some(5)), ScalarValue::Int64(Some(99))))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_value_range_all_null_is_none() {
+        let index = train_and_load_int64(vec![vec![None, None, None]]).await;
+        assert_eq!(index.value_range(), None);
+    }
+
+    #[tokio::test]
+    async fn test_value_range_nan_max_is_none() {
+        // Zone size 2: zone [1.0, 2.0] then zone [100.0, NaN]. NaN wins the
+        // second zone's max under the index's total order, hiding the real
+        // finite max (100.0). Folding only finite maxes would report (1.0, 2.0)
+        // -- a subset that prunes the live 100.0 row -- so value_range bails.
+        let index = train_and_load_f32(vec![vec![
+            Some(1.0),
+            Some(2.0),
+            Some(100.0),
+            Some(f32::NAN),
+        ]])
+        .await;
+        assert_eq!(index.value_range(), None);
+    }
+
+    #[tokio::test]
+    async fn test_value_range_over_folds_segments() {
+        // Two disjoint segments of one logical index; the global range straddles
+        // both (min and max from `b`), proving the fold spans segments.
+        let a = train_and_load_int64(vec![vec![Some(5), Some(9)]]).await;
+        let b = train_and_load_int64(vec![vec![Some(1), Some(20)]]).await;
+        assert_eq!(
+            ZoneMapIndex::value_range_over([a.as_ref(), b.as_ref()]),
+            Some((ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(20))))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_value_range_over_nan_in_any_segment_is_none() {
+        // NaN in one segment hides that segment's finite max; the cross-segment
+        // fold must bail to None just as the single-segment path does.
+        let a = train_and_load_f32(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let b = train_and_load_f32(vec![vec![Some(100.0), Some(f32::NAN)]]).await;
+        assert_eq!(
+            ZoneMapIndex::value_range_over([a.as_ref(), b.as_ref()]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_value_range_over_skips_all_null_segment() {
+        // An all-null segment yields no finite zone; folding it with a finite
+        // segment returns the finite segment's range (null contributes nothing).
+        let a = train_and_load_int64(vec![vec![None, None]]).await;
+        let b = train_and_load_int64(vec![vec![Some(3), Some(7)]]).await;
+        assert_eq!(
+            ZoneMapIndex::value_range_over([a.as_ref(), b.as_ref()]),
+            Some((ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(7))))
+        );
     }
 
     #[tokio::test]

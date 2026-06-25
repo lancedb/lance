@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::scalar::ScalarValue;
 use lance_index::{IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
@@ -232,6 +233,20 @@ pub trait DatasetIndexExt {
 
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    /// Global `[min, max]` for `column` from its ZoneMap scalar index, no scan.
+    ///
+    /// `None` unless the column's ZoneMap segments *jointly* cover every live
+    /// fragment and the column is NaN-free — fragments appended after the index
+    /// was built, or a NaN-bearing column, yield `None`. The disjoint segments
+    /// of a multi-segment index are folded together.
+    ///
+    /// When `Some`, the range is a superset of live values, conservative under
+    /// deletion vectors: safe to prune with. See [`ZoneMapIndex::value_range`].
+    ///
+    /// [`ZoneMapIndex::value_range`]: lance_index::scalar::zonemap::ZoneMapIndex::value_range
+    async fn zonemap_value_range(&self, column: &str)
+    -> Result<Option<(ScalarValue, ScalarValue)>>;
 
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(
