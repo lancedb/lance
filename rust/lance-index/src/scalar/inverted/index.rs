@@ -63,7 +63,7 @@ use super::{
     },
     iter::PlainPostingListIterator,
     query::*,
-    scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
+    scorer::{B, K1, Scorer, idf},
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
@@ -751,19 +751,16 @@ impl InvertedIndex {
         metrics: Arc<dyn MetricsCollector>,
         base_scorer: Option<&MemBM25Scorer>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
-        // The wand only consults `scorer.doc_weight`, which is metadata-free.
-        // The outer aggregation below consults `scorer.query_weight`, which
-        // hits per-token `posting_len`; building a `MemBM25Scorer` with
-        // precomputed per-term IDFs avoids the v2 bulk metadata pull.
-        let local_scorer;
-        let scorer: &dyn Scorer = if let Some(base_scorer) = base_scorer {
-            base_scorer
+        // Use one corpus-wide scorer for every score-space consumer in this
+        // query. Shared WAND thresholds and block pruning are correct only when
+        // WAND scoring, final aggregation, and upper bounds all use these same
+        // BM25 statistics.
+        let scorer = Arc::new(if let Some(base_scorer) = base_scorer {
+            base_scorer.clone()
         } else {
-            local_scorer = self
-                .bm25_base_scorer(tokens.as_ref(), params.as_ref())
-                .await?;
-            &local_scorer
-        };
+            self.bm25_base_scorer(tokens.as_ref(), params.as_ref())
+                .await?
+        });
 
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
@@ -801,8 +798,10 @@ impl InvertedIndex {
         let mut candidates = BinaryHeap::new();
         // Shared top-k floor across this query's partitions. Seeded to -inf so
         // the first real score wins; each partition publishes its local k-th
-        // and prunes against the running global k-th (a lower bound on the true
-        // global k-th — see `Wand::shared_threshold`).
+        // and prunes against the running global k-th. Correctness depends on
+        // every partition using the same active BM25 scorer for scores and
+        // block upper bounds; grouped fuzzy expansions keep a private floor
+        // because WAND uses a conservative union proxy before exact rescoring.
         let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let parts = self
             .partitions
@@ -814,6 +813,7 @@ impl InvertedIndex {
                 let mask = mask.clone();
                 let metrics = metrics.clone();
                 let shared_threshold = shared_threshold.clone();
+                let scorer = scorer.clone();
                 async move {
                     let loaded_postings = part
                         .load_posting_lists(
@@ -821,6 +821,7 @@ impl InvertedIndex {
                             params.as_ref(),
                             operator,
                             metrics.as_ref(),
+                            scorer.as_ref(),
                         )
                         .await?;
                     let LoadedPostings {
@@ -862,6 +863,7 @@ impl InvertedIndex {
                     } else {
                         shared_threshold
                     };
+                    let scorer = scorer.clone();
                     let candidates = spawn_cpu(move || {
                         let candidates = part_for_wand.bm25_search(
                             docs_for_wand.as_ref(),
@@ -871,6 +873,7 @@ impl InvertedIndex {
                             postings,
                             metrics.as_ref(),
                             partition_threshold,
+                            scorer,
                         )?;
                         std::result::Result::<_, Error>::Ok(candidates)
                     })
@@ -1601,6 +1604,7 @@ impl InvertedPartition {
         params: &FtsSearchParams,
         operator: Operator,
         metrics: &dyn MetricsCollector,
+        scorer: &dyn Scorer,
     ) -> Result<LoadedPostings> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
@@ -1681,7 +1685,7 @@ impl InvertedPartition {
                 postings: loaded_postings
                     .into_iter()
                     .map(|(token_id, token, position, posting)| {
-                        let query_weight = idf(posting.len(), num_docs);
+                        let query_weight = scorer.query_weight(&token);
                         PostingIterator::with_query_weight(
                             token,
                             token_id,
@@ -1718,6 +1722,14 @@ impl InvertedPartition {
                 group.push((token_id, token, posting));
             }
 
+            // The union posting is only a WAND proxy; final scoring below
+            // rescans the exact matched expansion terms. Summing the expansion
+            // query weights keeps the proxy score an upper bound for documents
+            // that match multiple expansions at this original query position.
+            let query_weight = group
+                .iter()
+                .map(|(_, token, _)| scorer.query_weight(token))
+                .sum::<f32>();
             let (token_id, token, posting) = if group.len() == 1 {
                 group.pop().expect("single-item group must exist")
             } else {
@@ -1746,7 +1758,6 @@ impl InvertedPartition {
                 return Ok(LoadedPostings::empty());
             }
 
-            let query_weight = idf(posting.len(), num_docs);
             grouped_postings.push(PostingIterator::with_query_weight(
                 token,
                 token_id,
@@ -1777,6 +1788,7 @@ impl InvertedPartition {
         postings: Vec<PostingIterator>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
+        scorer: Arc<MemBM25Scorer>,
     ) -> Result<Vec<DocCandidate>> {
         if postings.is_empty() {
             return Ok(Vec::new());
@@ -1785,7 +1797,10 @@ impl InvertedPartition {
         // Caller selects the DocSet shape via `LazyDocSet::docs_for_wand`
         // and passes it in here; wand uses `docs.has_row_ids()` to
         // handle the num_tokens-only case.
-        let scorer = IndexBM25Scorer::new(std::iter::once(self));
+        let mut postings = postings;
+        for posting in &mut postings {
+            posting.recompute_upper_bounds(docs, scorer.as_ref());
+        }
         let mut wand = Wand::new(operator, postings.into_iter(), docs, scorer)
             .with_shared_threshold(shared_threshold);
         let hits = wand.search(params, mask, metrics)?;
@@ -7644,6 +7659,142 @@ mod tests {
                 expected_idf
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_shared_threshold_keeps_global_bm25_winner() {
+        async fn search_partition_with_shared_floor(
+            partition: Arc<InvertedPartition>,
+            tokens: &Tokens,
+            params: &FtsSearchParams,
+            shared_threshold: Arc<AtomicU32>,
+            scorer: Arc<MemBM25Scorer>,
+        ) -> Vec<DocCandidate> {
+            let metrics = NoOpMetricsCollector;
+            let loaded = partition
+                .load_posting_lists(tokens, params, Operator::Or, &metrics, scorer.as_ref())
+                .await
+                .unwrap();
+            assert!(loaded.grouped_expansions.is_empty());
+
+            let mask = Arc::new(RowAddrMask::all_rows());
+            let docs_for_wand = partition.docs.docs_for_wand(mask.as_ref()).await.unwrap();
+            let mut candidates = partition
+                .bm25_search(
+                    docs_for_wand.as_ref(),
+                    params,
+                    Operator::Or,
+                    mask,
+                    loaded.postings,
+                    &metrics,
+                    shared_threshold,
+                    scorer,
+                )
+                .unwrap();
+            resolve_deferred_candidates(partition.docs.as_ref(), &mut candidates)
+                .await
+                .unwrap();
+            candidates
+        }
+
+        fn candidate_row_ids(candidates: &[DocCandidate]) -> Vec<u64> {
+            candidates
+                .iter()
+                .map(|candidate| match candidate.addr {
+                    CandidateAddr::RowId(row_id) => row_id,
+                    CandidateAddr::Pending(doc_id) => {
+                        panic!("candidate doc_id {doc_id} should have been resolved")
+                    }
+                })
+                .collect()
+        }
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Partition 0 has a rare single-frequency hit. Its partition-local BM25
+        // score is high enough to raise the shared WAND floor first.
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("alpha".to_owned());
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
+        for doc_id in 0..10 {
+            builder0.docs.append(1_000 + doc_id as u64, 1_000);
+        }
+        builder0.write(store.as_ref()).await.unwrap();
+
+        // Partition 1 has alpha in every document, making its partition-local
+        // IDF and block upper bound small. Globally, doc 2000 should still win
+        // because its frequency dominates after applying the global scorer.
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("alpha".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        for doc_id in 0..10 {
+            let freq = if doc_id == 0 { 100 } else { 1 };
+            builder1.posting_lists[0].add(doc_id, PositionRecorder::Count(freq));
+            builder1.docs.append(2_000 + doc_id as u64, 100);
+        }
+        builder1.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let first_partition = index
+            .partitions
+            .iter()
+            .find(|partition| partition.id() == 0)
+            .unwrap()
+            .clone();
+        let second_partition = index
+            .partitions
+            .iter()
+            .find(|partition| partition.id() == 1)
+            .unwrap()
+            .clone();
+
+        let tokens = Tokens::new(vec!["alpha".to_owned()], DocType::Text);
+        let params = FtsSearchParams::new().with_limit(Some(1));
+        let global_scorer = Arc::new(index.bm25_base_scorer(&tokens, &params).await.unwrap());
+        let first_global_score =
+            global_scorer.query_weight("alpha") * global_scorer.doc_weight(1, 1_000);
+        let second_global_score =
+            global_scorer.query_weight("alpha") * global_scorer.doc_weight(100, 100);
+        assert!(
+            second_global_score > first_global_score,
+            "test setup must make row 2000 the global winner: \
+             first={first_global_score}, second={second_global_score}"
+        );
+
+        let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let first_candidates = search_partition_with_shared_floor(
+            first_partition,
+            &tokens,
+            &params,
+            shared_threshold.clone(),
+            global_scorer.clone(),
+        )
+        .await;
+        assert_eq!(candidate_row_ids(&first_candidates), vec![1_000]);
+
+        let second_candidates = search_partition_with_shared_floor(
+            second_partition,
+            &tokens,
+            &params,
+            shared_threshold,
+            global_scorer,
+        )
+        .await;
+        assert_eq!(
+            candidate_row_ids(&second_candidates),
+            vec![2_000],
+            "shared WAND threshold must not prune the row that wins under global BM25"
+        );
     }
 
     async fn write_test_metadata(

@@ -9,10 +9,9 @@
 //! cold object storage that's tens of GiB of IO before a query has even
 //! checked whether a partition contains the term it's looking for.
 //!
-//! [`LazyDocSet`] defers the load. Cheap sync getters (`len`,
-//! `total_tokens_cached`) work without IO; async getters fetch on
-//! demand and cache. Wand scoring still needs per-doc num_tokens, but
-//! only partitions that actually contribute hits pay
+//! [`LazyDocSet`] defers the load. The cheap sync getter (`len`) works
+//! without IO; async getters fetch on demand and cache. Wand scoring
+//! still needs per-doc num_tokens, but only partitions that actually contribute hits pay
 //! `ensure_num_tokens_loaded`/`ensure_loaded`.
 
 use std::sync::Arc;
@@ -153,18 +152,6 @@ impl LazyDocSet {
         match self {
             Self::Loaded(l) => l.num_rows,
             Self::Deferred(d) => d.num_rows,
-        }
-    }
-
-    /// Sync read of cached `total_tokens`. Returns `None` for a
-    /// `Deferred` LazyDocSet that hasn't yet had any of
-    /// `total_tokens_num` / `ensure_num_tokens_loaded` / `ensure_loaded`
-    /// run. Used by sync scoring code that has already paid for one
-    /// of those async calls.
-    pub fn total_tokens_cached(&self) -> Option<u64> {
-        match self {
-            Self::Loaded(l) => Some(l.total_tokens),
-            Self::Deferred(d) => d.total_tokens.get().copied(),
         }
     }
 

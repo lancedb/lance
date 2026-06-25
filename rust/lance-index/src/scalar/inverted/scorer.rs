@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::InvertedPartition;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:
@@ -10,6 +10,16 @@ use std::collections::HashMap;
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
+}
+
+impl<T: Scorer + ?Sized> Scorer for Arc<T> {
+    fn query_weight(&self, token: &str) -> f32 {
+        self.as_ref().query_weight(token)
+    }
+
+    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+        self.as_ref().doc_weight(freq, doc_tokens)
+    }
 }
 
 // BM25 parameters
@@ -80,70 +90,6 @@ impl Scorer for MemBM25Scorer {
         let freq = freq as f32;
         let doc_tokens = doc_tokens as f32;
         let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length());
-        (K1 + 1.0) * freq / (freq + doc_norm)
-    }
-}
-
-pub struct IndexBM25Scorer<'a> {
-    partitions: Vec<&'a InvertedPartition>,
-    num_docs: usize,
-    avg_doc_length: f32,
-}
-
-impl<'a> IndexBM25Scorer<'a> {
-    /// Sync constructor. Reads each partition's cached `total_tokens` via
-    /// `LazyDocSet::total_tokens_cached()`; callers must have already
-    /// populated it (via `ensure_loaded`, `ensure_num_tokens_loaded`, or
-    /// `total_tokens_num`). Panics with a clear message otherwise — this
-    /// is the wand-scoring path where the contract is statically known.
-    pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
-        let partitions = partitions.collect::<Vec<_>>();
-        let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens: u64 = partitions
-            .iter()
-            .map(|p| {
-                p.docs.total_tokens_cached().expect(
-                    "IndexBM25Scorer::new requires each partition's total_tokens to be \
-                     cached; call `ensure_loaded` / `ensure_num_tokens_loaded` / \
-                     `total_tokens_num` first",
-                )
-            })
-            .sum();
-        let avgdl = total_tokens as f32 / num_docs as f32;
-        Self {
-            partitions,
-            num_docs,
-            avg_doc_length: avgdl,
-        }
-    }
-
-    pub fn num_docs_containing_token(&self, token: &str) -> usize {
-        self.partitions
-            .iter()
-            .map(|part| {
-                if let Some(token_id) = part.tokens.get(token) {
-                    part.inverted_list.posting_len(token_id)
-                } else {
-                    0
-                }
-            })
-            .sum()
-    }
-}
-
-impl Scorer for IndexBM25Scorer<'_> {
-    fn query_weight(&self, token: &str) -> f32 {
-        let token_docs = self.num_docs_containing_token(token);
-        if token_docs == 0 {
-            return 0.0;
-        }
-        idf(token_docs, self.num_docs)
-    }
-
-    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-        let freq = freq as f32;
-        let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length);
         (K1 + 1.0) * freq / (freq + doc_norm)
     }
 }

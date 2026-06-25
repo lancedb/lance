@@ -56,6 +56,7 @@ pub struct PostingIterator {
     // the index of current block, this can be changed by `next() and shallow_next()`
     block_idx: usize,
     approximate_upper_bound: f32,
+    block_upper_bounds: Option<Vec<f32>>,
 
     // for compressed posting list
     compressed: Option<UnsafeCell<CompressedState>>,
@@ -150,6 +151,7 @@ impl BlockMaxWindow {
     fn max_score_up_to(
         &mut self,
         list: &CompressedPostingList,
+        block_upper_bounds: Option<&[f32]>,
         start_block_idx: usize,
         up_to: u64,
     ) -> BlockMaxScore {
@@ -182,7 +184,9 @@ impl BlockMaxWindow {
         while self.next_block_idx < list.blocks.len()
             && list.block_least_doc_id(self.next_block_idx) as u64 <= up_to
         {
-            let score = list.block_max_score(self.next_block_idx);
+            let score = block_upper_bounds
+                .and_then(|scores| scores.get(self.next_block_idx).copied())
+                .unwrap_or_else(|| list.block_max_score(self.next_block_idx));
             while matches!(self.max_scores.back(), Some((_, old_score)) if *old_score <= score) {
                 self.max_scores.pop_back();
             }
@@ -319,7 +323,57 @@ impl PostingIterator {
             index: 0,
             block_idx: 0,
             approximate_upper_bound,
+            block_upper_bounds: None,
             compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
+        }
+    }
+
+    pub(crate) fn recompute_upper_bounds<S: Scorer>(&mut self, docs: &DocSet, scorer: &S) {
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                let mut block_upper_bounds = Vec::with_capacity(list.blocks.len());
+                let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
+                let mut freqs = Vec::with_capacity(BLOCK_SIZE);
+                let mut buffer = Box::new([0; BLOCK_SIZE]);
+                let remainder = list.length as usize % BLOCK_SIZE;
+
+                for block_idx in 0..list.blocks.len() {
+                    doc_ids.clear();
+                    freqs.clear();
+                    let block = list.blocks.value(block_idx);
+                    let is_remainder_block = remainder != 0 && block_idx + 1 == list.blocks.len();
+                    if is_remainder_block {
+                        decompress_posting_remainder(
+                            block,
+                            remainder,
+                            list.posting_tail_codec,
+                            &mut doc_ids,
+                            &mut freqs,
+                        );
+                    } else {
+                        decompress_posting_block(block, &mut buffer, &mut doc_ids, &mut freqs);
+                    }
+
+                    let block_upper_bound = doc_ids
+                        .iter()
+                        .zip(freqs.iter())
+                        .map(|(&doc_id, &freq)| {
+                            self.query_weight * scorer.doc_weight(freq, docs.num_tokens(doc_id))
+                        })
+                        .fold(0.0, f32::max);
+                    block_upper_bounds.push(block_upper_bound);
+                }
+                self.approximate_upper_bound =
+                    block_upper_bounds.iter().copied().fold(0.0, f32::max);
+                self.block_upper_bounds = Some(block_upper_bounds);
+            }
+            PostingList::Plain(_) => {
+                // Plain / legacy postings do not carry scorer-space impacts we
+                // can recompute by block here, so use the BM25 doc-weight
+                // ceiling as a conservative bound.
+                self.approximate_upper_bound = self.query_weight * (K1 + 1.0);
+                self.block_upper_bounds = None;
+            }
         }
     }
 
@@ -496,7 +550,11 @@ impl PostingIterator {
     #[inline]
     fn block_max_score(&self) -> f32 {
         match self.list {
-            PostingList::Compressed(ref list) => list.block_max_score(self.block_idx),
+            PostingList::Compressed(ref list) => self
+                .block_upper_bounds
+                .as_ref()
+                .and_then(|scores| scores.get(self.block_idx).copied())
+                .unwrap_or_else(|| list.block_max_score(self.block_idx)),
             PostingList::Plain(_) => self.approximate_upper_bound,
         }
     }
@@ -506,9 +564,12 @@ impl PostingIterator {
         match self.list {
             PostingList::Compressed(ref list) => {
                 let compressed = unsafe { &mut *self.compressed_state_ptr() };
-                compressed
-                    .block_max_window
-                    .max_score_up_to(list, self.block_idx, up_to)
+                compressed.block_max_window.max_score_up_to(
+                    list,
+                    self.block_upper_bounds.as_deref(),
+                    self.block_idx,
+                    up_to,
+                )
             }
             PostingList::Plain(_) => BlockMaxScore {
                 score: self.approximate_upper_bound,
@@ -728,8 +789,9 @@ pub struct Wand<'a, S: Scorer> {
     docs: &'a DocSet,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
-    // k-th score (`atomic_store_max_f32`) and prunes against the running value
-    // -- a lower bound on the global k-th, so it never drops a real top-k doc.
+    // k-th score (`atomic_store_max_f32`) and prunes against the running value.
+    // This is correct only when WAND exact scoring, final aggregation, and all
+    // block / tail upper bounds are expressed in the same BM25 score space.
     shared_threshold: Option<Arc<AtomicU32>>,
 }
 
@@ -1210,7 +1272,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             // Block-Max WAND pruning: skip the whole window when its score upper
-            // bound cannot reach the top-k threshold.
+            // bound cannot reach the top-k threshold. The bound and threshold
+            // must be in the same BM25 score space.
             if self.threshold > 0.0 && self.or_block_window_max() <= self.threshold {
                 // On the final block `up_to` is the `u64::MAX` sentinel; step once
                 // there to avoid seeking past the valid doc id range.
@@ -1978,7 +2041,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
         metrics::{MetricsCollector, NoOpMetricsCollector},
         scalar::inverted::{
@@ -2238,8 +2300,7 @@ mod tests {
             ),
         ];
 
-        let bm25 = IndexBM25Scorer::new(std::iter::empty());
-        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
         // This should trigger the bug when the second posting list becomes empty
         let result = wand
             .search(
@@ -2364,8 +2425,7 @@ mod tests {
             ),
         ];
 
-        let bm25 = IndexBM25Scorer::new(std::iter::empty());
-        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, bm25);
+        let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
 
         // set a threshold that the sum of max scores can hit,
         // but the sum of block max scores is less than the threshold,
@@ -3393,8 +3453,7 @@ mod tests {
             ),
         ];
 
-        let bm25 = IndexBM25Scorer::new(std::iter::empty());
-        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
         assert!(wand.check_exact_positions());
         assert!(wand.check_positions(0));
     }
@@ -3431,8 +3490,7 @@ mod tests {
             ),
         ];
 
-        let bm25 = IndexBM25Scorer::new(std::iter::empty());
-        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
         assert!(wand.check_exact_positions());
         assert!(wand.check_positions(0));
     }
