@@ -1153,9 +1153,6 @@ const PREWARM_CHUNK_TARGET_BYTES: u64 = 128 << 20;
 /// Cap on token rows per chunk, bounding the built `Vec` when posting lists are tiny.
 const PREWARM_MAX_CHUNK_TOKENS: usize = 256 * 1024;
 
-/// Number of chunks to read/build concurrently inside one partition.
-const PREWARM_CHUNK_CONCURRENCY: usize = 4;
-
 /// Floor on token rows per chunk, so a partition always makes progress.
 const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
 
@@ -1232,9 +1229,10 @@ fn group_range_for_start_index(starts: &[u32], token_count: usize, group_idx: us
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         let with_position = options.with_position;
+        let chunk_concurrency = self.store.io_parallelism().max(1);
         for part in &self.partitions {
             part.inverted_list
-                .prewarm_posting_lists(with_position)
+                .prewarm_posting_lists(with_position, chunk_concurrency)
                 .await?;
             // Materialize the deferred DocSet too: prewarm's contract is
             // that subsequent queries do no IO, so the per-doc row_ids /
@@ -2763,8 +2761,12 @@ impl PostingListReader {
         Ok(batch)
     }
 
-    async fn prewarm_posting_lists(&self, with_position: bool) -> Result<()> {
-        self.prewarm_posting_lists_chunked(with_position, None)
+    async fn prewarm_posting_lists(
+        &self,
+        with_position: bool,
+        chunk_concurrency: usize,
+    ) -> Result<()> {
+        self.prewarm_posting_lists_chunked(with_position, None, chunk_concurrency)
             .await?;
         Ok(())
     }
@@ -2776,6 +2778,7 @@ impl PostingListReader {
         &self,
         with_position: bool,
         chunk_tokens_override: Option<usize>,
+        chunk_concurrency: usize,
     ) -> Result<usize> {
         if with_position && !self.has_positions() {
             return Err(Error::invalid_input(
@@ -2800,6 +2803,7 @@ impl PostingListReader {
             .max(1);
         let chunk_ranges = prewarm_chunk_ranges(group_starts.as_deref(), token_count, chunk_tokens);
         let chunk_count = chunk_ranges.len();
+        let chunk_concurrency = chunk_concurrency.max(1);
 
         let read_build_start = Instant::now();
         stream::iter(chunk_ranges)
@@ -2822,7 +2826,7 @@ impl PostingListReader {
                     Result::Ok(())
                 }
             })
-            .buffer_unordered(PREWARM_CHUNK_CONCURRENCY)
+            .buffer_unordered(chunk_concurrency)
             .try_collect::<()>()
             .await?;
         let read_build_elapsed = read_build_start.elapsed();
@@ -2833,7 +2837,7 @@ impl PostingListReader {
             token_count,
             chunk_count,
             chunk_tokens,
-            chunk_concurrency = PREWARM_CHUNK_CONCURRENCY,
+            chunk_concurrency,
             posting_data_size_bytes,
             read_build_ms = read_build_elapsed.as_secs_f64() * 1000.0,
             "posting list prewarm timing"
@@ -6478,7 +6482,7 @@ mod tests {
             "test should use modern posting layout"
         );
 
-        inverted_list.prewarm_posting_lists(false).await.unwrap();
+        inverted_list.prewarm_posting_lists(false, 2).await.unwrap();
 
         // The two tiny tokens land in a single cache group [0, 2) (issue
         // #7040); both postings are read out of that group entry.
@@ -6666,7 +6670,7 @@ mod tests {
         // CHUNK_TOKENS < NUM_TOKENS each chunk is bounded below the whole partition.
         const CHUNK_TOKENS: usize = 6;
         let chunk_count = inverted_list
-            .prewarm_posting_lists_chunked(false, Some(CHUNK_TOKENS))
+            .prewarm_posting_lists_chunked(false, Some(CHUNK_TOKENS), 2)
             .await
             .unwrap();
 
@@ -6784,7 +6788,7 @@ mod tests {
 
         const CHUNK_TOKENS: usize = 5;
         let chunk_count = inverted_list
-            .prewarm_posting_lists_chunked(true, Some(CHUNK_TOKENS))
+            .prewarm_posting_lists_chunked(true, Some(CHUNK_TOKENS), 2)
             .await
             .unwrap();
         assert!(
@@ -8801,7 +8805,10 @@ mod tests {
             "fixture should span multiple groups",
         );
 
-        posting_reader.prewarm_posting_lists(false).await.unwrap();
+        posting_reader
+            .prewarm_posting_lists(false, 2)
+            .await
+            .unwrap();
 
         for token in 0..num_tokens {
             let (start, end) = posting_reader.group_range_for_token(token).unwrap();
@@ -8946,7 +8953,10 @@ mod tests {
         let posting_reader = PostingListReader::try_new(stripped, &cache).await.unwrap();
         assert!(posting_reader.group_starts.is_none());
 
-        posting_reader.prewarm_posting_lists(false).await.unwrap();
+        posting_reader
+            .prewarm_posting_lists(false, 2)
+            .await
+            .unwrap();
 
         for token_id in 0..num_tokens {
             assert!(
