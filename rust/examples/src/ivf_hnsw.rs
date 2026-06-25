@@ -39,7 +39,7 @@ struct Args {
     ef: usize,
 
     /// Max number of edges of each node.
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "15")]
     max_edges: usize,
 
     #[arg(long, default_value = "7")]
@@ -51,7 +51,7 @@ struct Args {
     #[arg(short, default_value = "10")]
     k: usize,
 
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value = "true")]
     create_index: bool,
 
     #[arg(long, default_value = "cosine")]
@@ -114,6 +114,11 @@ async fn main() {
     let args = Args::parse();
     let tempdir;
     let column = args.column.as_deref().unwrap_or("vector");
+
+    if args.max_level == 0 {
+        println!("max_level must be greater than 0");
+        return;
+    }
 
     let uri = match args.uri.as_deref() {
         Some(uri) => uri,
