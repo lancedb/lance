@@ -54,8 +54,9 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
         // Path::from_url_path decodes it first so the Path internal representation
         // holds the raw UTF-8 string. This prevents double-encoding when the
         // object store client later percent-encodes the path for HTTP requests.
-        Path::from_url_path(url.path())
-            .map_err(|e| Error::invalid_input(format!("Invalid path in URL '{}': {}", url.path(), e)))
+        Path::from_url_path(url.path()).map_err(|e| {
+            Error::invalid_input(format!("Invalid path in URL '{}': {}", url.path(), e))
+        })
     }
 
     /// Calculate the unique prefix that should be used for this object store.

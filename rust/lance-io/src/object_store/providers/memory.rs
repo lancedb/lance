@@ -42,9 +42,10 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             output.push_str(domain);
         }
         output.push_str(url.path());
-        Path::from_url_path(output).map_err(|e| {
-            lance_core::Error::invalid_input(format!("Failed to parse path '{}': {}", output, e))
-        })
+        // The in-memory store uses the Path directly as a key with no HTTP layer,
+        // so there is no re-encoding step and thus no double-encoding to avoid.
+        // Path::from also tolerates the empty segments that local temp paths embed.
+        Ok(Path::from(output))
     }
 
     fn calculate_object_store_prefix(
