@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
 """
 Benchmark allocator memory usage in pylance.
 This script compares the RSS memory growth under different allocator configurations:
