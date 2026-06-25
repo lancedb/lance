@@ -69,7 +69,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 | `min_gram`          | UInt32  | 2         | Minimum n-gram length (only for ngram tokenizer)               |
 | `max_gram`          | UInt32  | 15        | Maximum n-gram length (only for ngram tokenizer)               |
 | `prefix_only`       | Boolean | false     | Generate only prefix n-grams (only for ngram tokenizer)        |
-| `block_size`        | UInt32  | 256       | Documents per compressed posting block. Must be 128, 256, or 512. Missing values from older indexes read as 128. |
+| `block_size`        | UInt32  | 256       | Documents per compressed posting block. Must be 128 or 256. Missing values from older indexes read as 128. |
 
 ## Tokenizers
 

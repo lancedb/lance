@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_compress_posting_list_supported_block_sizes() -> Result<()> {
-        for block_size in [128, 256, 512] {
+        for block_size in [128, 256] {
             let num_rows: usize = block_size * 2 + 7;
             let doc_ids = (0..num_rows as u32).collect::<Vec<_>>();
             let frequencies = (0..num_rows as u32)

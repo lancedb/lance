@@ -44,16 +44,18 @@ class InvertedIndexParamsTest {
 
   @Test
   void blockSizeIsSerialized() {
-    ScalarIndexParams params = InvertedIndexParams.builder().blockSize(512).build();
+    ScalarIndexParams params = InvertedIndexParams.builder().blockSize(128).build();
 
     assertEquals("inverted", params.getIndexType());
     Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
-    assertEquals(512, ((Number) json.get("block_size")).intValue());
+    assertEquals(128, ((Number) json.get("block_size")).intValue());
   }
 
   @Test
   void invalidBlockSizeIsRejected() {
     assertThrows(
         IllegalArgumentException.class, () -> InvertedIndexParams.builder().blockSize(129));
+    assertThrows(
+        IllegalArgumentException.class, () -> InvertedIndexParams.builder().blockSize(512));
   }
 }

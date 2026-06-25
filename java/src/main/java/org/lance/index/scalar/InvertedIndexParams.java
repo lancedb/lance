@@ -229,16 +229,16 @@ public final class InvertedIndexParams {
     /**
      * Configure the number of documents in each compressed posting block.
      *
-     * <p>Supported values are {@code 128}, {@code 256}, and {@code 512}. New indexes default to
-     * {@code 256} when this is not set.
+     * <p>Supported values are {@code 128} and {@code 256}. New indexes default to {@code 256}
+     * when this is not set.
      *
      * @param blockSize posting block size
      * @return this builder
      * @throws IllegalArgumentException if {@code blockSize} is unsupported
      */
     public Builder blockSize(int blockSize) {
-      if (blockSize != 128 && blockSize != 256 && blockSize != 512) {
-        throw new IllegalArgumentException("blockSize must be one of 128, 256, or 512");
+      if (blockSize != 128 && blockSize != 256) {
+        throw new IllegalArgumentException("blockSize must be one of 128 or 256");
       }
       this.blockSize = blockSize;
       return this;

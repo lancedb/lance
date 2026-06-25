@@ -599,7 +599,7 @@ mod tests {
                 7.0,
                 3,
                 PostingTailCodec::VarintDelta,
-                512,
+                256,
                 Some(CompressedPositionStorage::SharedStream(stream)),
             );
             let entry = PostingList::Compressed(posting.clone());
@@ -628,7 +628,7 @@ mod tests {
             7.0,
             3,
             PostingTailCodec::VarintDelta,
-            512,
+            256,
             Some(CompressedPositionStorage::SharedStream(
                 expected_stream.clone(),
             )),

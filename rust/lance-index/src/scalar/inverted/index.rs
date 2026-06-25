@@ -5936,7 +5936,8 @@ mod tests {
         assert_eq!(parse_posting_block_size(&HashMap::new()).unwrap(), 128);
 
         let metadata = HashMap::from([(POSTING_BLOCK_SIZE_KEY.to_owned(), "512".to_owned())]);
-        assert_eq!(parse_posting_block_size(&metadata).unwrap(), 512);
+        let err = parse_posting_block_size(&metadata).unwrap_err();
+        assert!(err.to_string().contains("block_size"));
 
         let metadata = HashMap::from([(POSTING_BLOCK_SIZE_KEY.to_owned(), "129".to_owned())]);
         let err = parse_posting_block_size(&metadata).unwrap_err();

@@ -31,7 +31,7 @@ use lance_tokenizer::{
 
 pub const LEGACY_BLOCK_SIZE: usize = 128;
 pub const DEFAULT_BLOCK_SIZE: usize = 256;
-pub const VALID_BLOCK_SIZES: [usize; 3] = [128, 256, 512];
+pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -208,7 +208,7 @@ fn legacy_block_size() -> usize {
 }
 
 fn invalid_block_size_message(block_size: usize) -> String {
-    format!("FTS inverted index block_size must be one of 128, 256, or 512, got {block_size}")
+    format!("FTS inverted index block_size must be one of 128 or 256, got {block_size}")
 }
 
 pub fn validate_block_size(block_size: usize) -> Result<usize> {
@@ -357,9 +357,8 @@ impl InvertedIndexParams {
 
     /// Set the compressed posting block size.
     ///
-    /// Supported values are 128, 256, and 512. Larger values reduce block-max
-    /// metadata and WAND skip granularity; smaller values preserve the legacy
-    /// layout.
+    /// Supported values are 128 and 256. Larger values reduce block-max metadata
+    /// and WAND skip granularity; smaller values preserve the legacy layout.
     pub fn block_size(mut self, block_size: usize) -> Result<Self> {
         self.block_size = validate_block_size(block_size)?;
         Ok(self)
@@ -600,9 +599,9 @@ mod tests {
 
     #[test]
     fn test_block_size_details_conversion() {
-        let params = InvertedIndexParams::default().block_size(512).unwrap();
+        let params = InvertedIndexParams::default().block_size(256).unwrap();
         let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
-        assert_eq!(details.block_size, Some(512));
+        assert_eq!(details.block_size, Some(256));
 
         let old_details = pbold::InvertedIndexDetails {
             base_tokenizer: Some("simple".to_string()),
@@ -624,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_block_size_accepts_supported_values() {
-        for block_size in [128, 256, 512] {
+        for block_size in [128, 256] {
             let params = InvertedIndexParams::default()
                 .block_size(block_size)
                 .unwrap();
@@ -641,12 +640,15 @@ mod tests {
         let err = InvertedIndexParams::default().block_size(129).unwrap_err();
         assert!(err.to_string().contains("block_size"));
 
+        let err = InvertedIndexParams::default().block_size(512).unwrap_err();
+        assert!(err.to_string().contains("128 or 256"));
+
         let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
         json.as_object_mut()
             .unwrap()
             .insert("block_size".to_string(), serde_json::Value::from(1024));
         let err = serde_json::from_value::<InvertedIndexParams>(json).unwrap_err();
-        assert!(err.to_string().contains("128, 256, or 512"));
+        assert!(err.to_string().contains("128 or 256"));
     }
 
     #[test]
