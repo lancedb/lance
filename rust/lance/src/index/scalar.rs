@@ -1834,7 +1834,6 @@ mod tests {
         assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 1);
     }
 
-
     #[tokio::test]
     async fn test_zonemap_index_then_deletion() {
         // Tests the opposite scenario: create index FIRST, then perform deletions
