@@ -1154,7 +1154,7 @@ const PREWARM_CHUNK_TARGET_BYTES: u64 = 128 << 20;
 const PREWARM_MAX_CHUNK_TOKENS: usize = 256 * 1024;
 
 /// Number of chunks to read/build concurrently inside one partition.
-const PREWARM_CHUNK_CONCURRENCY: usize = 2;
+const PREWARM_CHUNK_CONCURRENCY: usize = 4;
 
 /// Floor on token rows per chunk, so a partition always makes progress.
 const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
