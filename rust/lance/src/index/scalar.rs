@@ -46,7 +46,7 @@ use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
 use lance_index::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    ScalarIndexCacheKey, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
@@ -436,7 +436,6 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
@@ -448,29 +447,41 @@ pub async fn open_scalar_index(
         .index_cache
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
-    if let Some(index) = plugin
-        .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
-        .await?
-    {
-        // Compatibility check is only needed on first load; a cache hit means
-        // the index was already validated when it was originally opened in
-        // this session, so we can skip the extra `open_index_file` IOP.
-        return Ok(index);
-    }
+    // Single-flight the open: concurrent cold opens share one load instead of
+    // each re-reading `page_lookup.lance` and rebuilding the lookup (an N× I/O
+    // and transient-memory spike); a warm hit returns the live index with no I/O.
+    let loader_cache = index_cache.clone();
+    index_cache
+        .get_or_insert_unsized_with_key(ScalarIndexCacheKey, move || async move {
+            // L2: a plugin with a serializable form reconstructs from a
+            // persistent backend here (at most once under single-flight).
+            if let Some(cached) = plugin
+                .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &loader_cache)
+                .await?
+            {
+                // Compatibility check is only needed on first load; a cache hit means
+                // the index was already validated when it was originally opened in
+                // this session, so we can skip the extra `open_index_file` IOP.
+                return Ok(cached);
+            }
 
-    if index_details.type_url.ends_with("LabelListIndexDetails") {
-        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
-    }
+            if index_details.type_url.ends_with("LabelListIndexDetails") {
+                validate_label_list_index_compatibility(dataset, column, index, &index_store)
+                    .await?;
+            }
 
-    let index = plugin
-        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
-        .await?;
+            let opened = plugin
+                .load_index(index_store, &index_details, frag_reuse_index, &loader_cache)
+                .await?;
 
-    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
-    metrics.record_index_load();
+            tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index.uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = opened.index_type().to_string());
+            metrics.record_index_load();
 
-    plugin.put_in_cache(&index_cache, index.clone()).await?;
-    Ok(index)
+            // Persist the serializable form for the next cold open (e.g. another process).
+            plugin.put_in_cache(&loader_cache, opened.clone()).await?;
+            Ok(opened)
+        })
+        .await
 }
 
 pub(crate) async fn infer_scalar_index_details(
@@ -1773,6 +1784,56 @@ mod tests {
             "Zonemap index with deletions returns wrong results"
         );
     }
+
+    #[tokio::test]
+    async fn test_open_scalar_index_coalesces_concurrent_cold_opens() {
+        use crate::dataset::builder::DatasetBuilder;
+        use arrow::datatypes::Int64Type;
+        use futures::future::try_join_all;
+        use lance_datagen::array;
+        use lance_index::metrics::LocalMetricsCollector;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+        use std::sync::atomic::Ordering;
+
+        let dir = TempStrDir::default();
+        let uri = dir.as_ref();
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_dataset(uri, FragmentCount::from(1), FragmentRowCount::from(200))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Reopen so the index cache is cold; the concurrent opens below all race
+        // to populate it.
+        let ds = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let id_field = ds.schema().field("id").unwrap().id;
+        let index_meta = ds
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.fields == [id_field])
+            .cloned()
+            .expect("btree index on `id`");
+
+        // Eight concurrent cold opens of the same index. Single-flight: the loader
+        // (which calls `record_index_load`) runs exactly once; the rest share its
+        // result instead of each re-reading the index and rebuilding the lookup.
+        let metrics = LocalMetricsCollector::default();
+        let indices =
+            try_join_all((0..8).map(|_| open_scalar_index(&ds, "id", &index_meta, &metrics)))
+                .await
+                .unwrap();
+
+        assert_eq!(indices.len(), 8);
+        assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 1);
+    }
+
 
     #[tokio::test]
     async fn test_zonemap_index_then_deletion() {
