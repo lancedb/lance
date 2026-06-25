@@ -1467,10 +1467,9 @@ impl DatasetIndexExt for Dataset {
         let field_id = field.id;
         let field_path = self.schema().field_path(field_id)?;
 
-        // A multi-segment ZoneMap over one column is several index entries that
-        // share a name, each over a disjoint fragment subset; collect them all.
-        // Match the single field, then the details type (the column may also
-        // carry e.g. a BTree).
+        // A multi-segment ZoneMap is several index entries over the same column,
+        // each covering a disjoint fragment subset. Match the field, then the
+        // details type (the column may also carry e.g. a BTree).
         let indices = self.load_indices().await?;
         let segments: Vec<_> = indices
             .iter()
@@ -1486,10 +1485,8 @@ impl DatasetIndexExt for Dataset {
         }
 
         // Soundness: the segments must *jointly* cover every live fragment, else
-        // the fold sees only a subset of the data and could prune live rows.
-        // Fragments appended after the index was built, or a segment set that
-        // doesn't span the table, leave a live fragment uncovered -> bail. Extra
-        // dead fragments in the union are fine (the range stays a superset).
+        // the fold sees only a subset and could prune live rows (e.g. fragments
+        // appended after the index was built). Extra dead fragments are harmless.
         let mut covered = RoaringBitmap::new();
         for idx in &segments {
             let Some(bitmap) = idx.fragment_bitmap.as_ref() else {
@@ -1501,8 +1498,8 @@ impl DatasetIndexExt for Dataset {
             return Ok(None);
         }
 
-        // Open every segment and fold their zones into one global range. Hold
-        // the opened indices so the ZoneMapIndex refs we fold stay borrowed.
+        // Keep the opened indices alive so the `ZoneMapIndex` refs we fold over
+        // stay borrowed.
         let mut opened = Vec::with_capacity(segments.len());
         for idx in &segments {
             opened.push(
