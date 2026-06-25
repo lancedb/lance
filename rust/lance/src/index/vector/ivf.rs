@@ -958,13 +958,16 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     ivf_mut.write(&mut writer).await?;
-    let index_size = writer.tell().await? as u64;
+    // `finish` writes the file footer (page tables, statistics, dictionaries,
+    // schema metadata, magic bytes), so the on-disk size is only known after it
+    // returns. The underlying object writer's cursor stays valid post-shutdown.
     writer.finish().await?;
+    let index_size = writer.tell().await? as u64;
 
     // Write the aux file
     aux_ivf.write(&mut aux_writer).await?;
-    let aux_size = aux_writer.tell().await? as u64;
     aux_writer.finish().await?;
+    let aux_size = aux_writer.tell().await? as u64;
 
     Ok((
         existing_indices.len() - start_pos,
@@ -6563,5 +6566,81 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert!(!indices.is_empty(), "should have at least one index");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ivf_hnsw_records_actual_file_sizes() {
+        // Regression test: `optimize_ivf_hnsw_indices` must record the on-disk
+        // file sizes, which are only known after `finish()` writes the footer.
+        const DIM: usize = 16;
+        let data = gen_batch()
+            .col(
+                "vec",
+                array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)),
+            )
+            .into_batch_rows(RowCount::from(1_000))
+            .unwrap();
+        let schema = data.schema();
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        // Legacy file version keeps the index on the v1 path that goes through
+        // `optimize_ivf_hnsw_indices`.
+        let mut params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default().num_edges(50),
+            SQBuildParams::default(),
+        );
+        params.version(IndexFileVersion::Legacy);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Append unindexed data so `optimize_indices` has something to merge.
+        let more = gen_batch()
+            .col(
+                "vec",
+                array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)),
+            )
+            .into_batch_rows(RowCount::from(500))
+            .unwrap();
+        let more = RecordBatch::try_new(schema.clone(), more.columns().to_vec()).unwrap();
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![more])
+            .await
+            .unwrap();
+
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.first().expect("should have an index");
+        let files = index
+            .files
+            .as_ref()
+            .expect("optimized index should record file sizes");
+        assert!(!files.is_empty(), "index should record at least one file");
+
+        let indices_dir = dataset.indices_dir().join(index.uuid.to_string());
+        for file in files {
+            let actual = dataset
+                .object_store
+                .size(&indices_dir.clone().join(file.path.as_str()))
+                .await
+                .unwrap();
+            assert_eq!(
+                file.size_bytes, actual,
+                "recorded size for {} must match the on-disk size",
+                file.path
+            );
+        }
     }
 }
