@@ -1232,26 +1232,16 @@ fn group_range_for_start_index(starts: &[u32], token_count: usize, group_idx: us
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         let with_position = options.with_position;
-        let io_parallelism = self.store.io_parallelism();
-        let prewarm_futures = self
-            .partitions
-            .iter()
-            .map(Arc::clone)
-            .map(|part| async move {
-                part.inverted_list
-                    .prewarm_posting_lists(with_position)
-                    .await?;
-                // Materialize the deferred DocSet too: prewarm's contract is
-                // that subsequent queries do no IO, so the per-doc row_ids /
-                // num_tokens must be resident, not lazily faulted in at query
-                // time. `ensure_loaded` opens, reads, and drops the reader.
-                part.docs.ensure_loaded().await?;
-                Result::Ok(())
-            });
-        stream::iter(prewarm_futures)
-            .buffer_unordered(io_parallelism)
-            .try_collect::<Vec<_>>()
-            .await?;
+        for part in &self.partitions {
+            part.inverted_list
+                .prewarm_posting_lists(with_position)
+                .await?;
+            // Materialize the deferred DocSet too: prewarm's contract is
+            // that subsequent queries do no IO, so the per-doc row_ids /
+            // num_tokens must be resident, not lazily faulted in at query
+            // time. `ensure_loaded` opens, reads, and drops the reader.
+            part.docs.ensure_loaded().await?;
+        }
         Ok(())
     }
     /// Search docs match the input text.
