@@ -43,6 +43,7 @@ use super::index::{
     CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
     Positions, PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
 };
+use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 
 // ---------------------------------------------------------------------------
 // Tags
@@ -291,6 +292,7 @@ fn serialize_compressed(
         posting_tail_codec: posting_tail_codec_to_proto(posting.posting_tail_codec) as i32,
         position_storage: position_storage as i32,
         position_stream_codec: position_stream_codec as i32,
+        block_size: posting.block_size as u32,
     };
     w.write_header(&header)?;
 
@@ -322,12 +324,18 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
 
     let stream_codec = proto_to_position_stream_codec(header.position_stream_codec());
     let positions = read_position_sections(r, header.position_storage(), stream_codec)?;
+    let block_size = if header.block_size == 0 {
+        LEGACY_BLOCK_SIZE
+    } else {
+        validate_block_size(header.block_size as usize)?
+    };
 
     Ok(CompressedPostingList::new(
         blocks,
         header.max_score,
         header.length,
         posting_tail_codec,
+        block_size,
         positions,
     ))
 }
@@ -533,13 +541,14 @@ mod tests {
             Some(&[6, 7, 8, 9, 10][..]),
         ]);
         let posting =
-            CompressedPostingList::new(blocks, 3.5, 42, PostingTailCodec::VarintDelta, None);
+            CompressedPostingList::new(blocks, 3.5, 42, PostingTailCodec::VarintDelta, 256, None);
         let entry = PostingList::Compressed(posting.clone());
         match roundtrip_posting_list(&entry) {
             PostingList::Compressed(restored) => {
                 assert_eq!(restored.max_score, posting.max_score);
                 assert_eq!(restored.length, posting.length);
                 assert_eq!(restored.posting_tail_codec, posting.posting_tail_codec);
+                assert_eq!(restored.block_size, posting.block_size);
                 assert_eq!(restored.blocks, posting.blocks);
                 assert!(restored.positions.is_none());
             }
@@ -555,6 +564,7 @@ mod tests {
             1.25,
             5,
             PostingTailCodec::Fixed32,
+            crate::scalar::inverted::LEGACY_BLOCK_SIZE,
             Some(CompressedPositionStorage::LegacyPerDoc(legacy_positions(
                 &[&[0, 4, 8]],
             ))),
@@ -589,6 +599,7 @@ mod tests {
                 7.0,
                 3,
                 PostingTailCodec::VarintDelta,
+                512,
                 Some(CompressedPositionStorage::SharedStream(stream)),
             );
             let entry = PostingList::Compressed(posting.clone());
@@ -617,6 +628,7 @@ mod tests {
             7.0,
             3,
             PostingTailCodec::VarintDelta,
+            512,
             Some(CompressedPositionStorage::SharedStream(
                 expected_stream.clone(),
             )),
@@ -651,6 +663,7 @@ mod tests {
             2.5,
             7,
             PostingTailCodec::VarintDelta,
+            256,
             None,
         ));
 
@@ -760,6 +773,7 @@ mod tests {
                 7.0,
                 3,
                 PostingTailCodec::VarintDelta,
+                256,
                 Some(CompressedPositionStorage::SharedStream(stream)),
             ))
         }
@@ -810,6 +824,7 @@ mod tests {
                     7.0,
                     3,
                     PostingTailCodec::VarintDelta,
+                    256,
                     None,
                 ))
             };

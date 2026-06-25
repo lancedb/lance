@@ -74,11 +74,11 @@ struct CompressedState {
 }
 
 impl CompressedState {
-    fn new() -> Self {
+    fn new(block_size: usize) -> Self {
         Self {
             block_idx: 0,
-            doc_ids: Vec::with_capacity(BLOCK_SIZE),
-            freqs: Vec::with_capacity(BLOCK_SIZE),
+            doc_ids: Vec::with_capacity(block_size),
+            freqs: Vec::with_capacity(block_size),
             buffer: Box::new([0; BLOCK_SIZE]),
             position_block_idx: None,
             position_values: Vec::new(),
@@ -95,11 +95,12 @@ impl CompressedState {
         num_blocks: usize,
         length: u32,
         tail_codec: super::PostingTailCodec,
+        block_size: usize,
     ) {
         self.doc_ids.clear();
         self.freqs.clear();
 
-        let remainder = length as usize % BLOCK_SIZE;
+        let remainder = length as usize % block_size;
         if block_idx + 1 == num_blocks && remainder != 0 {
             decompress_posting_remainder(
                 block,
@@ -109,7 +110,13 @@ impl CompressedState {
                 &mut self.freqs,
             );
         } else {
-            decompress_posting_block(block, &mut self.buffer, &mut self.doc_ids, &mut self.freqs);
+            decompress_posting_block(
+                block,
+                &mut self.buffer,
+                &mut self.doc_ids,
+                &mut self.freqs,
+                block_size,
+            );
         }
         self.block_idx = block_idx;
         self.position_block_idx = None;
@@ -279,6 +286,7 @@ impl PostingIterator {
                 list.blocks.len(),
                 list.length,
                 list.posting_tail_codec,
+                list.block_size,
             );
         }
         compressed as *mut CompressedState
@@ -307,8 +315,12 @@ impl PostingIterator {
             Some(max_score) => max_score,
             None => idf(list.len(), num_doc) * (K1 + 1.0),
         };
-
-        let is_compressed = matches!(list, PostingList::Compressed(_));
+        let compressed = match &list {
+            PostingList::Compressed(list) => {
+                Some(UnsafeCell::new(CompressedState::new(list.block_size)))
+            }
+            PostingList::Plain(_) => None,
+        };
 
         Self {
             token,
@@ -319,7 +331,7 @@ impl PostingIterator {
             index: 0,
             block_idx: 0,
             approximate_upper_bound,
-            compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
+            compressed,
         }
     }
 
@@ -361,8 +373,8 @@ impl PostingIterator {
 
         match self.list {
             PostingList::Compressed(ref list) => {
-                let block_idx = self.index / BLOCK_SIZE;
-                let block_offset = self.index % BLOCK_SIZE;
+                let block_idx = self.index / list.block_size;
+                let block_offset = self.index % list.block_size;
                 let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
 
                 // Read from the decompressed block
@@ -400,8 +412,8 @@ impl PostingIterator {
                     ))
                 }
                 CompressedPositionStorage::SharedStream(stream) => {
-                    let block_idx = self.index / BLOCK_SIZE;
-                    let block_offset = self.index % BLOCK_SIZE;
+                    let block_idx = self.index / list.block_size;
+                    let block_offset = self.index % list.block_size;
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     if compressed.position_block_idx != Some(block_idx) {
@@ -441,33 +453,33 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
-                let mut block_idx = self.index / BLOCK_SIZE;
+                let mut block_idx = self.index / list.block_size;
                 while block_idx + 1 < list.blocks.len()
                     && list.block_least_doc_id(block_idx + 1) <= least_id
                 {
                     block_idx += 1;
                 }
-                self.index = self.index.max(block_idx * BLOCK_SIZE);
+                self.index = self.index.max(block_idx * list.block_size);
                 let length = list.length as usize;
                 while self.index < length {
-                    let block_idx = self.index / BLOCK_SIZE;
-                    let block_offset = self.index % BLOCK_SIZE;
+                    let block_idx = self.index / list.block_size;
+                    let block_offset = self.index % list.block_size;
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     let in_block = &compressed.doc_ids[block_offset..];
                     let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
                     let new_offset = block_offset + offset_in_block;
                     if new_offset < compressed.doc_ids.len() {
-                        self.index = block_idx * BLOCK_SIZE + new_offset;
+                        self.index = block_idx * list.block_size + new_offset;
                         break;
                     }
                     if block_idx + 1 >= list.blocks.len() {
                         self.index = length;
                         break;
                     }
-                    self.index = (block_idx + 1) * BLOCK_SIZE;
+                    self.index = (block_idx + 1) * list.block_size;
                 }
-                self.block_idx = self.index / BLOCK_SIZE;
+                self.block_idx = self.index / list.block_size;
             }
             PostingList::Plain(ref list) => {
                 self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
@@ -2146,6 +2158,7 @@ mod tests {
                 max_score,
                 doc_ids.len() as u32,
                 crate::scalar::inverted::PostingTailCodec::VarintDelta,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
                 None,
             ))
         } else {

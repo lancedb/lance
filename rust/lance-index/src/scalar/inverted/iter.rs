@@ -28,6 +28,7 @@ impl<'a> PostingListIterator<'a> {
                     posting.blocks.clone(),
                     posting.posting_tail_codec,
                     posting.positions.clone(),
+                    posting.block_size,
                 )))
             }
         }
@@ -82,6 +83,7 @@ pub struct CompressedPostingListIterator {
     next_block_idx: usize,
     posting_tail_codec: PostingTailCodec,
     positions: Option<CompressedPositionStorage>,
+    block_size: usize,
     idx: usize,
     doc_ids: Vec<u32>,
     frequencies: Vec<u32>,
@@ -97,10 +99,11 @@ impl CompressedPostingListIterator {
         blocks: LargeBinaryArray,
         posting_tail_codec: PostingTailCodec,
         positions: Option<CompressedPositionStorage>,
+        block_size: usize,
     ) -> Self {
         debug_assert!(length > 0, "length: {}", length);
         debug_assert_eq!(
-            length.div_ceil(BLOCK_SIZE),
+            length.div_ceil(block_size),
             blocks.len(),
             "length: {}, num_blocks: {}",
             length,
@@ -108,11 +111,12 @@ impl CompressedPostingListIterator {
         );
 
         Self {
-            remainder: length % BLOCK_SIZE,
+            remainder: length % block_size,
             blocks,
             next_block_idx: 0,
             posting_tail_codec,
             positions,
+            block_size,
             idx: 0,
             doc_ids: Vec::new(),
             frequencies: Vec::new(),
@@ -172,6 +176,7 @@ impl Iterator for CompressedPostingListIterator {
                 &mut self.buffer,
                 &mut self.doc_ids,
                 &mut self.frequencies,
+                self.block_size,
             );
         }
         self.doc_idx_in_block = 0;

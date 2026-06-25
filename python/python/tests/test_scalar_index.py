@@ -949,6 +949,19 @@ def test_create_scalar_index_fts_alias(dataset):
     assert any(idx.index_type == "Inverted" for idx in dataset.describe_indices())
 
 
+def test_create_scalar_index_fts_block_size(dataset):
+    dataset.create_scalar_index(
+        "doc", index_type="INVERTED", with_position=False, block_size=512
+    )
+    row = dataset.take(indices=[0], columns=["doc"])
+    query = row.column(0)[0].as_py().split(" ")[0]
+    results = dataset.scanner(columns=["doc"], full_text_query=query).to_table()
+    assert results.num_rows > 0
+
+    with pytest.raises(ValueError, match="block_size"):
+        dataset.create_scalar_index("doc2", index_type="INVERTED", block_size=129)
+
+
 def test_multi_index_create(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100

@@ -53,6 +53,7 @@ public final class InvertedIndexParams {
     private Integer minNgramLength;
     private Integer maxNgramLength;
     private Boolean prefixOnly;
+    private Integer blockSize = 256;
     private Boolean skipMerge;
 
     /**
@@ -226,6 +227,24 @@ public final class InvertedIndexParams {
     }
 
     /**
+     * Configure the number of documents in each compressed posting block.
+     *
+     * <p>Supported values are {@code 128}, {@code 256}, and {@code 512}. New indexes default to
+     * {@code 256} when this is not set.
+     *
+     * @param blockSize posting block size
+     * @return this builder
+     * @throws IllegalArgumentException if {@code blockSize} is unsupported
+     */
+    public Builder blockSize(int blockSize) {
+      if (blockSize != 128 && blockSize != 256 && blockSize != 512) {
+        throw new IllegalArgumentException("blockSize must be one of 128, 256, or 512");
+      }
+      this.blockSize = blockSize;
+      return this;
+    }
+
+    /**
      * Configure whether to skip the partition merge stage after indexing. If true, skip the
      * partition merge stage after indexing. This can be useful for distributed indexing where merge
      * is handled separately.
@@ -281,6 +300,9 @@ public final class InvertedIndexParams {
       }
       if (prefixOnly != null) {
         params.put("prefix_only", prefixOnly);
+      }
+      if (blockSize != null) {
+        params.put("block_size", blockSize);
       }
       if (skipMerge != null) {
         params.put("skip_merge", skipMerge);
