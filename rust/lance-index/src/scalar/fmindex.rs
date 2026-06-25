@@ -1372,7 +1372,7 @@ impl ScalarIndex for FMIndexScalarIndex {
     ) -> Result<CreatedIndex> {
         let files = write_partitioned_fmindex_stream(new_data, dest).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
+            index_details: prost_types::Any::from_msg(&pb::FmIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
             files,
         })
@@ -1702,7 +1702,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
     ) -> Result<CreatedIndex> {
         let files = write_partitioned_fmindex_stream(data, store).await?;
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::FmIndexIndexDetails {}).unwrap(),
+            index_details: prost_types::Any::from_msg(&pb::FmIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
             files,
         })
@@ -1734,9 +1734,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         fri: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let _ = details
-            .to_msg::<pb::FmIndexIndexDetails>()
-            .unwrap_or_default();
+        let _ = details.to_msg::<pb::FmIndexDetails>().unwrap_or_default();
         Ok(FMIndexScalarIndex::load(store, fri, cache).await? as Arc<dyn ScalarIndex>)
     }
     async fn load_statistics(

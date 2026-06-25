@@ -287,6 +287,9 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
 
+    /// Return a store that submits its I/O at the given base priority.
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore>;
+
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating

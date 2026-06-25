@@ -995,6 +995,16 @@ class LanceDataset(pa.dataset.Dataset):
         """Returns index information for all indices in the dataset."""
         return self._ds.describe_indices()
 
+    def remap_row_addrs(self, addrs: "pa.Array") -> "Optional[pa.Array]":
+        """Remap row addresses across compactions still recorded in the
+        fragment-reuse index. Rows a compaction dropped become null. The index
+        retains only recent rounds (older ones are pruned as index remap catches
+        up), so remap promptly: an address whose round was pruned is returned
+        unchanged, not remapped. Returns ``None`` when there is no fragment-reuse
+        index.
+        """
+        return self._ds.remap_row_addrs(addrs)
+
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
             "LanceDataset.index_statistics() is deprecated, "
@@ -3227,7 +3237,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 5 types of scalar indices available today.
+        Lance supports the following scalar index types:
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -3326,6 +3336,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "icu": ICU dictionary-based Unicode word segmentation.
+            * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true

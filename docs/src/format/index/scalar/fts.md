@@ -81,6 +81,7 @@ The full text search index supports multiple tokenizer types for different text 
 | **raw**        | No tokenization, treats entire text as single token                       | Exact matching         |
 | **ngram**      | Breaks text into overlapping character sequences                          | Substring/fuzzy search |
 | **icu**        | ICU dictionary-based Unicode word segmentation                            | Mixed-language text    |
+| **icu/split**  | ICU segmentation with simple-style delimiter splitting                    | Mixed-language identifiers |
 | **jieba/***    | Chinese text tokenizer with word segmentation                             | Chinese text           |
 | **lindera/***  | Japanese text tokenizer with morphological analysis                       | Japanese text          |
 
@@ -88,8 +89,10 @@ The full text search index supports multiple tokenizer types for different text 
 
 The ICU tokenizer uses Unicode word boundary rules and dictionary-based segmentation for complex scripts. It is useful for mixed-language text where the default `simple` tokenizer would keep an unspaced CJK span as one large token.
 
+By default, Lance preserves ICU word segments as returned by ICU. Use `base_tokenizer: "icu/split"` to split ICU word segments again on non-alphanumeric delimiters such as underscores and punctuation. For example, `hello_world こんにちは世界` is tokenized as `hello`, `world`, `こんにちは`, and `世界`.
+
 - **Models**: Uses compiled ICU4X segmenter data bundled with Lance
-- **Usage**: Specify as `icu`
+- **Usage**: Specify as `icu`, or `icu/split` to split punctuation-delimited identifiers
 - **Features**:
   - Unicode-aware word boundary detection
   - Dictionary-based segmentation for Chinese, Japanese, Khmer, Lao, Myanmar, and Thai

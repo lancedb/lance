@@ -45,6 +45,8 @@ pub struct LanceIndexStore {
     /// When set, used to avoid HEAD calls when opening files
     file_sizes: HashMap<String, u64>,
     format_version: LanceFileVersion,
+    /// Base I/O priority for all requests this store submits to `scheduler`.
+    io_priority: u64,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -88,6 +90,7 @@ impl LanceIndexStore {
             scheduler,
             file_sizes: HashMap::new(),
             format_version,
+            io_priority: 0,
         }
     }
 
@@ -98,6 +101,11 @@ impl LanceIndexStore {
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
         self.file_sizes = file_sizes;
         self
+    }
+
+    /// The base I/O priority all this store's requests are submitted at.
+    pub fn io_priority(&self) -> u64 {
+        self.io_priority
     }
 
     fn index_file_path(&self, name: &str) -> Result<Path> {
@@ -432,6 +440,15 @@ impl IndexStore for LanceIndexStore {
         }))
     }
 
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        // The `scheduler` is shared (`Arc`), so this clone is cheap and the new
+        // priority only affects requests this clone submits.
+        Arc::new(Self {
+            io_priority,
+            ..self.clone()
+        })
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
@@ -440,7 +457,10 @@ impl IndexStore for LanceIndexStore {
             .get(name)
             .map(|&size| CachedFileSize::new(size))
             .unwrap_or_else(CachedFileSize::unknown);
-        let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
+        let file_scheduler = self
+            .scheduler
+            .open_file_with_priority(&path, self.io_priority, &cached_size)
+            .await?;
         match current_reader::FileReader::try_open(
             file_scheduler,
             None,

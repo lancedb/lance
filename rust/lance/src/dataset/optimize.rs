@@ -627,6 +627,15 @@ impl DefaultCompactionPlanner {
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        if self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
+            return Err(Error::invalid_input(
+                "defer_index_remap=true is not supported on datasets with stable row IDs: \
+                 stable row IDs do not require index remapping during compaction, so there \
+                 is nothing to defer."
+                    .to_string(),
+            ));
+        }
+
         // get_fragments should be returning fragments in sorted order (by id)
         // and fragment ids should be unique
         let fragments = dataset.get_fragments();
@@ -3034,6 +3043,49 @@ mod tests {
         load_frag_reuse_index_details(&dataset, &frag_reuse_meta)
             .await
             .expect("loading large frag reuse index details must not fail");
+    }
+
+    #[tokio::test]
+    async fn test_defer_index_remap_rejected_with_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1000, // 9 fragments
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.uses_stable_row_ids());
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 3_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        // Fails at planning time, before any fragment is rewritten.
+        let plan_err = plan_compaction(&dataset, &options).await.unwrap_err();
+        assert!(matches!(plan_err, Error::InvalidInput { .. }));
+        let msg = plan_err.to_string();
+        assert!(msg.contains("defer_index_remap"));
+        assert!(msg.contains("stable row IDs"));
+
+        // The full compact_files entry point fails the same way and leaves the
+        // dataset untouched (no new manifest version, no orphaned data files).
+        let version_before = dataset.manifest.version;
+        let compact_err = compact_files(&mut dataset, options, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(compact_err, Error::InvalidInput { .. }));
+        assert_eq!(dataset.manifest.version, version_before);
     }
 
     #[tokio::test]

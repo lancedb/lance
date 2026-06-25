@@ -289,7 +289,7 @@ fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
         .as_ref()
-        .is_some_and(|details| details.type_url.ends_with("FMIndexIndexDetails"))
+        .is_some_and(|details| details.type_url.ends_with("FMIndexDetails"))
 }
 
 // Cache keys for different index types
@@ -458,7 +458,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "BloomFilter" => IndexType::BloomFilter.to_string(),
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
-        "FMIndex" => IndexType::Fm.to_string(),
+        "FMIndex" | "FM" => IndexType::Fm.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),

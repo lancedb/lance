@@ -60,7 +60,9 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexExt, IndexSegment, vector::VectorIndexParams};
+use lance::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -1019,6 +1021,32 @@ impl Dataset {
                     index_name, err
                 )),
             })
+    }
+
+    /// Remap row addresses across compactions still recorded in the
+    /// fragment-reuse index. Rows a compaction dropped become null. The index
+    /// retains only recent rounds (older ones are pruned as index remap catches
+    /// up), so remap promptly: an address whose round was pruned is returned
+    /// unchanged, not remapped. Returns None when there is no fragment-reuse
+    /// index.
+    fn remap_row_addrs(
+        &self,
+        py: Python,
+        addrs: PyArrowType<ArrayData>,
+    ) -> PyResult<Option<PyArrowType<ArrayData>>> {
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let array = make_array(addrs.0);
+        let frag_reuse_index = rt()
+            .block_on(
+                Some(py),
+                self.ds.open_frag_reuse_index(&NoOpMetricsCollector),
+            )?
+            .map_err(|err| {
+                PyIOError::new_err(format!("failed to open fragment reuse index: {err}"))
+            })?;
+
+        Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
     }
 
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
