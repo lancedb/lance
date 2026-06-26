@@ -2002,6 +2002,12 @@ mod tests {
             self.inner.io_parallelism()
         }
 
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_priority(io_priority),
+            })
+        }
+
         async fn new_index_file(
             &self,
             _name: &str,
@@ -2595,6 +2601,34 @@ mod tests {
         .await
         .unwrap_err();
 
+        assert!(format!("{err}").contains("injected FMIndex write failure"));
+    }
+
+    #[tokio::test]
+    async fn test_fail_new_file_store_with_io_priority_preserves_failure() {
+        // `with_io_priority` re-wraps in `FailNewFileStore`, so the reprioritized
+        // store must keep injecting the `new_index_file` failure.
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let inner = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        )) as Arc<dyn IndexStore>;
+        let store = FailNewFileStore { inner };
+
+        let reprioritized = store.with_io_priority(7);
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "x",
+            DataType::UInt64,
+            false,
+        )]));
+        let err = reprioritized
+            .new_index_file("test", schema)
+            .await
+            .err()
+            .expect("new_index_file should fail");
         assert!(format!("{err}").contains("injected FMIndex write failure"));
     }
 
