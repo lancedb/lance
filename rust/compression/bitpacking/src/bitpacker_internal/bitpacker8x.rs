@@ -3,9 +3,7 @@
 
 use super::BitPacker;
 
-#[cfg(target_arch = "x86_64")]
-use crate::bitpacker_internal::Available;
-use crate::bitpacker_internal::UnsafeBitPacker;
+use crate::bitpacker_internal::{Available, UnsafeBitPacker};
 
 const BLOCK_LEN: usize = 32 * 8;
 
@@ -80,6 +78,195 @@ mod avx2 {
     impl Available for UnsafeBitPackerImpl {
         fn available() -> bool {
             is_x86_feature_detected!("avx2")
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod neon {
+    use super::BLOCK_LEN;
+    use crate::bitpacker_internal::Available;
+    use std::arch::aarch64::{
+        uint32x4_t, vaddq_u32, vandq_u32, vdupq_n_u32, vextq_u32, vgetq_lane_u32, vld1q_u32,
+        vorrq_u32, vshlq_n_u32, vshrq_n_u32, vst1q_u32, vsubq_u32,
+    };
+
+    pub(crate) type DataType = [uint32x4_t; 2];
+
+    #[inline]
+    unsafe fn set1(el: i32) -> DataType {
+        let lanes = vdupq_n_u32(el as u32);
+        [lanes, lanes]
+    }
+
+    #[inline]
+    unsafe fn right_shift_32<const N: i32>(el: DataType) -> DataType {
+        const {
+            assert!(N >= 0);
+            assert!(N <= 32);
+        }
+
+        match N {
+            0 => el,
+            1 => [vshrq_n_u32::<1>(el[0]), vshrq_n_u32::<1>(el[1])],
+            2 => [vshrq_n_u32::<2>(el[0]), vshrq_n_u32::<2>(el[1])],
+            3 => [vshrq_n_u32::<3>(el[0]), vshrq_n_u32::<3>(el[1])],
+            4 => [vshrq_n_u32::<4>(el[0]), vshrq_n_u32::<4>(el[1])],
+            5 => [vshrq_n_u32::<5>(el[0]), vshrq_n_u32::<5>(el[1])],
+            6 => [vshrq_n_u32::<6>(el[0]), vshrq_n_u32::<6>(el[1])],
+            7 => [vshrq_n_u32::<7>(el[0]), vshrq_n_u32::<7>(el[1])],
+            8 => [vshrq_n_u32::<8>(el[0]), vshrq_n_u32::<8>(el[1])],
+            9 => [vshrq_n_u32::<9>(el[0]), vshrq_n_u32::<9>(el[1])],
+            10 => [vshrq_n_u32::<10>(el[0]), vshrq_n_u32::<10>(el[1])],
+            11 => [vshrq_n_u32::<11>(el[0]), vshrq_n_u32::<11>(el[1])],
+            12 => [vshrq_n_u32::<12>(el[0]), vshrq_n_u32::<12>(el[1])],
+            13 => [vshrq_n_u32::<13>(el[0]), vshrq_n_u32::<13>(el[1])],
+            14 => [vshrq_n_u32::<14>(el[0]), vshrq_n_u32::<14>(el[1])],
+            15 => [vshrq_n_u32::<15>(el[0]), vshrq_n_u32::<15>(el[1])],
+            16 => [vshrq_n_u32::<16>(el[0]), vshrq_n_u32::<16>(el[1])],
+            17 => [vshrq_n_u32::<17>(el[0]), vshrq_n_u32::<17>(el[1])],
+            18 => [vshrq_n_u32::<18>(el[0]), vshrq_n_u32::<18>(el[1])],
+            19 => [vshrq_n_u32::<19>(el[0]), vshrq_n_u32::<19>(el[1])],
+            20 => [vshrq_n_u32::<20>(el[0]), vshrq_n_u32::<20>(el[1])],
+            21 => [vshrq_n_u32::<21>(el[0]), vshrq_n_u32::<21>(el[1])],
+            22 => [vshrq_n_u32::<22>(el[0]), vshrq_n_u32::<22>(el[1])],
+            23 => [vshrq_n_u32::<23>(el[0]), vshrq_n_u32::<23>(el[1])],
+            24 => [vshrq_n_u32::<24>(el[0]), vshrq_n_u32::<24>(el[1])],
+            25 => [vshrq_n_u32::<25>(el[0]), vshrq_n_u32::<25>(el[1])],
+            26 => [vshrq_n_u32::<26>(el[0]), vshrq_n_u32::<26>(el[1])],
+            27 => [vshrq_n_u32::<27>(el[0]), vshrq_n_u32::<27>(el[1])],
+            28 => [vshrq_n_u32::<28>(el[0]), vshrq_n_u32::<28>(el[1])],
+            29 => [vshrq_n_u32::<29>(el[0]), vshrq_n_u32::<29>(el[1])],
+            30 => [vshrq_n_u32::<30>(el[0]), vshrq_n_u32::<30>(el[1])],
+            31 => [vshrq_n_u32::<31>(el[0]), vshrq_n_u32::<31>(el[1])],
+            32 => set1(0),
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+
+    #[inline]
+    unsafe fn left_shift_32<const N: i32>(el: DataType) -> DataType {
+        const {
+            assert!(N >= 0);
+            assert!(N <= 32);
+        }
+
+        match N {
+            0 => el,
+            1 => [vshlq_n_u32::<1>(el[0]), vshlq_n_u32::<1>(el[1])],
+            2 => [vshlq_n_u32::<2>(el[0]), vshlq_n_u32::<2>(el[1])],
+            3 => [vshlq_n_u32::<3>(el[0]), vshlq_n_u32::<3>(el[1])],
+            4 => [vshlq_n_u32::<4>(el[0]), vshlq_n_u32::<4>(el[1])],
+            5 => [vshlq_n_u32::<5>(el[0]), vshlq_n_u32::<5>(el[1])],
+            6 => [vshlq_n_u32::<6>(el[0]), vshlq_n_u32::<6>(el[1])],
+            7 => [vshlq_n_u32::<7>(el[0]), vshlq_n_u32::<7>(el[1])],
+            8 => [vshlq_n_u32::<8>(el[0]), vshlq_n_u32::<8>(el[1])],
+            9 => [vshlq_n_u32::<9>(el[0]), vshlq_n_u32::<9>(el[1])],
+            10 => [vshlq_n_u32::<10>(el[0]), vshlq_n_u32::<10>(el[1])],
+            11 => [vshlq_n_u32::<11>(el[0]), vshlq_n_u32::<11>(el[1])],
+            12 => [vshlq_n_u32::<12>(el[0]), vshlq_n_u32::<12>(el[1])],
+            13 => [vshlq_n_u32::<13>(el[0]), vshlq_n_u32::<13>(el[1])],
+            14 => [vshlq_n_u32::<14>(el[0]), vshlq_n_u32::<14>(el[1])],
+            15 => [vshlq_n_u32::<15>(el[0]), vshlq_n_u32::<15>(el[1])],
+            16 => [vshlq_n_u32::<16>(el[0]), vshlq_n_u32::<16>(el[1])],
+            17 => [vshlq_n_u32::<17>(el[0]), vshlq_n_u32::<17>(el[1])],
+            18 => [vshlq_n_u32::<18>(el[0]), vshlq_n_u32::<18>(el[1])],
+            19 => [vshlq_n_u32::<19>(el[0]), vshlq_n_u32::<19>(el[1])],
+            20 => [vshlq_n_u32::<20>(el[0]), vshlq_n_u32::<20>(el[1])],
+            21 => [vshlq_n_u32::<21>(el[0]), vshlq_n_u32::<21>(el[1])],
+            22 => [vshlq_n_u32::<22>(el[0]), vshlq_n_u32::<22>(el[1])],
+            23 => [vshlq_n_u32::<23>(el[0]), vshlq_n_u32::<23>(el[1])],
+            24 => [vshlq_n_u32::<24>(el[0]), vshlq_n_u32::<24>(el[1])],
+            25 => [vshlq_n_u32::<25>(el[0]), vshlq_n_u32::<25>(el[1])],
+            26 => [vshlq_n_u32::<26>(el[0]), vshlq_n_u32::<26>(el[1])],
+            27 => [vshlq_n_u32::<27>(el[0]), vshlq_n_u32::<27>(el[1])],
+            28 => [vshlq_n_u32::<28>(el[0]), vshlq_n_u32::<28>(el[1])],
+            29 => [vshlq_n_u32::<29>(el[0]), vshlq_n_u32::<29>(el[1])],
+            30 => [vshlq_n_u32::<30>(el[0]), vshlq_n_u32::<30>(el[1])],
+            31 => [vshlq_n_u32::<31>(el[0]), vshlq_n_u32::<31>(el[1])],
+            32 => set1(0),
+            _ => core::hint::unreachable_unchecked(),
+        }
+    }
+
+    #[inline]
+    unsafe fn op_or(left: DataType, right: DataType) -> DataType {
+        [vorrq_u32(left[0], right[0]), vorrq_u32(left[1], right[1])]
+    }
+
+    #[inline]
+    unsafe fn op_and(left: DataType, right: DataType) -> DataType {
+        [vandq_u32(left[0], right[0]), vandq_u32(left[1], right[1])]
+    }
+
+    #[inline]
+    unsafe fn load_unaligned(addr: *const DataType) -> DataType {
+        let ptr = addr.cast::<u32>();
+        [vld1q_u32(ptr), vld1q_u32(ptr.add(4))]
+    }
+
+    #[inline]
+    unsafe fn store_unaligned(addr: *mut DataType, data: DataType) {
+        let ptr = addr.cast::<u32>();
+        vst1q_u32(ptr, data[0]);
+        vst1q_u32(ptr.add(4), data[1]);
+    }
+
+    #[inline]
+    unsafe fn or_collapse_to_u32(accumulator: DataType) -> u32 {
+        vgetq_lane_u32(accumulator[0], 0)
+            | vgetq_lane_u32(accumulator[0], 1)
+            | vgetq_lane_u32(accumulator[0], 2)
+            | vgetq_lane_u32(accumulator[0], 3)
+            | vgetq_lane_u32(accumulator[1], 0)
+            | vgetq_lane_u32(accumulator[1], 1)
+            | vgetq_lane_u32(accumulator[1], 2)
+            | vgetq_lane_u32(accumulator[1], 3)
+    }
+
+    #[inline]
+    unsafe fn compute_delta(curr: DataType, prev: DataType) -> DataType {
+        [
+            vsubq_u32(curr[0], vextq_u32(prev[1], curr[0], 3)),
+            vsubq_u32(curr[1], vextq_u32(curr[0], curr[1], 3)),
+        ]
+    }
+
+    #[allow(non_snake_case)]
+    #[inline]
+    unsafe fn integrate_half(base: u32, delta: uint32x4_t) -> uint32x4_t {
+        let base = vdupq_n_u32(base);
+        let zero = vdupq_n_u32(0);
+        let a__b__c__d_ = delta;
+        let ______a__b_ = vextq_u32(zero, a__b__c__d_, 2);
+        let a__b__ca_db = vaddq_u32(______a__b_, a__b__c__d_);
+        let ___a__b__ca = vextq_u32(zero, a__b__ca_db, 3);
+        let a_ab_abc_abcd = vaddq_u32(___a__b__ca, a__b__ca_db);
+        vaddq_u32(base, a_ab_abc_abcd)
+    }
+
+    #[inline]
+    unsafe fn integrate_delta(prev: DataType, delta: DataType) -> DataType {
+        let low = integrate_half(vgetq_lane_u32(prev[1], 3), delta[0]);
+        let high = integrate_half(vgetq_lane_u32(low, 3), delta[1]);
+        [low, high]
+    }
+
+    #[inline]
+    unsafe fn add(left: DataType, right: DataType) -> DataType {
+        [vaddq_u32(left[0], right[0]), vaddq_u32(left[1], right[1])]
+    }
+
+    #[inline]
+    unsafe fn sub(left: DataType, right: DataType) -> DataType {
+        [vsubq_u32(left[0], right[0]), vsubq_u32(left[1], right[1])]
+    }
+
+    declare_bitpacker!(target_feature(enable = "neon"));
+
+    impl Available for UnsafeBitPackerImpl {
+        fn available() -> bool {
+            std::arch::is_aarch64_feature_detected!("neon")
         }
     }
 }
@@ -228,6 +415,8 @@ mod scalar {
 enum InstructionSet {
     #[cfg(target_arch = "x86_64")]
     AVX2,
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    NEON,
     Scalar,
 }
 
@@ -249,6 +438,16 @@ impl BitPacker8x {
         None
     }
 
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    pub(crate) fn new_neon() -> Option<Self> {
+        neon::UnsafeBitPackerImpl::available().then_some(BitPacker8x(InstructionSet::NEON))
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    pub(crate) fn new_neon() -> Option<Self> {
+        None
+    }
+
     pub(crate) fn new_scalar() -> Self {
         BitPacker8x(InstructionSet::Scalar)
     }
@@ -258,7 +457,9 @@ impl BitPacker for BitPacker8x {
     const BLOCK_LEN: usize = BLOCK_LEN;
 
     fn new() -> Self {
-        Self::new_avx2().unwrap_or_else(Self::new_scalar)
+        Self::new_avx2()
+            .or_else(Self::new_neon)
+            .unwrap_or_else(Self::new_scalar)
     }
 
     fn compress(&self, decompressed: &[u32], compressed: &mut [u8], num_bits: u8) -> usize {
@@ -267,6 +468,10 @@ impl BitPacker for BitPacker8x {
                 #[cfg(target_arch = "x86_64")]
                 InstructionSet::AVX2 => {
                     avx2::UnsafeBitPackerImpl::compress(decompressed, compressed, num_bits)
+                }
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => {
+                    neon::UnsafeBitPackerImpl::compress(decompressed, compressed, num_bits)
                 }
                 InstructionSet::Scalar => {
                     scalar::UnsafeBitPackerImpl::compress(decompressed, compressed, num_bits)
@@ -286,6 +491,13 @@ impl BitPacker for BitPacker8x {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
                 InstructionSet::AVX2 => avx2::UnsafeBitPackerImpl::compress_sorted(
+                    initial,
+                    decompressed,
+                    compressed,
+                    num_bits,
+                ),
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => neon::UnsafeBitPackerImpl::compress_sorted(
                     initial,
                     decompressed,
                     compressed,
@@ -317,6 +529,13 @@ impl BitPacker for BitPacker8x {
                     compressed,
                     num_bits,
                 ),
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => neon::UnsafeBitPackerImpl::compress_strictly_sorted(
+                    initial,
+                    decompressed,
+                    compressed,
+                    num_bits,
+                ),
                 InstructionSet::Scalar => scalar::UnsafeBitPackerImpl::compress_strictly_sorted(
                     initial,
                     decompressed,
@@ -333,6 +552,10 @@ impl BitPacker for BitPacker8x {
                 #[cfg(target_arch = "x86_64")]
                 InstructionSet::AVX2 => {
                     avx2::UnsafeBitPackerImpl::decompress(compressed, decompressed, num_bits)
+                }
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => {
+                    neon::UnsafeBitPackerImpl::decompress(compressed, decompressed, num_bits)
                 }
                 InstructionSet::Scalar => {
                     scalar::UnsafeBitPackerImpl::decompress(compressed, decompressed, num_bits)
@@ -352,6 +575,13 @@ impl BitPacker for BitPacker8x {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
                 InstructionSet::AVX2 => avx2::UnsafeBitPackerImpl::decompress_sorted(
+                    initial,
+                    compressed,
+                    decompressed,
+                    num_bits,
+                ),
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => neon::UnsafeBitPackerImpl::decompress_sorted(
                     initial,
                     compressed,
                     decompressed,
@@ -383,6 +613,13 @@ impl BitPacker for BitPacker8x {
                     decompressed,
                     num_bits,
                 ),
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => neon::UnsafeBitPackerImpl::decompress_strictly_sorted(
+                    initial,
+                    compressed,
+                    decompressed,
+                    num_bits,
+                ),
                 InstructionSet::Scalar => scalar::UnsafeBitPackerImpl::decompress_strictly_sorted(
                     initial,
                     compressed,
@@ -398,6 +635,8 @@ impl BitPacker for BitPacker8x {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
                 InstructionSet::AVX2 => avx2::UnsafeBitPackerImpl::num_bits(decompressed),
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => neon::UnsafeBitPackerImpl::num_bits(decompressed),
                 InstructionSet::Scalar => scalar::UnsafeBitPackerImpl::num_bits(decompressed),
             }
         }
@@ -409,6 +648,10 @@ impl BitPacker for BitPacker8x {
                 #[cfg(target_arch = "x86_64")]
                 InstructionSet::AVX2 => {
                     avx2::UnsafeBitPackerImpl::num_bits_sorted(initial, decompressed)
+                }
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => {
+                    neon::UnsafeBitPackerImpl::num_bits_sorted(initial, decompressed)
                 }
                 InstructionSet::Scalar => {
                     scalar::UnsafeBitPackerImpl::num_bits_sorted(initial, decompressed)
@@ -423,6 +666,10 @@ impl BitPacker for BitPacker8x {
                 #[cfg(target_arch = "x86_64")]
                 InstructionSet::AVX2 => {
                     avx2::UnsafeBitPackerImpl::num_bits_strictly_sorted(initial, decompressed)
+                }
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                InstructionSet::NEON => {
+                    neon::UnsafeBitPackerImpl::num_bits_strictly_sorted(initial, decompressed)
                 }
                 InstructionSet::Scalar => {
                     scalar::UnsafeBitPackerImpl::num_bits_strictly_sorted(initial, decompressed)
@@ -557,6 +804,34 @@ mod tests {
         }
     }
 
+    fn assert_strictly_sorted_compatible(ours: BitPacker8x, external: ExternalBitPacker8x) {
+        for width in 0..=16 {
+            for seed in [0, 1, 2, 123456789] {
+                let (initial, values) = strictly_sorted_values(width, seed);
+                let num_bits = external.num_bits_strictly_sorted(initial, &values);
+                assert_eq!(ours.num_bits_strictly_sorted(initial, &values), num_bits);
+
+                let mut actual = vec![0u8; BitPacker8x::compressed_block_size(num_bits)];
+                let actual_len =
+                    ours.compress_strictly_sorted(initial, &values, &mut actual, num_bits);
+
+                let mut expected = vec![0u8; ExternalBitPacker8x::compressed_block_size(num_bits)];
+                let expected_len =
+                    external.compress_strictly_sorted(initial, &values, &mut expected, num_bits);
+
+                assert_eq!(actual_len, expected_len);
+                assert_eq!(actual, expected, "strict width {width} seed {seed}");
+
+                let mut decoded = vec![0u32; BitPacker8x::BLOCK_LEN];
+                assert_eq!(
+                    ours.decompress_strictly_sorted(initial, &actual, &mut decoded, num_bits),
+                    actual_len
+                );
+                assert_eq!(decoded, values);
+            }
+        }
+    }
+
     #[test]
     fn bitpacker8x_raw_compatible_with_external_bitpacking() {
         assert_raw_compatible(BitPacker8x::new(), ExternalBitPacker8x::new());
@@ -581,30 +856,18 @@ mod tests {
         let scalar = BitPacker8x::new_scalar();
         let external = ExternalBitPacker8x::new();
 
-        for width in 0..=16 {
-            for seed in [0, 1, 2, 123456789] {
-                let (initial, values) = strictly_sorted_values(width, seed);
-                let num_bits = external.num_bits_strictly_sorted(initial, &values);
-                assert_eq!(scalar.num_bits_strictly_sorted(initial, &values), num_bits);
+        assert_strictly_sorted_compatible(scalar, external);
+    }
 
-                let mut actual = vec![0u8; BitPacker8x::compressed_block_size(num_bits)];
-                let actual_len =
-                    scalar.compress_strictly_sorted(initial, &values, &mut actual, num_bits);
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[test]
+    fn neon_backend_matches_external_bitpacker8x() {
+        if let Some(neon) = BitPacker8x::new_neon() {
+            let external = ExternalBitPacker8x::new();
 
-                let mut expected = vec![0u8; ExternalBitPacker8x::compressed_block_size(num_bits)];
-                let expected_len =
-                    external.compress_strictly_sorted(initial, &values, &mut expected, num_bits);
-
-                assert_eq!(actual_len, expected_len);
-                assert_eq!(actual, expected, "strict width {width} seed {seed}");
-
-                let mut decoded = vec![0u32; BitPacker8x::BLOCK_LEN];
-                assert_eq!(
-                    scalar.decompress_strictly_sorted(initial, &actual, &mut decoded, num_bits),
-                    actual_len
-                );
-                assert_eq!(decoded, values);
-            }
+            assert_raw_compatible(neon, external);
+            assert_sorted_compatible(neon, external);
+            assert_strictly_sorted_compatible(neon, external);
         }
     }
 }
