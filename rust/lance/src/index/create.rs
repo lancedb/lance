@@ -847,9 +847,9 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use arrow::datatypes::{Float32Type, Int32Type};
+    use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
     use arrow_array::cast::AsArray;
-    use arrow_array::{FixedSizeListArray, RecordBatchIterator};
+    use arrow_array::{Array, FixedSizeListArray, ListArray, RecordBatchIterator};
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use datafusion::common::ScalarValue;
@@ -2375,6 +2375,207 @@ mod tests {
         // The merged segment returns every row whose labels include 3 across both
         // fragments — i.e. the per-fragment bitmaps and null sets were unioned.
         assert_eq!(count_has_any(&dataset, &merged, 3).await, expected);
+    }
+
+    fn label_list_batch(labels: Vec<Option<Vec<Option<i64>>>>) -> (Arc<ArrowSchema>, RecordBatch) {
+        let labels = ListArray::from_iter_primitive::<Int64Type, _, _>(labels);
+        let row_count = labels.len();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("labels", labels.data_type().clone(), true),
+        ]));
+        let ids = Int32Array::from_iter_values((0..row_count).map(|id| id as i32));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(labels)]).unwrap();
+        (schema, batch)
+    }
+
+    #[tokio::test]
+    async fn test_label_list_merge_existing_index_segments_drops_retired_fragments() {
+        use lance_index::scalar::{LabelListQuery, SearchResult};
+
+        async fn search_counts(
+            dataset: &Dataset,
+            segment: &IndexMetadata,
+            label: i64,
+        ) -> (usize, usize) {
+            let field_path = dataset.schema().field_path(segment.fields[0]).unwrap();
+            let index = crate::index::scalar::open_scalar_index(
+                dataset,
+                &field_path,
+                segment,
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::Int64(Some(label))]);
+            match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+                SearchResult::Exact(row_addrs) => (
+                    row_addrs.true_rows().row_addrs().unwrap().count(),
+                    row_addrs.null_rows().row_addrs().unwrap().count(),
+                ),
+                other => panic!("expected exact result, got {other:?}"),
+            }
+        }
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let (schema, batch) = label_list_batch(vec![
+            Some(vec![Some(1)]),
+            None,
+            Some(vec![Some(1)]),
+            Some(vec![Some(1)]),
+            Some(vec![Some(2)]),
+            Some(vec![Some(2)]),
+            Some(vec![Some(2)]),
+            Some(vec![Some(2)]),
+        ]);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList);
+        let mut staged = Vec::new();
+        for fragment in dataset.get_fragments() {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["labels"], IndexType::LabelList, &params)
+                    .name("labels_retired_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("labels_retired_idx", "labels", staged)
+            .await
+            .unwrap();
+
+        dataset.delete("id < 4").await.unwrap();
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 4,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !dataset.fragment_bitmap.contains(0),
+            "compaction should retire fragment 0"
+        );
+
+        let merged = dataset
+            .merge_existing_index_segments(
+                dataset
+                    .load_indices_by_name("labels_retired_idx")
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let coverage = merged.fragment_bitmap.as_ref().unwrap();
+        assert!(!coverage.contains(0), "must drop retired frag 0");
+        assert!(coverage.contains(1), "must keep live indexed frag 1");
+
+        let (retired_true, _) = search_counts(&dataset, &merged, 1).await;
+        assert_eq!(
+            retired_true, 0,
+            "must filter value bitmaps from retired fragments"
+        );
+
+        let (live_true, null_rows) = search_counts(&dataset, &merged, 2).await;
+        assert_eq!(live_true, 4, "must keep live fragment rows");
+        assert_eq!(
+            null_rows, 0,
+            "must filter list_nulls from retired fragments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_label_list_merge_rejects_nullable_segment_missing_null_metadata() {
+        use crate::dataset::index::LanceIndexStoreExt;
+        use lance_index::scalar::IndexStore;
+        use lance_index::scalar::label_list::{
+            BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
+        };
+        use lance_index::scalar::lance_format::LanceIndexStore;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let (schema, batch) = label_list_batch(vec![
+            Some(vec![Some(1)]),
+            None,
+            Some(vec![Some(2)]),
+            Some(vec![Some(3)]),
+        ]);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList);
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["labels"], IndexType::LabelList, &params)
+                .name("labels_legacy_idx".to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        let source_store = LanceIndexStore::from_dataset_for_existing(&dataset, &segment)
+            .await
+            .unwrap();
+        let reader = source_store
+            .open_index_file(BITMAP_LOOKUP_NAME)
+            .await
+            .unwrap();
+        let batch = reader.read_range(0..reader.num_rows(), None).await.unwrap();
+        let source_schema: ArrowSchema = reader.schema().into();
+        let schema_without_metadata = Arc::new(ArrowSchema::new(source_schema.fields().clone()));
+
+        let legacy_uuid = Uuid::new_v4();
+        let legacy_store = LanceIndexStore::from_dataset_for_new(&dataset, &legacy_uuid).unwrap();
+        let mut writer = legacy_store
+            .new_index_file(BITMAP_LOOKUP_NAME, schema_without_metadata)
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        let legacy_file = writer.finish().await.unwrap();
+
+        let mut legacy_segment = segment.clone();
+        legacy_segment.uuid = legacy_uuid;
+        legacy_segment.index_version = LABEL_LIST_NULLS_MIN_VERSION;
+        legacy_segment.files = Some(vec![legacy_file]);
+
+        let err = dataset
+            .merge_existing_index_segments(vec![legacy_segment])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(LABEL_LIST_NULLS_METADATA_KEY),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

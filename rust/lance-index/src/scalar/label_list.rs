@@ -28,7 +28,10 @@ use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
-use super::{AnyQuery, IndexFile, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
+use super::{
+    AnyQuery, IndexFile, IndexStore, LabelListQuery, OldIndexDataFilter, ScalarIndex,
+    bitmap::BitmapIndex,
+};
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
@@ -493,10 +496,12 @@ async fn write_label_list_bitmap_index(
 /// (distinct fragments), merging is a cheap union of the underlying bitmap states
 /// and of the `list_nulls` sets — no re-scan of source data is required. This
 /// mirrors [`crate::scalar::bitmap::merge_bitmap_indices`] but also carries the
-/// per-segment `list_nulls`.
+/// per-segment `list_nulls`. When `old_data_filter` is provided, rows from
+/// retired fragments are removed from both the value bitmaps and `list_nulls`.
 pub async fn merge_label_list_indices(
     source_indices: &[Arc<LabelListIndex>],
     dest_store: &dyn IndexStore,
+    old_data_filter: Option<OldIndexDataFilter>,
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 ) -> Result<CreatedIndex> {
     if source_indices.is_empty() {
@@ -526,13 +531,23 @@ pub async fn merge_label_list_indices(
         }
 
         let state = source_index.values_index.load_bitmap_index_state().await?;
-        for (key, bitmap) in state {
+        for (key, mut bitmap) in state {
+            if let Some(filter) = old_data_filter.as_ref() {
+                filter.retain_old_rows(&mut bitmap);
+            }
+            if bitmap.is_empty() {
+                continue;
+            }
             merged_state
                 .entry(key)
                 .and_modify(|existing| *existing |= &bitmap)
                 .or_insert(bitmap);
         }
-        merged_nulls |= source_index.list_nulls.as_ref();
+        let mut list_nulls = source_index.list_nulls.as_ref().clone();
+        if let Some(filter) = old_data_filter.as_ref() {
+            filter.retain_old_rows(&mut list_nulls);
+        }
+        merged_nulls |= &list_nulls;
         progress
             .stage_progress("merge_label_list_segments", (idx + 1) as u64)
             .await?;
