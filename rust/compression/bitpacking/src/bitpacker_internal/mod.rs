@@ -3,7 +3,7 @@
 
 // Lance-owned u32 SIMD bitpacking kernels.
 //
-// This is adapted from the Apache-2.0 `bitpacking` crate so Lance can keep the
+// This is adapted from the MIT-licensed `bitpacking` crate so Lance can keep the
 // hot FTS posting-list bitpacking implementation inside lance-bitpacking while
 // preserving byte compatibility with the existing 4x format.
 
