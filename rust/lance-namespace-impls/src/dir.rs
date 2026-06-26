@@ -3951,7 +3951,7 @@ impl LanceNamespace for DirectoryNamespace {
                         .map(|field_id| {
                         dataset
                             .schema()
-                            .field_path(i32::try_from(*field_id).map_err(|e| {
+                            .field_path_minimal(i32::try_from(*field_id).map_err(|e| {
                                 lance_core::Error::from(NamespaceError::Internal {
                                     message: format!(
                                         "Field id {} does not fit in i32 for table '{}': {}",
