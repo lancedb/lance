@@ -2002,6 +2002,12 @@ mod tests {
             self.inner.io_parallelism()
         }
 
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_priority(io_priority),
+            })
+        }
+
         async fn new_index_file(
             &self,
             _name: &str,
