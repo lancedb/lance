@@ -5,19 +5,20 @@
 
 use arrow_array::{Array, StructArray, cast::AsArray, make_array};
 use arrow_buffer::NullBuffer;
-use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::ArrowError;
 
 pub trait StructArrayExt {
-    /// Removes the offset / length of the struct array by pushing it into the children
+    /// Ensures the struct array's slicing is normalized: any offset is pushed into
+    /// the children rather than left on the struct itself.
     ///
-    /// In arrow-rs when slice is called it recursively slices the children.
-    /// In arrow-cpp when slice is called it just sets the offset/length of
-    ///   the struct array and leaves the children as-is
+    /// In arrow-rs a `StructArray` cannot carry a slice offset. Both
+    /// [`arrow_array::Array::slice`] and `StructArray::from(ArrayData)` push the
+    /// offset into the children (slicing them) at construction time, so any
+    /// `StructArray` reaching this method is already normalized and this is a
+    /// no-op. The arrow-cpp shape (offset on the parent, children left as-is)
+    /// cannot be represented by an arrow-rs `StructArray`.
     ///
-    /// Both are legal approaches (╥﹏╥)
-    ///
-    /// This method helps reduce complexity by folding into the arrow-rs approach
+    /// The method is kept for API stability and to assert the invariant.
     fn normalize_slicing(&self) -> Result<Self, ArrowError>
     where
         Self: Sized;
@@ -45,50 +46,20 @@ pub trait StructArrayExt {
         Self: Sized;
 }
 
-fn normalized_struct_array_data(data: ArrayData) -> Result<ArrayData, ArrowError> {
-    let parent_offset = data.offset();
-    let parent_len = data.len();
-    let modified_children = data
-        .child_data()
-        .iter()
-        .map(|d| {
-            let d = normalized_struct_array_data(d.clone())?;
-            let offset = d.offset();
-            let len = d.len();
-            if len < parent_len + parent_offset {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "Child array {} has length {} which is less than the parent length {} plus the parent offset {}",
-                    d.data_type(),
-                    len,
-                    parent_len,
-                    parent_offset
-                )));
-            }
-            let new_offset = offset + parent_offset;
-            d.into_builder().offset(new_offset)
-                .len(parent_len)
-                .build()
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    ArrayDataBuilder::new(data.data_type().clone())
-        .len(parent_len)
-        .offset(0)
-        .buffers(data.buffers().to_vec())
-        .child_data(modified_children)
-        .build()
-}
-
 impl StructArrayExt for StructArray {
     fn normalize_slicing(&self) -> Result<Self, ArrowError>
     where
         Self: Sized,
     {
-        if self.offset() == 0 && self.columns().iter().all(|c| c.len() == self.len()) {
-            return Ok(self.clone());
-        }
-
-        let data = normalized_struct_array_data(self.to_data())?;
-        Ok(Self::from(data))
+        // An arrow-rs `StructArray` is always already normalized: the offset is
+        // pushed into the children at construction (see the trait docs), so there
+        // is nothing to do. The assert documents that invariant and trips in tests
+        // if a future arrow-rs change ever violates it.
+        debug_assert!(
+            self.offset() == 0 && self.columns().iter().all(|c| c.len() == self.len()),
+            "StructArray reached normalize_slicing without being normalized"
+        );
+        Ok(self.clone())
     }
 
     fn pushdown_nulls(&self) -> Result<Self, ArrowError>
