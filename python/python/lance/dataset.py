@@ -7881,9 +7881,27 @@ class LanceVectorIndexHandle:
     def num_segments(self) -> int:
         return self._native.num_segments
 
+    @property
+    def metric_type(self) -> str:
+        return self._native.metric_type
+
+    @property
+    def dimension(self) -> int:
+        return self._native.dimension
+
     def as_ivf(self) -> "LanceIvfIndexHandle":
         """Return an IVF view on this handle."""
         return LanceIvfIndexHandle(self._native.as_ivf())
+
+
+@dataclass(frozen=True)
+class LancePqCodebook:
+    """Trained PQ codebook and parameters required to reuse it."""
+
+    codebook: "pa.FixedSizeListArray"
+    num_bits: int
+    num_sub_vectors: int
+    dimension: int
 
 
 class LanceIvfIndexHandle:
@@ -7891,6 +7909,14 @@ class LanceIvfIndexHandle:
 
     def __init__(self, native):
         self._native = native
+
+    @property
+    def metric_type(self) -> str:
+        return self._native.metric_type
+
+    @property
+    def dimension(self) -> int:
+        return self._native.dimension
 
     def read_centroids(self) -> "pa.FixedSizeListArray":
         """Read the trained IVF centroids of this index.
@@ -7902,13 +7928,22 @@ class LanceIvfIndexHandle:
         """
         return self._native.read_centroids()
 
-    def read_pq_codebook(self) -> "Optional[pa.FixedSizeListArray]":
+    def read_pq_codebook(self) -> "Optional[LancePqCodebook]":
         """Read the trained PQ codebook, or ``None`` if non-PQ.
 
         For ``IVF_PQ`` / ``IVF_HNSW_PQ`` indices this returns a
+        :class:`LancePqCodebook` whose ``codebook`` field is a
         ``pa.FixedSizeListArray`` with ``2 ** num_bits`` rows of length equal
-        to the indexed vector dimension, all in ``float32``. For non-PQ
-        indices (``IVF_FLAT`` / ``IVF_SQ`` / ``IVF_HNSW_FLAT`` /
-        ``IVF_HNSW_SQ`` / ``IVF_RQ``) it returns ``None``.
+        to the indexed vector dimension, all in ``float32``. For non-PQ indices
+        (``IVF_FLAT`` / ``IVF_SQ`` / ``IVF_HNSW_FLAT`` / ``IVF_HNSW_SQ`` /
+        ``IVF_RQ``) it returns ``None``.
         """
-        return self._native.read_pq_codebook()
+        result = self._native.read_pq_codebook()
+        if result is None:
+            return None
+        return LancePqCodebook(
+            codebook=result["codebook"],
+            num_bits=result["num_bits"],
+            num_sub_vectors=result["num_sub_vectors"],
+            dimension=result["dimension"],
+        )

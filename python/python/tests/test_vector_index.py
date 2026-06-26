@@ -3395,8 +3395,12 @@ def test_open_vector_index_handle_pq(tmp_path):
     assert handle.name == "vec_idx"
     assert handle.column == "vector"
     assert handle.num_segments == 1
+    assert handle.metric_type == "l2"
+    assert handle.dimension == 32
 
     ivf = handle.as_ivf()
+    assert ivf.metric_type == "l2"
+    assert ivf.dimension == 32
     centroids = ivf.read_centroids()
     assert isinstance(centroids, pa.FixedSizeListArray)
     assert len(centroids) == 4
@@ -3404,10 +3408,13 @@ def test_open_vector_index_handle_pq(tmp_path):
 
     codebook = ivf.read_pq_codebook()
     assert codebook is not None
-    assert isinstance(codebook, pa.FixedSizeListArray)
-    assert len(codebook) == 256  # 2 ** num_bits, num_bits=8 default
-    assert codebook.type.list_size == 32
-    assert codebook.type.value_type == pa.float32()
+    assert codebook.num_bits == 8
+    assert codebook.num_sub_vectors == 8
+    assert codebook.dimension == 32
+    assert isinstance(codebook.codebook, pa.FixedSizeListArray)
+    assert len(codebook.codebook) == 256  # 2 ** num_bits, num_bits=8 default
+    assert codebook.codebook.type.list_size == 32
+    assert codebook.codebook.type.value_type == pa.float32()
 
 
 def test_open_vector_index_handle_flat_codebook_is_none(tmp_path):
@@ -3421,7 +3428,11 @@ def test_open_vector_index_handle_flat_codebook_is_none(tmp_path):
     )
 
     handle = ds.open_vector_index_handle("vec_flat")
+    assert handle.metric_type == "l2"
+    assert handle.dimension == 32
     ivf = handle.as_ivf()
+    assert ivf.metric_type == "l2"
+    assert ivf.dimension == 32
     centroids = ivf.read_centroids()
     assert isinstance(centroids, pa.FixedSizeListArray)
     assert len(centroids) == 4

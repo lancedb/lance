@@ -515,6 +515,16 @@ impl PyVectorIndexHandle {
         self.inner.num_segments()
     }
 
+    #[getter]
+    fn metric_type(&self) -> String {
+        self.inner.metric_type().to_string()
+    }
+
+    #[getter]
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
     fn as_ivf(&self) -> PyVectorIvfIndexHandle {
         PyVectorIvfIndexHandle {
             inner: self.inner.clone(),
@@ -529,6 +539,18 @@ pub struct PyVectorIvfIndexHandle {
 
 #[pymethods]
 impl PyVectorIvfIndexHandle {
+    #[getter]
+    fn metric_type(&self) -> PyResult<String> {
+        let view = self.inner.as_ivf().map_err(map_index_lookup_error)?;
+        Ok(view.metric_type().to_string())
+    }
+
+    #[getter]
+    fn dimension(&self) -> PyResult<usize> {
+        let view = self.inner.as_ivf().map_err(map_index_lookup_error)?;
+        Ok(view.dimension())
+    }
+
     fn read_centroids<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let view = self.inner.as_ivf().map_err(map_index_lookup_error)?;
         let centroids = rt()
@@ -537,11 +559,18 @@ impl PyVectorIvfIndexHandle {
         centroids.into_data().to_pyarrow(py)
     }
 
-    fn read_pq_codebook<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+    fn read_pq_codebook<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         let view = self.inner.as_ivf().map_err(map_index_lookup_error)?;
         let result = rt().block_on(Some(py), view.read_pq_codebook())?;
         match result {
-            Ok((codebook, _num_bits)) => Ok(Some(codebook.into_data().to_pyarrow(py)?)),
+            Ok(codebook) => {
+                let dict = PyDict::new(py);
+                dict.set_item("codebook", codebook.codebook.into_data().to_pyarrow(py)?)?;
+                dict.set_item("num_bits", codebook.num_bits)?;
+                dict.set_item("num_sub_vectors", codebook.num_sub_vectors)?;
+                dict.set_item("dimension", codebook.dimension)?;
+                Ok(Some(dict))
+            }
             Err(lance::Error::NotSupported { .. }) => Ok(None),
             Err(e) => Err(map_index_lookup_error(e)),
         }

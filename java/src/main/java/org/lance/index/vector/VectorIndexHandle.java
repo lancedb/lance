@@ -13,8 +13,11 @@
  */
 package org.lance.index.vector;
 
+import org.lance.index.DistanceType;
+
 import com.google.common.base.Preconditions;
 
+import java.util.Locale;
 import java.util.Optional;
 
 /**
@@ -30,14 +33,25 @@ public final class VectorIndexHandle implements AutoCloseable {
   private final String name;
   private final String column;
   private final int numSegments;
+  private final DistanceType distanceType;
+  private final int dimension;
 
   // Invoked from JNI via reflection.
-  private VectorIndexHandle(long nativeHandle, String name, String column, int numSegments) {
+  private VectorIndexHandle(
+      long nativeHandle,
+      String name,
+      String column,
+      int numSegments,
+      String distanceType,
+      int dimension) {
     Preconditions.checkArgument(nativeHandle != 0, "nativeHandle must be non-zero");
+    Preconditions.checkArgument(dimension > 0, "dimension must be positive");
     this.nativeHandle = nativeHandle;
     this.name = name;
     this.column = column;
     this.numSegments = numSegments;
+    this.distanceType = parseDistanceType(distanceType);
+    this.dimension = dimension;
   }
 
   /** Logical name of the indexed vector. */
@@ -53,6 +67,16 @@ public final class VectorIndexHandle implements AutoCloseable {
   /** Number of physical segments composing this logical index. */
   public int getNumSegments() {
     return numSegments;
+  }
+
+  /** Distance metric used to build this vector index. */
+  public DistanceType getDistanceType() {
+    return distanceType;
+  }
+
+  /** Indexed vector dimension. */
+  public int getDimension() {
+    return dimension;
   }
 
   /**
@@ -85,6 +109,22 @@ public final class VectorIndexHandle implements AutoCloseable {
   private void checkNotClosed() {
     if (nativeHandle == 0) {
       throw new IllegalStateException("VectorIndexHandle is closed");
+    }
+  }
+
+  private static DistanceType parseDistanceType(String value) {
+    Preconditions.checkArgument(value != null, "distanceType cannot be null");
+    switch (value.toLowerCase(Locale.ROOT)) {
+      case "l2":
+        return DistanceType.L2;
+      case "cosine":
+        return DistanceType.Cosine;
+      case "dot":
+        return DistanceType.Dot;
+      case "hamming":
+        return DistanceType.Hamming;
+      default:
+        throw new IllegalArgumentException("Unsupported distanceType: " + value);
     }
   }
 

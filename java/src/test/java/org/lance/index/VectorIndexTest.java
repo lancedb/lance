@@ -421,8 +421,12 @@ public class VectorIndexTest {
             dataset.openVectorIndexHandle(TestVectorDataset.indexName)) {
           assertEquals(TestVectorDataset.indexName, handle.getName());
           assertEquals(TestVectorDataset.vectorColumnName, handle.getColumn());
+          assertEquals(DistanceType.L2, handle.getDistanceType());
+          assertEquals(32, handle.getDimension());
 
           org.lance.index.vector.IvfHandle ivf = handle.asIvf().orElseThrow();
+          assertEquals(DistanceType.L2, ivf.getDistanceType());
+          assertEquals(32, ivf.getDimension());
           org.lance.index.vector.IvfCentroids centroids = ivf.readCentroids();
           assertEquals(2, centroids.getNumPartitions());
           assertEquals(32, centroids.getDimension());
@@ -469,6 +473,7 @@ public class VectorIndexTest {
           assertTrue(result.isPresent(), "IVF_PQ should produce a PQ codebook");
           org.lance.index.vector.PqCodebook codebook = result.get();
           assertEquals(8, codebook.getNumBits());
+          assertEquals(2, codebook.getNumSubVectors());
           assertEquals(32, codebook.getDimension());
           assertEquals(256 * 32, codebook.getFlat().length);
         }

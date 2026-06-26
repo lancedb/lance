@@ -13,6 +13,8 @@
  */
 package org.lance.index.vector;
 
+import org.lance.index.DistanceType;
+
 import java.util.Optional;
 
 /**
@@ -24,6 +26,16 @@ public final class IvfHandle {
 
   IvfHandle(VectorIndexHandle parent) {
     this.parent = parent;
+  }
+
+  /** Distance metric used to build this vector index. */
+  public DistanceType getDistanceType() {
+    return parent.getDistanceType();
+  }
+
+  /** Indexed vector dimension. */
+  public int getDimension() {
+    return parent.getDimension();
   }
 
   /**

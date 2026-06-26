@@ -3808,29 +3808,32 @@ fn ivf_centroids_to_java<'a>(
 
 fn pq_codebook_to_java<'a>(
     env: &mut JNIEnv<'a>,
-    codebook: &FixedSizeListArray,
-    num_bits: i32,
+    codebook: &lance::index::vector::PqCodebook,
 ) -> Result<JObject<'a>> {
     let values = codebook
+        .codebook
         .values()
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| {
             Error::runtime_error(format!(
                 "Expected Float32 PQ codebook, got {:?}",
-                codebook.value_type()
+                codebook.codebook.value_type()
             ))
         })?;
     let flat: Vec<f32> = values.values().to_vec();
-    let dimension = codebook.value_length();
+    let num_bits = codebook.num_bits as i32;
+    let num_sub_vectors = codebook.num_sub_vectors as i32;
+    let dimension = codebook.dimension as i32;
     let jarray = env.new_float_array(flat.len() as i32)?;
     env.set_float_array_region(&jarray, 0, &flat)?;
     Ok(env.new_object(
         "org/lance/index/vector/PqCodebook",
-        "([FII)V",
+        "([FIII)V",
         &[
             JValueGen::Object(&JObject::from(jarray)),
             JValueGen::Int(num_bits),
+            JValueGen::Int(num_sub_vectors),
             JValueGen::Int(dimension),
         ],
     )?)
@@ -3868,17 +3871,21 @@ fn inner_open_vector_index_handle<'local>(
     };
     let name_jstr = env.new_string(logical.name())?;
     let column_jstr = env.new_string(logical.column())?;
+    let distance_type_jstr = env.new_string(logical.metric_type().to_string())?;
     let num_segments = logical.num_segments() as i32;
+    let dimension = logical.dimension() as i32;
     let boxed: Box<Arc<LogicalVectorIndex>> = Box::new(Arc::new(logical));
     let handle_ptr = Box::into_raw(boxed) as jlong;
     let result = env.new_object(
         "org/lance/index/vector/VectorIndexHandle",
-        "(JLjava/lang/String;Ljava/lang/String;I)V",
+        "(JLjava/lang/String;Ljava/lang/String;ILjava/lang/String;I)V",
         &[
             JValueGen::Long(handle_ptr),
             JValueGen::Object(&JObject::from(name_jstr)),
             JValueGen::Object(&JObject::from(column_jstr)),
             JValueGen::Int(num_segments),
+            JValueGen::Object(&JObject::from(distance_type_jstr)),
+            JValueGen::Int(dimension),
         ],
     );
     match result {
@@ -3960,13 +3967,12 @@ fn inner_handle_read_pq_codebook<'local>(
     // SAFETY: handle_ptr was produced by Box::into_raw and is still owned by Java.
     let logical: &Arc<LogicalVectorIndex> =
         unsafe { &*(handle_ptr as *const Arc<LogicalVectorIndex>) };
-    let result: std::result::Result<(FixedSizeListArray, i32), lance::Error> = RT.block_on(async {
+    let result = RT.block_on(async {
         let view = logical.as_ivf()?;
-        let (codebook, num_bits) = view.read_pq_codebook().await?;
-        Ok::<_, lance::Error>((codebook, num_bits as i32))
+        view.read_pq_codebook().await
     });
     match result {
-        Ok((codebook, num_bits)) => pq_codebook_to_java(env, &codebook, num_bits),
+        Ok(codebook) => pq_codebook_to_java(env, &codebook),
         Err(lance::Error::NotSupported { .. }) => Ok(JObject::null()),
         Err(e) => Err(e.into()),
     }

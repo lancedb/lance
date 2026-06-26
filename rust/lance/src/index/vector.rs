@@ -87,6 +87,19 @@ pub struct LogicalIvfView<'a> {
     logical_index: &'a LogicalVectorIndex,
 }
 
+/// Trained PQ codebook and the build parameters required to reuse it.
+#[derive(Debug, Clone)]
+pub struct PqCodebook {
+    /// Codebook rows stored in the layout consumed by [`PQBuildParams::with_codebook`].
+    pub codebook: arrow_array::FixedSizeListArray,
+    /// Bits per PQ code.
+    pub num_bits: u32,
+    /// Number of PQ sub-vectors.
+    pub num_sub_vectors: usize,
+    /// Indexed vector dimension.
+    pub dimension: usize,
+}
+
 impl LogicalVectorIndex {
     pub(crate) fn try_new(
         name: String,
@@ -120,6 +133,16 @@ impl LogicalVectorIndex {
     /// Returns the number of physical segments in this logical index.
     pub fn num_segments(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Returns the distance metric used by this logical vector index.
+    pub fn metric_type(&self) -> MetricType {
+        self.segments[0].1.metric_type()
+    }
+
+    /// Returns the indexed vector dimension.
+    pub fn dimension(&self) -> usize {
+        self.segments[0].1.ivf_model().dimension()
     }
 
     /// Returns the committed metadata for all physical segments.
@@ -164,6 +187,16 @@ impl<'a> LogicalIvfView<'a> {
         &self,
     ) -> impl ExactSizeIterator<Item = (&IndexMetadata, &Arc<dyn VectorIndex>)> + '_ {
         self.logical_index.iter()
+    }
+
+    /// Returns the distance metric used by this IVF index.
+    pub fn metric_type(&self) -> MetricType {
+        self.logical_index.metric_type()
+    }
+
+    /// Returns the indexed vector dimension.
+    pub fn dimension(&self) -> usize {
+        self.logical_index.dimension()
     }
 
     /// Returns the partition count for each segment in this IVF index.
@@ -249,11 +282,10 @@ impl<'a> LogicalIvfView<'a> {
     /// Read the trained PQ codebook for an `IVF_PQ` / `IVF_HNSW_PQ` index.
     ///
     /// All segments of one logical index are constructed with the same
-    /// codebook, so this returns the codebook from the first segment along
-    /// with its trained `num_bits` (log2 of the codebook row count) so
-    /// language bindings can populate POJOs without re-walking the segment
-    /// list.
-    pub async fn read_pq_codebook(&self) -> Result<(arrow_array::FixedSizeListArray, u32)> {
+    /// codebook, so this returns the codebook from the first segment along with
+    /// the trained PQ parameters required to pass it back to
+    /// [`PQBuildParams::with_codebook`].
+    pub async fn read_pq_codebook(&self) -> Result<PqCodebook> {
         use lance_index::vector::quantizer::Quantizer;
 
         let first = self
@@ -261,7 +293,12 @@ impl<'a> LogicalIvfView<'a> {
             .next()
             .expect("LogicalVectorIndex has >= 1 segment by construction");
         match first.quantizer() {
-            Quantizer::Product(pq) => Ok((pq.codebook, pq.num_bits)),
+            Quantizer::Product(pq) => Ok(PqCodebook {
+                dimension: pq.dimension,
+                num_bits: pq.num_bits,
+                num_sub_vectors: pq.num_sub_vectors,
+                codebook: pq.codebook,
+            }),
             _ => Err(Error::not_supported(format!(
                 "LogicalIvfView '{}': index does not use product quantization",
                 self.logical_index.name()

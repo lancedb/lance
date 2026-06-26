@@ -90,7 +90,7 @@ use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_in
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
-pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
+pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex, PqCodebook};
 use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
@@ -3112,7 +3112,9 @@ mod tests {
             .open_logical_vector_index("vector", "vec_pq")
             .await
             .unwrap();
-        let (codebook, num_bits) = logical_index
+        assert_eq!(logical_index.metric_type(), DistanceType::L2);
+        assert_eq!(logical_index.dimension(), 32);
+        let codebook = logical_index
             .as_ivf()
             .unwrap()
             .read_pq_codebook()
@@ -3123,12 +3125,14 @@ mod tests {
         // length = full vector dimension (the same layout
         // `PQBuildParams::with_codebook` consumes).
         // num_bits=8 → 2^8 = 256 rows.
-        assert_eq!(num_bits, 8);
-        assert_eq!(codebook.len(), 256);
+        assert_eq!(codebook.num_bits, 8);
+        assert_eq!(codebook.num_sub_vectors, 8);
+        assert_eq!(codebook.dimension, 32);
+        assert_eq!(codebook.codebook.len(), 256);
         // Inner list length equals indexed dimension (32 here).
-        assert_eq!(codebook.value_length(), 32);
+        assert_eq!(codebook.codebook.value_length(), 32);
         assert_eq!(
-            codebook.value_type(),
+            codebook.codebook.value_type(),
             arrow_schema::DataType::Float32,
             "PQ codebooks are always loaded as Float32"
         );
@@ -3197,8 +3201,12 @@ mod tests {
             .unwrap();
         assert_eq!(handle.name(), "vector_idx");
         assert_eq!(handle.column(), "vector");
+        assert_eq!(handle.metric_type(), DistanceType::L2);
+        assert_eq!(handle.dimension(), DIMENSION as usize);
 
         let ivf = handle.as_ivf().unwrap();
+        assert_eq!(ivf.metric_type(), DistanceType::L2);
+        assert_eq!(ivf.dimension(), DIMENSION as usize);
         let centroids = ivf.read_centroids().await.unwrap();
         assert_eq!(centroids.len(), 2);
         assert_eq!(centroids.value_length(), DIMENSION);
@@ -3235,19 +3243,28 @@ mod tests {
             .unwrap();
 
         let handle = dataset.open_vector_index_handle("vector_pq").await.unwrap();
+        assert_eq!(handle.metric_type(), DistanceType::L2);
+        assert_eq!(handle.dimension(), DIMENSION as usize);
         let ivf = handle.as_ivf().unwrap();
+        assert_eq!(ivf.metric_type(), DistanceType::L2);
+        assert_eq!(ivf.dimension(), DIMENSION as usize);
         let centroids = ivf.read_centroids().await.unwrap();
         assert_eq!(centroids.len(), 2);
         assert_eq!(centroids.value_length(), DIMENSION);
 
-        let (codebook, num_bits) = ivf.read_pq_codebook().await.unwrap();
-        assert_eq!(num_bits, 8);
+        let codebook = ivf.read_pq_codebook().await.unwrap();
+        assert_eq!(codebook.num_bits, 8);
+        assert_eq!(codebook.num_sub_vectors, 2);
+        assert_eq!(codebook.dimension, DIMENSION as usize);
         // 2^num_bits codebook rows.
-        assert_eq!(codebook.len(), 256);
+        assert_eq!(codebook.codebook.len(), 256);
         // Inner list length equals the full indexed vector dimension (matches
         // the layout `PQBuildParams::with_codebook` consumes).
-        assert_eq!(codebook.value_length(), DIMENSION);
-        assert_eq!(codebook.value_type(), arrow_schema::DataType::Float32);
+        assert_eq!(codebook.codebook.value_length(), DIMENSION);
+        assert_eq!(
+            codebook.codebook.value_type(),
+            arrow_schema::DataType::Float32
+        );
     }
 
     #[tokio::test]
