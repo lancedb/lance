@@ -1775,7 +1775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dataset_zonemap_value_range() {
+    async fn test_dataset_column_value_range() {
         use crate::index::DatasetIndexExt;
         use arrow::datatypes::Int64Type;
         use datafusion::scalar::ScalarValue;
@@ -1798,15 +1798,15 @@ mod tests {
 
         // Folded straight from the ZoneMap summaries: global [0, 9].
         assert_eq!(
-            ds.zonemap_value_range("id").await.unwrap(),
+            ds.column_value_range("id").await.unwrap(),
             Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
         );
         // `other` has no ZoneMap index -> no precomputed range.
-        assert_eq!(ds.zonemap_value_range("other").await.unwrap(), None);
+        assert_eq!(ds.column_value_range("other").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn test_zonemap_value_range_none_when_index_misses_fragments() {
+    async fn test_column_value_range_none_when_index_misses_fragments() {
         use crate::index::DatasetIndexExt;
         use arrow::datatypes::Int64Type;
         use lance_datagen::{BatchCount, RowCount, array};
@@ -1823,7 +1823,7 @@ mod tests {
         ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
             .await
             .unwrap();
-        assert!(ds.zonemap_value_range("id").await.unwrap().is_some());
+        assert!(ds.column_value_range("id").await.unwrap().is_some());
 
         // Append a fragment the index doesn't cover. Its rows may hold values
         // outside the indexed range, so any non-None range would be a subset
@@ -1833,11 +1833,11 @@ mod tests {
             .into_reader_rows(RowCount::from(5), BatchCount::from(1));
         ds.append(reader, None).await.unwrap();
 
-        assert_eq!(ds.zonemap_value_range("id").await.unwrap(), None);
+        assert_eq!(ds.column_value_range("id").await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn test_zonemap_value_range_folds_multiple_segments() {
+    async fn test_column_value_range_folds_multiple_segments() {
         use crate::index::DatasetIndexExt;
         use arrow::datatypes::Int64Type;
         use datafusion::scalar::ScalarValue;
@@ -1873,7 +1873,7 @@ mod tests {
         // spans both and yields the global range, not None.
         assert_eq!(ds.load_indices_by_name("id_idx").await.unwrap().len(), 2);
         assert_eq!(
-            ds.zonemap_value_range("id").await.unwrap(),
+            ds.column_value_range("id").await.unwrap(),
             Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
         );
     }

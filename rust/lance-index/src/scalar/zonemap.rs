@@ -150,13 +150,6 @@ impl ZoneMapIndex {
         Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
     }
 
-    /// Global `[min, max]` folded from this index's per-zone summaries, no scan.
-    /// Thin wrapper over [`value_range_over`](Self::value_range_over) for a
-    /// single segment; see it for the full contract.
-    pub fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
-        Self::value_range_over([self])
-    }
-
     /// Global `[min, max]` folded across one or more ZoneMap segments (the
     /// disjoint per-column segments of a multi-segment index), without a scan.
     ///
@@ -692,6 +685,12 @@ impl ScalarIndex for ZoneMapIndex {
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
+    }
+
+    /// Single-segment `[min, max]` folded from this index's zones; see
+    /// [`value_range_over`](Self::value_range_over) for the full contract.
+    fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        Self::value_range_over([self])
     }
 }
 

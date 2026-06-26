@@ -234,19 +234,19 @@ pub trait DatasetIndexExt {
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
-    /// Global `[min, max]` for `column` from its ZoneMap scalar index, no scan.
+    /// Global `[min, max]` for `column` from its min/max-capable scalar index
+    /// (currently ZoneMap), without a scan.
     ///
-    /// `None` unless the column's ZoneMap segments *jointly* cover every live
-    /// fragment and the column is NaN-free — fragments appended after the index
-    /// was built, or a NaN-bearing column, yield `None`. The disjoint segments
-    /// of a multi-segment index are folded together.
+    /// `None` unless the column's index segments *jointly* cover every live
+    /// fragment and the column can be soundly bounded — fragments appended after
+    /// the index was built, or a NaN-bearing column, yield `None`. The disjoint
+    /// segments of a multi-segment index are folded together.
     ///
     /// When `Some`, the range is a superset of live values, conservative under
-    /// deletion vectors: safe to prune with. See [`ZoneMapIndex::value_range`].
+    /// deletion vectors: safe to prune with. See [`ScalarIndex::value_range`].
     ///
-    /// [`ZoneMapIndex::value_range`]: lance_index::scalar::zonemap::ZoneMapIndex::value_range
-    async fn zonemap_value_range(&self, column: &str)
-    -> Result<Option<(ScalarValue, ScalarValue)>>;
+    /// [`ScalarIndex::value_range`]: lance_index::scalar::ScalarIndex::value_range
+    async fn column_value_range(&self, column: &str) -> Result<Option<(ScalarValue, ScalarValue)>>;
 
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(

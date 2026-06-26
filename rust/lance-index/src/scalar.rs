@@ -1132,6 +1132,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// Global `[min, max]` of the indexed column from index metadata, without a
+    /// scan, or `None` if this index type cannot supply a sound bound. When
+    /// `Some`, the range is a superset of live values (conservative under
+    /// deletes): safe to prune with, not guaranteed tight.
+    fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        None
+    }
 }
 
 #[cfg(test)]

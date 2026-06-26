@@ -1455,13 +1455,10 @@ impl DatasetIndexExt for Dataset {
             .await
     }
 
-    async fn zonemap_value_range(
-        &self,
-        column: &str,
-    ) -> Result<Option<(ScalarValue, ScalarValue)>> {
+    async fn column_value_range(&self, column: &str) -> Result<Option<(ScalarValue, ScalarValue)>> {
         let Some(field) = self.schema().field(column) else {
             return Err(Error::invalid_input(format!(
-                "zonemap_value_range: column '{column}' not found in dataset schema"
+                "column_value_range: column '{column}' not found in dataset schema"
             )));
         };
         let field_id = field.id;
