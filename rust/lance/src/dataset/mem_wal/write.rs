@@ -2173,6 +2173,37 @@ impl ShardWriter {
         }
     }
 
+    /// Abort the writer without flushing.
+    ///
+    /// Shuts down the background flush tasks and leaves all buffered
+    /// memtable state to be dropped with the writer. Unlike
+    /// [`Self::close`], no WAL/MemTable flush is issued: pending in-memory
+    /// rows are discarded, not made durable, and no object-store IO is
+    /// performed. Used on drop-table, where the dataset directory is about
+    /// to be removed and a flush would only race fresh files back into a
+    /// doomed path.
+    ///
+    /// Caller-quiesce contract: `abort` takes `&self` (so it can be called
+    /// through the `Arc<ShardWriter>` callers hold) and therefore cannot
+    /// structurally bar a concurrent or subsequent `put` the way consuming
+    /// `close(self)` does. After abort the dispatchers are gone, so a later
+    /// `put` would buffer data that never flushes. Callers MUST stop
+    /// issuing writes before calling abort.
+    ///
+    /// Blocks until any flush already mid-`handle()` settles —
+    /// cancellation only fires between messages — so no flush task lingers
+    /// after abort returns. Idempotent: a second call re-cancels an
+    /// already-cancelled token and joins an already-emptied task set.
+    #[instrument(name = "sw_abort", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
+    pub async fn abort(&self) -> Result<()> {
+        info!(
+            "Aborting ShardWriter for shard {} (no flush)",
+            self.config.shard_id
+        );
+        self.task_executor.shutdown_all().await?;
+        Ok(())
+    }
+
     /// Close the writer gracefully.
     ///
     /// Flushes pending data and shuts down background tasks.
@@ -5106,6 +5137,63 @@ mod tests {
         assert_eq!(manifest.flushed_generations.len(), flushed_before + 1);
 
         writer.close().await.unwrap();
+    }
+
+    /// `abort` tears down the background flush tasks WITHOUT flushing —
+    /// buffered memtable rows are discarded, not sealed into an L0
+    /// generation the way `close` would. Idempotent on a second call.
+    #[tokio::test]
+    async fn test_abort_discards_without_flushing_and_is_idempotent() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        // Thresholds high enough that nothing auto-flushes; the rows stay
+        // in the active memtable until abort discards them.
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        let flushed_before = writer
+            .manifest()
+            .await
+            .unwrap()
+            .map(|m| m.flushed_generations.len())
+            .unwrap_or(0);
+
+        writer.abort().await.unwrap();
+
+        // No generation was sealed — contrast with `close`, which flushes
+        // the 10 buffered rows into a new L0 generation.
+        let flushed_after = writer
+            .manifest()
+            .await
+            .unwrap()
+            .map(|m| m.flushed_generations.len())
+            .unwrap_or(0);
+        assert_eq!(
+            flushed_after, flushed_before,
+            "abort must not flush a new L0 generation"
+        );
+
+        // Idempotent: re-cancels the already-cancelled token, joins an
+        // already-emptied task set.
+        writer.abort().await.unwrap();
     }
 
     /// On a successful flush commit the sealed generation's rows land in the

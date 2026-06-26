@@ -150,24 +150,34 @@ impl ColumnAlteration {
 
 /// Limit casts to same type. This is mostly to filter out weird casts like
 /// casting a string to a boolean or float to string.
-fn is_upcast_downcast(from_type: &DataType, to_type: &DataType) -> bool {
+fn is_upcast_downcast(from_type: &DataType, to_type: &DataType, version: LanceFileVersion) -> bool {
     use DataType::*;
-    match from_type {
-        from_type if from_type.is_integer() => to_type.is_integer(),
-        from_type if from_type.is_floating() => to_type.is_floating(),
-        from_type if from_type.is_temporal() => to_type.is_temporal(),
-        Boolean => matches!(to_type, Boolean),
-        Utf8 | LargeUtf8 => matches!(to_type, Utf8 | LargeUtf8),
-        Binary | LargeBinary => matches!(to_type, Binary | LargeBinary),
-        Decimal128(_, _) | Decimal256(_, _) => {
-            matches!(to_type, Decimal128(_, _) | Decimal256(_, _))
+    match (from_type, to_type) {
+        // Legacy storage cannot materialize a fresh Dictionary column via
+        // alter because the writer expects `field.dictionary` metadata to be
+        // pre-populated, which the alter pipeline does not compute.
+        (_, Dictionary(_, _)) if matches!(version, LanceFileVersion::Legacy) => false,
+        // These need to be in front
+        (Dictionary(_, from_value_type), _) => {
+            is_upcast_downcast(from_value_type, to_type, version)
         }
-        List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _) => match to_type {
+        (_, Dictionary(_, to_value_type)) => is_upcast_downcast(from_type, to_value_type, version),
+        (from, to) if from.is_integer() => to.is_integer(),
+        (from, to) if from.is_floating() => to.is_floating(),
+        (from, to) if from.is_temporal() => to.is_temporal(),
+        (Boolean, to) => matches!(to, Boolean),
+        (Utf8 | LargeUtf8, to) => matches!(to, Utf8 | LargeUtf8),
+        (Binary | LargeBinary, to) => matches!(to, Binary | LargeBinary),
+        (Decimal128(_, _) | Decimal256(_, _), to) => {
+            matches!(to, Decimal128(_, _) | Decimal256(_, _))
+        }
+        (List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _), to) => match to {
             List(to_field) | LargeList(to_field) | FixedSizeList(to_field, _) => {
-                is_upcast_downcast(from_field.data_type(), to_field.data_type())
+                is_upcast_downcast(from_field.data_type(), to_field.data_type(), version)
             }
             _ => false,
         },
+
         _ => false,
     }
 }
@@ -698,6 +708,7 @@ pub(super) async fn alter_columns(
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
+    let version = dataset.manifest.data_storage_format.lance_file_version()?;
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -724,7 +735,7 @@ pub(super) async fn alter_columns(
 
         if let Some(data_type) = &alteration.data_type {
             if !(can_cast_types(&field_src.data_type(), data_type)
-                && is_upcast_downcast(&field_src.data_type(), data_type))
+                && is_upcast_downcast(&field_src.data_type(), data_type, version))
             {
                 return Err(Error::invalid_input(format!(
                     "Cannot cast column \"{}\" from {:?} to {:?}",
@@ -2997,6 +3008,179 @@ mod test {
                 64,
             ),
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_upcast_downcast_dictionary() {
+        use DataType::*;
+
+        let dict_i32_utf8 = Dictionary(Box::new(Int32), Box::new(Utf8));
+        let dict_i16_utf8 = Dictionary(Box::new(Int16), Box::new(Utf8));
+        let dict_i32_large_utf8 = Dictionary(Box::new(Int32), Box::new(LargeUtf8));
+        let dict_i32_int64 = Dictionary(Box::new(Int32), Box::new(Int64));
+        let stable = LanceFileVersion::Stable;
+        let legacy = LanceFileVersion::Legacy;
+
+        // Dict(_, Utf8) -> Utf8 / LargeUtf8 (decode direction): both versions.
+        assert!(is_upcast_downcast(&dict_i32_utf8, &Utf8, stable));
+        assert!(is_upcast_downcast(&dict_i32_utf8, &LargeUtf8, stable));
+        assert!(is_upcast_downcast(&dict_i32_utf8, &Utf8, legacy));
+        assert!(is_upcast_downcast(&dict_i32_utf8, &LargeUtf8, legacy));
+
+        // Utf8 / LargeUtf8 -> Dict(_, Utf8) (encode direction): stable only.
+        assert!(is_upcast_downcast(&Utf8, &dict_i32_utf8, stable));
+        assert!(is_upcast_downcast(&LargeUtf8, &dict_i32_utf8, stable));
+        assert!(!is_upcast_downcast(&Utf8, &dict_i32_utf8, legacy));
+        assert!(!is_upcast_downcast(&LargeUtf8, &dict_i32_utf8, legacy));
+
+        // Dict -> Dict with compatible value types, including different index
+        // types. Stable only; Legacy can't materialize a fresh dictionary.
+        assert!(is_upcast_downcast(&dict_i32_utf8, &dict_i16_utf8, stable));
+        assert!(is_upcast_downcast(
+            &dict_i32_utf8,
+            &dict_i32_large_utf8,
+            stable
+        ));
+        assert!(!is_upcast_downcast(&dict_i32_utf8, &dict_i16_utf8, legacy));
+
+        // Dict(_, Int64) <-> integer types (peel applies to non-string families).
+        assert!(is_upcast_downcast(&dict_i32_int64, &Int32, stable));
+        assert!(is_upcast_downcast(&Int32, &dict_i32_int64, stable));
+        assert!(is_upcast_downcast(&dict_i32_int64, &Int32, legacy));
+        assert!(!is_upcast_downcast(&Int32, &dict_i32_int64, legacy));
+
+        // Cross-family casts must still be rejected after peeling.
+        assert!(!is_upcast_downcast(&dict_i32_utf8, &Int32, stable));
+        assert!(!is_upcast_downcast(&Int32, &dict_i32_utf8, stable));
+        assert!(!is_upcast_downcast(&dict_i32_utf8, &Boolean, stable));
+        assert!(!is_upcast_downcast(&Boolean, &dict_i32_utf8, stable));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_cast_dictionary_to_string(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int32Type;
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            dict_type.clone(),
+            false,
+        )]));
+
+        let values = ["alpha", "beta", "gamma", "alpha", "beta"];
+        let dict_array: DictionaryArray<Int32Type> = values.iter().copied().collect();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dict_array)])?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        dataset
+            .alter_columns(&[ColumnAlteration::new("d".into()).cast_to(DataType::Utf8)])
+            .await?;
+        dataset.validate().await?;
+        assert_eq!(
+            dataset.schema().field("d").unwrap().data_type(),
+            DataType::Utf8
+        );
+        let scanned = dataset.scan().try_into_batch().await?;
+        let decoded = scanned.column_by_name("d").unwrap();
+        let expected_decoded = StringArray::from(values.to_vec());
+        assert_eq!(
+            decoded.as_ref(),
+            &expected_decoded as &dyn arrow_array::Array
+        );
+
+        // Cross-family casts must still be rejected even through a dictionary.
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("d".into()).cast_to(DataType::Int32)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Cannot cast column"));
+
+        Ok(())
+    }
+
+    // Stable can materialize a fresh Dictionary column via alter; Legacy
+    // cannot, because its writer requires `field.dictionary` metadata to be
+    // pre-populated, so the cast is rejected upfront with a clean error.
+    #[rstest]
+    #[tokio::test]
+    async fn test_cast_string_to_dictionary(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int32Type;
+
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let values = ["alpha", "beta", "gamma", "alpha", "beta"];
+        let string_array = StringArray::from(values.to_vec());
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(string_array)])?;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let result = dataset
+            .alter_columns(&[ColumnAlteration::new("s".into()).cast_to(dict_type.clone())])
+            .await;
+
+        match data_storage_version {
+            LanceFileVersion::Legacy => {
+                let err = result.unwrap_err();
+                assert!(
+                    err.to_string().contains("Cannot cast column"),
+                    "expected upfront rejection on Legacy, got: {err}"
+                );
+            }
+            _ => {
+                result?;
+                dataset.validate().await?;
+                assert_eq!(
+                    dataset.schema().field("s").unwrap().data_type(),
+                    dict_type.clone()
+                );
+                let scanned = dataset.scan().try_into_batch().await?;
+                let encoded = scanned.column_by_name("s").unwrap();
+                let expected_encoded: DictionaryArray<Int32Type> = values.iter().copied().collect();
+                assert_eq!(
+                    encoded.as_ref(),
+                    &expected_encoded as &dyn arrow_array::Array
+                );
+            }
+        }
 
         Ok(())
     }
