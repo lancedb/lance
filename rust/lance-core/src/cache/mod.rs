@@ -427,6 +427,10 @@ impl LanceCache {
     /// load. Use this for `Arc<dyn Trait>` values, where the load is expensive
     /// (I/O + deserialization) and worth coalescing across racing callers.
     ///
+    /// A failing `loader` is not cached: the error is propagated to the waiters
+    /// and the next call retries, so a transient I/O failure cannot poison the
+    /// entry.
+    ///
     /// [`get_or_insert_with_key`]: Self::get_or_insert_with_key
     pub async fn get_or_insert_unsized_with_key<K, F, Fut>(
         &self,
