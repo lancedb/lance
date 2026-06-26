@@ -18,7 +18,7 @@ use core::mem::size_of;
 
 mod bitpacker_internal;
 
-pub use bitpacker_internal::{BitPacker, BitPacker4x};
+pub use bitpacker_internal::{BitPacker, BitPacker4x, BitPacker8x};
 
 pub const FL_ORDER: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 

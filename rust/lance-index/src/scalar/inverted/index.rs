@@ -3794,7 +3794,7 @@ pub struct CompressedPostingList {
     pub length: u32,
     // each binary is a block of compressed data
     // that contains `block_size` doc ids and then `block_size` frequencies,
-    // packed internally in 128-value bitpacking chunks.
+    // packed by the physical bitpacker matching that block size.
     pub blocks: LargeBinaryArray,
     pub posting_tail_codec: PostingTailCodec,
     pub block_size: usize,

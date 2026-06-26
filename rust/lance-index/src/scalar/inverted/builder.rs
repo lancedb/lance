@@ -42,8 +42,9 @@ use std::task::{Context, Poll};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
 
-// The physical bitpacking block size. Logical FTS posting blocks may contain
-// 1, 2, or 4 of these chunks, configured by InvertedIndexParams::block_size.
+// The legacy bitpacking block size. Position streams still use this block size;
+// FTS posting blocks choose their physical bitpacker from the configured
+// InvertedIndexParams::block_size.
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 // The default number of workers to use for FTS builds.

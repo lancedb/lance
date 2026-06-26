@@ -29,8 +29,8 @@ use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
     builder::ScoredDoc,
     encoding::{
-        decode_position_stream_block, decompress_positions, decompress_posting_block,
-        decompress_posting_remainder,
+        MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
+        decompress_posting_block, decompress_posting_remainder,
     },
     query::FtsSearchParams,
     scorer::Scorer,
@@ -66,7 +66,7 @@ struct CompressedState {
     block_idx: usize,
     doc_ids: Vec<u32>,
     freqs: Vec<u32>,
-    buffer: Box<[u32; BLOCK_SIZE]>,
+    buffer: Box<[u32; MAX_POSTING_BLOCK_SIZE]>,
     position_block_idx: Option<usize>,
     position_values: Vec<u32>,
     position_offsets: Vec<usize>,
@@ -79,7 +79,7 @@ impl CompressedState {
             block_idx: 0,
             doc_ids: Vec::with_capacity(block_size),
             freqs: Vec::with_capacity(block_size),
-            buffer: Box::new([0; BLOCK_SIZE]),
+            buffer: Box::new([0; MAX_POSTING_BLOCK_SIZE]),
             position_block_idx: None,
             position_values: Vec::new(),
             position_offsets: Vec::new(),
@@ -112,7 +112,7 @@ impl CompressedState {
         } else {
             decompress_posting_block(
                 block,
-                &mut self.buffer,
+                &mut self.buffer[..],
                 &mut self.doc_ids,
                 &mut self.freqs,
                 block_size,

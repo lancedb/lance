@@ -6,10 +6,9 @@ use arrow_array::{Array, LargeBinaryArray};
 
 use super::{
     CompressedPositionStorage, PostingList, PostingTailCodec,
-    builder::BLOCK_SIZE,
     encoding::{
-        decode_position_stream_block, decompress_positions, decompress_posting_block,
-        decompress_posting_remainder,
+        MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
+        decompress_posting_block, decompress_posting_remainder,
     },
 };
 
@@ -90,7 +89,7 @@ pub struct CompressedPostingListIterator {
     doc_idx_in_block: usize,
     decoded_positions: Vec<u32>,
     position_offsets: Vec<usize>,
-    buffer: [u32; BLOCK_SIZE],
+    buffer: [u32; MAX_POSTING_BLOCK_SIZE],
 }
 
 impl CompressedPostingListIterator {
@@ -123,7 +122,7 @@ impl CompressedPostingListIterator {
             doc_idx_in_block: 0,
             decoded_positions: Vec::new(),
             position_offsets: Vec::new(),
-            buffer: [0; BLOCK_SIZE],
+            buffer: [0; MAX_POSTING_BLOCK_SIZE],
         }
     }
 }
