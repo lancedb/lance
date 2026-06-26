@@ -76,7 +76,10 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
+    scalar::{
+        FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
+        inverted::InvertedListFormatVersion,
+    },
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
@@ -2291,6 +2294,12 @@ impl Dataset {
                     }
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
+                    }
+                    if let Some(format_version) = kwargs.get_item("format_version")? {
+                        let format_version =
+                            InvertedListFormatVersion::try_from(format_version.extract::<u32>()?)
+                                .map_err(PyValueError::new_err)?;
+                        params = params.with_format_version(format_version);
                     }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);

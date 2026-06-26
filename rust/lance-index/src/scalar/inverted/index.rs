@@ -48,6 +48,7 @@ use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use tracing::{info, instrument};
@@ -133,26 +134,41 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
-fn resolve_fts_format_version(
-    value: Option<&str>,
-) -> std::result::Result<InvertedListFormatVersion, Error> {
-    value.unwrap_or("1").parse()
-}
-
 pub fn current_fts_format_version() -> InvertedListFormatVersion {
-    resolve_fts_format_version(std::env::var("LANCE_FTS_FORMAT_VERSION").ok().as_deref())
-        .expect("failed to parse LANCE_FTS_FORMAT_VERSION")
+    InvertedListFormatVersion::V2
 }
 
 pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
     InvertedListFormatVersion::V2
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(into = "u32", try_from = "u32")]
 pub enum InvertedListFormatVersion {
-    #[default]
     V1,
+    #[default]
     V2,
+}
+
+impl From<InvertedListFormatVersion> for u32 {
+    fn from(value: InvertedListFormatVersion) -> Self {
+        value.index_version()
+    }
+}
+
+impl TryFrom<u32> for InvertedListFormatVersion {
+    type Error = String;
+
+    fn try_from(value: u32) -> std::result::Result<Self, Self::Error> {
+        match value {
+            INVERTED_INDEX_VERSION_V1 => Ok(Self::V1),
+            INVERTED_INDEX_VERSION_V2 => Ok(Self::V2),
+            other => Err(format!(
+                "unsupported FTS format version {}, expected 1 or 2",
+                other
+            )),
+        }
+    }
 }
 
 impl InvertedListFormatVersion {
@@ -5964,13 +5980,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_fts_format_version_defaults_to_v1() {
+    fn test_current_fts_format_version_defaults_to_v2() {
+        assert_eq!(current_fts_format_version(), InvertedListFormatVersion::V2);
         assert_eq!(
-            resolve_fts_format_version(None).unwrap(),
+            InvertedListFormatVersion::try_from(1).unwrap(),
             InvertedListFormatVersion::V1
         );
         assert_eq!(
-            resolve_fts_format_version(Some("2")).unwrap(),
+            InvertedListFormatVersion::try_from(2).unwrap(),
             InvertedListFormatVersion::V2
         );
     }

@@ -247,14 +247,14 @@ impl InvertedIndexBuilder {
         deleted_fragments: RoaringBitmap,
     ) -> Self {
         Self {
+            posting_tail_codec: params.format_version().posting_tail_codec(),
+            format_version: params.format_version(),
             params,
             partitions,
             new_partitions: Vec::new(),
             src_store: store,
             token_set_format,
             fragment_mask,
-            format_version: current_fts_format_version(),
-            posting_tail_codec: current_fts_format_version().posting_tail_codec(),
             progress: noop_progress(),
             deleted_fragments,
         }

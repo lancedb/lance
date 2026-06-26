@@ -148,13 +148,14 @@ impl InvertedIndexPlugin {
         });
 
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
+        let format_version = params.format_version();
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
                 .with_progress(progress);
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: current_fts_format_version().index_version(),
+            index_version: format_version.index_version(),
             files,
         })
     }

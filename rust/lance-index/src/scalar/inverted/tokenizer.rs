@@ -18,6 +18,7 @@ use jieba::JiebaTokenizerBuilder;
 #[cfg(feature = "tokenizer-lindera")]
 use lindera::LinderaTokenizerBuilder;
 
+use super::index::InvertedListFormatVersion;
 use crate::pbold;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
@@ -97,6 +98,10 @@ pub struct InvertedIndexParams {
     #[serde(default)]
     pub(crate) prefix_only: bool,
 
+    /// On-disk FTS inverted-list format version for newly created index segments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) format_version: Option<InvertedListFormatVersion>,
+
     /// Total memory limit in MiB for the build stage.
     ///
     /// This is split evenly across FTS workers at build time. By default Lance
@@ -164,6 +169,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             min_ngram_length: details.min_ngram_length,
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
+            format_version: None,
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
         })
@@ -218,6 +224,7 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
+            format_version: Some(InvertedListFormatVersion::V2),
             memory_limit_mb: None,
             num_workers: None,
         }
@@ -253,6 +260,15 @@ impl InvertedIndexParams {
     /// Get whether positions are stored in this index.
     pub fn has_positions(&self) -> bool {
         self.with_position
+    }
+
+    pub fn with_format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
+        self.format_version = Some(format_version);
+        self
+    }
+
+    pub fn format_version(&self) -> InvertedListFormatVersion {
+        self.format_version.unwrap_or(InvertedListFormatVersion::V2)
     }
 
     pub fn max_token_length(mut self, max_token_length: Option<usize>) -> Self {
@@ -492,6 +508,34 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
+    }
+
+    #[test]
+    fn test_format_version_defaults_to_v2_for_new_params() {
+        let params = InvertedIndexParams::default();
+        assert_eq!(
+            params.format_version(),
+            super::InvertedListFormatVersion::V2
+        );
+
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            json.get("format_version"),
+            Some(&serde_json::Value::from(2))
+        );
+    }
+
+    #[test]
+    fn test_missing_format_version_deserializes_without_override() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        json.as_object_mut().unwrap().remove("format_version");
+
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.format_version, None);
+        assert_eq!(
+            params.format_version(),
+            super::InvertedListFormatVersion::V2
+        );
     }
 
     #[test]

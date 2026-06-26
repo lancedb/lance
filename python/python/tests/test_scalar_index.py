@@ -4802,9 +4802,8 @@ def test_json_inverted_match_query(tmp_path):
     assert results.num_rows == 1
 
 
-@pytest.mark.parametrize("fts_format_version", ["1", "2"])
-def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
-    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", fts_format_version)
+@pytest.mark.parametrize("fts_format_version", [1, 2])
+def test_describe_indices(tmp_path, fts_format_version):
     data = pa.table(
         {
             "id": range(100),
@@ -4820,7 +4819,9 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
         }
     )
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", index_type="INVERTED")
+    ds.create_scalar_index(
+        "text", index_type="INVERTED", format_version=fts_format_version
+    )
     indices = ds.describe_indices()
     assert len(indices) == 1
 
