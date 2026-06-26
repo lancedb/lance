@@ -189,6 +189,33 @@ impl LsmPointLookupPlanner {
         pk_values: &[ScalarValue],
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        match self.plan_lookup_coalesced(pk_values, projection).await? {
+            // Tombstones are dropped AFTER the coalesce, never per-source: the
+            // tombstone wins the newest-first coalesce (its source is the newest
+            // non-empty arm), so filtering it here yields "not found". Filtering
+            // per-source would empty the newest arm and let `CoalesceFirstExec`
+            // fall through to an older arm — resurrecting the deleted row. Then
+            // the carried `_tombstone` column is projected away.
+            Some(coalesced) => {
+                let canonical =
+                    canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+                filter_tombstones_after_coalesce(coalesced, &canonical)
+            }
+            None => self.empty_plan(projection),
+        }
+    }
+
+    /// Build the coalesced point-lookup plan: each source scanned newest-first,
+    /// unioned under `CoalesceFirstExec`, output in the *carry* schema (canonical
+    /// output + the `_tombstone` marker). `None` when there are no sources at
+    /// all. [`Self::plan_lookup`] drops the tombstone on top of this;
+    /// [`Self::lookup_keep_tombstone`] keeps it so partial-update merge can tell
+    /// a fresh-deleted key from an absent one.
+    async fn plan_lookup_coalesced(
+        &self,
+        pk_values: &[ScalarValue],
+        projection: Option<&[String]>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if pk_values.len() != self.pk_columns.len() {
             return Err(lance_core::Error::invalid_input(format!(
                 "Expected {} primary key values, got {}",
@@ -202,7 +229,7 @@ impl LsmPointLookupPlanner {
         let sources = self.collector.collect()?;
 
         if sources.is_empty() {
-            return self.empty_plan(projection);
+            return Ok(None);
         }
 
         // Sort by generation DESC (newest first)
@@ -242,17 +269,60 @@ impl LsmPointLookupPlanner {
         // needs (the in-memory mem_wal execs report empty column statistics, and
         // datafusion's projection statistics would index out of bounds without
         // this normalization).
-        let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalesceFirstExec::new(source_plans));
+        Ok(Some(Arc::new(CoalesceFirstExec::new(source_plans))))
+    }
 
-        // Tombstones must be dropped AFTER the coalesce, never per-source: the
-        // tombstone wins the newest-first coalesce (its source is the newest
-        // non-empty arm), so filtering it here yields "not found". Filtering
-        // per-source would empty the newest arm and let `CoalesceFirstExec`
-        // fall through to an older arm — resurrecting the deleted row. Then the
-        // carried `_tombstone` column is projected away.
+    /// Like [`Self::lookup`] but does NOT drop a tombstone: the returned 1-row
+    /// batch carries the `_tombstone` marker (`true` ⇒ the key's newest fresh
+    /// version is a delete); `None` still means the key is absent from every
+    /// source. Partial-update merge uses this to treat a fresh-deleted PK as
+    /// absent, so it never resurrects stale, not-yet-compacted base columns.
+    /// Always plans (no in-memory fast path) — used off the hot read path, on
+    /// small partial-update batches.
+    pub async fn lookup_keep_tombstone(
+        &self,
+        pk_values: &[ScalarValue],
+        projection: Option<&[String]>,
+    ) -> Result<Option<RecordBatch>> {
+        let Some(plan) = self.plan_lookup_coalesced(pk_values, projection).await? else {
+            return Ok(None);
+        };
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, self.task_ctx.clone())?
+            .try_collect()
+            .await?;
+        for batch in batches {
+            if batch.num_rows() > 0 {
+                return Ok(Some(batch.slice(0, 1)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Tombstone-preserving [`Self::lookup_many`] for single- or multi-column
+    /// keys: resolves each key with [`Self::lookup_keep_tombstone`] and
+    /// concatenates the hits in the carry schema (canonical output +
+    /// `_tombstone`); keys absent from every source are omitted. Per-key (no
+    /// batched fast path) — the partial-update batches that use it are small.
+    pub async fn lookup_many_keep_tombstone(
+        &self,
+        keys: &[Vec<ScalarValue>],
+        projection: Option<&[String]>,
+    ) -> Result<RecordBatch> {
         let canonical =
             canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
-        filter_tombstones_after_coalesce(coalesced, &canonical)
+        let target = carry_schema(&canonical);
+        let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(b) = self.lookup_keep_tombstone(key, projection).await? {
+                out.push(b);
+            }
+        }
+        match out.len() {
+            0 => Ok(RecordBatch::new_empty(target)),
+            1 => Ok(out.pop().unwrap()),
+            _ => Ok(arrow_select::concat::concat_batches(&target, &out)?),
+        }
     }
 
     /// Resolve a single-row point lookup, returning the newest matching row (a
@@ -1982,6 +2052,85 @@ mod tests {
                 },
             );
         LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema)
+    }
+
+    /// Read the `_tombstone` marker from row 0 of a keep-tombstone result.
+    fn tombstone_at(b: &RecordBatch) -> bool {
+        let idx = b.schema().index_of(TOMBSTONE).expect("_tombstone column");
+        b.column(idx)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("_tombstone is Boolean")
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn test_lookup_keep_tombstone_returns_deleted_row_with_marker() {
+        // The tombstone-preserving variant keeps a deleted key that the filtered
+        // `lookup` would drop: id=1 deleted, id=2 live, id=99 absent.
+        let schema = pk_ts_schema();
+        let planner = active_ts_planner(&[ts_real(&schema, &[1, 2], "v"), ts_tomb(&schema, &[1])]);
+
+        // Deleted key: present with `_tombstone = true` (vs `None` from `lookup`).
+        let deleted = planner
+            .lookup_keep_tombstone(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap()
+            .expect("deleted key kept by lookup_keep_tombstone");
+        assert_eq!(id_at(&deleted), 1);
+        assert!(
+            tombstone_at(&deleted),
+            "deleted key carries _tombstone = true"
+        );
+
+        // Live key: present with `_tombstone = false`.
+        let live = planner
+            .lookup_keep_tombstone(&[ScalarValue::Int32(Some(2))], None)
+            .await
+            .unwrap()
+            .expect("live key found");
+        assert_eq!(id_at(&live), 2);
+        assert!(!tombstone_at(&live), "live key carries _tombstone = false");
+
+        // Absent key: still `None` — no fresh entry at all to distinguish.
+        assert!(
+            planner
+                .lookup_keep_tombstone(&[ScalarValue::Int32(Some(99))], None)
+                .await
+                .unwrap()
+                .is_none(),
+            "absent key has no fresh entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lookup_many_keep_tombstone_includes_tombstoned_keys() {
+        // Batched variant: the tombstoned key is INCLUDED (carrying its marker),
+        // unlike `lookup_many` which omits it. id=2 deleted; 1 and 3 live.
+        let schema = pk_ts_schema();
+        let planner =
+            active_ts_planner(&[ts_real(&schema, &[1, 2, 3], "v"), ts_tomb(&schema, &[2])]);
+        let keys = vec![
+            vec![ScalarValue::Int32(Some(1))],
+            vec![ScalarValue::Int32(Some(2))],
+            vec![ScalarValue::Int32(Some(3))],
+        ];
+        let batch = planner
+            .lookup_many_keep_tombstone(&keys, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "all three keys kept, including the tombstone"
+        );
+        // Exactly one row (id=2) is marked deleted.
+        let deleted: Vec<i32> = (0..batch.num_rows())
+            .map(|r| batch.slice(r, 1))
+            .filter(tombstone_at)
+            .map(|b| id_at(&b))
+            .collect();
+        assert_eq!(deleted, vec![2], "only id=2 is marked deleted");
     }
 
     #[tokio::test]

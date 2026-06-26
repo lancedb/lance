@@ -3237,7 +3237,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 5 types of scalar indices available today.
+        Lance supports the following scalar index types:
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -3336,6 +3336,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "icu": ICU dictionary-based Unicode word segmentation.
+            * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true

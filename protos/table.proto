@@ -521,6 +521,16 @@ message FragmentReuseIndexDetails {
 // MemWAL Index Types
 // ============================================================================
 
+// Lifecycle status of a WAL shard. Drives drop-table two-phase commit:
+// a SEALED shard refuses new writer claims (reversible) until the drop
+// commits (the shard dir is deleted) or rolls back (status -> ACTIVE).
+enum ShardStatus {
+  // Normal: the shard accepts writer claims.
+  ACTIVE = 0;
+  // A drop is in flight: claims are refused. Reversible to ACTIVE.
+  SEALED = 1;
+}
+
 // Shard manifest containing epoch-based fencing and WAL state.
 // Each shard has exactly one active writer at any time.
 message ShardManifest {
@@ -566,6 +576,10 @@ message ShardManifest {
 
   // List of flushed MemTable generations and their directory paths.
   repeated FlushedGeneration flushed_generations = 8;
+
+  // Lifecycle status. Default ACTIVE; SEALED marks an in-flight drop
+  // (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
+  ShardStatus status = 15;
 }
 
 // A shard field value stored as raw Arrow scalar bytes.
