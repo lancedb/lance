@@ -25,7 +25,7 @@ SMALL_NUM_ROWS = SMALL_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 
 def make_ds(num_rows: int, rows_per_frag: int, tmpdir: pathlib.Path, dtype: str):
     vectors = np.random.randn(num_rows, DIMENSION).astype(dtype)
-    vectors.shape = -1
+    vectors = vectors.reshape(-1)
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     table = pa.Table.from_arrays([vectors], names=["vectors"])
     uri = str(tmpdir / "dataset")
@@ -53,7 +53,7 @@ def small_rand_dataset(tmpdir, request):
 @pytest.fixture
 def mostly_null_dataset(tmpdir, request):
     vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(np.float32)
-    vectors.shape = -1
+    vectors = vectors.reshape(-1)
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     vectors = vectors.to_pylist()
     vectors = [vec if i % 10 == 0 else None for i, vec in enumerate(vectors)]
@@ -219,7 +219,7 @@ def test_ivf_centroids_fragment_ids(tmpdir):
         ],
         axis=0,
     )
-    vectors.shape = -1
+    vectors = vectors.reshape(-1)
     table = pa.Table.from_arrays(
         [pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)], names=["vectors"]
     )

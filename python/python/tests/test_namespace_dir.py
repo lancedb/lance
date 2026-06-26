@@ -1106,6 +1106,49 @@ def test_external_manifest_store_invokes_namespace_apis(use_custom):
         ), "describe_table_version should be called once when opening version 1"
 
 
+def test_dataset_namespace_open_does_not_pass_version_to_describe_table():
+    """Dataset versions are applied to dataset open, not namespace describe_table."""
+
+    class VersionRejectingNamespace(CustomNamespace):
+        def __init__(self, inner: lance.namespace.DirectoryNamespace):
+            super().__init__(inner)
+            self.describe_versions = []
+
+        def describe_table(
+            self, request: DescribeTableRequest
+        ) -> DescribeTableResponse:
+            self.describe_versions.append(request.version)
+            assert request.version is None
+            return super().describe_table(request)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        inner_ns_client = lance.namespace.DirectoryNamespace(root=tmpdir)
+        ns_client = VersionRejectingNamespace(inner_ns_client)
+        table_id = ["test_table"]
+
+        table1 = pa.Table.from_pylist([{"a": 1}, {"a": 2}])
+        ds = lance.write_dataset(
+            table1, namespace_client=ns_client, table_id=table_id, mode="create"
+        )
+        assert ds.count_rows() == 2
+        assert ds.version == 1
+
+        table2 = pa.Table.from_pylist([{"a": 3}])
+        ds = lance.write_dataset(
+            table2, namespace_client=ns_client, table_id=table_id, mode="append"
+        )
+        assert ds.count_rows() == 3
+        assert ds.version == 2
+
+        version_one = lance.dataset(
+            namespace_client=ns_client, table_id=table_id, version=1
+        )
+        assert version_one.count_rows() == 2
+        assert version_one.version == 1
+        assert ns_client.describe_versions
+        assert all(version is None for version in ns_client.describe_versions)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="Windows file locking prevents reliable concurrent filesystem operations",

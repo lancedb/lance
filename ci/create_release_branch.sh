@@ -229,9 +229,9 @@ else
     bump-my-version bump -vv --new-version "${RC_VERSION}" --no-tag patch
 
     # Update Cargo.lock files after version bump
-    cargo update
-    (cd python && cargo update)
-    (cd java/lance-jni && cargo update)
+    cargo update --workspace
+    (cd python && cargo update --workspace)
+    (cd java/lance-jni && cargo update --workspace)
 
     # Commit the RC version
     git add -A
@@ -259,9 +259,9 @@ else
     bump-my-version bump -vv --new-version "${NEXT_VERSION}" --no-tag patch
 
     # Update Cargo.lock files after version bump
-    cargo update
-    (cd python && cargo update)
-    (cd java/lance-jni && cargo update)
+    cargo update --workspace
+    (cd python && cargo update --workspace)
+    (cd java/lance-jni && cargo update --workspace)
 
     git add -A
     git commit -m "chore: bump main to ${NEXT_VERSION}

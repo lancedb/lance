@@ -45,6 +45,8 @@ pub struct LanceIndexStore {
     /// When set, used to avoid HEAD calls when opening files
     file_sizes: HashMap<String, u64>,
     format_version: LanceFileVersion,
+    /// Base I/O priority for all requests this store submits to `scheduler`.
+    io_priority: u64,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -88,6 +90,7 @@ impl LanceIndexStore {
             scheduler,
             file_sizes: HashMap::new(),
             format_version,
+            io_priority: 0,
         }
     }
 
@@ -98,6 +101,29 @@ impl LanceIndexStore {
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
         self.file_sizes = file_sizes;
         self
+    }
+
+    /// The base I/O priority all this store's requests are submitted at.
+    pub fn io_priority(&self) -> u64 {
+        self.io_priority
+    }
+
+    fn index_file_path(&self, name: &str) -> Result<Path> {
+        let relative_path = Path::parse(name).map_err(|err| {
+            Error::invalid_input(format!("invalid index file path {name:?}: {err}"))
+        })?;
+        if self.index_dir.is_root() {
+            return Ok(relative_path);
+        }
+        if relative_path.is_root() {
+            return Ok(self.index_dir.clone());
+        }
+        Path::parse(format!(
+            "{}/{}",
+            self.index_dir.as_ref(),
+            relative_path.as_ref()
+        ))
+        .map_err(|err| Error::invalid_input(format!("invalid index file path {name:?}: {err}")))
     }
 }
 
@@ -397,7 +423,7 @@ impl IndexStore for LanceIndexStore {
         name: &str,
         schema: Arc<Schema>,
     ) -> Result<Box<dyn IndexWriter>> {
-        let path = self.index_dir.clone().join(name);
+        let path = self.index_file_path(name)?;
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
         let writer = current_writer::FileWriter::try_new(
@@ -414,15 +440,27 @@ impl IndexStore for LanceIndexStore {
         }))
     }
 
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        // The `scheduler` is shared (`Arc`), so this clone is cheap and the new
+        // priority only affects requests this clone submits.
+        Arc::new(Self {
+            io_priority,
+            ..self.clone()
+        })
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let path = self.index_dir.clone().join(name);
+        let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
         let cached_size = self
             .file_sizes
             .get(name)
             .map(|&size| CachedFileSize::new(size))
             .unwrap_or_else(CachedFileSize::unknown);
-        let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
+        let file_scheduler = self
+            .scheduler
+            .open_file_with_priority(&path, self.io_priority, &cached_size)
+            .await?;
         match current_reader::FileReader::try_open(
             file_scheduler,
             None,
@@ -436,7 +474,7 @@ impl IndexStore for LanceIndexStore {
             Err(e) => {
                 // If the error is a version conflict we can try to read the file with v1 reader
                 if let Error::VersionConflict { .. } = e {
-                    let path = self.index_dir.clone().join(name);
+                    let path = self.index_file_path(name)?;
                     let file_reader = PreviousFileReader::try_new_self_described(
                         &self.object_store,
                         &path,
@@ -452,7 +490,16 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<IndexFile> {
-        let path = self.index_dir.clone().join(name);
+        self.copy_index_file_to(name, name, dest_store).await
+    }
+
+    async fn copy_index_file_to(
+        &self,
+        name: &str,
+        new_name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<IndexFile> {
+        let path = self.index_file_path(name)?;
 
         let other_store = dest_store.as_any().downcast_ref::<Self>();
         match other_store {
@@ -460,21 +507,21 @@ impl IndexStore for LanceIndexStore {
                 // If both this store and the destination are lance stores we can use object_store's copy
                 // This does blindly assume that both stores are using the same underlying object_store
                 // but there is no easy way to verify this and it happens to always be true at the moment
-                let dest_path = dest_store.index_dir.clone().join(name);
+                let dest_path = dest_store.index_file_path(new_name)?;
                 self.object_store.copy(&path, &dest_path).await?;
                 let size_bytes = match self.file_sizes.get(name) {
                     Some(size_bytes) => *size_bytes,
                     None => self.object_store.size(&path).await?,
                 };
                 Ok(IndexFile {
-                    path: name.to_string(),
+                    path: new_name.to_string(),
                     size_bytes,
                 })
             }
             _ => {
                 let reader = self.open_index_file(name).await?;
                 let mut writer = dest_store
-                    .new_index_file(name, Arc::new(reader.schema().into()))
+                    .new_index_file(new_name, Arc::new(reader.schema().into()))
                     .await?;
 
                 for offset in (0..reader.num_rows()).step_by(4096) {
@@ -488,8 +535,8 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
-        let path = self.index_dir.clone().join(name);
-        let new_path = self.index_dir.clone().join(new_name);
+        let path = self.index_file_path(name)?;
+        let new_path = self.index_file_path(new_name)?;
         self.object_store.copy(&path, &new_path).await?;
         self.object_store.delete(&path).await?;
         let size_bytes = match self.file_sizes.get(name) {
@@ -503,7 +550,7 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn delete_index_file(&self, name: &str) -> Result<()> {
-        let path = self.index_dir.clone().join(name);
+        let path = self.index_file_path(name)?;
         self.object_store.delete(&path).await
     }
 

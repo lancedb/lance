@@ -1772,6 +1772,8 @@ def test_index_cast_centroids(tmp_path):
     values = pa.array([x for arr in centroids for x in arr], pa.float32())
     centroids = pa.FixedSizeListArray.from_arrays(values, 128)
 
+    # Cast invalidates the attached index; drop it first per the new contract.
+    dataset.drop_index(index_name)
     dataset.alter_columns(dict(path="vector", data_type=pa.list_(pa.float16(), 128)))
 
     # centroids are f32, but the column is now f16

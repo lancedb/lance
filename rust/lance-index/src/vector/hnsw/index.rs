@@ -119,11 +119,6 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
         self
     }
 
-    /// Cast to [VectorIndex]
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
-    }
-
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({

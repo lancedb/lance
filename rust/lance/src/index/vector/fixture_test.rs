@@ -71,10 +71,6 @@ mod test {
             self
         }
 
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
-        }
-
         async fn prewarm(&self) -> Result<()> {
             Ok(())
         }

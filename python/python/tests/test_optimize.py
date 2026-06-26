@@ -324,6 +324,47 @@ def test_defer_index_remap(tmp_path: Path):
     assert any(idx.name == "__lance_frag_reuse" for idx in indices)
 
 
+@pytest.mark.parametrize("use_commit_options", [True, False])
+def test_defer_index_remap_via_commit_options(tmp_path: Path, use_commit_options: bool):
+    """Compaction.commit respects defer_index_remap passed in options.
+
+    When options={"defer_index_remap": True} is supplied to Compaction.commit
+    the __lance_frag_reuse system index must appear in describe_indices().
+    When the option is omitted (default) no such system index is written.
+    """
+    base_dir = tmp_path / f"dataset_commit_opts_{use_commit_options}"
+    data = pa.table({"i": range(6_000), "val": range(6_000)})
+    dataset = lance.write_dataset(data, base_dir, max_rows_per_file=1_000)
+    dataset.create_scalar_index("i", "BTREE")
+    dataset.delete("i < 500")
+
+    plan = Compaction.plan(
+        dataset,
+        options=dict(target_rows_per_fragment=2_000, num_threads=1),
+    )
+    rewrites = [task.execute(dataset) for task in plan.tasks]
+
+    if use_commit_options:
+        Compaction.commit(dataset, rewrites, options={"defer_index_remap": True})
+    else:
+        Compaction.commit(dataset, rewrites)
+
+    dataset = lance.dataset(base_dir)
+    indices = dataset.describe_indices()
+    has_frag_reuse = any(idx.name == "__lance_frag_reuse" for idx in indices)
+
+    if use_commit_options:
+        assert has_frag_reuse, (
+            "expected __lance_frag_reuse system index when defer_index_remap=True "
+            "is passed to Compaction.commit"
+        )
+    else:
+        assert not has_frag_reuse, (
+            "did not expect __lance_frag_reuse system index when options is omitted "
+            "from Compaction.commit"
+        )
+
+
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_describe_indices_matches_list_indices_for_frag_reuse(tmp_path: Path):
     """describe_indices() and list_indices() must agree on the index_type
@@ -533,3 +574,34 @@ def test_compaction_generates_rewrite_transaction(tmp_path: Path):
         t is not None and t.operation.__class__.__name__ == "Rewrite"
         for t in transactions
     )
+
+
+def test_remap_row_addrs(tmp_path: Path):
+    # Dataset.remap_row_addrs follows rows across a compaction via the
+    # fragment-reuse index: an address valid before the compaction maps to the
+    # row's new address after it. None when there is no fragment-reuse index.
+    base_dir = tmp_path / "dataset"
+    data = pa.table({"id": range(1_000), "v": range(1_000)})
+    ds = lance.write_dataset(data, base_dir, max_rows_per_file=100)  # 10 fragments
+
+    # No fragment-reuse index yet -> None (nothing to remap against).
+    addrs = pa.array([0, 1 << 32, (5 << 32) | 7], pa.uint64())
+    assert ds.remap_row_addrs(addrs) is None
+
+    before = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
+
+    ds.optimize.compact_files(
+        target_rows_per_fragment=1_000, defer_index_remap=True, num_threads=1
+    )
+    ds = lance.dataset(base_dir)
+    assert any(idx.name == "__lance_frag_reuse" for idx in ds.describe_indices())
+
+    after = ds.scanner(columns=["id"], with_row_address=True).to_table()
+    new = dict(zip(after["id"].to_pylist(), after["_rowaddr"].to_pylist()))
+
+    sample = [0, 137, 999]
+    remapped = ds.remap_row_addrs(
+        pa.array([old[i] for i in sample], pa.uint64())
+    ).to_pylist()
+    assert remapped == [new[i] for i in sample]

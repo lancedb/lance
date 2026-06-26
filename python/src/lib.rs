@@ -38,7 +38,9 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
-use dataset::cleanup::CleanupStats;
+use dataset::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+};
 use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -265,6 +267,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<CleanupCandidateFile>()?;
+    m.add_class::<CleanupReferencedBranch>()?;
+    m.add_class::<CleanupExplanation>()?;
     m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;
@@ -293,6 +298,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mem_wal::PyLsmPointLookupPlanner>()?;
     m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_evaluate_sharding_spec))?;
+    m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;

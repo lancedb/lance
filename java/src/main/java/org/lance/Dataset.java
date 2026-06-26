@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
@@ -2143,12 +2144,30 @@ public class Dataset implements Closeable {
       String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
 
   /**
+   * Create a cleanup operation for the specified policy.
+   *
+   * <p>Use {@link CleanupOperation#explain()} to inspect what cleanup would remove without deleting
+   * files, or {@link CleanupOperation#execute()} to perform cleanup.
+   *
+   * @param policy cleanup policy
+   * @return cleanup operation
+   */
+  public CleanupOperation cleanup(CleanupPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    return new CleanupOperation(this, policy);
+  }
+
+  /**
    * Cleanup dataset based on a specified policy.
    *
    * @param policy cleanup policy
    * @return removal stats
    */
   public RemovalStats cleanupWithPolicy(CleanupPolicy policy) {
+    return cleanup(policy).execute();
+  }
+
+  RemovalStats executeCleanup(CleanupPolicy policy) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeCleanupWithPolicy(policy);
@@ -2156,4 +2175,14 @@ public class Dataset implements Closeable {
   }
 
   private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
+
+  CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles);
+    }
+  }
+
+  private native CleanupExplanation nativeExplainCleanupWithPolicy(
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles);
 }

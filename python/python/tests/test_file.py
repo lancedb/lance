@@ -736,6 +736,44 @@ def test_session_list_with_trailing_slash(tmp_path):
     assert files_no_slash == ["dir/file.lance"]
 
 
+def test_session_list_with_delimiter(tmp_path):
+    """Test that LanceFileSession.list_with_delimiter() is non-recursive."""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    # Two top-level files and two nested subtrees.
+    with session.open_writer("file1.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+    with session.open_writer("file2.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+    with session.open_writer("subdir/file3.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [3]}))
+    with session.open_writer("subdir/nested/file4.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [4]}))
+    with session.open_writer("other/file5.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [5]}))
+
+    # Listing the base path returns only the immediate children: the two
+    # top-level files and the two child directories (not their contents).
+    result = session.list_with_delimiter()
+    assert sorted(result.common_prefixes) == ["other", "subdir"]
+    assert sorted(result.objects) == ["file1.lance", "file2.lance"]
+
+    # Listing a subdirectory descends exactly one level: the direct file and
+    # the nested directory, but not the file inside the nested directory.
+    subdir = session.list_with_delimiter("subdir")
+    assert subdir.common_prefixes == ["subdir/nested"]
+    assert subdir.objects == ["subdir/file3.lance"]
+
+    # Trailing slash behaves the same as no trailing slash.
+    assert session.list_with_delimiter("subdir/") == subdir
+
+    # A non-existent prefix yields empty results rather than erroring.
+    empty = session.list_with_delimiter("nonexistent")
+    assert empty.common_prefixes == []
+    assert empty.objects == []
+
+
 def test_session_contains(tmp_path):
     """Test that LanceFileSession.contains() works correctly"""
     session = LanceFileSession(str(tmp_path))
@@ -757,6 +795,56 @@ def test_session_contains(tmp_path):
 
     assert session.contains("subdir/nested.lance")
     assert not session.contains("subdir/nonexistent.lance")
+
+
+def test_session_read_range(tmp_path):
+    """Test that LanceFileSession.read_range() returns the requested bytes."""
+    session = LanceFileSession(str(tmp_path))
+
+    payload = bytes(range(256))
+    local = tmp_path / "src.bin"
+    local.write_bytes(payload)
+    session.upload_file(str(local), "data/file.bin")
+
+    # A range in the middle of the file.
+    assert session.read_range("data/file.bin", 10, 5) == payload[10:15]
+    # From the start.
+    assert session.read_range("data/file.bin", 0, 4) == payload[0:4]
+    # Up to the end.
+    assert session.read_range("data/file.bin", 250, 6) == payload[250:256]
+    # A zero-length read yields empty bytes.
+    assert session.read_range("data/file.bin", 100, 0) == b""
+
+    # Reading a missing object raises OSError (consistent with download_file).
+    with pytest.raises(OSError):
+        session.read_range("data/missing.bin", 0, 4)
+
+
+def test_session_delete_file(tmp_path):
+    """Test that LanceFileSession.delete_file() removes files and is idempotent."""
+    session = LanceFileSession(str(tmp_path))
+    schema = pa.schema([pa.field("x", pa.int64())])
+
+    with session.open_writer("test.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [1]}))
+    with session.open_writer("subdir/nested.lance", schema=schema) as writer:
+        writer.write_batch(pa.table({"x": [2]}))
+
+    # Deleting an existing file removes it.
+    assert session.contains("test.lance")
+    session.delete_file("test.lance")
+    assert not session.contains("test.lance")
+
+    # Nested paths work too.
+    assert session.contains("subdir/nested.lance")
+    session.delete_file("subdir/nested.lance")
+    assert not session.contains("subdir/nested.lance")
+
+    # Deleting a missing path raises OSError (consistent with download_file).
+    with pytest.raises(OSError):
+        session.delete_file("test.lance")
+    with pytest.raises(OSError):
+        session.delete_file("never_existed.lance")
 
 
 def test_struct_null_regression():

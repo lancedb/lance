@@ -29,9 +29,9 @@ bump_and_commit_version() {
     bump-my-version bump -vv --new-version "${NEW_VERSION}" --no-tag patch
 
     # Update Cargo.lock files after version bump
-    cargo update
-    (cd python && cargo update)
-    (cd java/lance-jni && cargo update)
+    cargo update --workspace
+    (cd python && cargo update --workspace)
+    (cd java/lance-jni && cargo update --workspace)
 
     git add -A
     git commit -m "${COMMIT_MESSAGE}"

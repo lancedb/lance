@@ -8,12 +8,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use datafusion::common::ScalarValue;
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::expressions::{Column, Literal, NotExpr};
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::{Expr, SessionContext};
 use futures::TryStreamExt;
@@ -22,19 +27,17 @@ use lance_core::{Result, is_system_column};
 use lance_datafusion::exec::OneShotExec;
 use tracing::instrument;
 
+use crate::dataset::mem_wal::TOMBSTONE;
 use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{
-    BloomFilterGuardExec, CoalesceFirstExec, DedupDirection, WithinSourceDedupExec,
-    compute_pk_hash_from_scalars,
-};
-use super::flushed_cache::{FlushedMemTableCache, open_flushed_dataset};
+use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
+use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
-    build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
-    wants_row_address, wants_row_id,
+    DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
+    project_to_canonical, wants_row_address, wants_row_id,
 };
 use crate::session::Session;
 
@@ -87,7 +90,9 @@ pub struct LsmPointLookupPlanner {
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
     /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<FlushedMemTableCache>>,
+    flushed_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of a flushed generation.
+    warmer: Option<Arc<dyn GenerationWarmer>>,
     /// Precomputed canonical output schema for the no-projection case, so the
     /// hot `lookup(.., None)` path clones an `Arc` instead of rebuilding the
     /// schema on every call.
@@ -120,6 +125,7 @@ impl LsmPointLookupPlanner {
             bloom_filters: std::collections::HashMap::new(),
             session: None,
             flushed_cache: None,
+            warmer: None,
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
         }
@@ -137,8 +143,14 @@ impl LsmPointLookupPlanner {
     /// front during scan setup via
     /// [`DatasetMemWalExt::prewarm_mem_wal`](crate::dataset::mem_wal::DatasetMemWalExt::prewarm_mem_wal)
     /// so the first gen-key lookup does not pay the dataset open.
-    pub fn with_flushed_cache(mut self, cache: Arc<FlushedMemTableCache>) -> Self {
+    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
         self.flushed_cache = Some(cache);
+        self
+    }
+
+    /// Inject the warmer fired on first open of a flushed generation.
+    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+        self.warmer = Some(warmer);
         self
     }
 
@@ -177,6 +189,33 @@ impl LsmPointLookupPlanner {
         pk_values: &[ScalarValue],
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        match self.plan_lookup_coalesced(pk_values, projection).await? {
+            // Tombstones are dropped AFTER the coalesce, never per-source: the
+            // tombstone wins the newest-first coalesce (its source is the newest
+            // non-empty arm), so filtering it here yields "not found". Filtering
+            // per-source would empty the newest arm and let `CoalesceFirstExec`
+            // fall through to an older arm — resurrecting the deleted row. Then
+            // the carried `_tombstone` column is projected away.
+            Some(coalesced) => {
+                let canonical =
+                    canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+                filter_tombstones_after_coalesce(coalesced, &canonical)
+            }
+            None => self.empty_plan(projection),
+        }
+    }
+
+    /// Build the coalesced point-lookup plan: each source scanned newest-first,
+    /// unioned under `CoalesceFirstExec`, output in the *carry* schema (canonical
+    /// output + the `_tombstone` marker). `None` when there are no sources at
+    /// all. [`Self::plan_lookup`] drops the tombstone on top of this;
+    /// [`Self::lookup_keep_tombstone`] keeps it so partial-update merge can tell
+    /// a fresh-deleted key from an absent one.
+    async fn plan_lookup_coalesced(
+        &self,
+        pk_values: &[ScalarValue],
+        projection: Option<&[String]>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if pk_values.len() != self.pk_columns.len() {
             return Err(lance_core::Error::invalid_input(format!(
                 "Expected {} primary key values, got {}",
@@ -190,7 +229,7 @@ impl LsmPointLookupPlanner {
         let sources = self.collector.collect()?;
 
         if sources.is_empty() {
-            return self.empty_plan(projection);
+            return Ok(None);
         }
 
         // Sort by generation DESC (newest first)
@@ -224,13 +263,66 @@ impl LsmPointLookupPlanner {
             source_plans.push(guarded_plan);
         }
 
-        let plan: Arc<dyn ExecutionPlan> = if source_plans.len() == 1 {
-            source_plans.remove(0)
-        } else {
-            Arc::new(CoalesceFirstExec::new(source_plans))
-        };
+        // Always coalesce, even for a single source: besides picking the newest
+        // non-empty arm, `CoalesceFirstExec` normalizes child statistics to a
+        // schema-sized "unknown", which the downstream tombstone `FilterExec`
+        // needs (the in-memory mem_wal execs report empty column statistics, and
+        // datafusion's projection statistics would index out of bounds without
+        // this normalization).
+        Ok(Some(Arc::new(CoalesceFirstExec::new(source_plans))))
+    }
 
-        Ok(plan)
+    /// Like [`Self::lookup`] but does NOT drop a tombstone: the returned 1-row
+    /// batch carries the `_tombstone` marker (`true` ⇒ the key's newest fresh
+    /// version is a delete); `None` still means the key is absent from every
+    /// source. Partial-update merge uses this to treat a fresh-deleted PK as
+    /// absent, so it never resurrects stale, not-yet-compacted base columns.
+    /// Always plans (no in-memory fast path) — used off the hot read path, on
+    /// small partial-update batches.
+    pub async fn lookup_keep_tombstone(
+        &self,
+        pk_values: &[ScalarValue],
+        projection: Option<&[String]>,
+    ) -> Result<Option<RecordBatch>> {
+        let Some(plan) = self.plan_lookup_coalesced(pk_values, projection).await? else {
+            return Ok(None);
+        };
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, self.task_ctx.clone())?
+            .try_collect()
+            .await?;
+        for batch in batches {
+            if batch.num_rows() > 0 {
+                return Ok(Some(batch.slice(0, 1)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Tombstone-preserving [`Self::lookup_many`] for single- or multi-column
+    /// keys: resolves each key with [`Self::lookup_keep_tombstone`] and
+    /// concatenates the hits in the carry schema (canonical output +
+    /// `_tombstone`); keys absent from every source are omitted. Per-key (no
+    /// batched fast path) — the partial-update batches that use it are small.
+    pub async fn lookup_many_keep_tombstone(
+        &self,
+        keys: &[Vec<ScalarValue>],
+        projection: Option<&[String]>,
+    ) -> Result<RecordBatch> {
+        let canonical =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+        let target = carry_schema(&canonical);
+        let mut out: Vec<RecordBatch> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(b) = self.lookup_keep_tombstone(key, projection).await? {
+                out.push(b);
+            }
+        }
+        match out.len() {
+            0 => Ok(RecordBatch::new_empty(target)),
+            1 => Ok(out.pop().unwrap()),
+            _ => Ok(arrow_select::concat::concat_batches(&target, &out)?),
+        }
     }
 
     /// Resolve a single-row point lookup, returning the newest matching row (a
@@ -299,6 +391,7 @@ impl LsmPointLookupPlanner {
                             target,
                         )? {
                             Probe::Hit(batch) => Ok(Some(FastOutcome::Hit(batch))),
+                            Probe::Deleted => Ok(Some(FastOutcome::Deleted)),
                             Probe::Miss => Ok(None),
                             Probe::NoIndex => Ok(Some(FastOutcome::NeedsFallback)),
                         }
@@ -306,6 +399,9 @@ impl LsmPointLookupPlanner {
                 )?;
                 match outcome {
                     Some(FastOutcome::Hit(batch)) => return Ok(Some(batch)),
+                    // Newest version is a tombstone → deleted; do not consult
+                    // older (on-disk) sources.
+                    Some(FastOutcome::Deleted) => return Ok(None),
                     Some(FastOutcome::NeedsFallback) => { /* fall through to plan */ }
                     None => {
                         // Every in-memory memtable missed. If there is no
@@ -403,7 +499,12 @@ impl LsmPointLookupPlanner {
             for (ri, m) in refs.iter().enumerate() {
                 match probe_position(&m.batch_store, &m.index_store, pk_col, key)? {
                     ProbePos::Found { batch_idx, row } => {
-                        hits.entry((ri, batch_idx)).or_default().push(row as u32);
+                        // Newest version is a tombstone → the key is deleted:
+                        // resolve it as a miss (emit nothing) and do not fall
+                        // through to an older source.
+                        if !is_tombstone_at(&m.batch_store, batch_idx, row)? {
+                            hits.entry((ri, batch_idx)).or_default().push(row as u32);
+                        }
                         resolved = true;
                         break;
                     }
@@ -546,10 +647,18 @@ impl LsmPointLookupPlanner {
                 scanner.create_plan().await?
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset =
-                    open_flushed_dataset(path, self.session.as_ref(), self.flushed_cache.as_ref())
-                        .await?;
+                let dataset = open_flushed_dataset(
+                    path,
+                    self.session.as_ref(),
+                    self.flushed_cache.as_ref(),
+                    self.warmer.as_ref(),
+                )
+                .await?;
                 let mut scanner = dataset.scan();
+                // Carry `_tombstone` through so the post-coalesce filter can drop
+                // a deleted key (gen written before deletes existed lack it →
+                // `project_to_carry` synthesizes `false`).
+                let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
                 scanner.create_plan().await?
@@ -564,6 +673,9 @@ impl LsmPointLookupPlanner {
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                // Carry `_tombstone` through so the post-coalesce filter can drop
+                // a deleted key; it survives the sort below.
+                let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 scanner.filter_expr(filter.clone());
                 // Expose `_rowid` (the BatchStore row offset, monotonic with
@@ -573,22 +685,35 @@ impl LsmPointLookupPlanner {
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
                 let raw = scanner.create_plan().await?;
-                // Within the active memtable, larger `_rowid` = newer
-                // insert. After dedup there is exactly one row per PK.
-                let deduped: Arc<dyn ExecutionPlan> = Arc::new(WithinSourceDedupExec::new(
-                    raw,
-                    self.pk_columns.clone(),
-                    lance_core::ROW_ID,
-                    DedupDirection::KeepMaxRowAddr,
-                ));
+                // The filter already restricts to the exact PK value, so the
+                // scan yields that key's insert history. Within the active
+                // memtable larger `_rowid` = newer insert, so sorting `_rowid`
+                // DESC and keeping the first row picks the newest version — one
+                // row per (value-exact) PK.
+                let rowid_idx = raw.schema().index_of(lance_core::ROW_ID)?;
+                let ordering = LexOrdering::new(vec![PhysicalSortExpr {
+                    expr: Arc::new(Column::new(lance_core::ROW_ID, rowid_idx)),
+                    options: SortOptions {
+                        descending: true,
+                        nulls_first: false,
+                    },
+                }])
+                .ok_or_else(|| {
+                    lance_core::Error::internal("point-lookup: failed to build _rowid ordering")
+                })?;
+                let newest: Arc<dyn ExecutionPlan> =
+                    Arc::new(SortExec::new(ordering, raw).with_fetch(Some(1)));
                 // Per-source `_rowid` would collide with the base table's;
                 // NULL it before canonicalization (the value is internal to
                 // this arm). project_to_canonical drops it entirely when
                 // the user didn't request `_rowid` in the projection.
-                null_columns(deduped, &[lance_core::ROW_ID])?
+                null_columns(newest, &[lance_core::ROW_ID])?
             }
         };
-        project_to_canonical(scan, &target)
+        // Output carries `_tombstone` (canonical + the marker) so it survives
+        // the union/coalesce to the post-coalesce filter; base / legacy sources
+        // that lack the column get a synthesized `false`.
+        project_to_carry(scan, &target)
     }
 
     /// Create an empty execution plan with the canonical output schema.
@@ -601,10 +726,113 @@ impl LsmPointLookupPlanner {
     }
 }
 
+/// Append `_tombstone` to a scanner projection when the source carries it, so
+/// the column survives to the post-coalesce tombstone filter. Sources without
+/// it (base table, generations written before deletes existed) are left alone
+/// and have `false` synthesized by [`project_to_carry`].
+fn cols_with_tombstone(cols: &[String], present: bool) -> Vec<String> {
+    if !present {
+        return cols.to_vec();
+    }
+    let mut out = cols.to_vec();
+    if !out.iter().any(|c| c == TOMBSTONE) {
+        out.push(TOMBSTONE.to_string());
+    }
+    out
+}
+
+/// Carry schema = canonical output + a trailing non-nullable `_tombstone`
+/// Boolean. Non-nullable so the base arm's synthesized `Literal(false)` matches
+/// the WAL arms' real column under `CoalesceFirstExec`'s exact-schema check.
+fn carry_schema(canonical: &SchemaRef) -> SchemaRef {
+    let mut fields: Vec<Arc<Field>> = canonical.fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(TOMBSTONE, DataType::Boolean, false)));
+    Arc::new(Schema::new(fields))
+}
+
+/// Project a source scan to the carry schema: existing columns are forwarded, a
+/// missing `_tombstone` becomes `false` (base table / legacy generations carry
+/// no tombstones), and missing system / `_distance` columns are NULL-filled
+/// (mirroring [`project_to_canonical`]).
+fn project_to_carry(
+    plan: Arc<dyn ExecutionPlan>,
+    canonical: &SchemaRef,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let input = plan.schema();
+    let carry = carry_schema(canonical);
+    let mut project_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(carry.fields().len());
+    for field in carry.fields() {
+        let name = field.name();
+        let expr: Arc<dyn PhysicalExpr> = match input.column_with_name(name) {
+            Some((idx, _)) => Arc::new(Column::new(name, idx)),
+            None if name == TOMBSTONE => Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
+            None if is_system_column(name) => Arc::new(Literal::new(ScalarValue::UInt64(None))),
+            None if name == DISTANCE_COLUMN => Arc::new(Literal::new(ScalarValue::Float32(None))),
+            None => {
+                return Err(lance_core::Error::internal(format!(
+                    "Column '{}' missing from point-lookup carry source schema (have: {:?})",
+                    name,
+                    input
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().clone())
+                        .collect::<Vec<_>>()
+                )));
+            }
+        };
+        project_exprs.push((expr, name.clone()));
+    }
+    Ok(Arc::new(
+        ProjectionExec::try_new(project_exprs, plan).map_err(|e| {
+            lance_core::Error::internal(format!("Failed to build carry ProjectionExec: {}", e))
+        })?,
+    ))
+}
+
+/// Drop tombstone rows after `CoalesceFirstExec` has already picked the newest
+/// source, then project the carried `_tombstone` column away (back to the
+/// canonical schema).
+fn filter_tombstones_after_coalesce(
+    plan: Arc<dyn ExecutionPlan>,
+    canonical: &SchemaRef,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let idx = plan.schema().index_of(TOMBSTONE).map_err(|e| {
+        lance_core::Error::internal(format!("point-lookup carry plan missing _tombstone: {}", e))
+    })?;
+    let predicate: Arc<dyn PhysicalExpr> =
+        Arc::new(NotExpr::new(Arc::new(Column::new(TOMBSTONE, idx))));
+    let filtered: Arc<dyn ExecutionPlan> =
+        Arc::new(FilterExec::try_new(predicate, plan).map_err(|e| {
+            lance_core::Error::internal(format!("Failed to build tombstone FilterExec: {}", e))
+        })?);
+    project_to_canonical(filtered, canonical)
+}
+
+/// Whether the row at `(batch_idx, row)` of `batch_store` is a tombstone.
+/// Memtables without the `_tombstone` column (legacy / direct-construction
+/// tests) are treated as carrying no tombstones.
+fn is_tombstone_at(batch_store: &BatchStore, batch_idx: usize, row: usize) -> Result<bool> {
+    let stored = batch_store.get(batch_idx).ok_or_else(|| {
+        lance_core::Error::internal("point-lookup: tombstone-check batch missing")
+    })?;
+    let Some(col) = stored.data.column_by_name(TOMBSTONE) else {
+        return Ok(false);
+    };
+    let arr = col.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+        lance_core::Error::internal("point-lookup: _tombstone column is not Boolean")
+    })?;
+    Ok(arr.is_valid(row) && arr.value(row))
+}
+
 /// Result of probing the in-memory memtables newest-first in `lookup()`.
 enum FastOutcome {
     /// A visible row was found; here it is, projected.
     Hit(RecordBatch),
+    /// The newest visible version of the key is a tombstone — the key is
+    /// deleted. The search stops here (no fall-through to older sources) and
+    /// resolves to "not found".
+    Deleted,
     /// A memtable could not be probed directly (no BTree on the key) — the
     /// caller must fall back to the plan path.
     NeedsFallback,
@@ -614,6 +842,9 @@ enum FastOutcome {
 enum Probe {
     /// The key was found; here is the newest visible row, projected.
     Hit(RecordBatch),
+    /// The newest visible version of the key is a tombstone — deleted. Stop the
+    /// search and return "not found".
+    Deleted,
     /// The key is not present in this memtable (but may be in an older source).
     Miss,
     /// This memtable has no BTree on the key column, so it cannot be probed
@@ -642,10 +873,6 @@ fn probe_position(
     pk_column: &str,
     pk_value: &ScalarValue,
 ) -> Result<ProbePos> {
-    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
-        return Ok(ProbePos::NoIndex);
-    };
-
     // Visible batches are the committed prefix [0, last_visible_idx]; each
     // `StoredBatch` carries its cumulative `row_offset`, so visibility and the
     // position→batch mapping are O(1)/O(log) with no per-probe allocation.
@@ -661,22 +888,37 @@ fn probe_position(
     if visible_end == 0 {
         return Ok(ProbePos::Miss);
     }
+    let max_visible_row = visible_end - 1;
 
-    // Newest visible position of the key — a single seek-and-stop on the
-    // ordered skiplist (largest key ≤ (value, max_visible_row)). No range
-    // collect, no allocation.
-    let Some(pos) = btree.get_newest_visible(pk_value, visible_end - 1) else {
+    // A single-column primary key always has a value-keyed BTree (reused or
+    // auto-created — see `IndexStore::enable_pk_index`): collision-free, so one
+    // seek yields the answer with no re-check. Absent only when the table has no
+    // PK index, where the caller falls back to the plan path.
+    let Some(btree) = index_store.get_btree_by_column(pk_column) else {
+        return Ok(ProbePos::NoIndex);
+    };
+    let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
         return Ok(ProbePos::Miss);
     };
+    let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
+    Ok(ProbePos::Found { batch_idx, row })
+}
 
-    // Binary-search the owning batch by `row_offset` (appended in order).
+/// Map a global row `position` to its `(batch_idx, row_in_batch)` by binary
+/// searching the visible batch prefix on cumulative `row_offset` (batches are
+/// appended in order).
+fn resolve_position(
+    batch_store: &BatchStore,
+    last_visible_idx: usize,
+    position: u64,
+) -> Result<(usize, usize)> {
     let (mut lo, mut hi) = (0usize, last_visible_idx);
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         let off = batch_store.get(mid).map(|b| b.row_offset).ok_or_else(|| {
             lance_core::Error::internal("point-lookup: batch index out of range during search")
         })?;
-        if off <= pos {
+        if off <= position {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -685,10 +927,7 @@ fn probe_position(
     let stored = batch_store
         .get(lo)
         .ok_or_else(|| lance_core::Error::internal("point-lookup: resolved batch missing"))?;
-    Ok(ProbePos::Found {
-        batch_idx: lo,
-        row: (pos - stored.row_offset) as usize,
-    })
+    Ok((lo, (position - stored.row_offset) as usize))
 }
 
 /// Gather `rows` from `batch_store`'s batch `batch_idx` into the `target`
@@ -745,12 +984,20 @@ fn probe_memtable(
     match probe_position(batch_store, index_store, pk_column, pk_value)? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
-        ProbePos::Found { batch_idx, row } => Ok(Probe::Hit(gather_rows(
-            batch_store,
-            batch_idx,
-            &[row as u32],
-            target,
-        )?)),
+        ProbePos::Found { batch_idx, row } => {
+            // The newest visible version is a tombstone → the key is deleted.
+            // Stop here rather than materializing or falling through to an
+            // older source.
+            if is_tombstone_at(batch_store, batch_idx, row)? {
+                return Ok(Probe::Deleted);
+            }
+            Ok(Probe::Hit(gather_rows(
+                batch_store,
+                batch_idx,
+                &[row as u32],
+                target,
+            )?))
+        }
     }
 }
 
@@ -1097,8 +1344,8 @@ mod tests {
         // Regression: same primary key inserted twice into one active
         // memtable must return the *newest* row. The bug was that
         // `FilterExec → LIMIT 1` over an insert-ordered scan returned the
-        // first (oldest) match. `WithinSourceDedupExec` collapses by PK,
-        // keeping the row with the largest `_rowid` (insert order).
+        // first (oldest) match. The plan-path active arm now sorts `_rowid`
+        // DESC and keeps the first row (largest `_rowid` = newest insert).
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use futures::TryStreamExt;
@@ -1118,17 +1365,17 @@ mod tests {
         let b_old = create_test_batch(&schema, &[1], "old");
         let b_new = create_test_batch(&schema, &[1], "new");
         let b_other = create_test_batch(&schema, &[2], "two");
-        let (_, _, bp_old) = batch_store.append(b_old.clone()).unwrap();
+        let (bp_old, off_old, _) = batch_store.append(b_old.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_old, 0, Some(bp_old))
+            .insert_with_batch_position(&b_old, off_old, Some(bp_old))
             .unwrap();
-        let (_, _, bp_new) = batch_store.append(b_new.clone()).unwrap();
+        let (bp_new, off_new, _) = batch_store.append(b_new.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_new, 1, Some(bp_new))
+            .insert_with_batch_position(&b_new, off_new, Some(bp_new))
             .unwrap();
-        let (_, _, bp_other) = batch_store.append(b_other.clone()).unwrap();
+        let (bp_other, off_other, _) = batch_store.append(b_other.clone()).unwrap();
         index_store
-            .insert_with_batch_position(&b_other, 2, Some(bp_other))
+            .insert_with_batch_position(&b_other, off_other, Some(bp_other))
             .unwrap();
         let index_store = Arc::new(index_store);
 
@@ -1165,6 +1412,88 @@ mod tests {
             name_arr.value(0),
             "new_1",
             "active-arm lookup must return the newer insert, not the oldest"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_probes_auto_created_pk_btree() {
+        // No user `add_btree` on the PK column — only `enable_pk_index`, which
+        // auto-creates a BTree on the primary key (the production default). The
+        // fast probe must resolve the newest visible version through that
+        // collision-free BTree rather than falling back to the plan path.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        // No `add_btree` — `enable_pk_index` auto-creates the PK BTree.
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+
+        // pk=1 written twice (the newer second), plus an unrelated pk=2.
+        let b_old = create_test_batch(&schema, &[1], "old");
+        let b_new = create_test_batch(&schema, &[1], "new");
+        let b_other = create_test_batch(&schema, &[2], "two");
+        let (bp_old, off_old, _) = batch_store.append(b_old.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_old, off_old, Some(bp_old))
+            .unwrap();
+        let (bp_new, off_new, _) = batch_store.append(b_new.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_new, off_new, Some(bp_new))
+            .unwrap();
+        let (bp_other, off_other, _) = batch_store.append(b_other.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&b_other, off_other, Some(bp_other))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        // `lookup` takes the fast probe path (single-column PK, no system cols).
+        let hit = planner
+            .lookup(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap()
+            .expect("pk=1 must be found via the PK-position index probe");
+        assert_eq!(hit.num_rows(), 1);
+        let name = hit
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            name.value(0),
+            "new_1",
+            "probe must return the newest version"
+        );
+
+        // An absent key resolves to None (no on-disk sources to consult).
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(999))], None)
+                .await
+                .unwrap()
+                .is_none(),
+            "absent key must miss"
         );
     }
 
@@ -1660,5 +1989,266 @@ mod tests {
                 .is_none(),
             "absent key must miss"
         );
+    }
+
+    // ----- tombstone (delete) point-lookup tests -----
+
+    /// Memtable schema = base (`id`, `name`) + the `_tombstone` marker.
+    fn pk_ts_schema() -> Arc<ArrowSchema> {
+        let mut id_metadata = HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id = Field::new("id", DataType::Int32, false).with_metadata(id_metadata);
+        Arc::new(ArrowSchema::new(vec![
+            id,
+            Field::new("name", DataType::Utf8, true),
+            Field::new(TOMBSTONE, DataType::Boolean, false),
+        ]))
+    }
+
+    fn ts_real(schema: &Arc<ArrowSchema>, ids: &[i32], prefix: &str) -> RecordBatch {
+        let names: Vec<String> = ids.iter().map(|i| format!("{}_{}", prefix, i)).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(names)),
+                Arc::new(arrow_array::BooleanArray::from(vec![false; ids.len()])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn ts_tomb(schema: &Arc<ArrowSchema>, ids: &[i32]) -> RecordBatch {
+        let names: Vec<Option<String>> = ids.iter().map(|_| None).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(names)),
+                Arc::new(arrow_array::BooleanArray::from(vec![true; ids.len()])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Active-only planner whose memtable carries `_tombstone`; the planner's
+    /// base schema stays tombstone-free (as the base table is in production).
+    fn active_ts_planner(batches: &[RecordBatch]) -> LsmPointLookupPlanner {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        let base_schema = create_pk_schema();
+        let mem_schema = pk_ts_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let active = active_memtable_ref(&mem_schema, batches, 1);
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active,
+                    frozen: vec![],
+                },
+            );
+        LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema)
+    }
+
+    /// Read the `_tombstone` marker from row 0 of a keep-tombstone result.
+    fn tombstone_at(b: &RecordBatch) -> bool {
+        let idx = b.schema().index_of(TOMBSTONE).expect("_tombstone column");
+        b.column(idx)
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .expect("_tombstone is Boolean")
+            .value(0)
+    }
+
+    #[tokio::test]
+    async fn test_lookup_keep_tombstone_returns_deleted_row_with_marker() {
+        // The tombstone-preserving variant keeps a deleted key that the filtered
+        // `lookup` would drop: id=1 deleted, id=2 live, id=99 absent.
+        let schema = pk_ts_schema();
+        let planner = active_ts_planner(&[ts_real(&schema, &[1, 2], "v"), ts_tomb(&schema, &[1])]);
+
+        // Deleted key: present with `_tombstone = true` (vs `None` from `lookup`).
+        let deleted = planner
+            .lookup_keep_tombstone(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap()
+            .expect("deleted key kept by lookup_keep_tombstone");
+        assert_eq!(id_at(&deleted), 1);
+        assert!(
+            tombstone_at(&deleted),
+            "deleted key carries _tombstone = true"
+        );
+
+        // Live key: present with `_tombstone = false`.
+        let live = planner
+            .lookup_keep_tombstone(&[ScalarValue::Int32(Some(2))], None)
+            .await
+            .unwrap()
+            .expect("live key found");
+        assert_eq!(id_at(&live), 2);
+        assert!(!tombstone_at(&live), "live key carries _tombstone = false");
+
+        // Absent key: still `None` — no fresh entry at all to distinguish.
+        assert!(
+            planner
+                .lookup_keep_tombstone(&[ScalarValue::Int32(Some(99))], None)
+                .await
+                .unwrap()
+                .is_none(),
+            "absent key has no fresh entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lookup_many_keep_tombstone_includes_tombstoned_keys() {
+        // Batched variant: the tombstoned key is INCLUDED (carrying its marker),
+        // unlike `lookup_many` which omits it. id=2 deleted; 1 and 3 live.
+        let schema = pk_ts_schema();
+        let planner =
+            active_ts_planner(&[ts_real(&schema, &[1, 2, 3], "v"), ts_tomb(&schema, &[2])]);
+        let keys = vec![
+            vec![ScalarValue::Int32(Some(1))],
+            vec![ScalarValue::Int32(Some(2))],
+            vec![ScalarValue::Int32(Some(3))],
+        ];
+        let batch = planner
+            .lookup_many_keep_tombstone(&keys, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "all three keys kept, including the tombstone"
+        );
+        // Exactly one row (id=2) is marked deleted.
+        let deleted: Vec<i32> = (0..batch.num_rows())
+            .map(|r| batch.slice(r, 1))
+            .filter(tombstone_at)
+            .map(|b| id_at(&b))
+            .collect();
+        assert_eq!(deleted, vec![2], "only id=2 is marked deleted");
+    }
+
+    #[tokio::test]
+    async fn test_lookup_tombstone_within_active_not_found() {
+        // Fast path: id=1 written then tombstoned (newer); id=2 is a control.
+        let schema = pk_ts_schema();
+        let planner = active_ts_planner(&[ts_real(&schema, &[1, 2], "v"), ts_tomb(&schema, &[1])]);
+
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(1))], None)
+                .await
+                .unwrap()
+                .is_none(),
+            "deleted key must resolve to not-found, not the older real row"
+        );
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(2))], None)
+            .await
+            .unwrap()
+            .expect("untouched key still found");
+        assert_eq!(id_at(&row), 2);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_tombstone_then_reinsert() {
+        // delete then re-insert the same key → the re-insert is newest.
+        let schema = pk_ts_schema();
+        let planner = active_ts_planner(&[
+            ts_real(&schema, &[1], "old"),
+            ts_tomb(&schema, &[1]),
+            ts_real(&schema, &[1], "new"),
+        ]);
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap()
+            .expect("re-inserted key must be found");
+        assert_eq!(name_at(&row), "new_1");
+    }
+
+    #[tokio::test]
+    async fn test_lookup_tombstone_of_absent_key_is_noop() {
+        // Deleting a key that never existed is a no-op miss.
+        let schema = pk_ts_schema();
+        let planner = active_ts_planner(&[ts_real(&schema, &[1], "v"), ts_tomb(&schema, &[99])]);
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(99))], None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(1))], None)
+            .await
+            .unwrap()
+            .expect("unrelated key unaffected");
+        assert_eq!(id_at(&row), 1);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_tombstone_plan_path_resurrection_guard() {
+        // Force the plan path (project a system column) so the after-coalesce
+        // filter — not the fast-path short-circuit — must drop the tombstone.
+        // Real row lives in base; the newer active arm holds only its tombstone.
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        let base_schema = create_pk_schema();
+        let mem_schema = pk_ts_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2], "base")],
+            )
+            .await,
+        );
+        let active = active_memtable_ref(&mem_schema, &[ts_tomb(&mem_schema, &[1])], 2);
+        let collector = LsmDataSourceCollector::new(base, vec![]).with_in_memory_memtables(
+            Uuid::new_v4(),
+            InMemoryMemTables {
+                active,
+                frozen: vec![],
+            },
+        );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], base_schema);
+
+        let proj = vec!["id".to_string(), "_rowid".to_string()];
+        assert!(
+            planner
+                .lookup(&[ScalarValue::Int32(Some(1))], Some(&proj))
+                .await
+                .unwrap()
+                .is_none(),
+            "plan path must not fall through to the base row for a deleted key"
+        );
+        let row = planner
+            .lookup(&[ScalarValue::Int32(Some(2))], Some(&proj))
+            .await
+            .unwrap()
+            .expect("untouched base row found");
+        assert_eq!(id_at(&row), 2);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_many_skips_tombstoned_keys() {
+        // Batched lookup: a tombstoned key is omitted, others resolved.
+        let schema = pk_ts_schema();
+        let planner =
+            active_ts_planner(&[ts_real(&schema, &[1, 2, 3], "v"), ts_tomb(&schema, &[2])]);
+        let keys = [
+            ScalarValue::Int32(Some(1)),
+            ScalarValue::Int32(Some(2)),
+            ScalarValue::Int32(Some(3)),
+        ];
+        let batch = planner.lookup_many(&keys, None).await.unwrap();
+        assert_eq!(batch.num_rows(), 2, "the tombstoned key is omitted");
+        assert_eq!(sorted_ids(&batch), vec![1, 3]);
     }
 }

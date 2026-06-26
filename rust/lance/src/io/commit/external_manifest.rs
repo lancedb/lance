@@ -4,10 +4,14 @@
 /// Keep the tests in `lance` crate because it has dependency on [Dataset].
 #[cfg(test)]
 mod test {
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{collections::HashMap, time::Duration};
 
     use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
     use futures::{StreamExt, TryStreamExt, future::join_all};
     use lance_core::{Error, Result};
     use lance_table::io::commit::external_manifest::{
@@ -15,7 +19,12 @@ mod test {
     };
     use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
-    use object_store::{ObjectStoreExt, local::LocalFileSystem, path::Path};
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore as OSObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
+        PutResult, RenameOptions, Result as OSResult, local::LocalFileSystem, path::Path,
+    };
     use tokio::sync::Mutex;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -419,5 +428,289 @@ mod test {
             })
             .collect::<Vec<_>>();
         assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
+    }
+
+    /// S3's `CopyObject` API has a hard 5 GB cap on the source object size.
+    /// Above that, callers must use multipart copy (`UploadPartCopy`) instead.
+    /// `lance-table::io::commit::external_manifest` calls
+    /// `object_store.copy(staging, final)` unconditionally on the manifest
+    /// commit path — which fails for manifests >5 GB.
+    ///
+    /// This wrapper enforces that S3-side cap on top of any inner store, so
+    /// the regression can be reproduced in-process without S3.
+    ///
+    /// It also lets the test override `head().size` for a chosen path, so the
+    /// staging file can *appear* to be 14 GB without actually putting that
+    /// many bytes into the inner store.
+    const S3_COPY_OBJECT_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+    #[derive(Debug)]
+    struct CopyCapStore {
+        inner: Arc<dyn OSObjectStore>,
+        /// path → fake size returned by head(); overrides the inner store.
+        head_size_overrides: Arc<Mutex<HashMap<String, u64>>>,
+        /// Counts calls to `copy_opts` (the fast path). Tests use this to
+        /// assert which branch of `copy_size_aware` was taken — succeeding
+        /// alone is not enough, since the slow path can also succeed for
+        /// small files.
+        copy_calls: AtomicUsize,
+        /// Counts calls to `put_multipart_opts` (the slow read+rewrite path).
+        put_multipart_calls: AtomicUsize,
+    }
+
+    impl CopyCapStore {
+        fn new(inner: Arc<dyn OSObjectStore>) -> Self {
+            Self {
+                inner,
+                head_size_overrides: Arc::new(Mutex::new(HashMap::new())),
+                copy_calls: AtomicUsize::new(0),
+                put_multipart_calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn override_size(&self, path: &Path, size: u64) {
+            self.head_size_overrides
+                .lock()
+                .await
+                .insert(path.to_string(), size);
+        }
+
+        async fn effective_size(&self, location: &Path, real: u64) -> u64 {
+            self.head_size_overrides
+                .lock()
+                .await
+                .get(&location.to_string())
+                .copied()
+                .unwrap_or(real)
+        }
+
+        fn copy_calls(&self) -> usize {
+            self.copy_calls.load(Ordering::SeqCst)
+        }
+
+        fn put_multipart_calls(&self) -> usize {
+            self.put_multipart_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Display for CopyCapStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CopyCapStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for CopyCapStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.put_multipart_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            // `head()` is a default method on `ObjectStore` that delegates to
+            // `get_opts(location, GetOptions { head: true, .. })`. To make a
+            // staging file *appear* to be 14 GB without holding 14 GB in
+            // memory, we override the size in the returned ObjectMeta here.
+            let mut res = self.inner.get_opts(location, options).await?;
+            let overridden = self.effective_size(location, res.meta.size).await;
+            res.meta.size = overridden;
+            Ok(res)
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        // `head` and `delete` are default methods on `ObjectStore`, derived
+        // from `get_opts`/`delete_stream`. We override `head` indirectly by
+        // overriding `get_opts` below — it returns size based on the
+        // overrides table for the chosen path.
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            // Mimic S3's CopyObject 5 GB hard cap: read the (possibly-overridden)
+            // size of the source via head() and reject if it crosses the cap.
+            let meta = self.head(from).await?;
+            if meta.size >= S3_COPY_OBJECT_CAP_BYTES {
+                return Err(object_store::Error::Generic {
+                    store: "S3",
+                    source: format!(
+                        "EntityTooLarge: ProposedSize {} exceeds CopyObject 5GB cap",
+                        meta.size
+                    )
+                    .into(),
+                });
+            }
+            self.copy_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.copy_opts(from, to, opts).await
+        }
+
+        async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+            self.inner.rename_opts(from, to, opts).await
+        }
+    }
+
+    /// Repro for the manifest >5 GB bug.
+    ///
+    /// Drives `ExternalManifestStore::put` (the default impl) against a
+    /// staging file whose `head().size` is reported as 14 GB. That `put`
+    /// calls `object_store.copy(staging, final)` unconditionally — which
+    /// our `CopyCapStore` wrapper rejects with the same `EntityTooLarge`
+    /// error S3 returns in production.
+    ///
+    /// Today this test is RED: the copy step fails on >5 GB.
+    /// After `copy_size_aware` lands, it should turn GREEN by falling back
+    /// to a multipart-equivalent path (option 1: read+rewrite via
+    /// `ObjectWriter`).
+    #[tokio::test]
+    async fn manifest_commit_succeeds_when_staging_exceeds_5gb_copy_cap() {
+        let inner: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let capped = Arc::new(CopyCapStore::new(inner));
+
+        // Write a small staging file, then lie about its size so the
+        // CopyObject cap fires without holding 14 GB in memory.
+        let base_path = Path::from("repro");
+        let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
+        let body = b"fake manifest body";
+        capped
+            .put(&staging_path, PutPayload::from_static(body))
+            .await
+            .expect("seed staging file");
+        capped
+            .override_size(&staging_path, 14_961_429_442) // matches the production failure
+            .await;
+
+        // Spin up an ExternalManifestStore and drive `put` (the same code
+        // path the failing CTAS hits via ExternalManifestCommitHandler).
+        let external = SleepyExternalManifestStore::new();
+        let head_meta = capped.head(&staging_path).await.unwrap();
+
+        let location = external
+            .put(
+                &base_path,
+                1,
+                &staging_path,
+                head_meta.size,
+                head_meta.e_tag,
+                capped.as_ref(),
+                ManifestNamingScheme::V2,
+            )
+            .await
+            .expect(
+                "manifest commit should succeed for a >5 GB staging file via multipart-aware copy",
+            );
+
+        // Branch-taken assertions: the slow read+rewrite path was used.
+        assert_eq!(
+            capped.copy_calls(),
+            0,
+            "CopyObject must not be attempted for >5 GiB sources"
+        );
+        assert!(
+            capped.put_multipart_calls() >= 1,
+            "read+rewrite path must initiate a multipart upload"
+        );
+
+        // End-state assertions: final manifest exists with the original
+        // bytes, and the staging file was deleted.
+        let final_get = capped
+            .inner
+            .get(&location.path)
+            .await
+            .expect("final manifest must exist on the inner store")
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(final_get.as_ref(), body);
+        let staging_after = capped.inner.head(&staging_path).await;
+        assert!(
+            matches!(staging_after, Err(object_store::Error::NotFound { .. })),
+            "staging file must be cleaned up after commit, got: {:?}",
+            staging_after
+        );
+    }
+
+    /// Counterpart to manifest_commit_succeeds_when_staging_exceeds_5gb_copy_cap.
+    /// Confirms that for staging files BELOW the 5 GB cap, the fast-path
+    /// server-side `copy()` is still used — i.e. we haven't accidentally
+    /// regressed every commit to read+rewrite.
+    #[tokio::test]
+    async fn manifest_commit_uses_fast_copy_for_small_staging() {
+        let inner: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let capped = Arc::new(CopyCapStore::new(inner));
+
+        let base_path = Path::from("repro");
+        let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
+        capped
+            .put(
+                &staging_path,
+                PutPayload::from_static(b"small manifest body"),
+            )
+            .await
+            .expect("seed staging file");
+        // No size override — the staging file's real size is ~20 bytes,
+        // well below the 5 GB cap, so copy_size_aware must take the fast
+        // path.
+
+        let external = SleepyExternalManifestStore::new();
+        let head_meta = capped.head(&staging_path).await.unwrap();
+
+        external
+            .put(
+                &base_path,
+                1,
+                &staging_path,
+                head_meta.size,
+                head_meta.e_tag,
+                capped.as_ref(),
+                ManifestNamingScheme::V2,
+            )
+            .await
+            .expect("small manifest commit must succeed via fast-path copy");
+
+        // The branch-taken assertion: fast path was used, slow path was not.
+        assert!(
+            capped.copy_calls() >= 1,
+            "small-file commit must use server-side CopyObject"
+        );
+        assert_eq!(
+            capped.put_multipart_calls(),
+            0,
+            "small-file commit must NOT initiate a multipart upload"
+        );
     }
 }

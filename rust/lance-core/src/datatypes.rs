@@ -25,6 +25,7 @@ pub use field::{
 pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
     escape_field_path_for_project, format_field_path, parse_field_path,
+    validate_fixed_size_list_dimensions,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -116,7 +117,7 @@ impl LogicalType {
         self.0.starts_with("fixed_size_list:struct:")
     }
 
-    fn is_struct(&self) -> bool {
+    pub fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
 
