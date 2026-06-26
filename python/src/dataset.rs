@@ -2429,11 +2429,6 @@ impl Dataset {
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
-                    if let Some(block_size) = kwargs.get_item("block_size")? {
-                        params = params
-                            .block_size(block_size.extract()?)
-                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                    }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
                     }

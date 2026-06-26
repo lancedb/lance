@@ -215,7 +215,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
                 .into()))
         }
 
-        let params = InvertedIndexParams::from_training_json(params)?;
+        let params = serde_json::from_str::<InvertedIndexParams>(params)?;
         Ok(Box::new(InvertedIndexTrainingRequest::new(params)))
     }
 
@@ -308,7 +308,6 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     #[test]
     fn test_plugin_version_tracks_max_supported_format() {
@@ -317,37 +316,5 @@ mod tests {
             plugin.version(),
             max_supported_fts_format_version().index_version()
         );
-    }
-
-    #[test]
-    fn test_new_training_request_defaults_missing_block_size_to_256() {
-        let plugin = InvertedIndexPlugin;
-        let field = Field::new("text", DataType::Utf8, true);
-
-        let cases = [
-            (
-                ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
-                false,
-            ),
-            (ScalarIndexParams::new("inverted".to_string()), false),
-            (
-                ScalarIndexParams::new("inverted".to_string())
-                    .with_params(&serde_json::json!({ "with_position": true })),
-                true,
-            ),
-        ];
-
-        for (params, expected_with_position) in cases {
-            let request = plugin
-                .new_training_request(params.params.as_deref().unwrap_or("{}"), &field)
-                .unwrap();
-            let request = request
-                .as_any()
-                .downcast_ref::<InvertedIndexTrainingRequest>()
-                .unwrap();
-
-            assert_eq!(request.parameters.posting_block_size(), DEFAULT_BLOCK_SIZE);
-            assert_eq!(request.parameters.has_positions(), expected_with_position);
-        }
     }
 }

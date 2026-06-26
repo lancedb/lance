@@ -6,7 +6,6 @@ use super::{InvertedIndexParams, index::*};
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
-use crate::scalar::inverted::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexFile, IndexStore, OldIndexDataFilter};
@@ -16,13 +15,13 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use bitpacking::{BitPacker, BitPacker4x};
 use bytes::Bytes;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use fst::Streamer;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
+use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
@@ -42,8 +41,9 @@ use std::task::{Context, Poll};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
 
-// The physical bitpacking block size. Logical FTS posting blocks may contain
-// 1, 2, or 4 of these chunks, configured by InvertedIndexParams::block_size.
+// the number of elements in each block
+// each block contains 128 row ids and 128 frequencies
+// WARNING: changing this value will break the compatibility with existing indexes
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
 // The default number of workers to use for FTS builds.
@@ -448,7 +448,6 @@ impl InvertedIndexBuilder {
             fragment_mask: self.fragment_mask,
             token_set_format: self.token_set_format,
             worker_memory_limit_bytes,
-            block_size: self.params.block_size,
         };
         let next_id = self.next_partition_id();
         let id_alloc = Arc::new(AtomicU64::new(next_id));
@@ -795,7 +794,6 @@ pub struct InnerBuilder {
     token_set_format: TokenSetFormat,
     format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
-    block_size: usize,
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
@@ -818,45 +816,12 @@ impl InnerBuilder {
         token_set_format: TokenSetFormat,
         format_version: InvertedListFormatVersion,
     ) -> Self {
-        Self::new_with_format_version_and_block_size(
-            id,
-            with_position,
-            token_set_format,
-            format_version,
-            LEGACY_BLOCK_SIZE,
-        )
-    }
-
-    pub fn new_with_block_size(
-        id: u64,
-        with_position: bool,
-        token_set_format: TokenSetFormat,
-        block_size: usize,
-    ) -> Self {
-        Self::new_with_format_version_and_block_size(
-            id,
-            with_position,
-            token_set_format,
-            current_fts_format_version(),
-            block_size,
-        )
-    }
-
-    pub fn new_with_format_version_and_block_size(
-        id: u64,
-        with_position: bool,
-        token_set_format: TokenSetFormat,
-        format_version: InvertedListFormatVersion,
-        block_size: usize,
-    ) -> Self {
-        validate_block_size(block_size).expect("invalid posting list block size");
         Self {
             id,
             with_position,
             token_set_format,
             format_version,
             posting_tail_codec: format_version.posting_tail_codec(),
-            block_size,
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
@@ -870,34 +835,13 @@ impl InnerBuilder {
         token_set_format: TokenSetFormat,
         posting_tail_codec: PostingTailCodec,
     ) -> Self {
-        Self::new_with_posting_tail_codec_and_block_size(
-            id,
-            with_position,
-            token_set_format,
-            posting_tail_codec,
-            LEGACY_BLOCK_SIZE,
-        )
-    }
-
-    pub fn new_with_posting_tail_codec_and_block_size(
-        id: u64,
-        with_position: bool,
-        token_set_format: TokenSetFormat,
-        posting_tail_codec: PostingTailCodec,
-        block_size: usize,
-    ) -> Self {
         let format_version = if posting_tail_codec == PostingTailCodec::Fixed32 {
             InvertedListFormatVersion::V1
         } else {
             InvertedListFormatVersion::V2
         };
-        let mut builder = Self::new_with_format_version_and_block_size(
-            id,
-            with_position,
-            token_set_format,
-            format_version,
-            block_size,
-        );
+        let mut builder =
+            Self::new_with_format_version(id, with_position, token_set_format, format_version);
         builder.posting_tail_codec = posting_tail_codec;
         builder
     }
@@ -978,7 +922,6 @@ impl InnerBuilder {
             token_set_format,
             format_version,
             posting_tail_codec,
-            block_size,
             tokens,
             posting_lists,
             docs,
@@ -1009,12 +952,6 @@ impl InnerBuilder {
                 self.posting_tail_codec, posting_tail_codec
             )));
         }
-        if self.block_size != block_size {
-            return Err(Error::index(format!(
-                "cannot merge partitions with mismatched FTS block sizes: {} vs {}",
-                self.block_size, block_size
-            )));
-        }
 
         let mut token_id_map = vec![u32::MAX; posting_lists.len()];
         match tokens.tokens {
@@ -1040,11 +977,7 @@ impl InnerBuilder {
             self.docs.append(*row_id, *num_tokens);
         }
         self.posting_lists.resize_with(self.tokens.len(), || {
-            PostingListBuilder::new_with_posting_tail_codec_and_block_size(
-                with_position,
-                self.posting_tail_codec,
-                self.block_size,
-            )
+            PostingListBuilder::new_with_posting_tail_codec(with_position, self.posting_tail_codec)
         });
 
         for (token_id, posting_list) in posting_lists.into_iter().enumerate() {
@@ -1111,11 +1044,7 @@ impl InnerBuilder {
         let mut writer = store
             .new_index_file(
                 path,
-                inverted_list_schema_for_version_with_block_size(
-                    self.with_position,
-                    self.format_version,
-                    self.block_size,
-                ),
+                inverted_list_schema_for_version(self.with_position, self.format_version),
             )
             .await?;
         let posting_lists = std::mem::take(&mut self.posting_lists);
@@ -1129,11 +1058,7 @@ impl InnerBuilder {
         let with_position = self.with_position;
         let format_version = self.format_version;
         let group_config = self.group_config;
-        let schema = inverted_list_schema_for_version_with_block_size(
-            self.with_position,
-            self.format_version,
-            self.block_size,
-        );
+        let schema = inverted_list_schema_for_version(self.with_position, self.format_version);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
         let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
@@ -1289,7 +1214,6 @@ struct IndexWorkerConfig {
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
     worker_memory_limit_bytes: u64,
-    block_size: usize,
 }
 
 impl IndexWorker {
@@ -1333,22 +1257,17 @@ impl IndexWorker {
         id_alloc: Arc<AtomicU64>,
         config: IndexWorkerConfig,
     ) -> Result<Self> {
-        let schema = inverted_list_schema_for_version_with_block_size(
-            config.with_position,
-            config.format_version,
-            config.block_size,
-        );
+        let schema = inverted_list_schema_for_version(config.with_position, config.format_version);
 
         Ok(Self {
             tokenizer,
             dest_store,
-            builder: InnerBuilder::new_with_format_version_and_block_size(
+            builder: InnerBuilder::new_with_format_version(
                 id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | config.fragment_mask.unwrap_or(0),
                 config.with_position,
                 config.token_set_format,
                 config.format_version,
-                config.block_size,
             ),
             partitions: Vec::new(),
             files: Vec::new(),
@@ -1407,10 +1326,9 @@ impl IndexWorker {
                             * std::mem::size_of::<PostingListBuilder>())
                             as u64;
                         builder.posting_lists.push(
-                            PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                            PostingListBuilder::new_with_posting_tail_codec(
                                 true,
                                 posting_tail_codec,
-                                builder.block_size,
                             ),
                         );
                         let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
@@ -1456,10 +1374,9 @@ impl IndexWorker {
                 self.builder
                     .posting_lists
                     .resize_with(self.builder.tokens.len(), || {
-                        PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                        PostingListBuilder::new_with_posting_tail_codec(
                             false,
                             self.builder.posting_tail_codec,
-                            self.builder.block_size,
                         )
                     });
                 let new_posting_lists_overhead_size = self.posting_lists_overhead_size();
@@ -1564,17 +1481,15 @@ impl IndexWorker {
         self.memory_size = self.temporary_memory_size();
         let with_position = self.has_position();
         let format_version = self.builder.format_version;
-        let block_size = self.builder.block_size;
         let builder = std::mem::replace(
             &mut self.builder,
-            InnerBuilder::new_with_format_version_and_block_size(
+            InnerBuilder::new_with_format_version(
                 self.id_alloc
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | self.fragment_mask.unwrap_or(0),
                 with_position,
                 self.token_set_format,
                 format_version,
-                block_size,
             ),
         );
         let written_partition_id = builder.id();
@@ -1694,31 +1609,17 @@ pub fn inverted_list_schema_for_version(
     with_position: bool,
     format_version: InvertedListFormatVersion,
 ) -> SchemaRef {
-    inverted_list_schema_for_version_with_block_size(
-        with_position,
-        format_version,
-        LEGACY_BLOCK_SIZE,
-    )
-}
-
-pub fn inverted_list_schema_for_version_with_block_size(
-    with_position: bool,
-    format_version: InvertedListFormatVersion,
-    block_size: usize,
-) -> SchemaRef {
-    validate_block_size(block_size).expect("invalid posting list block size");
     match format_version {
-        InvertedListFormatVersion::V1 => inverted_list_schema_v1(with_position, block_size),
+        InvertedListFormatVersion::V1 => inverted_list_schema_v1(with_position),
         InvertedListFormatVersion::V2 => inverted_list_schema_with_tail_codec_and_position_codec(
             with_position,
             PostingTailCodec::VarintDelta,
             Some(PositionStreamCodec::PackedDelta),
-            block_size,
         ),
     }
 }
 
-fn inverted_list_schema_v1(with_position: bool, block_size: usize) -> SchemaRef {
+fn inverted_list_schema_v1(with_position: bool) -> SchemaRef {
     let mut fields = vec![
         arrow_schema::Field::new(
             POSTING_COL,
@@ -1747,10 +1648,7 @@ fn inverted_list_schema_v1(with_position: bool, block_size: usize) -> SchemaRef 
             false,
         ));
     }
-    Arc::new(arrow_schema::Schema::new_with_metadata(
-        fields,
-        HashMap::from([(POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string())]),
-    ))
+    Arc::new(arrow_schema::Schema::new(fields))
 }
 
 pub fn inverted_list_schema_with_tail_codec(
@@ -1761,7 +1659,6 @@ pub fn inverted_list_schema_with_tail_codec(
         with_position,
         posting_tail_codec,
         Some(PositionStreamCodec::PackedDelta),
-        LEGACY_BLOCK_SIZE,
     )
 }
 
@@ -1769,7 +1666,6 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
     with_position: bool,
     posting_tail_codec: PostingTailCodec,
     position_codec: Option<PositionStreamCodec>,
-    block_size: usize,
 ) -> SchemaRef {
     let mut fields = vec![
         // we compress the posting lists (including row ids and frequencies),
@@ -1806,7 +1702,6 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
         POSTING_TAIL_CODEC_KEY.to_owned(),
         posting_tail_codec.as_str().to_owned(),
     )]);
-    metadata.insert(POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string());
     if let Some(position_codec) = position_codec.filter(|_| with_position) {
         metadata.insert(
             POSITIONS_LAYOUT_KEY.to_owned(),
@@ -3289,7 +3184,6 @@ mod tests {
                 fragment_mask: None,
                 token_set_format,
                 worker_memory_limit_bytes: u64::MAX,
-                block_size: params.block_size,
             },
         )
         .await?;
@@ -3313,7 +3207,6 @@ mod tests {
                 fragment_mask: None,
                 token_set_format,
                 worker_memory_limit_bytes: u64::MAX,
-                block_size: params.block_size,
             },
         )
         .await?;
@@ -3787,7 +3680,6 @@ mod tests {
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
-                block_size: InvertedIndexParams::default().block_size,
             },
         )
         .await?;
@@ -3819,7 +3711,6 @@ mod tests {
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
-                block_size: InvertedIndexParams::default().block_size,
             },
         )
         .await?;
@@ -3858,7 +3749,6 @@ mod tests {
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
-                block_size: InvertedIndexParams::default().block_size,
             },
         )
         .await?;

@@ -13,47 +13,19 @@
  */
 package org.lance.index.scalar;
 
-import org.lance.util.JsonUtils;
-
 import org.junit.jupiter.api.Test;
 
-import java.util.Map;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class InvertedIndexParamsTest {
+public class InvertedIndexParamsTest {
 
   @Test
-  void testIcuSplitTokenizerVariant() {
+  public void testIcuSplitTokenizerVariant() {
     ScalarIndexParams params = InvertedIndexParams.builder().baseTokenizer("icu/split").build();
 
     assertEquals("inverted", params.getIndexType());
     String jsonParams = params.getJsonParams().orElseThrow(AssertionError::new);
     assertTrue(jsonParams.contains("\"base_tokenizer\":\"icu/split\""));
-  }
-
-  @Test
-  void defaultBlockSizeIsSerialized() {
-    ScalarIndexParams params = InvertedIndexParams.builder().build();
-
-    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
-    assertEquals(256, ((Number) json.get("block_size")).intValue());
-  }
-
-  @Test
-  void blockSizeIsSerialized() {
-    ScalarIndexParams params = InvertedIndexParams.builder().blockSize(512).build();
-
-    assertEquals("inverted", params.getIndexType());
-    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
-    assertEquals(512, ((Number) json.get("block_size")).intValue());
-  }
-
-  @Test
-  void invalidBlockSizeIsRejected() {
-    assertThrows(
-        IllegalArgumentException.class, () -> InvertedIndexParams.builder().blockSize(129));
   }
 }

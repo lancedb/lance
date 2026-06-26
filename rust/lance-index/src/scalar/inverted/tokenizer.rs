@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::{Error, Result};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -28,10 +28,6 @@ use lance_tokenizer::{
     SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
     WhitespaceTokenizer,
 };
-
-pub const LEGACY_BLOCK_SIZE: usize = 128;
-pub const DEFAULT_BLOCK_SIZE: usize = 256;
-pub const VALID_BLOCK_SIZES: [usize; 3] = [128, 256, 512];
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,17 +98,6 @@ pub struct InvertedIndexParams {
     #[serde(default)]
     pub(crate) prefix_only: bool,
 
-    /// Number of documents in each compressed posting block.
-    ///
-    /// Missing serialized values come from indexes written before this
-    /// parameter existed and must read as 128 for backwards compatibility. New
-    /// indexes default to 256.
-    #[serde(
-        default = "legacy_block_size",
-        deserialize_with = "deserialize_block_size"
-    )]
-    pub(crate) block_size: usize,
-
     /// Total memory limit in MiB for the build stage.
     ///
     /// This is split evenly across FTS workers at build time. By default Lance
@@ -153,7 +138,6 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             min_ngram_length: params.min_ngram_length,
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
-            block_size: Some(params.block_size as u32),
         })
     }
 }
@@ -181,10 +165,6 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             min_ngram_length: details.min_ngram_length,
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
-            block_size: match details.block_size {
-                Some(block_size) => validate_block_size(block_size as usize)?,
-                None => LEGACY_BLOCK_SIZE,
-            },
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
         })
@@ -201,30 +181,6 @@ fn default_min_ngram_length() -> u32 {
 
 fn default_max_ngram_length() -> u32 {
     3
-}
-
-fn legacy_block_size() -> usize {
-    LEGACY_BLOCK_SIZE
-}
-
-fn invalid_block_size_message(block_size: usize) -> String {
-    format!("FTS inverted index block_size must be one of 128, 256, or 512, got {block_size}")
-}
-
-pub fn validate_block_size(block_size: usize) -> Result<usize> {
-    if VALID_BLOCK_SIZES.contains(&block_size) {
-        Ok(block_size)
-    } else {
-        Err(Error::invalid_input(invalid_block_size_message(block_size)))
-    }
-}
-
-fn deserialize_block_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let block_size = usize::deserialize(deserializer)?;
-    validate_block_size(block_size).map_err(serde::de::Error::custom)
 }
 
 impl Default for InvertedIndexParams {
@@ -264,7 +220,6 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
-            block_size: DEFAULT_BLOCK_SIZE,
             memory_limit_mb: None,
             num_workers: None,
         }
@@ -355,21 +310,6 @@ impl InvertedIndexParams {
         self
     }
 
-    /// Set the compressed posting block size.
-    ///
-    /// Supported values are 128, 256, and 512. Larger values reduce block-max
-    /// metadata and WAND skip granularity; smaller values preserve the legacy
-    /// layout.
-    pub fn block_size(mut self, block_size: usize) -> Result<Self> {
-        self.block_size = validate_block_size(block_size)?;
-        Ok(self)
-    }
-
-    /// Get the compressed posting block size.
-    pub fn posting_block_size(&self) -> usize {
-        self.block_size
-    }
-
     pub fn memory_limit_mb(mut self, memory_limit_mb: u64) -> Self {
         self.memory_limit_mb = Some(memory_limit_mb);
         self
@@ -403,23 +343,6 @@ impl InvertedIndexParams {
             );
         }
         Ok(value)
-    }
-
-    /// Deserialize params for new index training, using current creation defaults
-    /// for omitted fields.
-    pub(crate) fn from_training_json(params: &str) -> Result<Self> {
-        let supplied = serde_json::from_str::<serde_json::Value>(params)?;
-        let mut value = serde_json::to_value(Self::default())?;
-
-        let supplied = supplied.as_object().ok_or_else(|| {
-            Error::invalid_input("FTS inverted index params must be a JSON object".to_string())
-        })?;
-        let object = value
-            .as_object_mut()
-            .expect("inverted index params should serialize to a JSON object");
-        object.extend(supplied.clone());
-
-        Ok(serde_json::from_value(value)?)
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
@@ -527,10 +450,8 @@ pub fn language_model_home() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pbold;
-
     use super::InvertedIndexParams;
-    use lance_tokenizer::{Language, TokenStream};
+    use lance_tokenizer::TokenStream;
     use rstest::rstest;
 
     #[test]
@@ -579,74 +500,6 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
-    }
-
-    #[test]
-    fn test_block_size_new_default_serializes() {
-        let params = InvertedIndexParams::default();
-        assert_eq!(params.block_size, 256);
-        let json = serde_json::to_value(&params).unwrap();
-        assert_eq!(json.get("block_size"), Some(&serde_json::Value::from(256)));
-    }
-
-    #[test]
-    fn test_block_size_missing_metadata_falls_back_to_128() {
-        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
-        json.as_object_mut().unwrap().remove("block_size");
-
-        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
-        assert_eq!(params.block_size, 128);
-    }
-
-    #[test]
-    fn test_block_size_details_conversion() {
-        let params = InvertedIndexParams::default().block_size(512).unwrap();
-        let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
-        assert_eq!(details.block_size, Some(512));
-
-        let old_details = pbold::InvertedIndexDetails {
-            base_tokenizer: Some("simple".to_string()),
-            language: serde_json::to_string(&Language::English).unwrap(),
-            with_position: false,
-            max_token_length: Some(40),
-            lower_case: true,
-            stem: true,
-            remove_stop_words: true,
-            ascii_folding: true,
-            min_ngram_length: 3,
-            max_ngram_length: 3,
-            prefix_only: false,
-            block_size: None,
-        };
-        let params = InvertedIndexParams::try_from(&old_details).unwrap();
-        assert_eq!(params.block_size, 128);
-    }
-
-    #[test]
-    fn test_block_size_accepts_supported_values() {
-        for block_size in [128, 256, 512] {
-            let params = InvertedIndexParams::default()
-                .block_size(block_size)
-                .unwrap();
-            assert_eq!(params.block_size, block_size);
-
-            let roundtrip: InvertedIndexParams =
-                serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
-            assert_eq!(roundtrip.block_size, block_size);
-        }
-    }
-
-    #[test]
-    fn test_block_size_rejects_invalid_values() {
-        let err = InvertedIndexParams::default().block_size(129).unwrap_err();
-        assert!(err.to_string().contains("block_size"));
-
-        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .insert("block_size".to_string(), serde_json::Value::from(1024));
-        let err = serde_json::from_value::<InvertedIndexParams>(json).unwrap_err();
-        assert!(err.to_string().contains("128, 256, or 512"));
     }
 
     #[test]

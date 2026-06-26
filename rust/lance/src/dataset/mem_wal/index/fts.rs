@@ -54,9 +54,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arc_swap::ArcSwap;
 use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow_schema::DataType;
-use bitpacking::{BitPacker, BitPacker4x};
 use crossbeam_skiplist::SkipMap;
 use fst::{Map, Streamer};
+use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::Operator;
@@ -1699,7 +1699,6 @@ impl FtsMemIndex {
 
         let st = self.state.load_full();
         let with_position = self.params.has_positions();
-        let block_size = self.params.posting_block_size();
         let total_rows_u64 = total_rows as u64;
 
         // Step 1: collect (original_pos, num_tokens) for every doc across all
@@ -1717,11 +1716,10 @@ impl FtsMemIndex {
             }
         }
         if all_docs.is_empty() {
-            return Ok(InnerBuilder::new_with_block_size(
+            return Ok(InnerBuilder::new(
                 partition_id,
                 with_position,
                 Default::default(),
-                block_size,
             ));
         }
 
@@ -1807,10 +1805,7 @@ impl FtsMemIndex {
             docs_for_term.sort_by_key(|(doc_id, _, _)| *doc_id);
             let token_id = tokens.add(token) as usize;
             debug_assert_eq!(token_id, posting_lists.len());
-            posting_lists.push(PostingListBuilder::new_with_block_size(
-                with_position,
-                block_size,
-            ));
+            posting_lists.push(PostingListBuilder::new(with_position));
             let plb = &mut posting_lists[token_id];
             for (doc_id, freq, pos) in docs_for_term {
                 let recorder = if with_position {
@@ -1822,12 +1817,7 @@ impl FtsMemIndex {
             }
         }
 
-        let mut builder = InnerBuilder::new_with_block_size(
-            partition_id,
-            with_position,
-            Default::default(),
-            block_size,
-        );
+        let mut builder = InnerBuilder::new(partition_id, with_position, Default::default());
         builder.set_tokens(tokens);
         builder.set_docs(docs);
         builder.set_posting_lists(posting_lists);
