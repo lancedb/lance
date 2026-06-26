@@ -2332,6 +2332,42 @@ def test_json_index():
     )
 
 
+def test_json_index_negative_floats():
+    # A JSON float-path btree index must agree with the un-indexed scan even when
+    # the path holds negative values. The extracted values were not sorted before
+    # btree training, so a page's recorded min/max were taken from storage order
+    # and a negative value corrupted range / boundary-equality lookups (#7485).
+    vals = [
+        '{"v": 10.5}',
+        '{"v": 40.1}',
+        '{"v": -3.2}',
+        '{"v": 0.5}',
+        '{"v": -100.0}',
+    ]
+    tbl = pa.table({"data": pa.array(vals, pa.json_())})
+    ds = lance.write_dataset(tbl, "memory://test")
+    ds.create_scalar_index(
+        "data",
+        IndexConfig(
+            index_type="json", parameters={"target_index_type": "btree", "path": "v"}
+        ),
+    )
+
+    for predicate in [
+        "json_get_float(data, 'v') > 0",
+        "json_get_float(data, 'v') < 0",
+        "json_get_float(data, 'v') >= 10.5",
+        "json_get_float(data, 'v') = 40.1",
+        "json_get_float(data, 'v') = -3.2",
+        "json_get_float(data, 'v') = -100.0",
+        "json_get_float(data, 'v') != 0.5",
+    ]:
+        assert "ScalarIndexQuery" in ds.scanner(filter=predicate).explain_plan()
+        assert ds.to_table(filter=predicate) == ds.to_table(
+            filter=predicate, use_scalar_index=False
+        ), predicate
+
+
 def test_null_handling():
     tbl = pa.table(
         {

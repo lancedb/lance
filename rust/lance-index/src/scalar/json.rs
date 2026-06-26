@@ -8,17 +8,17 @@ use std::{
 };
 
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
-use arrow_schema::{DataType, Field, Field as ArrowField, Schema};
+use arrow_schema::{DataType, Field, Field as ArrowField, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec},
+    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
 };
 use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
-    PhysicalExpr, ScalarFunctionExpr,
+    PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
 use futures::StreamExt;
@@ -663,6 +663,35 @@ impl JsonIndexPlugin {
             futures::stream::iter(converted_batches.into_iter().map(Ok)),
         )))
     }
+
+    /// Sort a `(value, row_id)` stream ascending by value before sub-index training.
+    ///
+    /// The btree sub-index trainer assumes its input is globally sorted by value: it
+    /// records each page's min/max as the first/last element of the page. The normal
+    /// scalar-index path sorts the column upstream, but the JSON path extracts the
+    /// typed values here, so the extracted stream is in storage order, not value order.
+    /// Without this sort the page min/max are wrong and range/equality queries skip
+    /// valid pages (e.g. a negative float, whose storage order differs from its value
+    /// order, makes a page's recorded `max` smaller than real values it contains).
+    async fn sort_stream_by_value(
+        data: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        let input = Arc::new(OneShotExec::new(data));
+        let value_idx = input.schema().index_of(VALUE_COLUMN_NAME)?;
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_idx)),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let sorted = Arc::new(SortExec::new([sort_expr].into(), input));
+        let ctx = get_session_context(&LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        });
+        Ok(sorted.execute(0, ctx.task_ctx())?)
+    }
 }
 
 #[async_trait]
@@ -750,6 +779,10 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let converted_stream =
             Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
 
+        // The btree sub-index trainer requires its input globally sorted by value, so
+        // sort the extracted values here (the JSON path has no upstream value sort).
+        let sorted_stream = Self::sort_stream_by_value(converted_stream).await?;
+
         // Update the target request with inferred type
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&request.parameters.target_index_type)?;
@@ -766,7 +799,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 
         let target_index = target_plugin
             .train_index(
-                converted_stream,
+                sorted_stream,
                 index_store,
                 target_request,
                 fragment_ids,
