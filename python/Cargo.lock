@@ -1049,15 +1049,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
-name = "bitpacking"
-version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96a7139abd3d9cebf8cd6f920a389cf3dc9576172e32f4563f188cae3c3eb019"
-dependencies = [
- "crunchy",
-]
-
-[[package]]
 name = "bitvec"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4076,7 +4067,6 @@ dependencies = [
  "async_cell",
  "aws-credential-types",
  "aws-sdk-dynamodb",
- "bitpacking",
  "byteorder",
  "bytes",
  "chrono",
@@ -4095,6 +4085,7 @@ dependencies = [
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
+ "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
  "lance-encoding",
@@ -4177,6 +4168,7 @@ name = "lance-bitpacking"
 version = "9.0.0-beta.8"
 dependencies = [
  "arrayref",
+ "crunchy",
  "paste",
  "seq-macro",
 ]
@@ -4370,7 +4362,6 @@ dependencies = [
  "async-channel",
  "async-recursion",
  "async-trait",
- "bitpacking",
  "bitvec",
  "bytes",
  "chrono",
@@ -4391,6 +4382,7 @@ dependencies = [
  "jsonb",
  "lance-arrow",
  "lance-arrow-stats",
+ "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
  "lance-datagen",

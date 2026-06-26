@@ -141,6 +141,39 @@ impl TryFrom<pb::IndexCatchupProgress> for IndexCatchupProgress {
     }
 }
 
+/// Lifecycle status of a WAL shard, persisted in [`ShardManifest`].
+///
+/// `Sealed` is the durable in-doubt record for drop-table two-phase
+/// commit: a sealed shard refuses new writer claims (enforced in
+/// `claim_epoch`) but is reversible back to `Active` on rollback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardStatus {
+    /// Normal: the shard accepts writer claims.
+    #[default]
+    Active,
+    /// A drop is in flight: claims are refused. Reversible.
+    Sealed,
+}
+
+impl ShardStatus {
+    /// Map to the protobuf enum discriminant (`pb::ShardStatus`).
+    fn to_i32(self) -> i32 {
+        match self {
+            Self::Active => 0,
+            Self::Sealed => 1,
+        }
+    }
+
+    /// Map from the protobuf enum discriminant; unknown values decode as
+    /// `Active` (forward-compatible default).
+    fn from_i32(v: i32) -> Self {
+        match v {
+            1 => Self::Sealed,
+            _ => Self::Active,
+        }
+    }
+}
+
 /// Shard manifest containing epoch-based fencing and WAL state.
 /// Each shard has exactly one active writer at any time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +199,9 @@ pub struct ShardManifest {
     pub wal_entry_position_last_seen: u64,
     pub current_generation: u64,
     pub flushed_generations: Vec<FlushedGeneration>,
+    /// Lifecycle status (drop-table 2PC). Defaults to `Active`; preserved
+    /// across claims via `..base` so only fresh constructions set it.
+    pub status: ShardStatus,
 }
 
 impl DeepSizeOf for ShardManifest {
@@ -194,6 +230,7 @@ impl From<&ShardManifest> for pb::ShardManifest {
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
             current_generation: rm.current_generation,
             flushed_generations: rm.flushed_generations.iter().map(|fg| fg.into()).collect(),
+            status: rm.status.to_i32(),
         }
     }
 }
@@ -226,6 +263,7 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
                 .into_iter()
                 .map(FlushedGeneration::from)
                 .collect(),
+            status: ShardStatus::from_i32(rm.status),
         })
     }
 }

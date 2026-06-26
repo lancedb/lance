@@ -9,7 +9,7 @@ use super::index::{PositionStreamCodec, PostingTailCodec};
 use super::tokenizer::LEGACY_BLOCK_SIZE;
 use super::tokenizer::validate_block_size;
 use arrow::array::LargeBinaryBuilder;
-use bitpacking::{BitPacker, BitPacker4x};
+use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::{Error, Result};
 
 // we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),

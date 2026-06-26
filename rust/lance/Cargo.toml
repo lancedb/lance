@@ -32,6 +32,7 @@ lance-namespace = { workspace = true }
 lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
+lance-bitpacking = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -43,7 +44,6 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 async-recursion.workspace = true
 async-trait.workspace = true
-bitpacking = { workspace = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true

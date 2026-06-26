@@ -321,18 +321,15 @@ impl ReaderProjection {
     ) -> Result<()> {
         for field in fields {
             let is_structural = file_version >= LanceFileVersion::V2_1;
+            let (contributes, recurse) = field_column_shape(field, is_structural);
             // In the 2.0 system we needed ids for intermediate fields.  In 2.1+
             // we only need ids for leaf fields.
-            if (!is_structural
-                || field.children.is_empty()
-                || field.is_blob()
-                || field.is_packed_struct())
+            if contributes
                 && let Some(column_idx) = field_id_to_column_index.get(&(field.id as u32)).copied()
             {
                 column_indices.push(column_idx);
             }
-            // Don't recurse into children if the field is a blob or packed struct in 2.1
-            if !is_structural || (!field.is_blob() && !field.is_packed_struct()) {
+            if recurse {
                 Self::from_field_ids_helper(
                     file_version,
                     field.children.iter(),
@@ -520,6 +517,119 @@ struct Footer {
 
 const FOOTER_LEN: usize = 40;
 
+// How a field maps onto physical columns, shared by the projection-building and
+// projection-validation walks so they stay in lockstep. In the 2.0 layout every
+// field (including structs and lists) has its own column; in 2.1 only leaves do,
+// and blob/packed-struct fields are opaque (a single column with no descent).
+// Returns `(contributes, recurse)`: whether the field has its own column and
+// whether to walk into its children. The DFS order is the field's own column (if
+// any) followed by its children, so a field's root (first) column is always the
+// first entry of its sub-slice.
+fn field_column_shape(field: &Field, is_structural: bool) -> (bool, bool) {
+    let contributes =
+        !is_structural || field.children.is_empty() || field.is_blob() || field.is_packed_struct();
+    let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
+    (contributes, recurse)
+}
+
+// Whether a field's children each cover the same rows as the field itself. Struct
+// children do (one value per parent row), so they must share its length. List,
+// map, and fixed-size-list items have an independent cardinality (item count, not
+// row count) and are validated only against themselves.
+fn children_share_parent_length(field: &Field) -> bool {
+    field.logical_type.is_struct()
+}
+
+// Validate one field's slice of a projection's flat `column_indices`, returning
+// the field's top-level row count (the page-row sum of its root column). Walks the
+// same DFS order as `from_field_ids_helper`, advancing `cursor` past every column
+// the field contributes.
+//
+// `comparable` tracks whether the field's row count shares the read's top-level
+// cardinality. A struct's children must all match that count -- the decoders
+// combine them assuming equal lengths and would otherwise panic or read past a
+// shorter child -- so the equality check runs only while `comparable` holds. Once
+// the walk descends through a list/map/fixed-size-list its items have an
+// independent cardinality (item count, not row count), so `comparable` turns off
+// for that whole subtree and a nested struct's children are no longer compared.
+fn validate_field_length<F: Fn(usize) -> Result<u64>>(
+    field: &Field,
+    is_structural: bool,
+    comparable: bool,
+    column_indices: &[u32],
+    cursor: &mut usize,
+    column_len: &F,
+) -> Result<u64> {
+    let (contributes, recurse) = field_column_shape(field, is_structural);
+    let mut field_rows: Option<u64> = None;
+    if contributes {
+        let column = *column_indices.get(*cursor).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "projection supplied fewer column indices than its fields require \
+                 (ran out at field '{}')",
+                field.name
+            ))
+        })?;
+        *cursor += 1;
+        field_rows = Some(column_len(column as usize)?);
+    }
+    if recurse {
+        // Only enforce equal-length children for a struct whose own count is still
+        // at the top-level cardinality; below a list/map/fixed-size-list the items
+        // have an independent cardinality, so neither this field nor its
+        // descendants are comparable.
+        let enforce_children = comparable && children_share_parent_length(field);
+        for child in &field.children {
+            let child_rows = validate_field_length(
+                child,
+                is_structural,
+                enforce_children,
+                column_indices,
+                cursor,
+                column_len,
+            )?;
+            // A struct that contributes no column of its own (the 2.1 layout)
+            // takes its row count from its first child.
+            let expected = *field_rows.get_or_insert(child_rows);
+            if enforce_children && child_rows != expected {
+                return Err(Error::invalid_input(format!(
+                    "cannot read field '{}': its children have differing lengths \
+                     (child '{}' has {} rows, but the field has {}); a struct's \
+                     children must all have the same length",
+                    field.name, child.name, child_rows, expected
+                )));
+            }
+        }
+    }
+    field_rows.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "projected field '{}' maps to no columns",
+            field.name
+        ))
+    })
+}
+
+// The reader combines a projection's columns into rectangular batches, so they
+// must all have the same length.  Returns that common length, or a descriptive
+// error (naming each column's length) when they differ. Ordinary files always
+// pass; only files written with `FileWriter::write_column` whose columns ended up
+// unequal can fail, and those must be read separately.
+fn verify_uniform_lengths(field_lengths: &[(&str, u64)]) -> Result<u64> {
+    let first = field_lengths.first().map_or(0, |&(_, len)| len);
+    if field_lengths.iter().all(|&(_, len)| len == first) {
+        return Ok(first);
+    }
+    let columns = field_lengths
+        .iter()
+        .map(|(name, len)| format!("{name}={len}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::invalid_input(format!(
+        "cannot read columns of differing lengths together ({columns}); \
+         read each column (or equal-length group) separately"
+    )))
+}
+
 impl FileReader {
     pub fn with_scheduler(&self, scheduler: Arc<dyn EncodingsIo>) -> Self {
         Self {
@@ -547,6 +657,29 @@ impl FileReader {
 
     pub fn num_rows(&self) -> u64 {
         self.core.num_rows()
+    }
+
+    /// The number of rows stored in a single physical column.
+    ///
+    /// For ordinary (rectangular) files every column has the same length, equal
+    /// to [`num_rows`](Self::num_rows). Files written with
+    /// [`FileWriter::write_column`](crate::writer::FileWriter::write_column)
+    /// may have columns of differing lengths; this returns the length of one
+    /// such column, derived by summing its pages' row counts. Errors if
+    /// `column_index` is out of bounds.
+    pub fn column_num_rows(&self, column_index: usize) -> Result<u64> {
+        let column = self
+            .metadata
+            .column_metadatas
+            .get(column_index)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "column index {} is out of bounds (file has {} columns)",
+                    column_index,
+                    self.metadata.column_metadatas.len()
+                ))
+            })?;
+        Ok(column.pages.iter().map(|page| page.length).sum())
     }
 
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
@@ -1546,12 +1679,20 @@ impl FileReader {
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let projection = projection.unwrap_or_else(|| self.core.base_projection.clone());
         Self::validate_projection(&projection, &self.metadata)?;
+        // Apply the same projection-length validation as the async path.  This
+        // reader is always backed by full metadata, so we can build the prepared
+        // projection synchronously (no column-metadata I/O) and reuse the shared
+        // check.  `read_len` is the projection's common column length, which
+        // `RangeFull`/`RangeFrom` resolve against rather than `num_rows`.
+        let prepared = PreparedProjection {
+            column_infos: self.metadata.column_infos.clone(),
+            decoder_projection: projection.clone(),
+        };
+        let read_len = self.core.prepared_read_length(&prepared)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
-            if bound > self.core.num_rows() || bound == self.core.num_rows() && inclusive {
+            if bound > read_len || (bound == read_len && inclusive) {
                 Err(Error::invalid_input(format!(
-                    "cannot read {:?} from file with {} rows",
-                    params,
-                    self.core.num_rows()
+                    "cannot read {params:?} from columns with {read_len} rows"
                 )))
             } else {
                 Ok(())
@@ -1592,7 +1733,7 @@ impl FileReader {
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
                 self.read_range_blocking(
-                    range.start as u64..self.core.num_rows(),
+                    range.start as u64..read_len,
                     batch_size,
                     projection,
                     filter,
@@ -1603,7 +1744,7 @@ impl FileReader {
                 self.read_range_blocking(0..range.end as u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFull => {
-                self.read_range_blocking(0..self.core.num_rows(), batch_size, projection, filter)
+                self.read_range_blocking(0..read_len, batch_size, projection, filter)
             }
         }
     }
@@ -1939,17 +2080,64 @@ impl FileReadCore {
         })
     }
 
+    // The common length to read across a prepared projection, after validating
+    // its columns can be combined into rectangular batches. Each top-level field
+    // is checked for internal consistency (see `validate_field_length`); the
+    // top-level fields must then share a length, since one read combines them.
+    // Ordinary files always pass (every column has `num_rows` rows); files
+    // written with `FileWriter::write_column` whose columns ended up unequal are
+    // rejected here and must be read separately.
+    //
+    // `column_infos` and `decoder_projection.column_indices` line up for both
+    // metadata providers: the full provider keeps absolute indices into the whole
+    // file, while the indexed (lazy) provider loads only the projected columns and
+    // renumbers them 0..N -- in either case `column_infos[column_index]` is the
+    // requested column.
+    fn prepared_read_length(&self, prepared: &PreparedProjection) -> Result<u64> {
+        let is_structural = self.version() >= LanceFileVersion::V2_1;
+        let column_infos = &prepared.column_infos;
+        let column_len = |column: usize| -> Result<u64> {
+            let info = column_infos.get(column).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "projection references column index {} but only {} columns are available",
+                    column,
+                    column_infos.len()
+                ))
+            })?;
+            Ok(info.page_infos.iter().map(|page| page.num_rows).sum())
+        };
+        let column_indices = &prepared.decoder_projection.column_indices;
+        let fields = &prepared.decoder_projection.schema.fields;
+        let mut cursor = 0usize;
+        let mut field_lengths = Vec::with_capacity(fields.len());
+        for field in fields {
+            let rows = validate_field_length(
+                field,
+                is_structural,
+                true,
+                column_indices,
+                &mut cursor,
+                &column_len,
+            )?;
+            field_lengths.push((field.name.as_str(), rows));
+        }
+        if cursor != column_indices.len() {
+            return Err(Error::invalid_input(format!(
+                "projection supplied {} column indices but its fields require {}",
+                column_indices.len(),
+                cursor
+            )));
+        }
+        verify_uniform_lengths(&field_lengths)
+    }
+
     async fn read_range(
         &self,
         range: Range<u64>,
         batch_size: u32,
-        projection: ReaderProjection,
+        prepared: PreparedProjection,
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
-        let prepared = self
-            .metadata_provider
-            .prepare_projection(&projection, &self.scheduler, &self.cache)
-            .await?;
         FileReader::do_read_range(
             prepared.column_infos,
             self.scheduler.clone(),
@@ -1970,12 +2158,8 @@ impl FileReadCore {
         &self,
         indices: Vec<u64>,
         batch_size: u32,
-        projection: ReaderProjection,
+        prepared: PreparedProjection,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
-        let prepared = self
-            .metadata_provider
-            .prepare_projection(&projection, &self.scheduler, &self.cache)
-            .await?;
         FileReader::do_take_rows(
             prepared.column_infos,
             self.scheduler.clone(),
@@ -1995,13 +2179,9 @@ impl FileReadCore {
         &self,
         ranges: Vec<Range<u64>>,
         batch_size: u32,
-        projection: ReaderProjection,
+        prepared: PreparedProjection,
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
-        let prepared = self
-            .metadata_provider
-            .prepare_projection(&projection, &self.scheduler, &self.cache)
-            .await?;
         FileReader::do_read_ranges(
             prepared.column_infos,
             self.scheduler.clone(),
@@ -2025,12 +2205,21 @@ impl FileReadCore {
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
+        let prepared = self
+            .metadata_provider
+            .prepare_projection(&projection, &self.scheduler, &self.cache)
+            .await?;
+        // All projected columns must share a length: the reader combines them
+        // into rectangular batches.  Ordinary files satisfy this (every column
+        // has `num_rows` rows); files written with `FileWriter::write_column`
+        // may not, and such columns must be read separately.  `read_len` is that
+        // common length, which `RangeFull`/`RangeFrom` resolve against (rather
+        // than `num_rows`, the file's longest column).
+        let read_len = self.prepared_read_length(&prepared)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
-            if bound > self.num_rows() || bound == self.num_rows() && inclusive {
+            if bound > read_len || (bound == read_len && inclusive) {
                 Err(Error::invalid_input(format!(
-                    "cannot read {:?} from file with {} rows",
-                    params,
-                    self.num_rows()
+                    "cannot read {params:?} from columns with {read_len} rows"
                 )))
             } else {
                 Ok(())
@@ -2049,14 +2238,14 @@ impl FileReadCore {
                     }
                 }
                 let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
-                self.take_rows(indices, batch_size, projection).await
+                self.take_rows(indices, batch_size, prepared).await
             }
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end as u64, false)?;
                 self.read_range(
                     range.start as u64..range.end as u64,
                     batch_size,
-                    projection,
+                    prepared,
                     filter,
                 )
                 .await
@@ -2067,26 +2256,21 @@ impl FileReadCore {
                     verify_bound(&params, range.end, false)?;
                     ranges_u64.push(range.start..range.end);
                 }
-                self.read_ranges(ranges_u64, batch_size, projection, filter)
+                self.read_ranges(ranges_u64, batch_size, prepared, filter)
                     .await
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
-                self.read_range(
-                    range.start as u64..self.num_rows(),
-                    batch_size,
-                    projection,
-                    filter,
-                )
-                .await
+                self.read_range(range.start as u64..read_len, batch_size, prepared, filter)
+                    .await
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
-                self.read_range(0..range.end as u64, batch_size, projection, filter)
+                self.read_range(0..range.end as u64, batch_size, prepared, filter)
                     .await
             }
             ReadBatchParams::RangeFull => {
-                self.read_range(0..self.num_rows(), batch_size, projection, filter)
+                self.read_range(0..read_len, batch_size, prepared, filter)
                     .await
             }
         }
@@ -2415,7 +2599,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::reader::{
-        EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader, ReaderProjection,
+        EncodedBatchReaderExt, FileReader, FileReaderOptions, ProjectedFileReader,
+        ReaderProjection, validate_field_length, verify_uniform_lengths,
     };
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
@@ -3042,6 +3227,113 @@ mod tests {
         );
     }
 
+    // The projection-length validation lives in `FileReadCore`, shared by the
+    // eager and the lazy (indexed) metadata providers. The indexed provider loads
+    // only the projected columns and renumbers them 0..N, so this checks that the
+    // renumbered `column_infos`/`column_indices` still line up for the length
+    // check: a mismatched-length projection is rejected through
+    // `ProjectedFileReader`, and a single short column resolves to its own length.
+    #[tokio::test]
+    async fn test_lazy_reader_validates_unequal_length_projection() {
+        use arrow_array::Int32Array;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("c", DataType::Int32, true),
+        ]));
+        let lance_schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let options = FileWriterOptions {
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            options,
+        )
+        .unwrap();
+        // "a" has 5 rows, "c" has 1 -- an unequal-length file.
+        writer
+            .write_column(0, Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])))
+            .await
+            .unwrap();
+        writer
+            .write_column(1, Arc::new(Int32Array::from(vec![100])))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let cache = test_cache();
+        let open_indexed = |names: &[&str]| {
+            let projection =
+                ReaderProjection::from_column_names(LanceFileVersion::V2_1, &lance_schema, names)
+                    .unwrap();
+            ProjectedFileReader::try_open(
+                file_scheduler.clone(),
+                Some(projection),
+                Arc::<DecoderPlugins>::default(),
+                &cache,
+                FileReaderOptions::default(),
+            )
+        };
+
+        // A mismatched-length projection [a, c] (5 vs 1) is rejected at read time,
+        // through the indexed provider's renumbered column infos.
+        let lazy = open_indexed(&["a", "c"]).await.unwrap();
+        // (`read_tasks` yields a stream, which is not `Debug`, so match rather
+        // than `unwrap_err`.)
+        let err = match lazy
+            .read_tasks(
+                ReadBatchParams::RangeFull,
+                1024,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected the mismatched-length projection to be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("a=5") && err.contains("c=1"),
+            "error should name each column's length, got: {err}"
+        );
+
+        // A single short column resolves to its own length (1), not the file's
+        // longest column.
+        let lazy = open_indexed(&["c"]).await.unwrap();
+        let tasks = lazy
+            .read_tasks(
+                ReadBatchParams::RangeFull,
+                1024,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches = collect_read_tasks(tasks, 16).await;
+        let values: Vec<Option<i32>> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec![Some(100)]);
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_compressing_buffer() {
         let fs = FsFixture::default();
@@ -3539,5 +3831,127 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.contains('2'), "error should mention the index: {msg}");
+    }
+
+    // Exercises the projection length-validation walk in isolation, feeding
+    // synthetic per-column lengths so we can reach cases no current writer can
+    // actually produce -- in particular a struct whose children diverge in
+    // length, which the decoders would otherwise panic on or misread.
+    #[rstest]
+    fn test_validate_struct_child_lengths(#[values(false, true)] is_structural: bool) {
+        let run = |dt: DataType, indices: &[u32], lengths: Vec<u64>| -> lance_core::Result<u64> {
+            let arrow = ArrowSchema::new(vec![Field::new("s", dt, true)]);
+            let schema = Schema::try_from(&arrow).unwrap();
+            let column_len = |c: usize| Ok(lengths[c]);
+            let mut cursor = 0usize;
+            let mut field_lengths = Vec::new();
+            for field in &schema.fields {
+                let rows = validate_field_length(
+                    field,
+                    is_structural,
+                    true,
+                    indices,
+                    &mut cursor,
+                    &column_len,
+                )?;
+                field_lengths.push((field.name.as_str(), rows));
+            }
+            verify_uniform_lengths(&field_lengths)
+        };
+
+        let struct_ty = || {
+            DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ]))
+        };
+
+        // In 2.1 a struct contributes no column of its own (just its two leaves);
+        // in 2.0 it also has its own column first.
+        let (indices, equal, unequal): (&[u32], Vec<u64>, Vec<u64>) = if is_structural {
+            (&[0, 1], vec![5, 5], vec![5, 3])
+        } else {
+            (&[0, 1, 2], vec![5, 5, 5], vec![5, 5, 3])
+        };
+
+        assert_eq!(run(struct_ty(), indices, equal).unwrap(), 5);
+
+        let err = run(struct_ty(), indices, unequal).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("differing lengths") && msg.contains('b'),
+            "expected a child-length error naming 'b', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_length_list_and_empty_struct() {
+        let validate = |dt: DataType,
+                        is_structural: bool,
+                        indices: &[u32],
+                        lengths: Vec<u64>|
+         -> lance_core::Result<u64> {
+            let arrow = ArrowSchema::new(vec![Field::new("f", dt, true)]);
+            let schema = Schema::try_from(&arrow).unwrap();
+            let column_len = |c: usize| Ok(lengths[c]);
+            let mut cursor = 0usize;
+            validate_field_length(
+                &schema.fields[0],
+                is_structural,
+                true,
+                indices,
+                &mut cursor,
+                &column_len,
+            )
+        };
+
+        // A list's items have a different cardinality than its rows; that gap
+        // must not be flagged as a mismatch. In 2.0 the list is an offsets column
+        // (rows) plus an items column (item count); in 2.1 it is a single column
+        // whose page rows are the top-level row count.
+        let list_ty = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        assert_eq!(
+            validate(list_ty.clone(), false, &[0, 1], vec![5, 17]).unwrap(),
+            5
+        );
+        assert_eq!(validate(list_ty, true, &[0], vec![5]).unwrap(), 5);
+
+        // A list of structs: the struct's children sit below the list boundary, so
+        // their (item-count) lengths must NOT be compared against the list's row
+        // count. In 2.0 each field has a column [list, struct, a, b] = [6, 6, 29,
+        // 29]; the list resolves to its own row count (6) and the struct's longer
+        // children are not flagged. (Regression: this previously errored because
+        // the nested struct's children were checked against the struct's count.)
+        let list_of_struct = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(Fields::from(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ])),
+            true,
+        )));
+        assert_eq!(
+            validate(
+                list_of_struct.clone(),
+                false,
+                &[0, 1, 2, 3],
+                vec![6, 6, 29, 29]
+            )
+            .unwrap(),
+            6
+        );
+        // In 2.1 only the two leaves carry columns; still no false mismatch.
+        assert_eq!(
+            validate(list_of_struct, true, &[0, 1], vec![29, 29]).unwrap(),
+            29
+        );
+
+        // An empty struct contributes a single column and validates to its length.
+        let empty_struct = DataType::Struct(Fields::empty());
+        assert_eq!(
+            validate(empty_struct.clone(), false, &[0], vec![9]).unwrap(),
+            9
+        );
+        assert_eq!(validate(empty_struct, true, &[0], vec![9]).unwrap(), 9);
     }
 }

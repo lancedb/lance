@@ -4402,7 +4402,6 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
- "bitpacking",
  "byteorder",
  "bytes",
  "chrono",
@@ -4428,6 +4427,7 @@ dependencies = [
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
+ "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
  "lance-datagen",
@@ -4534,6 +4534,8 @@ name = "lance-bitpacking"
 version = "9.0.0-beta.8"
 dependencies = [
  "arrayref",
+ "bitpacking",
+ "crunchy",
  "paste",
  "seq-macro",
 ]
@@ -4778,7 +4780,6 @@ dependencies = [
  "async-channel",
  "async-recursion",
  "async-trait",
- "bitpacking",
  "bitvec",
  "bytes",
  "chrono",
@@ -4802,6 +4803,7 @@ dependencies = [
  "jsonb",
  "lance-arrow",
  "lance-arrow-stats",
+ "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
  "lance-datagen",
