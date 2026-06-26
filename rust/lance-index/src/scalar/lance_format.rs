@@ -136,10 +136,10 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
     }
 
     async fn finish(&mut self) -> Result<IndexFile> {
-        Self::finish(self).await?;
+        let summary = Self::finish(self).await?;
         Ok(IndexFile {
             path: String::new(),
-            size_bytes: self.tell().await? as u64,
+            size_bytes: summary.size_bytes,
         })
     }
 
@@ -147,10 +147,10 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
         &mut self,
         metadata: HashMap<String, String>,
     ) -> Result<IndexFile> {
-        Self::finish_with_metadata(self, &metadata).await?;
+        let summary = Self::finish_with_metadata(self, &metadata).await?;
         Ok(IndexFile {
             path: String::new(),
-            size_bytes: self.tell().await? as u64,
+            size_bytes: summary.size_bytes,
         })
     }
 }

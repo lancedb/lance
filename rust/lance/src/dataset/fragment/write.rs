@@ -287,7 +287,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        fragment.physical_rows = Some(writer.finish().await?);
+        fragment.physical_rows = Some(writer.finish().await?.num_rows as usize);
 
         progress.complete(&fragment).await?;
 

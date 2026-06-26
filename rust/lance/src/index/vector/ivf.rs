@@ -958,16 +958,12 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     ivf_mut.write(&mut writer).await?;
-    // `finish` writes the file footer (page tables, statistics, dictionaries,
-    // schema metadata, magic bytes), so the on-disk size is only known after it
-    // returns. The underlying object writer's cursor stays valid post-shutdown.
-    writer.finish().await?;
-    let index_size = writer.tell().await? as u64;
+    // `finish` writes the footer and returns the authoritative on-disk size.
+    let index_size = writer.finish().await?.size_bytes;
 
     // Write the aux file
     aux_ivf.write(&mut aux_writer).await?;
-    aux_writer.finish().await?;
-    let aux_size = aux_writer.tell().await? as u64;
+    let aux_size = aux_writer.finish().await?.size_bytes;
 
     Ok((
         existing_indices.len() - start_pos,
