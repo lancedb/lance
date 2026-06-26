@@ -22,13 +22,14 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -998,12 +999,18 @@ struct LazyFMIndex {
     sa_samples: Vec<u64>,
     doc_start_positions: Vec<u64>,
     c_table: Vec<usize>,
+    fully_prewarmed: AtomicBool,
 }
 
 impl LazyFMIndex {
     /// Pre-load all wavelet tree blocks before sync search operations.
     async fn prewarm(&self) -> Result<()> {
-        self.wavelet.load_all().await
+        if self.fully_prewarmed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.wavelet.load_all().await.inspect(|_| {
+            self.fully_prewarmed.store(true, Ordering::Release);
+        })
     }
 
     fn backward_search(&self, pattern: &[u8]) -> (usize, usize) {
@@ -1196,6 +1203,7 @@ impl LazyFMIndex {
             sa_samples,
             doc_start_positions,
             c_table,
+            fully_prewarmed: AtomicBool::new(false),
         })
     }
 
@@ -1220,6 +1228,7 @@ struct FMIndexPartition {
 #[derive(Debug)]
 pub struct FMIndexScalarIndex {
     partitions: Vec<Arc<FMIndexPartition>>,
+    io_parallelism: usize,
 }
 
 impl DeepSizeOf for FMIndexScalarIndex {
@@ -1326,7 +1335,53 @@ impl FMIndexScalarIndex {
                 Self::load_partition(store.as_ref(), name, *id).await?,
             ));
         }
-        Ok(Arc::new(Self { partitions: parts }))
+        Ok(Arc::new(Self {
+            partitions: parts,
+            io_parallelism: store.io_parallelism().max(1),
+        }))
+    }
+
+    fn partition_parallelism(&self) -> usize {
+        self.io_parallelism.max(1).min(self.partitions.len().max(1))
+    }
+
+    async fn prewarm_partitions(&self) -> Result<()> {
+        futures::stream::iter(self.partitions.iter().cloned())
+            .map(|partition| async move { partition.fm.prewarm().await })
+            .buffer_unordered(self.partition_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+
+    async fn search_string_contains(&self, pattern: &[u8]) -> Result<SearchResult> {
+        use lance_select::RowAddrTreeMap;
+
+        let pattern: Arc<[u8]> = Arc::from(pattern);
+        let tree = futures::stream::iter(self.partitions.iter().cloned())
+            .map(|partition| {
+                let pattern = Arc::clone(&pattern);
+                async move {
+                    partition.fm.prewarm().await?;
+                    spawn_cpu(move || {
+                        Result::<Vec<u64>>::Ok(partition.fm.search_row_addrs(pattern.as_ref()))
+                    })
+                    .await
+                }
+            })
+            .buffer_unordered(self.partition_parallelism())
+            .try_fold(RowAddrTreeMap::new(), |mut tree, row_addrs| async move {
+                for row_addr in row_addrs {
+                    tree.insert(row_addr);
+                }
+                Result::Ok(tree)
+            })
+            .await?;
+
+        Ok(SearchResult::Exact(lance_select::NullableRowAddrSet::new(
+            tree,
+            Default::default(),
+        )))
     }
 }
 
@@ -1339,7 +1394,7 @@ impl Index for FMIndexScalarIndex {
         self
     }
     async fn prewarm(&self) -> Result<()> {
-        Ok(())
+        self.prewarm_partitions().await
     }
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!({
@@ -1376,19 +1431,7 @@ impl ScalarIndex for FMIndexScalarIndex {
             .ok_or_else(|| Error::invalid_input("Fm only supports TextQuery"))?;
         match tq {
             TextQuery::StringContains(pattern) => {
-                let pb = pattern.as_bytes();
-                use lance_select::RowAddrTreeMap;
-                let mut tree = RowAddrTreeMap::new();
-                for p in &self.partitions {
-                    p.fm.prewarm().await?;
-                    for row_addr in p.fm.search_row_addrs(pb) {
-                        tree.insert(row_addr);
-                    }
-                }
-                Ok(SearchResult::Exact(lance_select::NullableRowAddrSet::new(
-                    tree,
-                    Default::default(),
-                )))
+                self.search_string_contains(pattern.as_bytes()).await
             }
             // Regex queries are routed only to the ngram index (the FM-index's
             // query parser advertises `supports_regex = false`), so this is
@@ -2043,6 +2086,29 @@ mod tests {
         }
     }
 
+    fn loaded_wavelet_blocks(index: &FMIndexScalarIndex) -> usize {
+        index
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.fm.wavelet.nodes.iter())
+            .map(|node| {
+                node.blocks
+                    .iter()
+                    .filter(|block| block.get().is_some())
+                    .count()
+            })
+            .sum()
+    }
+
+    fn total_wavelet_blocks(index: &FMIndexScalarIndex) -> usize {
+        index
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.fm.wavelet.nodes.iter())
+            .map(|node| node.blocks.len())
+            .sum()
+    }
+
     #[test]
     fn test_fmindex_build_and_search() {
         let texts: Vec<(u64, &[u8])> = vec![
@@ -2427,6 +2493,55 @@ mod tests {
             }
             _ => panic!("expected exact result"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_public_prewarm_loads_lazy_blocks() {
+        let docs: Vec<Vec<u8>> = (0..30)
+            .map(|i| format!("document {i} hello world test data").into_bytes())
+            .collect();
+        let texts: Vec<(u64, Vec<u8>)> = docs
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (i as u64, d))
+            .collect();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_partitioned_fmindex(&texts, store.as_ref())
+            .await
+            .unwrap();
+
+        let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let total_blocks = total_wavelet_blocks(index.as_ref());
+        assert!(total_blocks > 0);
+        assert_eq!(loaded_wavelet_blocks(index.as_ref()), 0);
+
+        index.prewarm().await.unwrap();
+        assert_eq!(loaded_wavelet_blocks(index.as_ref()), total_blocks);
+
+        let r = index
+            .search(
+                &TextQuery::StringContains("hello world".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(30));
+            }
+            _ => panic!("expected exact result"),
+        }
+        assert_eq!(loaded_wavelet_blocks(index.as_ref()), total_blocks);
     }
 
     #[tokio::test(flavor = "multi_thread")]
