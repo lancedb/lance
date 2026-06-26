@@ -27,6 +27,10 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
+    CleanupCandidateFile,
+    CleanupExplanation,
+    CleanupReferencedBranch,
+    CleanupStats,
     DatasetBasePath,
     FFILanceTableProvider,
     ScanStatistics,
@@ -70,6 +74,10 @@ __all__ = [
     "BlobFile",
     "blob_array",
     "blob_field",
+    "CleanupCandidateFile",
+    "CleanupExplanation",
+    "CleanupReferencedBranch",
+    "CleanupStats",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",

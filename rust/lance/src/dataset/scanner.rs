@@ -9360,6 +9360,191 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         );
     }
 
+    /// Regression for over-matching on the zone-map recheck path: a literal prefix
+    /// containing LIKE metacharacters (`_`, `%`) must be matched literally, not as
+    /// wildcards. The indexed (recheck) result must equal the unindexed ground truth.
+    #[tokio::test]
+    async fn test_like_prefix_zone_map_escapes_metacharacters() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let names: Vec<&str> = vec!["a_b", "a_c", "axb", "a1c", "b%c", "bxc", "bcc", "zoo"];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..names.len() as i32)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://test_like_zonemap_escape", None)
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_zonemap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let collect_names = |batch: &RecordBatch| -> BTreeSet<String> {
+            batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect()
+        };
+
+        // Ensure the predicate actually exercises the zone-map LikePrefix recheck path.
+        let mut scanner = dataset.scan();
+        scanner.filter("starts_with(name, 'a_')").unwrap();
+        let plan_str = format!("{:?}", scanner.create_plan().await.unwrap());
+        assert!(
+            plan_str.contains("LikePrefix"),
+            "expected a zone-map LikePrefix plan, got: {plan_str}"
+        );
+
+        // `_` and `%` in the prefix are literal characters; the indexed result must match
+        // the unindexed evaluation for each predicate (no wildcard over-match).
+        for predicate in ["starts_with(name, 'a_')", "starts_with(name, 'b%')"] {
+            let with_index = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let without_index = dataset
+                .scan()
+                .use_scalar_index(false)
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_names(&with_index),
+                collect_names(&without_index),
+                "indexed result over-matched for predicate `{predicate}`"
+            );
+        }
+
+        // Explicit expectation so the intended (non-over-matching) result is obvious.
+        let result = dataset
+            .scan()
+            .filter("starts_with(name, 'a_')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from(["a_b".to_string(), "a_c".to_string()])
+        );
+    }
+
+    /// A bitmap index cannot answer prefix queries, so `LIKE 'prefix%'` / `starts_with`
+    /// must fall back to ordinary filtering (returning correct results) instead of being
+    /// planned as a `LikePrefix` index scan that bitmap search would reject.
+    #[tokio::test]
+    async fn test_like_prefix_bitmap_falls_back_to_filter() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let names: Vec<&str> = vec!["apple", "app", "application", "banana", "band", "zoo"];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..names.len() as i32)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://test_like_bitmap_fallback", None)
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_bitmap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // The predicate must not be planned as a LikePrefix index scan (bitmap rejects it).
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan_str = format!("{:?}", scanner.create_plan().await.unwrap());
+        assert!(
+            !plan_str.contains("LikePrefix"),
+            "bitmap LIKE must not use a LikePrefix index scan, got: {plan_str}"
+        );
+
+        let collect_names = |batch: &RecordBatch| -> BTreeSet<String> {
+            batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect()
+        };
+
+        // And it must execute successfully with correct results (previously errored).
+        let result = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from([
+                "apple".to_string(),
+                "app".to_string(),
+                "application".to_string(),
+            ])
+        );
+
+        let result = dataset
+            .scan()
+            .filter("starts_with(name, 'ban')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from(["banana".to_string(), "band".to_string()])
+        );
+    }
+
     /// Build an in-memory dataset with a single `Dictionary(Int16, Utf8)` column.
     /// The dictionary cycles through "a", "b", "c" so each value appears in a
     /// predictable, repeated pattern.

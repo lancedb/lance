@@ -18,7 +18,7 @@ use crate::{
         vector_index_details, vector_index_details_default,
     },
 };
-use futures::future::BoxFuture;
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
@@ -133,6 +133,11 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
+        self.execute_uncommitted_impl().await
+    }
+
+    fn execute_uncommitted_impl(&mut self) -> BoxFuture<'_, Result<IndexMetadata>> {
+        async move {
         if self.columns.len() != 1 {
             return Err(Error::index(
                 "Only support building index on 1 column at the moment".to_string(),
@@ -481,6 +486,8 @@ impl<'a> CreateIndexBuilder<'a> {
             base_id: None,
             files: Some(created_index.files),
         })
+        }
+        .boxed()
     }
 
     #[instrument(skip_all)]

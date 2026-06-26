@@ -82,3 +82,69 @@ impl DatasetStatisticsExt for Dataset {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_file::version::LanceFileVersion;
+
+    use crate::dataset::WriteParams;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_calculate_data_stats_after_dropping_wide_dataset_columns() {
+        let num_columns = 64;
+        let num_rows = 128;
+        let schema = Arc::new(ArrowSchema::new(
+            (0..num_columns)
+                .map(|idx| ArrowField::new(format!("col_{idx}"), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            (0..num_columns)
+                .map(|column_idx| {
+                    Arc::new(Int32Array::from_iter_values(
+                        (0..num_rows).map(|row_idx| row_idx + column_idx),
+                    )) as ArrayRef
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let columns_to_drop = (1..num_columns)
+            .map(|idx| format!("col_{idx}"))
+            .collect::<Vec<_>>();
+        let column_refs = columns_to_drop
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        dataset.drop_columns(&column_refs).await.unwrap();
+
+        let stats = Arc::new(dataset).calculate_data_stats().await.unwrap();
+        assert_eq!(stats.fields.len(), 1);
+        assert_eq!(stats.fields[0].id, 0);
+        assert!(
+            stats.fields[0].bytes_on_disk > 0,
+            "bytes_on_disk should include the remaining column after drop_columns"
+        );
+    }
+}

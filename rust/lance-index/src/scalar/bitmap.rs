@@ -1744,11 +1744,12 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         index_name: String,
         _index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            false,
-        )))
+        // Bitmap indexes cannot answer `LikePrefix` queries (see `search`), so the parser
+        // is configured to skip them and let such predicates fall back to ordinary filtering.
+        Some(Box::new(
+            SargableQueryParser::new(index_name, self.name().to_string(), false)
+                .without_like_prefix(),
+        ))
     }
 
     async fn train_index(

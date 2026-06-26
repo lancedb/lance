@@ -269,6 +269,7 @@ pub struct SargableQueryParser {
     index_name: String,
     index_type: String,
     needs_recheck: bool,
+    supports_like_prefix: bool,
 }
 
 impl SargableQueryParser {
@@ -277,7 +278,16 @@ impl SargableQueryParser {
             index_name,
             index_type,
             needs_recheck,
+            supports_like_prefix: true,
         }
+    }
+
+    /// Bitmap (and similar) indexes cannot answer prefix queries; disabling
+    /// `LikePrefix` emission makes `LIKE`/`starts_with` predicates fall back to
+    /// ordinary filtering instead of failing at search time.
+    pub fn without_like_prefix(mut self) -> Self {
+        self.supports_like_prefix = false;
+        self
     }
 }
 
@@ -392,11 +402,23 @@ impl ScalarQueryParser for SargableQueryParser {
     ) -> Option<IndexedExpression> {
         // Handle starts_with(col, 'prefix') -> convert to LikePrefix query
         if func.name() == "starts_with" && args.len() == 2 {
+            // Indexes that cannot answer prefix queries (e.g. bitmap) fall back to
+            // ordinary filtering rather than emitting a query they would reject.
+            if !self.supports_like_prefix {
+                return None;
+            }
             // Extract the prefix from the second argument
             let prefix = match &args[1] {
                 Expr::Literal(ScalarValue::Utf8(Some(s)), _) => ScalarValue::Utf8(Some(s.clone())),
                 Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => {
                     ScalarValue::LargeUtf8(Some(s.clone()))
+                }
+                // Lance stores `Utf8View` columns as `Utf8` (normalized at write time), so a
+                // `Utf8View` literal is normalized to `Utf8` to match the indexed data: the
+                // BTree compares the query bound against `Utf8` page statistics at the Arrow
+                // level, which rejects a `Utf8View` bound.
+                Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => {
+                    ScalarValue::Utf8(Some(s.clone()))
                 }
                 _ => return None,
             };
@@ -425,19 +447,29 @@ impl ScalarQueryParser for SargableQueryParser {
             return None;
         }
 
+        // Indexes that cannot answer prefix queries (e.g. bitmap) fall back to
+        // ordinary filtering rather than emitting a query they would reject.
+        if !self.supports_like_prefix {
+            return None;
+        }
+
         // Extract the pattern string
         let pattern_str = match pattern {
-            ScalarValue::Utf8(Some(s)) => s.as_str(),
-            ScalarValue::LargeUtf8(Some(s)) => s.as_str(),
+            ScalarValue::Utf8(Some(s))
+            | ScalarValue::LargeUtf8(Some(s))
+            | ScalarValue::Utf8View(Some(s)) => s.as_str(),
             _ => return None,
         };
 
         // Try to extract a prefix from the LIKE pattern
         let (prefix, needs_refine) = extract_like_leading_prefix(pattern_str, like.escape_char)?;
 
-        // Create the prefix ScalarValue with the same type as the pattern
+        // Create the prefix ScalarValue with the same type as the pattern. `Utf8View` is
+        // normalized to `Utf8` because Lance stores `Utf8View` columns as `Utf8`, and the
+        // downstream BTree compares the query bound against `Utf8` page statistics at the
+        // Arrow level (a `Utf8View` bound would fail that comparison).
         let prefix_value = match pattern {
-            ScalarValue::Utf8(_) => ScalarValue::Utf8(Some(prefix)),
+            ScalarValue::Utf8(_) | ScalarValue::Utf8View(_) => ScalarValue::Utf8(Some(prefix)),
             ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(prefix)),
             _ => return None,
         };
@@ -3215,6 +3247,166 @@ mod tests {
                 "starts_with and LIKE 'prefix%' should produce identical queries"
             );
         }
+    }
+
+    #[test]
+    fn test_sargable_query_parser_utf8view() {
+        // Follow-up to PR #7310 / #7139: the BTree `SargableQueryParser` must accept
+        // `Utf8View` prefixes for `starts_with` and infix-free LIKE, not only `Utf8` /
+        // `LargeUtf8`. DataFusion can coerce the predicate literal to `ScalarValue::Utf8View`;
+        // dropping that variant silently skips the index. The `Utf8View` prefix is normalized
+        // to `Utf8` (Lance stores `Utf8View` columns as `Utf8`), so the emitted query is a
+        // `LikePrefix(Utf8(..))`. `visit_scalar_function` / `visit_like` are exercised directly
+        // so the test does not depend on the planner's coercion choices, and the `Utf8` case
+        // is a parity control: the pre-existing path must keep behaving identically.
+        let parser = SargableQueryParser::new("color_idx".to_string(), "BTree".to_string(), false);
+
+        let assert_like_prefix =
+            |indexed: &IndexedExpression, expected: &ScalarValue, needs_refine: bool| {
+                assert_eq!(
+                    indexed.refine_expr.is_some(),
+                    needs_refine,
+                    "unexpected refine_expr presence"
+                );
+                let Some(ScalarIndexExpr::Query(search)) = &indexed.scalar_query else {
+                    panic!("expected a scalar index query");
+                };
+                match search
+                    .query
+                    .as_any()
+                    .downcast_ref::<SargableQuery>()
+                    .expect("query should be a SargableQuery")
+                {
+                    SargableQuery::LikePrefix(prefix) => assert_eq!(prefix, expected),
+                    _ => panic!("expected a LikePrefix query"),
+                }
+            };
+
+        // starts_with(col, <Utf8View prefix>) -> LikePrefix(Utf8). Reuse a real
+        // `starts_with` UDF parsed from SQL, then swap in a `Utf8View` literal argument.
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8View, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+        let Expr::ScalarFunction(starts_with) = state
+            .create_logical_expr("starts_with(color, 'foo')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected starts_with to parse as a scalar function");
+        };
+        let args = vec![
+            starts_with.args[0].clone(),
+            Expr::Literal(ScalarValue::Utf8View(Some("foo".to_string())), None),
+        ];
+        let indexed = parser
+            .visit_scalar_function(
+                "color",
+                &DataType::Utf8View,
+                starts_with.func.as_ref(),
+                &args,
+            )
+            .expect("starts_with should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+
+        // col LIKE <Utf8View pattern>. `visit_like` is called directly so the test does not
+        // depend on DataFusion's LIKE type coercion choosing `Utf8View` for the pattern.
+        let like = |pattern: ScalarValue| {
+            Like::new(
+                false,
+                Box::new(Expr::Column(Column::new_unqualified("color"))),
+                Box::new(Expr::Literal(pattern, None)),
+                None,
+                false,
+            )
+        };
+
+        // Pure prefix: routed to the index with no recheck needed.
+        let pattern = ScalarValue::Utf8View(Some("foo%".to_string()));
+        let indexed = parser
+            .visit_like("color", &like(pattern.clone()), &pattern)
+            .expect("LIKE prefix should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+
+        // Wildcards beyond the leading prefix keep the original LIKE as a recheck.
+        let pattern = ScalarValue::Utf8View(Some("foo%bar%".to_string()));
+        let indexed = parser
+            .visit_like("color", &like(pattern.clone()), &pattern)
+            .expect("LIKE prefix should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), true);
+
+        // Parity control: the pre-existing `Utf8` path is unchanged.
+        let pattern = ScalarValue::Utf8(Some("foo%".to_string()));
+        let indexed = parser
+            .visit_like("color", &like(pattern.clone()), &pattern)
+            .expect("LIKE prefix should use the BTree index");
+        assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
+    }
+
+    #[test]
+    fn test_sargable_query_parser_without_like_prefix() {
+        // Bitmap indexes configure the parser with `without_like_prefix`: a bitmap index
+        // cannot answer `LikePrefix` queries (its `search` rejects them), so `starts_with` /
+        // `LIKE 'prefix%'` must not be turned into an index query. Returning `None` lets the
+        // predicate fall back to ordinary filtering instead of failing at search time.
+        let bitmap_parser =
+            SargableQueryParser::new("color_idx".to_string(), "BITMAP".to_string(), false)
+                .without_like_prefix();
+        let btree_parser =
+            SargableQueryParser::new("color_idx".to_string(), "BTree".to_string(), false);
+
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, false)]);
+        let df_schema: DFSchema = schema.try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+        let Expr::ScalarFunction(starts_with) = state
+            .create_logical_expr("starts_with(color, 'foo')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected starts_with to parse as a scalar function");
+        };
+
+        let pattern = ScalarValue::Utf8(Some("foo%".to_string()));
+        let like = Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(pattern.clone(), None)),
+            None,
+            false,
+        );
+
+        // Bitmap parser: both prefix paths fall back (return `None`).
+        assert!(
+            bitmap_parser
+                .visit_scalar_function(
+                    "color",
+                    &DataType::Utf8,
+                    starts_with.func.as_ref(),
+                    &starts_with.args,
+                )
+                .is_none(),
+            "bitmap parser must not emit a LikePrefix for starts_with"
+        );
+        assert!(
+            bitmap_parser.visit_like("color", &like, &pattern).is_none(),
+            "bitmap parser must not emit a LikePrefix for LIKE"
+        );
+
+        // A prefix-capable parser (e.g. BTree) still emits the index query.
+        assert!(
+            btree_parser
+                .visit_scalar_function(
+                    "color",
+                    &DataType::Utf8,
+                    starts_with.func.as_ref(),
+                    &starts_with.args,
+                )
+                .is_some(),
+            "BTree parser should still emit a LikePrefix for starts_with"
+        );
+        assert!(
+            btree_parser.visit_like("color", &like, &pattern).is_some(),
+            "BTree parser should still emit a LikePrefix for LIKE"
+        );
     }
 
     #[test]

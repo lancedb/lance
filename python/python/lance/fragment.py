@@ -14,6 +14,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -961,6 +962,24 @@ class LanceFragment(pa.dataset.Fragment):
             doc page for an example of using this API.
         """
         raw_fragment = self._fragment.delete(predicate)
+        if raw_fragment is None:
+            return None
+        return raw_fragment.metadata()
+
+    def delete_rows(self, offsets: "Iterable[int]") -> FragmentMetadata | None:
+        """Delete rows by their local (within-fragment) physical row offsets.
+
+        Adds the given 0-based offsets to this fragment's deletion file and
+        returns a new fragment, or None if no rows are left. Unlike
+        :meth:`delete`, this deletes exactly the supplied rows without
+        re-evaluating a SQL predicate -- useful when the caller already knows
+        which rows to delete (e.g. offsets collected from a prior scan).
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+        """
+        raw_fragment = self._fragment.delete_rows([int(o) for o in offsets])
         if raw_fragment is None:
             return None
         return raw_fragment.metadata()

@@ -51,6 +51,7 @@ from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
+    CleanupExplanation,
     CleanupStats,
     Compaction,
     CompactionMetrics,
@@ -993,6 +994,16 @@ class LanceDataset(pa.dataset.Dataset):
     def describe_indices(self) -> List[IndexDescription]:
         """Returns index information for all indices in the dataset."""
         return self._ds.describe_indices()
+
+    def remap_row_addrs(self, addrs: "pa.Array") -> "Optional[pa.Array]":
+        """Remap row addresses across compactions still recorded in the
+        fragment-reuse index. Rows a compaction dropped become null. The index
+        retains only recent rounds (older ones are pruned as index remap catches
+        up), so remap promptly: an address whose round was pruned is returned
+        unchanged, not remapped. Returns ``None`` when there is no fragment-reuse
+        index.
+        """
+        return self._ds.remap_row_addrs(addrs)
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -2979,6 +2990,64 @@ class LanceDataset(pa.dataset.Dataset):
             delete_rate_limit,
         )
 
+    def explain_cleanup_old_versions(
+        self,
+        older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
+        *,
+        delete_unverified: bool = False,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+        include_files: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupExplanation:
+        """
+        Explain what :meth:`cleanup_old_versions` would remove without deleting files.
+
+        Parameters
+        ----------
+
+        older_than: timedelta, optional
+            Only versions older than this would be removed. If ``older_than`` and
+            ``retain_versions`` are not specified, this will default to two weeks.
+
+        retain_versions: int, optional
+            Retain the last N versions of the dataset.
+
+        delete_unverified: bool, default False
+            Include unverified files that cleanup would remove when this is set.
+
+        error_if_tagged_old_versions: bool, default True
+            If set to `True`, an exception will be raised if any tagged versions
+            match the parameters. Otherwise, tagged versions will be ignored.
+
+        delete_rate_limit: int, optional
+            Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
+            issued by explain.
+
+        include_files: bool, default False
+            If `True`, include candidate files in the explanation up to
+            ``max_files`` entries. Aggregate stats always include all candidates.
+
+        max_files: int, default 1000
+            Maximum number of candidate files to include when ``include_files``
+            is `True`.
+        """
+        if older_than is None and retain_versions is None:
+            older_than = timedelta(days=14)
+        if max_files <= 0:
+            raise ValueError("max_files must be positive")
+
+        return self._ds.explain_cleanup_old_versions(
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+            include_files,
+            max_files,
+        )
+
     def _prepare_scalar_index_request(
         self,
         column: Union[str, List[str]],
@@ -3168,7 +3237,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 5 types of scalar indices available today.
+        Lance supports the following scalar index types:
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -3267,6 +3336,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "icu": ICU dictionary-based Unicode word segmentation.
+            * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true

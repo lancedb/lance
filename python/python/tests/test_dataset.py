@@ -1407,6 +1407,45 @@ def test_cleanup_old_versions(tmp_path):
     assert stats.old_versions == 1
 
 
+def test_explain_cleanup_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    before_versions = len(dataset.versions())
+
+    explanation = dataset.explain_cleanup_old_versions(
+        older_than=(datetime.now() - moment),
+        include_files=True,
+        max_files=1000,
+    )
+
+    assert explanation.read_version == dataset.version
+    assert explanation.stats.bytes_removed > 0
+    assert explanation.stats.old_versions == 1
+    assert explanation.candidate_files
+    assert not explanation.candidate_files_truncated
+    assert len(dataset.versions()) == before_versions
+
+    summary = dataset.explain_cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert summary.stats.old_versions == explanation.stats.old_versions
+    assert summary.candidate_files == []
+
+    with pytest.raises(ValueError, match="max_files must be positive"):
+        dataset.explain_cleanup_old_versions(
+            older_than=(datetime.now() - moment),
+            max_files=0,
+        )
+
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed == explanation.stats.bytes_removed
+    assert stats.old_versions == explanation.stats.old_versions
+
+
 def test_cleanup_error_when_tagged_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"

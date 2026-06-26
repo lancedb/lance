@@ -37,7 +37,7 @@ use pyo3::{
 use uuid::Uuid;
 
 use lance::dataset::AutoCleanupParams;
-use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
@@ -60,7 +60,9 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexExt, IndexSegment, vector::VectorIndexParams};
+use lance::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -105,7 +107,9 @@ use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
-use self::cleanup::CleanupStats;
+use self::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+};
 use self::commit::PyCommitLock;
 use self::io_stats::IoStats;
 
@@ -682,6 +686,89 @@ pub struct Dataset {
     pub(crate) ds: Arc<LanceDataset>,
 }
 
+impl Dataset {
+    async fn cleanup_policy(
+        &self,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+    ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
+        let mut builder = CleanupPolicyBuilder::default();
+        if let Some(v) = older_than_micros {
+            let older_than = Duration::microseconds(v);
+            builder = builder.before_timestamp(Utc::now() - older_than);
+        }
+        if let Some(v) = retain_versions {
+            builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
+        }
+        if let Some(v) = delete_unverified {
+            builder = builder.delete_unverified(v);
+        }
+        if let Some(v) = error_if_tagged_old_versions {
+            builder = builder.error_if_tagged_old_versions(v);
+        }
+        if let Some(v) = delete_rate_limit {
+            builder = builder.delete_rate_limit(v)?;
+        }
+        Ok(builder.build())
+    }
+}
+
+fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
+    CleanupStats {
+        bytes_removed: stats.bytes_removed,
+        old_versions: stats.old_versions,
+        data_files_removed: stats.data_files_removed,
+        transaction_files_removed: stats.transaction_files_removed,
+        index_files_removed: stats.index_files_removed,
+        deletion_files_removed: stats.deletion_files_removed,
+    }
+}
+
+fn cleanup_file_kind(kind: CleanupFileKind) -> &'static str {
+    match kind {
+        CleanupFileKind::Manifest => "manifest",
+        CleanupFileKind::Data => "data",
+        CleanupFileKind::Transaction => "transaction",
+        CleanupFileKind::Index => "index",
+        CleanupFileKind::Deletion => "deletion",
+        CleanupFileKind::TemporaryManifest => "temporary_manifest",
+    }
+}
+
+fn cleanup_explanation(
+    explanation: lance::dataset::cleanup::CleanupExplanation,
+) -> CleanupExplanation {
+    CleanupExplanation {
+        read_version: explanation.read_version,
+        stats: cleanup_stats(explanation.stats),
+        candidate_files: explanation
+            .candidate_files
+            .into_iter()
+            .map(|file| CleanupCandidateFile {
+                path: file.path,
+                kind: cleanup_file_kind(file.kind).to_string(),
+                unverified: file.unverified,
+                size_bytes: file.size_bytes,
+            })
+            .collect(),
+        candidate_files_truncated: explanation.candidate_files_truncated,
+        candidate_file_limit: explanation.candidate_file_limit,
+        referenced_branches: explanation
+            .referenced_branches
+            .into_iter()
+            .map(|branch| CleanupReferencedBranch {
+                name: branch.name,
+                referenced_version: branch.referenced_version,
+                cleanup_candidate: branch.cleanup_candidate,
+            })
+            .collect(),
+        warnings: explanation.warnings,
+    }
+}
+
 #[pymethods]
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
@@ -934,6 +1021,32 @@ impl Dataset {
                     index_name, err
                 )),
             })
+    }
+
+    /// Remap row addresses across compactions still recorded in the
+    /// fragment-reuse index. Rows a compaction dropped become null. The index
+    /// retains only recent rounds (older ones are pruned as index remap catches
+    /// up), so remap promptly: an address whose round was pruned is returned
+    /// unchanged, not remapped. Returns None when there is no fragment-reuse
+    /// index.
+    fn remap_row_addrs(
+        &self,
+        py: Python,
+        addrs: PyArrowType<ArrayData>,
+    ) -> PyResult<Option<PyArrowType<ArrayData>>> {
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let array = make_array(addrs.0);
+        let frag_reuse_index = rt()
+            .block_on(
+                Some(py),
+                self.ds.open_frag_reuse_index(&NoOpMetricsCollector),
+            )?
+            .map_err(|err| {
+                PyIOError::new_err(format!("failed to open fragment reuse index: {err}"))
+            })?;
+
+        Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
     }
 
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
@@ -1860,37 +1973,61 @@ impl Dataset {
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
     ) -> PyResult<CleanupStats> {
-        let cleanup_stats = rt()
+        let stats = rt()
             .block_on(None, async {
-                let mut builder = CleanupPolicyBuilder::default();
-                if let Some(v) = older_than_micros {
-                    let older_than = Duration::microseconds(v);
-                    builder = builder.before_timestamp(Utc::now() - older_than);
-                }
-                if let Some(v) = retain_versions {
-                    builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
-                }
-                if let Some(v) = delete_unverified {
-                    builder = builder.delete_unverified(v);
-                }
-                if let Some(v) = error_if_tagged_old_versions {
-                    builder = builder.error_if_tagged_old_versions(v);
-                }
-                if let Some(v) = delete_rate_limit {
-                    builder = builder.delete_rate_limit(v)?;
-                }
-
-                self.ds.cleanup_with_policy(builder.build()).await
+                let policy = self
+                    .cleanup_policy(
+                        older_than_micros,
+                        retain_versions,
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                        delete_rate_limit,
+                    )
+                    .await?;
+                self.ds.cleanup_with_policy(policy).await
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        Ok(CleanupStats {
-            bytes_removed: cleanup_stats.bytes_removed,
-            old_versions: cleanup_stats.old_versions,
-            data_files_removed: cleanup_stats.data_files_removed,
-            transaction_files_removed: cleanup_stats.transaction_files_removed,
-            index_files_removed: cleanup_stats.index_files_removed,
-            deletion_files_removed: cleanup_stats.deletion_files_removed,
-        })
+        Ok(cleanup_stats(stats))
+    }
+
+    /// Explain cleanup old versions from the dataset without deleting files
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, include_files = false, max_files = 1000))]
+    fn explain_cleanup_old_versions(
+        &self,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+        include_files: bool,
+        max_files: usize,
+    ) -> PyResult<CleanupExplanation> {
+        let explanation = rt()
+            .block_on(None, async {
+                let policy = self
+                    .cleanup_policy(
+                        older_than_micros,
+                        retain_versions,
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                        delete_rate_limit,
+                    )
+                    .await?;
+                self.ds
+                    .cleanup(policy)
+                    .with_max_candidate_files(max_files)
+                    .explain()
+                    .await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let mut explanation = cleanup_explanation(explanation);
+        if !include_files {
+            explanation.candidate_files.clear();
+            explanation.candidate_files_truncated = false;
+            explanation.warnings.clear();
+        }
+        Ok(explanation)
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<Py<PyAny>> {

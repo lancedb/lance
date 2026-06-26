@@ -1869,6 +1869,55 @@ def test_icu_tokenizer(tmp_path):
     assert results["_rowid"].to_pylist() == [0]
 
 
+def test_icu_tokenizer_split_on_non_alphanumeric_default(tmp_path):
+    data = pa.table({"text": ["hello_world"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    results = ds.to_table(full_text_query="hello", prefilter=True, with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(
+        full_text_query="hello_world", prefilter=True, with_row_id=True
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_icu_tokenizer_split_on_non_alphanumeric(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "hello_world こんにちは世界",
+                "alpha.beta",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu/split",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    for query, expected_row_ids in [
+        ("hello", [0]),
+        ("world", [0]),
+        ("世界", [0]),
+        ("alpha", [1]),
+        ("beta", [1]),
+    ]:
+        results = ds.to_table(full_text_query=query, prefilter=True, with_row_id=True)
+        assert results["_rowid"].to_pylist() == expected_row_ids
+
+
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):
     set_language_model_path()
     data = pa.table(
