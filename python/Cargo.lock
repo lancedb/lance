@@ -4106,6 +4106,7 @@ dependencies = [
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
+ "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
@@ -4693,12 +4694,6 @@ checksum = "409851a618475d2d5796377cad353802345cba92c867d9fbcde9cf4eac4e14df"
 dependencies = [
  "lexical-util",
 ]
-
-[[package]]
-name = "libbz2-rs-sys"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
 
 [[package]]
 name = "libc"

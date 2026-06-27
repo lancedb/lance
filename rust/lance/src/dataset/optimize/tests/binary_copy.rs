@@ -72,6 +72,7 @@ async fn do_test_binary_copy_empty_string_scalar_index(version: LanceFileVersion
         Some(WriteParams {
             max_rows_per_file: 1_000,
             data_storage_version: Some(version),
+            disable_column_stats: true,
             ..Default::default()
         }),
     )
