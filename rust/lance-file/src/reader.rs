@@ -2786,6 +2786,7 @@ mod tests {
             fs,
             FileWriterOptions {
                 format_version: Some(version),
+                disable_column_stats: true,
                 ..Default::default()
             },
         )
