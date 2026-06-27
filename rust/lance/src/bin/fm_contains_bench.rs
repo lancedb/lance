@@ -68,8 +68,8 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     queries: usize,
 
-    #[arg(long, value_parser = parse_threads, default_value = "1 2 4 8")]
-    threads: Vec<usize>,
+    #[arg(long, default_value = "1 2 4 8")]
+    threads: String,
 
     #[arg(long, default_value_t = 60.0)]
     query_timeout_secs: f64,
@@ -507,6 +507,7 @@ fn csv_escape(value: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Arc::new(Args::parse());
+    let thread_counts = parse_threads(&args.threads).map_err(Error::invalid_input)?;
     if args.k <= 0 {
         return Err(Error::invalid_input("--k must be greater than zero"));
     }
@@ -548,7 +549,7 @@ async fn main() -> Result<()> {
     let warmup_patterns = &patterns[..args.warmup];
     let query_patterns = &patterns[args.warmup..];
     let mut summaries = Vec::new();
-    for thread_count in args.threads.iter().copied() {
+    for thread_count in thread_counts.iter().copied() {
         if !warmup_patterns.is_empty() {
             summaries.push(
                 run_batch(
@@ -592,7 +593,7 @@ async fn main() -> Result<()> {
         k: args.k,
         warmup: args.warmup,
         queries: args.queries,
-        threads: args.threads.clone(),
+        threads: thread_counts,
         query_timeout_secs: args.query_timeout_secs,
         index_cache_bytes: args.index_cache_bytes,
         metadata_cache_bytes: args.metadata_cache_bytes,
