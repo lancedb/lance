@@ -700,19 +700,26 @@ impl MaterializeIndexExec {
         // gets pruned downstream by `LanceFilterExec` (the full filter
         // runs on the materialized batches via the scan plan, so any
         // non-matching candidates in `upper` are dropped before they
-        // reach the user). `AtLeast` carries an unbounded upper, so the
-        // candidate set is the whole row space — not actionable here.
-        let take_upper = |result: IndexExprResult| -> Result<RowAddrMask> {
+        // reach the user).
+        //
+        // `AtLeast` carries an unbounded `upper`, so we cannot use it as the
+        // candidate set. Instead we materialize its `lower` mask: every row
+        // in `lower` is a guaranteed match, so it is a sound (possibly
+        // partial) answer. This is exactly what the limit pushdown produces —
+        // the B-tree stops early and returns a confirmed lower bound, and a
+        // downstream `GlobalLimitExec` still enforces the exact limit.
+        let candidate_mask = |result: IndexExprResult| -> Result<RowAddrMask> {
             if result.is_at_least() && !result.is_exact() {
-                todo!("Support AtLeast in MaterializeIndexExec")
+                Ok(result.lower)
+            } else {
+                Ok(result.upper)
             }
-            Ok(result.upper)
         };
         let mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
-            take_upper(expr_result)? & (*prefilter).clone()
+            candidate_mask(expr_result)? & (*prefilter).clone()
         } else {
-            take_upper(expr_result.await?)?
+            candidate_mask(expr_result.await?)?
         };
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);

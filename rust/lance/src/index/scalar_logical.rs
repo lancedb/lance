@@ -588,9 +588,12 @@ mod tests {
             .search_limited(&query, &NoOpMetricsCollector, Some(limit))
             .await
             .unwrap();
+        // Each B-tree segment short-circuits on the limit and reports `AtLeast`, so the combined
+        // result must also be `AtLeast` (a lower bound), never `Exact` — otherwise a caller could
+        // treat this partial match set as the complete answer.
         let row_addrs = match result {
-            SearchResult::Exact(row_addrs) | SearchResult::AtLeast(row_addrs) => row_addrs,
-            other => panic!("unexpected result variant from limited search: {:?}", other),
+            SearchResult::AtLeast(row_addrs) => row_addrs,
+            other => panic!("limited search must return AtLeast, got {:?}", other),
         };
         let count = row_addrs.true_rows().row_addrs().unwrap().count();
         assert!(

@@ -2236,7 +2236,16 @@ impl BTreeIndex {
         // Merge matching row IDs
         let selection = NullableRowAddrSet::union_all(&results);
 
-        Ok(SearchResult::Exact(selection))
+        // A limited search may stop before reading every matching page, so the returned set is
+        // not the complete answer. Every row in it does satisfy the query (there may be more),
+        // which is exactly `AtLeast`. Reporting `Exact` here would let callers treat a partial
+        // match set as the full one. We conservatively report `AtLeast` for any limited search,
+        // even one that happened to read all pages, since the answer is still a valid lower bound.
+        Ok(if limit.is_some() {
+            SearchResult::AtLeast(selection)
+        } else {
+            SearchResult::Exact(selection)
+        })
     }
 }
 
@@ -5578,6 +5587,12 @@ mod tests {
             .search_limited(&everything, &metrics, Some(limit))
             .await
             .unwrap();
+        // A short-circuited search is not the complete match set, so it must be reported as
+        // `AtLeast` (a lower bound), never `Exact`.
+        assert!(
+            matches!(limited, SearchResult::AtLeast(_)),
+            "limited search must return AtLeast, got {limited:?}"
+        );
         let limited_len = limited.row_addrs().len().unwrap();
         assert!(
             limited_len >= limit as u64,

@@ -2861,15 +2861,23 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Decide whether a limit can be pushed into the index search. The fragments the
-        // read covers (used for the deletion check) are the requested subset, or the whole
-        // dataset when none was given.
+        // Decide whether a limit can be pushed into the index search. The fragments the read
+        // covers are the requested subset, or the whole dataset when none was given; the index
+        // is only allowed to stop early when every fragment it covers is in this scanned set
+        // and free of deletions (see `index_search_limit`).
+        //
+        // `scan_range` is a separate limit/offset pushdown that only applies when there is no
+        // filter (see the `filter_plan.is_empty()` guard at its only call site). With no filter
+        // there is no index query, so `index_search_limit` returns `None`; the two pushdowns are
+        // therefore mutually exclusive and need no extra coordination here.
         let all_fragments = self.dataset.fragments();
         let scanned_fragments: &[Fragment] = fragments
             .as_ref()
             .map(|frags| frags.as_slice())
             .unwrap_or_else(|| all_fragments.as_slice());
-        let pushdown_limit = self.index_search_limit(filter_plan, scanned_fragments);
+        let pushdown_limit = self
+            .index_search_limit(filter_plan, scanned_fragments)
+            .await?;
 
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
@@ -4105,51 +4113,62 @@ impl Scanner {
     /// - There is no aggregate (the limit applies after aggregation).
     /// - The index result is used as is, with no refine filter and no recheck. Either of
     ///   those re-filters rows later and could drop matches.
-    /// - The relevant fragments have no deletions. Deleted rows are pruned after the index
-    ///   search, so stopping early could leave fewer than `limit` live rows.
-    /// - The scan is not restricted to a fragment subset (`with_fragments`). The index search
-    ///   runs over the whole dataset, and the fragment restriction is applied afterwards, so
-    ///   an early stop could return `limit` matches that all fall outside the subset and leave
-    ///   fewer than `limit` rows once it is applied.
+    /// - The index cannot yield row addresses that are filtered out after the search. The
+    ///   index search returns row addresses from every fragment its segments cover, and those
+    ///   that do not survive into the final result are pruned *after* the search. An early stop
+    ///   would then spend its budget on rows that get dropped and could leave fewer than `limit`
+    ///   live rows. A row address is dropped after the search when it belongs to a fragment that
+    ///   has deletions (the deleted rows are masked out) or one that is not in the scanned set (a
+    ///   retired/compacted-away fragment the index still has stale entries for, or a fragment
+    ///   excluded by `with_fragments`). The single safe condition is therefore that every fragment
+    ///   the index covers is in the scanned set *and* has no deletion file.
     ///
     /// Returns `None` when no limit can be pushed.
-    fn index_search_limit(
+    async fn index_search_limit(
         &self,
         filter_plan: &ExprFilterPlan,
-        relevant_fragments: &[Fragment],
-    ) -> Option<usize> {
-        let limit = self.limit?;
+        scanned_fragments: &[Fragment],
+    ) -> Result<Option<usize>> {
+        let Some(limit) = self.limit else {
+            return Ok(None);
+        };
         if limit <= 0 {
-            return None;
+            return Ok(None);
         }
-        // Ordered scans return storage-order matches, while a B-tree stops in index-value order.
-        // A fragment subset is restricted only after the (global) index search, so an early stop
-        // could leave fewer than `limit` rows once the restriction is applied.
+        // Ordered scans return storage-order matches, while a B-tree stops in index-value order,
+        // so the two would return different subsets. The other modes reorder or re-filter the
+        // rows after the index search, which can also drop early-collected matches.
         if self.ordered
-            || self.fragments.is_some()
             || self.ordering.is_some()
             || self.nearest.is_some()
             || self.full_text_query.is_some()
             || self.aggregate.is_some()
             || filter_plan.has_refine()
         {
-            return None;
+            return Ok(None);
         }
-        if filter_plan
-            .index_query
-            .as_ref()
-            .is_some_and(|query| query.needs_recheck())
-        {
-            return None;
+        let Some(index_query) = filter_plan.index_query.as_ref() else {
+            return Ok(None);
+        };
+        if index_query.needs_recheck() {
+            return Ok(None);
         }
-        if relevant_fragments
+        // Every row address the index covers must survive into the result, otherwise an early
+        // stop could leave fewer than `limit` live rows. That requires every index-covered
+        // fragment to be both scanned and free of deletions. Fragments that are scanned but
+        // *not* covered by the index are fine: they only add rows (via a separate scan of the
+        // missing fragments), they never remove index hits.
+        let live_undeleted: RoaringBitmap = scanned_fragments
             .iter()
-            .any(|fragment| fragment.deletion_file.is_some())
-        {
-            return None;
+            .filter(|fragment| fragment.deletion_file.is_none())
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        let covered_frags = self.fragments_covered_by_index_query(index_query).await?;
+        if !covered_frags.is_subset(&live_undeleted) {
+            return Ok(None);
         }
         let offset = self.offset.unwrap_or(0).max(0) as usize;
-        Some((limit as usize).saturating_add(offset))
+        Ok(Some((limit as usize).saturating_add(offset)))
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -4177,7 +4196,12 @@ impl Scanner {
             .await?;
 
         // A limit can be pushed into the index search only when safe; see index_search_limit.
-        let pushdown_limit = self.index_search_limit(filter_plan, &relevant_frags);
+        // `relevant_frags` is `covered ∩ scanned`, so requiring the index's covered fragments to
+        // be a subset of it rejects both retired/uncovered-scanned fragments and `with_fragments`
+        // subsets that drop covered fragments.
+        let pushdown_limit = self
+            .index_search_limit(filter_plan, &relevant_frags)
+            .await?;
 
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(
             MaterializeIndexExec::new(
@@ -6071,6 +6095,111 @@ mod test {
         assert!(
             ids.iter().all(|&id| id >= 10_000),
             "must only return rows from the requested fragment"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_limit_not_pushed_with_retired_fragment(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        // A scalar index keeps entries for every fragment it was trained on. When a fragment is
+        // retired (here by deleting all of its rows) the index still has stale entries for it, but
+        // those rows are dropped after the search. If the limit were pushed, an unordered scan
+        // could early-stop on the retired fragment's (smallest) ids and return fewer than `limit`
+        // live rows. The limit must therefore not be pushed when the index covers a retired
+        // fragment, even though no *live* fragment has a deletion file.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        // Fragment 0 holds the smallest ids (0..10_000), fragment 1 the rest. Index order ==
+        // storage order, so the first matches in index order all live in the soon-retired fragment.
+        let num_rows = 20_000i32;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 10_000,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.fragments().len(), 2, "expected two fragments");
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Delete every row in fragment 0. Depending on the storage version this either removes the
+        // fragment from the manifest entirely (Stable) or leaves it behind with a deletion file
+        // (Legacy). Either way the single index segment was trained on both fragments and still has
+        // stale entries for fragment 0 that are dropped after the search.
+        dataset.delete("id < 10000").await.unwrap();
+        // The set of fragments whose rows all survive the search: live fragments with no deletion
+        // file. This is exactly the set `index_search_limit` requires the index coverage to be a
+        // subset of.
+        let live_undeleted: std::collections::HashSet<u32> = dataset
+            .fragments()
+            .iter()
+            .filter(|fragment| fragment.deletion_file.is_none())
+            .map(|fragment| fragment.id as u32)
+            .collect();
+        assert_eq!(
+            live_undeleted.len(),
+            1,
+            "only the second fragment should have surviving rows, got {live_undeleted:?}"
+        );
+        // Precondition for what this test exercises: the index covers a fragment whose rows do not
+        // all survive (a retired fragment, or one masked by a deletion file), so an early stop could
+        // spend its budget on rows that get dropped afterwards.
+        let covered = scalar_index_fragment_bitmap(&dataset, "id", "id_idx")
+            .await
+            .unwrap()
+            .expect("index must report fragment coverage");
+        assert!(
+            covered
+                .iter()
+                .any(|frag_id| !live_undeleted.contains(&frag_id)),
+            "test precondition: index must cover a retired/deleted fragment, covered={covered:?}, live_undeleted={live_undeleted:?}"
+        );
+
+        let limit = 100i64;
+        let mut scan = dataset.scan();
+        scan.filter("id >= 0")
+            .unwrap()
+            .scan_in_order(false)
+            .limit(Some(limit), None)
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+
+        assert_eq!(
+            ids.len(),
+            limit as usize,
+            "a scan over a stale-index dataset must still return `limit` live rows"
+        );
+        assert!(
+            ids.iter().all(|&id| id >= 10_000),
+            "retired rows must not be returned"
         );
     }
 
