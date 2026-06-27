@@ -30,7 +30,8 @@ use arrow_array::StructArray;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use datafusion::scalar::ScalarValue;
+use arrow_select::concat::concat;
+use lance_arrow_stats::ArrowScalar;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_core::utils::zone::ZoneBound;
@@ -57,8 +58,8 @@ pub struct ZoneStats {
     pub zone_id: u32,
     pub null_count: u32,
     pub nan_count: u32,
-    pub min: ScalarValue,
-    pub max: ScalarValue,
+    pub min: ArrowScalar,
+    pub max: ArrowScalar,
 }
 
 /// Consolidate column statistics from all fragments into a single file.
@@ -476,20 +477,18 @@ async fn read_fragment_column_stats(
         // zone_idx is the zone_id within the fragment
         let mut zones = Vec::with_capacity(num_zones);
         for zone_idx in 0..num_zones {
-            let min_scalar =
-                ScalarValue::try_from_array(min_array.as_ref(), zone_idx).map_err(|e| {
-                    Error::internal(format!(
-                        "Failed to get min ScalarValue for column '{}': {}",
-                        col_name, e
-                    ))
-                })?;
-            let max_scalar =
-                ScalarValue::try_from_array(max_array.as_ref(), zone_idx).map_err(|e| {
-                    Error::internal(format!(
-                        "Failed to get max ScalarValue for column '{}': {}",
-                        col_name, e
-                    ))
-                })?;
+            let min_scalar = ArrowScalar::try_new(min_array, zone_idx).map_err(|e| {
+                Error::internal(format!(
+                    "Failed to get min ArrowScalar for column '{}': {}",
+                    col_name, e
+                ))
+            })?;
+            let max_scalar = ArrowScalar::try_new(max_array, zone_idx).map_err(|e| {
+                Error::internal(format!(
+                    "Failed to get max ArrowScalar for column '{}': {}",
+                    col_name, e
+                ))
+            })?;
             let zone_stat = ZoneStats {
                 bound: ZoneBound {
                     fragment_id: fragment_id_array.value(zone_idx),
@@ -563,7 +562,7 @@ fn build_consolidated_batch(
             // Sort zones by zone_id first, then fragment_id (as per requirements)
             zones.sort_by_key(|z| (z.zone_id, z.bound.fragment_id));
 
-            // Build arrays for the struct fields; min/max use ScalarValue::iter_to_array (typed)
+            // Build arrays for the struct fields; min/max use ArrowScalar's typed Arrow arrays.
             let mut fragment_ids = Vec::with_capacity(zones.len());
             let mut zone_starts = Vec::with_capacity(zones.len());
             let mut zone_lengths = Vec::with_capacity(zones.len());
@@ -578,20 +577,10 @@ fn build_consolidated_batch(
                 nan_counts.push(zone.nan_count);
             }
 
-            let min_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.min.clone()))
-                .map_err(|e| {
-                    Error::internal(format!(
-                        "Failed to build min array for column '{}': {}",
-                        col_name, e
-                    ))
-                })?;
-            let max_array = ScalarValue::iter_to_array(zones.iter().map(|z| z.max.clone()))
-                .map_err(|e| {
-                    Error::internal(format!(
-                        "Failed to build max array for column '{}': {}",
-                        col_name, e
-                    ))
-                })?;
+            let min_scalars: Vec<_> = zones.iter().map(|z| z.min.clone()).collect();
+            let max_scalars: Vec<_> = zones.iter().map(|z| z.max.clone()).collect();
+            let min_array = arrow_scalars_to_array(&min_scalars, col_name, "min")?;
+            let max_array = arrow_scalars_to_array(&max_scalars, col_name, "max")?;
 
             let column_type = field.data_type();
             let consolidated_zone_struct_type = create_consolidated_zone_struct_type(&column_type);
@@ -675,6 +664,23 @@ fn build_consolidated_batch(
         Error::internal(format!(
             "[ColumnStats] Failed to create consolidated stats batch: {}",
             e
+        ))
+    })
+}
+
+fn arrow_scalars_to_array(
+    scalars: &[ArrowScalar],
+    column_name: &str,
+    stat_name: &str,
+) -> Result<ArrayRef> {
+    let arrays: Vec<&dyn Array> = scalars
+        .iter()
+        .map(|scalar| scalar.as_array().as_ref())
+        .collect();
+    concat(&arrays).map_err(|e| {
+        Error::internal(format!(
+            "Failed to build {} array for column '{}': {}",
+            stat_name, column_name, e
         ))
     })
 }

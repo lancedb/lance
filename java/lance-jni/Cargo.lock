@@ -3935,7 +3935,6 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
- "deepsize",
  "futures",
  "lance-arrow",
  "lance-core",

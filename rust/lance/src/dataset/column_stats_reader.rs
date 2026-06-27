@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ListArray, RecordBatch, StructArray, UInt32Array, UInt64Array};
-use datafusion::scalar::ScalarValue;
+use lance_arrow_stats::ArrowScalar;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
 
@@ -21,7 +21,7 @@ use crate::Error;
 ///
 /// This reader provides convenient access to column statistics stored in
 /// consolidated stats files. It automatically converts min/max values to
-/// strongly-typed ScalarValue based on the dataset schema.
+/// Arrow-native scalar values based on the dataset schema.
 pub struct ColumnStatsReader {
     dataset_schema: Arc<Schema>,
     stats_batch: RecordBatch,
@@ -35,8 +35,8 @@ pub struct ColumnStats {
     pub zone_lengths: Vec<u64>,
     pub null_counts: Vec<u32>,
     pub nan_counts: Vec<u32>,
-    pub min_values: Vec<ScalarValue>,
-    pub max_values: Vec<ScalarValue>,
+    pub min_values: Vec<ArrowScalar>,
+    pub max_values: Vec<ArrowScalar>,
 }
 
 impl ColumnStatsReader {
@@ -223,26 +223,24 @@ impl ColumnStatsReader {
             ))
         })?;
 
-        // Min/max are stored in the column's Arrow type; convert to ScalarValue per zone
+        // Min/max are stored in the column's Arrow type; convert to ArrowScalar per zone
         let num_zones = fragment_id_array.len();
         let mut min_values = Vec::with_capacity(num_zones);
         let mut max_values = Vec::with_capacity(num_zones);
 
         for i in 0..num_zones {
-            let min_val =
-                ScalarValue::try_from_array(min_value_array.as_ref(), i).map_err(|e| {
-                    Error::internal(format!(
-                        "Failed to get min ScalarValue for column '{}' zone {}: {}",
-                        column_name, i, e
-                    ))
-                })?;
-            let max_val =
-                ScalarValue::try_from_array(max_value_array.as_ref(), i).map_err(|e| {
-                    Error::internal(format!(
-                        "Failed to get max ScalarValue for column '{}' zone {}: {}",
-                        column_name, i, e
-                    ))
-                })?;
+            let min_val = ArrowScalar::try_new(min_value_array, i).map_err(|e| {
+                Error::internal(format!(
+                    "Failed to get min ArrowScalar for column '{}' zone {}: {}",
+                    column_name, i, e
+                ))
+            })?;
+            let max_val = ArrowScalar::try_new(max_value_array, i).map_err(|e| {
+                Error::internal(format!(
+                    "Failed to get max ArrowScalar for column '{}' zone {}: {}",
+                    column_name, i, e
+                ))
+            })?;
             min_values.push(min_val);
             max_values.push(max_val);
         }
@@ -415,13 +413,13 @@ mod tests {
 
         // Verify min_values
         assert_eq!(stats.min_values.len(), 2);
-        assert_eq!(stats.min_values[0], ScalarValue::Int32(Some(0)));
-        assert_eq!(stats.min_values[1], ScalarValue::Int32(Some(100)));
+        assert_eq!(stats.min_values[0], ArrowScalar::from(0i32));
+        assert_eq!(stats.min_values[1], ArrowScalar::from(100i32));
 
         // Verify max_values
         assert_eq!(stats.max_values.len(), 2);
-        assert_eq!(stats.max_values[0], ScalarValue::Int32(Some(99)));
-        assert_eq!(stats.max_values[1], ScalarValue::Int32(Some(199)));
+        assert_eq!(stats.max_values[0], ArrowScalar::from(99i32));
+        assert_eq!(stats.max_values[1], ArrowScalar::from(199i32));
     }
 
     #[test]
@@ -437,25 +435,13 @@ mod tests {
 
         // Verify min_values (strings)
         assert_eq!(stats.min_values.len(), 2);
-        assert_eq!(
-            stats.min_values[0],
-            ScalarValue::Utf8(Some("alice".to_string()))
-        );
-        assert_eq!(
-            stats.min_values[1],
-            ScalarValue::Utf8(Some("mike".to_string()))
-        );
+        assert_eq!(stats.min_values[0], ArrowScalar::from("alice"));
+        assert_eq!(stats.min_values[1], ArrowScalar::from("mike"));
 
         // Verify max_values (strings)
         assert_eq!(stats.max_values.len(), 2);
-        assert_eq!(
-            stats.max_values[0],
-            ScalarValue::Utf8(Some("jenny".to_string()))
-        );
-        assert_eq!(
-            stats.max_values[1],
-            ScalarValue::Utf8(Some("zoe".to_string()))
-        );
+        assert_eq!(stats.max_values[0], ArrowScalar::from("jenny"));
+        assert_eq!(stats.max_values[1], ArrowScalar::from("zoe"));
     }
 
     #[test]
@@ -477,6 +463,76 @@ mod tests {
         // "score" is in schema but not in stats_batch
         let result = reader.read_column_stats("score").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_column_stats_null_min_max() {
+        use arrow_array::{Int32Array, StructArray};
+        use arrow_buffer::OffsetBuffer;
+        use lance_file::writer::create_consolidated_zone_struct_type;
+
+        let schema = create_test_schema();
+        let id_zone_type = create_consolidated_zone_struct_type(&DataType::Int32);
+
+        let id_struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("fragment_id", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("zone_start", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("zone_length", DataType::UInt64, false)),
+                Arc::new(UInt64Array::from(vec![10])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("null_count", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![10])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("nan_count", DataType::UInt32, false)),
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("min_value", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![None])) as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("max_value", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![None])) as ArrayRef,
+            ),
+        ]);
+
+        let id_list_field = Arc::new(ArrowField::new("zone", id_zone_type, false));
+        let id_list = ListArray::try_new(
+            id_list_field.clone(),
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(id_struct_array) as ArrayRef,
+            None,
+        )
+        .unwrap();
+
+        let stats_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::List(id_list_field),
+            false,
+        )]));
+        let stats_batch =
+            RecordBatch::try_new(stats_schema, vec![Arc::new(id_list) as ArrayRef]).unwrap();
+
+        let reader = ColumnStatsReader::new(schema, stats_batch);
+        let stats = reader.read_column_stats("id").unwrap().unwrap();
+
+        assert_eq!(
+            stats.min_values[0],
+            ArrowScalar::new_null(&DataType::Int32).unwrap()
+        );
+        assert_eq!(
+            stats.max_values[0],
+            ArrowScalar::new_null(&DataType::Int32).unwrap()
+        );
     }
 
     #[test]

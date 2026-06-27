@@ -726,6 +726,70 @@ impl FileReader {
         self.core.read_global_buffer(index).await
     }
 
+    /// Check if the file contains column statistics.
+    ///
+    /// Column statistics are stored in the schema metadata. If the metadata
+    /// contains the buffer index key, the file has column statistics that can
+    /// be read with [`Self::read_column_stats`].
+    pub fn has_column_stats(&self) -> bool {
+        self.metadata
+            .file_schema
+            .metadata
+            .contains_key(COLUMN_STATS_BUFFER_INDEX_KEY)
+    }
+
+    /// Read column statistics from the file.
+    ///
+    /// Column statistics are stored as a global buffer containing an Arrow IPC
+    /// encoded RecordBatch. The batch uses a columnar layout: one column per
+    /// dataset column, one row per zone.
+    pub async fn read_column_stats(&self) -> Result<Option<arrow_array::RecordBatch>> {
+        let Some(buffer_index_str) = self
+            .metadata
+            .file_schema
+            .metadata
+            .get(COLUMN_STATS_BUFFER_INDEX_KEY)
+        else {
+            return Ok(None);
+        };
+
+        let version = self
+            .metadata
+            .file_schema
+            .metadata
+            .get(COLUMN_STATS_VERSION_KEY)
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        if version > COLUMN_STATS_VERSION {
+            log::warn!(
+                "Column stats version {} is newer than supported version {}. \
+                 Skipping column stats for forward compatibility.",
+                version,
+                COLUMN_STATS_VERSION
+            );
+            return Ok(None);
+        }
+
+        let buffer_index: u32 = buffer_index_str.parse().map_err(|_| {
+            Error::internal(format!(
+                "Invalid column stats buffer index in metadata: {}",
+                buffer_index_str
+            ))
+        })?;
+
+        let stats_bytes = self.read_global_buffer(buffer_index).await?;
+        let cursor = Cursor::new(stats_bytes.as_ref());
+        let mut reader = arrow_ipc::reader::FileReader::try_new(cursor, None).map_err(|e| {
+            Error::internal(format!("Failed to decode column stats Arrow IPC: {}", e))
+        })?;
+
+        reader
+            .next()
+            .transpose()
+            .map_err(|e| Error::internal(format!("Failed to read column stats batch: {}", e)))
+    }
+
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
         let file_size = scheduler.reader().size().await? as u64;
         let begin = if file_size < scheduler.reader().block_size() as u64 {
@@ -2435,8 +2499,8 @@ impl ProjectedFileReader {
     /// be read with `read_column_stats()`.
     ///
     pub fn has_column_stats(&self) -> bool {
-        self.metadata
-            .file_schema
+        self.core
+            .schema()
             .metadata
             .contains_key(COLUMN_STATS_BUFFER_INDEX_KEY)
     }
@@ -2451,8 +2515,8 @@ impl ProjectedFileReader {
     pub async fn read_column_stats(&self) -> Result<Option<arrow_array::RecordBatch>> {
         // Check if column stats exist
         let Some(buffer_index_str) = self
-            .metadata
-            .file_schema
+            .core
+            .schema()
             .metadata
             .get(COLUMN_STATS_BUFFER_INDEX_KEY)
         else {
@@ -2461,8 +2525,8 @@ impl ProjectedFileReader {
 
         // Check version for forward compatibility
         let version = self
-            .metadata
-            .file_schema
+            .core
+            .schema()
             .metadata
             .get(COLUMN_STATS_VERSION_KEY)
             .and_then(|v| v.parse::<u32>().ok())
@@ -2480,36 +2544,15 @@ impl ProjectedFileReader {
         }
 
         // Parse the buffer index
-        let buffer_index: usize = buffer_index_str.parse().map_err(|_| {
+        let buffer_index: u32 = buffer_index_str.parse().map_err(|_| {
             Error::internal(format!(
                 "Invalid column stats buffer index in metadata: {}",
                 buffer_index_str
             ))
         })?;
 
-        // Check bounds
-        if buffer_index >= self.metadata.file_buffers.len() {
-            return Err(Error::internal(format!(
-                "Column stats buffer index {} out of bounds (only {} buffers)",
-                buffer_index,
-                self.metadata.file_buffers.len()
-            )));
-        }
-
         // Read the buffer
-        let buffer_descriptor = &self.metadata.file_buffers[buffer_index];
-        let stats_bytes_vec = self
-            .scheduler
-            .submit_request(
-                vec![
-                    buffer_descriptor.position..buffer_descriptor.position + buffer_descriptor.size,
-                ],
-                0,
-            )
-            .await?;
-
-        // The buffer is returned as a single chunk since we requested one range
-        let stats_bytes = stats_bytes_vec.into_iter().next().unwrap();
+        let stats_bytes = self.core.read_global_buffer(buffer_index).await?;
 
         // Decode Arrow IPC format
         let cursor = Cursor::new(stats_bytes.as_ref());

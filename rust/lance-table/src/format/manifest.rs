@@ -602,7 +602,7 @@ impl DeepSizeOf for BasePath {
 }
 
 impl DeepSizeOf for pb::ColumnStats {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.path.deep_size_of_children(context) + size_of::<u32>()
     }
 }

@@ -55,7 +55,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::{ArrowError, DataType};
-use lance_arrow_scalar::ArrowScalar;
+pub use lance_arrow_scalar::ArrowScalar;
 
 use nan::count_nans;
 
