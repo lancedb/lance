@@ -21,7 +21,7 @@ use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
-    pack_codes, rabit_binary_code_field, rabit_ex_code_field,
+    pack_codes, rabit_binary_code_field, rabit_ex_code_field, unpack_codes,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
@@ -460,6 +460,11 @@ struct ShardInfo {
     lengths: Vec<u32>,
     partition_offsets: Vec<usize>,
     total_rows: usize,
+    /// IVF_RQ only: this shard stores its RaBitQ binary codes in the packed
+    /// SIMD-block layout, so they must be unpacked back to row-major before the
+    /// merge re-packs the concatenated partition. Row-major shards leave this
+    /// false and are untouched.
+    unpack_rq_codes: bool,
 }
 
 #[derive(Debug)]
@@ -469,6 +474,7 @@ struct ShardWindowReadJob {
     window_total_rows: usize,
     start_offset: usize,
     end_offset: usize,
+    unpack_rq_codes: bool,
 }
 
 #[derive(Debug)]
@@ -587,6 +593,7 @@ async fn read_partition_window(
                 window_total_rows,
                 start_offset,
                 end_offset,
+                unpack_rq_codes: shard.unpack_rq_codes,
             }
         })
         .collect();
@@ -692,6 +699,39 @@ async fn read_shard_window_partitions(
             "Shard has fewer rows than declared lengths in partition window [{}, {})",
             window_start, window_end
         )));
+    }
+
+    // When this shard stores already-packed RaBitQ binary codes, unpack them
+    // back to row-major here, per partition. Each partition is packed as an
+    // independent unit, so its rows must first be reassembled (a partition can
+    // span multiple stream batches) before `unpack_codes` can invert the
+    // SIMD-block layout. This must happen per shard, before the merge stage
+    // concatenates partitions across shards and re-packs them: packed codes
+    // from different shards cannot be concatenated, and packing already-packed
+    // codes corrupts them.
+    if shard_job.unpack_rq_codes {
+        for batches in per_partition_batches.iter_mut() {
+            if batches.is_empty() {
+                continue;
+            }
+            let schema = batches[0].schema();
+            let merged = concat_batches(&schema, batches.iter())?;
+            let rq_col = merged.column_by_name(RABIT_CODE_COLUMN).ok_or_else(|| {
+                Error::index(format!(
+                    "RQ column {} missing in packed shard",
+                    RABIT_CODE_COLUMN
+                ))
+            })?;
+            let rq_fsl = rq_col.as_fixed_size_list_opt().ok_or_else(|| {
+                Error::index(format!(
+                    "RQ column {} is not a FixedSizeList in packed shard, got {}",
+                    RABIT_CODE_COLUMN,
+                    rq_col.data_type(),
+                ))
+            })?;
+            let unpacked = unpack_codes(rq_fsl);
+            *batches = vec![merged.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(unpacked))?];
+        }
     }
 
     Ok(per_partition_batches)
@@ -881,6 +921,11 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Compute format version once; defaults to V2_0 if no shards processed yet
         let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
 
+        // IVF_RQ: whether THIS shard's binary codes are packed. Captured per
+        // shard (not from the shared first-shard metadata) so a mix of packed
+        // and row-major shards merges correctly.
+        let mut shard_unpack_rq_codes = false;
+
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
@@ -1013,6 +1058,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         rq_meta_parsed.rotation_type
                     )));
                 }
+                shard_unpack_rq_codes = rq_meta_parsed.packed;
                 if rq_meta.is_none() {
                     rq_meta = Some(rq_meta_parsed.clone());
                 }
@@ -1357,6 +1403,7 @@ pub async fn merge_partial_vector_auxiliary_files(
             lengths,
             partition_offsets,
             total_rows: running_offset,
+            unpack_rq_codes: shard_unpack_rq_codes,
         });
         progress
             .stage_progress("read_shard_metadata", idx as u64 + 1)
