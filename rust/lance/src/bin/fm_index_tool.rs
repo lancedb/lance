@@ -10,10 +10,11 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use lance::dataset::ReadParams;
 use lance::dataset::builder::DatasetBuilder;
-use lance::index::DatasetIndexExt;
+use lance::index::{CreateIndexBuilder, DatasetIndexExt};
 use lance::{Error, Result};
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -41,6 +42,9 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     num_segments: u32,
+
+    #[arg(long)]
+    index_uuid: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -135,15 +139,18 @@ async fn main() -> Result<()> {
         Action::Create => {
             let params = fm_params(args.num_segments);
             let start = Instant::now();
-            let metadata = dataset
-                .create_index(
-                    &[args.column.as_str()],
-                    lance_index::IndexType::Fm,
-                    Some(args.index_name.clone()),
-                    &params,
-                    true,
-                )
-                .await?;
+            let mut builder = CreateIndexBuilder::new(
+                &mut dataset,
+                &[args.column.as_str()],
+                lance_index::IndexType::Fm,
+                &params,
+            )
+            .name(args.index_name.clone())
+            .replace(true);
+            if let Some(index_uuid) = args.index_uuid {
+                builder = builder.index_uuid(index_uuid);
+            }
+            let metadata = builder.await?;
             println!(
                 "created index {} uuid={} in {:.3}s; new version {}",
                 metadata.name,

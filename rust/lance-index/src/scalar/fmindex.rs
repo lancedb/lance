@@ -86,6 +86,17 @@ static LANCE_FMINDEX_WRITE_QUEUE_SIZE: std::sync::LazyLock<usize> =
             .parse()
             .expect("failed to parse LANCE_FMINDEX_WRITE_QUEUE_SIZE")
     });
+static LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS")
+            .map(|value| {
+                matches!(
+                    value.as_str(),
+                    "1" | "true" | "TRUE" | "True" | "yes" | "YES"
+                )
+            })
+            .unwrap_or(false)
+    });
 static LANCE_FMINDEX_PREWARM_CHUNK_BYTES: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| {
         std::env::var("LANCE_FMINDEX_PREWARM_CHUNK_BYTES")
@@ -112,6 +123,12 @@ fn fmindex_partition_path(partition_id: u64) -> String {
     format!("part_{partition_id}_fm.lance")
 }
 
+fn fmindex_partition_id_from_path(path: &str) -> Option<u64> {
+    path.strip_prefix("part_")
+        .and_then(|r| r.strip_suffix("_fm.lance"))
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
 fn fmindex_num_workers() -> usize {
     (*LANCE_FMINDEX_NUM_WORKERS).max(1)
 }
@@ -126,6 +143,10 @@ fn fmindex_partition_bytes() -> usize {
 
 fn fmindex_write_queue_size() -> usize {
     (*LANCE_FMINDEX_WRITE_QUEUE_SIZE).max(1)
+}
+
+fn fmindex_resume_existing_partitions() -> bool {
+    *LANCE_FMINDEX_RESUME_EXISTING_PARTITIONS
 }
 
 fn fmindex_prewarm_chunk_bytes() -> usize {
@@ -1627,12 +1648,7 @@ impl FMIndexScalarIndex {
         let files = store.list_files_with_sizes().await?;
         let mut pfiles: Vec<(u64, String)> = Vec::new();
         for f in &files {
-            if let Some(id) = f
-                .path
-                .strip_prefix("part_")
-                .and_then(|r| r.strip_suffix("_fm.lance"))
-                .and_then(|s| s.parse::<u64>().ok())
-            {
+            if let Some(id) = fmindex_partition_id_from_path(&f.path) {
                 pfiles.push((id, f.path.clone()));
             }
         }
@@ -1813,6 +1829,7 @@ struct FMIndexPartitionConfig {
     max_rows: usize,
     max_bytes: usize,
     queue_size: usize,
+    resume_existing: bool,
 }
 
 impl FMIndexPartitionConfig {
@@ -1822,6 +1839,7 @@ impl FMIndexPartitionConfig {
             max_rows: fmindex_partition_rows(),
             max_bytes: fmindex_partition_bytes(),
             queue_size: fmindex_write_queue_size(),
+            resume_existing: fmindex_resume_existing_partitions(),
         }
     }
 
@@ -1831,6 +1849,7 @@ impl FMIndexPartitionConfig {
             max_rows: self.max_rows.max(1),
             max_bytes: self.max_bytes.max(1),
             queue_size: self.queue_size.max(1),
+            resume_existing: self.resume_existing,
         }
     }
 }
@@ -1861,6 +1880,23 @@ async fn write_partitioned_fmindex_stream_with_config(
         async_channel::Receiver<FMIndexPartitionJob>,
     ) = async_channel::bounded(config.queue_size);
     let store = store.clone_arc();
+    let mut completed_files = if config.resume_existing {
+        store
+            .list_files_with_sizes()
+            .await?
+            .into_iter()
+            .filter_map(|file| fmindex_partition_id_from_path(&file.path).map(|id| (id, file)))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    if !completed_files.is_empty() {
+        log::info!(
+            "resuming FMIndex build with {} existing partition files",
+            completed_files.len()
+        );
+    }
+    let mut files = Vec::new();
     let mut worker_tasks = Vec::with_capacity(config.num_workers);
     for _ in 0..config.num_workers {
         let receiver = receiver.clone();
@@ -1909,12 +1945,14 @@ async fn write_partitioned_fmindex_stream_with_config(
                         config.max_rows,
                         config.max_bytes,
                     ) {
-                        send_fmindex_partition(
+                        finish_fmindex_partition(
                             &sender,
                             &mut partition,
                             &mut partition_bytes,
                             partition_id,
                             config.max_rows,
+                            &mut completed_files,
+                            &mut files,
                         )
                         .await?;
                         partition_id += 1;
@@ -1924,12 +1962,14 @@ async fn write_partitioned_fmindex_stream_with_config(
         }
 
         if !partition.is_empty() {
-            send_fmindex_partition(
+            finish_fmindex_partition(
                 &sender,
                 &mut partition,
                 &mut partition_bytes,
                 partition_id,
                 config.max_rows,
+                &mut completed_files,
+                &mut files,
             )
             .await?;
         }
@@ -1939,7 +1979,6 @@ async fn write_partitioned_fmindex_stream_with_config(
     .await;
     drop(sender);
 
-    let mut files = Vec::new();
     let mut worker_error = None;
     for worker_task in worker_tasks {
         match worker_task.await {
@@ -1983,15 +2022,21 @@ fn fmindex_partition_limit_reached(
     rows >= max_rows || bytes >= max_bytes
 }
 
-async fn send_fmindex_partition(
+async fn finish_fmindex_partition(
     sender: &async_channel::Sender<FMIndexPartitionJob>,
     partition: &mut Vec<(u64, Vec<u8>)>,
     partition_bytes: &mut usize,
     partition_id: u64,
     max_rows: usize,
+    completed_files: &mut HashMap<u64, IndexFile>,
+    output_files: &mut Vec<(u64, IndexFile)>,
 ) -> Result<()> {
     let texts = std::mem::replace(partition, Vec::with_capacity(max_rows.min(PARTITION_SIZE)));
     *partition_bytes = 0;
+    if let Some(file) = completed_files.remove(&partition_id) {
+        output_files.push((partition_id, file));
+        return Ok(());
+    }
     sender
         .send(FMIndexPartitionJob {
             partition_id,
@@ -3027,6 +3072,7 @@ mod tests {
                 max_rows: 100,
                 max_bytes: 5,
                 queue_size: 1,
+                resume_existing: false,
             },
         )
         .await
@@ -3050,6 +3096,104 @@ mod tests {
         match r {
             SearchResult::Exact(set) => {
                 assert_eq!(set.len(), Some(1));
+            }
+            _ => panic!("expected exact result"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_train_resumes_existing_partitions() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                crate::scalar::registry::VALUE_COLUMN_NAME,
+                DataType::Utf8,
+                false,
+            ),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let first_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["first partition"])),
+                Arc::new(UInt64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let first_stream =
+            RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(first_batch)]));
+        let first_files = write_partitioned_fmindex_stream_with_config(
+            Box::pin(first_stream),
+            store.as_ref(),
+            FMIndexPartitionConfig {
+                num_workers: 1,
+                max_rows: 1,
+                max_bytes: 1024,
+                queue_size: 1,
+                resume_existing: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_files.len(), 1);
+        assert_eq!(first_files[0].path, fmindex_partition_path(0));
+
+        let resumed_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "first partition",
+                    "second partition",
+                ])),
+                Arc::new(UInt64Array::from(vec![0, 1])),
+            ],
+        )
+        .unwrap();
+        let resumed_stream =
+            RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(resumed_batch)]));
+        let resumed_files = write_partitioned_fmindex_stream_with_config(
+            Box::pin(resumed_stream),
+            store.as_ref(),
+            FMIndexPartitionConfig {
+                num_workers: 1,
+                max_rows: 1,
+                max_bytes: 1024,
+                queue_size: 1,
+                resume_existing: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resumed_paths = resumed_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resumed_paths,
+            vec![fmindex_partition_path(0), fmindex_partition_path(1)]
+        );
+
+        let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let r = index
+            .search(
+                &TextQuery::StringContains("partition".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(2));
             }
             _ => panic!("expected exact result"),
         }
@@ -3092,6 +3236,7 @@ mod tests {
                 max_rows: 1,
                 max_bytes: 1024,
                 queue_size: 1,
+                resume_existing: false,
             },
         )
         .await
