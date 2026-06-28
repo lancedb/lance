@@ -54,6 +54,7 @@ const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
 const PARTITION_SIZE: usize = 10_000;
 const DEFAULT_PARTITION_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const PREWARM_CHUNK_TARGET_BYTES: usize = 128 * 1024 * 1024;
 const SENTINEL_BYTE: u8 = 0xFF;
 
 /// SA sampling rate. Store every D-th SA entry. Locate walks at most D LF steps.
@@ -478,13 +479,68 @@ impl LazyRankBitVec {
     /// Pre-load all blocks into memory. Call this before sync rank/access operations
     /// to avoid the need for `block_in_place` during queries.
     async fn load_all_blocks(&self) -> Result<()> {
-        for (idx, lock) in self.blocks.iter().enumerate() {
-            if lock.get().is_none() {
-                let words = self.load_block(idx).await?;
-                let _ = lock.set(words);
+        let chunk_rows = (PREWARM_CHUNK_TARGET_BYTES / (BLOCK_WORDS * 8)).max(1);
+        let mut start = 0;
+        while start < self.blocks.len() {
+            let end = (start + chunk_rows).min(self.blocks.len());
+            if self.blocks[start..end]
+                .iter()
+                .all(|lock| lock.get().is_some())
+            {
+                start = end;
+                continue;
             }
+
+            let batch = self
+                .reader
+                .read_range(
+                    self.block_row_offset + start..self.block_row_offset + end,
+                    Some(&["words"]),
+                )
+                .await?;
+            if batch.num_rows() != end - start {
+                return Err(Error::index(format!(
+                    "expected {} FM-Index block rows, got {}",
+                    end - start,
+                    batch.num_rows()
+                )));
+            }
+            let col = Self::words_column(&batch)?;
+            for row in 0..batch.num_rows() {
+                let block_idx = start + row;
+                if self.blocks[block_idx].get().is_none() {
+                    let words = Self::decode_words(col.value(row));
+                    let _ = self.blocks[block_idx].set(words);
+                }
+            }
+            start = end;
         }
         Ok(())
+    }
+
+    async fn load_block_if_needed(&self, idx: usize) -> Result<()> {
+        if idx >= self.blocks.len() {
+            return Err(Error::index(format!(
+                "FM-Index block {idx} is out of range for {} blocks",
+                self.blocks.len()
+            )));
+        }
+        if self.blocks[idx].get().is_none() {
+            let words = self.load_block(idx).await?;
+            let _ = self.blocks[idx].set(words);
+        }
+        Ok(())
+    }
+
+    async fn load_block_for_rank(&self, pos: usize) -> Result<()> {
+        if pos == 0 || pos.is_multiple_of(BLOCK_BITS) {
+            return Ok(());
+        }
+        self.load_block_if_needed(pos / BLOCK_BITS).await
+    }
+
+    async fn load_block_for_access(&self, pos: usize) -> Result<()> {
+        self.load_block_if_needed(pos / BLOCK_BITS).await
     }
 
     #[inline]
@@ -503,16 +559,22 @@ impl LazyRankBitVec {
             .reader
             .read_range(row..row + 1, Some(&["words"]))
             .await?;
-        let col = batch
+        let col = Self::words_column(&batch)?;
+        Ok(Self::decode_words(col.value(0)))
+    }
+
+    fn words_column(batch: &RecordBatch) -> Result<&arrow_array::LargeBinaryArray> {
+        batch
             .column(0)
             .as_any()
             .downcast_ref::<arrow_array::LargeBinaryArray>()
-            .ok_or_else(|| Error::invalid_input("expected LargeBinary words column"))?;
-        Ok(col
-            .value(0)
-            .chunks_exact(8)
+            .ok_or_else(|| Error::invalid_input("expected LargeBinary words column"))
+    }
+
+    fn decode_words(raw: &[u8]) -> Vec<u64> {
+        raw.chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-            .collect())
+            .collect()
     }
 
     #[inline]
@@ -611,6 +673,31 @@ impl LazyHuffmanWaveletTree {
         }
     }
 
+    async fn access_async(&self, mut pos: usize) -> Result<u8> {
+        if self.nodes.is_empty() {
+            return Ok(0);
+        }
+        let mut node_idx = 0;
+        loop {
+            self.nodes[node_idx].load_block_for_access(pos).await?;
+            let bit = self.nodes[node_idx].get(pos);
+            let (ref left, ref right) = self.children[node_idx];
+            if bit {
+                pos = self.nodes[node_idx].rank1(pos);
+                match right {
+                    WaveletChild::Leaf(b) => return Ok(*b),
+                    WaveletChild::Node(next) => node_idx = *next,
+                }
+            } else {
+                pos = self.nodes[node_idx].rank0(pos);
+                match left {
+                    WaveletChild::Leaf(b) => return Ok(*b),
+                    WaveletChild::Node(next) => node_idx = *next,
+                }
+            }
+        }
+    }
+
     #[inline]
     fn rank(&self, c: u8, pos: usize) -> usize {
         let code = &self.codes[c as usize];
@@ -628,6 +715,26 @@ impl LazyHuffmanWaveletTree {
             }
         }
         hi - lo
+    }
+
+    async fn rank_async(&self, c: u8, pos: usize) -> Result<usize> {
+        let code = &self.codes[c as usize];
+        if code.length == 0 {
+            return Ok(0);
+        }
+        let (mut lo, mut hi) = (0, pos);
+        for (level, &nid) in code.node_path.iter().enumerate() {
+            self.nodes[nid].load_block_for_rank(lo).await?;
+            self.nodes[nid].load_block_for_rank(hi).await?;
+            if (code.bits >> (code.length - 1 - level as u8)) & 1 == 0 {
+                lo = self.nodes[nid].rank0(lo);
+                hi = self.nodes[nid].rank0(hi);
+            } else {
+                lo = self.nodes[nid].rank1(lo);
+                hi = self.nodes[nid].rank1(hi);
+            }
+        }
+        Ok(hi - lo)
     }
 
     #[inline]
@@ -649,6 +756,29 @@ impl LazyHuffmanWaveletTree {
             }
         }
         (l - s, h - s)
+    }
+
+    async fn rank_pair_async(&self, c: u8, lo: usize, hi: usize) -> Result<(usize, usize)> {
+        let code = &self.codes[c as usize];
+        if code.length == 0 {
+            return Ok((0, 0));
+        }
+        let (mut s, mut l, mut h) = (0, lo, hi);
+        for (level, &nid) in code.node_path.iter().enumerate() {
+            self.nodes[nid].load_block_for_rank(s).await?;
+            self.nodes[nid].load_block_for_rank(l).await?;
+            self.nodes[nid].load_block_for_rank(h).await?;
+            if (code.bits >> (code.length - 1 - level as u8)) & 1 == 0 {
+                s = self.nodes[nid].rank0(s);
+                l = self.nodes[nid].rank0(l);
+                h = self.nodes[nid].rank0(h);
+            } else {
+                s = self.nodes[nid].rank1(s);
+                l = self.nodes[nid].rank1(l);
+                h = self.nodes[nid].rank1(h);
+            }
+        }
+        Ok((l - s, h - s))
     }
 
     fn deep_size(&self) -> usize {
@@ -1030,6 +1160,23 @@ impl LazyFMIndex {
         (lo, hi)
     }
 
+    async fn backward_search_async(&self, pattern: &[u8]) -> Result<(usize, usize)> {
+        if pattern.is_empty() || self.wavelet.len == 0 {
+            return Ok((0, 0));
+        }
+        let (mut lo, mut hi) = (0, self.wavelet.len);
+        for &b in pattern.iter().rev() {
+            let c = self.c_table[b as usize];
+            let (occ_lo, occ_hi) = self.wavelet.rank_pair_async(b, lo, hi).await?;
+            lo = c + occ_lo;
+            hi = c + occ_hi;
+            if lo >= hi {
+                return Ok((0, 0));
+            }
+        }
+        Ok((lo, hi))
+    }
+
     #[inline]
     fn locate(&self, mut pos: usize) -> usize {
         let mut steps = 0;
@@ -1045,6 +1192,24 @@ impl LazyFMIndex {
             if steps >= n {
                 log::warn!("FM-Index SA locate exceeded {n} steps, possible index corruption");
                 return 0;
+            }
+        }
+    }
+
+    async fn locate_async(&self, mut pos: usize) -> Result<usize> {
+        let mut steps = 0;
+        let n = self.wavelet.len;
+        loop {
+            if pos.is_multiple_of(SA_SAMPLE_RATE) && (pos / SA_SAMPLE_RATE) < self.sa_samples.len()
+            {
+                return Ok((self.sa_samples[pos / SA_SAMPLE_RATE] as usize + steps) % n);
+            }
+            let c = self.wavelet.access_async(pos).await?;
+            pos = self.c_table[c as usize] + self.wavelet.rank_async(c, pos).await?;
+            steps += 1;
+            if steps >= n {
+                log::warn!("FM-Index SA locate exceeded {n} steps, possible index corruption");
+                return Ok(0);
             }
         }
     }
@@ -1090,6 +1255,24 @@ impl LazyFMIndex {
             }
         }
         result
+    }
+
+    async fn search_row_addrs_async(&self, pattern: &[u8]) -> Result<Vec<u64>> {
+        let (lo, hi) = self.backward_search_async(pattern).await?;
+        if lo >= hi {
+            return Ok(Vec::new());
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for i in lo..hi {
+            let text_pos = self.locate_async(i).await?;
+            let doc_idx = self.doc_for_position(text_pos);
+            let row_addr = self.row_ids[doc_idx];
+            if seen.insert(row_addr) {
+                result.push(row_addr);
+            }
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1362,11 +1545,14 @@ impl FMIndexScalarIndex {
             .map(|partition| {
                 let pattern = Arc::clone(&pattern);
                 async move {
-                    partition.fm.prewarm().await?;
-                    spawn_cpu(move || {
-                        Result::<Vec<u64>>::Ok(partition.fm.search_row_addrs(pattern.as_ref()))
-                    })
-                    .await
+                    if partition.fm.fully_prewarmed.load(Ordering::Acquire) {
+                        spawn_cpu(move || {
+                            Result::<Vec<u64>>::Ok(partition.fm.search_row_addrs(pattern.as_ref()))
+                        })
+                        .await
+                    } else {
+                        partition.fm.search_row_addrs_async(pattern.as_ref()).await
+                    }
                 }
             })
             .buffer_unordered(self.partition_parallelism())
@@ -2542,6 +2728,62 @@ mod tests {
             _ => panic!("expected exact result"),
         }
         assert_eq!(loaded_wavelet_blocks(index.as_ref()), total_blocks);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_contains_search_does_not_full_prewarm_partitions() {
+        let docs: Vec<Vec<u8>> = (0..30)
+            .map(|i| format!("document {i} hello world test data").into_bytes())
+            .collect();
+        let texts: Vec<(u64, Vec<u8>)> = docs
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (i as u64, d))
+            .collect();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_partitioned_fmindex(&texts, store.as_ref())
+            .await
+            .unwrap();
+
+        let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(loaded_wavelet_blocks(index.as_ref()), 0);
+        assert!(
+            index
+                .partitions
+                .iter()
+                .all(|partition| !partition.fm.fully_prewarmed.load(Ordering::Acquire))
+        );
+
+        let r = index
+            .search(
+                &TextQuery::StringContains("document 15".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => {
+                assert_eq!(set.len(), Some(1));
+            }
+            _ => panic!("expected exact result"),
+        }
+
+        assert!(
+            index
+                .partitions
+                .iter()
+                .all(|partition| !partition.fm.fully_prewarmed.load(Ordering::Acquire))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
