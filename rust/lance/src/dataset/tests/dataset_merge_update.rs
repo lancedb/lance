@@ -36,7 +36,7 @@ use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::DataFile;
+use lance_table::format::{DataFile, Fragment};
 
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use futures::TryStreamExt;
@@ -2237,6 +2237,184 @@ async fn test_data_replacement_invalidates_index_bitmap() {
     assert!(
         !effective.contains(0),
         "Fragment 0 should be removed from index bitmap after DataReplacement on indexed column"
+    );
+}
+
+/// Run a predicate over `col` twice -- once index-served, once via a forced flat scan
+/// (`use_scalar_index(false)`) -- assert the two agree, and return the matching `col`
+/// values sorted. Equality is the index-consistency invariant: a divergence means the
+/// index served rows that disagree with the underlying data.
+async fn index_consistent_values(dataset: &Dataset, col: &str, predicate: &str) -> Vec<i32> {
+    let sorted = |batch: &RecordBatch| -> Vec<i32> {
+        let mut v: Vec<i32> = batch
+            .column_by_name(col)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .iter()
+            .flatten()
+            .collect();
+        v.sort();
+        v
+    };
+
+    let indexed = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let flat = dataset
+        .scan()
+        .use_scalar_index(false)
+        .filter(predicate)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    let indexed_vals = sorted(&indexed);
+    let flat_vals = sorted(&flat);
+    assert_eq!(
+        indexed_vals, flat_vals,
+        "index-served `{predicate}` disagrees with a flat scan"
+    );
+    indexed_vals
+}
+
+/// Build a Merge overlay fragment that rewrites a single `field_id` in place: tombstone
+/// (-2) the field in `prev`'s existing data files and back it with `new_file` (a new
+/// single-column file) instead. A file left with no live field is dropped. This is the
+/// manifest shape an in-place column rewrite produces when it falls back from a
+/// DataReplacement to a Merge.
+fn build_overlay_frag(prev: &Fragment, field_id: i32, new_file: &str) -> Fragment {
+    let mut overlay = prev.clone();
+    overlay.files = prev
+        .files
+        .iter()
+        .filter_map(|df| {
+            let masked: Vec<i32> = df
+                .fields
+                .iter()
+                .map(|&f| if f == field_id { -2 } else { f })
+                .collect();
+            if masked.iter().all(|&f| f == -2) {
+                return None; // file holds only the tombstoned field
+            }
+            let mut m = df.clone();
+            m.fields = masked.into();
+            Some(m)
+        })
+        .collect();
+    overlay.add_file(
+        new_file,
+        vec![field_id],
+        vec![0],
+        &LanceFileVersion::default(),
+        None,
+    );
+    overlay
+}
+
+/// A `Merge` that rewrites an indexed column's data in place must keep that column's
+/// index consistent: a query the index serves must return the same rows as a flat scan
+/// of the rewritten data. The overlay fragment tombstones (-2) the column's field id in
+/// the existing data file and appends a new file for it, so the field stays in the
+/// schema and its index is retained -- the rewritten fragment must be pruned from that
+/// index. This is the shape produced when an in-place column rewrite cannot be expressed
+/// as a DataReplacement (e.g. an `update` has merged the fragment's column files) and
+/// falls back to a Merge overlay.
+#[tokio::test]
+async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, true),
+        ArrowField::new("b", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+            Arc::new(Int32Array::from(vec![10, 20, 30, 40])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, "memory://merge_index_rewrite", None)
+        .await
+        .unwrap();
+
+    dataset
+        .create_index(
+            &["a"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // Baseline: the index serves correct results before the rewrite.
+    assert_eq!(
+        index_consistent_values(&dataset, "a", "a >= 3").await,
+        vec![3, 4]
+    );
+
+    let a_field_id = 0i32;
+
+    // Write a new single-column file holding `a`'s replacement values.
+    let a_only = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "a",
+        DataType::Int32,
+        true,
+    )]));
+    let new_a = RecordBatch::try_new(
+        a_only.clone(),
+        vec![Arc::new(Int32Array::from(vec![91, 92, 93, 94]))],
+    )
+    .unwrap();
+    let new_a_path = dataset.data_dir().join("merge_new_a.lance");
+    let object_writer = dataset.object_store.create(&new_a_path).await.unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        a_only.as_ref().try_into().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    writer.write_batch(&new_a).await.unwrap();
+    writer.finish().await.unwrap();
+
+    // Overlay that file onto fragment 0, rewriting `a` in place.
+    let prev = dataset.get_fragment(0).unwrap().metadata().clone();
+    let overlay = build_overlay_frag(&prev, a_field_id, "merge_new_a.lance");
+
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::Merge {
+            fragments: vec![overlay],
+            schema: schema.as_ref().try_into().unwrap(),
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // `a` now holds [91, 92, 93, 94]; an index-served query must reflect that.
+    assert_eq!(
+        index_consistent_values(&dataset, "a", "a >= 90").await,
+        vec![91, 92, 93, 94],
+        "index-served `a >= 90` must return the rewritten values"
+    );
+    assert!(
+        index_consistent_values(&dataset, "a", "a < 90")
+            .await
+            .is_empty(),
+        "no row satisfies `a < 90` after the rewrite"
     );
 }
 

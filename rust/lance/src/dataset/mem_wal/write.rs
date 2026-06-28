@@ -1661,6 +1661,26 @@ impl ShardWriter {
     /// ```
     #[instrument(name = "sw_delete", level = "info", skip_all, fields(batch_count = keys.len(), shard_id = %self.config.shard_id))]
     pub async fn delete(&self, keys: Vec<RecordBatch>) -> Result<WriteResult> {
+        let (result, watcher) = self.delete_no_wait(keys).await?;
+        // Wait for durability if configured (mirrors `put` → `put_memtable`).
+        if let Some(mut watcher) = watcher {
+            watcher.wait().await?;
+        }
+        Ok(result)
+    }
+
+    /// Like [`Self::delete`], but returns the durability watcher *without*
+    /// awaiting it — the tombstone lands in the in-memory tier the instant this
+    /// returns, but the index-driven LSM read only folds it once the watcher
+    /// resolves the flush (which advances the visibility watermark and updates
+    /// the PK index). The delete analog of [`Self::put_no_wait`], so a caller
+    /// can hold an external lock across only the in-memory insert and await
+    /// durability after releasing it. MemTable mode only.
+    #[instrument(name = "sw_delete_no_wait", level = "info", skip_all, fields(batch_count = keys.len(), shard_id = %self.config.shard_id))]
+    pub async fn delete_no_wait(
+        &self,
+        keys: Vec<RecordBatch>,
+    ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
         if keys.is_empty() {
             return Err(Error::invalid_input("Cannot delete with empty key list"));
         }
@@ -1687,7 +1707,7 @@ impl ShardWriter {
                         build_tombstone_batch(&k, &writer_state.schema, &writer_state.pk_columns)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                self.put_memtable(tombstones, state, writer_state, backpressure)
+                self.put_memtable_no_wait(tombstones, state, writer_state, backpressure)
                     .await
             }
             WriterMode::WalOnly { .. } => Err(Error::invalid_input(
@@ -1697,7 +1717,9 @@ impl ShardWriter {
     }
 
     /// Like [`Self::put`], but returns the durability watcher *without* awaiting
-    /// it. The row is visible to reads on this writer the instant this returns;
+    /// it. The row lands in the in-memory tier the instant this returns, but the
+    /// index-driven LSM read only surfaces it once the watcher resolves the
+    /// flush (which advances the visibility watermark and updates the indexes);
     /// the caller awaits durability via the watcher (`None` when `durable_write`
     /// is off).
     ///
@@ -3156,6 +3178,128 @@ mod tests {
             vec![0, 1, 3, 4],
             "id=2 deleted; tombstone not surfaced"
         );
+
+        writer.close().await.unwrap();
+    }
+
+    /// `delete_no_wait` lands the tombstone in the in-memory tier (visible at
+    /// the batch-store level the instant it returns) and hands back the
+    /// durability watcher *without* awaiting it. Index-driven LSM read
+    /// visibility — folding the tombstone out — follows once the watcher
+    /// resolves the flush that advances the visibility watermark and updates
+    /// the PK index. The delete analog of
+    /// `test_put_no_wait_durable_visible_then_durable`.
+    #[tokio::test]
+    async fn test_shard_writer_delete_no_wait_durable_visible_after_watcher() {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+        use futures::TryStreamExt;
+
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            ..Default::default()
+        };
+        let shard_id = config.shard_id;
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+
+        // Tombstone id=2 without blocking on durability.
+        let (_result, watcher) = writer
+            .delete_no_wait(vec![id_only_keys(&[2])])
+            .await
+            .unwrap();
+
+        // The tombstone is in the in-memory tier immediately (5 rows + 1
+        // tombstone), even though the index-driven read can't fold it until the
+        // flush behind the watcher lands. `durable_write` is on, so a watcher is
+        // returned to await.
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 6);
+        let mut watcher = watcher.expect("durable_write returns a watcher");
+
+        // Awaiting the watcher waits for the flush, which advances the
+        // visibility watermark and updates the PK index — only then does the LSM
+        // read fold the delete.
+        watcher.wait().await.unwrap();
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri,
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let arr = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..arr.len()).map(|i| arr.value(i)));
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0, 1, 3, 4],
+            "delete folded by the LSM read once the watcher resolves"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// With `durable_write` off, `delete_no_wait` returns no watcher (nothing to
+    /// await), but the tombstone still lands in the in-memory tier. The delete
+    /// analog of `test_put_no_wait_non_durable_returns_no_watcher`.
+    #[tokio::test]
+    async fn test_shard_writer_delete_no_wait_non_durable_returns_no_watcher() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+
+        let (_result, watcher) = writer
+            .delete_no_wait(vec![id_only_keys(&[2])])
+            .await
+            .unwrap();
+        assert!(watcher.is_none(), "non-durable delete has nothing to await");
+
+        // Tombstone landed in the in-memory tier (5 rows + 1 tombstone).
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 6);
 
         writer.close().await.unwrap();
     }

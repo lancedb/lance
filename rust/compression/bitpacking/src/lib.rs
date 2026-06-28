@@ -16,6 +16,10 @@
 use arrayref::{array_mut_ref, array_ref};
 use core::mem::size_of;
 
+mod bitpacker_internal;
+
+pub use bitpacker_internal::{BitPacker, BitPacker4x};
+
 pub const FL_ORDER: [usize; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
 pub trait FastLanes: Sized + Copy {
@@ -1709,6 +1713,7 @@ pack_64!(pack_64_64, 64);
 #[cfg(test)]
 mod test {
     use super::*;
+    use bitpacking::{BitPacker as ExternalBitPacker, BitPacker4x as ExternalBitPacker4x};
     use core::array;
     // a fast random number generator
     pub struct XorShift {
@@ -1727,6 +1732,104 @@ mod test {
             x ^= x << 17;
             self.state = x;
             x
+        }
+    }
+
+    fn mask_for_width(width: u8) -> u32 {
+        match width {
+            0 => 0,
+            32 => u32::MAX,
+            _ => (1u32 << width) - 1,
+        }
+    }
+
+    fn raw_bitpacker4x_case(width: u8, seed: u64) -> Vec<u32> {
+        let mask = mask_for_width(width);
+        let mut rng = XorShift::new(seed);
+        (0..BitPacker4x::BLOCK_LEN)
+            .map(|idx| match seed % 4 {
+                0 => 0,
+                1 => mask,
+                2 => idx as u32 & mask,
+                _ => (rng.next() as u32) & mask,
+            })
+            .collect()
+    }
+
+    fn sorted_bitpacker4x_case(width: u8, seed: u64) -> (u32, Vec<u32>) {
+        if width == 0 {
+            return (17, vec![17; BitPacker4x::BLOCK_LEN]);
+        }
+        if width == 32 {
+            return (0, vec![u32::MAX; BitPacker4x::BLOCK_LEN]);
+        }
+
+        let mask = mask_for_width(width).min(127);
+        let mut rng = XorShift::new(seed);
+        let mut current = 17u32;
+        let values = (0..BitPacker4x::BLOCK_LEN)
+            .map(|_| {
+                current += (rng.next() as u32) & mask;
+                current
+            })
+            .collect();
+        (17, values)
+    }
+
+    #[test]
+    fn test_bitpacker4x_raw_compatible_with_external_bitpacking() {
+        let ours = BitPacker4x::new();
+        let external = ExternalBitPacker4x::new();
+
+        for width in 0..=32 {
+            for seed in [0, 1, 2, 123456789] {
+                let values = raw_bitpacker4x_case(width, seed);
+                assert_eq!(ours.num_bits(&values), external.num_bits(&values));
+
+                let mut actual = vec![0u8; BitPacker4x::compressed_block_size(width)];
+                let actual_len = ours.compress(&values, &mut actual, width);
+
+                let mut expected = vec![0u8; ExternalBitPacker4x::compressed_block_size(width)];
+                let expected_len = external.compress(&values, &mut expected, width);
+
+                assert_eq!(actual_len, expected_len);
+                assert_eq!(actual, expected, "width {width} seed {seed}");
+
+                let mut decoded = vec![0u32; BitPacker4x::BLOCK_LEN];
+                let consumed = ours.decompress(&actual, &mut decoded, width);
+                assert_eq!(consumed, actual_len);
+                assert_eq!(decoded, values);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bitpacker4x_sorted_compatible_with_external_bitpacking() {
+        let ours = BitPacker4x::new();
+        let external = ExternalBitPacker4x::new();
+
+        for width in 0..=32 {
+            for seed in [0, 1, 2, 123456789] {
+                let (initial, values) = sorted_bitpacker4x_case(width, seed);
+                assert_eq!(
+                    ours.num_bits_sorted(initial, &values),
+                    external.num_bits_sorted(initial, &values)
+                );
+
+                let mut actual = vec![0u8; BitPacker4x::compressed_block_size(width)];
+                let actual_len = ours.compress_sorted(initial, &values, &mut actual, width);
+
+                let mut expected = vec![0u8; ExternalBitPacker4x::compressed_block_size(width)];
+                let expected_len = external.compress_sorted(initial, &values, &mut expected, width);
+
+                assert_eq!(actual_len, expected_len);
+                assert_eq!(actual, expected, "width {width} seed {seed}");
+
+                let mut decoded = vec![0u32; BitPacker4x::BLOCK_LEN];
+                let consumed = ours.decompress_sorted(initial, &actual, &mut decoded, width);
+                assert_eq!(consumed, actual_len);
+                assert_eq!(decoded, values);
+            }
         }
     }
 
