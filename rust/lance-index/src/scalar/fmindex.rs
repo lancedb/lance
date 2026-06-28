@@ -54,6 +54,7 @@ const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
 const PARTITION_SIZE: usize = 10_000;
 const DEFAULT_PARTITION_SIZE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_DEMAND_PAGE_TARGET_BYTES: usize = 512 * 1024;
 const DEFAULT_PREWARM_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const SENTINEL_BYTE: u8 = 0xFF;
 
@@ -92,6 +93,13 @@ static LANCE_FMINDEX_PREWARM_CHUNK_BYTES: std::sync::LazyLock<usize> =
             .parse()
             .expect("failed to parse LANCE_FMINDEX_PREWARM_CHUNK_BYTES")
     });
+static LANCE_FMINDEX_DEMAND_PAGE_BYTES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("LANCE_FMINDEX_DEMAND_PAGE_BYTES")
+            .unwrap_or_else(|_| DEFAULT_DEMAND_PAGE_TARGET_BYTES.to_string())
+            .parse()
+            .expect("failed to parse LANCE_FMINDEX_DEMAND_PAGE_BYTES")
+    });
 static LANCE_FMINDEX_PREWARM_CHUNK_CONCURRENCY: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| {
         std::env::var("LANCE_FMINDEX_PREWARM_CHUNK_CONCURRENCY")
@@ -122,6 +130,14 @@ fn fmindex_write_queue_size() -> usize {
 
 fn fmindex_prewarm_chunk_bytes() -> usize {
     (*LANCE_FMINDEX_PREWARM_CHUNK_BYTES).max(BLOCK_WORDS * 8)
+}
+
+fn fmindex_demand_page_bytes() -> usize {
+    (*LANCE_FMINDEX_DEMAND_PAGE_BYTES).max(BLOCK_WORDS * 8)
+}
+
+fn fmindex_demand_page_rows() -> usize {
+    (fmindex_demand_page_bytes() / (BLOCK_WORDS * 8)).max(1)
 }
 
 fn fmindex_prewarm_chunk_concurrency() -> usize {
@@ -506,8 +522,44 @@ impl LazyRankBitVec {
             )));
         }
         if self.blocks[idx].get().is_none() {
-            let words = self.load_block(idx).await?;
-            let _ = self.blocks[idx].set(words);
+            self.load_page_containing(idx).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_page_containing(&self, idx: usize) -> Result<()> {
+        let page_rows = fmindex_demand_page_rows();
+        let start = (idx / page_rows) * page_rows;
+        let end = (start + page_rows).min(self.blocks.len());
+        if self.blocks[start..end]
+            .iter()
+            .all(|block| block.get().is_some())
+        {
+            return Ok(());
+        }
+
+        let batch = self
+            .reader
+            .read_range(
+                self.block_row_offset + start..self.block_row_offset + end,
+                Some(&["words"]),
+            )
+            .await?;
+        if batch.num_rows() != end - start {
+            return Err(Error::index(format!(
+                "expected {} FM-Index block rows, got {}",
+                end - start,
+                batch.num_rows()
+            )));
+        }
+
+        let col = Self::words_column(&batch)?;
+        for row in 0..batch.num_rows() {
+            let block_idx = start + row;
+            if self.blocks[block_idx].get().is_none() {
+                let words = Self::decode_words(col.value(row));
+                let _ = self.blocks[block_idx].set(words);
+            }
         }
         Ok(())
     }
@@ -1588,15 +1640,26 @@ impl FMIndexScalarIndex {
             return Err(Error::invalid_input("no FM-Index partition files found"));
         }
         pfiles.sort_by_key(|(id, _)| *id);
-        let mut parts = Vec::with_capacity(pfiles.len());
-        for (id, name) in &pfiles {
-            parts.push(Arc::new(
-                Self::load_partition(store.as_ref(), name, *id).await?,
-            ));
-        }
+        let io_parallelism = store.io_parallelism().max(1);
+        let mut parts = futures::stream::iter(pfiles.into_iter())
+            .map(|(id, name)| {
+                let store = Arc::clone(&store);
+                async move {
+                    let partition = Self::load_partition(store.as_ref(), &name, id).await?;
+                    Result::<_>::Ok((id, Arc::new(partition)))
+                }
+            })
+            .buffer_unordered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        parts.sort_by_key(|(id, _)| *id);
+        let parts = parts
+            .into_iter()
+            .map(|(_, partition)| partition)
+            .collect::<Vec<_>>();
         Ok(Arc::new(Self {
             partitions: parts,
-            io_parallelism: store.io_parallelism().max(1),
+            io_parallelism,
         }))
     }
 
