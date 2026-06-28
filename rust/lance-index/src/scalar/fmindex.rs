@@ -54,7 +54,7 @@ const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
 const PARTITION_SIZE: usize = 10_000;
 const DEFAULT_PARTITION_SIZE_BYTES: usize = 16 * 1024 * 1024;
-const PREWARM_CHUNK_TARGET_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_PREWARM_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
 const SENTINEL_BYTE: u8 = 0xFF;
 
 /// SA sampling rate. Store every D-th SA entry. Locate walks at most D LF steps.
@@ -85,6 +85,20 @@ static LANCE_FMINDEX_WRITE_QUEUE_SIZE: std::sync::LazyLock<usize> =
             .parse()
             .expect("failed to parse LANCE_FMINDEX_WRITE_QUEUE_SIZE")
     });
+static LANCE_FMINDEX_PREWARM_CHUNK_BYTES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("LANCE_FMINDEX_PREWARM_CHUNK_BYTES")
+            .unwrap_or_else(|_| DEFAULT_PREWARM_CHUNK_TARGET_BYTES.to_string())
+            .parse()
+            .expect("failed to parse LANCE_FMINDEX_PREWARM_CHUNK_BYTES")
+    });
+static LANCE_FMINDEX_PREWARM_CHUNK_CONCURRENCY: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("LANCE_FMINDEX_PREWARM_CHUNK_CONCURRENCY")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse()
+            .expect("failed to parse LANCE_FMINDEX_PREWARM_CHUNK_CONCURRENCY")
+    });
 
 fn fmindex_partition_path(partition_id: u64) -> String {
     format!("part_{partition_id}_fm.lance")
@@ -104,6 +118,14 @@ fn fmindex_partition_bytes() -> usize {
 
 fn fmindex_write_queue_size() -> usize {
     (*LANCE_FMINDEX_WRITE_QUEUE_SIZE).max(1)
+}
+
+fn fmindex_prewarm_chunk_bytes() -> usize {
+    (*LANCE_FMINDEX_PREWARM_CHUNK_BYTES).max(BLOCK_WORDS * 8)
+}
+
+fn fmindex_prewarm_chunk_concurrency() -> usize {
+    (*LANCE_FMINDEX_PREWARM_CHUNK_CONCURRENCY).max(1)
 }
 
 // ── Bitvector with O(1) rank ─────────────────────────────────────────────────
@@ -626,6 +648,7 @@ impl LazyHuffmanWaveletTree {
         let Some(total_rows) = ranges.iter().map(|range| range.end).max() else {
             return Ok(());
         };
+        let ranges = Arc::new(ranges);
 
         let chunk_loaded = |start: usize, end: usize| {
             ranges.iter().all(|range| {
@@ -641,47 +664,62 @@ impl LazyHuffmanWaveletTree {
             })
         };
 
-        let chunk_rows = (PREWARM_CHUNK_TARGET_BYTES / (BLOCK_WORDS * 8)).max(1);
+        let chunk_rows = (fmindex_prewarm_chunk_bytes() / (BLOCK_WORDS * 8)).max(1);
         let reader = Arc::clone(&self.nodes[0].reader);
-        let mut start = 0;
-        while start < total_rows {
-            let end = (start + chunk_rows).min(total_rows);
-            if chunk_loaded(start, end) {
-                start = end;
-                continue;
-            }
+        let chunks = (0..total_rows)
+            .step_by(chunk_rows)
+            .map(|start| {
+                let end = (start + chunk_rows).min(total_rows);
+                (start, end)
+            })
+            .filter(|(start, end)| !chunk_loaded(*start, *end))
+            .collect::<Vec<_>>();
 
-            let batch = reader.read_range(start..end, Some(&["words"])).await?;
-            if batch.num_rows() != end - start {
-                return Err(Error::index(format!(
-                    "expected {} FM-Index block rows, got {}",
-                    end - start,
-                    batch.num_rows()
-                )));
-            }
-
-            let col = LazyRankBitVec::words_column(&batch)?;
-            let mut range_idx = ranges.partition_point(|range| range.end <= start);
-            for row in 0..batch.num_rows() {
-                let absolute_row = start + row;
-                while range_idx < ranges.len() && absolute_row >= ranges[range_idx].end {
-                    range_idx += 1;
+        futures::stream::iter(chunks)
+            .map(|(start, end)| {
+                let reader = Arc::clone(&reader);
+                async move {
+                    let batch = reader.read_range(start..end, Some(&["words"])).await?;
+                    Result::<_>::Ok((start, end, batch))
                 }
-                if range_idx == ranges.len() || absolute_row < ranges[range_idx].start {
-                    continue;
-                }
+            })
+            .buffer_unordered(fmindex_prewarm_chunk_concurrency())
+            .try_for_each(|(start, end, batch)| {
+                let ranges = Arc::clone(&ranges);
+                let nodes = &self.nodes;
+                async move {
+                    if batch.num_rows() != end - start {
+                        return Err(Error::index(format!(
+                            "expected {} FM-Index block rows, got {}",
+                            end - start,
+                            batch.num_rows()
+                        )));
+                    }
 
-                let range = ranges[range_idx];
-                let block_idx = absolute_row - range.start;
-                let node = &self.nodes[range.node_idx];
-                if node.blocks[block_idx].get().is_none() {
-                    let words = LazyRankBitVec::decode_words(col.value(row));
-                    let _ = node.blocks[block_idx].set(words);
-                }
-            }
+                    let col = LazyRankBitVec::words_column(&batch)?;
+                    let mut range_idx = ranges.partition_point(|range| range.end <= start);
+                    for row in 0..batch.num_rows() {
+                        let absolute_row = start + row;
+                        while range_idx < ranges.len() && absolute_row >= ranges[range_idx].end {
+                            range_idx += 1;
+                        }
+                        if range_idx == ranges.len() || absolute_row < ranges[range_idx].start {
+                            continue;
+                        }
 
-            start = end;
-        }
+                        let range = ranges[range_idx];
+                        let block_idx = absolute_row - range.start;
+                        let node = &nodes[range.node_idx];
+                        if node.blocks[block_idx].get().is_none() {
+                            let words = LazyRankBitVec::decode_words(col.value(row));
+                            let _ = node.blocks[block_idx].set(words);
+                        }
+                    }
+
+                    Ok(())
+                }
+            })
+            .await?;
 
         Ok(())
     }
