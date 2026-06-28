@@ -476,48 +476,6 @@ impl LazyRankBitVec {
         }
     }
 
-    /// Pre-load all blocks into memory. Call this before sync rank/access operations
-    /// to avoid the need for `block_in_place` during queries.
-    async fn load_all_blocks(&self) -> Result<()> {
-        let chunk_rows = (PREWARM_CHUNK_TARGET_BYTES / (BLOCK_WORDS * 8)).max(1);
-        let mut start = 0;
-        while start < self.blocks.len() {
-            let end = (start + chunk_rows).min(self.blocks.len());
-            if self.blocks[start..end]
-                .iter()
-                .all(|lock| lock.get().is_some())
-            {
-                start = end;
-                continue;
-            }
-
-            let batch = self
-                .reader
-                .read_range(
-                    self.block_row_offset + start..self.block_row_offset + end,
-                    Some(&["words"]),
-                )
-                .await?;
-            if batch.num_rows() != end - start {
-                return Err(Error::index(format!(
-                    "expected {} FM-Index block rows, got {}",
-                    end - start,
-                    batch.num_rows()
-                )));
-            }
-            let col = Self::words_column(&batch)?;
-            for row in 0..batch.num_rows() {
-                let block_idx = start + row;
-                if self.blocks[block_idx].get().is_none() {
-                    let words = Self::decode_words(col.value(row));
-                    let _ = self.blocks[block_idx].set(words);
-                }
-            }
-            start = end;
-        }
-        Ok(())
-    }
-
     async fn load_block_if_needed(&self, idx: usize) -> Result<()> {
         if idx >= self.blocks.len() {
             return Err(Error::index(format!(
@@ -642,9 +600,89 @@ impl std::fmt::Debug for LazyHuffmanWaveletTree {
 impl LazyHuffmanWaveletTree {
     /// Pre-load all wavelet tree blocks into memory.
     async fn load_all(&self) -> Result<()> {
-        for node in &self.nodes {
-            node.load_all_blocks().await?;
+        if self.nodes.is_empty() {
+            return Ok(());
         }
+
+        #[derive(Clone, Copy)]
+        struct RowRange {
+            start: usize,
+            end: usize,
+            node_idx: usize,
+        }
+
+        let mut ranges = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| !node.blocks.is_empty())
+            .map(|(node_idx, node)| RowRange {
+                start: node.block_row_offset,
+                end: node.block_row_offset + node.blocks.len(),
+                node_idx,
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start);
+        let Some(total_rows) = ranges.iter().map(|range| range.end).max() else {
+            return Ok(());
+        };
+
+        let chunk_loaded = |start: usize, end: usize| {
+            ranges.iter().all(|range| {
+                let overlap_start = start.max(range.start);
+                let overlap_end = end.min(range.end);
+                if overlap_start >= overlap_end {
+                    return true;
+                }
+                let node = &self.nodes[range.node_idx];
+                node.blocks[overlap_start - range.start..overlap_end - range.start]
+                    .iter()
+                    .all(|block| block.get().is_some())
+            })
+        };
+
+        let chunk_rows = (PREWARM_CHUNK_TARGET_BYTES / (BLOCK_WORDS * 8)).max(1);
+        let reader = Arc::clone(&self.nodes[0].reader);
+        let mut start = 0;
+        while start < total_rows {
+            let end = (start + chunk_rows).min(total_rows);
+            if chunk_loaded(start, end) {
+                start = end;
+                continue;
+            }
+
+            let batch = reader.read_range(start..end, Some(&["words"])).await?;
+            if batch.num_rows() != end - start {
+                return Err(Error::index(format!(
+                    "expected {} FM-Index block rows, got {}",
+                    end - start,
+                    batch.num_rows()
+                )));
+            }
+
+            let col = LazyRankBitVec::words_column(&batch)?;
+            let mut range_idx = ranges.partition_point(|range| range.end <= start);
+            for row in 0..batch.num_rows() {
+                let absolute_row = start + row;
+                while range_idx < ranges.len() && absolute_row >= ranges[range_idx].end {
+                    range_idx += 1;
+                }
+                if range_idx == ranges.len() || absolute_row < ranges[range_idx].start {
+                    continue;
+                }
+
+                let range = ranges[range_idx];
+                let block_idx = absolute_row - range.start;
+                let node = &self.nodes[range.node_idx];
+                if node.blocks[block_idx].get().is_none() {
+                    let words = LazyRankBitVec::decode_words(col.value(row));
+                    let _ = node.blocks[block_idx].set(words);
+                }
+            }
+
+            start = end;
+        }
+
         Ok(())
     }
 
