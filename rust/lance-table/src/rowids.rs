@@ -22,19 +22,16 @@ pub mod segment;
 mod serde;
 pub mod version;
 
-use deepsize::DeepSizeOf;
+use lance_core::deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
-use lance_core::{
-    Error, Result,
-    utils::mask::{RowAddrMask, RowAddrTreeMap},
-};
+use lance_core::{Error, Result};
 use lance_io::ReadBatchParams;
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 pub use serde::{read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;
-use lance_core::utils::mask::RowSetOps;
 use segment::U64Segment;
 use tracing::instrument;
 
@@ -392,9 +389,27 @@ impl RowIdSequence {
                 U64Segment::Range(range) => {
                     let mut ids = RowAddrTreeMap::from(range.clone());
                     ids.mask(mask);
-                    ranges.extend(GroupingIterator::new(
-                        unsafe { ids.into_addr_iter() }.map(|addr| addr - range.start + offset),
-                    ));
+                    // Range-aware path: walk the bitmap's runs directly via
+                    // iter_runs so the per-row cost collapses to per-run cost.
+                    // SAFETY: built from a u64 range; no Full entries possible.
+                    let mut cur: Option<Range<u64>> = None;
+                    for (fragment, run) in unsafe { ids.iter_runs() } {
+                        let frag = u64::from(fragment);
+                        let run_start = (frag << 32) | u64::from(*run.start());
+                        let run_end_excl = (frag << 32) | (u64::from(*run.end()) + 1);
+                        let start = run_start - range.start + offset;
+                        let end = run_end_excl - range.start + offset;
+                        match cur.as_mut() {
+                            Some(c) if c.end == start => c.end = end,
+                            Some(c) => {
+                                ranges.push(std::mem::replace(c, start..end));
+                            }
+                            None => cur = Some(start..end),
+                        }
+                    }
+                    if let Some(c) = cur {
+                        ranges.push(c);
+                    }
                     offset += range.end - range.start;
                 }
                 U64Segment::RangeWithHoles { range, holes } => {
@@ -515,30 +530,32 @@ impl From<&RowIdSequence> for RowAddrTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
         let mut tree_map = Self::new();
         for segment in &row_ids.0 {
+            let mut seg = Self::new();
             match segment {
                 U64Segment::Range(range) => {
-                    tree_map.insert_range(range.clone());
+                    seg.insert_range(range.clone());
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
-                    tree_map.insert_range(range.clone());
+                    seg.insert_range(range.clone());
                     for (i, val) in range.clone().enumerate() {
                         if !bitmap.get(i) {
-                            tree_map.remove(val);
+                            seg.remove(val);
                         }
                     }
                 }
                 U64Segment::RangeWithHoles { range, holes } => {
-                    tree_map.insert_range(range.clone());
+                    seg.insert_range(range.clone());
                     for hole in holes.iter() {
-                        tree_map.remove(hole);
+                        seg.remove(hole);
                     }
                 }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
                     for val in array.iter() {
-                        tree_map.insert(val);
+                        seg.insert(val);
                     }
                 }
             }
+            tree_map |= seg;
         }
         tree_map
     }
@@ -1023,6 +1040,27 @@ mod test {
         .into_iter()
         .collect::<RowAddrTreeMap>();
         assert_eq!(tree_map, expected);
+    }
+
+    #[test]
+    fn test_row_id_sequence_to_treemap_overlapping_segments() {
+        // Compaction can concatenate segments whose ranges overlap but whose
+        // selected ids are disjoint (here: even ids, then odd ids over 0..6).
+        // The tree map must contain every id the sequence yields.
+        let sequence = RowIdSequence(vec![
+            U64Segment::RangeWithBitmap {
+                range: 0..6,
+                bitmap: [true, false, true, false, true, false].as_slice().into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 0..6,
+                bitmap: [false, true, false, true, false, true].as_slice().into(),
+            },
+        ]);
+
+        let expected = sequence.iter().collect::<RowAddrTreeMap>();
+        assert_eq!(expected, (0..6).collect::<RowAddrTreeMap>());
+        assert_eq!(RowAddrTreeMap::from(&sequence), expected);
     }
 
     #[test]

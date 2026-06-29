@@ -24,6 +24,8 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "gcp")]
 pub mod gcp;
+#[cfg(feature = "goosefs")]
+pub mod goosefs;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
@@ -33,6 +35,8 @@ pub mod oss;
 pub mod shared_memory;
 #[cfg(feature = "tencent")]
 pub mod tencent;
+#[cfg(feature = "tos")]
+pub mod tos;
 
 #[async_trait::async_trait]
 pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
@@ -46,8 +50,13 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// Meanwhile, for a file store, the path is relative to the filesystem root.
     /// So a URL of `file:///path/to/file` would return `/path/to/file`.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        Path::parse(url.path())
-            .map_err(|_| Error::invalid_input(format!("Invalid path in URL: {}", url.path())))
+        // url.path() returns a percent-encoded string (per the WHATWG URL spec).
+        // Path::from_url_path decodes it first so the Path internal representation
+        // holds the raw UTF-8 string. This prevents double-encoding when the
+        // object store client later percent-encodes the path for HTTP requests.
+        Path::from_url_path(url.path()).map_err(|e| {
+            Error::invalid_input(format!("Invalid path in URL '{}': {}", url.path(), e))
+        })
     }
 
     /// Calculate the unique prefix that should be used for this object store.
@@ -95,6 +104,7 @@ pub struct ObjectStoreRegistryStats {
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
 /// - `az`: An Azure Blob Storage object store.
 /// - `gs`: A Google Cloud Storage object store.
+/// - `tos`: A Volcengine TOS object store.
 ///
 /// Use [`Self::empty()`] to create an empty registry, with no providers registered.
 ///
@@ -324,12 +334,16 @@ impl Default for ObjectStoreRegistry {
         }
         #[cfg(feature = "gcp")]
         providers.insert("gs".into(), Arc::new(gcp::GcsStoreProvider));
+        #[cfg(feature = "goosefs")]
+        providers.insert("goosefs".into(), Arc::new(goosefs::GooseFsStoreProvider));
         #[cfg(feature = "oss")]
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
         #[cfg(feature = "tencent")]
         providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
+        #[cfg(feature = "tos")]
+        providers.insert("tos".into(), Arc::new(tos::TosStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),

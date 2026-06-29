@@ -50,6 +50,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -142,6 +143,30 @@ public class MemWalTest {
     }
   }
 
+  /**
+   * Stage a <em>faithful</em> flushed generation at {@code genPath}: the Lance dataset plus its
+   * primary-key dedup sidecar ({@code _pk_index/}), mirroring what production flush emits. The LSM
+   * scanner's cross-generation block-list opens the sidecar, so a dataset alone (no sidecar) is not
+   * a state production produces. Mirrors the Python {@code _write_flushed_gen} test helper.
+   */
+  private static void writeFlushedGen(
+      BufferAllocator allocator, String genPath, long[] ids, String prefix) throws Exception {
+    writeLookupDataset(allocator, genPath, ids, prefix).close();
+    try (VectorSchemaRoot root = lookupRoot(allocator, ids, prefix);
+        ArrowReader reader = toReader(allocator, root);
+        ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+      Data.exportArrayStream(allocator, reader, stream);
+      nativeWritePkSidecar(genPath, stream.memoryAddress(), Collections.singletonList("id"));
+    }
+  }
+
+  /**
+   * Test-support native: write the primary-key dedup sidecar for a flushed-generation dataset
+   * already staged at {@code genPath}. See {@link #writeFlushedGen}.
+   */
+  private static native void nativeWritePkSidecar(
+      String genPath, long streamAddress, List<String> pkColumns);
+
   /** Read an LSM scanner fully into an {@code id -> name} map. */
   private static Map<Long, String> readByName(ArrowReader reader) throws Exception {
     Map<Long, String> byId = new HashMap<>();
@@ -191,6 +216,111 @@ public class MemWalTest {
       ShardingField field = details.get().shardingSpecs().get(0).fields().get(0);
       assertEquals("bucket", field.transform().get());
       assertEquals("4", field.parameters().get("num_buckets"));
+    }
+  }
+
+  @Test
+  void testInitializeMemWalBucketShardingUsesConfiguredColumn(@TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("base").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {1, 2, 3}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams().withBucketSharding("name", 4));
+
+      MemWalIndexDetails details = dataset.memWalIndexDetails().get();
+      ShardingField field = details.shardingSpecs().get(0).fields().get(0);
+      int nameFieldId =
+          dataset.getLanceSchema().fields().stream()
+              .filter(f -> f.getName().equals("name"))
+              .findFirst()
+              .get()
+              .getId();
+      assertEquals("bucket", field.transform().get());
+      assertEquals(nameFieldId, field.sourceIds().get(0));
+    }
+  }
+
+  @Test
+  void testShardingEvaluatorBucketAndIdentity(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("append_only").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeAppendOnlyDataset(allocator, path, new long[] {1}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams().withBucketSharding("id", 4));
+      ShardingSpec bucketSpec = dataset.memWalIndexDetails().get().shardingSpecs().get(0);
+      ShardingField bucketField = bucketSpec.fields().get(0);
+
+      try (VectorSchemaRoot root = appendOnlyRoot(allocator, new long[] {1, 2, 3}, "eval");
+          ArrowReader reader =
+              ShardingEvaluator.evaluate(allocator, root, bucketSpec, dataset.getLanceSchema())) {
+        assertTrue(reader.loadNextBatch());
+        VectorSchemaRoot result = reader.getVectorSchemaRoot();
+        IntVector buckets = (IntVector) result.getVector(bucketField.fieldId());
+        assertEquals(3, result.getRowCount());
+        assertEquals(0, buckets.get(0));
+        assertEquals(0, buckets.get(1));
+        assertEquals(3, buckets.get(2));
+        assertFalse(reader.loadNextBatch());
+      }
+
+      int nameFieldId =
+          dataset.getLanceSchema().fields().stream()
+              .filter(f -> f.getName().equals("name"))
+              .findFirst()
+              .get()
+              .getId();
+      ShardingSpec identitySpec =
+          new ShardingSpec(
+              7,
+              Collections.singletonList(
+                  new ShardingField(
+                      "name_identity",
+                      Collections.singletonList(nameFieldId),
+                      "identity",
+                      null,
+                      "utf8",
+                      Collections.emptyMap())));
+      try (VectorSchemaRoot root = appendOnlyRoot(allocator, new long[] {1}, "eval");
+          ArrowReader reader =
+              ShardingEvaluator.evaluate(allocator, root, identitySpec, dataset.getLanceSchema())) {
+        assertTrue(reader.loadNextBatch());
+        VarCharVector names =
+            (VarCharVector) reader.getVectorSchemaRoot().getVector("name_identity");
+        assertEquals("eval_1", new String(names.get(0), StandardCharsets.UTF_8));
+        assertFalse(reader.loadNextBatch());
+      }
+
+      Map<String, String> stringBucketParameters = new HashMap<>();
+      stringBucketParameters.put("column", "key");
+      stringBucketParameters.put("num_buckets", "8");
+      ShardingSpec stringBucketSpec =
+          new ShardingSpec(
+              8,
+              Collections.singletonList(
+                  new ShardingField(
+                      "key_bucket",
+                      Collections.emptyList(),
+                      "bucket",
+                      null,
+                      "int32",
+                      stringBucketParameters)));
+      Schema stringSchema =
+          new Schema(Collections.singletonList(Field.nullable("key", new ArrowType.Utf8())));
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(stringSchema, allocator)) {
+        VarCharVector keyVector = (VarCharVector) root.getVector("key");
+        keyVector.allocateNew();
+        keyVector.setSafe(0, "a".getBytes(StandardCharsets.UTF_8));
+        keyVector.setSafe(1, "b".getBytes(StandardCharsets.UTF_8));
+        keyVector.setNull(2);
+        root.setRowCount(3);
+        try (ArrowReader reader = ShardingEvaluator.evaluate(allocator, root, stringBucketSpec)) {
+          assertTrue(reader.loadNextBatch());
+          IntVector buckets = (IntVector) reader.getVectorSchemaRoot().getVector("key_bucket");
+          assertEquals(1, buckets.get(0));
+          assertEquals(5, buckets.get(1));
+          assertEquals(0, buckets.get(2));
+          assertFalse(reader.loadNextBatch());
+        }
+      }
     }
   }
 
@@ -262,7 +392,7 @@ public class MemWalTest {
 
       // Flushed generation overwrites id=2.
       String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
-      writeLookupDataset(allocator, genPath, new long[] {2}, "gen1").close();
+      writeFlushedGen(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
           new ShardSnapshot(shardId).withFlushedGeneration(1, "gen_1").withCurrentGeneration(2);
@@ -288,7 +418,7 @@ public class MemWalTest {
       dataset.initializeMemWal(new InitializeMemWalParams());
 
       String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
-      writeLookupDataset(allocator, genPath, new long[] {2}, "gen1").close();
+      writeFlushedGen(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
           new ShardSnapshot(shardId).withFlushedGeneration(1, "gen_1").withCurrentGeneration(2);

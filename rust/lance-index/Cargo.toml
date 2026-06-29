@@ -26,7 +26,6 @@ datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion.workspace = true
-deepsize.workspace = true
 dirs.workspace = true
 fst.workspace = true
 futures.workspace = true
@@ -38,16 +37,19 @@ itertools.workspace = true
 jieba-rs = { workspace = true, optional = true }
 jsonb.workspace = true
 lance-arrow.workspace = true
+lance-arrow-stats.workspace = true
 lance-core.workspace = true
 lance-datafusion.workspace = true
 lance-encoding.workspace = true
 lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
+lance-bitpacking.workspace = true
+libsais-rs = "0.2"
 lance-linalg.workspace = true
+lance-select.workspace = true
 lance-tokenizer.workspace = true
 lance-table.workspace = true
-libm.workspace = true
 log.workspace = true
 ndarray.workspace = true
 num-traits.workspace = true
@@ -55,6 +57,7 @@ object_store.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 rand.workspace = true
+regex-syntax.workspace = true
 roaring.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
@@ -67,9 +70,7 @@ crossbeam-queue.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 uuid.workspace = true
-twox-hash = "2.0"
 async-channel = "2.3.1"
-bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 rand_distr.workspace = true
 lance-datagen.workspace = true
 rangemap.workspace = true
@@ -96,9 +97,6 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof.workspace = true
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version

@@ -17,7 +17,11 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_linalg::distance::DistanceType;
 
-use super::exec::{BTreeIndexExec, FtsIndexExec, MemTableScanExec, VectorIndexExec};
+use super::exec::{
+    BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
+    MemTableScanExec, VectorIndexExec,
+};
+use crate::dataset::mem_wal::scanner::exec::validate_pk_types;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Vector search query parameters.
@@ -93,6 +97,11 @@ pub struct FtsQuery {
     /// WAND factor for early termination (0.0 to 1.0).
     /// 1.0 = full recall (default), <1.0 = faster but may miss low-scoring results.
     pub wand_factor: f32,
+    /// Whether to also search the mutable tail (rows written since the last
+    /// freeze). `true` (default) = read-your-writes; `false` = search only the
+    /// immutable frozen partitions (the Lucene model), trading read-recency for
+    /// query latency. See [`crate::dataset::mem_wal::index::SearchOptions`].
+    pub include_tail: bool,
 }
 
 /// Default maximum number of fuzzy expansions.
@@ -110,6 +119,7 @@ impl FtsQuery {
                 query: query.into(),
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -122,6 +132,7 @@ impl FtsQuery {
                 slop,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -140,6 +151,7 @@ impl FtsQuery {
                 must_not,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -158,6 +170,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -175,6 +188,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -193,6 +207,7 @@ impl FtsQuery {
                 max_expansions,
             },
             wand_factor: DEFAULT_WAND_FACTOR,
+            include_tail: true,
         }
     }
 
@@ -203,6 +218,13 @@ impl FtsQuery {
     /// - 0.0 = only return the absolute best match
     pub fn with_wand_factor(mut self, wand_factor: f32) -> Self {
         self.wand_factor = wand_factor.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set whether to search the mutable tail (read-your-writes) or only the
+    /// immutable frozen partitions (the Lucene model). Default `true`.
+    pub fn with_include_tail(mut self, include_tail: bool) -> Self {
+        self.include_tail = include_tail;
         self
     }
 }
@@ -342,6 +364,14 @@ impl MemTableScanner {
     pub fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
         self
+    }
+
+    /// The `max_visible_batch_position` snapshot this scanner latched at
+    /// construction. A downstream recency filter must key on this same snapshot
+    /// (not a fresh read of the IndexStore watermark, which a concurrent append
+    /// could have advanced) so it stays consistent with the rows the search saw.
+    pub fn max_visible_batch_position(&self) -> usize {
+        self.max_visible_batch_position
     }
 
     /// Include the _rowaddr column in output.
@@ -612,6 +642,21 @@ impl MemTableScanner {
         self
     }
 
+    /// Choose whether FTS searches the mutable tail (read-your-writes, default)
+    /// or only the immutable frozen partitions (the Lucene model — lower latency,
+    /// does not reflect rows written since the last freeze). Only applies when a
+    /// full-text query is set.
+    pub fn fts_include_tail(&mut self, include_tail: bool) -> &mut Self {
+        if let Some(ref mut q) = self.full_text_query {
+            q.include_tail = include_tail;
+        } else {
+            log::warn!(
+                "fts_include_tail is not set because full_text_query has not been called yet"
+            );
+        }
+        self
+    }
+
     /// Enable or disable index usage.
     pub fn use_index(&mut self, use_index: bool) -> &mut Self {
         self.use_index = use_index;
@@ -782,6 +827,55 @@ impl MemTableScanner {
         Ok(plan)
     }
 
+    /// Plan a newest-per-PK active-arm scan via `MemTableDedupScanExec` —
+    /// dedup runs before the predicate so a PK whose newest version fails the
+    /// filter cannot leak an older version that passes. Unlike
+    /// `plan_full_scan`, this never takes the BTree skip (dedup needs
+    /// every version) and never pushes a limit (the LSM caps results above
+    /// the cross-source merge).
+    pub async fn create_dedup_plan(&self, pk_columns: &[String]) -> Result<Arc<dyn ExecutionPlan>> {
+        validate_pk_types(&self.schema, pk_columns)?;
+
+        let pk_indices = pk_columns
+            .iter()
+            .map(|name| {
+                self.schema
+                    .column_with_name(name)
+                    .map(|(idx, _)| idx)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Primary key column '{}' not found in schema",
+                            name
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<usize>>>()?;
+
+        let projection_indices = self.compute_projection_indices()?;
+
+        // optimize_expr() must run before create_physical_expr() for type coercion.
+        let (filter_predicate, filter_expr) = if let Some(ref filter) = self.filter {
+            let planner = Planner::new(self.schema.clone());
+            let optimized = planner.optimize_expr(filter.clone())?;
+            let predicate = planner.create_physical_expr(&optimized)?;
+            (Some(predicate), Some(optimized))
+        } else {
+            (None, None)
+        };
+
+        Ok(Arc::new(MemTableDedupScanExec::new(
+            self.batch_store.clone(),
+            self.max_visible_batch_position,
+            projection_indices,
+            self.output_schema(),
+            pk_indices,
+            self.with_row_id,
+            self.with_row_address,
+            filter_predicate,
+            filter_expr,
+        )))
+    }
+
     /// Plan a BTree index query.
     ///
     /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
@@ -812,26 +906,39 @@ impl MemTableScanner {
 
     /// Plan a vector similarity search.
     ///
-    /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
-    /// queries only see indexed data. Falls back to full scan if no index exists.
+    /// Always emits a plan whose output schema includes `_distance`: dispatches
+    /// to [`VectorIndexExec`] when an HNSW exists for the column, otherwise to
+    /// [`MemTableBruteForceVectorExec`]. The brute-force arm exists because the
+    /// active memtable is the LSM's unindexed-rows path — when the HNSW config
+    /// hasn't reached this writer yet (cold-start, or rows written between an
+    /// index commit and the next memtable rotation), KNN must still produce
+    /// correct, distance-bearing results so the LSM-level merge stays sound.
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_vector_index(&query.column) {
-            return self.plan_full_scan().await;
-        }
-
         let max_visible = self.max_visible_batch_position;
         let projection_indices = self.compute_projection_indices()?;
+        let base_schema = self.base_output_schema();
 
-        let index_exec = VectorIndexExec::new(
-            self.batch_store.clone(),
-            self.indexes.clone(),
-            query.clone(),
-            max_visible,
-            projection_indices,
-            self.base_output_schema(),
-            self.with_row_id,
-        )?;
-        self.apply_post_index_ops(Arc::new(index_exec)).await
+        let exec: Arc<dyn ExecutionPlan> = if self.has_vector_index(&query.column) {
+            Arc::new(VectorIndexExec::new(
+                self.batch_store.clone(),
+                self.indexes.clone(),
+                query.clone(),
+                max_visible,
+                projection_indices,
+                base_schema,
+                self.with_row_id,
+            )?)
+        } else {
+            Arc::new(MemTableBruteForceVectorExec::new(
+                self.batch_store.clone(),
+                query.clone(),
+                max_visible,
+                projection_indices,
+                base_schema,
+                self.with_row_id,
+            )?)
+        };
+        self.apply_post_index_ops(exec).await
     }
 
     /// Plan a full-text search.
@@ -1451,5 +1558,46 @@ mod tests {
             assert_eq!(row_ids.value(i), i as u64);
             assert_eq!(row_addrs.value(i), i as u64);
         }
+    }
+
+    /// Regression: vector search against a column with no HNSW must still
+    /// emit a plan whose output schema contains `_distance`. The earlier
+    /// behaviour fell back to `plan_full_scan` (no `_distance`), which broke
+    /// the LSM caller's `sort_by_distance` chain. Now the planner dispatches
+    /// to `MemTableBruteForceVectorExec` instead — see
+    /// [`super::super::exec::MemTableBruteForceVectorExec`].
+    #[tokio::test]
+    async fn test_plan_vector_search_without_hnsw_produces_distance_schema() {
+        use std::sync::Arc;
+
+        const DISTANCE_COLUMN: &str = "_distance";
+
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let indexes = Arc::new(IndexStore::new()); // intentionally no HNSW
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
+        let query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(vec![0.0_f32, 0.0_f32]));
+        scanner.nearest("vector", query, 5);
+
+        let plan = scanner
+            .create_plan()
+            .await
+            .expect("planner must produce a plan when no HNSW exists");
+        let out_schema = plan.schema();
+        assert!(
+            out_schema.field_with_name(DISTANCE_COLUMN).is_ok(),
+            "plan output schema missing `{DISTANCE_COLUMN}` — got {:?}",
+            out_schema
+        );
     }
 }

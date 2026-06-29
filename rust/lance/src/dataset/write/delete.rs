@@ -11,8 +11,8 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{Error, ROW_ID, Result};
+use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 use std::collections::BTreeMap;

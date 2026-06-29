@@ -14,6 +14,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     List,
     Literal,
@@ -965,6 +966,24 @@ class LanceFragment(pa.dataset.Fragment):
             return None
         return raw_fragment.metadata()
 
+    def delete_rows(self, offsets: "Iterable[int]") -> FragmentMetadata | None:
+        """Delete rows by their local (within-fragment) physical row offsets.
+
+        Adds the given 0-based offsets to this fragment's deletion file and
+        returns a new fragment, or None if no rows are left. Unlike
+        :meth:`delete`, this deletes exactly the supplied rows without
+        re-evaluating a SQL predicate -- useful when the caller already knows
+        which rows to delete (e.g. offsets collected from a prior scan).
+
+        .. warning::
+
+            Internal API. This method is not intended to be used by end users.
+        """
+        raw_fragment = self._fragment.delete_rows([int(o) for o in offsets])
+        if raw_fragment is None:
+            return None
+        return raw_fragment.metadata()
+
     @property
     def schema(self) -> pa.Schema:
         """Return the schema of this fragment."""
@@ -1011,6 +1030,9 @@ if TYPE_CHECKING:
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        external_blob_mode: Literal["reference", "ingest"] = "reference",
+        allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> Transaction: ...
@@ -1033,6 +1055,9 @@ if TYPE_CHECKING:
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
+        base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+        external_blob_mode: Literal["reference", "ingest"] = "reference",
+        allow_external_blob_outside_bases: bool = False,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
     ) -> List[FragmentMetadata]: ...
@@ -1055,6 +1080,9 @@ def write_fragments(
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
     namespace_client: Optional[LanceNamespace] = None,
     table_id: Optional[List[str]] = None,
 ) -> List[FragmentMetadata] | Transaction:
@@ -1132,6 +1160,25 @@ def write_fragments(
 
         **Only valid in CREATE mode**. Will raise an error if used with
         APPEND/OVERWRITE modes.
+    base_store_params : dict of str to dict, optional
+        Runtime-only object store parameters keyed by exact base path URI.
+        Each value is a dict of storage options for that base. These settings
+        are not persisted to the manifest. When a base has no explicit entry,
+        top-level ``storage_options`` is used as a fallback. If ``dataset_uri``
+        is a LanceDataset and this is omitted, the dataset's base store params
+        are inherited.
+    external_blob_mode: {"reference", "ingest"}, default "reference"
+        How external blob URIs are handled on write.
+
+        - ``"reference"`` stores the URI as an external blob reference.
+        - ``"ingest"`` reads the external bytes during write and stores them in
+          Lance-managed storage using the normal inline / packed / dedicated
+          thresholds.
+    allow_external_blob_outside_bases: bool, default False
+        If False, external blob URIs must map to a registered non-dataset-root
+        base path. If True, external blob URIs outside registered bases are
+        allowed. Only valid when ``external_blob_mode="reference"``. Setting
+        this to True with ``"ingest"`` mode raises an error.
     namespace_client : optional, LanceNamespace
         A namespace client for automatic credential refresh. When provided with
         `table_id`, a storage options provider will be created automatically to
@@ -1173,6 +1220,10 @@ def write_fragments(
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
     elif isinstance(dataset_uri, LanceDataset):
+        if base_store_params is None:
+            base_store_params = dataset_uri._base_store_params
+        if storage_options is None:
+            storage_options = dataset_uri._storage_options
         dataset_uri = dataset_uri._ds
     elif not isinstance(dataset_uri, str):
         raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
@@ -1204,6 +1255,9 @@ def write_fragments(
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
         initial_bases=initial_bases,
+        base_store_params=base_store_params,
+        external_blob_mode=external_blob_mode,
+        allow_external_blob_outside_bases=allow_external_blob_outside_bases,
     )
 
 

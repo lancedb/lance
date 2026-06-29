@@ -23,7 +23,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use futures::stream::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use std::sync::Arc;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};

@@ -5,7 +5,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.vector import vec_to_table
+from lance.vector import hamming_clustering_for_sample, vec_to_table
 
 
 def test_dict():
@@ -147,3 +147,38 @@ def test_binary_vectors_invalid_metric(tmp_path):
                 "metric": "l2",
             }
         ).to_table()
+
+
+def _hash_table(hashes):
+    """Build a table with a ``hash`` column of FixedSizeList<UInt8, 8>.
+
+    ``hashes`` is a list of 8-byte sequences, one per row.
+    """
+    flat = [byte for row in hashes for byte in row]
+    values = pa.FixedSizeListArray.from_arrays(
+        pa.array(flat, type=pa.uint8()), list_size=8
+    )
+    return pa.Table.from_arrays([values], names=["hash"])
+
+
+def test_hamming_clustering_for_sample(tmp_path):
+    hash_a = [0, 0, 0, 0, 0, 0, 0, 0]
+    hash_b = [255, 0, 0, 0, 0, 0, 0, 0]  # 8 bits from hash_a
+    hash_c = [1, 2, 3, 4, 5, 6, 7, 8]  # far from both
+    # Rows 0,1,2 share hash_a; rows 3,4 share hash_b; row 5 is unique.
+    table = _hash_table([hash_a, hash_a, hash_a, hash_b, hash_b, hash_c])
+    dataset = lance.write_dataset(table, tmp_path / "hashes")
+
+    # threshold 0 => only exact-match hashes cluster together. Full scan
+    # (sample_size=None) yields deterministic row ids 0..5.
+    result = hamming_clustering_for_sample(dataset, "hash", None, 0).read_all()
+
+    clusters = {
+        rep: sorted(dups)
+        for rep, dups in zip(
+            result["representative"].to_pylist(),
+            result["duplicates"].to_pylist(),
+        )
+    }
+    # Singleton row 5 is not emitted as a cluster.
+    assert clusters == {0: [1, 2], 3: [4]}

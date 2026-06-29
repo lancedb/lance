@@ -31,20 +31,28 @@
 //! let stream = scanner.try_into_stream().await?;
 //! ```
 
+mod block_list;
 mod builder;
 mod collector;
 mod data_source;
 pub mod exec;
+pub(crate) mod flushed_cache;
+mod fts_search;
 mod planner;
 mod point_lookup;
 mod projection;
 mod vector_search;
 
+pub use block_list::write_pk_sidecar;
 pub use builder::LsmScanner;
 pub use collector::{
     ActiveMemTableRef, InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector,
 };
-pub use data_source::{FlushedGeneration, LsmDataSource, LsmGeneration, ShardSnapshot};
+pub use data_source::{
+    FlushedGeneration, FreshTierWatermark, LsmDataSource, LsmGeneration, ShardSnapshot,
+};
+pub use flushed_cache::{DatasetCache, FlushedMemTableCache, GenerationWarmer};
+pub use fts_search::{LsmFtsSearchPlanner, SCORE_COLUMN};
 pub use point_lookup::LsmPointLookupPlanner;
 pub use projection::DISTANCE_COLUMN;
 pub use vector_search::LsmVectorSearchPlanner;

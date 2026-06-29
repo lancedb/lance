@@ -27,7 +27,6 @@ async-trait.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 datafusion-common.workspace = true
-deepsize.workspace = true
 futures.workspace = true
 log.workspace = true
 num-traits.workspace = true
@@ -39,6 +38,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 lance-datagen.workspace = true
+lance-testing.workspace = true
 criterion.workspace = true
 rstest.workspace = true
 proptest.workspace = true
@@ -49,9 +49,6 @@ libc.workspace = true
 [build-dependencies]
 prost-build.workspace = true
 protobuf-src = { version = "2.1", optional = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { workspace = true }
 
 [features]
 protoc = ["dep:protobuf-src"]

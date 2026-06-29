@@ -35,7 +35,7 @@ jobs:
     name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.config.platform }} manylinux${{ matrix.config.manylinux }}
     strategy:
       matrix:
-        python-minor-version: ["9"]
+        python-minor-version: ["10"]
         config:
           - platform: x86_64
             manylinux: "2_17"
@@ -101,7 +101,7 @@ jobs:
     runs-on: ${{ matrix.config.runner }}
     strategy:
       matrix:
-        python-minor-version: ["9"]
+        python-minor-version: ["10"]
         config:
           - target: aarch64-apple-darwin
             runner: warp-macos-14-arm64-6x
@@ -152,7 +152,7 @@ jobs:
     runs-on: windows-latest-4x
     strategy:
       matrix:
-        python-minor-version: ["9"]
+        python-minor-version: ["10"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:

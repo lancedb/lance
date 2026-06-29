@@ -739,6 +739,9 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                     crate::dataset::WhenMatched::UpdateIf(condition) => {
                         format!("UpdateIf({})", condition)
                     }
+                    crate::dataset::WhenMatched::UpdateIfExpr(expr) => {
+                        format!("UpdateIf({})", expr.human_display())
+                    }
                     crate::dataset::WhenMatched::Fail => "Fail".to_string(),
                     crate::dataset::WhenMatched::Delete => "Delete".to_string(),
                 };
@@ -938,10 +941,14 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
                 merged_generations,
+                // Use the full pre-order field list (not just top-level `fields`) so
+                // that nested leaf field ids are included. A merge_insert rewrites whole
+                // rows, so every field is potentially modified; omitting nested ids would
+                // let `register_pure_rewrite_rows_update_frags_in_indices` wrongly extend a
+                // nested-field index over the rewritten fragment, silently dropping rows.
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),

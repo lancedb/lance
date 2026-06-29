@@ -7,8 +7,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
-use arrow::array::AsArray;
-use arrow::datatypes::UInt32Type;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::runtime::SpawnedTask;
@@ -32,9 +30,6 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::mask::{
-    RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
-};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
@@ -43,8 +38,11 @@ use lance_datafusion::utils::{
     ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
-use lance_index::scalar::expression::{FilterPlan, IndexExprResult};
+use lance_index::scalar::expression::FilterPlan;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_select::{
+    IndexExprResult, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
+};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
@@ -81,30 +79,7 @@ impl EvaluatedIndex {
     }
 
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
-        if batch.num_rows() != 2 {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Expected a batch with exactly 2 rows but there are {} rows",
-                    batch.num_rows()
-                )
-                .into(),
-            ));
-        }
-        if batch.num_columns() != 3 {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Expected a batch with exactly two columns but there are {} columns",
-                    batch.num_columns()
-                )
-                .into(),
-            ));
-        }
-        let row_addr_mask = RowAddrMask::from_arrow(batch.column(0).as_binary())?;
-        let match_type = batch.column(1).as_primitive::<UInt32Type>().values()[0];
-        let index_result = IndexExprResult::from_parts(row_addr_mask, match_type)?;
-
-        let applicable_fragments = batch.column(2).as_binary::<i32>();
-        let applicable_fragments = RoaringBitmap::deserialize_from(applicable_fragments.value(0))?;
+        let (index_result, applicable_fragments) = IndexExprResult::deserialize(batch)?;
 
         Ok(Self {
             index_result,
@@ -515,18 +490,31 @@ impl FilteredReadStream {
         evaluated_index: &Option<Arc<EvaluatedIndex>>,
         options: &FilteredReadOptions,
     ) -> FilteredReadInternalPlan {
-        // For pushing down scan_range_after_filter
+        // For pushing down scan_range_after_filter.
+        //
+        // This is only valid when there is no refine filter left to evaluate.  An exact scalar
+        // index result is exact for the indexed predicate, but not for the full predicate if a
+        // refine filter can still reject rows.
+        let can_push_down_scan_range_after_filter = options.refine_filter.is_none();
         let mut scan_planned_with_limit_pushed_down = false;
-        let mut to_skip = options
-            .scan_range_after_filter
-            .as_ref()
-            .map(|r| r.start)
-            .unwrap_or(0);
-        let mut to_take = options
-            .scan_range_after_filter
-            .as_ref()
-            .map(|r| r.end - r.start)
-            .unwrap_or(u64::MAX);
+        let mut to_skip = if can_push_down_scan_range_after_filter {
+            options
+                .scan_range_after_filter
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut to_take = if can_push_down_scan_range_after_filter {
+            options
+                .scan_range_after_filter
+                .as_ref()
+                .map(|r| r.end - r.start)
+                .unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
 
         // Full fragment ranges to read before applying scan_range_after_filter
         let mut fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
@@ -580,9 +568,10 @@ impl FilteredReadStream {
                 &mut to_take,
                 &mut fragments_to_read,
                 &mut scan_push_down_fragments_to_read,
+                options.only_indexed_fragments,
             );
 
-            if to_take == 0 {
+            if can_push_down_scan_range_after_filter && to_take == 0 {
                 scan_planned_with_limit_pushed_down = true;
                 fragments_to_read = scan_push_down_fragments_to_read;
                 break;
@@ -598,14 +587,17 @@ impl FilteredReadStream {
                     // Resolve filter for this fragment
                     let filter = if let Some(evaluated_index) = evaluated_index {
                         if evaluated_index.applicable_fragments.contains(fragment_id) {
-                            match &evaluated_index.index_result {
-                                IndexExprResult::Exact(_) => options.refine_filter.clone(),
-                                IndexExprResult::AtLeast(_)
-                                    if scan_planned_with_limit_pushed_down =>
-                                {
-                                    options.refine_filter.clone()
-                                }
-                                _ => options.full_filter.clone(),
+                            let r = &evaluated_index.index_result;
+                            // `Exact` results don't need a recheck. `AtLeast`
+                            // results can also skip recheck when the
+                            // skip/take pushdown is in play (we only read the
+                            // guaranteed-match ranges in that case).
+                            let can_skip_recheck = r.is_exact()
+                                || (r.is_at_least() && scan_planned_with_limit_pushed_down);
+                            if can_skip_recheck {
+                                options.refine_filter.clone()
+                            } else {
+                                options.full_filter.clone()
                             }
                         } else {
                             options.full_filter.clone()
@@ -706,6 +698,7 @@ impl FilteredReadStream {
         to_take: &mut u64,
         fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
         scan_push_down_fragments_to_read: &mut BTreeMap<u32, Vec<Range<u64>>>,
+        only_indexed_fragments: bool,
     ) {
         let fragment_id = fragment.id() as u32;
 
@@ -713,35 +706,49 @@ impl FilteredReadStream {
             if evaluated_index.applicable_fragments.contains(fragment_id) {
                 let _span = tracing::span!(tracing::Level::DEBUG, "apply_index_result").entered();
 
-                match &evaluated_index.index_result {
-                    IndexExprResult::Exact(row_addr_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, matched_ranges.clone());
+                let index_result = &evaluated_index.index_result;
+                if index_result.is_exact() {
+                    // lower == upper; either side gives the precise answer.
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.upper);
+                    let mut matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, matched_ranges.clone());
 
-                        Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
-                        scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
-                    }
-                    IndexExprResult::AtMost(row_addr_mask) => {
-                        // Cannot push down skip/take for AtMost
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, matched_ranges);
-                    }
-                    IndexExprResult::AtLeast(row_addr_mask) => {
-                        let valid_ranges = row_id_sequence.mask_to_offset_ranges(row_addr_mask);
-                        let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
-                        fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
+                    Self::apply_skip_take_to_ranges(&mut matched_ranges, to_skip, to_take);
+                    scan_push_down_fragments_to_read.insert(fragment_id, matched_ranges);
+                } else if index_result.is_at_least() {
+                    // upper is universe; lower is the guaranteed-match set
+                    // used for the skip/take push-down path.
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.lower);
+                    let mut guaranteed_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, guaranteed_ranges.clone());
 
-                        Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
-                        scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
-                    }
+                    Self::apply_skip_take_to_ranges(&mut guaranteed_ranges, to_skip, to_take);
+                    scan_push_down_fragments_to_read.insert(fragment_id, guaranteed_ranges);
+                } else {
+                    // AtMost or true Refined: read everything in `upper`
+                    // and rely on the full-filter recheck for survivors.
+                    //
+                    // For AtMost the index gives no lower bound, so there's
+                    // no skip/take push-down to do. For Refined the lower
+                    // bound *is* a guaranteed-match set, but exploiting it
+                    // requires per-range filter push-down (different filter
+                    // per range within a fragment), which the current plan
+                    // doesn't support. The recheck-skip opportunity on the
+                    // `lower` portion would also be visible up at the
+                    // `can_skip_recheck` block — both are deferred. See
+                    // TODO(refined-pushdown).
+                    let valid_ranges = row_id_sequence.mask_to_offset_ranges(&index_result.upper);
+                    let matched_ranges = Self::intersect_ranges(&to_read, &valid_ranges);
+                    fragments_to_read.insert(fragment_id, matched_ranges);
                 }
             } else {
-                // Fragment not indexed - add full fragment to unindexed_ranges
-                fragments_to_read.insert(fragment_id, to_read);
+                // Fragment not indexed.  Normally we add the full fragment to keep
+                // results complete.  Fast search intentionally accepts staleness.
+                if !only_indexed_fragments {
+                    fragments_to_read.insert(fragment_id, to_read);
+                }
             }
-        } else {
+        } else if !only_indexed_fragments {
             // No index at all - add full fragment to unindexed_ranges
             fragments_to_read.insert(fragment_id, to_read);
         }
@@ -990,6 +997,10 @@ impl FilteredReadStream {
                     base_batch_stream.boxed()
                 };
 
+                // Clone so the finally handler can record a final snapshot even when
+                // no output batches were produced (inspect_ok never fires in that case).
+                let global_metrics_final = global_metrics.clone();
+                let scan_scheduler_final = scan_scheduler.clone();
                 let batch_stream = batch_stream
                     .inspect_ok(move |batch| {
                         partition_metrics_clone
@@ -998,6 +1009,9 @@ impl FilteredReadStream {
                         global_metrics.io_metrics.record(&scan_scheduler);
                     })
                     .finally(move || {
+                        global_metrics_final
+                            .io_metrics
+                            .record(&scan_scheduler_final);
                         partition_metrics.baseline_metrics.done();
                     })
                     .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
@@ -1279,6 +1293,8 @@ pub struct FilteredReadOptions {
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
+    /// If true, skip fragments that are not covered by the scalar index result.
+    pub only_indexed_fragments: bool,
 }
 
 impl FilteredReadOptions {
@@ -1307,6 +1323,7 @@ impl FilteredReadOptions {
             refine_filter: None,
             full_filter: None,
             io_buffer_size_bytes: None,
+            only_indexed_fragments: false,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1457,6 +1474,12 @@ impl FilteredReadOptions {
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
     pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
         self.io_buffer_size_bytes = Some(io_buffer_size);
+        self
+    }
+
+    /// Only read fragments covered by a scalar index result.
+    pub fn with_only_indexed_fragments(mut self) -> Self {
+        self.only_indexed_fragments = true;
         self
     }
 }
@@ -1716,7 +1739,13 @@ impl FilteredReadExec {
         // Second, multiple partitions all share the same underlying task stream (see get_stream)
         let running_stream_lock = self.running_stream.clone();
         let dataset = self.dataset.clone();
-        let options = self.options.clone();
+        let target_partitions = context.session_config().target_partitions();
+        let mut options = self.options.clone();
+        if let FilteredReadThreadingMode::OnePartitionMultipleThreads(n) = options.threading_mode {
+            options.threading_mode = FilteredReadThreadingMode::OnePartitionMultipleThreads(
+                n.min(target_partitions).max(1),
+            );
+        }
         let batch_size_bytes = options
             .file_reader_options
             .as_ref()
@@ -2120,6 +2149,7 @@ mod tests {
         optimize::OptimizeOptions,
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
+    use lance_select::result::IndexExprResultWireFormat;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -2250,6 +2280,7 @@ mod tests {
                     Some(Arc::new(ScalarIndexExec::new(
                         self.dataset.clone(),
                         index_query,
+                        IndexExprResultWireFormat::default(),
                     )))
                 } else {
                     None
@@ -2343,6 +2374,53 @@ mod tests {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
+    }
+
+    /// Round-trip every interval shape through the arrow wire format and
+    /// confirm the endpoints survive. Exercises both
+    /// `IndexExprResult::serialize` and `EvaluatedIndex::try_from_arrow`
+    /// so the schema names stay in sync.
+    #[test]
+    fn test_index_expr_result_serialize_roundtrip() {
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        let mk = |rows: &[u64]| RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(rows));
+
+        let mut frags = RoaringBitmap::new();
+        frags.insert(0);
+        frags.insert(7);
+
+        let cases = vec![
+            ("exact", IndexExprResult::exact(mk(&[1, 2, 3]))),
+            ("at_most", IndexExprResult::at_most(mk(&[1, 2, 3]))),
+            ("at_least", IndexExprResult::at_least(mk(&[1, 2]))),
+            // Refined: non-empty lower strictly inside non-universe upper.
+            ("refined", IndexExprResult::new(mk(&[1, 2]), mk(&[1, 2, 3]))),
+        ];
+
+        for (name, original) in cases {
+            let batch = original
+                .serialize(&frags, IndexExprResultWireFormat::default())
+                .unwrap_or_else(|e| panic!("serialize {name}: {e}"));
+            let decoded = EvaluatedIndex::try_from_arrow(&batch)
+                .unwrap_or_else(|e| panic!("try_from_arrow {name}: {e}"));
+
+            // The underlying RowAddrTreeMap is PartialEq; compare via mask
+            // emptiness + symmetric difference being empty would be more
+            // robust, but the canonical builders preserve representation.
+            assert_eq!(
+                decoded.index_result.lower, original.lower,
+                "{name}: lower endpoint changed across round-trip",
+            );
+            assert_eq!(
+                decoded.index_result.upper, original.upper,
+                "{name}: upper endpoint changed across round-trip",
+            );
+            assert_eq!(
+                decoded.applicable_fragments, frags,
+                "{name}: applicable fragments changed across round-trip",
+            );
+        }
     }
 
     #[test_log::test(tokio::test)]
@@ -2961,6 +3039,34 @@ mod tests {
             let result = plan.with_fetch(None);
             assert!(result.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_with_fetch_limit_after_scalar_index_refine_filter() {
+        let fixture = Arc::new(TestFixture::new().await);
+        let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let filter_plan = fixture
+            .filter_plan("fully_indexed < 50 AND not_indexed >= 10", true)
+            .await;
+        let options = base_options.with_filter_plan(filter_plan);
+        let plan = fixture.make_plan(options).await;
+
+        assert!(plan.index_input.is_some());
+        assert!(plan.options().refine_filter.is_some());
+
+        let limited_plan = plan.with_fetch(Some(10)).unwrap();
+        let limited_plan = limited_plan
+            .as_any()
+            .downcast_ref::<FilteredReadExec>()
+            .unwrap();
+        assert_eq!(limited_plan.options().scan_range_after_filter, Some(0..10));
+
+        let stream = limited_plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let actual_values = get_fully_indexed_values(batches).await;
+        assert_eq!(actual_values, (10..20).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -3623,6 +3729,55 @@ mod tests {
         assert!(iops > 0, "Should have recorded IO operations");
     }
 
+    // Reproduces a bug where bytes_read (and iops/requests) stay at 0 when a filter matches
+    // no rows. io_metrics.record is only called inside inspect_ok on the output batch stream,
+    // so when the filter produces zero output batches, the I/O that did occur is never counted.
+    #[tokio::test]
+    async fn test_io_metrics_recorded_when_filter_matches_no_rows() {
+        let fixture = TestFixture::new().await;
+        // not_indexed values in the fixture go up to ~400; this filter matches nothing
+        let filter_plan = fixture.filter_plan("not_indexed > 10000", false).await;
+        let options =
+            FilteredReadOptions::basic_full_read(&fixture.dataset).with_filter_plan(filter_plan);
+        let filtered_read =
+            Arc::new(FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap());
+
+        let batches = filtered_read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            0,
+            "filter should match no rows"
+        );
+
+        let metrics = filtered_read.metrics().unwrap();
+
+        let rows_scanned = metrics
+            .sum_by_name("rows_scanned")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            rows_scanned > 0,
+            "rows_scanned ({}) should be > 0: data was read even though filter matched nothing",
+            rows_scanned
+        );
+
+        let bytes_read = metrics
+            .sum_by_name("bytes_read")
+            .map(|v| v.as_usize())
+            .unwrap_or(0);
+        assert!(
+            bytes_read > 0,
+            "bytes_read ({}) should be > 0: io_metrics.record is only called when output batches \
+             are produced, so bytes_read stays 0 even though I/O occurred",
+            bytes_read
+        );
+    }
+
     /// Test that direct execution gives the same result as get_plan + execute_with_plan
     #[test_log::test(tokio::test)]
     async fn test_plan_round_trip() {
@@ -3704,5 +3859,38 @@ mod tests {
         for i in 0..result1.num_columns() {
             assert_eq!(result1.column(i).as_ref(), result3.column(i).as_ref());
         }
+    }
+
+    /// Verify that executing with target_partitions=1 produces the same results as the default
+    /// context and does not panic. This is a regression guard for the parallelism cap.
+    #[test_log::test(tokio::test)]
+    async fn test_target_partitions_cap_produces_correct_results() {
+        use datafusion::prelude::SessionConfig;
+
+        let fixture = TestFixture::new().await;
+
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset);
+        let plan =
+            FilteredReadExec::try_new(fixture.dataset.clone(), options.clone(), None).unwrap();
+
+        // Execute with default context (high thread count)
+        let default_ctx = Arc::new(TaskContext::default());
+        let stream = plan.execute(0, default_ctx).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let default_result = concat_batches(&schema, &batches).unwrap();
+
+        // Execute fresh plan with target_partitions=1
+        let plan2 = FilteredReadExec::try_new(fixture.dataset.clone(), options, None).unwrap();
+        let low_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::default().with_target_partitions(1)),
+        );
+        let stream2 = plan2.execute(0, low_ctx).unwrap();
+        let schema2 = stream2.schema();
+        let batches2 = stream2.try_collect::<Vec<_>>().await.unwrap();
+        let capped_result = concat_batches(&schema2, &batches2).unwrap();
+
+        assert_eq!(default_result.num_rows(), capped_result.num_rows());
     }
 }

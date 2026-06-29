@@ -337,7 +337,9 @@ pub async fn rewrite_files_binary_copy(
                         }
                         batch_counts.push(current_page.buffer_offsets_and_sizes.len());
                         for (offset, size) in current_page.buffer_offsets_and_sizes.iter() {
-                            batch_ranges.push((*offset)..(*offset + *size));
+                            if *size > 0 {
+                                batch_ranges.push((*offset)..(*offset + *size));
+                            }
                         }
                         batch_bytes += page_bytes;
                         batch_pages += 1;
@@ -360,15 +362,25 @@ pub async fn rewrite_files_binary_copy(
                         // Therefore `page_index - batch_pages + local_idx` yields the exact
                         // source page we are currently materializing, allowing us to access
                         // its metadata (encoding, row count, buffers) for the new page entry.
-                        let page =
-                            &src_column_info.page_infos[page_index - batch_pages + local_idx];
+                        let page_idx = page_index - batch_pages + local_idx;
+                        let page = &src_column_info.page_infos[page_idx];
                         let mut new_offsets = Vec::with_capacity(*buffer_count);
-                        for _ in 0..*buffer_count {
-                            if let Some(bytes) = bytes_iter.next() {
-                                let writer = current_writer.as_mut().unwrap().as_mut();
-                                current_pos =
-                                    apply_alignment_padding(writer, current_pos, version).await?;
-                                let start = current_pos;
+                        for (buffer_idx, (_, size)) in
+                            page.buffer_offsets_and_sizes.iter().enumerate()
+                        {
+                            let writer = current_writer.as_mut().unwrap().as_mut();
+                            current_pos =
+                                apply_alignment_padding(writer, current_pos, version).await?;
+                            let start = current_pos;
+                            if *size == 0 {
+                                new_offsets.push((start, 0));
+                            } else {
+                                let bytes = bytes_iter.next().ok_or_else(|| {
+                                    Error::execution(format!(
+                                        "binary copy: missing page buffer bytes while rewriting data file \
+                                         (column {col_idx}, page {page_idx}, buffer {buffer_idx}, expected size {size})",
+                                    ))
+                                })?;
                                 writer.write_all(&bytes).await?;
                                 current_pos += bytes.len() as u64;
                                 new_offsets.push((start, bytes.len() as u64));
@@ -410,16 +422,34 @@ pub async fn rewrite_files_binary_copy(
                     let ranges: Vec<Range<u64>> = src_column_info
                         .buffer_offsets_and_sizes
                         .iter()
+                        .filter(|(_, size)| *size > 0)
                         .map(|(offset, size)| (*offset)..(*offset + *size))
                         .collect();
-                    let bytes_vec = file_scheduler.submit_request(ranges, 0).await?;
-                    for bytes in bytes_vec.into_iter() {
+                    let bytes_vec = if ranges.is_empty() {
+                        Vec::new()
+                    } else {
+                        file_scheduler.submit_request(ranges, 0).await?
+                    };
+                    let mut bytes_iter = bytes_vec.into_iter();
+                    for (buffer_idx, (_, size)) in
+                        src_column_info.buffer_offsets_and_sizes.iter().enumerate()
+                    {
                         let writer = current_writer.as_mut().unwrap().as_mut();
                         current_pos = apply_alignment_padding(writer, current_pos, version).await?;
                         let start = current_pos;
-                        writer.write_all(&bytes).await?;
-                        current_pos += bytes.len() as u64;
-                        col_buffers[col_idx].push((start, bytes.len() as u64));
+                        if *size == 0 {
+                            col_buffers[col_idx].push((start, 0));
+                        } else {
+                            let bytes = bytes_iter.next().ok_or_else(|| {
+                                Error::execution(format!(
+                                    "binary copy: missing column buffer bytes while rewriting data file \
+                                     (column {col_idx}, buffer {buffer_idx}, expected size {size})",
+                                ))
+                            })?;
+                            writer.write_all(&bytes).await?;
+                            current_pos += bytes.len() as u64;
+                            col_buffers[col_idx].push((start, bytes.len() as u64));
+                        }
                     }
                 }
             } // finished all columns in the current source file

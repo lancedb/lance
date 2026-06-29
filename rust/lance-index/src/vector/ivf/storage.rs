@@ -4,9 +4,9 @@
 use std::ops::Range;
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt32Array};
-use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
@@ -41,10 +41,10 @@ pub struct IvfModel {
 }
 
 impl DeepSizeOf for IvfModel {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.centroids
             .as_ref()
-            .map(|centroids| centroids.get_array_memory_size())
+            .map(|centroids| (centroids as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or_default()
             + self.lengths.deep_size_of_children(context)
             + self.offsets.deep_size_of_children(context)

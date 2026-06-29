@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     Any,
@@ -20,6 +21,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Self,
     Sequence,
@@ -63,7 +65,6 @@ from .fragment import (
 )
 from .indices import IndexDescription as IndexDescription
 from .indices import IndexSegment as IndexSegment
-from .indices import IndexSegmentPlan as IndexSegmentPlan
 from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
@@ -93,6 +94,26 @@ class CleanupStats:
     transaction_files_removed: int
     index_files_removed: int
     deletion_files_removed: int
+
+class CleanupCandidateFile:
+    path: str
+    kind: str
+    unverified: bool
+    size_bytes: int
+
+class CleanupReferencedBranch:
+    name: str
+    referenced_version: int
+    cleanup_candidate: bool
+
+class CleanupExplanation:
+    read_version: int
+    stats: CleanupStats
+    candidate_files: List[CleanupCandidateFile]
+    candidate_files_truncated: bool
+    candidate_file_limit: int
+    referenced_branches: List[CleanupReferencedBranch]
+    warnings: List[str]
 
 class LanceFileWriter:
     def __init__(
@@ -134,6 +155,11 @@ class LanceFileSession:
     ) -> LanceFileWriter: ...
     def contains(self, path: str) -> bool: ...
     def list(self, path: Optional[str] = None) -> List[str]: ...
+    def list_with_delimiter(
+        self, path: Optional[str] = None
+    ) -> tuple[List[str], List[str]]: ...
+    def read_range(self, path: str, offset: int, length: int) -> bytes: ...
+    def delete_file(self, path: str) -> None: ...
     def upload_file(self, local_path: str, remote_path: str) -> None: ...
     def download_file(self, remote_path: str, local_path: str) -> None: ...
 
@@ -191,14 +217,6 @@ class LanceColumnStatistics:
 class _Session:
     def size_bytes(self) -> int: ...
 
-class IndexSegmentBuilder:
-    def with_index_type(self, index_type: str) -> Self: ...
-    def with_segments(self, segments: List[Index]) -> Self: ...
-    def with_target_segment_bytes(self, bytes: int) -> Self: ...
-    def plan(self) -> List[IndexSegmentPlan]: ...
-    def build(self, plan: IndexSegmentPlan) -> IndexSegment: ...
-    def build_all(self) -> List[IndexSegment]: ...
-
 class LanceBlobFile:
     def close(self): ...
     def is_closed(self) -> bool: ...
@@ -233,10 +251,12 @@ class _Dataset:
     def replace_field_metadata(self, field_name: str, metadata: Dict[str, str]): ...
     @property
     def data_storage_version(self) -> str: ...
+    @property
+    def has_stable_row_ids(self) -> bool: ...
     def index_statistics(self, index_name: str) -> str: ...
     def serialized_manifest(self) -> bytes: ...
-    def load_indices(self) -> List[Index]: ...
     def describe_indices(self) -> List[IndexDescription]: ...
+    def remap_row_addrs(self, addrs: pa.Array) -> Optional[pa.Array]: ...
     def scanner(
         self,
         columns: Optional[List[str]] = None,
@@ -253,6 +273,7 @@ class _Dataset:
         fragment_readahead: Optional[int] = None,
         scan_in_order: Optional[bool] = None,
         fragments: Optional[List[_Fragment]] = None,
+        index_segments: Optional[List[str]] = None,
         with_row_id: Optional[bool] = None,
         with_row_address: Optional[bool] = None,
         use_stats: Optional[bool] = None,
@@ -349,11 +370,22 @@ class _Dataset:
     def restore(self): ...
     def cleanup_old_versions(
         self,
-        older_than_micros: int,
+        older_than_micros: Optional[int] = None,
+        retain_versions: Optional[int] = None,
         delete_unverified: Optional[bool] = None,
         error_if_tagged_old_versions: Optional[bool] = None,
         delete_rate_limit: Optional[int] = None,
     ) -> CleanupStats: ...
+    def explain_cleanup_old_versions(
+        self,
+        older_than_micros: Optional[int] = None,
+        retain_versions: Optional[int] = None,
+        delete_unverified: Optional[bool] = None,
+        error_if_tagged_old_versions: Optional[bool] = None,
+        delete_rate_limit: Optional[int] = None,
+        include_files: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupExplanation: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
     def tags(self) -> Dict[str, Tag]: ...
@@ -409,7 +441,6 @@ class _Dataset:
         batch_readhead: Optional[int] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ): ...
-    def create_index_segment_builder(self) -> IndexSegmentBuilder: ...
     def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
     def commit_existing_index_segments(
         self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
@@ -438,6 +469,7 @@ class _Dataset:
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
         enable_stable_row_ids: Optional[bool] = None,
+        commit_timeout: Optional[timedelta] = None,
         **kwargs,
     ) -> _Dataset: ...
     @staticmethod
@@ -449,6 +481,7 @@ class _Dataset:
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = None,
         max_retries: Optional[int] = None,
+        commit_timeout: Optional[timedelta] = None,
     ) -> Tuple[_Dataset, Transaction]: ...
     def validate(self): ...
     def migrate_manifest_paths_v2(self): ...
@@ -467,6 +500,27 @@ class _Dataset:
     def get_transactions(
         self, recent_transactions=10
     ) -> List[Optional[Transaction]]: ...
+    def hamming_clustering_for_ivf_partition(
+        self,
+        index_name: str,
+        partition_id: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def get_ivf_partition_info(self, index_name: str) -> List[dict]: ...
+    def hamming_clustering_for_sample(
+        self,
+        column: str,
+        sample_size: Optional[int],
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
+    def hamming_clustering_for_range(
+        self,
+        column: str,
+        fragment_id: int,
+        start_row: int,
+        num_rows: int,
+        hamming_threshold: int,
+    ) -> pa.RecordBatchReader: ...
 
 class _MergeInsertBuilder:
     def __init__(self, dataset: _Dataset, on: str | Iterable[str]): ...
@@ -480,7 +534,7 @@ class _Scanner:
     @property
     def schema(self) -> pa.Schema: ...
     def explain_plan(self, verbose: bool) -> str: ...
-    def analyze_plan(self) -> str: ...
+    def analyze_plan(self, count_rows: bool = False) -> str: ...
     def count_rows(self) -> int: ...
     def to_pyarrow(self) -> pa.RecordBatchReader: ...
 
@@ -532,6 +586,7 @@ class _Fragment:
         batch_size: Optional[int],
     ) -> Tuple[FragmentMetadata, LanceSchema]: ...
     def delete(self, predicate: str) -> Optional[_Fragment]: ...
+    def delete_rows(self, offsets: List[int]) -> Optional[_Fragment]: ...
     def schema(self) -> pa.Schema: ...
     def data_files(self) -> List[DataFile]: ...
     def deletion_file(self) -> Optional[str]: ...
@@ -559,6 +614,11 @@ def _write_fragments(
     namespace_client: Optional[LanceNamespace],
     table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List[Any]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ): ...
 def _write_fragments_transaction(
     dataset_uri: str | Path | _Dataset,
@@ -573,11 +633,92 @@ def _write_fragments_transaction(
     namespace_client: Optional[LanceNamespace],
     table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
+    target_bases: Optional[List[str]] = None,
+    initial_bases: Optional[List[Any]] = None,
+    base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
+    external_blob_mode: Literal["reference", "ingest"] = "reference",
+    allow_external_blob_outside_bases: bool = False,
 ) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...
 def _parse_field_path(path: str) -> list[str]: ...
 def _format_field_path(segments: list[str]) -> str: ...
+def _evaluate_sharding_spec(
+    batch: pa.RecordBatch,
+    spec: Dict[str, Any],
+    schema: LanceSchema,
+) -> pa.RecordBatch: ...
+
+class _MergedGeneration:
+    shard_id: str
+    generation: int
+    def __init__(self, shard_id: str, generation: int) -> None: ...
+
+class _ShardSnapshot:
+    shard_id: str
+    def __init__(self, shard_id: str) -> None: ...
+    def with_spec_id(self, spec_id: int) -> Self: ...
+    def with_current_generation(self, generation: int) -> Self: ...
+    def with_flushed_generation(self, generation: int, path: str) -> Self: ...
+
+class _ShardWriter:
+    shard_id: str
+    def put(self, data: Any) -> None: ...
+    def close(self) -> None: ...
+    def stats(self) -> Dict[str, Any]: ...
+    def memtable_stats(self) -> Dict[str, Any]: ...
+    def lsm_scanner(
+        self, shard_snapshots: Optional[List[_ShardSnapshot]] = None
+    ) -> _LsmScanner: ...
+
+class _LsmScanner:
+    @staticmethod
+    def from_snapshots(
+        dataset: _Dataset, shard_snapshots: List[_ShardSnapshot]
+    ) -> _LsmScanner: ...
+    def project(self, columns: List[str]) -> Self: ...
+    def filter(self, expr: str) -> Self: ...
+    def limit(self, n: int, offset: Optional[int] = None) -> Self: ...
+    def with_row_address(self) -> Self: ...
+    def with_memtable_gen(self) -> Self: ...
+    def to_batch(self) -> pa.RecordBatch: ...
+    def to_batches(self) -> List[pa.RecordBatch]: ...
+    def count_rows(self) -> int: ...
+
+class _ExecutionPlan:
+    schema: pa.Schema
+    dataset_schema: pa.Schema
+    def explain(self) -> str: ...
+    def to_reader(self) -> pa.RecordBatchReader: ...
+    def to_batches(self) -> List[pa.RecordBatch]: ...
+
+class _LsmPointLookupPlanner:
+    def __init__(
+        self,
+        dataset: _Dataset,
+        shard_snapshots: List[_ShardSnapshot],
+        pk_columns: Optional[List[str]] = None,
+    ) -> None: ...
+    def plan_lookup(
+        self, pk_value: pa.Array, columns: Optional[List[str]] = None
+    ) -> _ExecutionPlan: ...
+
+class _LsmVectorSearchPlanner:
+    def __init__(
+        self,
+        dataset: _Dataset,
+        shard_snapshots: List[_ShardSnapshot],
+        vector_column: str,
+        pk_columns: Optional[List[str]] = None,
+        distance_type: Optional[str] = None,
+    ) -> None: ...
+    def plan_search(
+        self,
+        query: pa.Array,
+        k: int = 10,
+        nprobes: int = 20,
+        columns: Optional[List[str]] = None,
+    ) -> _ExecutionPlan: ...
 
 class _Hnsw:
     @staticmethod

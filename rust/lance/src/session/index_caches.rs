@@ -12,8 +12,8 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use deepsize::{Context, DeepSizeOf};
 use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
@@ -63,14 +63,14 @@ impl Deref for DSIndexCache {
 
 impl DSIndexCache {
     /// Create an index-specific cache with the given UUID prefix.
-    pub fn for_index(&self, uuid: &str, fri_uuid: Option<&Uuid>) -> LanceCache {
+    pub fn for_index(&self, uuid: &Uuid, fri_uuid: Option<&Uuid>) -> LanceCache {
         if let Some(fri_uuid) = fri_uuid {
             // If a FRI UUID is provided, use it to create a more specific cache key.
             let cache_key = format!("{}-{}", uuid, fri_uuid);
             self.0.with_key_prefix(&cache_key)
         } else {
             // Otherwise, just use the index UUID as the key prefix.
-            self.0.with_key_prefix(uuid)
+            self.0.with_key_prefix(&uuid.to_string())
         }
     }
 }
@@ -79,7 +79,7 @@ impl DSIndexCache {
 
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
-    pub uuid: &'a str,
+    pub uuid: &'a Uuid,
 }
 
 impl CacheKey for FragReuseIndexKey<'_> {
@@ -131,7 +131,7 @@ impl DeepSizeOf for ProstAny {
 /// what they are.  These we cache.
 #[derive(Debug)]
 pub struct ScalarIndexDetailsKey<'a> {
-    pub uuid: &'a str,
+    pub uuid: &'a Uuid,
 }
 
 impl CacheKey for ScalarIndexDetailsKey<'_> {

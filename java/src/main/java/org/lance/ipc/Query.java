@@ -32,6 +32,7 @@ public class Query {
   private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
   private final int queryParallelism;
+  private final ApproxMode approxMode;
 
   private Query(Builder builder) {
     this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
@@ -52,6 +53,7 @@ public class Query {
     this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
     this.queryParallelism = builder.queryParallelism;
+    this.approxMode = builder.approxMode;
   }
 
   public String getColumn() {
@@ -98,6 +100,14 @@ public class Query {
     return queryParallelism;
   }
 
+  public ApproxMode getApproxMode() {
+    return approxMode;
+  }
+
+  public String getApproxModeString() {
+    return approxMode.toRustString();
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -111,6 +121,7 @@ public class Query {
         .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
         .add("queryParallelism", queryParallelism)
+        .add("approxMode", approxMode)
         .toString();
   }
 
@@ -125,6 +136,7 @@ public class Query {
     private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
     private int queryParallelism = 0;
+    private ApproxMode approxMode = ApproxMode.NORMAL;
 
     /**
      * Sets the column to be searched.
@@ -139,6 +151,10 @@ public class Query {
 
     /**
      * Sets the vector to be searched.
+     *
+     * <p>This API accepts a single query vector. The array length must match the target vector
+     * column dimension. Batch nearest-neighbor search with multiple query vectors requires a
+     * list-shaped query input and is not available through this {@code float[]} entry point.
      *
      * @param key The search vector.
      * @return The Builder instance for method chaining.
@@ -268,6 +284,20 @@ public class Query {
       Preconditions.checkArgument(
           queryParallelism >= -1, "Query parallelism must be greater than or equal to -1");
       this.queryParallelism = queryParallelism;
+      return this;
+    }
+
+    /**
+     * Sets the speed / accuracy tradeoff for approximate vector search.
+     *
+     * <p>This setting currently only affects RQ-quantized vector indexes, such as IVF_RQ. Other
+     * index types ignore this setting.
+     *
+     * @param approxMode The approximate search mode to use for the query.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setApproxMode(ApproxMode approxMode) {
+      this.approxMode = Preconditions.checkNotNull(approxMode, "ApproxMode must not be null");
       return this;
     }
 

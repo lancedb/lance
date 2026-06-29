@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
@@ -40,6 +41,8 @@ import org.lance.operation.UpdateMap;
 import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceSchema;
 import org.lance.schema.SqlExpressions;
+import org.lance.update.UpdateParams;
+import org.lance.update.UpdateResult;
 import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -1150,44 +1153,6 @@ public class Dataset implements Closeable {
   private native void innerMergeIndexMetadata(
       String indexUUID, int indexType, Optional<Integer> batchReadHead);
 
-  /**
-   * Build physical vector index segments from previously-created fragment-level index outputs.
-   *
-   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
-   *     fragmentIds are provided
-   * @param indexType concrete index type for the staged segments
-   * @param targetSegmentBytes optional size target for merged physical segments
-   * @return built physical segment metadata
-   */
-  public List<Index> buildIndexSegments(
-      List<Index> segments, IndexType indexType, Optional<Long> targetSegmentBytes) {
-    Preconditions.checkNotNull(segments, "segments cannot be null");
-    Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
-    Preconditions.checkNotNull(indexType, "indexType cannot be null");
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeBuildIndexSegments(segments, indexType.getValue(), targetSegmentBytes);
-    }
-  }
-
-  /**
-   * Build physical vector index segments from previously-created fragment-level index outputs.
-   *
-   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
-   *     fragmentIds are provided
-   * @param targetSegmentBytes optional size target for merged physical segments
-   * @return built physical segment metadata
-   */
-  @Deprecated
-  public List<Index> buildIndexSegments(List<Index> segments, Optional<Long> targetSegmentBytes) {
-    throw new IllegalArgumentException(
-        "buildIndexSegments now requires an explicit index type; call "
-            + "buildIndexSegments(segments, indexType, targetSegmentBytes)");
-  }
-
-  private native List<Index> nativeBuildIndexSegments(
-      List<Index> segments, int indexType, Optional<Long> targetSegmentBytes);
-
   /** Merge one caller-defined group of existing uncommitted vector index segments. */
   public Index mergeExistingIndexSegments(List<Index> segments) {
     Preconditions.checkNotNull(segments, "segments cannot be null");
@@ -2033,6 +1998,44 @@ public class Dataset implements Closeable {
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   /**
+   * Update column values for rows matching an optional predicate.
+   *
+   * <p>This is similar to SQL's {@code UPDATE} statement: the entries of {@link
+   * UpdateParams#updates()} map target column names to SQL expressions evaluated for every row that
+   * satisfies {@link UpdateParams#whereClause()}. If no predicate is provided, every row is
+   * updated.
+   *
+   * <p>The predicate may reference dataset columns as well as the system columns {@code _rowid},
+   * {@code _rowaddr}, and {@code _rowoffset}, allowing rows to be targeted by stable row id (e.g.
+   * {@code "_rowid IN (1, 2, 3)"}).
+   *
+   * <p>This call does not mutate the current {@code Dataset} instance: it still references the
+   * pre-update version. Callers should close this {@code Dataset} and switch to {@link
+   * UpdateResult#getDataset()}, which holds the newly committed version.
+   *
+   * @param params update parameters
+   * @return UpdateResult containing the new committed Dataset and the number of rows updated.
+   */
+  public UpdateResult update(UpdateParams params) {
+    Preconditions.checkNotNull(params, "params must not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      UpdateResult result = nativeUpdate(params);
+
+      Dataset newDataset = result.getDataset();
+      if (selfManagedAllocator) {
+        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
+      } else {
+        newDataset.allocator = allocator;
+      }
+
+      return result;
+    }
+  }
+
+  private native UpdateResult nativeUpdate(UpdateParams params);
+
+  /**
    * Initialize MemWAL on this dataset.
    *
    * <p>Must be called once before any call to {@link #memWalWriter}. Append-only tables may omit
@@ -2146,12 +2149,30 @@ public class Dataset implements Closeable {
       String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
 
   /**
+   * Create a cleanup operation for the specified policy.
+   *
+   * <p>Use {@link CleanupOperation#explain()} to inspect what cleanup would remove without deleting
+   * files, or {@link CleanupOperation#execute()} to perform cleanup.
+   *
+   * @param policy cleanup policy
+   * @return cleanup operation
+   */
+  public CleanupOperation cleanup(CleanupPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    return new CleanupOperation(this, policy);
+  }
+
+  /**
    * Cleanup dataset based on a specified policy.
    *
    * @param policy cleanup policy
    * @return removal stats
    */
   public RemovalStats cleanupWithPolicy(CleanupPolicy policy) {
+    return cleanup(policy).execute();
+  }
+
+  RemovalStats executeCleanup(CleanupPolicy policy) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeCleanupWithPolicy(policy);
@@ -2159,4 +2180,14 @@ public class Dataset implements Closeable {
   }
 
   private native RemovalStats nativeCleanupWithPolicy(CleanupPolicy policy);
+
+  CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles);
+    }
+  }
+
+  private native CleanupExplanation nativeExplainCleanupWithPolicy(
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles);
 }

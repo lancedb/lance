@@ -26,6 +26,8 @@ import org.lance.namespace.model.AnalyzeTableQueryPlanRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsResponse;
 import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CreateMaterializedViewRequest;
+import org.lance.namespace.model.CreateMaterializedViewResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateNamespaceResponse;
 import org.lance.namespace.model.CreateTableIndexRequest;
@@ -663,6 +665,15 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
+  public CreateMaterializedViewResponse createMaterializedView(
+      CreateMaterializedViewRequest request) {
+    ensureInitialized();
+    String requestJson = toJson(request);
+    String responseJson = createMaterializedViewNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, CreateMaterializedViewResponse.class);
+  }
+
+  @Override
   public void close() {
     if (nativeDirectoryNamespaceHandle != 0) {
       releaseNative(nativeDirectoryNamespaceHandle);
@@ -829,6 +840,8 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   private native String deleteTableTagNative(long handle, String requestJson);
 
   private native String updateTableTagNative(long handle, String requestJson);
+
+  private native String createMaterializedViewNative(long handle, String requestJson);
 
   private native Map<String, Long> retrieveOpsMetricsNative(long handle);
 

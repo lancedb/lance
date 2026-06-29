@@ -1031,6 +1031,7 @@ class TestWriteFragmentsWithTargetBases:
             dataset,
             mode="append",
             target_bases=["base2"],
+            base_store_params={self.base2_uri: {}},
             max_rows_per_file=25,
         )
 
@@ -1053,6 +1054,42 @@ class TestWriteFragmentsWithTargetBases:
         base2_path = Path(self.base2_uri)
         data_files = list(base2_path.glob("**/*.lance"))
         assert len(data_files) > 0, "Expected data files in base2"
+
+    def test_write_fragments_with_base_store_params(self):
+        """Test write_fragments inherits base_store_params from LanceDataset."""
+        initial_data = pd.DataFrame({"id": range(10), "value": range(10)})
+
+        dataset = lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.base1_uri, name="base1"),
+                DatasetBasePath(self.base2_uri, name="base2"),
+            ],
+            target_bases=["base1"],
+            base_store_params={self.base2_uri: {}},
+            max_rows_per_file=10,
+        )
+
+        fragment_data = pd.DataFrame({"id": range(10, 20), "value": range(10, 20)})
+        fragments = write_fragments(
+            pa.Table.from_pandas(fragment_data),
+            dataset,
+            mode="append",
+            target_bases=["base2"],
+            max_rows_per_file=10,
+        )
+
+        operation = lance.LanceOperation.Append(fragments)
+        dataset = lance.LanceDataset.commit(
+            dataset, operation, read_version=dataset.version
+        )
+
+        result = dataset.to_table().to_pandas()
+        assert len(result) == 20
+        assert set(result["id"]) == set(range(20))
+        assert list(Path(self.base2_uri).glob("**/*.lance"))
 
     def test_write_fragments_transaction_with_target_bases(self):
         """Test write_fragments with return_transaction and target_bases."""

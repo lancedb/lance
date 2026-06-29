@@ -93,9 +93,9 @@ if [[ "${BRANCH}" == "main" ]] && [[ "${CURRENT_VERSION}" =~ -beta\.[0-9]+$ ]]; 
                 bump-my-version bump -vv --new-version "${NEXT_VERSION}" --no-tag patch
 
                 # Update Cargo.lock files after version bump
-                cargo update
-                (cd python && cargo update)
-                (cd java/lance-jni && cargo update)
+                cargo update --workspace
+                (cd python && cargo update --workspace)
+                (cd java/lance-jni && cargo update --workspace)
 
                 git add -A
                 git commit -m "chore: bump to ${NEXT_VERSION} based on breaking change detection"
@@ -133,9 +133,9 @@ echo "Bumping beta version"
 bump-my-version bump -vv prerelease_num
 
 # Update Cargo.lock files after version bump
-cargo update
-(cd python && cargo update)
-(cd java/lance-jni && cargo update)
+cargo update --workspace
+(cd python && cargo update --workspace)
+(cd java/lance-jni && cargo update --workspace)
 
 # Get new version
 NEW_VERSION=$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2)

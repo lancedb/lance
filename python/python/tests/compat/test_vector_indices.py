@@ -8,6 +8,7 @@ Tests that vector indices (IVF_PQ, etc.) created with one version of Lance
 can be read and written by other versions.
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -70,6 +71,17 @@ class PqVectorIndex(UpgradeDowngradeTest):
             }
         )
         assert result.num_rows == 4
+
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        elif self.compat_version >= "0.39.0":
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0]["name"]
+            stats = ds.stats.index_stats(name)
+            assert stats["num_indexed_rows"] > 0
 
     def check_write(self):
         """Verify can insert vectors and rebuild index."""
@@ -140,6 +152,18 @@ class HnswPqVectorIndex(UpgradeDowngradeTest):
         )
         assert result.num_rows == 4
 
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        else:
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0]["name"]
+
+        stats = ds.stats.index_stats(name)
+        assert stats["num_indexed_rows"] > 0
+
     def check_write(self):
         """Verify can insert vectors and rebuild index."""
         ds = lance.dataset(self.path)
@@ -209,6 +233,18 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         )
         assert result.num_rows == 4
 
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        else:
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0]["name"]
+
+        stats = ds.stats.index_stats(name)
+        assert stats["num_indexed_rows"] > 0
+
     def check_write(self):
         """Verify can insert vectors and rebuild index."""
         ds = lance.dataset(self.path)
@@ -226,12 +262,27 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(min_version="0.39.0")
+@compat_test(min_version="4.0.0-beta.8")
 class IvfRqVectorIndex(UpgradeDowngradeTest):
-    """Test IVF_RQ vector index compatibility."""
+    """Test IVF_RQ vector index compatibility. V2 was introduced in v4.0.0-beta.8"""
 
     def __init__(self, path: Path):
         self.path = path
+
+    def current_env(self, method_name: str):
+        if method_name == "check_read":
+            return {"LANCE_COMPAT_CURRENT_RUNTIME": "1"}
+        return {}
+
+    def skip_read_after_current_write(self, version: str) -> bool:
+        # Newly written IVF_RQ indexes carry raw-query estimator metadata and
+        # split-code schema that older runtimes cannot query or optimize safely.
+        # The upgrade_downgrade variant still covers old 1-bit residual-query
+        # indexes being read and rewritten by the current runtime.
+        return True
+
+    def skip_write_after_current_write(self, version: str) -> bool:
+        return True
 
     def create(self):
         """Create dataset with IVF_RQ vector index."""
@@ -272,6 +323,24 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
             }
         )
         assert result.num_rows == 4
+
+        if hasattr(ds, "describe_indices"):
+            indices = ds.describe_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+        else:
+            indices = ds.list_indices()
+            assert len(indices) >= 1
+            name = indices[0].name
+
+        stats = ds.stats.index_stats(name)
+        assert stats["num_indexed_rows"] > 0
+        if os.environ.get("LANCE_COMPAT_CURRENT_RUNTIME") == "1":
+            # Old 1-bit IVF_RQ indexes do not have split ex-code columns.
+            # The successful query above verifies the current reader does not
+            # require them.
+            sub_index = stats["indices"][0]["sub_index"]
+            assert sub_index["num_bits"] == 1
 
     def check_write(self):
         """Verify can insert vectors and run optimize workflows."""

@@ -87,33 +87,34 @@ impl Scorer for MemBM25Scorer {
 pub struct IndexBM25Scorer<'a> {
     partitions: Vec<&'a InvertedPartition>,
     num_docs: usize,
-    total_tokens: u64,
     avg_doc_length: f32,
 }
 
 impl<'a> IndexBM25Scorer<'a> {
+    /// Sync constructor. Reads each partition's cached `total_tokens` via
+    /// `LazyDocSet::total_tokens_cached()`; callers must have already
+    /// populated it (via `ensure_loaded`, `ensure_num_tokens_loaded`, or
+    /// `total_tokens_num`). Panics with a clear message otherwise — this
+    /// is the wand-scoring path where the contract is statically known.
     pub fn new(partitions: impl Iterator<Item = &'a InvertedPartition>) -> Self {
         let partitions = partitions.collect::<Vec<_>>();
         let num_docs = partitions.iter().map(|p| p.docs.len()).sum();
-        let total_tokens = partitions
+        let total_tokens: u64 = partitions
             .iter()
-            .map(|part| part.docs.total_tokens_num())
-            .sum::<u64>();
+            .map(|p| {
+                p.docs.total_tokens_cached().expect(
+                    "IndexBM25Scorer::new requires each partition's total_tokens to be \
+                     cached; call `ensure_loaded` / `ensure_num_tokens_loaded` / \
+                     `total_tokens_num` first",
+                )
+            })
+            .sum();
         let avgdl = total_tokens as f32 / num_docs as f32;
         Self {
             partitions,
             num_docs,
-            total_tokens,
             avg_doc_length: avgdl,
         }
-    }
-
-    pub fn num_docs(&self) -> usize {
-        self.num_docs
-    }
-
-    pub fn total_tokens(&self) -> u64 {
-        self.total_tokens
     }
 
     pub fn num_docs_containing_token(&self, token: &str) -> usize {

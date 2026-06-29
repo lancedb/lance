@@ -17,8 +17,8 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -71,17 +71,29 @@ pub struct PQIndex {
 }
 
 impl DeepSizeOf for PQIndex {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.pq.deep_size_of_children(context)
             + self
                 .code
                 .as_ref()
-                .map(|code| code.get_array_memory_size())
+                .map(|code| {
+                    if context.mark_seen(Arc::as_ptr(code) as *const () as usize) {
+                        (code.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
             + self
                 .row_ids
                 .as_ref()
-                .map(|row_ids| row_ids.get_array_memory_size())
+                .map(|row_ids| {
+                    if context.mark_seen(Arc::as_ptr(row_ids) as *const () as usize) {
+                        (row_ids.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
     }
 }
@@ -166,10 +178,6 @@ impl Index for PQIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
     }
 
     fn index_type(&self) -> IndexType {
@@ -645,10 +653,10 @@ mod tests {
     use lance_linalg::kernels::normalize_fsl;
 
     use crate::index::vector::ivf::build_ivf_model;
-    use lance_core::utils::mask::RowAddrMask;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::DEFAULT_QUERY_PARALLELISM;
     use lance_index::vector::ivf::IvfBuildParams;
+    use lance_select::RowAddrMask;
     use lance_testing::datagen::{
         generate_random_array_with_range, generate_random_array_with_seed,
     };
@@ -899,6 +907,7 @@ mod tests {
             use_index: true,
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
+            approx_mode: Default::default(),
         };
         let is_empty_threads = Arc::new(Mutex::new(Vec::new()));
         let pre_filter = Arc::new(TestPreFilter::with_thread_capture(

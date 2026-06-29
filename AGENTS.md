@@ -41,6 +41,9 @@ Key technical traits: async-first (tokio), Arrow-native, versioned writes with m
 * Coverage: `cargo +nightly llvm-cov -q -p <crate> --branch`
 * Coverage HTML: `cargo +nightly llvm-cov -q -p <crate> --branch --html`
 * Coverage for file: `python ci/coverage.py -p <crate> -f <file_path>`
+* Use repository-defined Cargo profiles instead of ad hoc LTO overrides.
+* Use `release-with-debug` for benchmarks and profiling so optimized builds keep debug symbols without a rebuild.
+* Use `release-no-lto` only for local debugging, IO-bound benchmarks, or compile-time-sensitive performance investigation where LTO would not affect the measured bottleneck.
 
 ### Python / Java
 
@@ -129,6 +132,11 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Keep doc examples in sync with actual API signatures — update when refactoring.
 - Indent content under MkDocs admonition directives (`!!! note`, etc.) with 4 spaces.
 - Proofread comments and docs for typos before committing.
+
+## Pull Requests
+
+- PR titles must follow the Conventional Commits specification because `.github/workflows/pr-title.yml` validates the PR title and body with commitlint. Use prefixes like `feat:`, `fix:`, `docs:`, `perf:`, `ci:`, `test:`, `build:`, `style:`, or `chore:`; add a scope when useful.
+- Before creating or updating a PR, run the lint checks for every touched language surface, even when they are expensive. For Rust changes, run `cargo fmt --all` and `cargo clippy --all --tests --benches -- -D warnings`. For Python changes, follow the environment workflow in `python/AGENTS.md` and run `uv run make lint` from `python/`. If a required lint check cannot be run, state the blocker explicitly in the PR summary.
 
 ## Review Guidelines
 

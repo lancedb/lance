@@ -10,10 +10,26 @@ use crate::{
     pb, pbold,
     scalar::{
         bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        inverted::InvertedIndexPlugin, json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
-        ngram::NGramIndexPlugin, registry::ScalarIndexPlugin, zonemap::ZoneMapIndexPlugin,
+        fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
+        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
+        zonemap::ZoneMapIndexPlugin,
     },
 };
+
+/// Derive a human-readable index type name from a details type URL.
+///
+/// The display name is the final `.`-separated segment of the type URL with any
+/// trailing `IndexDetails` removed. For example, `/lance.index.pb.VectorIndexDetails`
+/// yields `Vector`. Used as a best-effort fallback when no plugin is registered
+/// for the type URL, so the index type is never reported as opaque "Unknown"
+/// while valid index details exist.
+pub fn display_type_from_url(type_url: &str) -> &str {
+    let segment = type_url.rsplit('.').next().unwrap_or(type_url);
+    segment
+        .strip_suffix("IndexDetails")
+        .filter(|stripped| !stripped.is_empty())
+        .unwrap_or(segment)
+}
 
 /// A registry of index plugins
 pub struct IndexPluginRegistry {
@@ -66,6 +82,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::BloomFilterIndexDetails, BloomFilterIndexPlugin>();
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
+        registry.add_plugin::<pb::FmIndexDetails, FMIndexPlugin>();
         #[cfg(feature = "geo")]
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 
@@ -111,6 +128,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_display_type_from_url() {
+        assert_eq!(
+            display_type_from_url("/lance.index.pb.VectorIndexDetails"),
+            "Vector"
+        );
+        assert_eq!(display_type_from_url("BTreeIndexDetails"), "BTree");
+        // Segment without the IndexDetails suffix is returned verbatim.
+        assert_eq!(
+            display_type_from_url("/lance.pb.SomethingElse"),
+            "SomethingElse"
+        );
+        // A bare "IndexDetails" segment has nothing left after stripping, so it
+        // is returned as-is rather than an empty string.
+        assert_eq!(display_type_from_url("IndexDetails"), "IndexDetails");
+        assert_eq!(display_type_from_url(""), "");
+    }
+
+    #[test]
     fn test_get_plugin_by_name_accepts_case_insensitive_builtin_names() {
         let registry = IndexPluginRegistry::with_default_plugins();
 
@@ -121,6 +156,7 @@ mod tests {
             ("NGRAM", "NGram"),
             ("ZONEMAP", "ZoneMap"),
             ("BLOOMFILTER", "BloomFilter"),
+            ("FM", "Fm"),
             ("JSON", "Json"),
         ] {
             let plugin = registry.get_plugin_by_name(requested_name).unwrap();

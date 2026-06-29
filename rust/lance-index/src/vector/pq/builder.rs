@@ -44,6 +44,15 @@ pub struct PQBuildParams {
     pub sample_rate: usize,
 }
 
+impl From<&PQBuildParams> for crate::pb::vector_index_details::ProductQuantization {
+    fn from(params: &PQBuildParams) -> Self {
+        Self {
+            num_bits: params.num_bits as u32,
+            num_sub_vectors: params.num_sub_vectors as u32,
+        }
+    }
+}
+
 impl Default for PQBuildParams {
     fn default() -> Self {
         Self {

@@ -12,9 +12,9 @@ use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use deepsize::DeepSizeOf;
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::traits::Reader;
@@ -117,11 +117,6 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    /// Cast to [VectorIndex]
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
     }
 
     /// Retrieve index statistics as a JSON Value

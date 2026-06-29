@@ -27,6 +27,10 @@ from .dataset import (
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
+    CleanupCandidateFile,
+    CleanupExplanation,
+    CleanupReferencedBranch,
+    CleanupStats,
     DatasetBasePath,
     FFILanceTableProvider,
     ScanStatistics,
@@ -39,10 +43,11 @@ from .mem_wal import (
     LsmScanner,
     LsmVectorSearchPlanner,
     MergedGeneration,
-    RegionField,
-    RegionSnapshot,
-    RegionSpec,
-    RegionWriter,
+    ShardingField,
+    ShardingSpec,
+    ShardSnapshot,
+    ShardWriter,
+    evaluate_sharding_spec,
 )
 from .namespace import (
     DescribeTableRequest,
@@ -69,6 +74,10 @@ __all__ = [
     "BlobFile",
     "blob_array",
     "blob_field",
+    "CleanupCandidateFile",
+    "CleanupExplanation",
+    "CleanupReferencedBranch",
+    "CleanupStats",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
@@ -99,10 +108,11 @@ __all__ = [
     "LsmScanner",
     "LsmVectorSearchPlanner",
     "MergedGeneration",
-    "RegionField",
-    "RegionSpec",
-    "RegionSnapshot",
-    "RegionWriter",
+    "ShardSnapshot",
+    "ShardWriter",
+    "ShardingField",
+    "ShardingSpec",
+    "evaluate_sharding_spec",
 ]
 
 
@@ -228,7 +238,9 @@ def dataset(
                 "Both 'namespace_client' and 'table_id' must be provided together."
             )
 
-        request = DescribeTableRequest(id=table_id, version=version)
+        # Resolve the latest table metadata here. The requested dataset version is
+        # applied by the lower-level dataset open path after namespace resolution.
+        request = DescribeTableRequest(id=table_id, version=None)
         response = namespace_client.describe_table(request)
 
         uri = response.location

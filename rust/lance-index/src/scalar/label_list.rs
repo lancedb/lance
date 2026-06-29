@@ -17,21 +17,23 @@ use bytes::Bytes;
 use datafusion::execution::RecordBatchStream;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
 use datafusion_common::ScalarValue;
-use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
-use lance_core::cache::LanceCache;
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
-use lance_core::utils::mask::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use lance_core::{Error, ROW_ID, Result};
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
-use super::{AnyQuery, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
+use super::{AnyQuery, IndexFile, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
-use crate::scalar::bitmap::BitmapIndexPlugin;
+use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
     DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -106,12 +108,6 @@ impl Index for LabelListIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "LabeListIndex is not a vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -227,7 +223,7 @@ impl ScalarIndex for LabelListIndex {
                     .copied()
                     .unwrap_or(Some(addr_as_u64))
             }));
-        write_label_list_bitmap_index(
+        let file = write_label_list_bitmap_index(
             remapped_state,
             dest_store,
             self.values_index.value_type(),
@@ -239,7 +235,7 @@ impl ScalarIndex for LabelListIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -261,13 +257,15 @@ impl ScalarIndex for LabelListIndex {
         if !new_nulls.is_empty() {
             merged_nulls |= &new_nulls;
         }
-        write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls).await?;
+        let file =
+            write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls)
+                .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(dest_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -474,7 +472,7 @@ async fn write_label_list_bitmap_index(
     store: &dyn IndexStore,
     value_type: &DataType,
     list_nulls: &RowAddrTreeMap,
-) -> Result<()> {
+) -> Result<IndexFile> {
     BitmapIndexPlugin::write_bitmap_index_with_extras(
         state,
         store,
@@ -486,6 +484,96 @@ async fn write_label_list_bitmap_index(
         )],
     )
     .await
+}
+
+/// The serializable state of a [`LabelListIndex`].
+///
+/// `LabelListIndex` is a thin wrapper around a [`BitmapIndex`] plus a separate
+/// row bitmap tracking which list values were `NULL` (lost by unnest at build
+/// time). Its cache state is the corresponding [`BitmapIndexState`] plus the
+/// already-loaded `list_nulls`.
+#[derive(Debug, Clone)]
+pub struct LabelListIndexState {
+    bitmap_state: BitmapIndexState,
+    list_nulls: Arc<RowAddrTreeMap>,
+}
+
+impl DeepSizeOf for LabelListIndexState {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.bitmap_state.deep_size_of_children(context)
+            + self.list_nulls.deep_size_of_children(context)
+    }
+}
+
+impl LabelListIndexState {
+    fn from_index(index: &LabelListIndex) -> Result<Self> {
+        Ok(Self {
+            bitmap_state: BitmapIndexState::from_index(&index.values_index)?,
+            list_nulls: index.list_nulls.clone(),
+        })
+    }
+
+    fn into_label_list_index(
+        self,
+        store: Arc<dyn IndexStore>,
+        index_cache: &LanceCache,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Arc<LabelListIndex>> {
+        let bitmap = self
+            .bitmap_state
+            .to_bitmap_index(store, index_cache, frag_reuse_index)?;
+        Ok(Arc::new(LabelListIndex::new(bitmap, self.list_nulls)))
+    }
+}
+
+impl CacheCodecImpl for LabelListIndexState {
+    const TYPE_ID: &'static str = "lance.scalar.LabelListIndexState";
+    const CURRENT_VERSION: u32 = 1;
+
+    /// Wire format:
+    /// ```text
+    /// RAW_BLOB : list_nulls (roaring tree map, portable encoding)
+    /// <nested BitmapIndexState body (self-delimiting)>
+    /// ```
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let mut nulls_bytes = Vec::with_capacity(self.list_nulls.serialized_size());
+        self.list_nulls.serialize_into(&mut nulls_bytes)?;
+        w.write_raw(&nulls_bytes)?;
+        // The bitmap state writes its own self-delimiting body inline.
+        self.bitmap_state.serialize(w)?;
+        Ok(())
+    }
+
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let nulls_bytes = r.read_raw()?;
+        let list_nulls = Arc::new(RowAddrTreeMap::deserialize_from(nulls_bytes.as_ref())?);
+        // The bitmap state is self-delimiting (length-prefixed null map +
+        // Arrow IPC stream with EOS marker); it continues reading the body
+        // from where the null map left off.
+        let bitmap_state = BitmapIndexState::deserialize(r)?;
+        Ok(Self {
+            bitmap_state,
+            list_nulls,
+        })
+    }
+}
+
+struct LabelListIndexStateKey;
+
+impl CacheKey for LabelListIndexStateKey {
+    type ValueType = LabelListIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+
+    fn type_name() -> &'static str {
+        "LabelListIndexState"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<LabelListIndexState>())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -584,12 +672,13 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         let (state, value_type) =
             BitmapIndexPlugin::build_bitmap_index_state(data, HashMap::new()).await?;
         let list_nulls = list_nulls.lock().unwrap().clone();
-        write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
+        let file =
+            write_label_list_bitmap_index(state, index_store, &value_type, &list_nulls).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
             index_version: LABEL_LIST_INDEX_VERSION,
-            files: Some(index_store.list_files_with_sizes().await?),
+            files: vec![file],
         })
     }
 
@@ -605,5 +694,123 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             LabelListIndex::load(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
+    }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&LabelListIndexStateKey).await else {
+            return Ok(None);
+        };
+        let state = (*state).clone();
+        let index = state.into_label_list_index(index_store, cache, frag_reuse_index)?;
+        Ok(Some(index as Arc<dyn ScalarIndex>))
+    }
+
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+        let label_list = index
+            .as_any()
+            .downcast_ref::<LabelListIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "LabelListIndexPlugin::put_in_cache called with a non-label-list index",
+                )
+            })?;
+        let state = LabelListIndexState::from_index(label_list)?;
+        cache
+            .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
+            .await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use datafusion_common::ScalarValue;
+    use lance_core::cache::CacheCodec;
+    use lance_core::utils::address::RowAddress;
+
+    use super::super::bitmap::BitmapIndexState;
+    use super::super::btree::OrderableScalarValue;
+    use super::*;
+
+    fn sample_state() -> LabelListIndexState {
+        let mut index_map = BTreeMap::new();
+        for k in 0..32i32 {
+            index_map.insert(
+                OrderableScalarValue(ScalarValue::Int32(Some(k))),
+                k as usize,
+            );
+        }
+        let mut bitmap_nulls = RowAddrTreeMap::new();
+        bitmap_nulls.insert(RowAddress::new_from_parts(0, 3).into());
+        let bitmap_state =
+            BitmapIndexState::new_for_test(index_map, bitmap_nulls, DataType::Int32).unwrap();
+
+        let mut list_nulls = RowAddrTreeMap::new();
+        list_nulls.insert(RowAddress::new_from_parts(0, 9).into());
+        LabelListIndexState {
+            bitmap_state,
+            list_nulls: Arc::new(list_nulls),
+        }
+    }
+
+    #[test]
+    fn test_label_list_state_codec_roundtrip() {
+        let state = sample_state();
+        let mut buf = Vec::new();
+        state
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        let data = Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, LabelListIndexState::CURRENT_VERSION);
+        let restored = LabelListIndexState::deserialize(&mut reader).unwrap();
+
+        assert_eq!(&*restored.list_nulls, &*state.list_nulls);
+        assert_eq!(
+            restored.bitmap_state.lookup_batch(),
+            state.bitmap_state.lookup_batch()
+        );
+        assert_eq!(
+            restored.bitmap_state.null_map(),
+            state.bitmap_state.null_map()
+        );
+    }
+
+    /// The nested bitmap lookup batch must decode zero-copy through the full
+    /// envelope, proving the leading `list_nulls` RAW_BLOB does not knock the
+    /// nested IPC section off its 64-byte boundary.
+    #[test]
+    fn test_label_list_nested_lookup_is_zero_copy() {
+        const ALIGN: usize = 64;
+        let codec = CacheCodec::from_impl::<LabelListIndexState>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(sample_state());
+        let mut buf = Vec::new();
+        codec.serialize(&any, &mut buf).unwrap();
+
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).hit().unwrap();
+        let restored = restored.downcast::<LabelListIndexState>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.bitmap_state.lookup_batch().columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "nested bitmap lookup buffer was realigned — misaligned IPC section",
+                );
+            }
+        }
     }
 }

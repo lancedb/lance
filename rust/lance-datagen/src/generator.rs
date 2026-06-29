@@ -21,7 +21,6 @@ use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, Sc
 use futures::{StreamExt, stream::BoxStream};
 use rand::{Rng, RngCore, SeedableRng, distr::Uniform};
 use rand_distr::Zipf;
-use random_word;
 
 use self::array::rand_with_distribution;
 
@@ -1172,24 +1171,223 @@ impl ArrayGenerator for BinaryPrefixPlusCounterGenerator {
     }
 }
 
-// Common English stop words placed at the front to be sampled more frequently
+// Common English stop words placed at the front to be sampled more frequently.
 const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
     "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
     "they", "this", "to", "was", "will", "with",
 ];
 
+const ENGLISH_WORDS: &[&str] = &[
+    "ability",
+    "able",
+    "about",
+    "above",
+    "accept",
+    "access",
+    "account",
+    "across",
+    "action",
+    "active",
+    "activity",
+    "actual",
+    "address",
+    "adjust",
+    "admin",
+    "advance",
+    "agent",
+    "align",
+    "allow",
+    "amount",
+    "analysis",
+    "answer",
+    "application",
+    "archive",
+    "array",
+    "asset",
+    "async",
+    "attribute",
+    "available",
+    "balance",
+    "batch",
+    "binary",
+    "bitmap",
+    "block",
+    "branch",
+    "buffer",
+    "build",
+    "cache",
+    "capacity",
+    "catalog",
+    "change",
+    "chunk",
+    "client",
+    "cluster",
+    "column",
+    "commit",
+    "common",
+    "compare",
+    "compile",
+    "compute",
+    "condition",
+    "config",
+    "connect",
+    "content",
+    "context",
+    "control",
+    "convert",
+    "copy",
+    "core",
+    "count",
+    "create",
+    "current",
+    "cursor",
+    "data",
+    "dataset",
+    "decode",
+    "default",
+    "delete",
+    "delta",
+    "depend",
+    "derive",
+    "design",
+    "detail",
+    "detect",
+    "device",
+    "direct",
+    "display",
+    "document",
+    "domain",
+    "drive",
+    "dynamic",
+    "encode",
+    "engine",
+    "error",
+    "event",
+    "example",
+    "execute",
+    "expand",
+    "expect",
+    "export",
+    "extend",
+    "feature",
+    "field",
+    "filter",
+    "final",
+    "finish",
+    "format",
+    "fragment",
+    "future",
+    "generate",
+    "global",
+    "group",
+    "handle",
+    "header",
+    "index",
+    "input",
+    "insert",
+    "inspect",
+    "instance",
+    "integer",
+    "internal",
+    "item",
+    "join",
+    "kernel",
+    "large",
+    "layer",
+    "layout",
+    "length",
+    "level",
+    "limit",
+    "linear",
+    "local",
+    "logical",
+    "lookup",
+    "manage",
+    "manifest",
+    "memory",
+    "merge",
+    "metric",
+    "model",
+    "module",
+    "namespace",
+    "native",
+    "node",
+    "normal",
+    "number",
+    "object",
+    "offset",
+    "option",
+    "output",
+    "package",
+    "page",
+    "parallel",
+    "parse",
+    "partition",
+    "pattern",
+    "physical",
+    "plan",
+    "policy",
+    "prefix",
+    "prepare",
+    "primary",
+    "process",
+    "profile",
+    "project",
+    "property",
+    "query",
+    "range",
+    "reader",
+    "record",
+    "region",
+    "registry",
+    "request",
+    "resolve",
+    "resource",
+    "result",
+    "return",
+    "row",
+    "runtime",
+    "scalar",
+    "scan",
+    "schema",
+    "search",
+    "segment",
+    "select",
+    "session",
+    "setting",
+    "source",
+    "stable",
+    "stage",
+    "state",
+    "static",
+    "storage",
+    "stream",
+    "string",
+    "struct",
+    "table",
+    "target",
+    "task",
+    "thread",
+    "token",
+    "trace",
+    "transform",
+    "type",
+    "update",
+    "upload",
+    "value",
+    "vector",
+    "version",
+    "view",
+    "write",
+    "writer",
+];
+
 /// Word list with stop words at the front for Zipf sampling, computed once.
 static SENTENCE_WORDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    let all_words = random_word::all(random_word::Lang::En);
-    let mut words = Vec::with_capacity(STOP_WORDS.len() + all_words.len());
+    let mut words = Vec::with_capacity(STOP_WORDS.len() + ENGLISH_WORDS.len());
     words.extend(STOP_WORDS.iter().copied());
-    words.extend(
-        all_words
-            .iter()
-            .filter(|w| !STOP_WORDS.contains(w))
-            .copied(),
-    );
+    words.extend(ENGLISH_WORDS.iter().copied());
     words
 });
 
@@ -1279,7 +1477,7 @@ struct RandomWordGenerator {
 
 impl RandomWordGenerator {
     pub fn new(is_large: bool) -> Self {
-        let words = random_word::all(random_word::Lang::En);
+        let words = ENGLISH_WORDS;
         Self { words, is_large }
     }
 }
@@ -3190,9 +3388,9 @@ mod tests {
         assert_eq!(
             *genn.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values([
-                vec![174, 178],
-                vec![64, 122, 207, 248],
-                vec![124, 3, 58]
+                vec![111, 9, 80],
+                vec![86, 118, 13, 209],
+                vec![68, 33, 202]
             ])
         );
     }
