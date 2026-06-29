@@ -56,6 +56,7 @@ const PARTITION_SIZE: usize = 10_000;
 const DEFAULT_PARTITION_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_DEMAND_PAGE_TARGET_BYTES: usize = 512 * 1024;
 const DEFAULT_PREWARM_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
+const FMINDEX_PARTITION_FINGERPRINT_KEY: &str = "partition_fingerprint";
 const SENTINEL_BYTE: u8 = 0xFF;
 
 /// SA sampling rate. Store every D-th SA entry. Locate walks at most D LF steps.
@@ -586,7 +587,22 @@ impl LazyRankBitVec {
     }
 
     async fn load_block_for_rank(&self, pos: usize) -> Result<()> {
-        if pos == 0 || pos.is_multiple_of(BLOCK_BITS) {
+        if pos > self.len {
+            return Err(Error::invalid_input(format!(
+                "FM-Index rank position {pos} exceeds bitvector length {}",
+                self.len
+            )));
+        }
+        if pos == 0 {
+            return Ok(());
+        }
+        if pos == self.len && pos.is_multiple_of(BLOCK_BITS) {
+            if let Some(last_idx) = self.blocks.len().checked_sub(1) {
+                return self.load_block_if_needed(last_idx).await;
+            }
+            return Ok(());
+        }
+        if pos.is_multiple_of(BLOCK_BITS) {
             return Ok(());
         }
         self.load_block_if_needed(pos / BLOCK_BITS).await
@@ -630,15 +646,42 @@ impl LazyRankBitVec {
             .collect()
     }
 
+    fn terminal_rank1(&self) -> usize {
+        if self.len == 0 {
+            return 0;
+        }
+        let Some(last_idx) = self.blocks.len().checked_sub(1) else {
+            return 0;
+        };
+        let mut count = self.prefix_ranks.get(last_idx).copied().unwrap_or(0) as usize;
+        let block = self.ensure_block(last_idx);
+        let local = self.len - last_idx * BLOCK_BITS;
+        let full_words = local / 64;
+        let trailing_bits = local % 64;
+        for w in &block[..full_words] {
+            count += w.count_ones() as usize;
+        }
+        if trailing_bits > 0 {
+            count += (block[full_words] & ((1u64 << trailing_bits) - 1)).count_ones() as usize;
+        }
+        count
+    }
+
     #[inline]
     fn rank1(&self, pos: usize) -> usize {
+        debug_assert!(pos <= self.len);
         if pos == 0 {
             return 0;
         }
         let bi = pos / BLOCK_BITS;
         let local = pos % BLOCK_BITS;
         if local == 0 {
-            return self.prefix_ranks[bi] as usize;
+            if let Some(prefix_rank) = self.prefix_ranks.get(bi) {
+                return *prefix_rank as usize;
+            }
+            if pos == self.len {
+                return self.terminal_rank1();
+            }
         }
         let mut count = self.prefix_ranks[bi] as usize;
         let block = self.ensure_block(bi);
@@ -660,6 +703,7 @@ impl LazyRankBitVec {
 
     #[inline]
     fn get(&self, pos: usize) -> bool {
+        debug_assert!(pos < self.len);
         let bi = pos / BLOCK_BITS;
         let local = pos % BLOCK_BITS;
         let block = self.ensure_block(bi);
@@ -1947,12 +1991,15 @@ async fn write_partitioned_fmindex_stream_with_config(
                     ) {
                         finish_fmindex_partition(
                             &sender,
+                            store.as_ref(),
                             &mut partition,
                             &mut partition_bytes,
                             partition_id,
                             config.max_rows,
-                            &mut completed_files,
-                            &mut files,
+                            &mut FMIndexPartitionResumeState {
+                                completed_files: &mut completed_files,
+                                output_files: &mut files,
+                            },
                         )
                         .await?;
                         partition_id += 1;
@@ -1964,12 +2011,15 @@ async fn write_partitioned_fmindex_stream_with_config(
         if !partition.is_empty() {
             finish_fmindex_partition(
                 &sender,
+                store.as_ref(),
                 &mut partition,
                 &mut partition_bytes,
                 partition_id,
                 config.max_rows,
-                &mut completed_files,
-                &mut files,
+                &mut FMIndexPartitionResumeState {
+                    completed_files: &mut completed_files,
+                    output_files: &mut files,
+                },
             )
             .await?;
         }
@@ -2001,6 +2051,14 @@ async fn write_partitioned_fmindex_stream_with_config(
         return Err(err);
     }
     producer_result?;
+
+    for (partition_id, file) in completed_files.drain() {
+        log::info!(
+            "deleting stale FMIndex partition {partition_id} from previous build: {}",
+            file.path
+        );
+        store.delete_index_file(&file.path).await?;
+    }
     if files.is_empty() {
         return Ok(vec![write_empty_fmindex_partition(store.as_ref()).await?]);
     }
@@ -2022,20 +2080,33 @@ fn fmindex_partition_limit_reached(
     rows >= max_rows || bytes >= max_bytes
 }
 
+struct FMIndexPartitionResumeState<'a> {
+    completed_files: &'a mut HashMap<u64, IndexFile>,
+    output_files: &'a mut Vec<(u64, IndexFile)>,
+}
+
 async fn finish_fmindex_partition(
     sender: &async_channel::Sender<FMIndexPartitionJob>,
+    store: &dyn IndexStore,
     partition: &mut Vec<(u64, Vec<u8>)>,
     partition_bytes: &mut usize,
     partition_id: u64,
     max_rows: usize,
-    completed_files: &mut HashMap<u64, IndexFile>,
-    output_files: &mut Vec<(u64, IndexFile)>,
+    resume_state: &mut FMIndexPartitionResumeState<'_>,
 ) -> Result<()> {
     let texts = std::mem::replace(partition, Vec::with_capacity(max_rows.min(PARTITION_SIZE)));
     *partition_bytes = 0;
-    if let Some(file) = completed_files.remove(&partition_id) {
-        output_files.push((partition_id, file));
-        return Ok(());
+    if let Some(file) = resume_state.completed_files.remove(&partition_id) {
+        let fingerprint = fmindex_partition_fingerprint(&texts);
+        if fmindex_partition_matches(store, &file, &fingerprint).await? {
+            resume_state.output_files.push((partition_id, file));
+            return Ok(());
+        }
+        log::info!(
+            "rebuilding stale FMIndex partition {partition_id}: {}",
+            file.path
+        );
+        store.delete_index_file(&file.path).await?;
     }
     sender
         .send(FMIndexPartitionJob {
@@ -2048,6 +2119,41 @@ async fn finish_fmindex_partition(
                 "failed to schedule FMIndex partition {partition_id}: {err}"
             ))
         })
+}
+
+fn fmindex_partition_fingerprint(texts: &[(u64, Vec<u8>)]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn update(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= *byte as u64;
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut hash = FNV_OFFSET;
+    update(&mut hash, b"lance-fmindex-partition-v1");
+    update(&mut hash, &(texts.len() as u64).to_le_bytes());
+    for (row_id, bytes) in texts {
+        update(&mut hash, &row_id.to_le_bytes());
+        update(&mut hash, &(bytes.len() as u64).to_le_bytes());
+        update(&mut hash, bytes);
+    }
+    format!("{hash:016x}")
+}
+
+async fn fmindex_partition_matches(
+    store: &dyn IndexStore,
+    file: &IndexFile,
+    expected_fingerprint: &str,
+) -> Result<bool> {
+    let reader = store.open_index_file(&file.path).await?;
+    Ok(reader
+        .schema()
+        .metadata
+        .get(FMINDEX_PARTITION_FINGERPRINT_KEY)
+        .is_some_and(|fingerprint| fingerprint == expected_fingerprint))
 }
 
 fn sanitize_text_bytes(bytes: &[u8]) -> Vec<u8> {
@@ -2177,7 +2283,12 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 ///   - Wavelet block rows (BWT nodes)
 ///   - SA sample blocks (packed u64 in LargeBinary)
 ///   - Metadata: c_table, huffman_codes, tree_topology, row_ids, doc_start_positions
-async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> Result<IndexFile> {
+async fn write_fmindex(
+    fm: &FMIndex,
+    store: &dyn IndexStore,
+    filename: &str,
+    partition_fingerprint: Option<&str>,
+) -> Result<IndexFile> {
     let schema = Arc::new(FMIndex::block_schema());
 
     let mut writer = store.new_index_file(filename, schema.clone()).await?;
@@ -2227,6 +2338,12 @@ async fn write_fmindex(fm: &FMIndex, store: &dyn IndexStore, filename: &str) -> 
     metadata.insert("total_wavelet_rows".into(), nw.to_string());
     metadata.insert("sa_sample_rate".into(), SA_SAMPLE_RATE.to_string());
     metadata.insert("alphabet_size".into(), fm.alphabet_size.to_string());
+    if let Some(fingerprint) = partition_fingerprint {
+        metadata.insert(
+            FMINDEX_PARTITION_FINGERPRINT_KEY.into(),
+            fingerprint.to_string(),
+        );
+    }
     metadata.insert("c_table".into(), hex_encode(&fm.serialize_c_table()));
     metadata.insert(
         "huffman_codes".into(),
@@ -2271,9 +2388,16 @@ async fn write_fmindex_partition(
     store: &dyn IndexStore,
     partition_id: u64,
 ) -> Result<IndexFile> {
+    let fingerprint = fmindex_partition_fingerprint(texts);
     let refs: Vec<(u64, &[u8])> = texts.iter().map(|(id, t)| (*id, t.as_slice())).collect();
     let fm = FMIndex::build(&refs)?;
-    write_fmindex(&fm, store, &fmindex_partition_path(partition_id)).await
+    write_fmindex(
+        &fm,
+        store,
+        &fmindex_partition_path(partition_id),
+        Some(&fingerprint),
+    )
+    .await
 }
 
 async fn write_fmindex_partition_owned(
@@ -2281,18 +2405,26 @@ async fn write_fmindex_partition_owned(
     store: Arc<dyn IndexStore>,
     partition_id: u64,
 ) -> Result<(u64, IndexFile)> {
+    let fingerprint = fmindex_partition_fingerprint(&texts);
     let fm = spawn_cpu(move || {
         let refs: Vec<(u64, &[u8])> = texts.iter().map(|(id, t)| (*id, t.as_slice())).collect();
         FMIndex::build(&refs)
     })
     .await?;
-    let file = write_fmindex(&fm, store.as_ref(), &fmindex_partition_path(partition_id)).await?;
+    let file = write_fmindex(
+        &fm,
+        store.as_ref(),
+        &fmindex_partition_path(partition_id),
+        Some(&fingerprint),
+    )
+    .await?;
     Ok((partition_id, file))
 }
 
 async fn write_empty_fmindex_partition(store: &dyn IndexStore) -> Result<IndexFile> {
     let fm = FMIndex::build(&[])?;
-    write_fmindex(&fm, store, &fmindex_partition_path(0)).await
+    let fingerprint = fmindex_partition_fingerprint(&[]);
+    write_fmindex(&fm, store, &fmindex_partition_path(0), Some(&fingerprint)).await
 }
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
@@ -2770,7 +2902,7 @@ mod tests {
         ));
 
         // Write
-        write_fmindex(&fm, store.as_ref(), &fmindex_partition_path(0))
+        write_fmindex(&fm, store.as_ref(), &fmindex_partition_path(0), None)
             .await
             .unwrap();
 
@@ -2912,6 +3044,39 @@ mod tests {
             _ => panic!("expected exact result"),
         }
         assert_eq!(loaded_wavelet_blocks(index.as_ref()), total_blocks);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lazy_rank_terminal_block_boundary() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "words",
+            DataType::LargeBinary,
+            false,
+        )]));
+        let words = vec![u64::MAX; BLOCK_WORDS];
+        let bytes = FMIndex::u64_to_bytes(&words);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from(vec![bytes.as_slice()]))],
+        )
+        .unwrap();
+        let mut writer = store.new_index_file("rank.lance", schema).await.unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let reader = store.open_index_file("rank.lance").await.unwrap();
+        let bitvec = LazyRankBitVec::new(vec![0], 1, reader, 0, BLOCK_BITS);
+        bitvec.load_block_for_rank(BLOCK_BITS).await.unwrap();
+
+        assert_eq!(bitvec.rank1(BLOCK_BITS), BLOCK_BITS);
+        assert_eq!(bitvec.rank0(BLOCK_BITS), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3195,6 +3360,111 @@ mod tests {
             SearchResult::Exact(set) => {
                 assert_eq!(set.len(), Some(2));
             }
+            _ => panic!("expected exact result"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stream_train_rebuilds_stale_resume_partitions() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                crate::scalar::registry::VALUE_COLUMN_NAME,
+                DataType::Utf8,
+                false,
+            ),
+            arrow_schema::Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let stale_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["stale zero", "stale one"])),
+                Arc::new(UInt64Array::from(vec![0, 1])),
+            ],
+        )
+        .unwrap();
+        let stale_stream =
+            RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(stale_batch)]));
+        write_partitioned_fmindex_stream_with_config(
+            Box::pin(stale_stream),
+            store.as_ref(),
+            FMIndexPartitionConfig {
+                num_workers: 1,
+                max_rows: 1,
+                max_bytes: 1024,
+                queue_size: 1,
+                resume_existing: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let fresh_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["fresh zero"])),
+                Arc::new(UInt64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let fresh_stream =
+            RecordBatchStreamAdapter::new(schema.clone(), stream::iter(vec![Ok(fresh_batch)]));
+        let fresh_files = write_partitioned_fmindex_stream_with_config(
+            Box::pin(fresh_stream),
+            store.as_ref(),
+            FMIndexPartitionConfig {
+                num_workers: 1,
+                max_rows: 10,
+                max_bytes: 1024,
+                queue_size: 1,
+                resume_existing: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fresh_files.len(), 1);
+        assert_eq!(fresh_files[0].path, fmindex_partition_path(0));
+        let remaining_paths = store
+            .list_files_with_sizes()
+            .await
+            .unwrap()
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_paths, vec![fmindex_partition_path(0)]);
+
+        let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let r = index
+            .search(
+                &TextQuery::StringContains("fresh zero".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => assert_eq!(set.len(), Some(1)),
+            _ => panic!("expected exact result"),
+        }
+
+        let r = index
+            .search(
+                &TextQuery::StringContains("stale one".to_string()),
+                &crate::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        match r {
+            SearchResult::Exact(set) => assert_eq!(set.len(), Some(0)),
             _ => panic!("expected exact result"),
         }
     }

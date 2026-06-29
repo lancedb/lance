@@ -22,10 +22,7 @@ struct Args {
     #[arg(value_enum)]
     action: Action,
 
-    #[arg(
-        long,
-        default_value = "az://datasets/mmlb/mmlb_100m_fts_en_fm_20260626.lance"
-    )]
+    #[arg(long)]
     uri: String,
 
     #[arg(long, default_value = "full_content_idx")]
