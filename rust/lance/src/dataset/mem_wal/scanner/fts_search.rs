@@ -181,7 +181,6 @@ impl LsmFtsSearchPlanner {
         let arm_inputs: Vec<_> = sources
             .iter()
             .map(|source| {
-                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
                 let blocked = block_lists.get(&(source.shard_id(), source.generation()));
                 // Over-fetch a blocked source so the post-filter still yields k live
                 // rows. The active arm returns all matches (no builder limit), so its
@@ -191,36 +190,35 @@ impl LsmFtsSearchPlanner {
                 } else {
                     k
                 };
-                (source, is_active, blocked, fetch_k)
+                (source, blocked, fetch_k)
             })
             .collect();
-        let built =
-            futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, fetch_k)| {
-                Box::pin(self.build_source_plan(source, column, &query, *fetch_k, projection))
-            }))
-            .await?;
+        let built = futures::future::try_join_all(arm_inputs.iter().map(|(source, _, fetch_k)| {
+            Box::pin(self.build_source_plan(source, column, &query, *fetch_k, projection))
+        }))
+        .await?;
 
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
-        for ((_, is_active, blocked, _), plan) in arm_inputs.iter().zip(built) {
-            let is_active = *is_active;
+        for ((_source, blocked, _), plan) in arm_inputs.iter().zip(built) {
             let blocked = *blocked;
-            // Dedup, mirroring LsmVectorSearchPlanner:
-            //  * active: already wrapped in `NewestPkFilterExec` inside
+            // Within-generation dedup is already applied per source:
+            //  * active/frozen in-memory: `NewestPkFilterExec` inside
             //    `build_source_plan` (drops predicate-crossing stale hits, which a
             //    result-set dedup can't catch).
-            //  * flushed/base: drop rows superseded by a newer generation via the
-            //    block-list (within-gen is handled by the flushed deletion vector).
-            let deduped = if is_active {
-                plan
-            } else if let Some(set) = blocked {
-                Arc::new(PkBlockFilterExec::new(
+            //  * flushed: the on-disk deletion vector.
+            // Cross-generation supersession (a newer gen's write or tombstone) is
+            // applied uniformly here via the block-list — including frozen
+            // in-memory generations, whose per-gen recency filter can't see a
+            // newer gen. The newest generation of each shard has no newer gen
+            // (`blocked` is None) and is unaffected.
+            let deduped = match blocked {
+                Some(set) => Arc::new(PkBlockFilterExec::new(
                     plan,
                     self.pk_columns.clone(),
                     set.clone(),
                     k,
-                )) as Arc<dyn ExecutionPlan>
-            } else {
-                plan
+                )) as Arc<dyn ExecutionPlan>,
+                None => plan,
             };
 
             // Normalize to canonical. This also drops the active arm's _rowid,
@@ -843,6 +841,99 @@ mod tests {
         assert!(
             ids.contains(&2),
             "live pk=2 ('alpha foo') must still match 'alpha'; got ids={ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_gen_stale_update_blocked_by_newer_memtable() {
+        // The cross-generation analog of `active_stale_update_predicate_crossing_leaks`:
+        // pk=1's stale "alpha" version lives in a FROZEN memtable and its fresh
+        // "beta" version in the ACTIVE one. The frozen arm's recency filter is
+        // per-generation and can't see the newer gen, so only the cross-gen
+        // block-list can drop the stale "alpha" hit. The cluster constantly
+        // freezes memtables, so an insert and its later update/delete split
+        // across in-memory generations — this is the residual fuzz phantom.
+        let schema = fts_schema();
+
+        // Frozen gen=1: pk=1 "alpha lance" (matches), pk=2 "alpha foo" (live).
+        let frozen_store = Arc::new(BatchStore::with_capacity(16));
+        let mut frozen_idx = IndexStore::new();
+        frozen_idx.enable_pk_index(&[("id".to_string(), 0)]);
+        frozen_idx.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let fb = make_batch(&schema, &[1, 2], &["alpha lance", "alpha foo"]);
+        let (bp, off, _) = frozen_store.append(fb.clone()).unwrap();
+        frozen_idx
+            .insert_with_batch_position(&fb, off, Some(bp))
+            .unwrap();
+
+        // Active gen=2: pk=1 updated to "beta lance" (no longer matches "alpha").
+        let active_store = Arc::new(BatchStore::with_capacity(16));
+        let mut active_idx = IndexStore::new();
+        active_idx.enable_pk_index(&[("id".to_string(), 0)]);
+        active_idx.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let ab = make_batch(&schema, &[1], &["beta lance"]);
+        let (bp, off, _) = active_store.append(ab.clone()).unwrap();
+        active_idx
+            .insert_with_batch_position(&ab, off, Some(bp))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: active_store,
+                        index_store: Arc::new(active_idx),
+                        schema: schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![InMemoryMemTableRef {
+                        batch_store: frozen_store,
+                        index_store: Arc::new(frozen_idx),
+                        schema: schema.clone(),
+                        generation: 1,
+                    }],
+                },
+            );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("alpha".to_string()),
+                10,
+                None,
+            )
+            .await
+            .expect("planner should produce a plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+
+        assert!(
+            !ids.contains(&1),
+            "stale frozen pk=1 ('alpha lance', now 'beta lance' in the active gen) \
+             leaked on an 'alpha' search; got ids={ids:?}"
+        );
+        assert!(
+            ids.contains(&2),
+            "live pk=2 ('alpha foo', only in the frozen gen) must still match; got ids={ids:?}"
         );
     }
 }
