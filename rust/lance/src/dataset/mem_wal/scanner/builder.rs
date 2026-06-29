@@ -13,7 +13,6 @@ use arrow_array::types::Float32Type;
 use arrow_array::{Array, FixedSizeListArray, RecordBatch};
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::common::ScalarValue;
-use datafusion::common::ToDFSchema;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
@@ -29,6 +28,7 @@ use super::data_source::{FreshTierWatermark, ShardSnapshot};
 use super::flushed_cache::{DatasetCache, GenerationWarmer};
 use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
+use super::projection::validate_projection_names;
 use crate::dataset::Dataset;
 use crate::session::Session;
 
@@ -364,7 +364,8 @@ impl LsmScanner {
 
     /// Set the over-fetch multiple block-listed sources use in search plans
     /// so they still yield `k` live rows after cross-generation dedup.
-    /// Threaded into [`super::LsmFtsSearchPlanner`]; clamped to `>= 1.0`.
+    /// Threaded into the LSM search planners; values below `1.0` are rejected
+    /// when the plan is created.
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = Some(factor);
         self
@@ -383,16 +384,7 @@ impl LsmScanner {
     ///
     /// The filter is pushed down to each data source when possible.
     pub fn filter(mut self, filter_expr: &str) -> Result<Self> {
-        let ctx = SessionContext::new();
-        let df_schema = self
-            .schema
-            .as_ref()
-            .clone()
-            .to_dfschema()
-            .map_err(|e| Error::invalid_input(format!("Failed to create DFSchema: {}", e)))?;
-        let expr = ctx.parse_sql_expr(filter_expr, &df_schema).map_err(|e| {
-            Error::invalid_input(format!("Failed to parse filter expression: {}", e))
-        })?;
+        let expr = super::parse_filter_expr(self.schema.as_ref(), filter_expr)?;
         self.filter = Some(expr);
         Ok(self)
     }
@@ -429,8 +421,9 @@ impl LsmScanner {
     /// Find the `k` nearest neighbors of `key` in `column`. Routes `create_plan`
     /// through the LSM vector planner (base ∪ flushed ∪ in-memory). Mirrors
     /// [`crate::dataset::scanner::Scanner::nearest`]; the LSM path supports a
-    /// single query vector. Tune with [`Self::nprobes`], [`Self::refine`], and
-    /// [`Self::distance_metric`].
+    /// single Float32 query vector. When combined with an offset, the LSM path
+    /// fetches `k + offset` per source before applying the final page. Tune with
+    /// [`Self::nprobes`], [`Self::refine`], and [`Self::distance_metric`].
     pub fn nearest(mut self, column: &str, key: &dyn Array, k: usize) -> Result<Self> {
         if k == 0 {
             return Err(Error::invalid_input("k must be positive".to_string()));
@@ -580,7 +573,7 @@ impl LsmScanner {
         // Over-fetch by `offset` so the per-source top-k still yields `k` live
         // rows after `apply_limit_offset` skips the first `offset` (mirrors the
         // FTS arm, which folds `offset` into its `k`).
-        let per_source_k = nearest.k + self.offset.unwrap_or(0);
+        let per_source_k = nearest.k.saturating_add(self.offset.unwrap_or(0));
         let overfetch_factor = self.overfetch_factor.unwrap_or(1.0);
         let plan = planner
             .plan_search(
@@ -615,6 +608,10 @@ impl LsmScanner {
                     .to_string(),
             )
         })?;
+        let base_schema = self.schema();
+        base_schema.field_with_name(&column).map_err(|_| {
+            Error::invalid_input(format!("Column '{}' not found in schema", column))
+        })?;
         let query_limit = query
             .limit
             .map(|limit| {
@@ -627,12 +624,16 @@ impl LsmScanner {
                 }
             })
             .transpose()?;
-        let source_limit = query_limit
-            .or(self.limit)
-            .map(|limit| limit + self.offset.unwrap_or(0));
+        // Match the dataset Scanner: a query-level FTS limit is the hard
+        // search cap, and scanner offset pages within that capped result set.
+        let source_limit = match query_limit {
+            Some(limit) => Some(limit),
+            None => self
+                .limit
+                .map(|limit| limit.saturating_add(self.offset.unwrap_or(0))),
+        };
 
         let collector = self.build_collector();
-        let base_schema = self.schema();
         let mut planner =
             super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema)
                 .with_filter(self.filter.clone());
@@ -663,6 +664,7 @@ impl LsmScanner {
     async fn plan_scan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
+        validate_projection_names(self.projection.as_deref(), &base_schema, &[])?;
 
         // Fast point-lookup routing: a `pk = lit` / `pk IN (..)` filter on the
         // single pk column — with no offset and no scan-only system columns —
@@ -729,8 +731,9 @@ impl LsmScanner {
     /// merged by `_score` DESC. Mirrors
     /// [`crate::dataset::scanner::Scanner::full_text_search`]: the searched
     /// column(s) come from the query (set via `FullTextSearchQuery::with_column`);
-    /// the top-k comes from [`Self::limit`]. The LSM path supports a single
-    /// FTS-indexed column.
+    /// the query limit, when present, controls the FTS source/merge top-k;
+    /// scanner limit/offset still apply to the final merged result. The LSM
+    /// path supports a single FTS-indexed column.
     pub fn full_text_search(mut self, query: FullTextSearchQuery) -> Result<Self> {
         self.full_text_query = Some(query);
         Ok(self)
@@ -967,6 +970,124 @@ mod tests {
             schema: pk_schema(),
             generation,
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_overfetch_factor_is_rejected() {
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            shard,
+            InMemoryMemTables {
+                active: mk_pk_memtable(&[1, 2], 2),
+                frozen: vec![],
+            },
+        )
+        .with_overfetch_factor(0.5);
+
+        let Err(err) = scanner.try_into_stream().await else {
+            panic!("invalid overfetch factor should fail planning");
+        };
+        assert!(
+            err.to_string().contains("overfetch_factor"),
+            "unexpected error for invalid overfetch factor: {err}"
+        );
+
+        let empty_scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://empty",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_overfetch_factor(0.5);
+        let Err(err) = empty_scanner.try_into_stream().await else {
+            panic!("invalid overfetch factor should fail even when there are no sources");
+        };
+        assert!(
+            err.to_string().contains("overfetch_factor"),
+            "unexpected error for invalid empty-source overfetch factor: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_scan_projection_column_is_rejected() {
+        let scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .project(&["missing"])
+        .unwrap();
+
+        let Err(err) = scanner.try_into_stream().await else {
+            panic!("unknown projection column should fail planning");
+        };
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing-column projection error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn point_lookup_fast_route_rejects_missing_projection_column() {
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            shard,
+            InMemoryMemTables {
+                active: mk_pk_memtable(&[1, 2], 2),
+                frozen: vec![],
+            },
+        )
+        .project(&["missing"])
+        .unwrap()
+        .filter("id = 1")
+        .unwrap();
+
+        let Err(err) = scanner.try_into_stream().await else {
+            panic!("unknown projection column should fail on point-lookup fast route");
+        };
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing-column point lookup error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_missing_column_is_rejected() {
+        use arrow_schema::{DataType, Field};
+
+        let scanner = LsmScanner::without_base_table(
+            pk_schema_with(Field::new("text", DataType::Utf8, true)),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .full_text_search(
+            FullTextSearchQuery::new("lance".to_string())
+                .with_column("missing".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let Err(err) = scanner.try_into_stream().await else {
+            panic!("unknown FTS column should fail planning");
+        };
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing FTS column error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1330,6 +1451,42 @@ mod tests {
             out,
             vec![1],
             "query-level FTS limit=1 must cap the unpaginated scanner result; got {out:?}"
+        );
+
+        let query_limited_with_offset =
+            LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+                .full_text_search(
+                    FullTextSearchQuery::new("lance".to_string())
+                        .with_column("text".to_string())
+                        .unwrap()
+                        .limit(Some(2)),
+                )
+                .unwrap()
+                .limit(None, Some(1))
+                .unwrap();
+        let batches: Vec<RecordBatch> = query_limited_with_offset
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let out: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            out,
+            vec![2],
+            "query-level FTS limit=2 plus offset=1 must page within the top 2; got {out:?}"
         );
 
         let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])

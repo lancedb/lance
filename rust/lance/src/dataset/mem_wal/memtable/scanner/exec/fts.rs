@@ -25,6 +25,7 @@ use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::{FtsQuery, FtsQueryType};
+use super::newest_pk_positions;
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -244,22 +245,23 @@ impl FtsIndexExec {
             }
         };
 
-        // Search the index using the query expression. `include_tail` selects
-        // read-your-writes vs immutable-only; `wand_factor` adds pruning.
-        let mut options = SearchOptions::new()
-            .with_wand_factor(self.query.wand_factor)
-            .with_include_tail(self.query.include_tail);
         let all_rows_visible = self.batch_ranges.last().is_none_or(|last| {
             self.max_visible_row
                 .map(|max_visible| max_visible + 1 >= last.end as u64)
                 .unwrap_or(last.end == 0)
         });
-        if self.filter.is_none()
-            && self.pk_columns.is_none()
-            && all_rows_visible
-            && let Some(limit) = self.query.limit
-        {
-            options = options.with_limit(limit);
+        let pk_recency_is_noop = self.pk_columns.is_none()
+            || (self.indexes.has_pk_index() && !self.indexes.pk_has_overrides());
+        let can_prune_in_index = self.filter.is_none() && pk_recency_is_noop && all_rows_visible;
+
+        // Search the index using the query expression. WAND pruning is only
+        // safe when the index search itself sees the final candidate set.
+        let mut options = SearchOptions::new().with_include_tail(self.query.include_tail);
+        if can_prune_in_index {
+            options = options.with_wand_factor(self.query.wand_factor);
+            if let Some(limit) = self.query.limit {
+                options = options.with_limit(limit);
+            }
         }
         let entries = index.search_with_options(&query_expr, options);
 
@@ -439,31 +441,48 @@ impl FtsIndexExec {
         let Some(pk_columns) = &self.pk_columns else {
             return Ok((final_columns, all_scores, all_row_positions));
         };
-        if pk_columns.is_empty() || !self.indexes.has_pk_index() || all_scores.is_empty() {
+        if pk_columns.is_empty() || all_scores.is_empty() {
             return Ok((final_columns, all_scores, all_row_positions));
         }
         let Some(max_visible_row) = self.max_visible_row else {
             return Ok((final_columns, all_scores, all_row_positions));
         };
+        if self.indexes.has_pk_index() && !self.indexes.pk_has_overrides() {
+            return Ok((final_columns, all_scores, all_row_positions));
+        }
         let Some(first) = self.batch_store.get(0) else {
             return Ok((final_columns, all_scores, all_row_positions));
+        };
+        let newest_positions = if self.indexes.has_pk_index() {
+            None
+        } else {
+            Some(newest_pk_positions(
+                &self.batch_store,
+                pk_columns,
+                self.max_visible_batch_position,
+                max_visible_row,
+            )?)
         };
 
         let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
         let pk_indices = resolve_pk_indices(&data_batch, pk_columns)?;
         let keep = (0..data_batch.num_rows())
             .map(|row| {
-                let values: Vec<ScalarValue> = pk_indices
-                    .iter()
-                    .map(|&col| ScalarValue::try_from_array(data_batch.column(col), row))
-                    .collect::<DataFusionResult<_>>()?;
-                Ok(self
-                    .indexes
-                    .pk_is_newest(&values, all_row_positions[row], max_visible_row))
+                Ok(match &newest_positions {
+                    Some(newest) => newest.contains(&all_row_positions[row]),
+                    None => {
+                        let values: Vec<ScalarValue> = pk_indices
+                            .iter()
+                            .map(|&col| ScalarValue::try_from_array(data_batch.column(col), row))
+                            .collect::<DataFusionResult<_>>()?;
+                        self.indexes
+                            .pk_is_newest(&values, all_row_positions[row], max_visible_row)
+                    }
+                })
             })
             .collect::<DataFusionResult<Vec<_>>>()?;
 
-        let mask = BooleanArray::from(keep.clone());
+        let mask = BooleanArray::from_iter(keep.iter().copied());
         let filtered_columns = data_batch
             .columns()
             .iter()

@@ -578,6 +578,40 @@ public class MemWalTest {
           double recall = (double) found / queryIds.length;
           assertTrue(recall >= 0.5, "vector search recall too low: " + recall);
         }
+
+        try (LsmVectorSearchPlanner planner =
+                new LsmVectorSearchPlanner(
+                    dataset, Collections.emptyList(), "vec", null, null, "id >= 200");
+            Float4Vector query = new Float4Vector("q", allocator)) {
+          int filteredQueryId = 250;
+          query.allocateNew(VDIM);
+          for (int d = 0; d < VDIM; d++) {
+            query.set(d, (float) (filteredQueryId * VDIM + d));
+          }
+          query.setValueCount(VDIM);
+
+          int filteredRows = 0;
+          boolean foundFilteredNearest = false;
+          try (ExecutionPlan plan =
+                  planner.planSearch(query, 20, 2, Collections.singletonList("id"), false);
+              ArrowReader reader = plan.toReader()) {
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot result = reader.getVectorSchemaRoot();
+              IntVector ids = (IntVector) result.getVector("id");
+              for (int i = 0; i < result.getRowCount(); i++) {
+                int id = ids.get(i);
+                assertTrue(id >= 200, "filtered vector search returned id " + id);
+                if (id == filteredQueryId) {
+                  foundFilteredNearest = true;
+                }
+                filteredRows++;
+              }
+            }
+          }
+          assertTrue(filteredRows > 0, "filtered vector search should return rows");
+          assertTrue(
+              foundFilteredNearest, "filtered vector search recall missed id " + filteredQueryId);
+        }
       } finally {
         dataset.close();
       }

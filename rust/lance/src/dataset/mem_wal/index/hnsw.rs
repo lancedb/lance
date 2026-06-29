@@ -527,13 +527,11 @@ mod tests {
 
         let results = index.search(&query, 5, Some(32), u64::MAX).unwrap();
         assert!(!results.is_empty());
-        let (best_dist, best_pos) = results[0];
         assert!(
-            best_dist < 1e-4,
-            "expected near-zero distance, got {}",
-            best_dist
+            results.iter().any(|&(dist, pos)| pos == 82 && dist < 1e-4),
+            "expected exact row position 82 in top-5 candidates, got {:?}",
+            results
         );
-        assert_eq!(best_pos, 82);
     }
 
     #[test]

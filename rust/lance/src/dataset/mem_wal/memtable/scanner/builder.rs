@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, SchemaRef};
-use datafusion::common::{ScalarValue, ToDFSchema};
+use datafusion::common::ScalarValue;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
@@ -24,7 +24,7 @@ use super::exec::{
     BTreeIndexExec, FtsIndexExec, MemTableBruteForceVectorExec, MemTableDedupScanExec,
     MemTableScanExec, SCORE_COLUMN, VectorIndexExec,
 };
-use crate::dataset::mem_wal::scanner::exec::validate_pk_types;
+use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Vector search query parameters.
@@ -523,15 +523,7 @@ impl MemTableScanner {
 
     /// Set a filter expression using SQL-like syntax.
     pub fn filter(&mut self, filter_expr: &str) -> Result<&mut Self> {
-        let ctx = SessionContext::new();
-        let df_schema = self
-            .schema
-            .clone()
-            .to_dfschema()
-            .map_err(|e| Error::invalid_input(format!("Failed to create DFSchema: {}", e)))?;
-        let expr = ctx.parse_sql_expr(filter_expr, &df_schema).map_err(|e| {
-            Error::invalid_input(format!("Failed to parse filter expression: {}", e))
-        })?;
+        let expr = parse_filter_expr(self.schema.as_ref(), filter_expr)?;
         self.filter = Some(expr);
         Ok(self)
     }
@@ -575,6 +567,14 @@ impl MemTableScanner {
     /// * `query` - The query vector.
     /// * `k` - Number of nearest neighbors to return.
     pub fn nearest(&mut self, column: &str, query: &dyn Array, k: usize) -> Result<&mut Self> {
+        if k == 0 {
+            return Err(Error::invalid_input("k must be positive".to_string()));
+        }
+        if query.is_empty() {
+            return Err(Error::invalid_input(
+                "query vector must have non-zero length".to_string(),
+            ));
+        }
         self.nearest = Some(VectorQuery {
             column: column.to_string(),
             query_vector: query.slice(0, query.len()),
@@ -926,6 +926,12 @@ impl MemTableScanner {
 
     /// Create the execution plan based on the query configuration.
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        if self.nearest.is_some() && self.full_text_query.is_some() {
+            return Err(Error::invalid_input(
+                "MemTableScanner cannot combine vector and full-text search".to_string(),
+            ));
+        }
+
         // Determine which type of plan to create
         if let Some(ref vector_query) = self.nearest {
             return self.plan_vector_search(vector_query).await;
@@ -1093,36 +1099,49 @@ impl MemTableScanner {
         let projection_indices = self.compute_projection_indices()?;
         let base_schema = self.base_output_schema();
         let filter_predicate = self.filter_predicate()?;
+        if let Some(pk_columns) = &self.pk_columns {
+            validate_pk_types(&self.schema, pk_columns)?;
+        }
 
-        // With a prefilter we use brute force (which masks rows before the
-        // top-k cut) rather than the HNSW arm, whose graph traversal cannot
-        // honor an arbitrary predicate. Memtables are bounded, so an exact
-        // filtered brute-force scan is cheap.
-        let exec: Arc<dyn ExecutionPlan> =
-            if filter_predicate.is_none() && self.has_vector_index(&query.column) {
-                Arc::new(VectorIndexExec::new(
+        // With a prefilter we use brute force rather than HNSW because graph
+        // traversal cannot honor an arbitrary predicate. With PK rewrites, we
+        // also need exact newest-before-top-k semantics: a stale near vector
+        // must not consume an HNSW top-k slot and hide the next live row. Pure
+        // append-only PK data can still use HNSW safely. This relies on
+        // `IndexStore` marking PK overrides before advancing the visible batch
+        // watermark, so any snapshot that sees a rewrite also sees the flag.
+        let hnsw_safe_with_pk = self
+            .pk_columns
+            .as_ref()
+            .map(|_| self.indexes.has_pk_index() && !self.indexes.pk_has_overrides())
+            .unwrap_or(true);
+        let exec: Arc<dyn ExecutionPlan> = if filter_predicate.is_none()
+            && hnsw_safe_with_pk
+            && self.has_vector_index(&query.column)
+        {
+            Arc::new(VectorIndexExec::new(
+                self.batch_store.clone(),
+                self.indexes.clone(),
+                query.clone(),
+                max_visible,
+                projection_indices,
+                base_schema,
+                self.with_row_id,
+            )?)
+        } else {
+            Arc::new(
+                MemTableBruteForceVectorExec::new(
                     self.batch_store.clone(),
-                    self.indexes.clone(),
                     query.clone(),
                     max_visible,
                     projection_indices,
                     base_schema,
                     self.with_row_id,
-                )?)
-            } else {
-                Arc::new(
-                    MemTableBruteForceVectorExec::new(
-                        self.batch_store.clone(),
-                        query.clone(),
-                        max_visible,
-                        projection_indices,
-                        base_schema,
-                        self.with_row_id,
-                    )?
-                    .with_filter(filter_predicate)
-                    .with_pk_columns(self.pk_columns.clone()),
-                )
-            };
+                )?
+                .with_filter(filter_predicate)
+                .with_pk_columns(self.pk_columns.clone()),
+            )
+        };
         self.apply_post_index_ops(exec).await
     }
 
@@ -1314,7 +1333,7 @@ impl MemTableScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{BooleanArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     fn create_test_schema() -> SchemaRef {
@@ -1681,9 +1700,213 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_text_search_with_pk_columns_drops_stale_filtered_hits() {
-        use arrow_array::BooleanArray;
+    async fn full_text_search_prefilter_null_predicate_excludes_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["needle", "needle", "needle"])),
+                Arc::new(BooleanArray::from(vec![None, Some(true), Some(false)])),
+            ],
+        )
+        .unwrap();
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
 
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.filter("active = true").unwrap();
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("needle".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let result = scanner.try_into_batch().await.unwrap();
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![2],
+            "NULL predicate results must be excluded from FTS prefilter candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_prefilter_disables_wand_pruning() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("active", DataType::Boolean, true),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["alpha beta gamma delta", "alpha"])),
+                Arc::new(BooleanArray::from(vec![Some(false), Some(true)])),
+            ],
+        )
+        .unwrap();
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.filter("active = true").unwrap();
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("alpha beta gamma delta".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .wand_factor(Some(0.99)),
+            )
+            .unwrap();
+
+        let result = scanner.try_into_batch().await.unwrap();
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![2],
+            "filtered FTS must not let WAND prune rows before the prefilter is applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_append_only_pk_keeps_wand_pruning() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["alpha beta gamma delta", "alpha"])),
+            ],
+        )
+        .unwrap();
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.with_pk_columns(vec!["id".to_string()]);
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("alpha beta gamma delta".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .wand_factor(Some(0.99)),
+            )
+            .unwrap();
+
+        let result = scanner.try_into_batch().await.unwrap();
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![1],
+            "append-only PK data should keep index WAND pruning enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_with_pk_rewrite_disables_index_limit_pushdown() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    "alpha beta gamma delta epsilon",
+                    "other",
+                    "alpha beta gamma delta",
+                    "alpha",
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.with_pk_columns(vec!["id".to_string()]);
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("alpha beta gamma delta epsilon".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .limit(Some(2)),
+            )
+            .unwrap();
+
+        let result = scanner.try_into_batch().await.unwrap();
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "FTS-only PK rewrites must disable index limit pushdown so live lower-scoring PKs can backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_with_pk_columns_drops_stale_filtered_hits() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("text", DataType::Utf8, true),
@@ -1723,6 +1946,63 @@ mod tests {
             result.num_rows(),
             0,
             "the older matching version must not leak when the newest PK fails the filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_with_pk_columns_falls_back_without_pk_index() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2])),
+                Arc::new(StringArray::from(vec![
+                    "needle stale",
+                    "other",
+                    "other",
+                    "needle fresh",
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, 0, Some(0))
+            .unwrap();
+
+        let mut scanner = MemTableScanner::new(batch_store, Arc::new(indexes), schema);
+        scanner.with_pk_columns(vec!["id".to_string()]);
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("needle".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let result = scanner
+            .try_into_batch()
+            .await
+            .expect("FTS PK recency should fall back without a PK index");
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(
+            ids,
+            vec![2],
+            "without a PK index the batch-scan fallback must drop stale id=1 \
+             but keep id=2 whose newest version still matches"
         );
     }
 
@@ -2090,6 +2370,108 @@ mod tests {
             out_schema.field_with_name(DISTANCE_COLUMN).is_ok(),
             "plan output schema missing `{DISTANCE_COLUMN}` — got {:?}",
             out_schema
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nearest_rejects_invalid_query_shape() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let indexes = Arc::new(IndexStore::new());
+
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        let query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(vec![0.0_f32, 0.0_f32]));
+        let Err(err) = scanner.nearest("vector", query.as_ref(), 0) else {
+            panic!("zero-k vector search should fail");
+        };
+        assert!(
+            err.to_string().contains("k must be positive"),
+            "unexpected zero-k error: {err}"
+        );
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
+        let empty_query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(Vec::<f32>::new()));
+        let Err(err) = scanner.nearest("vector", empty_query.as_ref(), 5) else {
+            panic!("empty vector search should fail");
+        };
+        assert!(
+            err.to_string().contains("non-zero length"),
+            "unexpected empty-query error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_plan_rejects_vector_and_fts_combination() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let indexes = Arc::new(IndexStore::new());
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
+        let query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(vec![0.0_f32, 0.0_f32]));
+        scanner.nearest("vector", query.as_ref(), 5).unwrap();
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("needle".to_string())
+                    .with_column("text".to_string())
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let err = scanner
+            .create_plan()
+            .await
+            .expect_err("vector and FTS search must not be silently combined");
+        assert!(
+            err.to_string().contains("vector and full-text search"),
+            "unexpected combined-search error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_vector_search_validates_pk_types() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Float64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let indexes = Arc::new(IndexStore::new());
+
+        let mut scanner = MemTableScanner::new(batch_store, indexes, schema);
+        scanner.with_pk_columns(vec!["id".to_string()]);
+        let query: Arc<dyn arrow_array::Array> =
+            Arc::new(arrow_array::Float32Array::from(vec![0.0_f32, 0.0_f32]));
+        scanner.nearest("vector", query.as_ref(), 5).unwrap();
+
+        let err = scanner
+            .create_plan()
+            .await
+            .expect_err("unsupported vector PK type must be rejected");
+        assert!(
+            err.to_string().contains("unsupported type Float64"),
+            "unexpected error: {err}"
         );
     }
 }

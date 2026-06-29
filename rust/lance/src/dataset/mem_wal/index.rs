@@ -22,7 +22,7 @@ mod pk_key;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use datafusion::common::ScalarValue;
 
@@ -257,6 +257,11 @@ pub struct IndexStore {
     /// visible to scanners. Advanced unconditionally after a WAL append
     /// succeeds; not gated on whether any indexes are configured.
     max_visible_batch_position: AtomicUsize,
+    /// Conservative flag set once this memtable has observed any primary-key
+    /// rewrite while maintaining a search index. Search planners can push top-k
+    /// into HNSW/FTS for append-only PK data, but must switch to
+    /// newest-before-top-k search after an overwrite.
+    pk_has_overrides: AtomicBool,
 }
 
 impl Default for IndexStore {
@@ -267,6 +272,7 @@ impl Default for IndexStore {
             fts_indexes: HashMap::new(),
             pk_index: None,
             max_visible_batch_position: AtomicUsize::new(0),
+            pk_has_overrides: AtomicBool::new(false),
         }
     }
 }
@@ -296,6 +302,10 @@ impl std::fmt::Debug for IndexStore {
             .field(
                 "max_visible_batch_position",
                 &self.max_visible_batch_position.load(Ordering::Acquire),
+            )
+            .field(
+                "pk_has_overrides",
+                &self.pk_has_overrides.load(Ordering::Acquire),
             )
             .finish()
     }
@@ -360,6 +370,10 @@ impl IndexStore {
     }
 
     /// Add an HNSW vector index with default build parameters.
+    ///
+    /// HNSW indexes must be configured before rows are inserted into a
+    /// PK-indexed memtable. The vector planner's append-only fast path relies
+    /// on `pk_has_overrides` being maintained for every row visible to HNSW.
     pub fn add_hnsw(
         &mut self,
         name: String,
@@ -369,6 +383,10 @@ impl IndexStore {
         capacity: usize,
         max_batches: usize,
     ) {
+        assert!(
+            self.pk_index.is_none() || self.pk_is_empty(),
+            "HNSW indexes must be configured before inserting rows into a PK memtable"
+        );
         self.hnsw_indexes.insert(
             name,
             HnswMemIndex::with_capacity(
@@ -383,6 +401,8 @@ impl IndexStore {
     }
 
     /// Add an HNSW vector index with explicit build parameters.
+    ///
+    /// See [`Self::add_hnsw`] for the PK-indexed memtable lifecycle invariant.
     #[allow(clippy::too_many_arguments)]
     pub fn add_hnsw_with_params(
         &mut self,
@@ -394,6 +414,10 @@ impl IndexStore {
         capacity: usize,
         max_batches: usize,
     ) {
+        assert!(
+            self.pk_index.is_none() || self.pk_is_empty(),
+            "HNSW indexes must be configured before inserting rows into a PK memtable"
+        );
         self.hnsw_indexes.insert(
             name,
             HnswMemIndex::with_capacity(
@@ -408,7 +432,15 @@ impl IndexStore {
     }
 
     /// Add an FTS index with default tokenizer parameters.
+    ///
+    /// FTS indexes must be configured before rows are inserted into a
+    /// PK-indexed memtable. FTS top-k pushdown relies on `pk_has_overrides`
+    /// being maintained for every row visible to the index.
     pub fn add_fts(&mut self, name: String, field_id: i32, column: String) {
+        assert!(
+            self.pk_index.is_none() || self.pk_is_empty(),
+            "FTS indexes must be configured before inserting rows into a PK memtable"
+        );
         self.fts_indexes
             .insert(name, FtsMemIndex::new(field_id, column));
     }
@@ -421,6 +453,10 @@ impl IndexStore {
         column: String,
         params: InvertedIndexParams,
     ) {
+        assert!(
+            self.pk_index.is_none() || self.pk_is_empty(),
+            "FTS indexes must be configured before inserting rows into a PK memtable"
+        );
         self.fts_indexes
             .insert(name, FtsMemIndex::with_params(field_id, column, params));
     }
@@ -434,8 +470,16 @@ impl IndexStore {
     /// order-preserving encoded tuple (synthetic `PK_KEY_COLUMN`), maintained
     /// explicitly in the insert paths. Call once at construction, after
     /// [`Self::from_configs`] and before any inserts; a no-op when `pk_columns`
-    /// is empty.
+    /// is empty. Search indexes (HNSW/FTS) must also still be empty so every
+    /// search-visible row participates in PK override tracking.
     pub fn enable_pk_index(&mut self, pk_columns: &[(String, i32)]) {
+        if !pk_columns.is_empty() {
+            assert!(
+                self.hnsw_indexes.values().all(|idx| idx.is_empty())
+                    && self.fts_indexes.values().all(|idx| idx.is_empty()),
+                "Primary-key indexes must be configured before inserting rows into a search-indexed memtable"
+            );
+        }
         self.pk_index = match pk_columns {
             [] => None,
             [(column, field_id)] => {
@@ -500,7 +544,12 @@ impl IndexStore {
     /// Maintain the composite PK index for `batch` (no-op for single/no PK):
     /// encode the PK columns into the synthetic `PK_KEY_COLUMN` `Binary` column
     /// and feed that to the keyed `BTreeMemIndex`.
-    fn insert_composite_pk(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
+    fn insert_composite_pk(
+        &self,
+        batch: &RecordBatch,
+        row_offset: u64,
+        report_existing: bool,
+    ) -> Result<bool> {
         if let Some(PkIndex::Composite { index, columns }) = &self.pk_index {
             let pk_indices = Self::pk_batch_indices(batch, columns)?;
             let encoded = encode_pk_batch(batch, &pk_indices)?;
@@ -511,9 +560,12 @@ impl IndexStore {
             )]));
             let key_batch = RecordBatch::try_new(schema, vec![Arc::new(encoded)])
                 .map_err(|e| Error::invalid_input(e.to_string()))?;
+            if report_existing {
+                return index.insert_and_report_existing(&key_batch, row_offset);
+            }
             index.insert(&key_batch, row_offset)?;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// The newest row position of the primary-key tuple `values` (in PK order)
@@ -577,6 +629,32 @@ impl IndexStore {
         }
     }
 
+    /// Whether this memtable has observed at least one PK rewrite.
+    ///
+    /// This is intentionally conservative: once true, it never resets for the
+    /// lifetime of the memtable. That is enough for query planning because a
+    /// memtable is flushed as a unit, and any rewrite means search-index top-k
+    /// pushdown can be polluted by stale entries that must be removed before
+    /// top-k. Scalar-only PK tables skip tracking because no search index uses
+    /// the flag.
+    pub fn pk_has_overrides(&self) -> bool {
+        self.pk_has_overrides.load(Ordering::Acquire)
+    }
+
+    fn should_track_pk_overrides(&self) -> bool {
+        (!self.hnsw_indexes.is_empty() || !self.fts_indexes.is_empty()) && !self.pk_has_overrides()
+    }
+
+    fn is_single_pk_btree(&self, index: &Arc<BTreeMemIndex>) -> bool {
+        matches!(&self.pk_index, Some(PkIndex::Single(pk)) if Arc::ptr_eq(pk, index))
+    }
+
+    fn mark_pk_overrides_if_needed(&self, had_existing_pk: bool) {
+        if had_existing_pk {
+            self.pk_has_overrides.store(true, Ordering::Release);
+        }
+    }
+
     /// Insert a batch into all indexes.
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         self.insert_with_batch_position(batch, row_offset, None)
@@ -590,8 +668,14 @@ impl IndexStore {
         row_offset: u64,
         batch_position: Option<usize>,
     ) -> Result<()> {
+        let track_pk_overrides = self.should_track_pk_overrides();
         for index in self.btree_indexes.values() {
-            index.insert(batch, row_offset)?;
+            if track_pk_overrides && self.is_single_pk_btree(index) {
+                let had_existing = index.insert_and_report_existing(batch, row_offset)?;
+                self.mark_pk_overrides_if_needed(had_existing);
+            } else {
+                index.insert(batch, row_offset)?;
+            }
         }
         for index in self.hnsw_indexes.values() {
             index.insert(batch, row_offset)?;
@@ -601,7 +685,8 @@ impl IndexStore {
         }
         // Single-column PK aliases a `btree_indexes` entry (maintained above);
         // a composite PK has its own index, maintained here.
-        self.insert_composite_pk(batch, row_offset)?;
+        let had_existing = self.insert_composite_pk(batch, row_offset, track_pk_overrides)?;
+        self.mark_pk_overrides_if_needed(had_existing);
 
         // Update global watermark after all indexes have been updated
         if let Some(bp) = batch_position {
@@ -613,11 +698,11 @@ impl IndexStore {
 
     /// Advance the visibility watermark to at least `batch_pos`.
     ///
-    /// The watermark only ever moves forward (idempotent max). Public so the
-    /// WAL flush handler can advance it after a successful WAL append, which
-    /// is the authoritative durability signal regardless of whether any
-    /// indexes are configured.
-    pub fn advance_max_visible_batch_position(&self, batch_pos: usize) {
+    /// The watermark only ever moves forward (idempotent max). The vector
+    /// planner relies on the insert paths setting `pk_has_overrides` before
+    /// calling this method, so any snapshot that can see a PK rewrite also
+    /// observes `pk_has_overrides == true`.
+    pub(crate) fn advance_max_visible_batch_position(&self, batch_pos: usize) {
         let mut current = self.max_visible_batch_position.load(Ordering::Acquire);
         while batch_pos > current {
             match self.max_visible_batch_position.compare_exchange_weak(
@@ -639,11 +724,20 @@ impl IndexStore {
             return Ok(());
         }
 
+        let track_pk_overrides = self.should_track_pk_overrides();
         // BTree indexes: iterate batches (no cross-batch optimization benefit)
         for index in self.btree_indexes.values() {
+            let track_this_index = track_pk_overrides && self.is_single_pk_btree(index);
+            let mut had_existing = false;
             for stored in batches {
-                index.insert(&stored.data, stored.row_offset)?;
+                if track_this_index {
+                    had_existing |=
+                        index.insert_and_report_existing(&stored.data, stored.row_offset)?;
+                } else {
+                    index.insert(&stored.data, stored.row_offset)?;
+                }
             }
+            self.mark_pk_overrides_if_needed(had_existing);
         }
 
         // HNSW indexes: use batched insert
@@ -660,9 +754,12 @@ impl IndexStore {
 
         // Single-column PK aliases a `btree_indexes` entry (maintained above);
         // a composite PK has its own index, maintained here.
+        let mut had_existing = false;
         for stored in batches {
-            self.insert_composite_pk(&stored.data, stored.row_offset)?;
+            had_existing |=
+                self.insert_composite_pk(&stored.data, stored.row_offset, track_pk_overrides)?;
         }
+        self.mark_pk_overrides_if_needed(had_existing);
 
         // Update global watermark to the max batch position
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
@@ -692,24 +789,32 @@ impl IndexStore {
             return Ok(std::collections::HashMap::new());
         }
 
+        let track_pk_overrides = self.should_track_pk_overrides();
         // Use std::thread::scope for parallel CPU-bound work
         std::thread::scope(|scope| {
             // Each handle returns (index_name, index_type, duration, Result)
             let mut handles: Vec<(
                 &str,
                 &str,
-                std::thread::ScopedJoinHandle<'_, (std::time::Duration, Result<()>)>,
+                std::thread::ScopedJoinHandle<'_, (std::time::Duration, Result<bool>)>,
             )> = Vec::new();
 
             // Spawn a thread for each BTree index
             for (name, index) in &self.btree_indexes {
-                let handle = scope.spawn(move || -> (std::time::Duration, Result<()>) {
+                let track_this_index = track_pk_overrides && self.is_single_pk_btree(index);
+                let handle = scope.spawn(move || -> (std::time::Duration, Result<bool>) {
                     let start = Instant::now();
                     let result = (|| {
+                        let mut had_existing = false;
                         for stored in batches {
-                            index.insert(&stored.data, stored.row_offset)?;
+                            if track_this_index {
+                                had_existing |= index
+                                    .insert_and_report_existing(&stored.data, stored.row_offset)?;
+                            } else {
+                                index.insert(&stored.data, stored.row_offset)?;
+                            }
                         }
-                        Ok(())
+                        Ok(had_existing)
                     })();
                     (start.elapsed(), result)
                 });
@@ -718,9 +823,9 @@ impl IndexStore {
 
             // Spawn a thread for each HNSW index
             for (name, index) in &self.hnsw_indexes {
-                let handle = scope.spawn(move || -> (std::time::Duration, Result<()>) {
+                let handle = scope.spawn(move || -> (std::time::Duration, Result<bool>) {
                     let start = Instant::now();
-                    let result = index.insert_batches(batches);
+                    let result = index.insert_batches(batches).map(|_| false);
                     (start.elapsed(), result)
                 });
                 handles.push((name.as_str(), "hnsw", handle));
@@ -728,13 +833,13 @@ impl IndexStore {
 
             // Spawn a thread for each FTS index
             for (name, index) in &self.fts_indexes {
-                let handle = scope.spawn(move || -> (std::time::Duration, Result<()>) {
+                let handle = scope.spawn(move || -> (std::time::Duration, Result<bool>) {
                     let start = Instant::now();
                     let result = (|| {
                         for stored in batches {
                             index.insert(&stored.data, stored.row_offset)?;
                         }
-                        Ok(())
+                        Ok(false)
                     })();
                     (start.elapsed(), result)
                 });
@@ -746,11 +851,13 @@ impl IndexStore {
             // BTree updates) are preserved instead of getting truncated to 0.
             let mut first_error: Option<Error> = None;
             let mut timings: Vec<(&str, &str, std::time::Duration)> = Vec::new();
+            let mut had_existing_pk = false;
 
             for (name, idx_type, handle) in handles {
                 match handle.join() {
-                    Ok((duration, Ok(()))) => {
+                    Ok((duration, Ok(had_existing))) => {
                         timings.push((name, idx_type, duration));
+                        had_existing_pk |= had_existing;
                     }
                     Ok((duration, Err(e))) => {
                         timings.push((name, idx_type, duration));
@@ -770,6 +877,7 @@ impl IndexStore {
             if let Some(e) = first_error {
                 return Err(e);
             }
+            self.mark_pk_overrides_if_needed(had_existing_pk);
 
             let duration_map: std::collections::HashMap<String, std::time::Duration> = timings
                 .into_iter()
@@ -780,9 +888,12 @@ impl IndexStore {
             // already maintained it (and joined). A composite PK has its own
             // index; maintain it here before the watermark advances so the
             // visible prefix is fully indexed.
+            let mut had_existing = false;
             for stored in batches {
-                self.insert_composite_pk(&stored.data, stored.row_offset)?;
+                had_existing |=
+                    self.insert_composite_pk(&stored.data, stored.row_offset, track_pk_overrides)?;
             }
+            self.mark_pk_overrides_if_needed(had_existing);
 
             // Update global watermark to the max batch position
             let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
@@ -965,6 +1076,66 @@ mod tests {
         .unwrap()
     }
 
+    fn id_vector_batch(ids: &[i32]) -> RecordBatch {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+        ]));
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        for id in ids {
+            vectors.values().append_value(*id as f32);
+            vectors.values().append_value(*id as f32 + 0.5);
+            vectors.append(true);
+        }
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(vectors.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn id_name_vector_batch(rows: &[(i32, &str)]) -> RecordBatch {
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                false,
+            ),
+        ]));
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut names = Vec::with_capacity(rows.len());
+        let mut vectors = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        for (id, name) in rows {
+            ids.push(*id);
+            names.push(*name);
+            vectors.values().append_value(*id as f32);
+            vectors.values().append_value(name.len() as f32);
+            vectors.append(true);
+        }
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(vectors.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn pk_newest_visible_single_column() {
         let mut store = IndexStore::new();
@@ -981,6 +1152,114 @@ mod tests {
         assert!(!store.pk_is_newest(&one, 0, 5));
         // Absent key (probed by the typed value, as the block-list does).
         assert!(!store.pk_contains_key(&ScalarValue::Int32(Some(9)), 5));
+    }
+
+    #[test]
+    fn pk_has_overrides_tracks_single_column_rewrites() {
+        let mut store = IndexStore::new();
+        store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+
+        store.insert(&id_vector_batch(&[1, 2]), 0).unwrap();
+        assert!(
+            !store.pk_has_overrides(),
+            "append-only PK inserts should keep HNSW eligible"
+        );
+
+        store.insert(&id_vector_batch(&[3, 3]), 2).unwrap();
+        assert!(
+            store.pk_has_overrides(),
+            "duplicate PKs within one insert must disable HNSW"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Primary-key indexes must be configured before inserting rows into a search-indexed memtable"
+    )]
+    fn enable_pk_index_after_search_rows_panics() {
+        let mut store = IndexStore::new();
+        store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        store.insert(&id_vector_batch(&[1, 2]), 0).unwrap();
+
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+    }
+
+    #[test]
+    fn pk_has_overrides_tracks_single_column_rewrites_across_inserts() {
+        let mut store = IndexStore::new();
+        store.add_hnsw(
+            "vector_hnsw".to_string(),
+            1,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+
+        store.insert(&id_vector_batch(&[1, 2]), 0).unwrap();
+        assert!(
+            !store.pk_has_overrides(),
+            "append-only PK inserts should keep HNSW eligible"
+        );
+
+        store.insert(&id_vector_batch(&[1]), 2).unwrap();
+        assert!(
+            store.pk_has_overrides(),
+            "single-column PK rewrites across inserts must disable HNSW"
+        );
+    }
+
+    #[test]
+    fn pk_has_overrides_skips_scalar_only_tables() {
+        let mut store = IndexStore::new();
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+
+        store.insert(&id_batch(&[1, 1]), 0).unwrap();
+        assert!(
+            !store.pk_has_overrides(),
+            "scalar-only PK tables should not pay override tracking cost"
+        );
+    }
+
+    #[test]
+    fn pk_has_overrides_tracks_fts_rewrites() {
+        let mut store = IndexStore::new();
+        store.enable_pk_index(&[("id".to_string(), 0)]);
+        store.add_fts("text_fts".to_string(), 1, "text".to_string());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(StringArray::from(vec!["alpha", "beta"])),
+            ],
+        )
+        .unwrap();
+        store.insert(&batch, 0).unwrap();
+        assert!(
+            store.pk_has_overrides(),
+            "FTS PK rewrites must disable index-level FTS limit/WAND pushdown"
+        );
     }
 
     #[test]
@@ -1017,6 +1296,30 @@ mod tests {
         let tuple_2a = [ScalarValue::Int32(Some(2)), ScalarValue::from("a")];
         let key_2a = ScalarValue::Binary(Some(encode_pk_tuple(&tuple_2a).unwrap()));
         assert!(!store.pk_contains_key(&key_2a, 5));
+    }
+
+    #[test]
+    fn pk_has_overrides_tracks_composite_rewrites() {
+        let mut store = IndexStore::new();
+        store.add_hnsw(
+            "vector_hnsw".to_string(),
+            2,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            64,
+            8,
+        );
+        store.enable_pk_index(&[("id".to_string(), 0), ("name".to_string(), 1)]);
+        let first = id_name_vector_batch(&[(1, "a"), (1, "b")]);
+        store.insert(&first, 0).unwrap();
+        assert!(!store.pk_has_overrides());
+
+        let rewrite = id_name_vector_batch(&[(1, "a")]);
+        store.insert(&rewrite, 2).unwrap();
+        assert!(
+            store.pk_has_overrides(),
+            "repeated composite PK must disable HNSW"
+        );
     }
 
     #[test]

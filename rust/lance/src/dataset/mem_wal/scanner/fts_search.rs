@@ -47,14 +47,15 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::Expr;
 use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use tracing::instrument;
 
 use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
-use super::exec::{NewestPkFilterExec, PkBlockFilterExec};
+use super::exec::PkBlockFilterExec;
 use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
-use super::projection::project_to_canonical;
+use super::projection::{project_to_canonical, validate_projection_names};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::session::Session;
 
@@ -68,6 +69,41 @@ pub const SCORE_COLUMN: &str = "_score";
 /// so a blocked source still yields `k` live rows after the block-list filter.
 const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
 
+fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
+    match &query.query {
+        IndexFtsQuery::Match(m) => {
+            if m.fuzziness != Some(0) && m.operator != Operator::Or {
+                return Err(Error::not_supported(
+                    "LSM fuzzy full-text search only supports OR match operators".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        IndexFtsQuery::Phrase(_) => Ok(()),
+        _ => Err(Error::not_supported(
+            "LSM full-text search only supports match and phrase leaf queries".to_string(),
+        )),
+    }
+}
+
+fn active_source_can_execute_fts(source: &LsmDataSource, column: &str) -> bool {
+    match source {
+        LsmDataSource::ActiveMemTable {
+            batch_store,
+            index_store,
+            ..
+        } => {
+            index_store
+                .get_fts_by_column(column)
+                .is_some_and(|index| !index.is_empty())
+                && batch_store
+                    .max_visible_row(index_store.max_visible_batch_position())
+                    .is_some()
+        }
+        _ => false,
+    }
+}
+
 /// Plans local-scoring FTS queries over LSM data.
 pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
@@ -79,7 +115,7 @@ pub struct LsmFtsSearchPlanner {
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
     warmer: Option<Arc<dyn GenerationWarmer>>,
-    /// Over-fetch multiple for blocked sources (clamped to `>= 1.0`).
+    /// Over-fetch multiple for blocked sources.
     overfetch_factor: f64,
     /// Optional prefilter predicate applied to every source arm so FTS hits
     /// failing the predicate are dropped. Base/flushed arms use the dataset
@@ -115,7 +151,8 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Set the over-fetch multiple for blocked sources so they still yield `k`
-    /// live rows after cross-generation block-list filtering. Clamped to `>= 1.0`.
+    /// live rows after cross-generation block-list filtering. Values below
+    /// `1.0` are rejected by [`Self::plan_search`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = factor;
         self
@@ -170,7 +207,15 @@ impl LsmFtsSearchPlanner {
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
+        if sources
+            .iter()
+            .any(|source| active_source_can_execute_fts(source, column))
+        {
+            validate_lsm_fts_query(&query)?;
+        }
+        validate_projection_names(projection, &self.base_schema, &[SCORE_COLUMN])?;
         let target_schema = self.canonical_fts_schema(projection);
+        let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
             return self.empty_plan(&target_schema);
@@ -186,7 +231,6 @@ impl LsmFtsSearchPlanner {
             self.flushed_cache.as_ref(),
         ))
         .await?;
-        let overfetch = self.overfetch_factor.max(1.0);
 
         // Stage the per-source over-fetch decisions, then build every source
         // plan concurrently — the builds are independent and a sequential loop
@@ -196,14 +240,22 @@ impl LsmFtsSearchPlanner {
             .map(|source| {
                 let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
                 let blocked = block_lists.get(&(source.shard_id(), source.generation()));
-                // The active PK arm has an exact recency filter after the FTS
-                // exec. Keep it uncapped until that filter runs so stale
-                // high-scoring hits cannot consume the per-source limit.
+                let active_needs_uncapped_recency = match source {
+                    LsmDataSource::ActiveMemTable { index_store, .. }
+                        if !self.pk_columns.is_empty() =>
+                    {
+                        !index_store.has_pk_index() || index_store.pk_has_overrides()
+                    }
+                    _ => false,
+                };
+                // Active PK arms only need to stay uncapped when recency
+                // filtering may drop hits. Append-only PK memtables can safely
+                // pass the limit through and let FtsIndexExec use WAND/top-k.
                 // Blocked non-active sources use heuristic over-fetch because
                 // their newer generation membership may also drop candidates.
-                let fetch_limit = if is_active && !self.pk_columns.is_empty() {
+                let fetch_limit = if active_needs_uncapped_recency {
                     None
-                } else if blocked.is_some() {
+                } else if blocked.is_some() && !self.pk_columns.is_empty() {
                     limit.map(|limit| ((limit as f64) * overfetch).ceil() as usize)
                 } else {
                     limit
@@ -218,18 +270,15 @@ impl LsmFtsSearchPlanner {
             .await?;
 
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
-        for ((_, is_active, blocked, _), plan) in arm_inputs.iter().zip(built) {
-            let is_active = *is_active;
+        for ((_, _, blocked, _), plan) in arm_inputs.iter().zip(built) {
             let blocked = *blocked;
-            // Within-generation dedup is already applied per source:
-            //  * active/frozen in-memory: `NewestPkFilterExec` inside
-            //    `build_source_plan` (drops predicate-crossing stale hits, which a
-            //    result-set dedup can't catch).
-            //  * flushed/base: drop rows superseded by a newer generation via the
-            //    block-list (within-gen is handled by the flushed deletion vector).
-            let deduped = if is_active {
-                plan
-            } else if let Some(set) = blocked
+            // Dedup, mirroring LsmVectorSearchPlanner:
+            //  * each memtable: `FtsIndexExec` drops superseded PK versions
+            //    within that memtable before the query limit whenever PK
+            //    columns are present.
+            //  * any source with a block-list: drop rows superseded by a newer
+            //    generation, including frozen in-memory memtables.
+            let deduped = if let Some(set) = blocked
                 && !self.pk_columns.is_empty()
             {
                 Arc::new(PkBlockFilterExec::new(
@@ -242,8 +291,7 @@ impl LsmFtsSearchPlanner {
                 plan
             };
 
-            // Normalize to canonical. This also drops the active arm's _rowid,
-            // which the canonical FTS schema omits — it served only the dedup.
+            // Normalize to the canonical FTS schema before merging sources.
             let normalized = project_to_canonical(deduped, &target_schema)?;
             per_source_plans.push(normalized);
         }
@@ -354,6 +402,10 @@ impl LsmFtsSearchPlanner {
                 schema,
                 ..
             } => {
+                if !active_source_can_execute_fts(source, column) {
+                    return self.empty_plan(&self.canonical_fts_schema(projection));
+                }
+                validate_lsm_fts_query(query)?;
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
                 let cols = self.fts_scanner_projection(projection);
@@ -363,13 +415,11 @@ impl LsmFtsSearchPlanner {
                     // masked by the predicate before projection.
                     scanner.filter_expr(filter.clone());
                 }
-                // Expose the row position so the recency filter can identify the
-                // newest visible version of each PK. The append-only inverted
-                // index keeps an updated row's old postings live, so a stale hit
-                // can match a query the fresh row no longer does; the filter
-                // drops it. `project_to_canonical` strips `_rowid` afterward.
+                // The append-only inverted index keeps an updated row's old
+                // postings live, so the memtable FTS exec needs PK columns to
+                // drop stale hits before it applies the query limit.
                 if !self.pk_columns.is_empty() {
-                    scanner.with_row_id();
+                    scanner.with_pk_columns(self.pk_columns.clone());
                 }
                 // `MemTableScanner::full_text_search` now takes a structured
                 // `FullTextSearchQuery` (match/phrase); it rejects compound
@@ -381,26 +431,7 @@ impl LsmFtsSearchPlanner {
                     bound_query = bound_query.limit(None);
                 }
                 scanner.full_text_search(bound_query)?;
-                let plan = scanner.create_plan().await?;
-                if self.pk_columns.is_empty() {
-                    return Ok(plan);
-                }
-                // Drop predicate-crossing stale hits: keep a hit iff it is the
-                // newest visible version of its PK (collapses duplicate-PK
-                // appends too — supersedes the old WithinSourceDedupExec).
-                debug_assert!(
-                    index_store.has_pk_index(),
-                    "active FTS PK recency filtering requires a maintained PK index"
-                );
-                let filtered: Arc<dyn ExecutionPlan> = Arc::new(NewestPkFilterExec::new(
-                    plan,
-                    self.pk_columns.clone(),
-                    lance_core::ROW_ID,
-                    index_store.clone(),
-                    batch_store.clone(),
-                    scanner.max_visible_batch_position(),
-                ));
-                Ok(filtered)
+                scanner.create_plan().await
             }
         }
     }
@@ -477,7 +508,7 @@ mod tests {
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use std::collections::HashMap;
@@ -495,6 +526,20 @@ mod tests {
         ]))
     }
 
+    fn fts_tombstone_schema() -> Arc<ArrowSchema> {
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(id_meta);
+        Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("text", DataType::Utf8, true),
+            Field::new(crate::dataset::mem_wal::TOMBSTONE, DataType::Boolean, false),
+        ]))
+    }
+
     fn make_batch(schema: &ArrowSchema, ids: &[i32], texts: &[&str]) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(schema.clone()),
@@ -506,12 +551,61 @@ mod tests {
         .unwrap()
     }
 
+    fn make_tombstone_batch(
+        schema: &ArrowSchema,
+        rows: &[(i32, Option<&str>, bool)],
+    ) -> RecordBatch {
+        let ids: Vec<i32> = rows.iter().map(|(id, _, _)| *id).collect();
+        let texts: Vec<Option<&str>> = rows.iter().map(|(_, text, _)| *text).collect();
+        let tombstones: Vec<bool> = rows.iter().map(|(_, _, tombstone)| *tombstone).collect();
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(texts)),
+                Arc::new(BooleanArray::from(tombstones)),
+            ],
+        )
+        .unwrap()
+    }
+
     async fn write_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
-        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
-        Dataset::write(reader, uri, Some(WriteParams::default()))
+        let has_id = schema.column_with_name("id").is_some();
+        let reader = RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, uri, Some(WriteParams::default()))
             .await
-            .unwrap()
+            .unwrap();
+        if has_id {
+            crate::dataset::mem_wal::scanner::block_list::write_pk_sidecar(uri, &batches, &["id"])
+                .await
+                .unwrap();
+        }
+        dataset
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_projection_column() {
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec!["missing".to_string()];
+        let err = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(1),
+                Some(&projection),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing-column projection error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -724,6 +818,291 @@ mod tests {
         );
     }
 
+    /// The flushed arm must apply the filter as a true FTS prefilter, and that
+    /// prefiltered candidate set must compose with cross-generation block-list
+    /// filtering plus over-fetch. Gen 1's best predicate-matching hit (id=3) is
+    /// superseded by gen 2; with over-fetch, gen 1 should still contribute id=4.
+    #[tokio::test]
+    async fn prefilter_on_flushed_composes_with_block_list() {
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+        use crate::index::DatasetIndexExt;
+        use datafusion::prelude::{col, lit};
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+
+        // Gen 1: id=1 matches strongly but fails the predicate. id=3 matches
+        // strongly but is stale (blocked by gen 2). id=4 is the next live
+        // predicate match that only survives if the flushed arm prefilters and
+        // over-fetches before the block-list drops id=3.
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        let mut gen1 = write_dataset(
+            &gen1_uri,
+            vec![make_batch(
+                &schema,
+                &[1, 3, 4],
+                &["lance lance lance lance", "lance lance lance", "lance"],
+            )],
+        )
+        .await;
+        gen1.create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".to_string()),
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Gen 2: newer id=3 shadows gen 1's match but does not match the query.
+        let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
+        let mut gen2 =
+            write_dataset(&gen2_uri, vec![make_batch(&schema, &[3], &["other text"])]).await;
+        gen2.create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".to_string()),
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(3)
+            .with_flushed_generation(1, "gen_1".to_string())
+            .with_flushed_generation(2, "gen_2".to_string());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot]);
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_filter(Some(col("id").gt_eq(lit(3i32))))
+            .with_overfetch_factor(2.0);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(1),
+                None,
+            )
+            .await
+            .expect("planner should produce a filtered flushed plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![4],
+            "flushed FTS prefilter should return live id=4 after stale id=3 is blocked; got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_tombstone_masks_base_fts_hit() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let base_schema = fts_schema();
+        let mem_schema = fts_tombstone_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+
+        let mut base = write_dataset(
+            &base_uri,
+            vec![make_batch(&base_schema, &[1, 2], &["lance lance", "lance"])],
+        )
+        .await;
+        base.create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_fts".to_string()),
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let active_tombstone = make_tombstone_batch(&mem_schema, &[(1, None, true)]);
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        index_store.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let (_, row_offset, batch_position) = batch_store.append(active_tombstone.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&active_tombstone, row_offset, Some(batch_position))
+            .unwrap();
+        let index_store = Arc::new(index_store);
+
+        let collector = LsmDataSourceCollector::new(Arc::new(base), vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: mem_schema,
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], base_schema)
+            .with_overfetch_factor(2.0);
+
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(1),
+                None,
+            )
+            .await
+            .unwrap();
+        let stream = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        assert_eq!(
+            ids,
+            vec![2],
+            "active tombstone for id=1 must block the older base FTS hit; got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_update_and_tombstone_mask_frozen_fts_hits() {
+        let base_schema = fts_schema();
+        let mem_schema = fts_tombstone_schema();
+
+        let frozen_batch = make_tombstone_batch(
+            &mem_schema,
+            &[
+                (1, Some("lance stale update"), false),
+                (2, Some("lance live"), false),
+                (3, Some("lance deleted"), false),
+            ],
+        );
+        let frozen_batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut frozen_index_store = IndexStore::new();
+        frozen_index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        frozen_index_store.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let (_, frozen_row_offset, frozen_batch_position) =
+            frozen_batch_store.append(frozen_batch.clone()).unwrap();
+        frozen_index_store
+            .insert_with_batch_position(
+                &frozen_batch,
+                frozen_row_offset,
+                Some(frozen_batch_position),
+            )
+            .unwrap();
+
+        let active_batch = make_tombstone_batch(
+            &mem_schema,
+            &[(1, Some("fresh other text"), false), (3, None, true)],
+        );
+        let active_batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut active_index_store = IndexStore::new();
+        active_index_store.enable_pk_index(&[("id".to_string(), 0)]);
+        active_index_store.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let (_, active_row_offset, active_batch_position) =
+            active_batch_store.append(active_batch.clone()).unwrap();
+        active_index_store
+            .insert_with_batch_position(
+                &active_batch,
+                active_row_offset,
+                Some(active_batch_position),
+            )
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: active_batch_store,
+                        index_store: Arc::new(active_index_store),
+                        schema: mem_schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![InMemoryMemTableRef {
+                        batch_store: frozen_batch_store,
+                        index_store: Arc::new(frozen_index_store),
+                        schema: mem_schema,
+                        generation: 1,
+                    }],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], base_schema);
+
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(10),
+                None,
+            )
+            .await
+            .unwrap();
+        let stream = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![2],
+            "active update id=1 and tombstone id=3 must block stale frozen FTS hits; got {ids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn active_filtered_search_without_pk_applies_small_limit_after_filter() {
         use datafusion::prelude::{col, lit};
@@ -735,7 +1114,7 @@ mod tests {
         let active_batch = make_batch(
             &schema,
             &[1, 2, 3],
-            &["lance one", "lance two", "lance three"],
+            &["lance", "lance filler", "lance filler filler"],
         );
         batch_store.append(active_batch.clone()).unwrap();
         indexes
@@ -789,14 +1168,203 @@ mod tests {
         }
         ids.sort_unstable();
         assert_eq!(
-            ids.len(),
-            2,
-            "no-PK filtered active search must apply the limit after filtering; got ids={ids:?}"
+            ids,
+            vec![1, 2],
+            "no-PK filtered active search must apply the limit after filtering \
+             and keep the top-scoring matching hits; got ids={ids:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn fuzzy_and_query_is_rejected_when_active_memtable_is_present() {
+        use lance_index::scalar::inverted::query::{
+            FtsQuery as IndexFtsQuery, MatchQuery, Operator,
+        };
+
+        let schema = fts_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_batch(&schema, &[1], &["lance memwal"]);
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: indexes,
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec![], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("lance memwal".to_string())
+                .with_operator(Operator::And)
+                .with_fuzziness(Some(1)),
+        ));
+
+        let err = planner
+            .plan_search("text", query, Some(10), None)
+            .await
+            .expect_err("fuzzy AND should be rejected consistently");
         assert!(
-            ids.iter().all(|id| (1..=3).contains(id)),
-            "no-PK filtered active search returned a row outside the filtered matches: {ids:?}"
+            err.to_string().contains("fuzzy full-text search"),
+            "unexpected error for fuzzy AND query: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn base_only_boolean_query_uses_dataset_scanner_support() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::query::{
+            BooleanQuery, FtsQuery as IndexFtsQuery, MatchQuery, Occur,
+        };
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(
+                &schema,
+                &[1, 2],
+                &["lance rocks", "unrelated text"],
+            )],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(
+            vec![(Occur::Must, MatchQuery::new("lance".to_string()).into())],
+        )));
+        let plan = planner
+            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .expect("base-only boolean query should be delegated to dataset scanner");
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn boolean_query_ignores_active_memtable_without_relevant_fts_index() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::query::{
+            BooleanQuery, FtsQuery as IndexFtsQuery, MatchQuery, Occur,
+        };
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_batch(
+                &schema,
+                &[1, 2],
+                &["lance rocks", "unrelated text"],
+            )],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        let active_batch = make_batch(&schema, &[99], &["active text has no fts index"]);
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Boolean(BooleanQuery::new(
+            vec![(Occur::Must, MatchQuery::new("lance".to_string()).into())],
+        )));
+        let plan = planner
+            .plan_search("text", query, Some(10), Some(&["id".to_string()]))
+            .await
+            .expect("irrelevant active memtable must not reject base-supported boolean query");
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, vec![1]);
     }
 
     /// The base arm must apply the filter as a true *prefilter*, not a
@@ -970,11 +1538,11 @@ mod tests {
         );
     }
 
-    /// The active FTS arm must also avoid capping before the newest-PK filter.
-    /// A stale high-scoring hit can be removed by `NewestPkFilterExec`; a lower
+    /// The active FTS arm must also avoid capping before newest-PK filtering.
+    /// A stale high-scoring hit can be removed by `FtsIndexExec`; a lower
     /// scoring live hit must still be available for the final global top-k.
     #[tokio::test]
-    async fn active_limit_applies_after_newest_pk_filter() {
+    async fn active_limit_applies_after_newest_pk_recency_filter() {
         use datafusion::prelude::{col, lit};
 
         let mut id_meta = HashMap::new();
@@ -1155,6 +1723,129 @@ mod tests {
             total, 0,
             "pk=5's current version is 'archived' and must be excluded; the stale \
              'active' older hit must not leak (filter evaluated on newest version)"
+        );
+    }
+
+    /// Cross-arm stale hits must be blocked even if the newer active row fails
+    /// the prefilter. The base copy of pk=5 matches both text and status, but
+    /// the newer active copy is archived; pk=5 must not leak from the base arm.
+    #[tokio::test]
+    async fn prefilter_blocks_base_hit_when_active_newest_fails() {
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::index::DatasetIndexExt;
+        use datafusion::prelude::{col, lit};
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_meta),
+            Field::new("text", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let make_rows = |rows: &[(i32, &str, &str)]| -> RecordBatch {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(
+                        rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        rows.iter().map(|(_, text, _)| *text).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        rows.iter()
+                            .map(|(_, _, status)| *status)
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = write_dataset(
+            &base_uri,
+            vec![make_rows(&[
+                (5, "lance base stale", "active"),
+                (6, "lance base live", "active"),
+            ])],
+        )
+        .await;
+        base_ds
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let active_batch = make_rows(&[(5, "lance active newest", "archived")]);
+        batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, 0, Some(0))
+            .unwrap();
+        let indexes = Arc::new(indexes);
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: indexes,
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_filter(Some(col("status").eq(lit("active"))));
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("lance".to_string()),
+                Some(10),
+                None,
+            )
+            .await
+            .expect("planner should produce a filtered base+active plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let id_array = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                ids.push(id_array.value(row));
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![6],
+            "base pk=5 passes the filter but is superseded by active archived pk=5; got {ids:?}"
         );
     }
 
@@ -1414,8 +2105,8 @@ mod tests {
         // index keeps the old "alpha" posting live, so an "alpha" search still
         // matches the STALE pk=1 row — and the fresh "beta lance" row isn't even
         // a candidate, so a result-set dedup has nothing to suppress it against.
-        // `NewestPkFilterExec` drops it predicate-independently: pk=1's newest
-        // visible row is "beta lance", so the "alpha" hit is not the newest.
+        // `FtsIndexExec` drops it predicate-independently: pk=1's newest visible
+        // row is "beta lance", so the "alpha" hit is not the newest.
         let schema = fts_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut indexes = IndexStore::new();
@@ -1550,7 +2241,7 @@ mod tests {
             .plan_search(
                 "text",
                 FullTextSearchQuery::new("alpha".to_string()),
-                10,
+                Some(10),
                 None,
             )
             .await

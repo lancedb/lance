@@ -2097,7 +2097,7 @@ fn tail_token_df(
     }
 }
 
-/// OR-score `tokens` against the visible tail, summing each token's BM25
+/// Score `tokens` against the visible tail, summing each token's BM25
 /// contribution per document. Uses the shared corpus-wide `scorer`.
 fn score_terms(
     snap: &Snapshot,
@@ -2138,7 +2138,8 @@ fn score_terms(
         return Vec::new();
     }
     let mut doc_scores: HashMap<RowPosition, f32> = HashMap::new();
-    let mut doc_hits: HashMap<RowPosition, u32> = HashMap::new();
+    let mut doc_hits: Option<HashMap<RowPosition, u32>> =
+        (operator == Operator::And).then(HashMap::new);
     for (qw, slice) in tail_terms {
         for chunk in slice.chunks() {
             if chunk.batch_position >= snap.visible_count {
@@ -2151,7 +2152,9 @@ fn score_terms(
                 let dl = meta.dl(row_position).unwrap_or(1);
                 let score = qw * scorer.doc_weight(chunk.frequencies[i], dl);
                 *doc_scores.entry(row_position).or_default() += score;
-                *doc_hits.entry(row_position).or_default() += 1;
+                if let Some(doc_hits) = &mut doc_hits {
+                    *doc_hits.entry(row_position).or_default() += 1;
+                }
             }
         }
     }
@@ -2160,7 +2163,8 @@ fn score_terms(
         .filter(|(row_position, _)| {
             operator == Operator::Or
                 || doc_hits
-                    .get(row_position)
+                    .as_ref()
+                    .and_then(|doc_hits| doc_hits.get(row_position))
                     .is_some_and(|hits| *hits >= tokens.len() as u32)
         })
         .map(|(row_position, score)| FtsEntry {

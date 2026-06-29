@@ -21,6 +21,7 @@ use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, RO
 use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
+    validate_projection_names,
 };
 use crate::session::Session;
 
@@ -103,7 +104,8 @@ impl LsmScanPlanner {
     }
 
     /// Set the over-fetch multiple for the per-source limit pushdown
-    /// (see the field docs). Clamped to `>= 1.0` at use.
+    /// (see the field docs). Values below `1.0` are rejected by
+    /// [`Self::plan_scan`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = factor;
         self
@@ -148,9 +150,11 @@ impl LsmScanPlanner {
             .map(|p| p.iter().any(|c| c == ROW_ADDRESS_COLUMN))
             .unwrap_or(false);
         let keep_row_address = keep_row_address || user_wants_rowaddr;
+        validate_projection_names(projection, &self.base_schema, &[])?;
 
         // 1. Collect all data sources
         let sources = self.collector.collect()?;
+        let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
             // Return empty plan
@@ -182,7 +186,6 @@ impl LsmScanPlanner {
         // is in-memory and within-gen append duplicates are resolved by its
         // own dedup, so it is never capped here.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
-        let overfetch = self.overfetch_factor.max(1.0);
 
         let mut source_plans = Vec::new();
         for source in sources {
@@ -192,7 +195,7 @@ impl LsmScanPlanner {
                 .get(&(source.shard_id(), source.generation()))
                 .cloned();
             let fetch = match (n_needed, is_active) {
-                (Some(n), false) => Some(if blocked.is_some() {
+                (Some(n), false) => Some(if blocked.is_some() && !self.pk_columns.is_empty() {
                     ((n as f64) * overfetch).ceil() as usize
                 } else {
                     n
@@ -207,13 +210,14 @@ impl LsmScanPlanner {
             // With a limit, `k = n_needed` arms the under-fetch warning; with
             // no limit `k = 0` keeps it silent.
             let scan = match blocked {
-                Some(set) => Arc::new(PkBlockFilterExec::new(
+                Some(set) if !self.pk_columns.is_empty() => Arc::new(PkBlockFilterExec::new(
                     scan,
                     self.pk_columns.clone(),
                     set,
                     n_needed.unwrap_or(0),
-                )) as Arc<dyn ExecutionPlan>,
-                None => scan,
+                ))
+                    as Arc<dyn ExecutionPlan>,
+                _ => scan,
             };
 
             // Post-block-list cap: each source contributes at most `n_needed`
