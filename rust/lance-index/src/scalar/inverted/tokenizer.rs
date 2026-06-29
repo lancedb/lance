@@ -359,12 +359,17 @@ impl InvertedIndexParams {
     ///
     /// Supported values are 128 and 256. Larger values reduce block-max metadata
     /// and WAND skip granularity; smaller values preserve the legacy layout.
+    ///
+    /// `block_size = 256` is experimental and may introduce breaking changes.
+    /// Use `128` when stable compatibility with the legacy posting layout is required.
     pub fn block_size(mut self, block_size: usize) -> Result<Self> {
         self.block_size = validate_block_size(block_size)?;
         Ok(self)
     }
 
     /// Get the compressed posting block size.
+    ///
+    /// `256` is experimental and may introduce breaking changes.
     pub fn posting_block_size(&self) -> usize {
         self.block_size
     }

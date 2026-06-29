@@ -3318,6 +3318,9 @@ class LanceDataset(pa.dataset.Dataset):
         block_size: int, default 256
             This is for the ``INVERTED`` index. Number of documents per compressed
             posting block. Must be one of ``128`` or ``256``.
+            ``block_size=256`` is experimental and may introduce breaking changes.
+            Use ``128`` when stable compatibility with the legacy posting layout is
+            required.
         memory_limit: int, optional
             This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
             If set, Lance divides this budget evenly across the workers. If unset,

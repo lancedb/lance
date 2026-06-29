@@ -232,6 +232,9 @@ public final class InvertedIndexParams {
      * <p>Supported values are {@code 128} and {@code 256}. New indexes default to {@code 256} when
      * this is not set.
      *
+     * <p>{@code blockSize = 256} is experimental and may introduce breaking changes. Use {@code
+     * 128} when stable compatibility with the legacy posting layout is required.
+     *
      * @param blockSize posting block size
      * @return this builder
      * @throws IllegalArgumentException if {@code blockSize} is unsupported
