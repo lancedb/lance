@@ -1691,7 +1691,17 @@ impl MergeInsertJob {
             }
         }
 
+        // A partial-schema source that both deletes matched rows and inserts
+        // unmatched rows cannot be expressed by the indexed-scan delete path
+        // (the delete cannot be folded into a partial write). Keep it off the
+        // scalar-index route so it falls through to the v2 plan, which handles
+        // delete + insert directly.
+        let is_partial_delete_with_insert = is_subset_schema
+            && self.params.insert_not_matched
+            && matches!(self.params.when_matched, WhenMatched::Delete);
+
         let would_use_scalar_index = if self.params.use_index
+            && !is_partial_delete_with_insert
             && matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -2407,11 +2417,35 @@ impl Merger {
             WhenMatched::DoNothing => {}
             WhenMatched::Delete => {
                 // Matched rows are removed, not rewritten: record their row ids
-                // for the commit to delete and emit no replacement batch.
-                let matched_row_ids = arrow::compute::filter(batch.column(row_id_col), &in_both)?;
-                let row_ids = matched_row_ids.as_primitive::<UInt64Type>();
-                merge_statistics.num_deleted_rows += row_ids.len() as u64;
-                deleted_row_ids.extend(row_ids.values());
+                // for the commit to delete and emit no replacement batch. A
+                // source with duplicate keys matches the same target row more
+                // than once; apply the same `source_dedupe_behavior` policy as
+                // updates so a duplicate either aborts (`Fail`) or is skipped
+                // and counted once (`FirstSeen`) — the commit deletes the row a
+                // single time regardless.
+                let matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+                let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
+
+                let mut processed_row_ids = self.processed_row_ids.lock().unwrap();
+                for (row_idx, &row_id) in row_ids.values().iter().enumerate() {
+                    if processed_row_ids.insert(row_id) {
+                        merge_statistics.num_deleted_rows += 1;
+                        deleted_row_ids.push(row_id);
+                    } else {
+                        match self.params.source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    &matched,
+                                    row_idx,
+                                    &self.params.on,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                merge_statistics.num_skipped_duplicates += 1;
+                            }
+                        }
+                    }
+                }
             }
             WhenMatched::Fail => {
                 // Any matched row aborts the whole operation.
@@ -4418,6 +4452,260 @@ mod tests {
                 .unwrap(),
             1,
             "unmatched source row must be inserted"
+        );
+    }
+
+    /// A delete whose source contains duplicate keys matching the same target
+    /// row applies `source_dedupe_behavior` on the indexed-scan path, exactly
+    /// like an update: the default `Fail` aborts (naming the ambiguous key),
+    /// while `FirstSeen` removes and counts the row once and reports the extra
+    /// match as a skipped duplicate.
+    #[rstest::rstest]
+    #[case::fail(SourceDedupeBehavior::Fail)]
+    #[case::first_seen(SourceDedupeBehavior::FirstSeen)]
+    #[tokio::test]
+    async fn test_indexed_merge_insert_delete_source_duplicates(
+        #[case] behavior: SourceDedupeBehavior,
+    ) {
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2, 2]),
+            ("b", Int32, [10, 20, 10, 20]),
+            ("value", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Index every join column so the merge takes the indexed-scan delete path.
+        let params = ScalarIndexParams::default();
+        ds.create_index(&["a"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        ds.create_index(&["b"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Two source rows collide on the same target key (1, 10).
+        let source = record_batch!(("a", Int32, [1, 1]), ("b", Int32, [10, 10])).unwrap();
+
+        let result =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .source_dedupe_behavior(behavior)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await;
+
+        if behavior == SourceDedupeBehavior::Fail {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Ambiguous merge inserts") && err.contains("a = 1"),
+                "Fail must abort naming the ambiguous key, got: {err}"
+            );
+            return;
+        }
+
+        let (updated_ds, stats) = result.unwrap();
+        assert_eq!(stats.num_deleted_rows, 1);
+        assert_eq!(stats.num_skipped_duplicates, 1);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("a = 1 AND b = 10".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "the matched row must be removed exactly once"
+        );
+    }
+
+    /// The v2 plans apply the same `source_dedupe_behavior` to deletes when the
+    /// source has duplicate keys matching one target row — covering both
+    /// `FullSchemaMergeInsertExec` (`Delete + InsertAll`) and
+    /// `DeleteOnlyMergeInsertExec` (pure delete). No scalar index, so routing
+    /// stays on the v2 path.
+    #[rstest::rstest]
+    #[case::full_schema_fail(true, SourceDedupeBehavior::Fail)]
+    #[case::full_schema_first_seen(true, SourceDedupeBehavior::FirstSeen)]
+    #[case::delete_only_fail(false, SourceDedupeBehavior::Fail)]
+    #[case::delete_only_first_seen(false, SourceDedupeBehavior::FirstSeen)]
+    #[tokio::test]
+    async fn test_v2_merge_insert_delete_source_duplicates(
+        #[case] with_insert: bool,
+        #[case] behavior: SourceDedupeBehavior,
+    ) {
+        let initial =
+            record_batch!(("a", Int32, [1, 2, 3]), ("value", Int32, [10, 20, 30])).unwrap();
+        let schema = initial.schema();
+
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Two source rows collide on target key a=1. With insert, a=4 is new.
+        let (source, when_not_matched, expected_inserted, expected_total) = if with_insert {
+            (
+                record_batch!(("a", Int32, [1, 1, 4]), ("value", Int32, [99, 99, 40])).unwrap(),
+                WhenNotMatched::InsertAll,
+                1,
+                3, // 3 - 1 deleted + 1 inserted
+            )
+        } else {
+            (
+                record_batch!(("a", Int32, [1, 1])).unwrap(),
+                WhenNotMatched::DoNothing,
+                0,
+                2, // 3 - 1 deleted
+            )
+        };
+
+        let result = MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::Delete)
+            .when_not_matched(when_not_matched)
+            .source_dedupe_behavior(behavior)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await;
+
+        if behavior == SourceDedupeBehavior::Fail {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Ambiguous merge inserts") && err.contains("a = 1"),
+                "Fail must abort naming the ambiguous key, got: {err}"
+            );
+            return;
+        }
+
+        let (updated_ds, stats) = result.unwrap();
+        assert_eq!(stats.num_deleted_rows, 1, "the matched row is removed once");
+        assert_eq!(stats.num_skipped_duplicates, 1);
+        assert_eq!(stats.num_inserted_rows, expected_inserted);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), expected_total);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("a = 1".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "the matched row must be removed exactly once"
+        );
+    }
+
+    /// A partial-schema source that combines `when_matched(Delete)` with
+    /// `when_not_matched(InsertAll)` must succeed even when every join key is
+    /// indexed. The indexed-scan delete path cannot fold a delete into a
+    /// partial write, so this case routes to the v2 plan (which fills omitted
+    /// nullable target columns) instead of being rejected.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_partial_schema_delete_with_insert() {
+        // Target carries two nullable non-key columns; the source omits `note`.
+        let full_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let full_batch = RecordBatch::try_new(
+            full_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2])),
+                Arc::new(Int32Array::from(vec![10, 20, 10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200, 300, 400])),
+                Arc::new(StringArray::from(vec!["w", "x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(full_batch)], full_schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::default();
+        ds.create_index(&["a"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        ds.create_index(&["b"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Source deletes matched (1, 10) and inserts new (3, 30), omitting `note`.
+        let partial_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let source = RecordBatch::try_new(
+            partial_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])),
+                Arc::new(Int32Array::from(vec![10, 30])),
+                Arc::new(Int32Array::from(vec![999, 333])),
+            ],
+        )
+        .unwrap();
+
+        let (updated_ds, stats) =
+            MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    vec![Ok(source.clone())],
+                    source.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_deleted_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 1);
+        // 4 - 1 deleted + 1 inserted = 4.
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 4);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("a = 1 AND b = 10".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "matched row must be deleted, not updated"
+        );
+        // Inserted row carries the omitted `note` column as NULL.
+        assert_eq!(
+            updated_ds
+                .count_rows(Some(
+                    "a = 3 AND b = 30 AND value = 333 AND note IS NULL".to_string()
+                ))
+                .await
+                .unwrap(),
+            1,
+            "unmatched source row must be inserted with omitted column NULL-filled"
         );
     }
 
