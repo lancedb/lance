@@ -106,6 +106,30 @@ message RangeToFile {
   string path = 4;
 }
 
+// Header for a serialized FM-index partition skeleton (`FMIndexPartitionState`).
+//
+// Followed, in order, by raw blobs: the C table, Huffman codes, wavelet tree
+// topology, document row ids, document start positions, sampled suffix array,
+// and the flattened per-block prefix ranks (split back into nodes by
+// `nodes[i].num_blocks`). The lazily-loaded BWT/SA word blocks themselves are
+// *not* part of this entry — they are cached per wavelet node separately.
+message FmIndexStateHeader {
+  uint64 bwt_len = 1;
+  uint32 alphabet_size = 2;
+  // Per wavelet node, in node-id order. A node's blocks occupy
+  // `num_blocks` consecutive rows starting after all earlier nodes' blocks, so
+  // the block row offset is the running sum of earlier `num_blocks`.
+  repeated FmIndexNodeMeta nodes = 3;
+}
+
+// Per-wavelet-node metadata within an `FmIndexStateHeader`.
+message FmIndexNodeMeta {
+  // Number of word blocks this node occupies (also its prefix-rank count).
+  uint32 num_blocks = 1;
+  // Number of bits in this node's bitvector.
+  uint64 bit_len = 2;
+}
+
 // ---------------------------------------------------------------------------
 // Vector indices (IVF partitions)
 // ---------------------------------------------------------------------------
