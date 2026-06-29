@@ -281,7 +281,7 @@ impl FloatArray<BFloat16Type> for FixedSizeBinaryArray {
     ///
     /// # Preconditions
     ///
-    /// - `value_length()` must be 2 (the [`FixedSizeBinary(2)`] storage shape
+    /// - `value_length()` must be 2 (the `FixedSizeBinary(2)` storage shape
     ///   used by [`BFloat16Array`]). Asserted at entry.
     /// - The value buffer must be at least 2-byte aligned. Lance's in-tree
     ///   constructors always satisfy this (every value buffer goes through

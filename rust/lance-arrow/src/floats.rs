@@ -189,7 +189,7 @@ pub trait FloatArray<T: ArrowFloatType + ?Sized>: Array + Clone + 'static {
     ///
     /// Implementations may panic if the array's storage shape does not match
     /// the expected element layout. In particular, the `bf16` impl panics if
-    /// `value_length() != 2` (the [`FixedSizeBinary(2)`] shape required by
+    /// `value_length() != 2` (the `FixedSizeBinary(2)` shape required by
     /// `BFloat16Array`).
     ///
     /// # Preconditions
