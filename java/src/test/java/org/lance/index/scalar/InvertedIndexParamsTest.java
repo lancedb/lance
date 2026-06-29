@@ -39,7 +39,7 @@ class InvertedIndexParamsTest {
     ScalarIndexParams params = InvertedIndexParams.builder().build();
 
     Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
-    assertEquals(256, ((Number) json.get("block_size")).intValue());
+    assertEquals(128, ((Number) json.get("block_size")).intValue());
   }
 
   @Test

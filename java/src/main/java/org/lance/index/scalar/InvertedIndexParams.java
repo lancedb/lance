@@ -53,7 +53,7 @@ public final class InvertedIndexParams {
     private Integer minNgramLength;
     private Integer maxNgramLength;
     private Boolean prefixOnly;
-    private Integer blockSize = 256;
+    private Integer blockSize = 128;
     private Boolean skipMerge;
 
     /**
@@ -229,7 +229,7 @@ public final class InvertedIndexParams {
     /**
      * Configure the number of documents in each compressed posting block.
      *
-     * <p>Supported values are {@code 128} and {@code 256}. New indexes default to {@code 256} when
+     * <p>Supported values are {@code 128} and {@code 256}. New indexes default to {@code 128} when
      * this is not set.
      *
      * <p>{@code blockSize = 256} is experimental and may introduce breaking changes. Use {@code

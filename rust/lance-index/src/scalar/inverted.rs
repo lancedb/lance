@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_training_request_defaults_missing_block_size_to_256() {
+    fn test_new_training_request_defaults_missing_block_size_to_128() {
         let plugin = InvertedIndexPlugin;
         let field = Field::new("text", DataType::Utf8, true);
 

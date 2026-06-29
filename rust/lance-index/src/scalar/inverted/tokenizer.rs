@@ -30,7 +30,7 @@ use lance_tokenizer::{
 };
 
 pub const LEGACY_BLOCK_SIZE: usize = 128;
-pub const DEFAULT_BLOCK_SIZE: usize = 256;
+pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 
 /// Tokenizer configs
@@ -106,7 +106,7 @@ pub struct InvertedIndexParams {
     ///
     /// Missing serialized values come from indexes written before this
     /// parameter existed and must read as 128 for backwards compatibility. New
-    /// indexes default to 256.
+    /// indexes currently default to 128.
     #[serde(
         default = "legacy_block_size",
         deserialize_with = "deserialize_block_size"
@@ -586,11 +586,11 @@ mod tests {
     }
 
     #[test]
-    fn test_block_size_new_default_serializes() {
+    fn test_block_size_default_serializes() {
         let params = InvertedIndexParams::default();
-        assert_eq!(params.block_size, 256);
+        assert_eq!(params.block_size, 128);
         let json = serde_json::to_value(&params).unwrap();
-        assert_eq!(json.get("block_size"), Some(&serde_json::Value::from(256)));
+        assert_eq!(json.get("block_size"), Some(&serde_json::Value::from(128)));
     }
 
     #[test]

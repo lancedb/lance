@@ -3315,7 +3315,7 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
-        block_size: int, default 256
+        block_size: int, default 128
             This is for the ``INVERTED`` index. Number of documents per compressed
             posting block. Must be one of ``128`` or ``256``.
             ``block_size=256`` is experimental and may introduce breaking changes.
