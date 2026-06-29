@@ -76,8 +76,8 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     scalar::inverted::InvertedListFormatVersion,
+    scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
@@ -2311,10 +2311,9 @@ impl Dataset {
                                 "format_version must be 1, 2, 'v1', or 'v2'",
                             ));
                         };
-                        let format_version =
-                            value.parse::<InvertedListFormatVersion>().map_err(|err| {
-                                PyValueError::new_err(err.to_string())
-                            })?;
+                        let format_version = value
+                            .parse::<InvertedListFormatVersion>()
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
                         params = params.format_version(format_version);
                     }
                 }

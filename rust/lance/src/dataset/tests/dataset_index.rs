@@ -990,12 +990,14 @@ async fn test_fts_v1_remains_queryable_after_append_optimize() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 2);
-    assert!(dataset
-        .load_indices()
-        .await
-        .unwrap()
-        .iter()
-        .all(|index| index.index_version == 1));
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.index_version == 1)
+    );
 }
 
 #[tokio::test]

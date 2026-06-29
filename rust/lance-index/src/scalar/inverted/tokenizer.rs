@@ -19,11 +19,11 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
-use crate::scalar::inverted::{
-    InvertedListFormatVersion, default_fts_format_version, resolve_fts_format_version,
-};
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
+};
+use crate::scalar::inverted::{
+    InvertedListFormatVersion, default_fts_format_version, resolve_fts_format_version,
 };
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
@@ -381,7 +381,8 @@ impl InvertedIndexParams {
 
     /// Resolve the requested FTS format version, falling back to Lance's default.
     pub fn resolved_format_version(&self) -> InvertedListFormatVersion {
-        self.format_version.unwrap_or_else(default_fts_format_version)
+        self.format_version
+            .unwrap_or_else(default_fts_format_version)
     }
 
     /// Serialize params for the build/training path, including build-only fields.
@@ -565,7 +566,10 @@ mod tests {
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
-        assert_eq!(json.get("format_version"), Some(&serde_json::Value::from(1)));
+        assert_eq!(
+            json.get("format_version"),
+            Some(&serde_json::Value::from(1))
+        );
     }
 
     #[test]

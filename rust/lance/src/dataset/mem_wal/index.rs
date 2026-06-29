@@ -31,8 +31,8 @@ use arrow_array::RecordBatch;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::pbold;
-use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
@@ -885,7 +885,6 @@ mod tests {
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use log::warn;
-    use prost::Message as _;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -931,8 +930,8 @@ mod tests {
     }
 
     fn fts_index_metadata(index_version: i32) -> IndexMetadata {
-        let details = pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default())
-            .unwrap();
+        let details =
+            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
         let mut value = Vec::new();
         details.encode(&mut value).unwrap();
 
