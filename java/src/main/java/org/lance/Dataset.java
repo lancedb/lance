@@ -25,7 +25,6 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
-import org.lance.index.scalar.ZonemapStatsCodec;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;

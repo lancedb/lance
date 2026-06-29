@@ -11,7 +11,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.lance.index.scalar;
+package org.lance;
+
+import org.lance.index.scalar.ZoneStats;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -31,10 +33,12 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -91,31 +95,152 @@ public class ZonemapStatsCodecTest {
   }
 
   @Test
-  public void decode_emptyBytes_returnsEmptyList() throws Exception {
+  public void decode_emptyBytes_returnsMutableEmptyList() throws Exception {
     try (BufferAllocator allocator = new RootAllocator()) {
-      assertTrue(ZonemapStatsCodec.decode(new byte[0], allocator).isEmpty());
-      assertTrue(ZonemapStatsCodec.decode(null, allocator).isEmpty());
+      List<ZoneStats> emptyBytes = ZonemapStatsCodec.decode(new byte[0], allocator);
+      assertTrue(emptyBytes.isEmpty());
+      emptyBytes.add(new ZoneStats(0, 0, 0, null, null, 0));
+      assertEquals(1, emptyBytes.size());
+
+      List<ZoneStats> nullBytes = ZonemapStatsCodec.decode(null, allocator);
+      assertTrue(nullBytes.isEmpty());
+      nullBytes.add(new ZoneStats(0, 0, 0, null, null, 0));
+      assertEquals(1, nullBytes.size());
     }
   }
 
   @ParameterizedTest
-  @ValueSource(strings = {"fragment_id", "zone_start", "zone_length", "null_count"})
-  public void decode_nullInNonNullableColumn_throwsIllegalStateException(String nullField)
-      throws Exception {
-    // Each of these four columns is non-nullable in the canonical schema; declare them
-    // nullable here only to simulate "upstream produced a null" corruption — the decoder
-    // must reject it explicitly instead of silently substituting 0.
-    Schema schema =
-        new Schema(
+  @ValueSource(strings = {"fragment_id", "zone_start", "zone_length", "null_count", "nan_count"})
+  public void decode_schemaDeclaresNullableForFixedColumn_throwsWithFieldAndExpected(
+      String nullableField) throws Exception {
+    // Rust producer declares these five columns notNullable. If upstream ships them as nullable
+    // (e.g. wrong schema), the codec must reject the stream at schema-validation time — before
+    // ever touching row data — with a message that names the field and what was expected.
+    List<Field> fields =
+        new ArrayList<>(
             Arrays.asList(
                 Field.nullable("min", new ArrowType.Int(32, true)),
                 Field.nullable("max", new ArrowType.Int(32, true)),
-                Field.nullable("null_count", new ArrowType.Int(32, false)),
-                Field.nullable("nan_count", new ArrowType.Int(32, false)),
-                Field.nullable("fragment_id", new ArrowType.Int(64, false)),
-                Field.nullable("zone_start", new ArrowType.Int(64, false)),
-                Field.nullable("zone_length", new ArrowType.Int(64, false))),
-            null);
+                new Field("null_count", FieldType.notNullable(new ArrowType.Int(32, false)), null),
+                new Field("nan_count", FieldType.notNullable(new ArrowType.Int(32, false)), null),
+                new Field("fragment_id", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+                new Field("zone_start", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+                new Field(
+                    "zone_length", FieldType.notNullable(new ArrowType.Int(64, false)), null)));
+    for (int i = 0; i < fields.size(); i++) {
+      if (fields.get(i).getName().equals(nullableField)) {
+        Field f = fields.get(i);
+        fields.set(i, Field.nullable(f.getName(), f.getType()));
+      }
+    }
+    Schema schema = new Schema(fields, null);
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      byte[] ipc = encodeIpc(schema, allocator, root -> root.setRowCount(0));
+      IllegalStateException ex =
+          assertThrows(IllegalStateException.class, () -> ZonemapStatsCodec.decode(ipc, allocator));
+      assertTrue(
+          ex.getMessage().contains("'" + nullableField + "'"),
+          "error must name the offending field, got: " + ex.getMessage());
+      assertTrue(
+          ex.getMessage().contains("nullability"),
+          "error must mention nullability, got: " + ex.getMessage());
+      assertTrue(
+          ex.getMessage().contains("expected=false") && ex.getMessage().contains("actual=true"),
+          "error must include expected/actual, got: " + ex.getMessage());
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "min",
+        "max",
+        "null_count",
+        "nan_count",
+        "fragment_id",
+        "zone_start",
+        "zone_length"
+      })
+  public void decode_missingRequiredField_throwsWithFieldName(String missingField)
+      throws Exception {
+    List<Field> fields =
+        new ArrayList<>(
+            Arrays.asList(
+                Field.nullable("min", new ArrowType.Int(32, true)),
+                Field.nullable("max", new ArrowType.Int(32, true)),
+                new Field("null_count", FieldType.notNullable(new ArrowType.Int(32, false)), null),
+                new Field("nan_count", FieldType.notNullable(new ArrowType.Int(32, false)), null),
+                new Field("fragment_id", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+                new Field("zone_start", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+                new Field(
+                    "zone_length", FieldType.notNullable(new ArrowType.Int(64, false)), null)));
+    fields.removeIf(f -> f.getName().equals(missingField));
+    Schema schema = new Schema(fields, null);
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      byte[] ipc = encodeIpc(schema, allocator, root -> root.setRowCount(0));
+      IllegalStateException ex =
+          assertThrows(IllegalStateException.class, () -> ZonemapStatsCodec.decode(ipc, allocator));
+      assertTrue(
+          ex.getMessage().contains("'" + missingField + "'"),
+          "error must name the missing field, got: " + ex.getMessage());
+      assertTrue(
+          ex.getMessage().contains("missing"), "error must say 'missing', got: " + ex.getMessage());
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+    // field name,        wrong bitWidth, wrong signed
+    "null_count,  64, false",
+    "nan_count,   64, false",
+    "fragment_id, 32, false",
+    "zone_start,  32, false",
+    "zone_length, 32, false",
+    "null_count,  32, true",
+    "fragment_id, 64, true",
+  })
+  public void decode_wrongFixedColumnType_throwsWithExpectedAndActual(
+      String fieldName, int bitWidth, boolean signed) throws Exception {
+    List<Field> fields =
+        new ArrayList<>(
+            Arrays.asList(
+                Field.nullable("min", new ArrowType.Int(32, true)),
+                Field.nullable("max", new ArrowType.Int(32, true)),
+                new Field("null_count", FieldType.notNullable(new ArrowType.Int(32, false)), null),
+                new Field("nan_count", FieldType.notNullable(new ArrowType.Int(32, false)), null),
+                new Field("fragment_id", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+                new Field("zone_start", FieldType.notNullable(new ArrowType.Int(64, false)), null),
+                new Field(
+                    "zone_length", FieldType.notNullable(new ArrowType.Int(64, false)), null)));
+    for (int i = 0; i < fields.size(); i++) {
+      if (fields.get(i).getName().equals(fieldName)) {
+        fields.set(
+            i,
+            new Field(fieldName, FieldType.notNullable(new ArrowType.Int(bitWidth, signed)), null));
+      }
+    }
+    Schema schema = new Schema(fields, null);
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      byte[] ipc = encodeIpc(schema, allocator, root -> root.setRowCount(0));
+      IllegalStateException ex =
+          assertThrows(IllegalStateException.class, () -> ZonemapStatsCodec.decode(ipc, allocator));
+      assertTrue(
+          ex.getMessage().contains("'" + fieldName + "'"),
+          "error must name the field, got: " + ex.getMessage());
+      assertTrue(
+          ex.getMessage().contains("type")
+              && ex.getMessage().contains("expected=")
+              && ex.getMessage().contains("actual="),
+          "error must include expected/actual type, got: " + ex.getMessage());
+    }
+  }
+
+  @Test
+  public void decode_fragmentIdExceedsIntMax_throws() throws Exception {
+    Schema schema = zonemapSchema(new ArrowType.Int(32, true));
     try (BufferAllocator allocator = new RootAllocator()) {
       byte[] ipc =
           encodeIpc(
@@ -123,55 +248,81 @@ public class ZonemapStatsCodecTest {
               allocator,
               root -> {
                 ((IntVector) root.getVector("min")).setSafe(0, 1);
-                ((IntVector) root.getVector("max")).setSafe(0, 100);
-                UInt4Vector nullCount = (UInt4Vector) root.getVector("null_count");
-                UInt4Vector nanCount = (UInt4Vector) root.getVector("nan_count");
-                UInt8Vector fragId = (UInt8Vector) root.getVector("fragment_id");
-                UInt8Vector start = (UInt8Vector) root.getVector("zone_start");
-                UInt8Vector length = (UInt8Vector) root.getVector("zone_length");
-
-                // Populate every non-target column with a valid value, then null out the target.
-                if (!nullField.equals("null_count")) {
-                  nullCount.setSafe(0, 0);
-                }
-                nanCount.setSafe(0, 0);
-                if (!nullField.equals("fragment_id")) {
-                  fragId.setSafe(0, 0L);
-                }
-                if (!nullField.equals("zone_start")) {
-                  start.setSafe(0, 0L);
-                }
-                if (!nullField.equals("zone_length")) {
-                  length.setSafe(0, 1024L);
-                }
-
-                switch (nullField) {
-                  case "null_count":
-                    nullCount.setNull(0);
-                    break;
-                  case "fragment_id":
-                    fragId.setNull(0);
-                    break;
-                  case "zone_start":
-                    start.setNull(0);
-                    break;
-                  case "zone_length":
-                    length.setNull(0);
-                    break;
-                  default:
-                    throw new IllegalArgumentException("unexpected field: " + nullField);
-                }
+                ((IntVector) root.getVector("max")).setSafe(0, 2);
+                ((UInt4Vector) root.getVector("null_count")).setSafe(0, 0);
+                ((UInt4Vector) root.getVector("nan_count")).setSafe(0, 0);
+                // Integer.MAX_VALUE + 1L written as an unsigned u64 — still under Long.MAX_VALUE
+                // so the raw long is positive, but it overflows Java int.
+                ((UInt8Vector) root.getVector("fragment_id"))
+                    .setSafe(0, (long) Integer.MAX_VALUE + 1L);
+                ((UInt8Vector) root.getVector("zone_start")).setSafe(0, 0L);
+                ((UInt8Vector) root.getVector("zone_length")).setSafe(0, 1024L);
                 root.setRowCount(1);
               });
-
       IllegalStateException ex =
           assertThrows(IllegalStateException.class, () -> ZonemapStatsCodec.decode(ipc, allocator));
       assertTrue(
-          ex.getMessage().contains(nullField),
-          "error must name the offending field, got: " + ex.getMessage());
+          ex.getMessage().contains("fragment_id"),
+          "error must name fragment_id, got: " + ex.getMessage());
       assertTrue(
-          ex.getMessage().contains("at row 0"),
-          "error must include row index in 'at row N' form, got: " + ex.getMessage());
+          ex.getMessage().contains("at row 0"), "error must include row, got: " + ex.getMessage());
+      assertTrue(
+          ex.getMessage().contains(Long.toUnsignedString((long) Integer.MAX_VALUE + 1L)),
+          "error must include the offending value, got: " + ex.getMessage());
+    }
+  }
+
+  @Test
+  public void decode_fragmentIdHighU64_throws() throws Exception {
+    // u64 value > Long.MAX_VALUE arrives as a negative signed long; codec must reject it.
+    Schema schema = zonemapSchema(new ArrowType.Int(32, true));
+    try (BufferAllocator allocator = new RootAllocator()) {
+      byte[] ipc =
+          encodeIpc(
+              schema,
+              allocator,
+              root -> {
+                ((IntVector) root.getVector("min")).setSafe(0, 1);
+                ((IntVector) root.getVector("max")).setSafe(0, 2);
+                ((UInt4Vector) root.getVector("null_count")).setSafe(0, 0);
+                ((UInt4Vector) root.getVector("nan_count")).setSafe(0, 0);
+                ((UInt8Vector) root.getVector("fragment_id")).setSafe(0, Long.MIN_VALUE);
+                ((UInt8Vector) root.getVector("zone_start")).setSafe(0, 0L);
+                ((UInt8Vector) root.getVector("zone_length")).setSafe(0, 1024L);
+                root.setRowCount(1);
+              });
+      IllegalStateException ex =
+          assertThrows(IllegalStateException.class, () -> ZonemapStatsCodec.decode(ipc, allocator));
+      assertTrue(
+          ex.getMessage().contains("fragment_id"),
+          "error must name fragment_id, got: " + ex.getMessage());
+      assertTrue(
+          ex.getMessage().contains("at row 0"), "error must include row, got: " + ex.getMessage());
+    }
+  }
+
+  @Test
+  public void decode_nullCountUInt32Boundary_preservesUnsignedValue() throws Exception {
+    Schema schema = zonemapSchema(new ArrowType.Int(32, true));
+    try (BufferAllocator allocator = new RootAllocator()) {
+      byte[] ipc =
+          encodeIpc(
+              schema,
+              allocator,
+              root -> {
+                ((IntVector) root.getVector("min")).setSafe(0, 1);
+                ((IntVector) root.getVector("max")).setSafe(0, 2);
+                // UInt32 max — must come out as 4_294_967_295L, not -1L or 0.
+                ((UInt4Vector) root.getVector("null_count")).setSafe(0, 0xFFFFFFFF);
+                ((UInt4Vector) root.getVector("nan_count")).setSafe(0, 0);
+                ((UInt8Vector) root.getVector("fragment_id")).setSafe(0, 0L);
+                ((UInt8Vector) root.getVector("zone_start")).setSafe(0, 0L);
+                ((UInt8Vector) root.getVector("zone_length")).setSafe(0, 1024L);
+                root.setRowCount(1);
+              });
+      List<ZoneStats> got = ZonemapStatsCodec.decode(ipc, allocator);
+      assertEquals(1, got.size());
+      assertEquals(4_294_967_295L, got.get(0).getNullCount());
     }
   }
 
