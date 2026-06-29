@@ -77,6 +77,7 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
+    scalar::inverted::InvertedListFormatVersion,
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
@@ -2297,6 +2298,24 @@ impl Dataset {
                     }
                     if let Some(num_workers) = kwargs.get_item("num_workers")? {
                         params = params.num_workers(num_workers.extract()?);
+                    }
+                    if let Some(format_version) = kwargs.get_item("format_version")?
+                        && !format_version.is_none()
+                    {
+                        let value = if let Ok(value) = format_version.cast::<PyString>() {
+                            value.to_string_lossy().to_string()
+                        } else if let Ok(value) = format_version.extract::<u32>() {
+                            value.to_string()
+                        } else {
+                            return Err(PyValueError::new_err(
+                                "format_version must be 1, 2, 'v1', or 'v2'",
+                            ));
+                        };
+                        let format_version =
+                            value.parse::<InvertedListFormatVersion>().map_err(|err| {
+                                PyValueError::new_err(err.to_string())
+                            })?;
+                        params = params.format_version(format_version);
                     }
                 }
                 Box::new(params)
