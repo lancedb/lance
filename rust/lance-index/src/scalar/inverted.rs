@@ -147,6 +147,7 @@ impl InvertedIndexPlugin {
             }
         });
 
+        params.validate_format_version()?;
         let format_version = params.resolved_format_version();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =

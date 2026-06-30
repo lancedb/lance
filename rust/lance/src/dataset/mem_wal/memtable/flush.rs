@@ -749,8 +749,9 @@ impl MemTableFlusher {
         use std::sync::Arc;
 
         use lance_index::scalar::inverted::{
-            POSITIONS_CODEC_KEY, POSITIONS_CODEC_PACKED_DELTA_V1, POSITIONS_LAYOUT_KEY,
-            POSITIONS_LAYOUT_SHARED_STREAM_V2, POSTING_TAIL_CODEC_KEY, TokenSetFormat,
+            FTS_FORMAT_VERSION_KEY, POSITIONS_CODEC_KEY, POSITIONS_CODEC_PACKED_DELTA_V1,
+            POSITIONS_LAYOUT_KEY, POSITIONS_LAYOUT_SHARED_STREAM_V2, POSTING_BLOCK_SIZE_KEY,
+            POSTING_TAIL_CODEC_KEY, TokenSetFormat,
         };
 
         // Create metadata with params and partitions in schema metadata (this is what InvertedIndex expects)
@@ -765,6 +766,14 @@ impl MemTableFlusher {
             (
                 POSTING_TAIL_CODEC_KEY.to_string(),
                 format_version.posting_tail_codec().as_str().to_string(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_string(),
+                format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_string(),
+                config.params.posting_block_size().to_string(),
             ),
         ]
         .into_iter()

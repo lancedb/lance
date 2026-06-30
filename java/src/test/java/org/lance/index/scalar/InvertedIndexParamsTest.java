@@ -58,4 +58,21 @@ class InvertedIndexParamsTest {
     assertThrows(
         IllegalArgumentException.class, () -> InvertedIndexParams.builder().blockSize(512));
   }
+
+  @Test
+  void formatVersionThreeRequiresBlockSize256() {
+    ScalarIndexParams params =
+        InvertedIndexParams.builder().blockSize(256).formatVersion(3).build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(256, ((Number) json.get("block_size")).intValue());
+    assertEquals(3, ((Number) json.get("format_version")).intValue());
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InvertedIndexParams.builder().formatVersion(3).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InvertedIndexParams.builder().blockSize(256).formatVersion(2).build());
+  }
 }

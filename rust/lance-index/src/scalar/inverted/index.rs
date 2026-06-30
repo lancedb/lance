@@ -86,8 +86,10 @@ use std::str::FromStr;
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
+// Version 3: Version 2 layout with 256-document physical posting blocks.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
+pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -110,6 +112,7 @@ pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
 pub const POSTING_TAIL_CODEC_KEY: &str = "posting_tail_codec";
+pub const FTS_FORMAT_VERSION_KEY: &str = "format_version";
 pub const POSITIONS_LAYOUT_KEY: &str = "positions_layout";
 pub const POSITIONS_CODEC_KEY: &str = "positions_codec";
 pub const POSTING_BLOCK_SIZE_KEY: &str = "posting_block_size";
@@ -153,7 +156,7 @@ pub fn current_fts_format_version() -> InvertedListFormatVersion {
 }
 
 pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
-    InvertedListFormatVersion::V2
+    InvertedListFormatVersion::V3
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -161,6 +164,7 @@ pub enum InvertedListFormatVersion {
     V1,
     #[default]
     V2,
+    V3,
 }
 
 impl InvertedListFormatVersion {
@@ -171,29 +175,50 @@ impl InvertedListFormatVersion {
         }
     }
 
+    pub fn from_posting_tail_codec_and_block_size(
+        codec: PostingTailCodec,
+        block_size: usize,
+    ) -> Result<Self> {
+        validate_block_size(block_size)?;
+        let format_version = match (codec, block_size) {
+            (PostingTailCodec::Fixed32, LEGACY_BLOCK_SIZE) => Self::V1,
+            (PostingTailCodec::VarintDelta, LEGACY_BLOCK_SIZE) => Self::V2,
+            (PostingTailCodec::VarintDelta, 256) => Self::V3,
+            (PostingTailCodec::Fixed32, 256) => {
+                return Err(Error::invalid_input(
+                    "FTS format_version=3 requires the varint-delta posting tail codec".to_string(),
+                ));
+            }
+            _ => unreachable!("validate_block_size limits supported block sizes"),
+        };
+        validate_format_version_block_size(format_version, block_size)?;
+        Ok(format_version)
+    }
+
     pub fn index_version(self) -> u32 {
         match self {
             Self::V1 => INVERTED_INDEX_VERSION_V1,
             Self::V2 => INVERTED_INDEX_VERSION_V2,
+            Self::V3 => INVERTED_INDEX_VERSION_V3,
         }
     }
 
     pub fn posting_tail_codec(self) -> PostingTailCodec {
         match self {
             Self::V1 => PostingTailCodec::Fixed32,
-            Self::V2 => PostingTailCodec::VarintDelta,
+            Self::V2 | Self::V3 => PostingTailCodec::VarintDelta,
         }
     }
 
     pub fn position_codec(self) -> Option<PositionStreamCodec> {
         match self {
             Self::V1 => None,
-            Self::V2 => Some(PositionStreamCodec::PackedDelta),
+            Self::V2 | Self::V3 => Some(PositionStreamCodec::PackedDelta),
         }
     }
 
     pub fn uses_shared_position_stream(self) -> bool {
-        matches!(self, Self::V2)
+        matches!(self, Self::V2 | Self::V3)
     }
 }
 
@@ -204,11 +229,44 @@ impl FromStr for InvertedListFormatVersion {
         match s.trim() {
             "1" | "v1" | "V1" => Ok(Self::V1),
             "2" | "v2" | "V2" => Ok(Self::V2),
+            "3" | "v3" | "V3" => Ok(Self::V3),
             other => Err(Error::index(format!(
-                "unsupported FTS format version {}, expected 1 or 2",
+                "unsupported FTS format version {}, expected 1, 2, or 3",
                 other
             ))),
         }
+    }
+}
+
+pub fn default_fts_format_version_for_block_size(
+    block_size: usize,
+) -> Result<InvertedListFormatVersion> {
+    validate_block_size(block_size)?;
+    match block_size {
+        LEGACY_BLOCK_SIZE => Ok(InvertedListFormatVersion::V2),
+        256 => Ok(InvertedListFormatVersion::V3),
+        _ => unreachable!("validate_block_size limits supported block sizes"),
+    }
+}
+
+pub fn validate_format_version_block_size(
+    format_version: InvertedListFormatVersion,
+    block_size: usize,
+) -> Result<()> {
+    validate_block_size(block_size)?;
+    match (format_version, block_size) {
+        (InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)
+        | (InvertedListFormatVersion::V3, 256) => Ok(()),
+        (InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2, 256) => {
+            Err(Error::invalid_input(format!(
+                "FTS format_version={} is incompatible with block_size=256; use format_version=3",
+                format_version.index_version()
+            )))
+        }
+        (InvertedListFormatVersion::V3, other) => Err(Error::invalid_input(format!(
+            "FTS format_version=3 requires block_size=256, got {other}"
+        ))),
+        _ => unreachable!("validate_block_size limits supported block sizes"),
     }
 }
 
@@ -425,6 +483,25 @@ fn parse_shared_position_codec(metadata: &HashMap<String, String>) -> Result<Pos
 pub(super) fn parse_format_version_from_metadata(
     metadata: &HashMap<String, String>,
 ) -> Result<InvertedListFormatVersion> {
+    if let Some(value) = metadata.get(FTS_FORMAT_VERSION_KEY) {
+        let format_version = InvertedListFormatVersion::from_str(value)?;
+        validate_format_version_block_size(format_version, parse_posting_block_size(metadata)?)?;
+        return Ok(format_version);
+    }
+    let block_size = parse_posting_block_size(metadata)?;
+    if block_size == 256 {
+        if metadata
+            .get(POSTING_TAIL_CODEC_KEY)
+            .map(|_| parse_posting_tail_codec(metadata))
+            .transpose()?
+            .is_some_and(|posting_tail_codec| posting_tail_codec != PostingTailCodec::VarintDelta)
+        {
+            return Err(Error::index(
+                "FTS block_size=256 requires the varint-delta posting tail codec".to_string(),
+            ));
+        }
+        return Ok(InvertedListFormatVersion::V3);
+    }
     if metadata.contains_key(POSITIONS_CODEC_KEY) || metadata.contains_key(POSITIONS_LAYOUT_KEY) {
         return Ok(InvertedListFormatVersion::V2);
     }
@@ -502,9 +579,12 @@ impl InvertedIndex {
     }
 
     fn index_version(&self) -> u32 {
-        match self.token_set_format {
-            TokenSetFormat::Arrow => 0,
-            TokenSetFormat::Fst => self.format_version().index_version(),
+        match (self.token_set_format, self.format_version()) {
+            (
+                TokenSetFormat::Arrow,
+                InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2,
+            ) => 0,
+            (_, format_version) => format_version.index_version(),
         }
     }
 
@@ -4837,11 +4917,10 @@ impl PostingListBuilder {
     }
 
     pub fn to_batch(self, block_max_scores: Vec<f32>) -> Result<RecordBatch> {
-        let format_version = if self.posting_tail_codec == PostingTailCodec::Fixed32 {
-            InvertedListFormatVersion::V1
-        } else {
-            InvertedListFormatVersion::V2
-        };
+        let format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
+            self.posting_tail_codec,
+            self.block_size,
+        )?;
         let schema = inverted_list_schema_for_version_with_block_size(
             self.has_positions(),
             format_version,
@@ -4906,13 +4985,7 @@ impl PostingListBuilder {
     }
 
     pub fn to_batch_with_docs(self, docs: &DocSet, schema: SchemaRef) -> Result<RecordBatch> {
-        let format_version = if schema.column_with_name(POSITION_COL).is_some()
-            && schema.column_with_name(COMPRESSED_POSITION_COL).is_none()
-        {
-            InvertedListFormatVersion::V1
-        } else {
-            InvertedListFormatVersion::V2
-        };
+        let format_version = parse_format_version_from_metadata(schema.metadata())?;
         let legacy_positions =
             if self.with_positions && !format_version.uses_shared_position_stream() {
                 Some(self.build_legacy_positions()?)
@@ -5888,17 +5961,18 @@ mod tests {
         row_id: u64,
     ) -> Result<Arc<InvertedIndex>> {
         let block_size = params.posting_block_size();
+        let format_version = params.resolved_format_version();
         let mut partition = InnerBuilder::new_with_format_version_and_block_size(
             0,
             false,
             token_set_format,
-            InvertedListFormatVersion::V1,
+            format_version,
             block_size,
         );
         partition.tokens.add(token.to_owned());
         let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             false,
-            PostingTailCodec::Fixed32,
+            format_version.posting_tail_codec(),
             block_size,
         );
         posting_list.add(0, PositionRecorder::Count(1));
@@ -5916,6 +5990,15 @@ mod tests {
                 TOKEN_SET_FORMAT_KEY.to_owned(),
                 token_set_format.to_string(),
             ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                format_version.posting_tail_codec().as_str().to_owned(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                format_version.index_version().to_string(),
+            ),
+            (POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string()),
         ]);
         let mut writer = store
             .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
@@ -5959,6 +6042,7 @@ mod tests {
         ));
 
         let params = InvertedIndexParams::default().block_size(256).unwrap();
+        let format_version = params.resolved_format_version();
         let block_size = params.posting_block_size();
         let num_docs = block_size + 7;
 
@@ -5966,13 +6050,13 @@ mod tests {
             0,
             false,
             TokenSetFormat::default(),
-            InvertedListFormatVersion::V1,
+            format_version,
             block_size,
         );
         builder.tokens.add("needle".to_owned());
         let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             false,
-            PostingTailCodec::Fixed32,
+            format_version.posting_tail_codec(),
             block_size,
         );
         for doc_id in 0..num_docs {
@@ -6252,6 +6336,19 @@ mod tests {
         assert_eq!(
             resolve_fts_format_version(Some("2")).unwrap(),
             InvertedListFormatVersion::V2
+        );
+        assert_eq!(
+            resolve_fts_format_version(Some("3")).unwrap(),
+            InvertedListFormatVersion::V3
+        );
+    }
+
+    #[test]
+    fn test_block_size_256_metadata_resolves_to_v3() {
+        let metadata = HashMap::from([(POSTING_BLOCK_SIZE_KEY.to_owned(), "256".to_owned())]);
+        assert_eq!(
+            parse_format_version_from_metadata(&metadata).unwrap(),
+            InvertedListFormatVersion::V3
         );
     }
 
@@ -7972,6 +8069,7 @@ mod tests {
         partition_ids: Vec<u64>,
         params: InvertedIndexParams,
     ) {
+        let format_version = params.resolved_format_version();
         let metadata = HashMap::from([
             (
                 "partitions".to_owned(),
@@ -7981,6 +8079,18 @@ mod tests {
             (
                 TOKEN_SET_FORMAT_KEY.to_owned(),
                 TokenSetFormat::default().to_string(),
+            ),
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                format_version.posting_tail_codec().as_str().to_owned(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_owned(),
+                params.posting_block_size().to_string(),
             ),
         ]);
         let mut writer = store
@@ -8669,6 +8779,70 @@ mod tests {
                 posting_tail_codec
             );
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()> {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let params = InvertedIndexParams::default().block_size(256)?;
+        let format_version = params.resolved_format_version();
+        assert_eq!(format_version, InvertedListFormatVersion::V3);
+
+        let mut partition = InnerBuilder::new_with_format_version_and_block_size(
+            0,
+            false,
+            TokenSetFormat::default(),
+            format_version,
+            params.posting_block_size(),
+        );
+        partition.tokens.add("hello".to_owned());
+        let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            false,
+            format_version.posting_tail_codec(),
+            params.posting_block_size(),
+        );
+        posting_list.add(0, PositionRecorder::Count(1));
+        partition.posting_lists.push(posting_list);
+        partition.docs.append(100, 1);
+        partition.write(src_store.as_ref()).await?;
+
+        write_test_metadata(&src_store, vec![0], params).await;
+
+        let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
+        assert_eq!(
+            index.index_version(),
+            InvertedListFormatVersion::V3.index_version()
+        );
+
+        let created = index
+            .update(empty_doc_stream(), dest_store.as_ref(), None)
+            .await?;
+        assert_eq!(
+            created.index_version,
+            InvertedListFormatVersion::V3.index_version()
+        );
+
+        let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(updated.format_version(), InvertedListFormatVersion::V3);
+        assert_eq!(
+            updated.index_version(),
+            InvertedListFormatVersion::V3.index_version()
+        );
 
         Ok(())
     }

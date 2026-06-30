@@ -23,7 +23,8 @@ use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
 use crate::scalar::inverted::{
-    InvertedListFormatVersion, default_fts_format_version, resolve_fts_format_version,
+    InvertedListFormatVersion, default_fts_format_version_for_block_size,
+    resolve_fts_format_version, validate_format_version_block_size,
 };
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
@@ -142,7 +143,10 @@ pub struct InvertedIndexParams {
     /// On-disk FTS format version to write when creating a new index.
     ///
     /// This is a build-time only parameter and is not persisted with the index.
-    /// If unset, Lance writes the current default FTS format.
+    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
+    /// `block_size = 256`.
+    /// `format_version = 3` is experimental and is only valid with
+    /// `block_size = 256`.
     #[serde(
         rename = "format_version",
         skip_serializing,
@@ -261,7 +265,7 @@ where
         serde_json::Value::Number(value) => {
             let Some(value) = value.as_u64() else {
                 return Err(serde::de::Error::custom(
-                    "FTS format_version must be 1 or 2",
+                    "FTS format_version must be 1, 2, or 3",
                 ));
             };
             resolve_fts_format_version(Some(&value.to_string()))
@@ -269,7 +273,7 @@ where
                 .map_err(serde::de::Error::custom)
         }
         other => Err(serde::de::Error::custom(format!(
-            "FTS format_version must be 1 or 2, got {other}"
+            "FTS format_version must be 1, 2, or 3, got {other}"
         ))),
     }
 }
@@ -438,17 +442,27 @@ impl InvertedIndexParams {
 
     /// Set the on-disk FTS format version to use when creating a new index.
     ///
-    /// If unset, Lance writes the current default FTS format. Existing indexes
-    /// keep their own on-disk format during update and optimize operations.
+    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
+    /// `block_size = 256`. Existing indexes keep their own on-disk format
+    /// during update and optimize operations.
+    /// `format_version = 3` is experimental and is only valid with
+    /// `block_size = 256`.
     pub fn format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
         self.format_version = Some(format_version);
         self
     }
 
-    /// Resolve the requested FTS format version, falling back to Lance's default.
+    /// Resolve the requested FTS format version, falling back to the default for
+    /// the configured block size.
     pub fn resolved_format_version(&self) -> InvertedListFormatVersion {
         self.format_version
-            .unwrap_or_else(default_fts_format_version)
+            .unwrap_or_else(|| default_fts_format_version_for_block_size(self.block_size).unwrap())
+    }
+
+    /// Validate that the requested FTS format version can safely encode the
+    /// configured posting block size.
+    pub fn validate_format_version(&self) -> Result<()> {
+        validate_format_version_block_size(self.resolved_format_version(), self.block_size)
     }
 
     /// Serialize params for the build/training path, including build-only fields.
@@ -492,7 +506,9 @@ impl InvertedIndexParams {
             .expect("inverted index params should serialize to a JSON object");
         object.extend(supplied.clone());
 
-        Ok(serde_json::from_value(value)?)
+        let params: Self = serde_json::from_value(value)?;
+        params.validate_format_version()?;
+        Ok(params)
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
@@ -669,6 +685,52 @@ mod tests {
             InvertedIndexParams::default().resolved_format_version(),
             InvertedListFormatVersion::V2
         );
+    }
+
+    #[test]
+    fn test_block_size_256_defaults_to_v3() {
+        assert_eq!(
+            InvertedIndexParams::default()
+                .block_size(256)
+                .unwrap()
+                .resolved_format_version(),
+            InvertedListFormatVersion::V3
+        );
+    }
+
+    #[test]
+    fn test_format_version_must_match_block_size() {
+        InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V2)
+            .validate_format_version()
+            .unwrap();
+        InvertedIndexParams::default()
+            .block_size(256)
+            .unwrap()
+            .validate_format_version()
+            .unwrap();
+
+        let err = InvertedIndexParams::default()
+            .block_size(256)
+            .unwrap()
+            .format_version(InvertedListFormatVersion::V2)
+            .validate_format_version()
+            .unwrap_err();
+        assert!(err.to_string().contains("block_size=256"));
+
+        let err = InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V3)
+            .validate_format_version()
+            .unwrap_err();
+        assert!(err.to_string().contains("format_version=3"));
+    }
+
+    #[test]
+    fn test_training_json_rejects_incompatible_format_version_and_block_size() {
+        let err =
+            InvertedIndexParams::from_training_json(r#"{"block_size": 256, "format_version": 2}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("block_size=256"));
     }
 
     #[test]

@@ -205,8 +205,9 @@ impl MemIndexConfig {
             // the maintained-index path can only write the modern format.
             0 | 1 => Ok(InvertedListFormatVersion::V1),
             2 => Ok(InvertedListFormatVersion::V2),
+            3 => Ok(InvertedListFormatVersion::V3),
             version => Err(Error::invalid_input(format!(
-                "FTS index '{}' has unsupported index_version {}; expected 0, 1, or 2",
+                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, or 3",
                 index_meta.name, version
             ))),
         }
@@ -1061,6 +1062,7 @@ mod tests {
             (0, InvertedListFormatVersion::V1),
             (1, InvertedListFormatVersion::V1),
             (2, InvertedListFormatVersion::V2),
+            (3, InvertedListFormatVersion::V3),
         ] {
             let config =
                 MemIndexConfig::fts_from_metadata(&fts_index_metadata(index_version), &schema)
@@ -1083,9 +1085,9 @@ mod tests {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(3), &schema).unwrap_err();
+        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(4), &schema).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported index_version 3"),
+            err.to_string().contains("unsupported index_version 4"),
             "{err}"
         );
     }

@@ -5,8 +5,8 @@ use super::encoding::encode_group_starts;
 use super::{InvertedIndexParams, index::*};
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
+use crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
-use crate::scalar::inverted::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexFile, IndexStore, OldIndexDataFilter};
@@ -263,8 +263,11 @@ impl InvertedIndexBuilder {
     }
 
     pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
-        self.format_version =
-            InvertedListFormatVersion::from_posting_tail_codec(posting_tail_codec);
+        self.format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
+            posting_tail_codec,
+            self.params.block_size,
+        )
+        .expect("invalid posting tail codec for posting block size");
         self.posting_tail_codec = posting_tail_codec;
         self
     }
@@ -291,6 +294,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
 
@@ -325,6 +329,7 @@ impl InvertedIndexBuilder {
         old_segments: &[Arc<InvertedIndex>],
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
 
@@ -589,6 +594,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         partitions: &[u64],
     ) -> Result<IndexFile> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let mut serialized_deleted_fragments =
             Vec::with_capacity(self.deleted_fragments.serialized_size());
         self.deleted_fragments
@@ -604,6 +610,14 @@ impl InvertedIndexBuilder {
             (
                 POSTING_TAIL_CODEC_KEY.to_owned(),
                 self.posting_tail_codec.as_str().to_owned(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                self.format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_owned(),
+                self.params.block_size.to_string(),
             ),
         ]);
 
@@ -649,6 +663,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         partition: u64, // Modify parameter type
     ) -> Result<IndexFile> {
+        validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let partitions = vec![partition];
         let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
@@ -660,6 +675,14 @@ impl InvertedIndexBuilder {
             (
                 POSTING_TAIL_CODEC_KEY.to_owned(),
                 self.posting_tail_codec.as_str().to_owned(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                self.format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_owned(),
+                self.params.block_size.to_string(),
             ),
         ]);
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
@@ -835,11 +858,13 @@ impl InnerBuilder {
         token_set_format: TokenSetFormat,
         block_size: usize,
     ) -> Self {
+        let format_version = default_fts_format_version_for_block_size(block_size)
+            .expect("invalid posting list block size");
         Self::new_with_format_version_and_block_size(
             id,
             with_position,
             token_set_format,
-            current_fts_format_version(),
+            format_version,
             block_size,
         )
     }
@@ -851,7 +876,8 @@ impl InnerBuilder {
         format_version: InvertedListFormatVersion,
         block_size: usize,
     ) -> Self {
-        validate_block_size(block_size).expect("invalid posting list block size");
+        validate_format_version_block_size(format_version, block_size)
+            .expect("invalid FTS format version for posting block size");
         Self {
             id,
             with_position,
@@ -888,11 +914,11 @@ impl InnerBuilder {
         posting_tail_codec: PostingTailCodec,
         block_size: usize,
     ) -> Self {
-        let format_version = if posting_tail_codec == PostingTailCodec::Fixed32 {
-            InvertedListFormatVersion::V1
-        } else {
-            InvertedListFormatVersion::V2
-        };
+        let format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
+            posting_tail_codec,
+            block_size,
+        )
+        .expect("invalid posting tail codec for posting block size");
         let mut builder = Self::new_with_format_version_and_block_size(
             id,
             with_position,
@@ -1708,15 +1734,19 @@ pub fn inverted_list_schema_for_version_with_block_size(
     format_version: InvertedListFormatVersion,
     block_size: usize,
 ) -> SchemaRef {
-    validate_block_size(block_size).expect("invalid posting list block size");
+    validate_format_version_block_size(format_version, block_size)
+        .expect("invalid FTS format version for posting block size");
     match format_version {
         InvertedListFormatVersion::V1 => inverted_list_schema_v1(with_position, block_size),
-        InvertedListFormatVersion::V2 => inverted_list_schema_with_tail_codec_and_position_codec(
-            with_position,
-            PostingTailCodec::VarintDelta,
-            Some(PositionStreamCodec::PackedDelta),
-            block_size,
-        ),
+        InvertedListFormatVersion::V2 | InvertedListFormatVersion::V3 => {
+            inverted_list_schema_with_tail_codec_and_position_codec(
+                with_position,
+                format_version,
+                PostingTailCodec::VarintDelta,
+                Some(PositionStreamCodec::PackedDelta),
+                block_size,
+            )
+        }
     }
 }
 
@@ -1751,7 +1781,13 @@ fn inverted_list_schema_v1(with_position: bool, block_size: usize) -> SchemaRef 
     }
     Arc::new(arrow_schema::Schema::new_with_metadata(
         fields,
-        HashMap::from([(POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string())]),
+        HashMap::from([
+            (POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string()),
+            (
+                FTS_FORMAT_VERSION_KEY.to_owned(),
+                InvertedListFormatVersion::V1.index_version().to_string(),
+            ),
+        ]),
     ))
 }
 
@@ -1759,8 +1795,14 @@ pub fn inverted_list_schema_with_tail_codec(
     with_position: bool,
     posting_tail_codec: PostingTailCodec,
 ) -> SchemaRef {
+    let format_version = InvertedListFormatVersion::from_posting_tail_codec_and_block_size(
+        posting_tail_codec,
+        LEGACY_BLOCK_SIZE,
+    )
+    .expect("invalid posting tail codec for posting block size");
     inverted_list_schema_with_tail_codec_and_position_codec(
         with_position,
+        format_version,
         posting_tail_codec,
         Some(PositionStreamCodec::PackedDelta),
         LEGACY_BLOCK_SIZE,
@@ -1769,6 +1811,7 @@ pub fn inverted_list_schema_with_tail_codec(
 
 fn inverted_list_schema_with_tail_codec_and_position_codec(
     with_position: bool,
+    format_version: InvertedListFormatVersion,
     posting_tail_codec: PostingTailCodec,
     position_codec: Option<PositionStreamCodec>,
     block_size: usize,
@@ -1808,6 +1851,10 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
         POSTING_TAIL_CODEC_KEY.to_owned(),
         posting_tail_codec.as_str().to_owned(),
     )]);
+    metadata.insert(
+        FTS_FORMAT_VERSION_KEY.to_owned(),
+        format_version.index_version().to_string(),
+    );
     metadata.insert(POSTING_BLOCK_SIZE_KEY.to_owned(), block_size.to_string());
     if let Some(position_codec) = position_codec.filter(|_| with_position) {
         metadata.insert(

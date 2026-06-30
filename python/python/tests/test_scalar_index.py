@@ -953,6 +953,10 @@ def test_create_scalar_index_fts_block_size(dataset):
     dataset.create_scalar_index(
         "doc", index_type="INVERTED", with_position=False, block_size=256
     )
+    indices = dataset.describe_indices()
+    doc_index = next(index for index in indices if index.name == "doc_idx")
+    assert doc_index.segments[0].index_version == 3
+
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py().split(" ")[0]
     results = dataset.scanner(columns=["doc"], full_text_query=query).to_table()
@@ -966,6 +970,15 @@ def test_create_scalar_index_fts_block_size(dataset):
     with pytest.raises(ValueError, match="block_size"):
         dataset.create_scalar_index(
             "doc", index_type="INVERTED", name="doc_invalid_512", block_size=512
+        )
+
+    with pytest.raises(ValueError, match="block_size=256"):
+        dataset.create_scalar_index(
+            "doc",
+            index_type="INVERTED",
+            name="doc_invalid_v2_256",
+            block_size=256,
+            format_version=2,
         )
 
 
@@ -5020,6 +5033,9 @@ def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
     ds = lance.write_dataset(data, tmp_path)
 
     with pytest.raises(ValueError, match="unsupported FTS format version"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
+
+    with pytest.raises(ValueError, match="format_version=3"):
         ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
 
 
