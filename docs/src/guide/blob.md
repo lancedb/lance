@@ -1,6 +1,6 @@
 # Blob Columns
 
-Lance stores large binary objects (images, videos, audio, model artifacts) in blob columns, where they are treated like any other column payload in the dataset.
+Lance can store large binary objects (images, videos, audio, model artifacts) in blob columns, where they are treated like any other column payload in the dataset.
 Blob columns support both planned full-payload reads and lazy file-like access.
 
 !!! tip "Choosing between `read_blobs` and `take_blobs`"
@@ -10,7 +10,7 @@ Blob columns support both planned full-payload reads and lazy file-like access.
 
 ![Blob](../images/blob.png)
 
-See the sections below to explore the read and write access patterns in more detail.
+If you're unsure about whether you need a blob column in the first place (and why it's useful), read the "[when to use blob column vs. inline binary](#when-to-use-a-blob-column-vs-inline-binary)" section below.
 
 ## Quick Start: Blob v2
 
@@ -341,6 +341,20 @@ lance.write_dataset(
 !!! warning
     - The example above materializes binary payloads in memory (`blob_handling="all_binary"` and `to_pylist()`).
     - For large datasets, prefer chunked/batched rewrite pipelines.
+
+## When to Use a Blob Column vs. Inline Binary
+
+Not every binary column needs to be a blob column. Plain Arrow `binary`/`large_binary` stores bytes *inline*, interleaved with your other columns, which is simplest and fastest for really small blobs (e.g., thumbnail images). Using a blob column to store the binary payload makes sense when either of these holds:
+
+- **You need partial or streaming reads.** Inline binary is always read in full; there is no way to fetch a byte range without materializing the entire value. Blob columns expose `take_blobs` → `BlobFile` handles that seek and range-read, so you pay only for the bytes you touch.
+- **Your values are large (roughly 1 MB or more on average).** Large inline values hurt on both reads and writes:
+    - *Read amplification:* the payloads bloat the data file's pages, so scans of *other* columns must read past them to get at the lightweight fields.
+    - *Write amplification:* Lance rewrites data at file/fragment granularity, so any update, delete-and-rewrite, or compaction that touches a fragment copies its large inline payloads forward into the new version — even when those bytes never changed. The bigger the payload, the more bytes you rewrite per logical change.
+
+    A blob column keeps large payloads in separate `.blob` files that are referenced rather than re-copied, so the main column path stays lean and unrelated edits don't rewrite the heavy bytes.
+
+!!! tip
+    As a rule of thumb, if average payload size is below a few tens of KB and you only ever read whole values, plain inline binary is fine. Above ~1 MB, or any time you want file-like access, prefer a blob column. Blob v2 also tunes this automatically: by default it keeps payloads under 16 KiB inline, packs mid-sized payloads into shared `.blob` sidecars, and gives payloads over 2 MiB their own dedicated `.blob` file.
 
 ## Troubleshooting
 
