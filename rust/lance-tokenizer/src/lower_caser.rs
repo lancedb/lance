@@ -47,10 +47,17 @@ pub struct LowerCaserTokenStream<'a, T> {
 
 fn to_lowercase_unicode(text: &str, output: &mut String) {
     output.clear();
-    output.reserve(50);
+    output.reserve(text.len());
     for ch in text.chars() {
         output.extend(ch.to_lowercase());
     }
+}
+
+fn is_lowercase_stable(text: &str) -> bool {
+    text.chars().all(|ch| {
+        let mut lower = ch.to_lowercase();
+        lower.next() == Some(ch) && lower.next().is_none()
+    })
 }
 
 impl<T: TokenStream> TokenStream for LowerCaserTokenStream<'_, T> {
@@ -58,11 +65,12 @@ impl<T: TokenStream> TokenStream for LowerCaserTokenStream<'_, T> {
         if !self.tail.advance() {
             return false;
         }
-        if self.token_mut().text.is_ascii() {
-            self.token_mut().text.make_ascii_lowercase();
-        } else {
-            to_lowercase_unicode(&self.tail.token().text, self.buffer);
-            mem::swap(&mut self.tail.token_mut().text, self.buffer);
+        let token = self.tail.token_mut();
+        if token.text.is_ascii() {
+            token.text.make_ascii_lowercase();
+        } else if !is_lowercase_stable(&token.text) {
+            to_lowercase_unicode(&token.text, self.buffer);
+            mem::swap(&mut token.text, self.buffer);
         }
         true
     }
@@ -73,5 +81,32 @@ impl<T: TokenStream> TokenStream for LowerCaserTokenStream<'_, T> {
 
     fn token_mut(&mut self) -> &mut Token {
         self.tail.token_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{LowerCaser, RawTokenizer, TextAnalyzer, Token};
+
+    fn collect_tokens(text: &str) -> Vec<Token> {
+        let mut analyzer = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(LowerCaser)
+            .build();
+        let mut stream = analyzer.token_stream(text);
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| tokens.push(token.clone()));
+        tokens
+    }
+
+    #[test]
+    fn test_lower_caser_unicode_changed() {
+        let tokens = collect_tokens("İSTANBUL");
+        assert_eq!(tokens[0].text, "i\u{307}stanbul");
+    }
+
+    #[test]
+    fn test_lower_caser_unicode_unchanged() {
+        let tokens = collect_tokens("こんにちは世界");
+        assert_eq!(tokens[0].text, "こんにちは世界");
     }
 }

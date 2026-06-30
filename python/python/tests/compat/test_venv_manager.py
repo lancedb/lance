@@ -13,6 +13,8 @@ from .venv_manager import _lance_namespace_dependency
         ("4.0.0b1", "lance-namespace<0.7"),
         ("6.0.0b5", "lance-namespace>=0.7.2,<0.8"),
         ("6.0.0", "lance-namespace>=0.7.2,<0.8"),
+        ("7.2.0b5", "lance-namespace>=0.8.0,<0.9"),
+        ("7.2.0", "lance-namespace>=0.8.0,<0.9"),
     ],
 )
 def test_lance_namespace_dependency(version: str, expected: str):

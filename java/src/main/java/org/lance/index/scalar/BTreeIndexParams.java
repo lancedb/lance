@@ -59,7 +59,14 @@ public final class BTreeIndexParams {
      * @param rangeId non-negative range identifier
      * @return this builder
      * @throws IllegalArgumentException
+     * @deprecated {@code rangeId} is no longer needed and is now ignored at build time (a warning
+     *     is logged if set). A pre-sorted data stream is still supported — just pass the reader
+     *     without a {@code rangeId}. Each build produces one canonical segment; for distributed
+     *     builds, build one segment per worker and commit them with {@code
+     *     commitExistingIndexSegments(...)}, optionally consolidating with {@code
+     *     mergeExistingIndexSegments(...)}. This parameter will be removed in a future release.
      */
+    @Deprecated
     public Builder rangeId(int rangeId) {
       if (rangeId < 0) {
         throw new IllegalArgumentException("rangeId must be non-negative");

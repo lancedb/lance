@@ -16,6 +16,8 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{ArrayRef, make_array, new_null_array};
 use arrow_cast::display::ArrayFormatter;
 use arrow_data::transform::MutableArrayData;
@@ -108,6 +110,28 @@ impl ArrowScalar {
     /// Returns `true` if this scalar is null.
     pub fn is_null(&self) -> bool {
         self.array.null_count() == 1
+    }
+
+    /// Returns `true` if this scalar is a non-null floating-point NaN.
+    ///
+    /// ```
+    /// use lance_arrow_scalar::ArrowScalar;
+    ///
+    /// assert!(ArrowScalar::from(f32::NAN).is_nan());
+    /// assert!(!ArrowScalar::from(1.0f32).is_nan());
+    /// assert!(!ArrowScalar::from(1i32).is_nan());
+    /// ```
+    pub fn is_nan(&self) -> bool {
+        if self.is_null() {
+            return false;
+        }
+
+        match self.data_type() {
+            DataType::Float16 => self.array.as_primitive::<Float16Type>().value(0).is_nan(),
+            DataType::Float32 => self.array.as_primitive::<Float32Type>().value(0).is_nan(),
+            DataType::Float64 => self.array.as_primitive::<Float64Type>().value(0).is_nan(),
+            _ => false,
+        }
     }
 }
 
@@ -280,6 +304,23 @@ mod tests {
         #[case] expected: Ordering,
     ) {
         assert_eq!(a.cmp(&b), expected);
+    }
+
+    #[rstest]
+    #[case::float16_nan(ArrowScalar::from(half::f16::NAN), true)]
+    #[case::float32_nan(ArrowScalar::from(f32::NAN), true)]
+    #[case::float64_nan(ArrowScalar::from(f64::NAN), true)]
+    #[case::float64_finite(ArrowScalar::from(1.0f64), false)]
+    #[case::int32(ArrowScalar::from(1i32), false)]
+    fn test_is_nan(#[case] scalar: ArrowScalar, #[case] expected: bool) {
+        assert_eq!(scalar.is_nan(), expected);
+    }
+
+    #[test]
+    fn test_null_is_not_nan() {
+        let array: ArrayRef = Arc::new(Float64Array::from(vec![None]));
+        let scalar = ArrowScalar::try_from_array(array).unwrap();
+        assert!(!scalar.is_nan());
     }
 
     #[test]

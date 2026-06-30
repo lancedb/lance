@@ -16,7 +16,9 @@ fn main() -> Result<(), String> {
     }
 
     // Let clippy know about our custom cfg attribute
-    println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512\"))");
+    println!(
+        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\"))"
+    );
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/bf16.c");
@@ -58,10 +60,10 @@ fn main() -> Result<(), String> {
                 "cargo:warning=Skipping build of AVX-512 fp16 kernels. Error: {}",
                 err
             );
-        } else {
+        } else if cfg!(feature = "fp16kernels") {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
-            println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
+            println!("cargo:rustc-cfg=kernel_support=\"avx512_f16\"");
         };
         // Build AVX-512 bf16 kernels (sapphirerapids has native vdpbf16ps)
         if let Err(err) =
@@ -71,16 +73,16 @@ fn main() -> Result<(), String> {
                 "cargo:warning=Skipping build of AVX-512 bf16 kernels. Error: {}",
                 err
             );
-        } else {
-            println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
+        } else if cfg!(feature = "fp16kernels") {
+            println!("cargo:rustc-cfg=kernel_support=\"avx512_bf16\"");
         };
-        if let Err(err) = build_dist_table_with_flags("avx512", &["-march=native"]) {
+        if let Err(err) = build_dist_table_with_flags("avx512", &["-march=sapphirerapids"]) {
             println!(
                 "cargo:warning=Skipping build of AVX-512 dist_table. Error: {}",
                 err
             );
         } else {
-            println!("cargo:rustc-cfg=kernel_support=\"avx512\"");
+            println!("cargo:rustc-cfg=kernel_support=\"avx512_dist_table\"");
         };
         // Build a version with AVX
         // While GCC doesn't have support for _Float16 until GCC 12, clang

@@ -311,7 +311,15 @@ async fn run(args: Args) -> Result<()> {
         args.text_bytes,
     )?;
     let batches = RecordBatchIterator::new([Ok(seed_batch)], schema.clone());
-    let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default())).await?;
+    let mut dataset = Dataset::write(
+        batches,
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await?;
 
     let index_start = Instant::now();
     if args.mode.indexed() {

@@ -11,11 +11,6 @@ on:
         description: "Tag to publish (e.g., v1.0.0)"
         required: true
         type: string
-      skip_check_repo:
-        description: "Skip checking if packages have been modified (useful for backfilling missed releases)"
-        required: false
-        type: boolean
-        default: false
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
@@ -90,14 +85,19 @@ jobs:
       # Wait until https://github.com/rust-lang/crates-io-auth-action/issues/51 fixed
       # - uses: rust-lang/crates-io-auth-action@v1
       #   id: auth
-      - uses: albertlockett/publish-crates@85f0989f1298bc3889830b5fc28122c7586efeec # v2.2
+      # lance-arrow-stats and lance-arrow-scalar are versioned with Arrow
+      # (currently 58.0.0) and released on Arrow's cadence, not Lance's, so
+      # they are excluded from the per-release publish. Bump and publish them
+      # explicitly when their source changes.
+      - name: Publish crates
         if: steps.check_version.outputs.skip != 'true'
-        with:
-          # registry-token: ${{ steps.auth.outputs.token }}
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          args: "--all-features"
-          path: .
-          check-repo: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_check_repo != true }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --workspace \
+            --exclude lance-arrow-stats \
+            --exclude lance-arrow-scalar \
+            --all-features
   report-failure:
     name: Report Workflow Failure
     runs-on: ubuntu-latest

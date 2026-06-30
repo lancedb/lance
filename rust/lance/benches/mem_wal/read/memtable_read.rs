@@ -46,7 +46,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 use rand::Rng;
 use uuid::Uuid;
 
@@ -224,6 +224,7 @@ async fn setup_lance(batches: Vec<RecordBatch>) -> LanceSetup {
 
     let uri = format!("memory://lance_bench_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -246,6 +247,7 @@ async fn setup_lance_per_batch(batches: Vec<RecordBatch>, batch_size: usize) -> 
 
     let uri = format!("memory://lance_per_batch_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
@@ -268,6 +270,7 @@ async fn setup_lance_with_fts(batches: Vec<RecordBatch>) -> LanceSetup {
 
     let uri = format!("memory://lance_fts_bench_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -300,6 +303,7 @@ async fn setup_lance_per_batch_with_fts(
 
     let uri = format!("memory://lance_fts_per_batch_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };
@@ -333,6 +337,7 @@ async fn setup_lance_with_vector_index(
 
     let uri = format!("memory://lance_vec_bench_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: total_rows + 1,
         ..Default::default()
     };
@@ -379,6 +384,7 @@ async fn setup_lance_per_batch_with_vector_index(
 
     let uri = format!("memory://lance_vec_per_batch_{}", Uuid::new_v4());
     let write_params = WriteParams {
+        data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
         max_rows_per_file: batch_size,
         ..Default::default()
     };

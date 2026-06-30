@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
+use crate::deepsize::DeepSizeOf;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
-use deepsize::DeepSizeOf;
 use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 
@@ -25,6 +25,7 @@ pub use field::{
 pub use schema::{
     BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
     escape_field_path_for_project, format_field_path, parse_field_path,
+    validate_fixed_size_list_dimensions,
 };
 
 pub static BLOB_DESC_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
@@ -70,6 +71,26 @@ pub static BLOB_V2_DESC_FIELD: LazyLock<ArrowField> = LazyLock::new(|| {
 pub static BLOB_V2_DESC_LANCE_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::try_from(&*BLOB_V2_DESC_FIELD).unwrap());
 
+/// Blob v2 user-view struct fields used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
+    Fields::from(vec![
+        ArrowField::new("data", DataType::LargeBinary, true),
+        ArrowField::new("uri", DataType::Utf8, true),
+        ArrowField::new("position", DataType::UInt64, true),
+        ArrowField::new("size", DataType::UInt64, true),
+    ])
+});
+
+/// Blob v2 user-view struct type used by internal rewrite paths.
+///
+/// This schema converts the descriptor view back into the write-side view used
+/// by blob compaction.
+pub static BLOB_V2_USER_TYPE: LazyLock<DataType> =
+    LazyLock::new(|| DataType::Struct(BLOB_V2_USER_FIELDS.clone()));
+
 pub const BLOB_LOGICAL_TYPE: &str = "blob";
 
 /// LogicalType is a string presentation of arrow type.
@@ -96,7 +117,7 @@ impl LogicalType {
         self.0.starts_with("fixed_size_list:struct:")
     }
 
-    fn is_struct(&self) -> bool {
+    pub fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
 
@@ -165,8 +186,8 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float64 => "double".to_string(),
             DataType::Decimal128(precision, scale) => format!("decimal:128:{precision}:{scale}"),
             DataType::Decimal256(precision, scale) => format!("decimal:256:{precision}:{scale}"),
-            DataType::Utf8 => "string".to_string(),
-            DataType::Binary => "binary".to_string(),
+            DataType::Utf8 | DataType::Utf8View => "string".to_string(),
+            DataType::Binary | DataType::BinaryView => "binary".to_string(),
             DataType::LargeUtf8 => "large_string".to_string(),
             DataType::LargeBinary => "large_binary".to_string(),
             DataType::Date32 => "date32:day".to_string(),
@@ -388,10 +409,10 @@ pub struct Dictionary {
 }
 
 impl DeepSizeOf for Dictionary {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut crate::deepsize::Context) -> usize {
         self.values
             .as_ref()
-            .map(|v| v.get_array_memory_size())
+            .map(|v| (v.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context))
             .unwrap_or(0)
     }
 }

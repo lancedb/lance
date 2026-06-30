@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 public class LanceSchema {
+  static final String LANCE_FIELD_ID_KEY = "lance:field_id";
   private final List<LanceField> fields;
   private final Map<String, String> metadata;
 
@@ -66,6 +67,12 @@ public class LanceSchema {
   public Schema asArrowSchema() {
     return new Schema(
         fields.stream().map(LanceField::asArrowField).collect(Collectors.toList()), metadata);
+  }
+
+  public Schema asArrowSchemaWithFieldIds() {
+    return new Schema(
+        fields.stream().map(LanceField::asArrowFieldWithFieldIds).collect(Collectors.toList()),
+        metadata);
   }
 
   @Override

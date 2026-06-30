@@ -15,7 +15,7 @@ use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
-use jni::sys::{jboolean, jint};
+use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -609,6 +609,19 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
     }
 }
 
+/// Translate the Java `commitTimeoutNanos` sentinel into an
+/// `Option<Duration>` for [`CommitBuilder::with_timeout`]. The Java side is
+/// the source of truth for the default (30 minutes) and for rejecting
+/// zero/negative-from-the-user inputs; here `< 0` simply means "disabled" and
+/// any other value is the timeout in nanoseconds.
+fn parse_commit_timeout(nanos: i64) -> Option<std::time::Duration> {
+    if nanos < 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_nanos(nanos as u64))
+    }
+}
+
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local>(
@@ -626,6 +639,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
     namespace_obj: JObject,
     table_id_obj: JObject,
     namespace_client_managed_versioning: jboolean,
+    commit_timeout_nanos: jlong,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -643,6 +657,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToDataset<'local
             namespace_obj,
             table_id_obj,
             namespace_client_managed_versioning != 0,
+            commit_timeout_nanos,
         )
     )
 }
@@ -662,7 +677,9 @@ fn inner_commit_to_dataset<'local>(
     namespace_obj: JObject,
     table_id_obj: JObject,
     namespace_client_managed_versioning: bool,
+    commit_timeout_nanos: jlong,
 ) -> Result<JObject<'local>> {
+    let commit_timeout = parse_commit_timeout(commit_timeout_nanos);
     let write_param = if write_params_obj.is_null() {
         HashMap::new()
     } else {
@@ -757,12 +774,18 @@ fn inner_commit_to_dataset<'local>(
     // Set namespace commit handler only if namespace_client_managed_versioning is true
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
     let commit_handler = if namespace_client_managed_versioning {
-        namespace_info.map(|(ns, tid)| {
-            let external_store = LanceNamespaceExternalManifestStore::new(ns, tid);
-            Arc::new(ExternalManifestCommitHandler {
-                external_manifest_store: Arc::new(external_store),
-            }) as Arc<dyn CommitHandler>
-        })
+        match namespace_info {
+            Some((ns, tid)) => {
+                // The store derives the branch a request targets from the base
+                // path it is handed, resolved against the table root.
+                let table_root = java_blocking_ds.inner.branch_location().find_main()?.path;
+                let external_store = LanceNamespaceExternalManifestStore::new(ns, tid, table_root);
+                Some(Arc::new(ExternalManifestCommitHandler {
+                    external_manifest_store: Arc::new(external_store),
+                }) as Arc<dyn CommitHandler>)
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -780,6 +803,7 @@ fn inner_commit_to_dataset<'local>(
             max_retries,
             skip_auto_cleanup,
             commit_handler,
+            commit_timeout,
         )?
     };
     new_blocking_ds.into_java(env)
@@ -1383,6 +1407,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
     max_retries: jint,
     skip_auto_cleanup: jboolean,
     namespace_client_managed_versioning: jboolean,
+    commit_timeout_nanos: jlong,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -1401,6 +1426,7 @@ pub extern "system" fn Java_org_lance_CommitBuilder_nativeCommitToUri<'local>(
             max_retries as u32,
             skip_auto_cleanup != 0,
             namespace_client_managed_versioning != 0,
+            commit_timeout_nanos,
         )
     )
 }
@@ -1421,7 +1447,9 @@ fn inner_commit_to_uri<'local>(
     max_retries: u32,
     skip_auto_cleanup: bool,
     namespace_client_managed_versioning: bool,
+    commit_timeout_nanos: jlong,
 ) -> Result<JObject<'local>> {
+    let commit_timeout = parse_commit_timeout(commit_timeout_nanos);
     let uri_str: String = uri.extract(env)?;
 
     // Extract write params from parameter
@@ -1520,7 +1548,8 @@ fn inner_commit_to_uri<'local>(
     let mut builder = CommitBuilder::new(&*uri_str)
         .with_store_params(store_params)
         .with_detached(detached)
-        .enable_v2_manifest_paths(enable_v2_manifest_paths);
+        .enable_v2_manifest_paths(enable_v2_manifest_paths)
+        .with_timeout(commit_timeout);
 
     if let Some(use_stable) = use_stable_row_ids {
         builder = builder.use_stable_row_ids(use_stable);
@@ -1537,7 +1566,8 @@ fn inner_commit_to_uri<'local>(
 
     // Set namespace commit handler only if namespace_client_managed_versioning is true
     if namespace_client_managed_versioning && let Some((namespace_client, tid)) = namespace_info {
-        let external_store = LanceNamespaceExternalManifestStore::new(namespace_client, tid);
+        let external_store =
+            LanceNamespaceExternalManifestStore::for_table_uri(namespace_client, tid, &uri_str)?;
         let commit_handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
             external_manifest_store: Arc::new(external_store),
         });

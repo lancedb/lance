@@ -6,9 +6,13 @@
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-use arrow_array::builder::LargeBinaryBuilder;
-use arrow_array::{Array, ArrayRef, LargeBinaryArray, LargeStringArray, RecordBatch, StringArray};
-use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema};
+use arrow_array::builder::{LargeBinaryBuilder, StringBuilder};
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, LargeBinaryArray, LargeListArray, LargeStringArray,
+    ListArray, MapArray, RecordBatch, StringArray, StructArray,
+};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema};
 
 use crate::ARROW_EXT_NAME_KEY;
 
@@ -51,6 +55,22 @@ pub fn has_json_fields(field: &ArrowField) -> bool {
             has_json_fields(f)
         }
         DataType::Map(f, _) => has_json_fields(f),
+        _ => false,
+    }
+}
+
+/// Check if a field or any of its descendants is an Arrow JSON field
+pub fn has_arrow_json_fields(field: &ArrowField) -> bool {
+    if is_arrow_json_field(field) {
+        return true;
+    }
+
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().any(|f| has_arrow_json_fields(f)),
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            has_arrow_json_fields(f)
+        }
+        DataType::Map(f, _) => has_arrow_json_fields(f),
         _ => false,
     }
 }
@@ -292,21 +312,249 @@ fn get_json_path(
 /// Convert an Arrow JSON field to Lance JSON field (with JSONB storage)
 pub fn arrow_json_to_lance_json(field: &ArrowField) -> ArrowField {
     if is_arrow_json_field(field) {
-        // Convert Arrow JSON (Utf8/LargeUtf8) to Lance JSON (LargeBinary)
-        // Preserve all metadata from the original field
-        let mut new_field =
-            ArrowField::new(field.name(), DataType::LargeBinary, field.is_nullable());
-
-        // Copy all metadata from the original field
-        let mut metadata = field.metadata().clone();
-        // Add/override the extension metadata for Lance JSON
-        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), JSON_EXT_NAME.to_string());
-
-        new_field = new_field.with_metadata(metadata);
-        new_field
-    } else {
-        field.clone()
+        return field_with_extension(field, DataType::LargeBinary, JSON_EXT_NAME);
     }
+
+    let data_type = match field.data_type() {
+        DataType::Struct(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| Arc::new(arrow_json_to_lance_json(field)))
+                .collect::<Vec<_>>();
+            DataType::Struct(Fields::from(fields))
+        }
+        DataType::List(item) => DataType::List(Arc::new(arrow_json_to_lance_json(item))),
+        DataType::LargeList(item) => DataType::LargeList(Arc::new(arrow_json_to_lance_json(item))),
+        DataType::FixedSizeList(item, size) => {
+            DataType::FixedSizeList(Arc::new(arrow_json_to_lance_json(item)), *size)
+        }
+        DataType::Map(entries, keys_sorted) => {
+            DataType::Map(Arc::new(arrow_json_to_lance_json(entries)), *keys_sorted)
+        }
+        _ => return field.clone(),
+    };
+
+    field_with_data_type(field, data_type)
+}
+
+/// Convert a Lance JSON field to Arrow JSON field.
+pub fn lance_json_to_arrow_json(field: &ArrowField) -> ArrowField {
+    if is_json_field(field) {
+        return field_with_extension(field, DataType::Utf8, ARROW_JSON_EXT_NAME);
+    }
+
+    let data_type = match field.data_type() {
+        DataType::Struct(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| Arc::new(lance_json_to_arrow_json(field)))
+                .collect::<Vec<_>>();
+            DataType::Struct(Fields::from(fields))
+        }
+        DataType::List(item) => DataType::List(Arc::new(lance_json_to_arrow_json(item))),
+        DataType::LargeList(item) => DataType::LargeList(Arc::new(lance_json_to_arrow_json(item))),
+        DataType::FixedSizeList(item, size) => {
+            DataType::FixedSizeList(Arc::new(lance_json_to_arrow_json(item)), *size)
+        }
+        DataType::Map(entries, keys_sorted) => {
+            DataType::Map(Arc::new(lance_json_to_arrow_json(entries)), *keys_sorted)
+        }
+        _ => return field.clone(),
+    };
+
+    field_with_data_type(field, data_type)
+}
+
+fn field_with_data_type(field: &ArrowField, data_type: DataType) -> ArrowField {
+    ArrowField::new(field.name(), data_type, field.is_nullable())
+        .with_metadata(field.metadata().clone())
+}
+
+fn field_with_extension(
+    field: &ArrowField,
+    data_type: DataType,
+    extension_name: &str,
+) -> ArrowField {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(ARROW_EXT_NAME_KEY.to_string(), extension_name.to_string());
+    ArrowField::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata)
+}
+
+fn convert_json_array<F>(
+    field: &ArrowField,
+    array: &ArrayRef,
+    convert_leaf: &F,
+) -> Result<(ArrowField, ArrayRef, bool), ArrowError>
+where
+    F: Fn(&ArrowField, &ArrayRef) -> Result<Option<(ArrowField, ArrayRef)>, ArrowError>,
+{
+    if let Some((field, array)) = convert_leaf(field, array)? {
+        return Ok((field, array, true));
+    }
+
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            let struct_array = array.as_struct();
+            let mut new_fields = Vec::with_capacity(fields.len());
+            let mut new_columns = Vec::with_capacity(fields.len());
+            let mut changed = false;
+
+            for (field, column) in fields.iter().zip(struct_array.columns()) {
+                let (new_field, new_column, field_changed) =
+                    convert_json_array(field, column, convert_leaf)?;
+                changed |= field_changed;
+                new_fields.push(Arc::new(new_field));
+                new_columns.push(new_column);
+            }
+
+            if changed {
+                let fields = Fields::from(new_fields);
+                let new_field = field_with_data_type(field, DataType::Struct(fields.clone()));
+                let new_array =
+                    StructArray::new(fields, new_columns, struct_array.nulls().cloned());
+                Ok((new_field, Arc::new(new_array) as ArrayRef, true))
+            } else {
+                Ok((field.clone(), array.clone(), false))
+            }
+        }
+        DataType::List(item) => {
+            let list_array: &ListArray = array.as_list();
+            let (new_item, new_values, changed) =
+                convert_json_array(item, list_array.values(), convert_leaf)?;
+            if changed {
+                let new_field =
+                    field_with_data_type(field, DataType::List(Arc::new(new_item.clone())));
+                let new_array = ListArray::new(
+                    Arc::new(new_item),
+                    list_array.offsets().clone(),
+                    new_values,
+                    list_array.nulls().cloned(),
+                );
+                Ok((new_field, Arc::new(new_array) as ArrayRef, true))
+            } else {
+                Ok((field.clone(), array.clone(), false))
+            }
+        }
+        DataType::LargeList(item) => {
+            let list_array: &LargeListArray = array.as_list();
+            let (new_item, new_values, changed) =
+                convert_json_array(item, list_array.values(), convert_leaf)?;
+            if changed {
+                let new_field =
+                    field_with_data_type(field, DataType::LargeList(Arc::new(new_item.clone())));
+                let new_array = LargeListArray::new(
+                    Arc::new(new_item),
+                    list_array.offsets().clone(),
+                    new_values,
+                    list_array.nulls().cloned(),
+                );
+                Ok((new_field, Arc::new(new_array) as ArrayRef, true))
+            } else {
+                Ok((field.clone(), array.clone(), false))
+            }
+        }
+        DataType::FixedSizeList(item, size) => {
+            let list_array: &FixedSizeListArray = array.as_fixed_size_list();
+            let (new_item, new_values, changed) =
+                convert_json_array(item, list_array.values(), convert_leaf)?;
+            if changed {
+                let new_field = field_with_data_type(
+                    field,
+                    DataType::FixedSizeList(Arc::new(new_item.clone()), *size),
+                );
+                let new_array = FixedSizeListArray::try_new_with_length(
+                    Arc::new(new_item),
+                    *size,
+                    new_values,
+                    list_array.nulls().cloned(),
+                    list_array.len(),
+                )?;
+                Ok((new_field, Arc::new(new_array) as ArrayRef, true))
+            } else {
+                Ok((field.clone(), array.clone(), false))
+            }
+        }
+        DataType::Map(entries, keys_sorted) => {
+            let map_array = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .expect("DataType::Map array must be MapArray");
+            let entries_array = Arc::new(map_array.entries().clone()) as ArrayRef;
+            let (new_entries, new_entries_array, changed) =
+                convert_json_array(entries, &entries_array, convert_leaf)?;
+            if changed {
+                let entries_struct = new_entries_array
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("Map entries must be StructArray")
+                    .clone();
+                let new_field = field_with_data_type(
+                    field,
+                    DataType::Map(Arc::new(new_entries.clone()), *keys_sorted),
+                );
+                let new_array = MapArray::new(
+                    Arc::new(new_entries),
+                    map_array.offsets().clone(),
+                    entries_struct,
+                    map_array.nulls().cloned(),
+                    *keys_sorted,
+                );
+                Ok((new_field, Arc::new(new_array) as ArrayRef, true))
+            } else {
+                Ok((field.clone(), array.clone(), false))
+            }
+        }
+        _ => Ok((field.clone(), array.clone(), false)),
+    }
+}
+
+fn convert_arrow_json_array(
+    field: &ArrowField,
+    array: &ArrayRef,
+) -> Result<(ArrowField, ArrayRef, bool), ArrowError> {
+    convert_json_array(field, array, &|field, array| {
+        if is_arrow_json_field(field) {
+            let json_array = JsonArray::try_from(array.clone())?;
+            Ok(Some((
+                arrow_json_to_lance_json(field),
+                Arc::new(json_array.into_inner()) as ArrayRef,
+            )))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+fn convert_lance_json_array(
+    field: &ArrowField,
+    array: &ArrayRef,
+) -> Result<(ArrowField, ArrayRef, bool), ArrowError> {
+    convert_json_array(field, array, &|field, array| {
+        if is_json_field(field) {
+            let binary_array = array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .expect("Lance JSON field must be LargeBinaryArray");
+            let mut builder = StringBuilder::new();
+
+            for i in 0..binary_array.len() {
+                if binary_array.is_null(i) {
+                    builder.append_null();
+                } else {
+                    let jsonb_bytes = binary_array.value(i);
+                    let json_str = decode_json(jsonb_bytes);
+                    builder.append_value(&json_str);
+                }
+            }
+
+            Ok(Some((
+                lance_json_to_arrow_json(field),
+                Arc::new(builder.finish()) as ArrayRef,
+            )))
+        } else {
+            Ok(None)
+        }
+    })
 }
 
 /// Convert a RecordBatch with Lance JSON columns (JSONB) back to Arrow JSON format (strings)
@@ -320,50 +568,11 @@ pub fn convert_lance_json_to_arrow(
 
     for (i, field) in schema.fields().iter().enumerate() {
         let column = batch.column(i);
+        let (new_field, new_column, changed) = convert_lance_json_array(field, column)?;
 
-        if is_json_field(field) {
-            needs_conversion = true;
-
-            // Convert the field back to Arrow JSON (Utf8)
-            let mut new_field = ArrowField::new(field.name(), DataType::Utf8, field.is_nullable());
-            let mut metadata = field.metadata().clone();
-            // Change from lance.json to arrow.json
-            metadata.insert(
-                ARROW_EXT_NAME_KEY.to_string(),
-                ARROW_JSON_EXT_NAME.to_string(),
-            );
-            new_field.set_metadata(metadata);
-            new_fields.push(new_field);
-
-            // Convert the data from JSONB to JSON strings
-            if batch.num_rows() == 0 {
-                // For empty batches, create an empty String array
-                let empty_strings = arrow_array::builder::StringBuilder::new().finish();
-                new_columns.push(Arc::new(empty_strings) as ArrayRef);
-            } else {
-                // Convert JSONB back to JSON strings
-                // Downcast is guaranteed to succeed since is_json_field verified the type
-                let binary_array = column
-                    .as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .expect("Lance JSON field must be LargeBinaryArray");
-
-                let mut builder = arrow_array::builder::StringBuilder::new();
-                for i in 0..binary_array.len() {
-                    if binary_array.is_null(i) {
-                        builder.append_null();
-                    } else {
-                        let jsonb_bytes = binary_array.value(i);
-                        let json_str = decode_json(jsonb_bytes);
-                        builder.append_value(&json_str);
-                    }
-                }
-                new_columns.push(Arc::new(builder.finish()) as ArrayRef);
-            }
-        } else {
-            new_fields.push(field.as_ref().clone());
-            new_columns.push(column.clone());
-        }
+        needs_conversion |= changed;
+        new_fields.push(new_field);
+        new_columns.push(new_column);
     }
 
     if needs_conversion {
@@ -389,40 +598,11 @@ pub fn convert_json_columns(
 
     for (i, field) in schema.fields().iter().enumerate() {
         let column = batch.column(i);
+        let (new_field, new_column, changed) = convert_arrow_json_array(field, column)?;
 
-        if is_arrow_json_field(field) {
-            needs_conversion = true;
-
-            // Convert the field metadata
-            new_fields.push(arrow_json_to_lance_json(field));
-
-            // Convert the data from JSON strings to JSONB
-            if batch.num_rows() == 0 {
-                // For empty batches, create an empty LargeBinary array
-                let empty_binary = LargeBinaryBuilder::new().finish();
-                new_columns.push(Arc::new(empty_binary) as ArrayRef);
-            } else {
-                // Convert non-empty data
-                // is_arrow_json_field guarantees type is Utf8 or LargeUtf8
-                let json_array =
-                    if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
-                        JsonArray::try_from(string_array)?
-                    } else {
-                        let large_string_array = column
-                            .as_any()
-                            .downcast_ref::<LargeStringArray>()
-                            .expect("Arrow JSON field must be Utf8 or LargeUtf8");
-                        JsonArray::try_from(large_string_array)?
-                    };
-
-                let binary_array = json_array.into_inner();
-
-                new_columns.push(Arc::new(binary_array) as ArrayRef);
-            }
-        } else {
-            new_fields.push(field.as_ref().clone());
-            new_columns.push(column.clone());
-        }
+        needs_conversion |= changed;
+        new_fields.push(new_field);
+        new_columns.push(new_column);
     }
 
     if needs_conversion {
@@ -544,6 +724,128 @@ mod tests {
             let decoded = decode_json(jsonb_bytes);
             assert!(decoded.contains("name"));
         }
+    }
+
+    #[test]
+    fn test_convert_nested_json_columns() {
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
+        let uri_field = Arc::new(ArrowField::new("uri", DataType::Utf8, false));
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let extra_field =
+            Arc::new(ArrowField::new("extra", DataType::Utf8, true).with_metadata(metadata));
+        let item_fields = Fields::from(vec![uri_field, extra_field]);
+
+        let values = StructArray::new(
+            item_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a.jpg"), Some("b.jpg")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"codec":"h264"}"#),
+                    None::<&str>,
+                ])) as ArrayRef,
+            ],
+            None,
+        );
+        let item = Arc::new(ArrowField::new("item", DataType::Struct(item_fields), true));
+        let media = ListArray::new(
+            item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+            Arc::new(values),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "media",
+            media.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(media) as ArrayRef]).unwrap();
+
+        assert!(has_arrow_json_fields(batch.schema().field(0)));
+
+        let converted = convert_json_columns(&batch).unwrap();
+        let converted_schema = converted.schema();
+        let DataType::List(item) = converted_schema.field(0).data_type() else {
+            panic!("expected list field");
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("expected struct item");
+        };
+        assert!(is_json_field(&fields[1]));
+
+        let list_array: &ListArray = converted.column(0).as_list();
+        let values = list_array.values().as_struct();
+        let extra = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert!(decode_json(extra.value(0)).contains("h264"));
+        assert!(extra.is_null(1));
+
+        let logical = convert_lance_json_to_arrow(&converted).unwrap();
+        let logical_schema = logical.schema();
+        let DataType::List(item) = logical_schema.field(0).data_type() else {
+            panic!("expected list field");
+        };
+        let DataType::Struct(fields) = item.data_type() else {
+            panic!("expected struct item");
+        };
+        assert!(is_arrow_json_field(&fields[1]));
+
+        let list_array: &ListArray = logical.column(0).as_list();
+        let values = list_array.values().as_struct();
+        let extra = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(extra.value(0).contains("h264"));
+        assert!(extra.is_null(1));
+    }
+
+    #[test]
+    fn test_convert_fixed_size_list_zero_json_preserves_length() {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let item = Arc::new(ArrowField::new("item", DataType::Utf8, true).with_metadata(metadata));
+        let values = Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as ArrayRef;
+        let lists = FixedSizeListArray::try_new_with_length(item, 0, values, None, 3).unwrap();
+        let schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "lists",
+            lists.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(lists) as ArrayRef]).unwrap();
+
+        let converted = convert_json_columns(&batch).unwrap();
+        assert_eq!(converted.num_rows(), 3);
+        assert_eq!(converted.column(0).len(), 3);
+
+        let converted_schema = converted.schema();
+        let DataType::FixedSizeList(item, size) = converted_schema.field(0).data_type() else {
+            panic!("expected fixed size list field");
+        };
+        assert_eq!(*size, 0);
+        assert!(is_json_field(item));
+
+        let logical = convert_lance_json_to_arrow(&converted).unwrap();
+        assert_eq!(logical.num_rows(), 3);
+        assert_eq!(logical.column(0).len(), 3);
+
+        let logical_schema = logical.schema();
+        let DataType::FixedSizeList(item, size) = logical_schema.field(0).data_type() else {
+            panic!("expected fixed size list field");
+        };
+        assert_eq!(*size, 0);
+        assert!(is_arrow_json_field(item));
     }
 
     #[test]

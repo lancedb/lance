@@ -216,8 +216,8 @@ public class OpenDatasetBuilder {
     // Call describe_table to get location and storage options
     DescribeTableRequest request = new DescribeTableRequest();
     request.setId(tableId);
-    // Only set version if present
-    options.getVersion().ifPresent(v -> request.setVersion(Long.valueOf(v)));
+    // Do not set the dataset version here. Some namespace implementations only support describing
+    // the latest table metadata; the requested version is applied when opening the dataset below.
 
     DescribeTableResponse response = namespaceClient.describeTable(request);
 

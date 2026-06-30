@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from typing import List
+from typing import List, Optional
 
 from lance import LanceDataset
 from lance.fragment import FragmentMetadata
@@ -51,5 +51,7 @@ class Compaction:
     def plan(dataset: "LanceDataset", options: CompactionOptions) -> CompactionPlan: ...
     @staticmethod
     def commit(
-        dataset: "LanceDataset", rewrites: List[RewriteResult]
+        dataset: "LanceDataset",
+        rewrites: List[RewriteResult],
+        options: Optional[CompactionOptions] = None,
     ) -> CompactionMetrics: ...

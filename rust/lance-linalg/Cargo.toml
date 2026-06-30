@@ -13,12 +13,12 @@ categories = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
-deepsize = { workspace = true }
 half = { workspace = true }
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 num-traits = { workspace = true }
 rand = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
@@ -35,9 +35,6 @@ cc = "1.0.83"
 # you need Clang 11 or later.)
 fp16kernels = []
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { workspace = true }
-
 [[bench]]
 name = "l2"
 harness = false
@@ -52,10 +49,6 @@ harness = false
 
 [[bench]]
 name = "cosine"
-harness = false
-
-[[bench]]
-name = "hamming"
 harness = false
 
 [[bench]]

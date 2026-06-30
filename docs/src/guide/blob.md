@@ -95,6 +95,16 @@ Note:
 - By default, external blob URIs must map to a registered non-dataset-root base path.
 - If you need to reference external objects outside those bases, set
   `allow_external_blob_outside_bases=True` when writing.
+- Blob v2 storage layout thresholds can be configured per column with
+  `blob_field(..., inline_size_threshold=..., dedicated_size_threshold=...)`.
+  The inline threshold controls when values move from the data file to packed
+  `.blob` sidecar storage. The dedicated threshold controls when values move
+  from packed sidecar storage to a dedicated `.blob` file. The dedicated
+  threshold is checked first. For existing columns, these thresholds are stored
+  in the dataset schema; appends that explicitly provide different threshold
+  metadata for the same column are rejected.
+- `blob_pack_file_size_threshold` is a write option for rolling packed `.blob`
+  sidecar files. It does not control inline-vs-packed placement.
 
 ### Example: packed external blobs (single container file)
 

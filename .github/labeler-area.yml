@@ -1,0 +1,70 @@
+# Area labels (A-*) applied by actions/labeler@v5 based on changed paths.
+# See .github/workflows/labeler.yml. Title/body conventional-commit labels are
+# handled separately by srvaroa/labeler via .github/labeler.yml.
+#
+# A PR may carry multiple A-* labels (e.g. a Java + namespace change gets both).
+
+A-java:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "java/**"
+          - "rust/lance-jni/**"
+
+A-namespace:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "rust/lance-namespace*/**"
+
+A-index:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "rust/lance-index/**"
+          - "rust/lance-linalg/**"
+          - "rust/lance-tokenizer/**"
+
+A-encoding:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "rust/lance-encoding/**"
+          - "rust/lance-io/**"
+          - "rust/lance-file/**"
+
+# On-disk format: the proto definitions and the format spec docs. Format docs
+# are excluded from A-docs (see below) so format changes get A-format only.
+A-format:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "protos/**"
+          - "docs/src/format/**"
+
+# Lockfiles are intentionally not excluded: a pure dependency bump gets both
+# A-python and A-deps. Over-labeling beats dropping the area signal on PRs that
+# touch python code alongside a lockfile.
+A-python:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "python/**"
+
+# Format spec docs (docs/src/format/**) are excluded so they get A-format only.
+# Caveat: a PR that touches both format docs and other docs in the same change
+# won't get A-docs, since the exclusion applies across all changed files.
+A-docs:
+  - all:
+      - changed-files:
+          - any-glob-to-any-file:
+              - "docs/**"
+          - all-globs-to-all-files:
+              - "!docs/src/format/**"
+
+A-ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/**"
+
+A-deps:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/Cargo.lock"
+          - "**/uv.lock"
+          - "deny.toml"
+          - "**/pyproject.toml"

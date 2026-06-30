@@ -147,6 +147,65 @@ impl LsmDataSourceCollector {
         &self.in_memory_memtables
     }
 
+    /// Whether the collector has any on-disk source (base table or a flushed
+    /// generation). The point-lookup fast path uses this to decide, after
+    /// missing every in-memory memtable, between "definitely absent" (`false`)
+    /// and "must consult disk via the plan path" (`true`). Cheap: no allocation.
+    pub fn has_on_disk_sources(&self) -> bool {
+        self.base_table.is_some()
+            || self
+                .shard_snapshots
+                .iter()
+                .any(|s| !s.flushed_generations.is_empty())
+    }
+
+    /// The in-memory memtables (active + frozen across all shards) as
+    /// references, **newest generation first**. Used by batch point lookups
+    /// that probe many keys against the same set of memtables; clones no
+    /// `Arc`s. Empty when there are no in-memory memtables.
+    pub fn in_memory_refs_newest_first(&self) -> Vec<&InMemoryMemTableRef> {
+        let mut refs: Vec<&InMemoryMemTableRef> = Vec::new();
+        for mems in self.in_memory_memtables.values() {
+            refs.push(&mems.active);
+            refs.extend(mems.frozen.iter());
+        }
+        refs.sort_by_key(|m| std::cmp::Reverse(m.generation));
+        refs
+    }
+
+    /// Visit the in-memory memtables (active + frozen) **newest generation
+    /// first** by reference, calling `f` until it returns `Some`; returns that
+    /// value (or `None` if every memtable was visited without one).
+    ///
+    /// Unlike [`Self::collect`], this clones no `Arc`s and — in the common
+    /// single-shard, single-active case — allocates nothing, so concurrent
+    /// readers don't contend on source refcounts. Generation-DESC order makes
+    /// a re-write in the active memtable win over a stale frozen row.
+    pub fn find_in_memory_newest_first<T>(
+        &self,
+        mut f: impl FnMut(&InMemoryMemTableRef) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        // Hot path: one shard, only the active memtable → no Vec, no sort.
+        if self.in_memory_memtables.len() == 1 {
+            let mems = self.in_memory_memtables.values().next().unwrap();
+            if mems.frozen.is_empty() {
+                return f(&mems.active);
+            }
+        }
+        let mut refs: Vec<&InMemoryMemTableRef> = Vec::new();
+        for mems in self.in_memory_memtables.values() {
+            refs.push(&mems.active);
+            refs.extend(mems.frozen.iter());
+        }
+        refs.sort_by_key(|m| std::cmp::Reverse(m.generation));
+        for m in refs {
+            if let Some(v) = f(m)? {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
+    }
+
     /// A shard's in-memory memtables (active + frozen-awaiting-flush) as
     /// scan sources, in **ascending generation order**. The planner relies
     /// on this: it reverses sources to generation-DESC so the newest row
@@ -170,6 +229,19 @@ impl LsmDataSourceCollector {
             .collect()
     }
 
+    /// True when `generation` for `shard_id` is still pinned in memory as a
+    /// frozen memtable. During the post-flush grace window a generation is both
+    /// committed to the manifest (a flushed source) and held in memory (an
+    /// in-memory source); it must be served only from memory — which preserves
+    /// the per-batch boundaries the flushed dataset has lost, so as-of reads
+    /// stay snapshot-bounded — and its on-disk copy skipped to avoid scanning
+    /// the generation twice. See `ShardWriterConfig::frozen_memtable_grace`.
+    fn flushed_gen_pinned_in_memory(&self, shard_id: &Uuid, generation: u64) -> bool {
+        self.in_memory_memtables
+            .get(shard_id)
+            .is_some_and(|mems| mems.frozen.iter().any(|f| f.generation == generation))
+    }
+
     /// Collect all data sources.
     ///
     /// Returns sources in a consistent order:
@@ -187,6 +259,9 @@ impl LsmDataSourceCollector {
 
         for snapshot in &self.shard_snapshots {
             for flushed in &snapshot.flushed_generations {
+                if self.flushed_gen_pinned_in_memory(&snapshot.shard_id, flushed.generation) {
+                    continue;
+                }
                 let path = self.resolve_flushed_path(&snapshot.shard_id, &flushed.path);
                 sources.push(LsmDataSource::FlushedMemTable {
                     path,
@@ -225,6 +300,9 @@ impl LsmDataSourceCollector {
             }
 
             for flushed in &snapshot.flushed_generations {
+                if self.flushed_gen_pinned_in_memory(&snapshot.shard_id, flushed.generation) {
+                    continue;
+                }
                 let path = self.resolve_flushed_path(&snapshot.shard_id, &flushed.path);
                 sources.push(LsmDataSource::FlushedMemTable {
                     path,
@@ -383,5 +461,54 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    /// During the post-flush grace window a generation is both committed to the
+    /// manifest (a flushed source) and still pinned in memory (a frozen
+    /// source). The collector must emit it once, from memory — so as-of reads
+    /// keep batch-resolved membership — and skip the on-disk copy. Flushed
+    /// generations NOT pinned in memory are still emitted from disk.
+    #[test]
+    fn test_collect_suppresses_flushed_gen_pinned_in_memory() {
+        let shard = Uuid::new_v4();
+        // Manifest lists gens 1 and 2 as flushed; gen 2 is still pinned in
+        // memory (just flushed, within grace), gen 1 has been swept.
+        let snapshot = ShardSnapshot {
+            shard_id: shard,
+            spec_id: 0,
+            current_generation: 3,
+            flushed_generations: vec![
+                FlushedGeneration {
+                    generation: 1,
+                    path: "gen_1".to_string(),
+                },
+                FlushedGeneration {
+                    generation: 2,
+                    path: "gen_2".to_string(),
+                },
+            ],
+        };
+        let mems = InMemoryMemTables {
+            active: memtable_ref(3),
+            frozen: vec![memtable_ref(2)],
+        };
+        let collector = LsmDataSourceCollector::without_base_table("/tmp/x", vec![snapshot])
+            .with_in_memory_memtables(shard, mems);
+
+        let sources = collector.collect().unwrap();
+        // gen 1: on-disk (not pinned). gen 2: in-memory only (pinned, disk
+        // copy suppressed). gen 3: active. No duplicate gen 2.
+        let flushed: Vec<u64> = sources
+            .iter()
+            .filter(|s| !s.is_active_memtable())
+            .map(|s| s.generation().as_u64())
+            .collect();
+        let in_memory: Vec<u64> = sources
+            .iter()
+            .filter(|s| s.is_active_memtable())
+            .map(|s| s.generation().as_u64())
+            .collect();
+        assert_eq!(flushed, vec![1], "only the unpinned flushed gen from disk");
+        assert_eq!(in_memory, vec![2, 3], "pinned gen 2 served from memory");
     }
 }

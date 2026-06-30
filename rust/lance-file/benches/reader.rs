@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{UInt32Array, cast::AsArray, types::Int32Type};
 use arrow_schema::DataType;
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use futures::{FutureExt, StreamExt};
 use lance_core::utils::{tempfile::TempDir, tokio::get_num_compute_intensive_cpus};
 use lance_datagen::ArrayGeneratorExt;
@@ -465,7 +467,7 @@ fn bench_random_access(c: &mut Criterion) {
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
-        .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
+        .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_reader, bench_random_access);
 
 // Non-linux version does not support pprof.

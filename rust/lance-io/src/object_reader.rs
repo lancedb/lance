@@ -11,12 +11,12 @@ use crate::local::read_exact_at;
 use std::os::unix::fs::FileExt;
 
 use bytes::Bytes;
-use deepsize::DeepSizeOf;
 use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
     stream::{self, StreamExt},
 };
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, error::CloneableError, utils::tracing::FutureTracingExt};
 use object_store::ObjectStoreExt;
 use object_store::{GetOptions, GetResult, ObjectStore, Result as OSResult, path::Path};
@@ -74,7 +74,7 @@ pub struct CloudObjectReader {
 }
 
 impl DeepSizeOf for CloudObjectReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // Skipping object_store because there is no easy way to do that and it shouldn't be too big
         self.path.as_ref().deep_size_of_children(context)
     }
@@ -188,25 +188,29 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
-        let get_request = Arc::new(GetRequest {
-            object_store: self.object_store.clone(),
-            path: self.path.clone(),
-            options: GetOptions {
-                range: Some(
-                    Range {
-                        start: range.start as u64,
-                        end: range.end as u64,
-                    }
-                    .into(),
-                ),
-                ..Default::default()
-            },
-        });
-        Box::pin(do_get_with_outer_retry(
-            self.download_retry_count,
-            get_request,
-            move || format!("range {:?}", range),
-        ))
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        let get_range = Range {
+            start: range.start as u64,
+            end: range.end as u64,
+        };
+        Box::pin(async move {
+            let bytes = do_with_retry(move || {
+                let object_store = object_store.clone();
+                let path = path.clone();
+                let get_range = get_range.clone();
+                Box::pin(async move { object_store.get_ranges(&path, &[get_range]).await })
+            })
+            .await?;
+
+            bytes
+                .into_iter()
+                .next()
+                .ok_or_else(|| object_store::Error::Generic {
+                    store: "CloudObjectReader",
+                    source: "get_ranges returned no bytes".into(),
+                })
+        })
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -445,7 +449,7 @@ pub(crate) fn stream_local_range(
 }
 
 impl DeepSizeOf for SmallReader {
-    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let mut size = self.inner.path.as_ref().deep_size_of_children(context);
 
         if let Ok(guard) = self.inner.state.try_lock()

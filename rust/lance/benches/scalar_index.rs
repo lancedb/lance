@@ -24,7 +24,7 @@ use lance_index::scalar::{
 use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
 use lance_select::RowSetOps;
 #[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
+use lance_testing::pprof::{Output, PProfProfiler};
 
 struct BenchmarkFixture {
     _datadir: TempStrDir,

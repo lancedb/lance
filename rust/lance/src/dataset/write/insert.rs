@@ -442,7 +442,7 @@ struct WriteContext<'a> {
 mod test {
     use std::collections::HashMap;
 
-    use arrow_array::{BinaryArray, Int32Array, RecordBatchReader, StructArray};
+    use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
     use lance_arrow::BLOB_META_KEY;
 
@@ -553,6 +553,41 @@ mod test {
             Error::InvalidInput { source, .. } => {
                 let message = source.to_string();
                 assert!(message.contains("Legacy blob columns"));
+                assert!(message.contains("lance.blob.v2"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_v2_2_dataset_rejects_nested_legacy_blob_schema() {
+        let image_field = Field::new("image_bytes", DataType::Binary, true).with_metadata(
+            HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "summary_image_nested",
+            DataType::Struct(vec![image_field.clone()].into()),
+            true,
+        )]));
+        let image_values: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"abc".as_slice())]));
+        let nested_values = StructArray::from(vec![(Arc::new(image_field), image_values)]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(nested_values)]).unwrap();
+
+        let dataset = InsertBuilder::new("memory://forced-nested-blob-v2")
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        let err = dataset.unwrap_err();
+        match err {
+            Error::InvalidInput { source, .. } => {
+                let message = source.to_string();
+                assert!(message.contains("Legacy blob columns"));
+                assert!(message.contains("summary_image_nested.image_bytes"));
                 assert!(message.contains("lance.blob.v2"));
             }
             other => panic!("unexpected error: {other:?}"),

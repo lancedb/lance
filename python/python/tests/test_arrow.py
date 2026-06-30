@@ -7,10 +7,11 @@ import re
 from pathlib import Path
 
 import lance
+import lance.arrow
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pytest
+import pytest  # pyright: ignore[reportMissingImports]
 from lance.arrow import (
     BFloat16,
     BFloat16Array,
@@ -46,6 +47,16 @@ def test_bf16_value():
         BFloat16(1.0) >= BFloat16(1.1),
     ]
     assert not any(comparison for comparison in should_be_false)
+
+
+def test_bf16_from_bytes_roundtrip():
+    assert BFloat16.from_bytes(b"\xc0\x3f") == BFloat16(1.5)
+
+
+@pytest.mark.parametrize("bad", [b"", b"\x00", b"\x00\x00\x00", b"\x00" * 4])
+def test_bf16_from_bytes_invalid_length_raises(bad):
+    with pytest.raises(ValueError, match="expected 2 bytes"):
+        BFloat16.from_bytes(bad)
 
 
 def test_bf16_repr():

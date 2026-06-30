@@ -1,27 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::encoding::encode_group_starts;
 use super::{InvertedIndexParams, index::*};
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::{IndexStore, OldIndexDataFilter};
+use crate::scalar::{IndexFile, IndexStore, OldIndexDataFilter};
 use crate::vector::graph::OrderedFloat;
 use crate::{progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use bitpacking::{BitPacker, BitPacker4x};
+use bytes::Bytes;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
-use deepsize::DeepSizeOf;
 use fst::Streamer;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
+use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
@@ -72,7 +74,91 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .parse()
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
+// Target serialized byte size of a posting-list cache group. Consecutive
+// posting lists are grouped into a single cache entry until their combined
+// serialized size reaches this target, amortizing per-entry overhead across
+// small (Zipfian-rare) terms. See issue #7040.
+static LANCE_FTS_POSTING_GROUP_TARGET_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_POSTING_GROUP_TARGET_BYTES")
+        .unwrap_or_else(|_| "4096".to_string())
+        .parse()
+        .expect("failed to parse LANCE_FTS_POSTING_GROUP_TARGET_BYTES")
+});
+// Maximum number of posting lists in a single cache group, regardless of byte
+// size. Caps the work and memory of a single group read for corpora with many
+// tiny terms.
+static LANCE_FTS_POSTING_GROUP_MAX_TOKENS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
+        .unwrap_or_else(|_| "256".to_string())
+        .parse()
+        .expect("failed to parse LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
+});
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
+
+/// Write-time configuration controlling how consecutive posting lists are
+/// grouped into a single read-path cache entry (issue #7040). Defaults come
+/// from the `LANCE_FTS_POSTING_GROUP_*` environment variables.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PostingGroupConfig {
+    pub(crate) target_bytes: usize,
+    pub(crate) max_tokens: usize,
+}
+
+impl Default for PostingGroupConfig {
+    fn default() -> Self {
+        Self {
+            target_bytes: (*LANCE_FTS_POSTING_GROUP_TARGET_BYTES).max(1),
+            max_tokens: (*LANCE_FTS_POSTING_GROUP_MAX_TOKENS).max(1),
+        }
+    }
+}
+
+/// Accumulates posting-list group boundaries at write time. Tokens are pushed
+/// in row order; a group is cut once its serialized bytes reach
+/// `target_bytes` or it holds `max_tokens` posting lists. A posting list
+/// larger than the target that *starts* a group occupies that group alone (the
+/// clamp case); one encountered mid-group is absorbed and closes that group, so
+/// a single term is never split across groups.
+#[derive(Debug)]
+pub(crate) struct PostingGroupAccumulator {
+    config: PostingGroupConfig,
+    starts: Vec<u32>,
+    next_token: u32,
+    current_bytes: usize,
+    current_tokens: usize,
+}
+
+impl PostingGroupAccumulator {
+    pub(crate) fn new(config: PostingGroupConfig) -> Self {
+        Self {
+            config,
+            starts: Vec::new(),
+            next_token: 0,
+            current_bytes: 0,
+            current_tokens: 0,
+        }
+    }
+
+    /// Record the next posting list in row order, given its serialized byte size.
+    pub(crate) fn push(&mut self, posting_bytes: usize) {
+        if self.current_tokens == 0 {
+            self.starts.push(self.next_token);
+        }
+        self.current_bytes += posting_bytes;
+        self.current_tokens += 1;
+        self.next_token += 1;
+        if self.current_bytes >= self.config.target_bytes
+            || self.current_tokens >= self.config.max_tokens
+        {
+            self.current_bytes = 0;
+            self.current_tokens = 0;
+        }
+    }
+
+    pub(crate) fn into_starts(self) -> Vec<u32> {
+        self.starts
+    }
+}
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -202,7 +288,7 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
 
@@ -219,15 +305,15 @@ impl InvertedIndexBuilder {
         self.progress
             .stage_start("tokenize_docs", None, "rows")
             .await?;
-        self.update_index(new_data, dest_store).await?;
+        let mut files = self.update_index(new_data, dest_store).await?;
 
         if let Some(OldIndexDataFilter::Fragments { to_remove, .. }) = old_data_filter {
             self.deleted_fragments.extend(to_remove);
         }
 
         self.progress.stage_complete("tokenize_docs").await?;
-        self.write(dest_store).await?;
-        Ok(())
+        files.extend(self.write(dest_store).await?);
+        Ok(files)
     }
 
     pub async fn update_from_segments(
@@ -236,7 +322,7 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
 
@@ -246,7 +332,8 @@ impl InvertedIndexBuilder {
             self.params.lance_tokenizer = Some(doc_type.as_ref().to_string());
         }
 
-        self.merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
+        let mut files = self
+            .merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
             .await?;
 
         let new_data = document_input(new_data, doc_col)?;
@@ -254,11 +341,11 @@ impl InvertedIndexBuilder {
         self.progress
             .stage_start("tokenize_docs", None, "rows")
             .await?;
-        self.update_index(new_data, dest_store).await?;
+        files.extend(self.update_index(new_data, dest_store).await?);
         self.progress.stage_complete("tokenize_docs").await?;
 
-        self.write(dest_store).await?;
-        Ok(())
+        files.extend(self.write(dest_store).await?);
+        Ok(files)
     }
 
     async fn merge_existing_segments(
@@ -266,10 +353,11 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
         old_data_filter: Option<&crate::scalar::OldIndexDataFilter>,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
         let num_workers = resolve_num_workers(&self.params);
         let memory_limit_bytes = resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let mut merged: Option<InnerBuilder> = None;
+        let mut files = Vec::new();
         for index in old_segments {
             if old_data_filter.is_none() {
                 self.deleted_fragments
@@ -296,7 +384,7 @@ impl InvertedIndexBuilder {
                             > u32::MAX as usize;
                         if would_exceed_memory || would_exceed_doc_ids {
                             let builder = std::mem::replace(merged, partition_builder);
-                            self.write_new_partition(dest_store, builder).await?;
+                            files.extend(self.write_new_partition(dest_store, builder).await?);
                         } else {
                             merged.merge_from(partition_builder)?;
                         }
@@ -307,21 +395,31 @@ impl InvertedIndexBuilder {
         }
 
         if let Some(builder) = merged {
-            self.write_new_partition(dest_store, builder).await?;
+            files.extend(self.write_new_partition(dest_store, builder).await?);
         }
-        Ok(())
+        Ok(files)
     }
 
     async fn write_new_partition(
         &mut self,
         dest_store: &dyn IndexStore,
         mut builder: InnerBuilder,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
         let partition_id = self.next_partition_id() | self.fragment_mask.unwrap_or(0);
         builder.set_id(partition_id);
-        builder.write(dest_store).await?;
+        let files = builder
+            .write_to(dest_store, self.partition_write_target())
+            .await?;
         self.new_partitions.push(partition_id);
-        Ok(())
+        Ok(files)
+    }
+
+    fn partition_write_target(&self) -> PartitionWriteTarget {
+        if self.fragment_mask.is_some() {
+            PartitionWriteTarget::Staged
+        } else {
+            PartitionWriteTarget::Final
+        }
     }
 
     fn next_partition_id(&self) -> u64 {
@@ -338,7 +436,7 @@ impl InvertedIndexBuilder {
         &mut self,
         stream: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
         let num_workers = resolve_num_workers(&self.params);
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
@@ -421,9 +519,11 @@ impl InvertedIndexBuilder {
             // wait for the workers to finish
             let start = std::time::Instant::now();
             let mut tail_partitions = Vec::new();
+            let mut files = Vec::new();
             for index_task in index_tasks {
                 let output = index_task.await??;
                 self.new_partitions.extend(output.partitions);
+                files.extend(output.files);
                 if let Some(tail_partition) = output.tail_partition {
                     tail_partitions.push(tail_partition);
                 }
@@ -433,10 +533,14 @@ impl InvertedIndexBuilder {
             if let Some(builder) = merged_tail_partitions {
                 self.new_partitions.push(builder.id());
                 let mut builder = builder;
-                builder.write(dest_store.as_ref()).await?;
+                files.extend(
+                    builder
+                        .write_to(dest_store.as_ref(), self.partition_write_target())
+                        .await?,
+                );
             }
             log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
-            Result::Ok(())
+            Result::Ok(files)
         };
 
         index_build.await
@@ -447,7 +551,8 @@ impl InvertedIndexBuilder {
         mapping: &HashMap<u64, Option<u64>>,
         src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
+        let mut files = Vec::new();
         for part in self.partitions.iter() {
             let part = InvertedPartition::load(
                 src_store.clone(),
@@ -459,20 +564,28 @@ impl InvertedIndexBuilder {
             .await?;
             let mut builder = part.into_builder().await?;
             builder.remap(mapping).await?;
-            builder.write(dest_store).await?;
+            files.extend(
+                builder
+                    .write_to(dest_store, self.partition_write_target())
+                    .await?,
+            );
         }
         if self.fragment_mask.is_none() {
-            self.write_metadata(dest_store, &self.partitions).await?;
+            files.push(self.write_metadata(dest_store, &self.partitions).await?);
         } else {
-            // in distributed mode, the part_temp_metadata is written by the worker
+            // in distributed mode, the staged partition metadata is written by the worker
             for &partition_id in &self.partitions {
-                self.write_part_metadata(dest_store, partition_id).await?;
+                files.push(self.write_part_metadata(dest_store, partition_id).await?);
             }
         }
-        Ok(())
+        Ok(files)
     }
 
-    async fn write_metadata(&self, dest_store: &dyn IndexStore, partitions: &[u64]) -> Result<()> {
+    async fn write_metadata(
+        &self,
+        dest_store: &dyn IndexStore,
+        partitions: &[u64],
+    ) -> Result<IndexFile> {
         let mut serialized_deleted_fragments =
             Vec::with_capacity(self.deleted_fragments.serialized_size());
         self.deleted_fragments
@@ -521,8 +634,7 @@ impl InvertedIndexBuilder {
             .new_index_file(METADATA_FILE, metadata_file_schema)
             .await?;
         writer.write_record_batch(record_batch).await?;
-        writer.finish_with_metadata(metadata).await?;
-        Ok(())
+        writer.finish_with_metadata(metadata).await
     }
 
     /// Write partition metadata file for a single partition
@@ -533,7 +645,7 @@ impl InvertedIndexBuilder {
         &self,
         dest_store: &dyn IndexStore,
         partition: u64, // Modify parameter type
-    ) -> Result<()> {
+    ) -> Result<IndexFile> {
         let partitions = vec![partition];
         let mut metadata = HashMap::from_iter(vec![
             ("partitions".to_owned(), serde_json::to_string(&partitions)?),
@@ -566,30 +678,30 @@ impl InvertedIndexBuilder {
         let mut writer = dest_store
             .new_index_file(&file_name, Arc::new(Schema::empty()))
             .await?;
-        writer.finish_with_metadata(metadata).await?;
-        Ok(())
+        writer.finish_with_metadata(metadata).await
     }
 
     async fn write_metadata_with_progress(
         &self,
         dest_store: &dyn IndexStore,
         partitions: &[u64],
-    ) -> Result<()> {
+    ) -> Result<Vec<IndexFile>> {
         let total = if self.fragment_mask.is_none() {
             Some(1)
         } else {
             Some(partitions.len() as u64)
         };
+        let mut files = Vec::new();
         self.progress
             .stage_start("write_metadata", total, "files")
             .await?;
         if self.fragment_mask.is_none() {
-            self.write_metadata(dest_store, partitions).await?;
+            files.push(self.write_metadata(dest_store, partitions).await?);
             self.progress.stage_progress("write_metadata", 1).await?;
         } else {
             let mut completed = 0;
             for &partition_id in partitions {
-                self.write_part_metadata(dest_store, partition_id).await?;
+                files.push(self.write_part_metadata(dest_store, partition_id).await?);
                 completed += 1;
                 self.progress
                     .stage_progress("write_metadata", completed)
@@ -597,10 +709,10 @@ impl InvertedIndexBuilder {
             }
         }
         self.progress.stage_complete("write_metadata").await?;
-        Ok(())
+        Ok(files)
     }
 
-    async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
+    async fn write(&self, dest_store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
         let mut partitions = Vec::with_capacity(self.partitions.len() + self.new_partitions.len());
         partitions.extend_from_slice(&self.partitions);
         partitions.extend_from_slice(&self.new_partitions);
@@ -614,22 +726,38 @@ impl InvertedIndexBuilder {
             )
             .await?;
         let mut copied = 0;
+        let mut files = Vec::new();
+        let target = self.partition_write_target();
         for part in self.partitions.iter() {
-            self.src_store
-                .as_ref()
-                .expect("existing partitions require a source store")
-                .copy_index_file(&token_file_path(*part), dest_store)
-                .await?;
-            self.src_store
-                .as_ref()
-                .expect("existing partitions require a source store")
-                .copy_index_file(&posting_file_path(*part), dest_store)
-                .await?;
-            self.src_store
-                .as_ref()
-                .expect("existing partitions require a source store")
-                .copy_index_file(&doc_file_path(*part), dest_store)
-                .await?;
+            files.push(
+                self.src_store
+                    .as_ref()
+                    .expect("existing partitions require a source store")
+                    .copy_index_file_to(
+                        &token_file_path(*part),
+                        &target.token_path(*part),
+                        dest_store,
+                    )
+                    .await?,
+            );
+            files.push(
+                self.src_store
+                    .as_ref()
+                    .expect("existing partitions require a source store")
+                    .copy_index_file_to(
+                        &posting_file_path(*part),
+                        &target.posting_path(*part),
+                        dest_store,
+                    )
+                    .await?,
+            );
+            files.push(
+                self.src_store
+                    .as_ref()
+                    .expect("existing partitions require a source store")
+                    .copy_index_file_to(&doc_file_path(*part), &target.doc_path(*part), dest_store)
+                    .await?,
+            );
             copied += 1;
             self.progress
                 .stage_progress("copy_partitions", copied)
@@ -643,9 +771,11 @@ impl InvertedIndexBuilder {
         }
         self.progress.stage_complete("copy_partitions").await?;
 
-        self.write_metadata_with_progress(dest_store, &partitions)
-            .await?;
-        Ok(())
+        files.extend(
+            self.write_metadata_with_progress(dest_store, &partitions)
+                .await?,
+        );
+        Ok(files)
     }
 }
 
@@ -667,6 +797,7 @@ pub struct InnerBuilder {
     pub(crate) tokens: TokenSet,
     pub(crate) posting_lists: Vec<PostingListBuilder>,
     pub(crate) docs: DocSet,
+    pub(crate) group_config: PostingGroupConfig,
 }
 
 impl InnerBuilder {
@@ -694,6 +825,7 @@ impl InnerBuilder {
             tokens: TokenSet::default(),
             posting_lists: Vec::new(),
             docs: DocSet::default(),
+            group_config: PostingGroupConfig::default(),
         }
     }
 
@@ -793,6 +925,7 @@ impl InnerBuilder {
             tokens,
             posting_lists,
             docs,
+            group_config: _,
         } = other;
 
         if self.with_position != with_position {
@@ -879,12 +1012,25 @@ impl InnerBuilder {
             + posting_lists_size
     }
 
-    pub async fn write(&mut self, store: &dyn IndexStore) -> Result<()> {
+    pub async fn write(&mut self, store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
+        self.write_to(store, PartitionWriteTarget::Final).await
+    }
+
+    async fn write_to(
+        &mut self,
+        store: &dyn IndexStore,
+        target: PartitionWriteTarget,
+    ) -> Result<Vec<IndexFile>> {
         let docs = Arc::new(std::mem::take(&mut self.docs));
-        self.write_posting_lists(store, docs.clone()).await?;
-        self.write_tokens(store).await?;
-        self.write_docs(store, docs).await?;
-        Ok(())
+        let files = vec![
+            self.write_posting_lists(store, docs.clone(), &target.posting_path(self.id))
+                .await?,
+            self.write_tokens(store, &target.token_path(self.id))
+                .await?,
+            self.write_docs(store, docs, &target.doc_path(self.id))
+                .await?,
+        ];
+        Ok(files)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -892,11 +1038,12 @@ impl InnerBuilder {
         &mut self,
         store: &dyn IndexStore,
         docs: Arc<DocSet>,
-    ) -> Result<()> {
+        path: &str,
+    ) -> Result<IndexFile> {
         let id = self.id;
         let mut writer = store
             .new_index_file(
-                &posting_file_path(self.id),
+                path,
                 inverted_list_schema_for_version(self.with_position, self.format_version),
             )
             .await?;
@@ -910,6 +1057,7 @@ impl InnerBuilder {
         );
         let with_position = self.with_position;
         let format_version = self.format_version;
+        let group_config = self.group_config;
         let schema = inverted_list_schema_for_version(self.with_position, self.format_version);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
@@ -921,6 +1069,7 @@ impl InnerBuilder {
                 with_position,
                 format_version,
                 batch_rows,
+                group_config,
             );
             for posting_list in posting_lists {
                 posting_list.append_to_batch_with_docs(
@@ -949,7 +1098,7 @@ impl InnerBuilder {
                 }
             }
 
-            Result::Ok(())
+            Result::Ok(batch_builder.into_group_starts())
         });
 
         while let Ok(batch) = rx.recv().await {
@@ -961,35 +1110,73 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        producer.await?;
+        let group_starts = producer.await?;
 
-        writer.finish().await?;
-        Ok(())
+        // Persist the posting-list cache-group boundaries as a global buffer,
+        // recording its 1-indexed id in schema metadata so the reader can group
+        // small posting lists into a single cache entry (issue #7040). Empty
+        // partitions skip this entirely and fall back to the per-token path.
+        let mut extra_metadata = HashMap::new();
+        if !group_starts.is_empty() {
+            let encoded = encode_group_starts(&group_starts);
+            let buffer_id = writer.add_global_buffer(Bytes::from(encoded)).await?;
+            extra_metadata.insert(
+                POSTING_GROUP_OFFSETS_BUF_KEY.to_owned(),
+                buffer_id.to_string(),
+            );
+        }
+        writer.finish_with_metadata(extra_metadata).await
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn write_tokens(&mut self, store: &dyn IndexStore) -> Result<()> {
+    async fn write_tokens(&mut self, store: &dyn IndexStore, path: &str) -> Result<IndexFile> {
         log::info!("writing tokens of partition {}", self.id);
         let tokens = std::mem::take(&mut self.tokens);
         let batch = tokens.to_batch(self.token_set_format)?;
-        let mut writer = store
-            .new_index_file(&token_file_path(self.id), batch.schema())
-            .await?;
+        let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
-        writer.finish().await?;
-        Ok(())
+        writer.finish().await
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn write_docs(&mut self, store: &dyn IndexStore, docs: Arc<DocSet>) -> Result<()> {
+    async fn write_docs(
+        &mut self,
+        store: &dyn IndexStore,
+        docs: Arc<DocSet>,
+        path: &str,
+    ) -> Result<IndexFile> {
         log::info!("writing docs of partition {}", self.id);
         let batch = docs.to_batch()?;
-        let mut writer = store
-            .new_index_file(&doc_file_path(self.id), batch.schema())
-            .await?;
+        let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
-        writer.finish().await?;
-        Ok(())
+        writer.finish().await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionWriteTarget {
+    Final,
+    Staged,
+}
+
+impl PartitionWriteTarget {
+    fn file_path(self, partition_id: u64, suffix: &str) -> String {
+        match self {
+            Self::Final => partition_file_path(partition_id, suffix),
+            Self::Staged => staged_partition_file_path(partition_id, suffix),
+        }
+    }
+
+    fn token_path(self, partition_id: u64) -> String {
+        self.file_path(partition_id, TOKENS_FILE)
+    }
+
+    fn posting_path(self, partition_id: u64) -> String {
+        self.file_path(partition_id, INVERT_LIST_FILE)
+    }
+
+    fn doc_path(self, partition_id: u64) -> String {
+        self.file_path(partition_id, DOCS_FILE)
     }
 }
 
@@ -999,6 +1186,7 @@ struct IndexWorker {
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
     partitions: Vec<u64>,
+    files: Vec<IndexFile>,
     schema: SchemaRef,
     memory_size: u64,
     worker_memory_limit_bytes: u64,
@@ -1015,6 +1203,7 @@ struct TailPartition {
 
 struct WorkerOutput {
     partitions: Vec<u64>,
+    files: Vec<IndexFile>,
     tail_partition: Option<TailPartition>,
 }
 
@@ -1081,6 +1270,7 @@ impl IndexWorker {
                 config.format_version,
             ),
             partitions: Vec::new(),
+            files: Vec::new(),
             id_alloc,
             schema,
             memory_size: 0,
@@ -1129,9 +1319,8 @@ impl IndexWorker {
 
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
-                    let token = token_stream.token_mut();
-                    let token_text = std::mem::take(&mut token.text);
-                    let token_id = builder.tokens.add(token_text);
+                    let token = token_stream.token();
+                    let token_id = builder.tokens.get_or_add(&token.text);
                     if token_id as usize == builder.posting_lists.len() {
                         let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
                             * std::mem::size_of::<PostingListBuilder>())
@@ -1170,9 +1359,7 @@ impl IndexWorker {
 
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
-                    let token = token_stream.token_mut();
-                    let token_text = std::mem::take(&mut token.text);
-                    let token_id = self.builder.tokens.add(token_text);
+                    let token_id = self.builder.tokens.get_or_add(&token_stream.token().text);
                     self.token_ids.push(token_id);
                     token_num += 1;
                 }
@@ -1307,8 +1494,13 @@ impl IndexWorker {
         );
         let written_partition_id = builder.id();
         let mut builder = builder;
-        builder
-            .write(self.dest_store.as_ref())
+        let target = if self.fragment_mask.is_some() {
+            PartitionWriteTarget::Staged
+        } else {
+            PartitionWriteTarget::Final
+        };
+        let files = builder
+            .write_to(self.dest_store.as_ref(), target)
             .await
             .map_err(|err| {
                 Error::execution(format!(
@@ -1316,6 +1508,7 @@ impl IndexWorker {
                     written_partition_id
                 ))
             })?;
+        self.files.extend(files);
         self.partitions.push(written_partition_id);
         Ok(())
     }
@@ -1330,6 +1523,7 @@ impl IndexWorker {
         };
         Ok(WorkerOutput {
             partitions: self.partitions,
+            files: self.files,
             tail_partition,
         })
     }
@@ -1657,14 +1851,23 @@ pub(crate) fn doc_file_path(partition_id: u64) -> String {
 }
 
 pub(crate) fn part_metadata_file_path(partition_id: u64) -> String {
-    format!("part_{}_{}", partition_id, METADATA_FILE)
+    staged_partition_file_path(partition_id, METADATA_FILE)
 }
 
 const PARTITION_FILE_SUFFIXES: [&str; 3] = [TOKENS_FILE, INVERT_LIST_FILE, DOCS_FILE];
-// Each remapped file is renamed twice: first to a temp path (phase 1), then to
-// its final path (phase 2). Keep in sync with the two rename loops below in
-// `merge_metadata_files`.
-const PARTITION_FILE_RENAME_PHASES: u64 = 2;
+const STAGED_PARTITION_DIR: &str = "staging";
+
+fn partition_file_path(partition_id: u64, suffix: &str) -> String {
+    format!("part_{}_{}", partition_id, suffix)
+}
+
+fn staged_partition_file_path(partition_id: u64, suffix: &str) -> String {
+    format!(
+        "{}/{}",
+        STAGED_PARTITION_DIR,
+        partition_file_path(partition_id, suffix)
+    )
+}
 
 pub async fn merge_index_files(
     object_store: &ObjectStore,
@@ -1672,33 +1875,65 @@ pub async fn merge_index_files(
     store: Arc<dyn IndexStore>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<()> {
-    // List all partition metadata files in the index directory
-    let part_metadata_files = list_metadata_files(object_store, index_dir).await?;
+    let metadata_path = index_dir.clone().join(METADATA_FILE);
+    if object_store.exists(&metadata_path).await? {
+        return Ok(());
+    }
+
+    // List all staged partition metadata files in the index directory
+    let index_files = list_index_files(object_store, index_dir).await?;
+    let part_metadata_files = metadata_files(&index_files);
+    if part_metadata_files.is_empty() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "No partition metadata files found in index directory: {}",
+                index_dir
+            )
+            .into(),
+        ));
+    }
 
     // Call merge_metadata_files function for inverted index
     merge_metadata_files(store, &part_metadata_files, progress).await
 }
 
-/// List and filter metadata files from the index directory
-/// Returns partition metadata files
-async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Result<Vec<String>> {
-    // List all partition metadata files in the index directory
-    let mut part_metadata_files = Vec::new();
-    let mut list_stream = object_store.list(Some(index_dir.clone()));
+async fn list_index_files(object_store: &ObjectStore, index_dir: &Path) -> Result<Vec<String>> {
+    let mut index_files = Vec::new();
+    let mut list_stream = object_store.read_dir_all(index_dir, None);
 
     while let Some(item) = list_stream.next().await {
         match item {
             Ok(meta) => {
-                let file_name = meta.location.filename().unwrap_or_default();
-                // Filter files matching the pattern part_*_metadata.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance") {
-                    part_metadata_files.push(file_name.to_string());
-                }
+                let location = meta.location.as_ref().trim_start_matches('/');
+                let index_dir = index_dir.as_ref().trim_start_matches('/');
+                let relative_path = location
+                    .strip_prefix(index_dir)
+                    .map(|s| s.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| meta.location.filename().unwrap_or("").to_string());
+                index_files.push(relative_path);
             }
-            Err(_) => continue,
+            Err(err) => return Err(err),
         }
     }
 
+    Ok(index_files)
+}
+
+fn metadata_files(index_files: &[String]) -> Vec<String> {
+    index_files
+        .iter()
+        .filter(|file_name| {
+            file_name.starts_with(&format!("{}/part_", STAGED_PARTITION_DIR))
+                && file_name.ends_with("_metadata.lance")
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+async fn list_metadata_files(object_store: &ObjectStore, index_dir: &Path) -> Result<Vec<String>> {
+    let index_files = list_index_files(object_store, index_dir).await?;
+    let part_metadata_files = metadata_files(&index_files);
     if part_metadata_files.is_empty() {
         return Err(Error::invalid_input_source(
             format!(
@@ -1789,89 +2024,35 @@ async fn merge_metadata_files(
     progress.stage_complete("read_partition_metadata").await?;
 
     // Create ID mapping: sorted original IDs -> 0,1,2...
-    let mut sorted_ids = all_partitions.clone();
+    let mut sorted_ids = all_partitions;
     sorted_ids.sort();
     sorted_ids.dedup();
 
-    let id_mapping: HashMap<u64, u64> = sorted_ids
+    let id_mapping: Vec<(u64, u64)> = sorted_ids
         .iter()
         .enumerate()
         .map(|(new_id, &old_id)| (old_id, new_id as u64))
         .collect();
 
-    // Safe rename partition files using temporary files to avoid overwrite
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let changed_partition_count = id_mapping
-        .iter()
-        .filter(|(old_id, new_id)| old_id != new_id)
-        .count() as u64;
-    let total_renames = changed_partition_count
-        * PARTITION_FILE_SUFFIXES.len() as u64
-        * PARTITION_FILE_RENAME_PHASES;
+    let total_copies = id_mapping.len() as u64 * PARTITION_FILE_SUFFIXES.len() as u64;
     progress
-        .stage_start("remap_partition_files", Some(total_renames), "files")
+        .stage_start("remap_partition_files", Some(total_copies), "files")
         .await?;
 
-    // Phase 1: Move files to temporary locations
-    let mut temp_files: Vec<(String, String, String)> = Vec::new(); // (temp_path, old_path, final_path)
-    let mut renamed_files = 0u64;
+    let mut copied_files = 0u64;
 
-    for (&old_id, &new_id) in &id_mapping {
-        if old_id != new_id {
-            for suffix in PARTITION_FILE_SUFFIXES {
-                let old_path = format!("part_{}_{}", old_id, suffix);
-                let new_path = format!("part_{}_{}", new_id, suffix);
-                let temp_path = format!("temp_{}_{}", timestamp, old_path);
-
-                // Move to temporary location first to avoid overwrite
-                if let Err(e) = store.rename_index_file(&old_path, &temp_path).await {
-                    // Rollback phase 1: restore files from temp locations
-                    for (temp_name, old_name, _) in temp_files.iter().rev() {
-                        let _ = store.rename_index_file(temp_name, old_name).await;
-                    }
-                    return Err(Error::index(format!(
-                        "Failed to move {} to temp {}: {}",
-                        old_path, temp_path, e
-                    )));
-                }
-                temp_files.push((temp_path, old_path, new_path));
-                renamed_files += 1;
-                progress
-                    .stage_progress("remap_partition_files", renamed_files)
-                    .await?;
-            }
+    for &(old_id, new_id) in &id_mapping {
+        for suffix in PARTITION_FILE_SUFFIXES {
+            let staged_path = staged_partition_file_path(old_id, suffix);
+            let final_path = partition_file_path(new_id, suffix);
+            store
+                .copy_index_file_to(&staged_path, &final_path, store.as_ref())
+                .await?;
+            copied_files += 1;
+            progress
+                .stage_progress("remap_partition_files", copied_files)
+                .await?;
         }
-    }
-
-    // Phase 2: Move from temporary to final locations
-    let mut completed_renames: Vec<(String, String)> = Vec::new(); // (final_path, temp_path)
-
-    for (temp_path, _old_path, final_path) in &temp_files {
-        if let Err(e) = store.rename_index_file(temp_path, final_path).await {
-            // Rollback phase 2: restore completed renames and remaining temps
-            for (final_name, temp_name) in completed_renames.iter().rev() {
-                let _ = store.rename_index_file(final_name, temp_name).await;
-            }
-            // Restore remaining temp files to original locations
-            for (temp_name, orig_name, _) in temp_files.iter() {
-                if !completed_renames.iter().any(|(_, t)| t == temp_name) {
-                    let _ = store.rename_index_file(temp_name, orig_name).await;
-                }
-            }
-            return Err(Error::index(format!(
-                "Failed to rename {} to {}: {}",
-                temp_path, final_path, e
-            )));
-        }
-        completed_renames.push((final_path.clone(), temp_path.clone()));
-        renamed_files += 1;
-        progress
-            .stage_progress("remap_partition_files", renamed_files)
-            .await?;
     }
     progress.stage_complete("remap_partition_files").await?;
 
@@ -1898,10 +2079,15 @@ async fn merge_metadata_files(
     progress.stage_progress("write_merged_metadata", 1).await?;
     progress.stage_complete("write_merged_metadata").await?;
 
-    // Cleanup partition metadata files
+    // Cleanup staged partition metadata files
     for file_name in part_metadata_files {
-        if file_name.starts_with("part_") && file_name.ends_with("_metadata.lance") {
-            let _ = store.delete_index_file(file_name).await;
+        let _ = store.delete_index_file(file_name).await;
+    }
+    for &(old_id, _) in &id_mapping {
+        for suffix in PARTITION_FILE_SUFFIXES {
+            let _ = store
+                .delete_index_file(&staged_partition_file_path(old_id, suffix))
+                .await;
         }
     }
 
@@ -1955,12 +2141,21 @@ mod tests {
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use futures::stream;
+    use futures::stream::{self, BoxStream};
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as OSResult,
+    };
     use std::any::Any;
+    use std::fmt::{Display, Formatter};
+    use std::ops::Range;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1972,6 +2167,121 @@ mod tests {
         let docs = Arc::new(StringArray::from(vec![Some(doc)]));
         let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
         RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
+    }
+
+    struct FailingListObjectStore {
+        inner: InMemory,
+    }
+
+    impl Default for FailingListObjectStore {
+        fn default() -> Self {
+            Self {
+                inner: InMemory::new(),
+            }
+        }
+    }
+
+    impl Display for FailingListObjectStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingListObjectStore")
+        }
+    }
+
+    impl Debug for FailingListObjectStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FailingListObjectStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for FailingListObjectStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            stream::iter(vec![Err(object_store::Error::Generic {
+                store: "failing-list",
+                source: "boom listing metadata".into(),
+            })])
+            .boxed()
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_metadata_files_propagates_list_error() -> Result<()> {
+        let mut object_store = ObjectStore::memory();
+        object_store.inner = Arc::new(FailingListObjectStore::default());
+
+        let err = list_metadata_files(&object_store, &Path::from("index"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("boom listing metadata"),
+            "expected original list error, got: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_metadata_files_empty_directory_returns_no_files_error() -> Result<()> {
+        let object_store = ObjectStore::memory();
+
+        let err = list_metadata_files(&object_store, &Path::from("empty-index"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("No partition metadata files found"),
+            "expected empty-directory error, got: {err}"
+        );
+        Ok(())
     }
 
     #[derive(Debug, Default, Clone)]
@@ -1992,13 +2302,250 @@ mod tests {
     }
 
     impl DeepSizeOf for CountingStore {
-        fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
             0
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct NoRenameStore {
+        inner: Arc<dyn IndexStore>,
+        final_delete_count: Option<Arc<AtomicUsize>>,
+    }
+
+    impl NoRenameStore {
+        fn new(inner: Arc<dyn IndexStore>) -> Self {
+            Self {
+                inner,
+                final_delete_count: None,
+            }
+        }
+
+        fn with_final_delete_tracking(inner: Arc<dyn IndexStore>) -> Self {
+            Self {
+                inner,
+                final_delete_count: Some(Arc::new(AtomicUsize::new(0))),
+            }
+        }
+
+        fn final_delete_count(&self) -> usize {
+            self.final_delete_count
+                .as_ref()
+                .map(|count| count.load(Ordering::SeqCst))
+                .unwrap_or_default()
+        }
+
+        fn unwrap_dest_store(dest_store: &dyn IndexStore) -> &dyn IndexStore {
+            dest_store
+                .as_any()
+                .downcast_ref::<Self>()
+                .map(|store| store.inner.as_ref())
+                .unwrap_or(dest_store)
+        }
+    }
+
+    impl DeepSizeOf for NoRenameStore {
+        fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+            self.inner.deep_size_of_children(context)
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for NoRenameStore {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(self.clone())
+        }
+
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(io_priority)
+        }
+
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<Schema>,
+        ) -> Result<Box<dyn IndexWriter>> {
+            self.inner.new_index_file(name, schema).await
+        }
+
+        async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+            self.inner.open_index_file(name).await
+        }
+
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<IndexFile> {
+            self.inner
+                .copy_index_file(name, Self::unwrap_dest_store(dest_store))
+                .await
+        }
+
+        async fn copy_index_file_to(
+            &self,
+            name: &str,
+            new_name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<IndexFile> {
+            self.inner
+                .copy_index_file_to(name, new_name, Self::unwrap_dest_store(dest_store))
+                .await
+        }
+
+        async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
+            Err(Error::internal(format!(
+                "merge_index_files should not rename partition file {name} to {new_name}"
+            )))
+        }
+
+        async fn delete_index_file(&self, name: &str) -> Result<()> {
+            if name.starts_with("part_")
+                && let Some(count) = &self.final_delete_count
+            {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.delete_index_file(name).await
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailMetadataStore {
+        inner: Arc<dyn IndexStore>,
+    }
+
+    impl FailMetadataStore {
+        fn new(inner: Arc<dyn IndexStore>) -> Self {
+            Self { inner }
+        }
+
+        fn unwrap_dest_store(dest_store: &dyn IndexStore) -> &dyn IndexStore {
+            dest_store
+                .as_any()
+                .downcast_ref::<Self>()
+                .map(|store| store.inner.as_ref())
+                .unwrap_or(dest_store)
+        }
+    }
+
+    impl DeepSizeOf for FailMetadataStore {
+        fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+            self.inner.deep_size_of_children(context)
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for FailMetadataStore {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.clone(),
+            })
+        }
+
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(io_priority)
+        }
+
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<Schema>,
+        ) -> Result<Box<dyn IndexWriter>> {
+            let writer = self.inner.new_index_file(name, schema).await?;
+            if name == METADATA_FILE {
+                Ok(Box::new(FailFinishWriter { inner: writer }))
+            } else {
+                Ok(writer)
+            }
+        }
+
+        async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+            self.inner.open_index_file(name).await
+        }
+
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<IndexFile> {
+            self.inner
+                .copy_index_file(name, Self::unwrap_dest_store(dest_store))
+                .await
+        }
+
+        async fn copy_index_file_to(
+            &self,
+            name: &str,
+            new_name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<IndexFile> {
+            self.inner
+                .copy_index_file_to(name, new_name, Self::unwrap_dest_store(dest_store))
+                .await
+        }
+
+        async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
+            self.inner.rename_index_file(name, new_name).await
+        }
+
+        async fn delete_index_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_index_file(name).await
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
+    struct FailFinishWriter {
+        inner: Box<dyn IndexWriter>,
+    }
+
+    #[async_trait]
+    impl IndexWriter for FailFinishWriter {
+        async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64> {
+            self.inner.write_record_batch(batch).await
+        }
+
+        async fn add_global_buffer(&mut self, data: Bytes) -> Result<u32> {
+            self.inner.add_global_buffer(data).await
+        }
+
+        async fn finish(&mut self) -> Result<IndexFile> {
+            Err(Error::internal("injected metadata write failure"))
+        }
+
+        async fn finish_with_metadata(
+            &mut self,
+            _metadata: HashMap<String, String>,
+        ) -> Result<IndexFile> {
+            Err(Error::internal("injected metadata write failure"))
         }
     }
 
     #[derive(Debug)]
     struct CountingWriter {
+        path: String,
         write_count: Arc<AtomicUsize>,
     }
 
@@ -2008,12 +2555,27 @@ mod tests {
             Ok(self.write_count.fetch_add(1, Ordering::SeqCst) as u64)
         }
 
-        async fn finish(&mut self) -> Result<()> {
-            Ok(())
+        async fn add_global_buffer(&mut self, _data: Bytes) -> Result<u32> {
+            // The posting-list writer stores the group offsets as a global
+            // buffer; mirror the real writer's 1-indexed return value.
+            Ok(1)
         }
 
-        async fn finish_with_metadata(&mut self, _metadata: HashMap<String, String>) -> Result<()> {
-            Ok(())
+        async fn finish(&mut self) -> Result<IndexFile> {
+            Ok(IndexFile {
+                path: self.path.clone(),
+                size_bytes: 0,
+            })
+        }
+
+        async fn finish_with_metadata(
+            &mut self,
+            _metadata: HashMap<String, String>,
+        ) -> Result<IndexFile> {
+            Ok(IndexFile {
+                path: self.path.clone(),
+                size_bytes: 0,
+            })
         }
     }
 
@@ -2031,12 +2593,18 @@ mod tests {
             1
         }
 
+        fn with_io_priority(&self, _io_priority: u64) -> Arc<dyn IndexStore> {
+            // No backing scheduler, so priority is meaningless here.
+            self.clone_arc()
+        }
+
         async fn new_index_file(
             &self,
-            _name: &str,
+            name: &str,
             _schema: Arc<Schema>,
         ) -> Result<Box<dyn IndexWriter>> {
             Ok(Box::new(CountingWriter {
+                path: name.to_string(),
                 write_count: self.write_count.clone(),
             }))
         }
@@ -2047,13 +2615,17 @@ mod tests {
             ))
         }
 
-        async fn copy_index_file(&self, _name: &str, _dest_store: &dyn IndexStore) -> Result<()> {
+        async fn copy_index_file(
+            &self,
+            _name: &str,
+            _dest_store: &dyn IndexStore,
+        ) -> Result<IndexFile> {
             Err(Error::not_supported(
                 "CountingStore does not support copying",
             ))
         }
 
-        async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<()> {
+        async fn rename_index_file(&self, _name: &str, _new_name: &str) -> Result<IndexFile> {
             Err(Error::not_supported(
                 "CountingStore does not support renaming",
             ))
@@ -2068,6 +2640,63 @@ mod tests {
         async fn list_files_with_sizes(&self) -> Result<Vec<IndexFile>> {
             Ok(vec![])
         }
+    }
+
+    fn collect_group_starts(config: PostingGroupConfig, sizes: &[usize]) -> Vec<u32> {
+        let mut acc = PostingGroupAccumulator::new(config);
+        for &size in sizes {
+            acc.push(size);
+        }
+        acc.into_starts()
+    }
+
+    #[test]
+    fn test_group_accumulator_cuts_on_target_bytes() {
+        let config = PostingGroupConfig {
+            target_bytes: 100,
+            max_tokens: 1000,
+        };
+        // 40+40 -> cut at 80? no, 80 < 100; third 40 reaches 120 >= 100 -> cut.
+        // So group 0 = tokens [0,3), then a new group starts at token 3.
+        let starts = collect_group_starts(config, &[40, 40, 40, 10, 10]);
+        assert_eq!(starts, vec![0, 3]);
+    }
+
+    #[test]
+    fn test_group_accumulator_cuts_on_max_tokens() {
+        let config = PostingGroupConfig {
+            target_bytes: 1_000_000,
+            max_tokens: 2,
+        };
+        // Byte target never reached; cap of 2 forces a cut every 2 tokens.
+        let starts = collect_group_starts(config, &[1, 1, 1, 1, 1]);
+        assert_eq!(starts, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn test_group_accumulator_clamps_oversized_term() {
+        let config = PostingGroupConfig {
+            target_bytes: 100,
+            max_tokens: 64,
+        };
+        // A term larger than the target that *starts* a group occupies that
+        // group alone ([1, 2) here), so a single huge posting list is never
+        // forced to share a cache entry. Token 0 (==100) closes its own group
+        // first; the trailing small terms regroup after the big one.
+        let starts = collect_group_starts(config, &[100, 5000, 10, 10]);
+        assert_eq!(starts, vec![0, 1, 2]);
+
+        // A huge term encountered mid-group is absorbed and closes that group;
+        // we never split one term across groups.
+        let starts = collect_group_starts(config, &[10, 10, 5000, 10, 10]);
+        assert_eq!(starts, vec![0, 3]);
+    }
+
+    #[test]
+    fn test_group_accumulator_empty_and_single() {
+        let config = PostingGroupConfig::default();
+        assert_eq!(collect_group_starts(config, &[]), Vec::<u32>::new());
+        assert_eq!(collect_group_starts(config, &[10]), vec![0]);
     }
 
     #[tokio::test]
@@ -2085,9 +2714,443 @@ mod tests {
 
         let store = CountingStore::new();
         let docs = Arc::new(std::mem::take(&mut builder.docs));
-        builder.write_posting_lists(&store, docs).await?;
+        builder
+            .write_posting_lists(&store, docs, &posting_file_path(0))
+            .await?;
 
         assert_eq!(store.write_count(), 1);
+        Ok(())
+    }
+
+    async fn write_partition_file_marker(
+        store: &dyn IndexStore,
+        path: &str,
+        partition_id: u64,
+    ) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "partition_id",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt64Array::from(vec![partition_id]))],
+        )?;
+        let mut writer = store.new_index_file(path, schema).await?;
+        writer.write_record_batch(batch).await?;
+        writer.finish().await?;
+        Ok(())
+    }
+
+    async fn write_partition_files(
+        store: &dyn IndexStore,
+        partition_id: u64,
+        target: PartitionWriteTarget,
+    ) -> Result<()> {
+        write_partition_file_marker(store, &target.token_path(partition_id), partition_id).await?;
+        write_partition_file_marker(store, &target.posting_path(partition_id), partition_id)
+            .await?;
+        write_partition_file_marker(store, &target.doc_path(partition_id), partition_id).await?;
+        Ok(())
+    }
+
+    async fn read_partition_file_marker(store: &dyn IndexStore, path: &str) -> Result<u64> {
+        let reader = store.open_index_file(path).await?;
+        let batch = reader.read_range(0..1, None).await?;
+        let partition_ids = batch.column(0).as_primitive::<datatypes::UInt64Type>();
+        Ok(partition_ids.value(0))
+    }
+
+    async fn assert_partition_file_markers(
+        store: &dyn IndexStore,
+        partition_id: u64,
+        expected_marker: u64,
+    ) -> Result<()> {
+        assert_eq!(
+            read_partition_file_marker(store, &token_file_path(partition_id)).await?,
+            expected_marker
+        );
+        assert_eq!(
+            read_partition_file_marker(store, &posting_file_path(partition_id)).await?,
+            expected_marker
+        );
+        assert_eq!(
+            read_partition_file_marker(store, &doc_file_path(partition_id)).await?,
+            expected_marker
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_files_remaps_staged_partitions_without_rename() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = Arc::new(NoRenameStore::new(base_store.clone()));
+        let partitions = vec![5_u64, 1_u64, (17_u64 << 32) | 2];
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        );
+
+        for partition_id in &partitions {
+            write_partition_files(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            store,
+            noop_progress(),
+        )
+        .await?;
+
+        let metadata_reader = base_store.open_index_file(METADATA_FILE).await?;
+        let metadata = &metadata_reader.schema().metadata;
+        let written_partitions: Vec<u64> = serde_json::from_str(
+            metadata
+                .get("partitions")
+                .expect("partitions missing from metadata"),
+        )?;
+        let mut expected_partitions = partitions.clone();
+        expected_partitions.sort_unstable();
+        expected_partitions.dedup();
+        let remapped_partitions = (0..expected_partitions.len() as u64).collect::<Vec<_>>();
+        assert_eq!(written_partitions, remapped_partitions);
+
+        for (new_id, old_id) in expected_partitions.iter().enumerate() {
+            assert_partition_file_markers(base_store.as_ref(), new_id as u64, *old_id).await?;
+            assert!(
+                base_store
+                    .open_index_file(&part_metadata_file_path(*old_id))
+                    .await
+                    .is_err(),
+                "partition metadata should be cleaned up after final metadata is written"
+            );
+            for suffix in PARTITION_FILE_SUFFIXES {
+                assert!(
+                    base_store
+                        .open_index_file(&staged_partition_file_path(*old_id, suffix))
+                        .await
+                        .is_err(),
+                    "staged partition files should be cleaned up after final metadata is written"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_files_rewrites_partial_final_files_from_staging() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = Arc::new(NoRenameStore::with_final_delete_tracking(
+            base_store.clone(),
+        ));
+        let partitions = vec![1_u64, 5_u64];
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        );
+
+        for partition_id in &partitions {
+            write_partition_files(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        for suffix in PARTITION_FILE_SUFFIXES {
+            write_partition_file_marker(base_store.as_ref(), &partition_file_path(1, suffix), 999)
+                .await?;
+        }
+
+        merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            store.clone(),
+            noop_progress(),
+        )
+        .await?;
+
+        assert_partition_file_markers(base_store.as_ref(), 0, 1).await?;
+        assert_partition_file_markers(base_store.as_ref(), 1, 5).await?;
+        assert_eq!(
+            store.final_delete_count(),
+            0,
+            "merge should overwrite final partition files without deleting them first"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_distributed_from_existing_copies_existing_partitions_to_staging_and_finalizes()
+    -> Result<()> {
+        let object_store = Arc::new(ObjectStore::local());
+        let source_dir = TempDir::default();
+        let dest_dir = TempDir::default();
+        let source_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            source_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            dest_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let merge_store = Arc::new(NoRenameStore::new(dest_store.clone()));
+        let fragment_mask = 7_u64 << 32;
+        let partitions = vec![fragment_mask | 5, fragment_mask | 1];
+
+        for partition_id in &partitions {
+            write_partition_files(
+                source_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Final,
+            )
+            .await?;
+        }
+
+        let builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            Some(source_store.clone()),
+            partitions.clone(),
+            TokenSetFormat::default(),
+            Some(fragment_mask),
+            RoaringBitmap::new(),
+        );
+        builder.write(dest_store.as_ref()).await?;
+
+        for partition_id in &partitions {
+            assert_partition_file_markers(source_store.as_ref(), *partition_id, *partition_id)
+                .await?;
+            for suffix in PARTITION_FILE_SUFFIXES {
+                let staged_path = staged_partition_file_path(*partition_id, suffix);
+                assert_eq!(
+                    read_partition_file_marker(dest_store.as_ref(), &staged_path).await?,
+                    *partition_id
+                );
+                assert!(
+                    dest_store
+                        .open_index_file(&partition_file_path(*partition_id, suffix))
+                        .await
+                        .is_err(),
+                    "distributed existing partition should be staged instead of copied to root"
+                );
+            }
+            dest_store
+                .open_index_file(&part_metadata_file_path(*partition_id))
+                .await?;
+        }
+
+        merge_index_files(
+            object_store.as_ref(),
+            &dest_dir.obj_path(),
+            merge_store,
+            noop_progress(),
+        )
+        .await?;
+
+        let mut expected_partitions = partitions.clone();
+        expected_partitions.sort_unstable();
+        for (new_id, old_id) in expected_partitions.iter().enumerate() {
+            assert_partition_file_markers(dest_store.as_ref(), new_id as u64, *old_id).await?;
+            for suffix in PARTITION_FILE_SUFFIXES {
+                assert!(
+                    dest_store
+                        .open_index_file(&staged_partition_file_path(*old_id, suffix))
+                        .await
+                        .is_err(),
+                    "staged partition files should be cleaned after final metadata is written"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_files_keeps_staging_when_final_metadata_write_fails() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let failing_store = Arc::new(FailMetadataStore::new(base_store.clone()));
+        let partitions = vec![1_u64, 5_u64];
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        );
+
+        for partition_id in &partitions {
+            write_partition_files(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        let err = merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            failing_store,
+            noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("metadata write failure"),
+            "expected injected metadata failure, got: {err}"
+        );
+
+        for partition_id in &partitions {
+            base_store
+                .open_index_file(&part_metadata_file_path(*partition_id))
+                .await?;
+            for suffix in PARTITION_FILE_SUFFIXES {
+                let staged_path = staged_partition_file_path(*partition_id, suffix);
+                assert_eq!(
+                    read_partition_file_marker(base_store.as_ref(), &staged_path).await?,
+                    *partition_id
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_distributed_build_writes_partition_data_to_staging() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = ObjectStore::local();
+        let store = Arc::new(LanceIndexStore::new(
+            object_store.into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let fragment_mask = 7_u64 << 32;
+        let batch = make_doc_batch("hello world", fragment_mask);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+        let mut builder = InvertedIndexBuilder::new_with_fragment_mask(
+            InvertedIndexParams::default(),
+            Some(fragment_mask),
+        );
+        builder.update(stream, store.as_ref(), None).await?;
+
+        let part_metadata_files =
+            list_metadata_files(&ObjectStore::local(), &index_dir.obj_path()).await?;
+        assert_eq!(part_metadata_files.len(), 1);
+        assert!(
+            part_metadata_files[0].starts_with("staging/part_"),
+            "partition metadata should be written to staging"
+        );
+        let reader = store.open_index_file(&part_metadata_files[0]).await?;
+        let partition_ids: Vec<u64> = serde_json::from_str(
+            reader
+                .schema()
+                .metadata
+                .get("partitions")
+                .expect("partitions missing from metadata"),
+        )?;
+        assert_eq!(partition_ids.len(), 1);
+        let partition_id = partition_ids[0];
+
+        store
+            .open_index_file(&staged_partition_file_path(partition_id, TOKENS_FILE))
+            .await?;
+        assert!(
+            store
+                .open_index_file(&partition_file_path(partition_id, METADATA_FILE))
+                .await
+                .is_err(),
+            "distributed build-only metadata should not be written to root partition metadata paths"
+        );
+        assert!(
+            store
+                .open_index_file(&token_file_path(partition_id))
+                .await
+                .is_err(),
+            "distributed build-only data should not be written to final partition paths"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_files_is_noop_when_metadata_exists() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default(),
+            None,
+            vec![42],
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        );
+        metadata_builder
+            .write_metadata(store.as_ref(), &[42])
+            .await?;
+
+        merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            store,
+            noop_progress(),
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -2529,7 +3592,6 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-
         let read_start = tags
             .iter()
             .position(|e| e == "start:read_partition_metadata")
@@ -2567,8 +3629,8 @@ mod tests {
         );
         assert_eq!(
             remap_progress.last().copied().unwrap_or_default(),
-            12,
-            "expected remap_partition_files progress to cover both rename phases"
+            6,
+            "expected remap_partition_files progress to cover staged-to-final copies"
         );
         assert!(
             tags.iter().any(|e| e == "progress:write_merged_metadata"),
@@ -2795,6 +3857,118 @@ mod tests {
             1
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_merge_from_after_remap_does_not_panic() {
+        // `first` is the merge accumulator. Give it three tokens, then remap away the
+        // middle one, mirroring filter_old_data dropping a token whose postings emptied.
+        let mut first = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for token in ["a", "b", "c"] {
+            first.tokens.add(token.to_owned());
+        }
+        first
+            .posting_lists
+            .resize_with(first.tokens.len(), || PostingListBuilder::new(false));
+        let first_doc = first.docs.append(10, 1);
+        first.posting_lists[0].add(first_doc, PositionRecorder::Count(1)); // "a"
+        first.posting_lists[2].add(first_doc, PositionRecorder::Count(1)); // "c"
+
+        // Remove token "b" (id 1) and compact its (empty) posting list to match.
+        first.tokens.remap(&[1]);
+        first.posting_lists.remove(1);
+        assert_eq!(first.tokens.len(), first.posting_lists.len());
+
+        // `second` contributes a brand-new token absent from `first`. Before the fix,
+        // get_or_add returned the stale next_id, indexing past posting_lists.
+        let mut second = InnerBuilder::new(1, false, TokenSetFormat::default());
+        let zeta = second.tokens.add("zeta".to_owned());
+        second
+            .posting_lists
+            .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
+        let second_doc = second.docs.append(20, 1);
+        second.posting_lists[zeta as usize].add(second_doc, PositionRecorder::Count(1));
+
+        first.merge_from(second).unwrap();
+
+        assert_eq!(first.tokens.len(), 3);
+        assert_eq!(first.posting_lists.len(), 3);
+        let zeta_id = first.tokens.get("zeta").expect("zeta should be merged in");
+        assert!((zeta_id as usize) < first.posting_lists.len());
+    }
+
+    // FST token file with a stale next_id (above the token count), as a pre-#7115 writer left.
+    async fn write_stale_next_id_token_file(store: &dyn IndexStore, partition_id: u64) {
+        let mut tokens = TokenSet::default();
+        tokens.add("alpha".to_owned());
+        tokens.add("gamma".to_owned());
+        assert_eq!(tokens.len(), 2);
+        tokens.next_id = 9;
+        let batch = tokens.to_batch(TokenSetFormat::Fst).unwrap();
+        let mut writer = store
+            .new_index_file(&token_file_path(partition_id), batch.schema())
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    // load_fst recomputes next_id from the token count rather than trusting the persisted value.
+    #[tokio::test]
+    async fn test_load_fst_recomputes_stale_next_id() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_stale_next_id_token_file(store.as_ref(), 0).await;
+        let reader = store.open_index_file(&token_file_path(0)).await.unwrap();
+        let tokens = TokenSet::load(reader, TokenSetFormat::Fst).await.unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens.next_id(), 2);
+    }
+
+    // A stale next_id loaded from disk must not leak an out-of-range token id into a merge.
+    #[tokio::test]
+    async fn test_merge_with_stale_next_id_token_file_does_not_panic() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_stale_next_id_token_file(store.as_ref(), 0).await;
+        let reader = store.open_index_file(&token_file_path(0)).await.unwrap();
+        let tokens = TokenSet::load(reader, TokenSetFormat::Fst)
+            .await
+            .unwrap()
+            .into_mutable();
+
+        let mut first = InnerBuilder::new(0, false, TokenSetFormat::Fst);
+        first.set_tokens(tokens);
+        first
+            .posting_lists
+            .resize_with(first.tokens.len(), || PostingListBuilder::new(false));
+        let doc = first.docs.append(10, 1);
+        first.posting_lists[0].add(doc, PositionRecorder::Count(1));
+        first.posting_lists[1].add(doc, PositionRecorder::Count(1));
+
+        let mut second = InnerBuilder::new(1, false, TokenSetFormat::Fst);
+        let zeta = second.tokens.add("zeta".to_owned());
+        second
+            .posting_lists
+            .resize_with(second.tokens.len(), || PostingListBuilder::new(false));
+        let second_doc = second.docs.append(20, 1);
+        second.posting_lists[zeta as usize].add(second_doc, PositionRecorder::Count(1));
+
+        first.merge_from(second).unwrap();
+        assert_eq!(first.tokens.len(), 3);
+        assert_eq!(first.posting_lists.len(), 3);
+        let zeta_id = first.tokens.get("zeta").expect("zeta should be merged in");
+        assert!((zeta_id as usize) < first.posting_lists.len());
     }
 
     #[tokio::test]
