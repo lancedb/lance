@@ -23,8 +23,10 @@ const STOP_TRIGRAMS: &[&str] = &[
     "our", "out", "his", "has", "how", "its", "may", "new", "now", "old", "see", "two", "way",
     "who", "did", "get", "let", "say", "she", "too", "use",
     // Low-selectivity fragments common in English text
-    "ing", "ion", "tio", "ent", "ati", "ere", "ter", "ate", "men", "est", "tha", "hat", "ith", // spellchecker:disable-line
-    "ver", "ill", "com", "ive", "ons", "res", "ers", "nce", "lin", "ear", "ght", // spellchecker:disable-line
+    "ing", "ion", "tio", "ent", "ati", "ere", "ter", "ate", "men", "est", "tha", "hat",
+    "ith", // spellchecker:disable-line
+    "ver", "ill", "com", "ive", "ons", "res", "ers", "nce", "lin", "ear",
+    "ght", // spellchecker:disable-line
 ];
 
 static STOP_TRIGRAM_TOKENS: LazyLock<HashSet<u32>> = LazyLock::new(|| {
