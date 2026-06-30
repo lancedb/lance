@@ -1124,6 +1124,70 @@ async fn test_deep_clone(
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_deep_clone_cross_store(
+    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    data_storage_version: LanceFileVersion,
+) {
+    // Source lives in an in-memory store while the target is a local directory, so the
+    // two stores have different `store_prefix`es and `deep_clone` must stream files from
+    // the source store to the target store (the cross-account code path).
+    let session = Arc::new(Session::default());
+    let test_dir = TempStdDir::default();
+    let clone_dir = test_dir.join("clone_ds");
+    let cloned_uri = clone_dir.to_str().unwrap();
+
+    // 64 rows across 4 files exercises the multi-fragment copy path.
+    let data_reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("val", array::fill_utf8("deep".to_string()))
+        .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+
+    let mut dataset = Dataset::write(
+        data_reader,
+        "memory://cross_store_src",
+        Some(WriteParams {
+            max_rows_per_file: 16,
+            max_rows_per_group: 16,
+            data_storage_version: Some(data_storage_version),
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_ne!(dataset.object_store.store_prefix, "");
+
+    // Delete some rows so a deletion file is also streamed across stores.
+    dataset.delete("id < 10").await.unwrap();
+    let cloned_dataset = dataset
+        .deep_clone(cloned_uri, dataset.version().version, None)
+        .await
+        .unwrap();
+
+    // The clone targets a local store, distinct from the in-memory source.
+    assert_ne!(
+        cloned_dataset.object_store.store_prefix,
+        dataset.object_store.store_prefix
+    );
+    assert!(cloned_dataset.manifest().base_paths.is_empty());
+
+    // Re-open the clone from a fresh session to prove the files were physically copied
+    // into the target store and the clone is fully independent of the source store.
+    let reopened = DatasetBuilder::from_uri(cloned_uri).load().await.unwrap();
+    let batches = reopened
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 54); // 64 rows - 10 deletions
+}
+
 // Helper: count files under a dataset directory (data/_indices/_deletions)
 async fn count_files(store: &ObjectStore, root: &Path, prefix: &str) -> usize {
     use futures::StreamExt;
