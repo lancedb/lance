@@ -730,7 +730,7 @@ def test_index_take_batch_size(tmp_path):
         mode="overwrite",
     )
     dataset.create_scalar_index("strings", index_type="NGRAM")
-    filter = "contains(strings, 'ing')"
+    filter = "contains(strings, 'str')"
     batches = dataset.scanner(
         with_row_id=True, filter=filter, batch_size=50, limit=1024
     ).to_batches()

@@ -3512,7 +3512,7 @@ async fn test_index_take_batch_size() -> Result<()> {
     let mut scanner = dataset2.scan();
     scanner
         .batch_size(50)
-        .filter("contains(strings, 'ing')")?
+        .filter("contains(strings, 'str')")?
         .limit(Some(1024), None)?
         .with_row_id();
     let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
