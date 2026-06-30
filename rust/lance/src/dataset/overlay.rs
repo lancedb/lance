@@ -88,10 +88,97 @@ impl OverlayRouting {
 ///
 /// Reads only the coverage bitmaps (newest-first), so it can run before the
 /// value columns are fetched and tells the caller exactly which ranks to fetch.
+///
+/// A scan reads a contiguous physical range, so when `offsets` is contiguous
+/// ascending we take a bitmap-major fast path that visits only each coverage's
+/// in-range bits — `O(covered + K)` — instead of probing every offset against
+/// every coverage. `take` supplies arbitrary offsets and uses the general path.
 pub fn route_overlays(
     offsets: &[u32],
     coverages_newest_first: &[&RoaringBitmap],
 ) -> OverlayRouting {
+    match contiguous_base(offsets) {
+        Some(base) => route_contiguous(base, offsets.len(), coverages_newest_first),
+        None => route_arbitrary(offsets, coverages_newest_first),
+    }
+}
+
+/// The starting offset if `offsets` is a contiguous ascending run
+/// `[base, base + 1, ...]`, else `None` (including when empty).
+fn contiguous_base(offsets: &[u32]) -> Option<u32> {
+    let base = *offsets.first()?;
+    offsets
+        .iter()
+        .enumerate()
+        .all(|(i, &offset)| offset as u64 == base as u64 + i as u64)
+        .then_some(base)
+}
+
+/// Fast path for a contiguous batch: offset `o` is output row `o - base`, so a
+/// coverage's bits route to rows directly without per-offset probing.
+///
+/// For each coverage we intersect with the batch's offset range, which is a
+/// container-level operation that drops a non-overlapping batch (e.g. a scan
+/// batch past a contiguous coverage's bits) in `O(containers)` without touching
+/// individual cells. The in-range bits then carry **consecutive** coverage ranks
+/// starting at the count of bits below `base` (one `rank` lookup) — no bits lie
+/// between them by construction — so ranks need no running count. Coverages are
+/// processed newest-first with a "first claim wins" guard for precedence.
+fn route_contiguous(
+    base: u32,
+    len: usize,
+    coverages_newest_first: &[&RoaringBitmap],
+) -> OverlayRouting {
+    let mut needed_ranks: Vec<Vec<u32>> = vec![Vec::new(); coverages_newest_first.len()];
+    let mut routed: Vec<Option<(usize, usize)>> = vec![None; len];
+    let range_end = (base as u64 + len as u64).min(u32::MAX as u64) as u32;
+    let mut batch_range = RoaringBitmap::new();
+    batch_range.insert_range(base..range_end);
+
+    for (k, coverage) in coverages_newest_first.iter().enumerate() {
+        let in_range = *coverage & &batch_range;
+        if in_range.is_empty() {
+            continue;
+        }
+        // 0-based rank of the first in-range cell: the coverage bits below `base`.
+        let base_rank = if base == 0 {
+            0
+        } else {
+            coverage.rank(base - 1) as u32
+        };
+        for (i, offset) in in_range.iter().enumerate() {
+            let row = (offset - base) as usize;
+            if routed[row].is_none() {
+                routed[row] = Some((k, needed_ranks[k].len()));
+                needed_ranks[k].push(base_rank + i as u32);
+            }
+        }
+    }
+
+    let mut any_overlay = false;
+    let indices = routed
+        .into_iter()
+        .enumerate()
+        .map(|(i, routed)| match routed {
+            None => (0, i),
+            Some((k, pos)) => {
+                any_overlay = true;
+                (k + 1, pos)
+            }
+        })
+        .collect();
+
+    OverlayRouting {
+        indices,
+        needed_ranks,
+        any_overlay,
+    }
+}
+
+/// General path for arbitrary (e.g. `take`) offsets: probe each offset against
+/// the coverages newest-first. `take` batches are small, so the `O(N * K)`
+/// probing here is not a bottleneck.
+fn route_arbitrary(offsets: &[u32], coverages_newest_first: &[&RoaringBitmap]) -> OverlayRouting {
     let mut rank_sets: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); coverages_newest_first.len()];
     let mut raw: Vec<Option<(usize, u32)>> = Vec::with_capacity(offsets.len());
     for &offset in offsets {
@@ -522,6 +609,49 @@ mod tests {
         // One value supplied for two requested ranks is a caller bug.
         let fetched = vec![i32_array([Some(9)])];
         assert!(assemble_overlay_column(&base, &routing, &fetched).is_err());
+    }
+
+    #[test]
+    fn test_contiguous_fast_path_matches_general() {
+        // The contiguous fast path must produce byte-for-byte identical routing
+        // to the general offset-major path for any contiguous batch. Fuzz a range
+        // of bases, lengths, overlay counts, and coverage densities — including
+        // bits outside the batch range — and compare both fields.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..500 {
+            let base = next() % 64;
+            let len = (next() % 48 + 1) as usize;
+            let num_overlays = (next() % 5) as usize;
+            let coverages: Vec<RoaringBitmap> = (0..num_overlays)
+                .map(|_| {
+                    let density = next() % 101;
+                    let mut b = RoaringBitmap::new();
+                    for off in base.saturating_sub(3)..base + len as u32 + 3 {
+                        if next() % 100 < density {
+                            b.insert(off);
+                        }
+                    }
+                    b
+                })
+                .collect();
+            let refs: Vec<&RoaringBitmap> = coverages.iter().collect();
+            let contiguous_offsets: Vec<u32> = (base..base + len as u32).collect();
+
+            let fast = route_contiguous(base, len, &refs);
+            let general = route_arbitrary(&contiguous_offsets, &refs);
+            assert_eq!(fast.indices, general.indices, "indices differ");
+            assert_eq!(
+                fast.needed_ranks, general.needed_ranks,
+                "needed_ranks differ"
+            );
+            assert_eq!(fast.any_overlay, general.any_overlay, "any_overlay differs");
+        }
     }
 
     #[test]
