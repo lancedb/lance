@@ -1136,6 +1136,74 @@ impl DirectoryNamespace {
         }
     }
 
+    /// Map a Lance error from a table mutation (update / delete / merge-insert) into the most
+    /// specific `NamespaceError` we can determine from the underlying variant.
+    ///
+    /// Collapsing every failure into `InvalidInput`/`Internal` hides the real cause from callers;
+    /// mapping per variant lets them branch on a meaningful error code (e.g. retry on
+    /// `ConcurrentModification`, surface `TableNotFound` to the user).
+    fn map_mutation_error(
+        err: lance_core::Error,
+        operation: &str,
+        table_uri: &str,
+    ) -> lance_core::Error {
+        let detail = err.to_string();
+        let ns_err = match &err {
+            lance_core::Error::InvalidInput { .. }
+            | lance_core::Error::Unprocessable { .. }
+            | lance_core::Error::InvalidRef { .. } => NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid input for {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            lance_core::Error::NotFound { .. } | lance_core::Error::DatasetNotFound { .. } => {
+                NamespaceError::TableNotFound {
+                    message: format!(
+                        "Table at '{}' not found while running {}: {}",
+                        table_uri, operation, detail
+                    ),
+                }
+            }
+            lance_core::Error::SchemaMismatch { .. } | lance_core::Error::Schema { .. } => {
+                NamespaceError::TableSchemaValidationError {
+                    message: format!(
+                        "Schema validation failed for {} on table at '{}': {}",
+                        operation, table_uri, detail
+                    ),
+                }
+            }
+            lance_core::Error::CommitConflict { .. }
+            | lance_core::Error::RetryableCommitConflict { .. }
+            | lance_core::Error::IncompatibleTransaction { .. }
+            | lance_core::Error::VersionConflict { .. } => NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Concurrent modification detected for {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            lance_core::Error::TooMuchWriteContention { .. } => NamespaceError::Throttling {
+                message: format!(
+                    "Too much write contention for {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            lance_core::Error::NotSupported { .. } => NamespaceError::Unsupported {
+                message: format!(
+                    "{} is not supported on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            _ => NamespaceError::Internal {
+                message: format!(
+                    "Failed to run {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+        };
+        ns_err.into()
+    }
+
     async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
         manifest::ManifestNamespace::path_has_actual_manifests(
             &self.object_store,
@@ -4195,12 +4263,7 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .execute_reader(reader)
             .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!(
-                    "Failed to merge_insert_into_table at '{}': {}",
-                    table_uri, e
-                ),
-            })?;
+            .map_err(|e| Self::map_mutation_error(e, "merge_insert_into_table", &table_uri))?;
 
         Ok(MergeInsertIntoTableResponse {
             transaction_id: None,
@@ -4281,9 +4344,10 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
 
-        let result = job.execute().await.map_err(|e| NamespaceError::Internal {
-            message: format!("Failed to update table at '{}': {}", table_uri, e),
-        })?;
+        let result = job
+            .execute()
+            .await
+            .map_err(|e| Self::map_mutation_error(e, "update_table", &table_uri))?;
 
         let version = result.new_dataset.version().version as i64;
         Ok(UpdateTableResponse {
@@ -4312,23 +4376,10 @@ impl LanceNamespace for DirectoryNamespace {
             .load_dataset(&table_uri, None, "delete_from_table")
             .await?;
 
-        let result = dataset.delete(&request.predicate).await.map_err(|e| {
-            // Most predicate errors come back as InvalidInput from the planner; treat any
-            // unexpected failure as Internal to keep callers' error matrices accurate.
-            match e {
-                lance_core::Error::InvalidInput { source, .. } => {
-                    lance_core::Error::from(NamespaceError::InvalidInput {
-                        message: format!(
-                            "Invalid delete predicate '{}': {}",
-                            request.predicate, source
-                        ),
-                    })
-                }
-                other => lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to delete from table at '{}': {}", table_uri, other),
-                }),
-            }
-        })?;
+        let result = dataset
+            .delete(&request.predicate)
+            .await
+            .map_err(|e| Self::map_mutation_error(e, "delete_from_table", &table_uri))?;
 
         Ok(DeleteFromTableResponse {
             transaction_id: None,
@@ -11512,6 +11563,34 @@ mod tests {
                 msg.contains("Table not found"),
                 "expected TableNotFound for missing table, got: {}",
                 msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_invalid_predicate_returns_invalid_input() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // A predicate referencing a column that does not exist reaches `Dataset::delete`
+            // and surfaces as `Error::InvalidInput`, which must map to `InvalidInput` rather
+            // than a generic `Internal`.
+            let request = DeleteFromTableRequest {
+                id: Some(table_id),
+                predicate: "no_such_column = 1".to_string(),
+                ..Default::default()
+            };
+
+            let err = namespace.delete_from_table(request).await.unwrap_err();
+            let lance_core::Error::Namespace { source, .. } = &err else {
+                panic!("expected a Namespace error, got: {}", err);
+            };
+            let ns_err = source
+                .downcast_ref::<NamespaceError>()
+                .expect("expected a NamespaceError source");
+            assert_eq!(
+                ns_err.code(),
+                lance_namespace::ErrorCode::InvalidInput,
+                "expected InvalidInput for an invalid delete predicate, got: {}",
+                err
             );
         }
     }
