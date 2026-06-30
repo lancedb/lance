@@ -825,9 +825,10 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
-            // Overlays are not exposed to Python yet, and the reverse conversion
-            // does not export them, so this round-trip is overlay-free.
-            overlays: vec![],
+            // Python's FragmentMetadata does not carry overlays; they are added
+            // to a fragment via the DataOverlay commit operation, not through
+            // fragment metadata round-trips.
+            overlays: Vec::new(),
         }))
     }
 }
