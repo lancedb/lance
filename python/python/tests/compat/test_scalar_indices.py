@@ -326,7 +326,7 @@ class FtsIndex(UpgradeDowngradeTest):
         # stay on the legacy posting block layout.
         if os.environ.get("LANCE_COMPAT_FTS_LEGACY_BLOCK_SIZE") == "1":
             kwargs["block_size"] = 128
-        dataset.create_scalar_index("text", "INVERTED", **kwargs)
+        dataset.create_scalar_index("text", "INVERTED", format_version=1, **kwargs)
 
     def check_read(self):
         """Verify FTS index can be queried."""
@@ -363,4 +363,9 @@ class FtsIndex(UpgradeDowngradeTest):
             }
         if method_name == "check_write":
             return {"LANCE_FTS_FORMAT_VERSION": "2"}
+        return {}
+
+    def compat_env(self, version: str, method_name: str) -> dict[str, str]:
+        if method_name in {"create", "check_write"}:
+            return {"LANCE_FTS_FORMAT_VERSION": "1"}
         return {}

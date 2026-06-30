@@ -5540,8 +5540,8 @@ mod shard_writer_tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::IndexType;
-    use lance_index::scalar::ScalarIndexParams;
-    use lance_index::scalar::inverted::InvertedIndexParams;
+    use lance_index::scalar::inverted::{InvertedIndexParams, InvertedListFormatVersion};
+    use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::builder::PQBuildParams;
     use lance_linalg::distance::MetricType;
@@ -5843,6 +5843,93 @@ mod shard_writer_tests {
             "the all-tombstone generation must still flush"
         );
         writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mem_wal_maintained_fts_v1_flush_preserves_format() {
+        use tempfile::TempDir;
+
+        let vector_dim = 32;
+        let schema = create_test_schema(vector_dim);
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let uri = format!("file://{}", temp_dir.path().display());
+
+        let initial = create_test_batch(&schema, 0, 16, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        let fts_params =
+            InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_fts".to_string()),
+                &fts_params,
+                false,
+            )
+            .await
+            .expect("Failed to create v1 FTS index");
+        let base_indices = dataset.load_indices().await.unwrap();
+        assert_eq!(base_indices.len(), 1);
+        assert_eq!(base_indices[0].index_version, 1);
+
+        dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["text_fts"])
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let shard_id = Uuid::new_v4();
+        let config = ShardWriterConfig::new(shard_id)
+            .with_durable_write(true)
+            .with_sync_indexed_write(true);
+        let writer = dataset
+            .mem_wal_writer(shard_id, config)
+            .await
+            .expect("Failed to create MemWAL writer");
+        writer
+            .put(vec![create_test_batch(&schema, 1_000, 3, vector_dim)])
+            .await
+            .expect("Failed to write MemWAL batch");
+        writer.close().await.expect("Failed to close writer");
+
+        let (store, base_path) = lance_io::object_store::ObjectStore::from_uri(&uri)
+            .await
+            .expect("Failed to open store");
+        let manifest_store =
+            super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest = manifest_store
+            .read_latest()
+            .await
+            .expect("Failed to read manifest")
+            .expect("Manifest should exist");
+        assert_eq!(manifest.flushed_generations.len(), 1);
+
+        let flushed = &manifest.flushed_generations[0];
+        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, flushed.path);
+        let flushed_dataset = Dataset::open(&gen_uri)
+            .await
+            .expect("Failed to open flushed generation");
+        let flushed_indices = flushed_dataset.load_indices().await.unwrap();
+        assert_eq!(flushed_indices.len(), 1);
+        assert_eq!(flushed_indices[0].name, "text_fts");
+        assert_eq!(
+            flushed_indices[0].index_version, 1,
+            "maintained v1 FTS index must flush as v1"
+        );
+
+        let results = flushed_dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("Sample".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
     }
 
     #[tokio::test]

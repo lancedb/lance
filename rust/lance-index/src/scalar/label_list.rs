@@ -28,7 +28,10 @@ use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
-use super::{AnyQuery, IndexFile, IndexStore, LabelListQuery, ScalarIndex, bitmap::BitmapIndex};
+use super::{
+    AnyQuery, IndexFile, IndexStore, LabelListQuery, OldIndexDataFilter, ScalarIndex,
+    bitmap::BitmapIndex,
+};
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::frag_reuse::FragReuseIndex;
@@ -486,6 +489,87 @@ async fn write_label_list_bitmap_index(
     .await
 }
 
+/// Merge multiple LabelList index segments into a single index.
+///
+/// A [`LabelListIndex`] is a [`BitmapIndex`] over the unnested list values plus a
+/// separate `list_nulls` row set. Because distributed segments cover disjoint rows
+/// (distinct fragments), merging is a cheap union of the underlying bitmap states
+/// and of the `list_nulls` sets — no re-scan of source data is required. This
+/// mirrors [`crate::scalar::bitmap::merge_bitmap_indices`] but also carries the
+/// per-segment `list_nulls`. When `old_data_filter` is provided, rows from
+/// retired fragments are removed from both the value bitmaps and `list_nulls`.
+pub async fn merge_label_list_indices(
+    source_indices: &[Arc<LabelListIndex>],
+    dest_store: &dyn IndexStore,
+    old_data_filter: Option<OldIndexDataFilter>,
+    progress: Arc<dyn crate::progress::IndexBuildProgress>,
+) -> Result<CreatedIndex> {
+    if source_indices.is_empty() {
+        return Err(Error::invalid_input(
+            "LabelList segment merge requires at least one source segment".to_string(),
+        ));
+    }
+
+    let value_type = source_indices[0].values_index.value_type().clone();
+    let mut merged_state = HashMap::<ScalarValue, RowAddrTreeMap>::new();
+    let mut merged_nulls = RowAddrTreeMap::new();
+
+    progress
+        .stage_start(
+            "merge_label_list_segments",
+            Some(source_indices.len() as u64),
+            "segments",
+        )
+        .await?;
+    for (idx, source_index) in source_indices.iter().enumerate() {
+        if source_index.values_index.value_type() != &value_type {
+            return Err(Error::invalid_input(format!(
+                "LabelList segment has value type {:?}, expected {:?}",
+                source_index.values_index.value_type(),
+                value_type
+            )));
+        }
+
+        let state = source_index.values_index.load_bitmap_index_state().await?;
+        for (key, mut bitmap) in state {
+            if let Some(filter) = old_data_filter.as_ref() {
+                filter.retain_old_rows(&mut bitmap);
+            }
+            if bitmap.is_empty() {
+                continue;
+            }
+            merged_state
+                .entry(key)
+                .and_modify(|existing| *existing |= &bitmap)
+                .or_insert(bitmap);
+        }
+        let mut list_nulls = source_index.list_nulls.as_ref().clone();
+        if let Some(filter) = old_data_filter.as_ref() {
+            filter.retain_old_rows(&mut list_nulls);
+        }
+        merged_nulls |= &list_nulls;
+        progress
+            .stage_progress("merge_label_list_segments", (idx + 1) as u64)
+            .await?;
+    }
+    progress.stage_complete("merge_label_list_segments").await?;
+
+    progress
+        .stage_start("write_label_list_index", Some(1), "files")
+        .await?;
+    let file =
+        write_label_list_bitmap_index(merged_state, dest_store, &value_type, &merged_nulls).await?;
+    progress.stage_progress("write_label_list_index", 1).await?;
+    progress.stage_complete("write_label_list_index").await?;
+
+    Ok(CreatedIndex {
+        index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
+            .unwrap(),
+        index_version: LABEL_LIST_INDEX_VERSION,
+        files: vec![file],
+    })
+}
+
 /// The serializable state of a [`LabelListIndex`].
 ///
 /// `LabelListIndex` is a thin wrapper around a [`BitmapIndex`] plus a separate
@@ -634,15 +718,13 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        // Training over a fragment subset is supported for distributed builds: the
+        // provided `data` stream is already scoped to those fragments, so a partial
+        // index covering exactly those rows is produced. Segments are recombined by
+        // `merge_label_list_indices`.
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "LabelList index does not support fragment training".into(),
-            ));
-        }
-
         let schema = data.schema();
         let field = schema
             .column_with_name(VALUE_COLUMN_NAME)

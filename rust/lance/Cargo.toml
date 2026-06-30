@@ -171,6 +171,14 @@ slow_tests = []
 name = "lq"
 required-features = ["cli"]
 
+[[bin]]
+name = "fm_contains_bench"
+required-features = ["cli"]
+
+[[bin]]
+name = "fm_index_tool"
+required-features = ["cli"]
+
 [[bench]]
 name = "scalar_index"
 harness = false

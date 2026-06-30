@@ -2111,13 +2111,12 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
             Operation::Merge { fragments, .. } => {
+                let existing_fragments = maybe_existing_fragments?;
                 let mut merged_fragments = fragments.clone();
                 if next_row_id.is_some() {
                     let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
-                    let prev_by_id: HashMap<u64, &Fragment> = maybe_existing_fragments?
-                        .iter()
-                        .map(|f| (f.id, f))
-                        .collect();
+                    let prev_by_id: HashMap<u64, &Fragment> =
+                        existing_fragments.iter().map(|f| (f.id, f)).collect();
                     for fragment in merged_fragments.iter_mut() {
                         match prev_by_id.get(&fragment.id) {
                             Some(prev) => {
@@ -2143,6 +2142,15 @@ impl Transaction {
                     }
                 }
                 final_fragments.extend(merged_fragments);
+
+                // A Merge can rewrite a column's data file in place; the field stays
+                // in the schema, so the index is retained -- prune its now-stale
+                // entries for the rewritten fragments.
+                Self::prune_merge_rewritten_fields_from_indices(
+                    &mut final_indices,
+                    existing_fragments,
+                    fragments,
+                );
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
@@ -2620,6 +2628,60 @@ impl Transaction {
                     fragment_bitmap.remove(fragment_id);
                 }
             }
+        }
+    }
+
+    /// Map each (non-tombstoned) field id in a fragment to the path of the data
+    /// file that backs it.
+    fn fragment_field_paths(frag: &Fragment) -> HashMap<i32, &str> {
+        let mut map = HashMap::new();
+        for file in &frag.files {
+            for &field_id in file.fields.iter() {
+                if field_id >= 0 {
+                    map.insert(field_id, file.path.as_str());
+                }
+            }
+        }
+        map
+    }
+
+    /// A `Merge` can rewrite a column's data *in place* -- the field stays in the
+    /// schema but its backing data file changes (the overlay fragment carries a new
+    /// file for the field and tombstones its old field id). `retain_relevant_indices`
+    /// only drops indices for *removed* fields, so without this the index keeps
+    /// covering the rewritten fragments with stale entries. Remove each such fragment
+    /// from any index covering a field whose backing data file changed.
+    fn prune_merge_rewritten_fields_from_indices(
+        indices: &mut [IndexMetadata],
+        prev_fragments: &[Fragment],
+        new_fragments: &[Fragment],
+    ) {
+        let prev_by_id: HashMap<u64, &Fragment> =
+            prev_fragments.iter().map(|f| (f.id, f)).collect();
+        for new_frag in new_fragments {
+            let Some(prev) = prev_by_id.get(&new_frag.id) else {
+                continue; // brand-new fragment: nothing stale to prune
+            };
+            let prev_paths = Self::fragment_field_paths(prev);
+            let new_paths = Self::fragment_field_paths(new_frag);
+            // Fields still present whose backing file path changed == rewritten data.
+            let changed: Vec<u32> = prev_paths
+                .iter()
+                .filter(|(field_id, prev_path)| {
+                    new_paths
+                        .get(*field_id)
+                        .is_some_and(|new_path| new_path != *prev_path)
+                })
+                .map(|(field_id, _)| *field_id as u32)
+                .collect();
+            if changed.is_empty() {
+                continue;
+            }
+            Self::prune_updated_fields_from_indices(
+                indices,
+                std::slice::from_ref(new_frag),
+                &changed,
+            );
         }
     }
 
