@@ -94,8 +94,8 @@ use datafusion::{
 };
 use datafusion_physical_expr::expressions::Column;
 use futures::{
-    Stream, StreamExt, TryStreamExt,
-    stream::{self},
+    StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
 };
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::datatypes::NullabilityComparison;
@@ -2377,10 +2377,13 @@ impl Merger {
     //
     // Returns 0, 1, or 2 batches
     // Potentially updates (as a side-effect) the deleted rows vec
+    // Returns a boxed stream rather than `impl Stream` on purpose: nesting an opaque
+    // `impl Stream` inside an `async fn`'s opaque future triggers a rustc ICE under coverage
+    // instrumentation (096694416, 2026-06-29), so we hand back a concrete type instead.
     async fn execute_batch(
         self,
         batch: RecordBatch,
-    ) -> datafusion::common::Result<impl Stream<Item = datafusion::common::Result<RecordBatch>>>
+    ) -> datafusion::common::Result<BoxStream<'static, datafusion::common::Result<RecordBatch>>>
     {
         let mut merge_statistics = self.merge_stats.lock().unwrap();
         let num_fields = batch.schema().fields.len();
@@ -2604,7 +2607,7 @@ impl Merger {
             WhenNotMatchedBySource::Keep => {}
         }
 
-        Ok(stream::iter(batches))
+        Ok(stream::iter(batches).boxed())
     }
 }
 

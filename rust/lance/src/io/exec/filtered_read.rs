@@ -1075,6 +1075,10 @@ impl FilteredReadStream {
 
     // Reads a single fragment into a stream of batch tasks
     #[instrument(name = "read_fragment", skip_all)]
+    // Returns a boxed stream rather than `impl Stream` on purpose: nesting an opaque
+    // `impl Stream` inside an `async fn`'s opaque future triggers a rustc ICE under coverage
+    // instrumentation (096694416, 2026-06-29), so we hand back a concrete type instead. The
+    // stream is already boxed below, so this does not change runtime behavior.
     async fn read_fragment(
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
