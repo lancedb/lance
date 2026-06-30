@@ -143,7 +143,7 @@ fn multiply_a_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 }
 
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    if m == 0 || n == 0 {
+    if a.len() == 0 || m == 0 || n == 0 {
         println!("Error: Matrix must have at least 1 row and at least 1 column.");
     }
     if a.len() != m * n {
