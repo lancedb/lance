@@ -39,8 +39,8 @@ use crate::pbold;
 use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -664,11 +664,7 @@ impl CacheKey for LabelListIndexStateKey {
 pub struct LabelListIndexPlugin;
 
 #[async_trait]
-impl ScalarIndexPlugin for LabelListIndexPlugin {
-    fn name(&self) -> &str {
-        "LabelList"
-    }
-
+impl BasicTrainer for LabelListIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -687,25 +683,6 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-        )))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        true
-    }
-
-    fn version(&self) -> u32 {
-        LABEL_LIST_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(LabelListQueryParser::new(
-            index_name,
-            self.name().to_string(),
         )))
     }
 
@@ -762,6 +739,36 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             index_version: LABEL_LIST_INDEX_VERSION,
             files: vec![file],
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "LabelList"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        LABEL_LIST_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(LabelListQueryParser::new(
+            index_name,
+            self.name().to_string(),
+        )))
     }
 
     /// Load an index from storage

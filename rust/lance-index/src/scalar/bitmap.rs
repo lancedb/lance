@@ -48,7 +48,7 @@ use crate::{
         CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
             VALUE_COLUMN_NAME,
         },
     },
@@ -1708,11 +1708,7 @@ pub async fn merge_bitmap_indices(
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for BitmapIndexPlugin {
-    fn name(&self) -> &str {
-        "Bitmap"
-    }
-
+impl BasicTrainer for BitmapIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1729,27 +1725,6 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             serde_json::from_str::<BitmapParameters>(params)?
         };
         Ok(Box::new(BitmapTrainingRequest::new(params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        true
-    }
-
-    fn version(&self) -> u32 {
-        BITMAP_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        // Bitmap indexes cannot answer `LikePrefix` queries (see `search`), so the parser
-        // is configured to skip them and let such predicates fall back to ordinary filtering.
-        Some(Box::new(
-            SargableQueryParser::new(index_name, self.name().to_string(), false)
-                .without_like_prefix(),
-        ))
     }
 
     async fn train_index(
@@ -1792,6 +1767,38 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             index_version: BITMAP_INDEX_VERSION,
             files: vec![file],
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for BitmapIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Bitmap"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        BITMAP_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        // Bitmap indexes cannot answer `LikePrefix` queries (see `search`), so the parser
+        // is configured to skip them and let such predicates fall back to ordinary filtering.
+        Some(Box::new(
+            SargableQueryParser::new(index_name, self.name().to_string(), false)
+                .without_like_prefix(),
+        ))
     }
 
     /// Load an index from storage

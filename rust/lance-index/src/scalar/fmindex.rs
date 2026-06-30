@@ -41,8 +41,8 @@ use crate::metrics::MetricsCollector;
 use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
@@ -2433,10 +2433,7 @@ async fn write_empty_fmindex_partition(store: &dyn IndexStore) -> Result<IndexFi
 pub struct FMIndexPlugin;
 
 #[async_trait]
-impl ScalarIndexPlugin for FMIndexPlugin {
-    fn name(&self) -> &str {
-        "Fm"
-    }
+impl BasicTrainer for FMIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -2469,6 +2466,17 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             index_version: FMINDEX_INDEX_VERSION,
             files,
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for FMIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Fm"
     }
     fn provides_exact_answer(&self) -> bool {
         true
@@ -2521,6 +2529,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::registry::BasicTrainer;
 
     #[derive(Debug, Clone)]
     struct FailNewFileStore {

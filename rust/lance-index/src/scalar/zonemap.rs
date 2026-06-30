@@ -16,7 +16,7 @@ use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,
@@ -961,11 +961,7 @@ impl TrainingRequest for ZoneMapIndexTrainingRequest {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for ZoneMapIndexPlugin {
-    fn name(&self) -> &str {
-        "ZoneMap"
-    }
-
+impl BasicTrainer for ZoneMapIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -980,26 +976,6 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
 
         Ok(Box::new(ZoneMapIndexTrainingRequest::new(params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        false
-    }
-
-    fn version(&self) -> u32 {
-        ZONEMAP_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            true,
-        )))
     }
 
     async fn train_index(
@@ -1024,6 +1000,37 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             index_version: ZONEMAP_INDEX_VERSION,
             files: vec![file],
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for ZoneMapIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "ZoneMap"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        ZONEMAP_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
     }
 
     async fn load_index(

@@ -119,7 +119,9 @@ use crate::{
     scalar::{
         CreatedIndex, ScalarIndex,
         expression::{FtsQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
+        registry::{
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+        },
     },
 };
 
@@ -195,11 +197,7 @@ impl TrainingRequest for InvertedIndexTrainingRequest {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for InvertedIndexPlugin {
-    fn name(&self) -> &str {
-        "Inverted"
-    }
-
+impl BasicTrainer for InvertedIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -219,33 +217,6 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
         let params = InvertedIndexParams::from_training_json(params)?;
         Ok(Box::new(InvertedIndexTrainingRequest::new(params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        false
-    }
-
-    fn version(&self) -> u32 {
-        max_supported_fts_format_version().index_version()
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        let Ok(index_details) = _index_details.to_msg::<pbold::InvertedIndexDetails>() else {
-            return None;
-        };
-
-        if Self::can_accelerate_queries(&index_details) {
-            Some(Box::new(FtsQueryParser::new(
-                index_name,
-                self.name().to_string(),
-            )))
-        } else {
-            None
-        }
     }
 
     /// Train a new index
@@ -281,6 +252,44 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             progress,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for InvertedIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Inverted"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        max_supported_fts_format_version().index_version()
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        let Ok(index_details) = _index_details.to_msg::<pbold::InvertedIndexDetails>() else {
+            return None;
+        };
+
+        if Self::can_accelerate_queries(&index_details) {
+            Some(Box::new(FtsQueryParser::new(
+                index_name,
+                self.name().to_string(),
+            )))
+        } else {
+            None
+        }
     }
 
     /// Load an index from storage

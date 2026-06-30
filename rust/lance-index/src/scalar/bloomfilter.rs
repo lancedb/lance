@@ -9,7 +9,7 @@
 
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
@@ -988,11 +988,7 @@ impl BloomFilterIndexPlugin {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for BloomFilterIndexPlugin {
-    fn name(&self) -> &str {
-        "BloomFilter"
-    }
-
+impl BasicTrainer for BloomFilterIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1075,6 +1071,13 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
             files: vec![file],
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
 
     fn provides_exact_answer(&self) -> bool {
         false
@@ -1082,6 +1085,10 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
 
     fn version(&self) -> u32 {
         BLOOMFILTER_INDEX_VERSION
+    }
+
+    fn name(&self) -> &str {
+        "BloomFilter"
     }
 
     fn new_query_parser(

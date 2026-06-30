@@ -21,8 +21,8 @@ use lance::dataset::scanner::Scanner;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
-    Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    Dataset, MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
@@ -54,14 +54,15 @@ use lance_namespace::models::{
     CreateTableBranchResponse, CreateTableIndexRequest, CreateTableIndexResponse,
     CreateTableRequest, CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
     CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DeleteTableBranchRequest, DeleteTableBranchResponse,
-    DeleteTableTagRequest, DeleteTableTagResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, DescribeTransactionRequest, DescribeTransactionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse,
-    DropTableRequest, DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats,
-    FragmentSummary, GetTableStatsRequest, GetTableStatsResponse, GetTableTagVersionRequest,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
+    DeleteTableTagResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
+    DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
+    DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats, FragmentSummary,
+    GetTableStatsRequest, GetTableStatsResponse, GetTableTagVersionRequest,
     GetTableTagVersionResponse, Identity, IndexContent, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableBranchesRequest, ListTableBranchesResponse, ListTableIndicesRequest,
@@ -70,8 +71,8 @@ use lance_namespace::models::{
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
     QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
     RestoreTableResponse, TableExistsRequest, TableVersion, TagContents as ModelTagContents,
-    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
-    UpdateTableTagResponse,
+    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 use lance_core::{Error, Result, box_error};
@@ -1133,6 +1134,85 @@ impl DirectoryNamespace {
             }
             .into(),
         }
+    }
+
+    /// Map a Lance error from a table mutation (update / delete / merge-insert) into the most
+    /// specific `NamespaceError` we can determine from the underlying variant.
+    ///
+    /// Collapsing every failure into `InvalidInput`/`Internal` hides the real cause from callers;
+    /// mapping per variant lets them branch on a meaningful error code (e.g. retry on
+    /// `ConcurrentModification`, surface `TableNotFound` to the user).
+    ///
+    /// Commit-conflict variants are mapped consistently with `convert_lance_commit_error` in
+    /// `manifest.rs`: `CommitConflict` (retries exhausted, safe to retry) -> `Throttling`, while
+    /// semantic conflicts (`TooMuchWriteContention` / `RetryableCommitConflict` /
+    /// `IncompatibleTransaction` / `VersionConflict`) -> `ConcurrentModification`.
+    fn map_mutation_error(
+        err: lance_core::Error,
+        operation: &str,
+        table_uri: &str,
+    ) -> lance_core::Error {
+        let detail = err.to_string();
+        let ns_err = match &err {
+            lance_core::Error::InvalidInput { .. }
+            | lance_core::Error::Unprocessable { .. }
+            | lance_core::Error::InvalidRef { .. } => NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid input for {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            lance_core::Error::NotFound { .. } | lance_core::Error::DatasetNotFound { .. } => {
+                NamespaceError::TableNotFound {
+                    message: format!(
+                        "Table at '{}' not found while running {}: {}",
+                        table_uri, operation, detail
+                    ),
+                }
+            }
+            lance_core::Error::SchemaMismatch { .. } | lance_core::Error::Schema { .. } => {
+                NamespaceError::TableSchemaValidationError {
+                    message: format!(
+                        "Schema validation failed for {} on table at '{}': {}",
+                        operation, table_uri, detail
+                    ),
+                }
+            }
+            // `CommitConflict` means the version-collision retries were exhausted; the operation
+            // is safe to retry as-is, so surface it as `Throttling` (kept aligned with
+            // `convert_lance_commit_error` in manifest.rs).
+            lance_core::Error::CommitConflict { .. } => NamespaceError::Throttling {
+                message: format!(
+                    "Too many concurrent writes for {} on table at '{}', please retry later: {}",
+                    operation, table_uri, detail
+                ),
+            },
+            // Semantic conflicts: a concurrent change is incompatible with this one and retrying
+            // as-is would not help, so surface them as `ConcurrentModification` (kept aligned with
+            // `convert_lance_commit_error` in manifest.rs).
+            lance_core::Error::TooMuchWriteContention { .. }
+            | lance_core::Error::RetryableCommitConflict { .. }
+            | lance_core::Error::IncompatibleTransaction { .. }
+            | lance_core::Error::VersionConflict { .. } => NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Concurrent modification detected for {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            lance_core::Error::NotSupported { .. } => NamespaceError::Unsupported {
+                message: format!(
+                    "{} is not supported on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            _ => NamespaceError::Internal {
+                message: format!(
+                    "Failed to run {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+        };
+        ns_err.into()
     }
 
     async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
@@ -4194,12 +4274,7 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .execute_reader(reader)
             .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!(
-                    "Failed to merge_insert_into_table at '{}': {}",
-                    table_uri, e
-                ),
-            })?;
+            .map_err(|e| Self::map_mutation_error(e, "merge_insert_into_table", &table_uri))?;
 
         Ok(MergeInsertIntoTableResponse {
             transaction_id: None,
@@ -4207,6 +4282,119 @@ impl LanceNamespace for DirectoryNamespace {
             num_inserted_rows: Some(stats.num_inserted_rows as i64),
             num_deleted_rows: Some(stats.num_deleted_rows as i64),
             version: Some(dataset.version().version as i64),
+        })
+    }
+
+    async fn update_table(&self, request: UpdateTableRequest) -> Result<UpdateTableResponse> {
+        self.record_op("update_table");
+
+        if request.updates.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "update_table requires at least one [column, expression] pair".to_string(),
+            }
+            .into());
+        }
+
+        // Validate every update pair shape and detect duplicate columns up front so we
+        // surface a clean error instead of failing deep inside the planner.
+        let mut seen_columns: HashMap<String, ()> = HashMap::with_capacity(request.updates.len());
+        for (idx, pair) in request.updates.iter().enumerate() {
+            if pair.len() != 2 {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "update_table updates[{}] must be a [column, expression] pair, got {} elements",
+                        idx,
+                        pair.len()
+                    ),
+                }
+                .into());
+            }
+            let column = &pair[0];
+            if column.trim().is_empty() {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!("update_table updates[{}] has an empty column name", idx),
+                }
+                .into());
+            }
+            if seen_columns.insert(column.clone(), ()).is_some() {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "update_table cannot update column '{}' more than once",
+                        column
+                    ),
+                }
+                .into());
+            }
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = Arc::new(self.load_dataset(&table_uri, None, "update_table").await?);
+
+        let mut builder = UpdateBuilder::new(dataset);
+        for pair in &request.updates {
+            // Indexing by 0/1 is safe due to the length check above.
+            builder = builder.set(&pair[0], &pair[1]).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Invalid update expression for column '{}': {}", pair[0], e),
+                })
+            })?;
+        }
+        if let Some(predicate) = request.predicate.as_deref()
+            && !predicate.trim().is_empty()
+        {
+            builder = builder.update_where(predicate).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Invalid update_table predicate '{}': {}", predicate, e),
+                })
+            })?;
+        }
+
+        let job = builder.build().map_err(|e| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!("Failed to build update_table job: {}", e),
+            })
+        })?;
+
+        let result = job
+            .execute()
+            .await
+            .map_err(|e| Self::map_mutation_error(e, "update_table", &table_uri))?;
+
+        let version = result.new_dataset.version().version as i64;
+        Ok(UpdateTableResponse {
+            transaction_id: None,
+            updated_rows: result.rows_updated as i64,
+            version,
+            properties: None,
+        })
+    }
+
+    async fn delete_from_table(
+        &self,
+        request: DeleteFromTableRequest,
+    ) -> Result<DeleteFromTableResponse> {
+        self.record_op("delete_from_table");
+
+        if request.predicate.trim().is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "delete_from_table requires a non-empty predicate".to_string(),
+            }
+            .into());
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "delete_from_table")
+            .await?;
+
+        let result = dataset
+            .delete(&request.predicate)
+            .await
+            .map_err(|e| Self::map_mutation_error(e, "delete_from_table", &table_uri))?;
+
+        Ok(DeleteFromTableResponse {
+            transaction_id: None,
+            version: Some(result.new_dataset.version().version as i64),
         })
     }
 
@@ -4793,6 +4981,52 @@ mod tests {
                 expected_fragment,
                 plan
             );
+        }
+    }
+
+    fn mutation_error_code(err: lance_core::Error) -> ErrorCode {
+        match err {
+            lance_core::Error::Namespace { source, .. } => source
+                .downcast_ref::<NamespaceError>()
+                .expect("mutation error should wrap a NamespaceError")
+                .code(),
+            other => panic!("expected Namespace error, got: {other:?}"),
+        }
+    }
+
+    /// `map_mutation_error` must classify commit-conflict variants the same way as
+    /// `convert_lance_commit_error` in `manifest.rs`: `CommitConflict` is a retries-exhausted
+    /// version collision that is safe to retry (`Throttling`), while the semantic-conflict variants
+    /// map to `ConcurrentModification`.
+    #[test]
+    fn test_map_mutation_error_commit_conflict_alignment() {
+        let boxed = || -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            Box::<dyn std::error::Error + Send + Sync>::from("inner conflict")
+        };
+
+        let throttling_cases = vec![lance_core::Error::commit_conflict_source(1, boxed())];
+        for err in throttling_cases {
+            let code = mutation_error_code(DirectoryNamespace::map_mutation_error(
+                err,
+                "update",
+                "memory://t",
+            ));
+            assert_eq!(code, ErrorCode::Throttling);
+        }
+
+        let concurrent_cases = vec![
+            lance_core::Error::too_much_write_contention("contention"),
+            lance_core::Error::retryable_commit_conflict_source(1, boxed()),
+            lance_core::Error::incompatible_transaction_source(boxed()),
+            lance_core::Error::version_conflict("conflict", 0, 3),
+        ];
+        for err in concurrent_cases {
+            let code = mutation_error_code(DirectoryNamespace::map_mutation_error(
+                err,
+                "update",
+                "memory://t",
+            ));
+            assert_eq!(code, ErrorCode::ConcurrentModification);
         }
     }
 
@@ -11217,6 +11451,204 @@ mod tests {
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             assert!(total_rows > 0);
             assert!(total_rows < 3);
+        }
+
+        // ---------------------- update_table / delete_from_table ----------------------
+
+        #[tokio::test]
+        async fn test_update_full_table() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // Capture base version so we can assert the update bumped it.
+            let base_version = open_dataset(&namespace, &table_id[0])
+                .await
+                .version()
+                .version;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id.clone()),
+                updates: vec![vec!["name".to_string(), "'updated'".to_string()]],
+                predicate: None,
+                ..Default::default()
+            };
+
+            let response = namespace.update_table(request).await.unwrap();
+            assert_eq!(response.updated_rows, 3);
+            assert!(response.version as u64 > base_version);
+
+            // Validate that all rows now carry the new value.
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: Some("name = 'updated'".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(namespace.count_table_rows(count_req).await.unwrap(), 3);
+        }
+
+        #[tokio::test]
+        async fn test_update_with_predicate() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id.clone()),
+                updates: vec![vec!["name".to_string(), "'matched'".to_string()]],
+                predicate: Some("id > 1".to_string()),
+                ..Default::default()
+            };
+
+            let response = namespace.update_table(request).await.unwrap();
+            assert_eq!(response.updated_rows, 2);
+
+            // Rows that did not match the predicate must remain unchanged.
+            let untouched = CountTableRowsRequest {
+                id: Some(table_id.clone()),
+                version: None,
+                predicate: Some("name = 'Alice'".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(namespace.count_table_rows(untouched).await.unwrap(), 1);
+
+            let touched = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: Some("name = 'matched'".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(namespace.count_table_rows(touched).await.unwrap(), 2);
+        }
+
+        #[tokio::test]
+        async fn test_update_invalid_expression_returns_invalid_input() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id),
+                // Reference an unknown column on the right-hand side.
+                updates: vec![vec!["name".to_string(), "no_such_column + 1".to_string()]],
+                predicate: None,
+                ..Default::default()
+            };
+
+            let err = namespace.update_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid input"),
+                "expected Invalid input error, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_update_rejects_duplicate_columns() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id),
+                updates: vec![
+                    vec!["name".to_string(), "'a'".to_string()],
+                    vec!["name".to_string(), "'b'".to_string()],
+                ],
+                predicate: None,
+                ..Default::default()
+            };
+
+            let err = namespace.update_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid input") && msg.contains("more than once"),
+                "expected duplicate column InvalidInput error, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_with_predicate() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = DeleteFromTableRequest {
+                id: Some(table_id.clone()),
+                predicate: "id > 1".to_string(),
+                ..Default::default()
+            };
+
+            let response = namespace.delete_from_table(request).await.unwrap();
+            assert!(response.version.is_some());
+
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: None,
+                ..Default::default()
+            };
+            // Original rows = 3; after deleting `id > 1` only row id=1 remains.
+            assert_eq!(namespace.count_table_rows(count_req).await.unwrap(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_delete_empty_predicate_returns_invalid_input() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = DeleteFromTableRequest {
+                id: Some(table_id),
+                predicate: "   ".to_string(),
+                ..Default::default()
+            };
+
+            let err = namespace.delete_from_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid input") && msg.contains("non-empty predicate"),
+                "expected non-empty predicate InvalidInput error, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_table_not_found() {
+            let (namespace, _temp_dir) = create_test_namespace().await;
+
+            let request = DeleteFromTableRequest {
+                id: Some(vec!["does_not_exist".to_string()]),
+                predicate: "id = 1".to_string(),
+                ..Default::default()
+            };
+
+            let err = namespace.delete_from_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Table not found"),
+                "expected TableNotFound for missing table, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_invalid_predicate_returns_invalid_input() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // A predicate referencing a column that does not exist reaches `Dataset::delete`
+            // and surfaces as `Error::InvalidInput`, which must map to `InvalidInput` rather
+            // than a generic `Internal`.
+            let request = DeleteFromTableRequest {
+                id: Some(table_id),
+                predicate: "no_such_column = 1".to_string(),
+                ..Default::default()
+            };
+
+            let err = namespace.delete_from_table(request).await.unwrap_err();
+            let lance_core::Error::Namespace { source, .. } = &err else {
+                panic!("expected a Namespace error, got: {}", err);
+            };
+            let ns_err = source
+                .downcast_ref::<NamespaceError>()
+                .expect("expected a NamespaceError source");
+            assert_eq!(
+                ns_err.code(),
+                lance_namespace::ErrorCode::InvalidInput,
+                "expected InvalidInput for an invalid delete predicate, got: {}",
+                err
+            );
         }
     }
 

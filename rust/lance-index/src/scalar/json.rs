@@ -39,7 +39,9 @@ use crate::{
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME},
+        registry::{
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME,
+        },
     },
 };
 
@@ -666,11 +668,7 @@ impl JsonIndexPlugin {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for JsonIndexPlugin {
-    fn name(&self) -> &str {
-        "Json"
-    }
-
+impl BasicTrainer for JsonIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -688,12 +686,89 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let params = serde_json::from_str::<JsonIndexParameters>(params)?;
         let registry = self.registry()?;
         let target_plugin = registry.get_plugin_by_name(&params.target_index_type)?;
-        let target_request = target_plugin.new_training_request(
+        let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.target_index_type).into(),
+            )
+        })?;
+        let target_request = target_trainer.new_training_request(
             params.target_index_parameters.as_deref().unwrap_or("{}"),
             &Field::new("", target_type, true),
         )?;
 
         Ok(Box::new(JsonTrainingRequest::new(params, target_request)))
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let request = (request as Box<dyn std::any::Any>)
+            .downcast::<JsonTrainingRequest>()
+            .unwrap();
+        let path = request.parameters.path.clone();
+
+        // Extract JSON with type information
+        let (data_stream, inferred_type) =
+            Self::extract_json_with_type_info(data, path.clone()).await?;
+
+        // Convert the stream to properly typed values based on inferred type
+        let converted_stream =
+            Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
+
+        // Update the target request with inferred type
+        let registry = self.registry()?;
+        let target_plugin = registry.get_plugin_by_name(&request.parameters.target_index_type)?;
+
+        // Create a new training request with the inferred type
+        let target_trainer = target_plugin.basic_trainer().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", request.parameters.target_index_type).into(),
+            )
+        })?;
+        let target_request = target_trainer.new_training_request(
+            request
+                .parameters
+                .target_index_parameters
+                .as_deref()
+                .unwrap_or("{}"),
+            &Field::new("", inferred_type, true),
+        )?;
+
+        let target_index = target_trainer
+            .train_index(
+                converted_stream,
+                index_store,
+                target_request,
+                fragment_ids,
+                progress,
+            )
+            .await?;
+
+        let index_details = crate::pb::JsonIndexDetails {
+            path,
+            target_details: Some(target_index.index_details),
+        };
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&index_details)?,
+            index_version: JSON_INDEX_VERSION,
+            files: target_index.files,
+        })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for JsonIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Json"
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -727,62 +802,6 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             json_details.path.clone(),
             target_parser,
         )) as Box<dyn ScalarQueryParser>)
-    }
-
-    async fn train_index(
-        &self,
-        data: SendableRecordBatchStream,
-        index_store: &dyn IndexStore,
-        request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
-        progress: Arc<dyn crate::progress::IndexBuildProgress>,
-    ) -> Result<CreatedIndex> {
-        let request = (request as Box<dyn std::any::Any>)
-            .downcast::<JsonTrainingRequest>()
-            .unwrap();
-        let path = request.parameters.path.clone();
-
-        // Extract JSON with type information
-        let (data_stream, inferred_type) =
-            Self::extract_json_with_type_info(data, path.clone()).await?;
-
-        // Convert the stream to properly typed values based on inferred type
-        let converted_stream =
-            Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
-
-        // Update the target request with inferred type
-        let registry = self.registry()?;
-        let target_plugin = registry.get_plugin_by_name(&request.parameters.target_index_type)?;
-
-        // Create a new training request with the inferred type
-        let target_request = target_plugin.new_training_request(
-            request
-                .parameters
-                .target_index_parameters
-                .as_deref()
-                .unwrap_or("{}"),
-            &Field::new("", inferred_type, true),
-        )?;
-
-        let target_index = target_plugin
-            .train_index(
-                converted_stream,
-                index_store,
-                target_request,
-                fragment_ids,
-                progress,
-            )
-            .await?;
-
-        let index_details = crate::pb::JsonIndexDetails {
-            path,
-            target_details: Some(target_index.index_details),
-        };
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&index_details)?,
-            index_version: JSON_INDEX_VERSION,
-            files: target_index.files,
-        })
     }
 
     async fn load_index(
