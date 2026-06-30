@@ -428,6 +428,74 @@ mod tests {
         check_basic_random(field).await;
     }
 
+    /// Regression test: a `List<List<Float32>>` column that spans more than one
+    /// page within a fragment fails to decode with
+    /// "Max offset N exceeds length of values M" (Arrow error raised by
+    /// `ListArray::try_new` in `StructuralListDecodeTask::decode`). The offsets
+    /// produced by `CompositeRepDefUnraveler::unravel_offsets` for the nested
+    /// inner list are not rebased per page, so a later page's offset is resolved
+    /// against an earlier page's child values length.
+    ///
+    /// Single-page reads of the same data decode fine, which is why the existing
+    /// small `test_nested_list` / `test_deeply_nested_lists` cases don't catch it.
+    /// Found in production on the gaming TransNet `dino_embedding_per_frame`
+    /// column (rectangular K x 768 float per row) — small reads (<=1000 rows) OK,
+    /// a full 5000-row fragment fails.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_multipage_nested_float_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        use arrow_array::Float32Array;
+
+        // Enough rows + inner data that, with a small max page size, the column
+        // is forced to span multiple pages (the condition that triggers the bug).
+        let num_rows: usize = 4000;
+        let inner_per_row: usize = 4; // inner lists per outer row (like K frames)
+        let inner_len: usize = 64; // floats per inner list
+
+        let total_inner = num_rows * inner_per_row;
+        let total_values = total_inner * inner_len;
+
+        let values = Float32Array::from((0..total_values).map(|i| i as f32).collect::<Vec<_>>());
+        let inner_offsets = ScalarBuffer::<i32>::from(
+            (0..=total_inner).map(|i| (i * inner_len) as i32).collect::<Vec<_>>(),
+        );
+        let inner_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            OffsetBuffer::new(inner_offsets),
+            Arc::new(values),
+            None,
+        );
+        let outer_offsets = ScalarBuffer::<i32>::from(
+            (0..=num_rows).map(|i| (i * inner_per_row) as i32).collect::<Vec<_>>(),
+        );
+        let outer_list = ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            )),
+            OffsetBuffer::new(outer_offsets),
+            Arc::new(inner_list),
+            None,
+        );
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        // Force the column to split across multiple pages.
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_max_page_size(4 * 1024);
+        check_round_trip_encoding_of_data(vec![Arc::new(outer_list)], &test_cases, field_metadata)
+            .await;
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_list_struct_list() {
         let struct_type = DataType::Struct(Fields::from(vec![Field::new(
