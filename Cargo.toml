@@ -160,6 +160,8 @@ jieba-rs = { version = "0.10.0", default-features = false }
 jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }
 libm = "0.2.15"
 log = "0.4"
+metrics = { version = "0.24" }
+metrics-util = { version = "0.19" }
 mockall = { version = "0.14.0" }
 mock_instant = { version = "0.6.0" }
 moka = { version = "0.12", features = ["future", "sync"] }

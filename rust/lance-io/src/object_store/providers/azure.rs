@@ -192,6 +192,15 @@ impl AzureBlobStoreProvider {
             builder = builder.with_credentials(credentials);
         }
 
+        #[cfg(feature = "metrics")]
+        {
+            builder = builder.with_http_connector(
+                crate::object_store::metrics::MeteringHttpConnector::new(
+                    base_path.scheme().to_string(),
+                ),
+            );
+        }
+
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
 

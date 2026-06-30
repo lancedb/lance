@@ -259,6 +259,12 @@ impl ObjectStoreRegistry {
 
         store.inner = store.inner.traced();
 
+        #[cfg(feature = "metrics")]
+        {
+            use crate::object_store::metrics::ObjectStoreMetricsExt;
+            store.inner = store.inner.metered(store.scheme.clone());
+        }
+
         if let Some(wrapper) = &params.object_store_wrapper {
             store.inner = wrapper.wrap(&cache_path, store.inner);
         }
