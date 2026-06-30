@@ -44,6 +44,7 @@ lance = { path = "../rust/lance", features = [
     "goosefs",
     "dynamodb",
     "substrait",
+    "metrics",
 ] }
 lance-arrow = { path = "../rust/lance-arrow" }
 lance-core = { path = "../rust/lance-core" }
@@ -54,7 +55,7 @@ lance-index = { path = "../rust/lance-index", features = [
     "tokenizer-lindera",
     "tokenizer-jieba",
 ] }
-lance-io = { path = "../rust/lance-io" }
+lance-io = { path = "../rust/lance-io", features = ["metrics"] }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-namespace = { path = "../rust/lance-namespace" }
 lance-namespace-impls = { path = "../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "dir-goosefs"] }
@@ -62,6 +63,8 @@ lance-table = { path = "../rust/lance-table" }
 lance-datafusion = { path = "../rust/lance-datafusion" }
 libc = "0.2.176"
 log = "0.4"
+metrics = "0.24"
+metrics-util = "0.19"
 prost = "0.14.1"
 prost-types = "0.14.1"
 pyo3 = { version = "0.28", features = [

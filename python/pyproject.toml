@@ -64,6 +64,7 @@ tests = [
 ]
 dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]
+otel = ["opentelemetry-api", "opentelemetry-sdk"]
 torch = ["torch>=2.0"]
 geo = [
     "geoarrow-rust-core",
@@ -84,6 +85,7 @@ tests = [
     "tensorflow==2.20.0; sys_platform == 'linux'",
     "tqdm==4.67.1",
     "datafusion==53.0.0",
+    "opentelemetry-sdk==1.30.0",
 ]
 dev = [
     "maturin==1.13.3",

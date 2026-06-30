@@ -87,6 +87,25 @@ from .trace import capture_trace_events as capture_trace_events
 from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
+class MetricPoint:
+    name: str
+    kind: str
+    attributes: Dict[str, str]
+    value: Optional[float]
+    buckets: Optional[List[Tuple[str, int]]]
+    count: Optional[int]
+    sum: Optional[float]
+
+class MetricDescription:
+    name: str
+    kind: str
+    unit: Optional[str]
+    description: str
+
+def register_lance_metrics_recorder() -> bool: ...
+def lance_metrics_catalog() -> List[MetricDescription]: ...
+def snapshot_lance_metrics() -> List[MetricPoint]: ...
+
 class CleanupStats:
     bytes_removed: int
     old_versions: int
