@@ -70,7 +70,7 @@ impl TrigramQuery {
     /// Build an `AND` of conditions, applying identity (`All`), absorbing
     /// (`None`), flattening, sorting and de-duplication so the result is
     /// canonical and free of nested `All`/`None`.
-    fn and(items: Vec<Self>) -> Self {
+    pub(crate) fn and(items: Vec<Self>) -> Self {
         let mut flat = Vec::with_capacity(items.len());
         for item in items {
             match item {
@@ -91,7 +91,7 @@ impl TrigramQuery {
 
     /// Build an `OR` of conditions, applying absorbing (`All`), identity
     /// (`None`), flattening, sorting and de-duplication.
-    fn or(items: Vec<Self>) -> Self {
+    pub(crate) fn or(items: Vec<Self>) -> Self {
         let mut flat = Vec::with_capacity(items.len());
         for item in items {
             match item {

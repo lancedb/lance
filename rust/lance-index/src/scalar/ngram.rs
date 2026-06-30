@@ -52,7 +52,9 @@ use serde::Serialize;
 use tracing::instrument;
 
 mod ngram_regex;
+mod ngram_stop_trigrams;
 pub(crate) use ngram_regex::regex_can_use_index;
+pub(crate) use ngram_stop_trigrams::{is_stop_trigram_token, strip_stop_trigrams};
 
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
@@ -448,18 +450,26 @@ impl ScalarIndex for NGramIndex {
                     return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
                 }
 
-                let mut row_offsets = Vec::with_capacity(substr.len() * 3);
-                let mut missing = false;
+                let mut row_offsets = Vec::with_capacity(substr.len());
+                let mut selective_trigram_count = 0usize;
+                let mut missing_selective = false;
                 tokenize_visitor(&self.tokenizer, substr, |ngram| {
                     let token = ngram_to_token(ngram, NGRAM_N);
+                    if is_stop_trigram_token(token) {
+                        return;
+                    }
+                    selective_trigram_count += 1;
                     if let Some(row_offset) = self.tokens.get(&token) {
                         row_offsets.push(*row_offset);
                     } else {
-                        missing = true;
+                        missing_selective = true;
                     }
                 });
-                // At least one token was missing, so we know there are zero results
-                if missing {
+                if selective_trigram_count == 0 {
+                    return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
+                }
+                // A selective trigram was missing from the index, so there are zero results
+                if missing_selective {
                     return Ok(SearchResult::exact(RowAddrTreeMap::new()));
                 }
                 let posting_lists = futures::stream::iter(
@@ -476,7 +486,8 @@ impl ScalarIndex for NGramIndex {
                 Ok(SearchResult::at_most(RowAddrTreeMap::from(row_ids)))
             }
             TextQuery::Regex(pattern) => {
-                let trigram_query = ngram_regex::regex_to_trigram_query(pattern);
+                let trigram_query =
+                    strip_stop_trigrams(ngram_regex::regex_to_trigram_query(pattern));
                 match &trigram_query {
                     // No usable trigram structure (e.g. `a.b`, `.*`): the index
                     // cannot prune, so every row must be rechecked.
@@ -886,6 +897,9 @@ impl NGramIndexBuilder {
             if let Some(text) = text {
                 tokenize_visitor(tokenizer, text, |token| {
                     let token = ngram_to_token(token, NGRAM_N);
+                    if is_stop_trigram_token(token) {
+                        return;
+                    }
                     let partition_id = (token as usize).saturating_sub(MIN_TOKEN) / divisor;
                     partitions[partition_id % num_workers].push((token, *row_id));
                 });
@@ -1508,7 +1522,7 @@ mod tests {
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
 
         let (index, _tmpdir) = do_train(builder, data).await;
-        assert_eq!(index.tokens.len(), 21);
+        assert_eq!(index.tokens.len(), 20);
 
         // Basic search
         let res = index
@@ -1851,6 +1865,61 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_stop_trigram_filtering() {
+        let data = StringArray::from_iter_values([
+            "the quick brown fox",
+            "and they went there",
+            "uniquexyzterm",
+            "theory is not the same",
+        ]);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        assert!(!index.tokens.contains_key(&ngram_to_token("the", 3)));
+        assert!(!index.tokens.contains_key(&ngram_to_token("and", 3)));
+        assert!(index.tokens.contains_key(&ngram_to_token("xyz", 3)));
+
+        let res = index
+            .search(
+                &TextQuery::StringContains("the".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res, SearchResult::at_least(RowAddrTreeMap::new()));
+
+        let res = index
+            .search(
+                &TextQuery::StringContains("uniquexyz".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res, SearchResult::at_most(RowAddrTreeMap::from_iter([2])));
+
+        let res = index
+            .search(
+                &TextQuery::StringContains("theory".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(res, SearchResult::at_most(RowAddrTreeMap::from_iter([3])));
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_ngram_index_with_spill() {
         let (data, schema) = lance_datagen::gen_batch()
             .col(
@@ -1872,6 +1941,6 @@ mod tests {
 
         let (index, _tmpdir) = do_train(builder, data).await;
 
-        assert_eq!(index.tokens.len(), 29012);
+        assert_eq!(index.tokens.len(), 28966);
     }
 }
