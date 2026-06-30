@@ -289,7 +289,14 @@ fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
         .as_ref()
-        .is_some_and(|details| details.type_url.ends_with("FMIndexIndexDetails"))
+        .is_some_and(|details| details.type_url.ends_with("FMIndexDetails"))
+}
+
+fn segment_has_label_list_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("LabelListIndexDetails"))
 }
 
 // Cache keys for different index types
@@ -458,7 +465,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "BloomFilter" => IndexType::BloomFilter.to_string(),
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
-        "FMIndex" => IndexType::Fm.to_string(),
+        "FMIndex" | "FM" => IndexType::Fm.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -1149,7 +1156,14 @@ impl DatasetIndexExt for Dataset {
         let all_btree = source_segments.iter().all(segment_has_btree_details);
         let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
         let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
-        if !all_vector && !all_inverted && !all_bitmap && !all_btree && !all_fmindex && !all_zonemap
+        let all_label_list = source_segments.iter().all(segment_has_label_list_details);
+        if !all_vector
+            && !all_inverted
+            && !all_bitmap
+            && !all_btree
+            && !all_fmindex
+            && !all_zonemap
+            && !all_label_list
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
@@ -1170,6 +1184,8 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+        } else if all_label_list {
+            crate::index::scalar::label_list::merge_segments(self, source_segments).await?
         } else if all_zonemap {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else {

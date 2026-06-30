@@ -574,6 +574,57 @@ impl LanceFileSession {
         })?
     }
 
+    /// Non-recursive, delimited list of a single directory level.
+    ///
+    /// Returns a tuple `(common_prefixes, objects)` of paths relative to the
+    /// session's `base_path`, where `common_prefixes` are the immediate child
+    /// "directories" and `objects` are the immediate child files. Unlike
+    /// `list`, this does not recurse into the subtree.
+    #[pyo3(signature=(path=None))]
+    pub fn list_with_delimiter(
+        &self,
+        path: Option<String>,
+    ) -> PyResult<(Vec<String>, Vec<String>)> {
+        rt().block_on(None, async {
+            let list_path = if let Some(prefix) = path {
+                self.base_path.child_path(&Path::from(prefix))
+            } else {
+                self.base_path.clone()
+            };
+
+            let result = self
+                .object_store
+                .list_with_delimiter(Some(&list_path))
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+            // Strip the base_path prefix to make each path relative to the session.
+            let relativize = |location: &Path| -> PyResult<String> {
+                let relative_parts = location.prefix_match(&self.base_path).ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Path '{}' does not start with base path '{}'",
+                        location.as_ref(),
+                        self.base_path.as_ref()
+                    ))
+                })?;
+                Ok(Path::from_iter(relative_parts).as_ref().to_string())
+            };
+
+            let common_prefixes = result
+                .common_prefixes
+                .iter()
+                .map(relativize)
+                .collect::<PyResult<Vec<String>>>()?;
+            let objects = result
+                .objects
+                .iter()
+                .map(|meta| relativize(&meta.location))
+                .collect::<PyResult<Vec<String>>>()?;
+
+            Ok((common_prefixes, objects))
+        })?
+    }
+
     /// Upload a file from local filesystem to the object store
     ///
     /// Parameters
@@ -603,6 +654,61 @@ impl LanceFileSession {
                 .map_err(|e| PyIOError::new_err(format!("Failed to finalize upload: {}", e)))?;
 
             Ok(())
+        })?
+    }
+
+    /// Delete a file from the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// `contains`/`upload_file`/`download_file`. Deleting a missing object
+    /// raises `OSError`, consistent with `download_file`.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path` to delete.
+    pub fn delete_file(&self, path: String) -> PyResult<()> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            self.object_store
+                .inner
+                .delete(&full_path)
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to delete remote file: {}", e)))?;
+            Ok(())
+        })?
+    }
+
+    /// Read a byte range from a file in the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// the other session methods. This issues a single ranged GET. Reading a
+    /// missing object raises `OSError`, consistent with `download_file`.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path` to read from.
+    /// offset : int
+    ///     Byte offset at which to start reading.
+    /// length : int
+    ///     Number of bytes to read.
+    ///
+    /// Returns
+    /// -------
+    /// bytes
+    ///     The requested byte range.
+    pub fn read_range(&self, path: String, offset: usize, length: usize) -> PyResult<Vec<u8>> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            let bytes = self
+                .object_store
+                .read_one_range(&full_path, offset..offset + length)
+                .await
+                .map_err(|e| {
+                    PyIOError::new_err(format!("Failed to read range from remote file: {}", e))
+                })?;
+            Ok(bytes.to_vec())
         })?
     }
 

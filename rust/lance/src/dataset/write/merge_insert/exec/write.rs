@@ -103,6 +103,29 @@ impl MergeState {
                 // Delete action - only delete, don't write back
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
+                    let row_id = row_id_array.value(row_idx);
+
+                    // A source with duplicate keys matches the same target row
+                    // more than once; apply the same dedupe policy as updates.
+                    // (Target-only deletes from `delete_not_matched_by_source`
+                    // also reach here but never duplicate, so they never trip
+                    // `Fail`.)
+                    if !self.processed_row_ids.insert(row_id) {
+                        match self.source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    batch,
+                                    row_idx,
+                                    &self.on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                self.metrics.num_skipped_duplicates.add(1);
+                                return Ok(None); // Skip this duplicate row
+                            }
+                        }
+                    }
+
                     self.delete_row_addrs.insert(row_addr);
                     self.metrics.num_deleted_rows.add(1);
                 }
@@ -941,10 +964,14 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
                 merged_generations,
+                // Use the full pre-order field list (not just top-level `fields`) so
+                // that nested leaf field ids are included. A merge_insert rewrites whole
+                // rows, so every field is potentially modified; omitting nested ids would
+                // let `register_pure_rewrite_rows_update_frags_in_indices` wrongly extend a
+                // nested-field index over the rewritten fragment, silently dropping rows.
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),

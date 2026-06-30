@@ -32,6 +32,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::pbold;
 use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
@@ -146,6 +147,7 @@ impl MemIndexConfig {
         } else {
             InvertedIndexParams::default()
         };
+        let params = params.format_version(Self::fts_format_version_from_metadata(index_meta)?);
 
         Ok(Self::Fts(FtsIndexConfig::with_params(
             index_meta.name.clone(),
@@ -192,6 +194,21 @@ impl MemIndexConfig {
                 "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
                 type_url
             )))
+        }
+    }
+
+    fn fts_format_version_from_metadata(
+        index_meta: &IndexMetadata,
+    ) -> Result<InvertedListFormatVersion> {
+        match index_meta.index_version {
+            // Legacy Arrow FTS indexes did not use the v1/v2 metadata values, but
+            // the maintained-index path can only write the modern format.
+            0 | 1 => Ok(InvertedListFormatVersion::V1),
+            2 => Ok(InvertedListFormatVersion::V2),
+            version => Err(Error::invalid_input(format!(
+                "FTS index '{}' has unsupported index_version {}; expected 0, 1, or 2",
+                index_meta.name, version
+            ))),
         }
     }
 
@@ -869,6 +886,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use log::warn;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     /// Check if an index type is supported and log warning if not.
     fn check_index_type_supported(index_type: &str) -> bool {
@@ -909,6 +927,29 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn fts_index_metadata(index_version: i32) -> IndexMetadata {
+        let details =
+            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        let mut value = Vec::new();
+        details.encode(&mut value).unwrap();
+
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![2],
+            name: "desc_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.InvertedIndexDetails".to_string(),
+                value,
+            })),
+            index_version,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
     }
 
     /// Single-column `id` batch for primary-key lookup tests.
@@ -1009,6 +1050,44 @@ mod tests {
         assert!(check_index_type_supported("inverted"));
 
         assert!(!check_index_type_supported("unknown"));
+    }
+
+    #[test]
+    fn fts_from_metadata_preserves_format_version() {
+        let arrow_schema = create_test_schema();
+        let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        for (index_version, expected_format_version) in [
+            (0, InvertedListFormatVersion::V1),
+            (1, InvertedListFormatVersion::V1),
+            (2, InvertedListFormatVersion::V2),
+        ] {
+            let config =
+                MemIndexConfig::fts_from_metadata(&fts_index_metadata(index_version), &schema)
+                    .unwrap();
+
+            match config {
+                MemIndexConfig::Fts(config) => {
+                    assert_eq!(
+                        config.params.resolved_format_version(),
+                        expected_format_version
+                    );
+                }
+                _ => unreachable!("fts metadata should create an FTS config"),
+            }
+        }
+    }
+
+    #[test]
+    fn fts_from_metadata_rejects_unsupported_format_version() {
+        let arrow_schema = create_test_schema();
+        let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(3), &schema).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported index_version 3"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -315,7 +315,22 @@ impl LsmVectorSearchPlanner {
                         batch_store,
                         active_max_visible.expect("active arm returns its max_visible snapshot"),
                     ));
-                sort_by_distance(filtered, k)?
+                // Cross-generation supersession: a frozen (older) in-memory
+                // generation can be superseded by a newer generation's write or
+                // tombstone. The recency filter above is within-generation only;
+                // the block-list is the sole cross-gen mechanism. The newest
+                // active memtable has no newer generation (`blocked` is None), so
+                // this is a no-op there — only older frozen gens are filtered.
+                let blocked_filtered: Arc<dyn ExecutionPlan> = match blocked {
+                    Some(set) => Arc::new(super::exec::PkBlockFilterExec::new(
+                        filtered,
+                        self.pk_columns.clone(),
+                        set.clone(),
+                        k,
+                    )),
+                    None => filtered,
+                };
+                sort_by_distance(blocked_filtered, k)?
             } else {
                 match blocked {
                     Some(set) => Arc::new(super::exec::PkBlockFilterExec::new(
@@ -622,6 +637,26 @@ mod tests {
         .unwrap()
     }
 
+    /// One row with an explicit `(id, vector)` — unlike [`create_test_batch`],
+    /// the vector is not derived from `id`, so the same PK can carry different
+    /// vectors across generations (an update / move-out-of-neighborhood).
+    fn create_id_vector_batch(schema: &ArrowSchema, id: i32, vector: [f32; 4]) -> RecordBatch {
+        use arrow_array::builder::Float32Builder;
+        let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+        for v in vector {
+            builder.values().append_value(v);
+        }
+        builder.append(true);
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(vec![id])),
+                Arc::new(builder.finish()),
+            ],
+        )
+        .unwrap()
+    }
+
     async fn create_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
         let has_id = schema.column_with_name("id").is_some();
@@ -806,6 +841,127 @@ mod tests {
             "expected near-zero distance for self-match, got {}",
             dist_col.value(0)
         );
+    }
+
+    #[tokio::test]
+    async fn cross_gen_stale_version_blocked_by_newer_memtable() {
+        // A PK updated ACROSS a freeze boundary: its old (near) version lives in
+        // a frozen memtable, its new (far) version in the active one. Both are
+        // in-memory `ActiveMemTable` sources, so each gets only a per-generation
+        // recency filter (`NewestPkFilterExec`) — which can't see the newer gen.
+        // The cross-generation block-list is the only thing that can drop the
+        // stale near copy; if the active arm discards it, the frozen near version
+        // leaks as a phantom near-neighbor. This is the residual wallop fuzz
+        // delete/update phantom: the cluster constantly freezes memtables
+        // (flush_interval ~250ms), so an insert and its later delete/update split
+        // across in-memory generations.
+        use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
+        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        // Base seed far from the query; id=1 is not in the base.
+        let base_dataset =
+            Arc::new(create_dataset(&base_uri, vec![create_test_batch(&schema, &[99])]).await);
+
+        // One in-memory memtable holding `id` at `vector`, with a PK + HNSW index.
+        let make_gen = |id: i32, vector: [f32; 4], generation: u64| {
+            let batch_store = Arc::new(BatchStore::with_capacity(16));
+            let mut index_store = IndexStore::new();
+            index_store.enable_pk_index(&[("id".to_string(), 0)]);
+            index_store.add_hnsw(
+                "vector_hnsw".to_string(),
+                1,
+                "vector".to_string(),
+                lance_linalg::distance::DistanceType::L2,
+                64,
+                8,
+            );
+            let batch = create_id_vector_batch(&schema, id, vector);
+            batch_store.append(batch.clone()).unwrap();
+            index_store
+                .insert_with_batch_position(&batch, 0, Some(0))
+                .unwrap();
+            InMemoryMemTableRef {
+                batch_store,
+                index_store: Arc::new(index_store),
+                schema: schema.clone(),
+                generation,
+            }
+        };
+
+        // Frozen gen=1: id=1 @ the query vector (distance ~0).
+        let frozen = make_gen(1, [0.1, 0.2, 0.3, 0.4], 1);
+        // Active gen=2: id=1 moved FAR — the newest version of the PK.
+        let active = make_gen(1, [9.0, 9.0, 9.0, 9.0], 2);
+
+        let shard_id = uuid::Uuid::new_v4();
+        let collector = LsmDataSourceCollector::new(base_dataset, vec![]).with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active,
+                frozen: vec![frozen],
+            },
+        );
+
+        let planner = LsmVectorSearchPlanner::new(
+            collector,
+            vec!["id".to_string()],
+            schema,
+            "vector".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+        );
+
+        let query = create_query_vector();
+        let plan = planner
+            .plan_search(&query, 3, 1, None, false, 1.0)
+            .await
+            .expect("planner should produce a plan");
+        let ctx = SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut id1_distances = Vec::new();
+        for b in &batches {
+            let ids = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dist = b
+                .column_by_name(DISTANCE_COLUMN)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                if ids.value(i) == 1 {
+                    id1_distances.push(dist.value(i));
+                }
+            }
+        }
+
+        // id=1 must surface at most once, and only at its NEWEST (far) distance —
+        // never the stale near ~0 copy the frozen generation still indexes.
+        assert!(
+            id1_distances.len() <= 1,
+            "id=1 leaked its stale frozen copy (appears {} times): {id1_distances:?}",
+            id1_distances.len()
+        );
+        if let Some(d) = id1_distances.first() {
+            assert!(
+                *d > 1.0,
+                "id=1 surfaced at the stale near distance {d}; its newest version is far"
+            );
+        }
     }
 
     #[tokio::test]

@@ -225,13 +225,14 @@ use futures::future::{BoxFuture, MaybeDone, maybe_done};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
 use lance_core::datatypes::{
     BLOB_DESC_LANCE_FIELD, Field, Schema, validate_fixed_size_list_dimensions,
 };
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
+use prost::Message;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
@@ -299,6 +300,15 @@ pub enum PageEncoding {
     Structural(pb21::PageLayout),
 }
 
+impl DeepSizeOf for PageEncoding {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        match self {
+            Self::Legacy(encoding) => encoding.encoded_len() * 4,
+            Self::Structural(encoding) => encoding.encoded_len() * 4,
+        }
+    }
+}
+
 impl PageEncoding {
     pub fn as_legacy(&self) -> &pb::ArrayEncoding {
         match self {
@@ -336,6 +346,13 @@ pub struct PageInfo {
     pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
 }
 
+impl DeepSizeOf for PageInfo {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.encoding.deep_size_of_children(context)
+            + self.buffer_offsets_and_sizes.deep_size_of_children(context)
+    }
+}
+
 /// Metadata describing a column in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
@@ -348,6 +365,14 @@ pub struct ColumnInfo {
     /// File positions and their sizes of the column-level buffers
     pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     pub encoding: pb::ColumnEncoding,
+}
+
+impl DeepSizeOf for ColumnInfo {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.page_infos.deep_size_of_children(context)
+            + self.buffer_offsets_and_sizes.deep_size_of_children(context)
+            + self.encoding.encoded_len() * 4
+    }
 }
 
 impl ColumnInfo {

@@ -15,13 +15,13 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use bitpacking::{BitPacker, BitPacker4x};
 use bytes::Bytes;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use fst::Streamer;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
+use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
@@ -246,6 +246,7 @@ impl InvertedIndexBuilder {
         fragment_mask: Option<u64>,
         deleted_fragments: RoaringBitmap,
     ) -> Self {
+        let format_version = params.resolved_format_version();
         Self {
             params,
             partitions,
@@ -253,8 +254,8 @@ impl InvertedIndexBuilder {
             src_store: store,
             token_set_format,
             fragment_mask,
-            format_version: current_fts_format_version(),
-            posting_tail_codec: current_fts_format_version().posting_tail_codec(),
+            format_version,
+            posting_tail_codec: format_version.posting_tail_codec(),
             progress: noop_progress(),
             deleted_fragments,
         }
@@ -1319,9 +1320,8 @@ impl IndexWorker {
 
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
-                    let token = token_stream.token_mut();
-                    let token_text = std::mem::take(&mut token.text);
-                    let token_id = builder.tokens.add(token_text);
+                    let token = token_stream.token();
+                    let token_id = builder.tokens.get_or_add(&token.text);
                     if token_id as usize == builder.posting_lists.len() {
                         let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
                             * std::mem::size_of::<PostingListBuilder>())
@@ -1360,9 +1360,7 @@ impl IndexWorker {
 
                 let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
                 while token_stream.advance() {
-                    let token = token_stream.token_mut();
-                    let token_text = std::mem::take(&mut token.text);
-                    let token_id = self.builder.tokens.add(token_text);
+                    let token_id = self.builder.tokens.get_or_add(&token_stream.token().text);
                     self.token_ids.push(token_id);
                     token_num += 1;
                 }
@@ -2367,6 +2365,10 @@ mod tests {
             self.inner.io_parallelism()
         }
 
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(io_priority)
+        }
+
         async fn new_index_file(
             &self,
             name: &str,
@@ -2459,6 +2461,10 @@ mod tests {
 
         fn io_parallelism(&self) -> usize {
             self.inner.io_parallelism()
+        }
+
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            self.inner.with_io_priority(io_priority)
         }
 
         async fn new_index_file(
@@ -2586,6 +2592,11 @@ mod tests {
 
         fn io_parallelism(&self) -> usize {
             1
+        }
+
+        fn with_io_priority(&self, _io_priority: u64) -> Arc<dyn IndexStore> {
+            // No backing scheduler, so priority is meaningless here.
+            self.clone_arc()
         }
 
         async fn new_index_file(
@@ -3220,7 +3231,8 @@ mod tests {
             token_set_format,
             None,
             RoaringBitmap::new(),
-        );
+        )
+        .with_format_version(InvertedListFormatVersion::V1);
         builder.write(dest_store.as_ref()).await?;
 
         let metadata_reader = dest_store.open_index_file(METADATA_FILE).await?;
@@ -3284,6 +3296,14 @@ mod tests {
             .await?;
 
         let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+        let derived_params = index.derive_index_params()?;
+        let derived_params: InvertedIndexParams =
+            serde_json::from_str(derived_params.params.as_deref().unwrap())?;
+        assert_eq!(
+            derived_params.format_version,
+            Some(InvertedListFormatVersion::V1)
+        );
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc", DataType::Utf8, true),
             Field::new(ROW_ID, DataType::UInt64, false),

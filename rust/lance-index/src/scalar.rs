@@ -18,13 +18,16 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::{any::Any, ops::Bound, sync::Arc};
 
-use datafusion_expr::{Expr, expr::ScalarFunction};
+use datafusion_expr::{
+    Expr,
+    expr::{Like, ScalarFunction},
+};
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
 
 use crate::metrics::MetricsCollector;
@@ -48,7 +51,6 @@ pub mod rtree;
 pub mod zoned;
 pub mod zonemap;
 
-use crate::frag_reuse::FragReuseIndex;
 pub use inverted::tokenizer::InvertedIndexParams;
 use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
 
@@ -284,6 +286,9 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// Open an existing file for retrieval
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>>;
 
+    /// Return a store that submits its I/O at the given base priority.
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore>;
+
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
@@ -452,6 +457,19 @@ pub enum SargableQuery {
     LikePrefix(ScalarValue),
 }
 
+/// Escape the LIKE metacharacters (`\`, `%`, `_`) in a literal string so it can be
+/// embedded in a LIKE pattern and matched literally (paired with `ESCAPE '\'`).
+fn escape_like_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl AnyQuery for SargableQuery {
     fn as_any(&self) -> &dyn Any {
         self
@@ -553,16 +571,43 @@ impl AnyQuery for SargableQuery {
             )),
             Self::IsNull() => col_expr.is_null(),
             Self::Equals(value) => col_expr.eq(Expr::Literal(value.clone(), None)),
-            Self::LikePrefix(prefix) => {
-                let pattern = match prefix {
-                    ScalarValue::Utf8(Some(s)) => ScalarValue::Utf8(Some(format!("{}%", s))),
-                    ScalarValue::LargeUtf8(Some(s)) => {
-                        ScalarValue::LargeUtf8(Some(format!("{}%", s)))
+            Self::LikePrefix(prefix) => match prefix {
+                ScalarValue::Utf8(Some(s))
+                | ScalarValue::LargeUtf8(Some(s))
+                | ScalarValue::Utf8View(Some(s)) => {
+                    // The prefix is a literal string. If it contains LIKE metacharacters
+                    // (`_`, `%`, `\`) they must be escaped before appending the `%` wildcard;
+                    // otherwise an inexact recheck (e.g. zone maps) would treat them as
+                    // wildcards and over-match rows that do not start with the literal prefix.
+                    // When the prefix has no metacharacters we keep the plain
+                    // `col LIKE 'prefix%'` form (no `ESCAPE`), identical to the prior behavior,
+                    // so DataFusion's optimized prefix matcher still applies.
+                    // A `Utf8View` prefix is handled here too (rather than falling through to
+                    // the catch-all arm, which would rebuild the recheck without the trailing
+                    // `%` and silently turn prefix matching into equality matching) and is
+                    // normalized to a `Utf8` pattern below, mirroring how the parser normalizes
+                    // `Utf8View` to `Utf8` (see `expression.rs`).
+                    let escaped = escape_like_pattern(s);
+                    let needs_escape = escaped.as_str() != s.as_str();
+                    let pattern = format!("{}%", escaped);
+                    let pattern_value = match prefix {
+                        ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(pattern)),
+                        _ => ScalarValue::Utf8(Some(pattern)),
+                    };
+                    if needs_escape {
+                        Expr::Like(Like {
+                            negated: false,
+                            expr: Box::new(col_expr),
+                            pattern: Box::new(Expr::Literal(pattern_value, None)),
+                            escape_char: Some('\\'),
+                            case_insensitive: false,
+                        })
+                    } else {
+                        col_expr.like(Expr::Literal(pattern_value, None))
                     }
-                    other => other.clone(),
-                };
-                col_expr.like(Expr::Literal(pattern, None))
-            }
+                }
+                other => col_expr.like(Expr::Literal(other.clone(), None)),
+            },
         }
     }
 
@@ -960,6 +1005,17 @@ impl OldIndexDataFilter {
                 .collect(),
         }
     }
+
+    /// Apply this filter in place to a set of existing (old) row ids/addresses,
+    /// retaining only the rows the filter selects to keep. Used by index types
+    /// that merge old postings directly (e.g. bitmap) instead of re-scanning a
+    /// row-id array through [`Self::filter_row_ids`].
+    pub fn retain_old_rows(&self, rows: &mut RowAddrTreeMap) {
+        match self {
+            Self::Fragments { to_keep, .. } => rows.retain_fragments(to_keep.iter()),
+            Self::RowIds(valid_row_ids) => *rows &= valid_row_ids,
+        }
+    }
 }
 
 impl UpdateCriteria {
@@ -1075,4 +1131,83 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+}
+
+/// Abstraction over any type that can remap row IDs during index loading.
+///
+/// This decouples scalar index plugins from the table-level [`crate::frag_reuse::FragReuseIndex`]
+/// type.  [`crate::frag_reuse::FragReuseIndex`] implements this trait, but callers may also
+/// supply custom implementations for testing or other remapping strategies.
+pub trait RowIdRemapper: Send + Sync + std::fmt::Debug {
+    /// Remap a single row id.  Returns `None` if the row was deleted.
+    fn remap_row_id(&self, row_id: u64) -> Option<u64>;
+    /// Remap all addresses in a [`RowAddrTreeMap`], dropping deleted rows.
+    fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap;
+    /// Remap all row ids in a [`RoaringTreemap`], dropping deleted rows.
+    fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap;
+    /// Remap the row-id column at `row_id_idx` inside `batch`, dropping deleted rows.
+    fn remap_row_ids_record_batch(
+        &self,
+        batch: RecordBatch,
+        row_id_idx: usize,
+    ) -> Result<RecordBatch>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_like_prefix_to_expr_escapes_metacharacters() {
+        // The stored prefix is a literal string, so LIKE metacharacters in it must be
+        // escaped when the recheck predicate is rebuilt; otherwise `_`/`%` would act as
+        // wildcards and over-match. The reconstructed expression uses `ESCAPE '\'`.
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("a_b%x".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, Some('\\'));
+        assert!(!like.negated);
+        assert!(!like.case_insensitive);
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "a\\_b\\%x%");
+
+        // A prefix without metacharacters only gains the trailing wildcard and keeps the
+        // plain `LIKE 'app%'` form (no `ESCAPE`) so the optimized prefix matcher still applies.
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("app".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, None);
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "app%");
+
+        // A `Utf8View` prefix must get the same treatment instead of falling through to the
+        // catch-all arm: it is normalized to a `Utf8` pattern that keeps the trailing `%`
+        // (and `ESCAPE '\'` when the prefix has metacharacters), so prefix pruning preserves
+        // starts-with semantics rather than degrading to equality.
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8View(Some("a_b%x".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, Some('\\'));
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "a\\_b\\%x%");
+
+        let query = SargableQuery::LikePrefix(ScalarValue::Utf8View(Some("app".to_string())));
+        let Expr::Like(like) = query.to_expr("name".to_string()) else {
+            panic!("expected a LIKE expression");
+        };
+        assert_eq!(like.escape_char, None);
+        let Expr::Literal(ScalarValue::Utf8(Some(pattern)), _) = like.pattern.as_ref() else {
+            panic!("expected a Utf8 literal pattern");
+        };
+        assert_eq!(pattern.as_str(), "app%");
+    }
 }

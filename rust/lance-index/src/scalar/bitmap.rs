@@ -42,13 +42,12 @@ use super::{
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
-    frag_reuse::FragReuseIndex,
     progress::IndexBuildProgress,
     scalar::{
-        CreatedIndex, UpdateCriteria,
+        CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
             VALUE_COLUMN_NAME,
         },
     },
@@ -125,7 +124,7 @@ pub struct BitmapIndex {
 
     index_cache: WeakLanceCache,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 
     lazy_reader: LazyIndexReader,
 }
@@ -200,7 +199,7 @@ impl BitmapIndexState {
         &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<BitmapIndex>> {
         Ok(Arc::new(BitmapIndex::new(
             self.index_map.clone(),
@@ -335,7 +334,7 @@ impl BitmapIndex {
         value_type: DataType,
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         let lazy_reader = LazyIndexReader::new(store.clone());
         Self {
@@ -351,7 +350,7 @@ impl BitmapIndex {
 
     pub(crate) async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
@@ -806,13 +805,14 @@ impl ScalarIndex for BitmapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let file = BitmapIndexPlugin::streaming_build_and_write(
             new_data,
             Some(self),
             dest_store,
             BITMAP_LOOKUP_NAME,
+            old_data_filter.as_ref(),
         )
         .await?;
 
@@ -1191,6 +1191,19 @@ async fn cleanup_bitmap_shard_files(store: &dyn IndexStore, shard_files: &[Strin
 #[derive(Debug, Default)]
 pub struct BitmapIndexPlugin;
 
+/// Drop the rows an old posting should no longer expose -- rows whose fragment
+/// was removed, or (under stable row ids) rows rewritten by an update -- keeping
+/// only those `filter` still considers valid. A no-op when `filter` is `None`.
+fn retain_valid(
+    mut bitmap: RowAddrTreeMap,
+    filter: Option<&super::OldIndexDataFilter>,
+) -> RowAddrTreeMap {
+    if let Some(filter) = filter {
+        filter.retain_old_rows(&mut bitmap);
+    }
+    bitmap
+}
+
 impl BitmapIndexPlugin {
     fn get_batch_from_arrays(
         keys: Arc<dyn Array>,
@@ -1322,7 +1335,7 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
-        Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME).await
+        Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME, None).await
     }
 
     async fn train_bitmap_shard(
@@ -1337,7 +1350,8 @@ impl BitmapIndexPlugin {
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
-        let file = Self::streaming_build_and_write(data, None, index_store, &file_name).await?;
+        let file =
+            Self::streaming_build_and_write(data, None, index_store, &file_name, None).await?;
         progress.stage_complete("build_bitmap_shard").await?;
         Ok(file)
     }
@@ -1354,6 +1368,7 @@ impl BitmapIndexPlugin {
         old_index: Option<&BitmapIndex>,
         index_store: &dyn IndexStore,
         output_file_name: &str,
+        old_data_filter: Option<&super::OldIndexDataFilter>,
     ) -> Result<IndexFile> {
         let value_type = data_source.schema().field(0).data_type().clone();
 
@@ -1400,6 +1415,7 @@ impl BitmapIndexPlugin {
                                 &mut old_pos,
                                 &mut emitted_null,
                                 &mut writer,
+                                old_data_filter,
                             )
                             .await?;
                         }
@@ -1422,6 +1438,7 @@ impl BitmapIndexPlugin {
                 &mut old_pos,
                 &mut emitted_null,
                 &mut writer,
+                old_data_filter,
             )
             .await?;
         }
@@ -1429,7 +1446,13 @@ impl BitmapIndexPlugin {
         // Emit any remaining old-only entries.
         if let Some(idx) = old_index {
             while old_pos < old_keys.len() {
-                let old_bitmap = idx.load_bitmap(&old_keys[old_pos], None).await?;
+                let old_bitmap = retain_valid(
+                    idx.load_bitmap(&old_keys[old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 writer
                     .emit(old_keys[old_pos].0.clone(), &old_bitmap)
                     .await?;
@@ -1444,7 +1467,8 @@ impl BitmapIndexPlugin {
         {
             let null_key = new_null_array(&value_type, 1);
             let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
-            writer.emit(null_key, &idx.null_map).await?;
+            let null_bitmap = retain_valid((*idx.null_map).clone(), old_data_filter);
+            writer.emit(null_key, &null_bitmap).await?;
         }
 
         writer.finish().await
@@ -1453,6 +1477,7 @@ impl BitmapIndexPlugin {
     /// Flush a completed value-run from the new data stream, emitting any
     /// old-only entries that sort before it and merging the old bitmap if the
     /// key exists in both old and new.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_run(
         key: ScalarValue,
         bitmap: &mut RowAddrTreeMap,
@@ -1461,13 +1486,14 @@ impl BitmapIndexPlugin {
         old_pos: &mut usize,
         emitted_null: &mut bool,
         writer: &mut BitmapBatchWriter,
+        old_data_filter: Option<&super::OldIndexDataFilter>,
     ) -> Result<()> {
         if key.is_null() {
             // Null values are stored separately in the old index's null_map.
             if let Some(idx) = old_index
                 && !idx.null_map.is_empty()
             {
-                *bitmap |= &*idx.null_map;
+                *bitmap |= &retain_valid((*idx.null_map).clone(), old_data_filter);
             }
             *emitted_null = true;
             writer.emit(key, bitmap).await?;
@@ -1476,7 +1502,13 @@ impl BitmapIndexPlugin {
 
             // Emit old-only entries that sort before this key.
             while *old_pos < old_keys.len() && old_keys[*old_pos] < orderable {
-                let old_bitmap = idx.load_bitmap(&old_keys[*old_pos], None).await?;
+                let old_bitmap = retain_valid(
+                    idx.load_bitmap(&old_keys[*old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 writer
                     .emit(old_keys[*old_pos].0.clone(), &old_bitmap)
                     .await?;
@@ -1485,8 +1517,13 @@ impl BitmapIndexPlugin {
 
             // If the old index also has this key, merge its bitmap.
             if *old_pos < old_keys.len() && old_keys[*old_pos] == orderable {
-                let old_bitmap = idx.load_bitmap(&old_keys[*old_pos], None).await?;
-                *bitmap |= &*old_bitmap;
+                *bitmap |= &retain_valid(
+                    idx.load_bitmap(&old_keys[*old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 *old_pos += 1;
             }
 
@@ -1670,11 +1707,7 @@ pub async fn merge_bitmap_indices(
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for BitmapIndexPlugin {
-    fn name(&self) -> &str {
-        "Bitmap"
-    }
-
+impl BasicTrainer for BitmapIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1691,26 +1724,6 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             serde_json::from_str::<BitmapParameters>(params)?
         };
         Ok(Box::new(BitmapTrainingRequest::new(params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        true
-    }
-
-    fn version(&self) -> u32 {
-        BITMAP_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            false,
-        )))
     }
 
     async fn train_index(
@@ -1754,13 +1767,45 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             files: vec![file],
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for BitmapIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Bitmap"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        BITMAP_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        // Bitmap indexes cannot answer `LikePrefix` queries (see `search`), so the parser
+        // is configured to skip them and let such predicates fall back to ordinary filtering.
+        Some(Box::new(
+            SargableQueryParser::new(index_name, self.name().to_string(), false)
+                .without_like_prefix(),
+        ))
+    }
 
     /// Load an index from storage
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
@@ -1769,7 +1814,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {

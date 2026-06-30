@@ -248,4 +248,4 @@ message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
 
-message FMIndexIndexDetails {}
+message FMIndexDetails {}

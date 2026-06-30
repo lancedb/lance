@@ -530,30 +530,32 @@ impl From<&RowIdSequence> for RowAddrTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
         let mut tree_map = Self::new();
         for segment in &row_ids.0 {
+            let mut seg = Self::new();
             match segment {
                 U64Segment::Range(range) => {
-                    tree_map.insert_range(range.clone());
+                    seg.insert_range(range.clone());
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
-                    tree_map.insert_range(range.clone());
+                    seg.insert_range(range.clone());
                     for (i, val) in range.clone().enumerate() {
                         if !bitmap.get(i) {
-                            tree_map.remove(val);
+                            seg.remove(val);
                         }
                     }
                 }
                 U64Segment::RangeWithHoles { range, holes } => {
-                    tree_map.insert_range(range.clone());
+                    seg.insert_range(range.clone());
                     for hole in holes.iter() {
-                        tree_map.remove(hole);
+                        seg.remove(hole);
                     }
                 }
                 U64Segment::SortedArray(array) | U64Segment::Array(array) => {
                     for val in array.iter() {
-                        tree_map.insert(val);
+                        seg.insert(val);
                     }
                 }
             }
+            tree_map |= seg;
         }
         tree_map
     }
@@ -1038,6 +1040,27 @@ mod test {
         .into_iter()
         .collect::<RowAddrTreeMap>();
         assert_eq!(tree_map, expected);
+    }
+
+    #[test]
+    fn test_row_id_sequence_to_treemap_overlapping_segments() {
+        // Compaction can concatenate segments whose ranges overlap but whose
+        // selected ids are disjoint (here: even ids, then odd ids over 0..6).
+        // The tree map must contain every id the sequence yields.
+        let sequence = RowIdSequence(vec![
+            U64Segment::RangeWithBitmap {
+                range: 0..6,
+                bitmap: [true, false, true, false, true, false].as_slice().into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 0..6,
+                bitmap: [false, true, false, true, false, true].as_slice().into(),
+            },
+        ]);
+
+        let expected = sequence.iter().collect::<RowAddrTreeMap>();
+        assert_eq!(expected, (0..6).collect::<RowAddrTreeMap>());
+        assert_eq!(RowAddrTreeMap::from(&sequence), expected);
     }
 
     #[test]
