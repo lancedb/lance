@@ -30,7 +30,7 @@ use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use lance_arrow::iter_str_array;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
@@ -966,12 +966,16 @@ impl NGramIndexBuilder {
         Ok(())
     }
 
+    // Returns a boxed stream rather than `impl Stream` on purpose: nesting an opaque
+    // `impl Stream` inside an `async fn`'s opaque future triggers a rustc ICE under coverage
+    // instrumentation (the `dyn IndexReader` well-formedness check), so we hand back a concrete
+    // type instead. The body has no `await`, so this does not need to be async.
     fn stream_spill_reader(
         reader: Arc<dyn IndexReader>,
-    ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
+    ) -> BoxStream<'static, Result<NGramIndexSpillState>> {
         let num_rows = reader.num_rows();
 
-        Ok(stream::try_unfold(0, move |offset| {
+        stream::try_unfold(0, move |offset| {
             let reader = reader.clone();
             async move {
                 // These are small batches but, in the worst case scenario, each row could
@@ -986,17 +990,18 @@ impl NGramIndexBuilder {
                 Ok(Some((state, new_offset)))
             }
             .boxed()
-        }))
+        })
+        .boxed()
     }
 
     async fn stream_spill(
         spill_store: Arc<dyn IndexStore>,
         id: usize,
-    ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
+    ) -> Result<BoxStream<'static, Result<NGramIndexSpillState>>> {
         let reader = spill_store
             .open_index_file(&Self::spill_filename(id))
             .await?;
-        Self::stream_spill_reader(reader)
+        Ok(Self::stream_spill_reader(reader))
     }
 
     fn merge_spill_states(
@@ -1202,7 +1207,7 @@ impl NGramIndexBuilder {
 
         let left_stream = Self::stream_spill(self.spill_store.clone(), new_data_num).await?;
         let old_reader = old_index.open_index_file(POSTINGS_FILENAME).await?;
-        let right_stream = Self::stream_spill_reader(old_reader)?;
+        let right_stream = Self::stream_spill_reader(old_reader);
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 
