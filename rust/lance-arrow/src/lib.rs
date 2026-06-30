@@ -5,6 +5,8 @@
 //!
 //! To improve Arrow-RS ergonomic
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 // lance-arrow reinterprets value bytes as native numeric types in
 // `FloatArray::as_slice` for `bf16` (rust/lance-arrow/src/bfloat16.rs), which
 // requires the host byte order to match the on-disk byte order Lance writes.
