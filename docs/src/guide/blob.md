@@ -1,7 +1,9 @@
 # Blob Columns
 
 Lance supports large binary objects (images, videos, audio, model artifacts) through blob columns.
-Blob access is lazy: reads return `BlobFile` handles so callers can stream bytes on demand.
+Blob columns support both planned full-payload reads and lazy file-like access.
+For data loaders and batch processing that need complete byte payloads, use `read_blobs`.
+Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
 
 ![Blob](../images/blob.png)
 
@@ -35,9 +37,8 @@ table = pa.table(
 
 ds = lance.write_dataset(table, "./blobs_v22.lance", data_storage_version="2.2")
 
-blob = ds.take_blobs("blob", indices=[0])[0]
-with blob as f:
-    assert f.read() == b"hello blob v2"
+_row_address, payload = ds.read_blobs("blob", indices=[0])[0]
+assert payload == b"hello blob v2"
 ```
 
 ## Version Compatibility (Single Source of Truth)
@@ -160,8 +161,20 @@ ds = lance.write_dataset(
 
 ## Blob v2 Read Patterns
 
-Use `take_blobs` to fetch file-like handles.
-Exactly one selector must be provided: `ids`, `indices`, or `addresses`.
+Choose the read API based on the payload shape you want:
+
+| API | Returns | Use When |
+|---|---|---|
+| `read_blobs` | `List[Tuple[int, bytes]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
+| `take_blobs` | `List[BlobFile]` | You need file-like objects for streaming, seeking, or partial reads. |
+| `scanner(..., blob_handling="all_binary")` | Arrow binary columns | You want blob columns in a scan result or `pyarrow.Table`. |
+
+Do not wrap `take_blobs` in your own thread pool just to call `read()` or
+`readall()` on every blob. Use `read_blobs` instead; it plans and executes
+batched blob reads through Lance's scheduler.
+
+Exactly one selector must be provided to `read_blobs` or `take_blobs`: `ids`,
+`indices`, or `addresses`.
 
 | Selector | Typical Use | Stability |
 |---|---|---|
@@ -169,7 +182,49 @@ Exactly one selector must be provided: `ids`, `indices`, or `addresses`.
 | `ids` | Logical row-id based reads | Stable logical identity (when row ids are available) |
 | `addresses` | Low-level physical reads and debugging | Unstable physical location |
 
-### Read by row indices
+### Read complete payloads by row indices
+
+```python
+import lance
+
+ds = lance.dataset("./blobs_v22.lance")
+rows = ds.read_blobs("blob", indices=[0, 1])
+payloads = [payload for _row_address, payload in rows]
+```
+
+### Read complete payloads by row ids
+
+```python
+import lance
+
+ds = lance.dataset("./blobs_v22.lance")
+row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
+
+rows = ds.read_blobs("blob", ids=row_ids[:2])
+```
+
+### Read complete payloads by row addresses
+
+```python
+import lance
+
+ds = lance.dataset("./blobs_v22.lance")
+row_addrs = ds.to_table(columns=[], with_row_address=True).column("_rowaddr").to_pylist()
+
+rows = ds.read_blobs("blob", addresses=row_addrs[:2])
+```
+
+### Read blob columns as Arrow binary
+
+```python
+import lance
+
+ds = lance.dataset("./blobs_v22.lance")
+table = ds.scanner(columns=["blob"], blob_handling="all_binary").to_table()
+payloads = table.column("blob").to_pylist()
+```
+
+### Open file-like blob handles lazily
 
 ```python
 import lance
@@ -178,29 +233,7 @@ ds = lance.dataset("./blobs_v22.lance")
 blobs = ds.take_blobs("blob", indices=[0, 1])
 
 with blobs[0] as f:
-    data = f.read()
-```
-
-### Read by row ids
-
-```python
-import lance
-
-ds = lance.dataset("./blobs_v22.lance")
-row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
-
-blobs = ds.take_blobs("blob", ids=row_ids[:2])
-```
-
-### Read by row addresses
-
-```python
-import lance
-
-ds = lance.dataset("./blobs_v22.lance")
-row_addrs = ds.to_table(columns=[], with_row_address=True).column("_rowaddr").to_pylist()
-
-blobs = ds.take_blobs("blob", addresses=row_addrs[:2])
+    header = f.read(1024)
 ```
 
 ### Example: decode video frames lazily
@@ -328,7 +361,7 @@ Fix:
 
 Cause:
 
-- `take_blobs` received none or multiple selectors.
+- `read_blobs` or `take_blobs` received none or multiple selectors.
 
 Fix:
 
