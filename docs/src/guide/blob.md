@@ -1,21 +1,24 @@
 # Blob Columns
 
-Lance supports large binary objects (images, videos, audio, model artifacts) through blob columns.
+Lance stores large binary objects (images, videos, audio, model artifacts) in blob columns, where they are treated like any other column payload in the dataset.
 Blob columns support both planned full-payload reads and lazy file-like access.
-For data loaders and batch processing that need complete byte payloads, use `read_blobs`.
-Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
+
+!!! tip "Choosing between `read_blobs` and `take_blobs`"
+    - For data loaders and batch processing that need complete byte payloads, use `read_blobs`.
+    - Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
+
 
 ![Blob](../images/blob.png)
 
-## What This Page Covers
+See the sections below to explore the read and write access patterns in more detail.
 
-This page focuses on Python blob workflows and uses Lance file format terminology.
+## Quick Start: Blob v2
+
+This page focuses on blob workflows in Python and uses Lance file format terminology.
 
 - `data_storage_version` means the Lance **file format version** of a dataset.
 - A dataset's `data_storage_version` is fixed once the dataset is created.
 - If you need a different file format version, write a **new dataset**.
-
-## Quick Start (Blob v2)
 
 ```python
 import lance
@@ -41,18 +44,23 @@ _row_address, payload = ds.read_blobs("blob", indices=[0])[0]
 assert payload == b"hello blob v2"
 ```
 
-## Version Compatibility (Single Source of Truth)
+## Version Compatibility
+
+Blob support is tied to the dataset's file format version. Earlier file format versions
+(`< 2.2`) stored blobs using the `lance-encoding:blob` metadata field, while Blob
+v2 introduces a new storage layout that requires file format `>= 2.2`.
+
+The two
+schemes are mutually exclusive: for file format `>= 2.2`, legacy blob metadata
+(`lance-encoding:blob`) is rejected on write. The table below is the single
+source of truth for which scheme is supported at each `data_storage_version`.
 
 | Dataset `data_storage_version` | Legacy blob metadata (`lance-encoding:blob`) | Blob v2 (`lance.blob.v2`) |
 |---|---|---|
 | `0.1`, `2.0`, `2.1` | Supported for write/read | Not supported |
 | `2.2+` | Not supported for write | Supported for write/read (recommended) |
 
-Important:
-
-- For file format `>= 2.2`, legacy blob metadata (`lance-encoding:blob`) is rejected on write.
-
-## Blob v2 Write Patterns
+## Blob v2: Write Patterns
 
 Use `blob_field` and `blob_array` to build blob v2 columns.
 
@@ -159,7 +167,7 @@ ds = lance.write_dataset(
 )
 ```
 
-## Blob v2 Read Patterns
+## Blob v2: Read Patterns
 
 Choose the read API based on the payload shape you want:
 
@@ -262,10 +270,10 @@ with av.open(blob) as container:
         pass
 ```
 
-## Legacy Compatibility Appendix (`data_storage_version` <= `2.1`)
+## Legacy Compatibility (`data_storage_version` <= `2.1`)
 
 If you need to keep writing legacy blob columns, use file format `0.1`, `2.0`, or `2.1`
-and mark `LargeBinary` fields with `lance-encoding:blob = true`.
+and mark `LargeBinary` fields with a metadata kwarg `"lance-encoding:blob": true`.
 
 ```python
 import lance
@@ -295,12 +303,12 @@ ds = lance.write_dataset(
 )
 ```
 
-This write pattern is invalid for `data_storage_version >= 2.2`.
-For new datasets, prefer blob v2.
+As mentioned above, this write pattern is invalid for `data_storage_version >= 2.2`.
+For new datasets, it's recommended to use Lance file format 2.2, which uses blob v2 by default.
 
 ## Rewrite to a New Blob v2 Dataset
 
-If your current dataset is legacy blob and you want blob v2, rewrite into a new dataset with `data_storage_version="2.2"`.
+If your current dataset consists of legacy blobs (stored in file formats <2.2) and you want to opt in to blob v2, you must rewrite it as a new dataset with `data_storage_version="2.2"`.
 
 ```python
 import lance
@@ -330,39 +338,23 @@ lance.write_dataset(
 )
 ```
 
-Warning:
-
-- The example above materializes binary payloads in memory (`blob_handling="all_binary"` and `to_pylist()`).
-- For large datasets, prefer chunked/batched rewrite pipelines.
+!!! warning
+    - The example above materializes binary payloads in memory (`blob_handling="all_binary"` and `to_pylist()`).
+    - For large datasets, prefer chunked/batched rewrite pipelines.
 
 ## Troubleshooting
 
-### "Blob v2 requires file version >= 2.2"
+This section contains commonly noticed issues or errors, and explains how to address them.
 
-Cause:
+### Blob v2 requires file version >= 2.2
+**Cause**: You are writing blob v2 values into a dataset/file format below `2.2`.  
+**Fix**: Write to a dataset created with `data_storage_version="2.2"` (or newer).
 
-- You are writing blob v2 values into a dataset/file format below `2.2`.
+### Legacy blob columns ... are not supported for file version >= 2.2
+**Cause**: You are using legacy blob metadata (`lance-encoding:blob`) while writing `2.2+` data.  
+**Fix**: Replace legacy metadata-based columns with blob v2 columns (`blob_field` / `blob_array`).
 
-Fix:
 
-- Write to a dataset created with `data_storage_version="2.2"` (or newer).
-
-### "Legacy blob columns ... are not supported for file version >= 2.2"
-
-Cause:
-
-- You are using legacy blob metadata (`lance-encoding:blob`) while writing `2.2+` data.
-
-Fix:
-
-- Replace legacy metadata-based columns with blob v2 columns (`blob_field` / `blob_array`).
-
-### "Exactly one of ids, indices, or addresses must be specified"
-
-Cause:
-
-- `read_blobs` or `take_blobs` received none or multiple selectors.
-
-Fix:
-
-- Provide exactly one of `ids`, `indices`, or `addresses`.
+### Exactly one of ids, indices, or addresses must be specified
+**Cause**: `read_blobs` or `take_blobs` received none or multiple selectors.  
+**Fix**: Provide exactly one of `ids`, `indices`, or `addresses`.
