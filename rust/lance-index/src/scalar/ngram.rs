@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::iter::once;
 use std::time::Instant;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -20,8 +20,7 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -48,7 +47,7 @@ use lance_tokenizer::{
 };
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 mod ngram_regex;
@@ -57,7 +56,22 @@ pub(crate) use ngram_regex::regex_can_use_index;
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
 const POSTINGS_FILENAME: &str = "ngram_postings.lance";
-const NGRAM_INDEX_VERSION: u32 = 0;
+const NGRAM_TRIGRAM_INDEX_VERSION: u32 = 0;
+const NGRAM_SPARSE_INDEX_VERSION: u32 = 1;
+
+// The Index format version is checked before loading. The postings metadata is used
+// after loading to pick the query tokenization without changing protobuf index
+// details.
+const NGRAM_TOKENIZATION_METADATA_KEY: &str = "lance.ngram.tokenization";
+
+// FNV-1a constants used to map variable-length sparse n-grams into the existing
+// u32 token column.
+const SPARSE_HASH_OFFSET: u32 = 0x811c9dc5;
+const SPARSE_HASH_PRIME: u32 = 0x01000193;
+const SPARSE_MIN_NGRAM_LEN: usize = 3;
+// Bound sparse token generation so one very long URL/base64/id run cannot
+// materialize every substring during index build or query planning.
+const SPARSE_MAX_NGRAM_LEN: usize = 128;
 
 use std::sync::LazyLock;
 
@@ -109,6 +123,47 @@ const MAX_TOKEN: usize = ALPHA_SPAN.pow(2) + ALPHA_SPAN;
 const MIN_TOKEN: usize = 0;
 const NGRAM_N: usize = 3;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NGramTokenization {
+    #[default]
+    Trigram,
+    Sparse,
+}
+
+impl NGramTokenization {
+    fn as_metadata_value(self) -> &'static str {
+        match self {
+            Self::Trigram => "trigram",
+            Self::Sparse => "sparse",
+        }
+    }
+
+    fn from_metadata_value(value: Option<&String>) -> Result<Self> {
+        match value.map(String::as_str) {
+            None | Some("trigram") => Ok(Self::Trigram),
+            Some("sparse") => Ok(Self::Sparse),
+            Some(other) => Err(Error::invalid_input_source(
+                format!("Unknown ngram tokenization mode: {other}").into(),
+            )),
+        }
+    }
+
+    fn index_version(self) -> u32 {
+        match self {
+            Self::Trigram => NGRAM_TRIGRAM_INDEX_VERSION,
+            Self::Sparse => NGRAM_SPARSE_INDEX_VERSION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NGramIndexParams {
+    #[serde(default)]
+    pub tokenization: NGramTokenization,
+}
+
 // Convert an ngram (string) to a token (u32).  This helps avoid heap allocations
 // and it makes it easier to partition the tokens for shuffling
 //
@@ -147,10 +202,244 @@ fn ngram_to_token(ngram: &str, ngram_length: usize) -> u32 {
     token
 }
 
+// Stable FNV-1a hash for persisted sparse token ids. Collisions only add false
+// positives because NGram search results are rechecked by the scan.
+fn stable_sparse_hash(bytes: impl IntoIterator<Item = u8>) -> u32 {
+    let mut hash = SPARSE_HASH_OFFSET;
+    for byte in bytes {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(SPARSE_HASH_PRIME);
+    }
+    // Token 0 is reserved for NULL rows. Hash collisions are acceptable because
+    // this index always returns candidates that are rechecked by the scan.
+    if hash == 0 { 1 } else { hash }
+}
+
+// Prefix sparse n-gram bytes before hashing so future token families can share
+// the u32 postings column without reusing the same hash namespace.
+fn sparse_ngram_to_token(ngram: &[u8]) -> u32 {
+    stable_sparse_hash(
+        b"lance_sparse_ngram_v1"
+            .iter()
+            .copied()
+            .chain(ngram.iter().copied()),
+    )
+}
+
+fn sparse_pair_weight(left: u8, right: u8) -> u32 {
+    stable_sparse_hash([left, right])
+}
+
+// Apply the same text normalization as the trigram tokenizer, then expose only
+// ASCII-alphanumeric runs so byte offsets remain valid sparse n-gram boundaries.
+fn normalized_alnum_runs(text: &str, mut visitor: impl FnMut(&str)) {
+    let mut prepper = TEXT_PREPPER.clone();
+    let mut raw_stream = prepper.token_stream(text);
+    while raw_stream.advance() {
+        let mut run = String::new();
+        for ch in raw_stream.token().text.chars() {
+            if ch.is_ascii_alphanumeric() {
+                run.push(ch);
+            } else if !run.is_empty() {
+                visitor(&run);
+                run.clear();
+            }
+        }
+        if !run.is_empty() {
+            visitor(&run);
+        }
+    }
+}
+
+// A sparse token plus the byte range it covers within a normalized run. The
+// range is used by query covering; the index build path only needs `token`.
+#[derive(Debug, Clone, Copy)]
+struct SparseTokenSpan {
+    token: u32,
+    #[cfg(test)]
+    start: usize,
+    #[cfg(test)]
+    end: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SparsePair {
+    // A sparse n-gram boundary is represented by the hash weight of an
+    // adjacent byte pair. `pos` is the byte offset of the pair's first byte.
+    weight: u32,
+    pos: usize,
+}
+
+fn sparse_span(bytes: &[u8], start: usize, end: usize) -> SparseTokenSpan {
+    SparseTokenSpan {
+        token: sparse_ngram_to_token(&bytes[start..end]),
+        #[cfg(test)]
+        start,
+        #[cfg(test)]
+        end,
+    }
+}
+
+fn push_sparse_span(spans: &mut Vec<SparseTokenSpan>, bytes: &[u8], start: usize, end: usize) {
+    if end - start <= SPARSE_MAX_NGRAM_LEN {
+        spans.push(sparse_span(bytes, start, end));
+    }
+}
+
+// Generate the sparse n-grams stored in the index with the standard monotonic
+// stack construction. A bounded span is emitted when its boundary pair weights
+// dominate the internal pair weights.
+fn sparse_spans_for_run(run: &str) -> Vec<SparseTokenSpan> {
+    let bytes = run.as_bytes();
+    if bytes.len() < SPARSE_MIN_NGRAM_LEN {
+        return Vec::new();
+    }
+
+    let mut spans = Vec::new();
+    // Monotonic stack of candidate boundary pairs, ordered by non-increasing
+    // pair weight from bottom to top.
+    let mut stack: Vec<SparsePair> = Vec::new();
+    for pair_pos in 0..bytes.len() - 1 {
+        let pair = SparsePair {
+            weight: sparse_pair_weight(bytes[pair_pos], bytes[pair_pos + 1]),
+            pos: pair_pos,
+        };
+        while stack.last().is_some_and(|last| pair.weight > last.weight) {
+            let start = stack.last().unwrap().pos;
+            // The current pair becomes the right boundary for the span whose
+            // left boundary is the pending tail pair.
+            push_sparse_span(&mut spans, bytes, start, pair_pos + 2);
+            // Equal-weight suffix pairs form a plateau. Sparse n-gram
+            // boundaries require strict domination over internal pairs, so the
+            // plateau can be collapsed before removing the dominated boundary.
+            while stack.len() > 1 && stack.last().unwrap().weight == stack[stack.len() - 2].weight {
+                stack.pop();
+            }
+            stack.pop();
+        }
+        if let Some(last) = stack.last() {
+            // The stack tail and the current pair form a valid sparse span. For
+            // adjacent pairs this emits the minimum-length token with no
+            // internal pair.
+            push_sparse_span(&mut spans, bytes, last.pos, pair_pos + 2);
+        }
+        stack.push(pair);
+    }
+    spans
+}
+
+// Index construction stores every sparse token for each normalized run. Query
+// planning can then choose a smaller covering subset without missing matches.
+fn sparse_index_token_visitor(text: &str, mut visitor: impl FnMut(u32)) {
+    normalized_alnum_runs(text, |run| {
+        for span in sparse_spans_for_run(run) {
+            visitor(span.token);
+        }
+    });
+}
+
+// Query planning uses the covering sparse n-gram stack construction so it can
+// read fewer, longer posting lists than the fixed-trigram path.
+fn sparse_covering_tokens(text: &str) -> Vec<u32> {
+    let mut tokens = Vec::new();
+    normalized_alnum_runs(text, |run| {
+        let bytes = run.as_bytes();
+        if bytes.len() < SPARSE_MIN_NGRAM_LEN {
+            return;
+        }
+
+        // Keep boundary candidates in a deque ordered by byte position. The
+        // front is the oldest boundary still available for the current
+        // covering window, and the back is the newest boundary being compared
+        // against the next adjacent pair. It is also monotonic by weight from
+        // front to back, with non-increasing pair weights.
+        let mut stack: VecDeque<SparsePair> = VecDeque::new();
+        for pair_pos in 0..bytes.len() - 1 {
+            let pair = SparsePair {
+                weight: sparse_pair_weight(bytes[pair_pos], bytes[pair_pos + 1]),
+                pos: pair_pos,
+            };
+
+            if stack.len() > 1 {
+                let covering_len = pair_pos + 2 - stack.front().unwrap().pos;
+                if covering_len > SPARSE_MAX_NGRAM_LEN {
+                    // The first two entries are adjacent surviving boundaries.
+                    // The build path emits the same bounded span when the
+                    // second boundary is pushed, so this token is safe to
+                    // require during query filtering.
+                    let start = stack.front().unwrap().pos;
+                    let end = stack[1].pos + 2;
+                    tokens.push(sparse_ngram_to_token(&bytes[start..end]));
+                    stack.pop_front();
+                }
+            }
+
+            while stack.back().is_some_and(|last| pair.weight > last.weight) {
+                // Query covering intentionally emits fewer tokens than index
+                // build. The index stores all valid sparse n-grams, but a
+                // query only needs a covering subset. Emit here only when the
+                // stack must be closed, such as for an equal-weight suffix.
+                if stack.front().unwrap().weight == stack.back().unwrap().weight {
+                    let start = stack.back().unwrap().pos;
+                    tokens.push(sparse_ngram_to_token(&bytes[start..pair_pos + 2]));
+                    while stack.len() > 1 {
+                        let end = stack.back().unwrap().pos + 2;
+                        stack.pop_back();
+                        let start = stack.back().unwrap().pos;
+                        tokens.push(sparse_ngram_to_token(&bytes[start..end]));
+                    }
+                }
+                stack.pop_back();
+            }
+
+            stack.push_back(pair);
+        }
+
+        // The run ended before these pending boundaries were closed by a
+        // higher-weight pair. Emit adjacent spans to cover the remaining
+        // monotonic suffix; adjacent spans have no internal pair, so they are
+        // valid sparse n-grams.
+        while stack.len() > 1 {
+            let end = stack.back().unwrap().pos + 2;
+            stack.pop_back();
+            let start = stack.back().unwrap().pos;
+            tokens.push(sparse_ngram_to_token(&bytes[start..end]));
+        }
+    });
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+// Convert a query literal into the token ids required by the selected
+// tokenization. Regex analysis uses this for literal fragments as well.
+fn query_tokens_for_text(tokenization: NGramTokenization, text: &str) -> Vec<u32> {
+    match tokenization {
+        NGramTokenization::Trigram => {
+            let mut tokens = Vec::new();
+            tokenize_visitor(&NGRAM_TOKENIZER, text, |ngram| {
+                tokens.push(ngram_to_token(ngram, NGRAM_N));
+            });
+            tokens
+        }
+        NGramTokenization::Sparse => sparse_covering_tokens(text),
+    }
+}
+
+// Persist the tokenization mode in the postings file so an index can recover
+// query tokenization after it is loaded.
+fn ngram_metadata(tokenization: NGramTokenization) -> HashMap<String, String> {
+    HashMap::from([(
+        NGRAM_TOKENIZATION_METADATA_KEY.to_string(),
+        tokenization.as_metadata_value().to_string(),
+    )])
+}
+
 /// Basic stats about an ngram index
 #[derive(Serialize)]
 struct NGramStatistics {
     num_ngrams: usize,
+    tokenization: NGramTokenization,
 }
 
 /// The row ids that contain a given ngram
@@ -268,13 +557,10 @@ impl NGramPostingListReader {
 pub struct NGramIndex {
     /// The mapping from tokens to row offsets
     tokens: HashMap<u32, u32>,
+    /// Tokenization mode used to build this index and to derive query tokens.
+    tokenization: NGramTokenization,
     /// The reader for the posting lists
     list_reader: Arc<NGramPostingListReader>,
-    /// The tokenizer used to tokenize text.  Note: not all tokenizers can be used with this index.  For
-    /// example, a stemming tokenizer would not work well because "dozing" would stem to "doze" and if the
-    /// search term is "zing" it would not match.  As a result, this tokenizer is not as configurable as the
-    /// tokenizers used in an inverted index.
-    tokenizer: TextAnalyzer,
     io_parallelism: usize,
     /// The store that owns the index
     store: Arc<dyn IndexStore>,
@@ -301,9 +587,15 @@ impl NGramIndex {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
     ) -> Result<Self> {
-        let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
-        let tokens = tokens
-            .read_range(0..tokens.num_rows(), Some(&[TOKENS_COL]))
+        let tokens_reader = store.open_index_file(POSTINGS_FILENAME).await?;
+        let tokenization = NGramTokenization::from_metadata_value(
+            tokens_reader
+                .schema()
+                .metadata
+                .get(NGRAM_TOKENIZATION_METADATA_KEY),
+        )?;
+        let tokens = tokens_reader
+            .read_range(0..tokens_reader.num_rows(), Some(&[TOKENS_COL]))
             .await?;
 
         let tokens_map = HashMap::from_iter(
@@ -316,7 +608,6 @@ impl NGramIndex {
                 .enumerate()
                 .map(|(idx, token)| (token, idx as u32)),
         );
-
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
             frag_reuse_index,
@@ -326,8 +617,8 @@ impl NGramIndex {
         Ok(Self {
             io_parallelism: store.io_parallelism(),
             tokens: tokens_map,
+            tokenization,
             list_reader: posting_reader,
-            tokenizer: NGRAM_TOKENIZER.clone(),
             store,
         })
     }
@@ -384,6 +675,10 @@ impl NGramIndex {
             Self::from_store(store, frag_reuse_index, index_cache).await?,
         ))
     }
+
+    fn query_tokens_for_text(&self, text: &str) -> Vec<u32> {
+        query_tokens_for_text(self.tokenization, text)
+    }
 }
 
 #[async_trait]
@@ -399,6 +694,7 @@ impl Index for NGramIndex {
     fn statistics(&self) -> Result<serde_json::Value> {
         let ngram_stats = NGramStatistics {
             num_ngrams: self.tokens.len(),
+            tokenization: self.tokenization,
         };
         serde_json::to_value(ngram_stats)
             .map_err(|e| Error::internal(format!("Error serializing statistics: {}", e)))
@@ -450,14 +746,17 @@ impl ScalarIndex for NGramIndex {
 
                 let mut row_offsets = Vec::with_capacity(substr.len() * 3);
                 let mut missing = false;
-                tokenize_visitor(&self.tokenizer, substr, |ngram| {
-                    let token = ngram_to_token(ngram, NGRAM_N);
+                let query_tokens = self.query_tokens_for_text(substr);
+                if query_tokens.is_empty() {
+                    return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
+                }
+                for token in query_tokens {
                     if let Some(row_offset) = self.tokens.get(&token) {
                         row_offsets.push(*row_offset);
                     } else {
                         missing = true;
                     }
-                });
+                }
                 // At least one token was missing, so we know there are zero results
                 if missing {
                     return Ok(SearchResult::exact(RowAddrTreeMap::new()));
@@ -476,23 +775,21 @@ impl ScalarIndex for NGramIndex {
                 Ok(SearchResult::at_most(RowAddrTreeMap::from(row_ids)))
             }
             TextQuery::Regex(pattern) => {
-                let trigram_query = ngram_regex::regex_to_trigram_query(pattern);
-                match &trigram_query {
-                    // No usable trigram structure (e.g. `a.b`, `.*`): the index
+                let ngram_query = ngram_regex::regex_to_ngram_query(pattern, self.tokenization);
+                match &ngram_query {
+                    // No usable ngram structure (e.g. `a.b`, `.*`): the index
                     // cannot prune, so every row must be rechecked.
-                    ngram_regex::TrigramQuery::All => {
+                    ngram_regex::NGramQuery::All => {
                         Ok(SearchResult::at_least(RowAddrTreeMap::new()))
                     }
                     // The pattern is provably unsatisfiable.
-                    ngram_regex::TrigramQuery::None => {
-                        Ok(SearchResult::exact(RowAddrTreeMap::new()))
-                    }
+                    ngram_regex::NGramQuery::None => Ok(SearchResult::exact(RowAddrTreeMap::new())),
                     _ => {
                         let mut tokens = HashSet::new();
-                        ngram_regex::collect_tokens(&trigram_query, &mut tokens);
-                        // Fetch the posting list for every trigram the condition
+                        ngram_regex::collect_tokens(&ngram_query, &mut tokens);
+                        // Fetch the posting list for every token the condition
                         // references; a token absent from the index contributes
-                        // an empty list, which `eval_trigram_query` handles.
+                        // an empty list, which `eval_ngram_query` handles.
                         let present = tokens.into_iter().filter_map(|token| {
                             self.tokens.get(&token).map(|offset| (token, *offset))
                         });
@@ -509,7 +806,7 @@ impl ScalarIndex for NGramIndex {
                             .into_iter()
                             .map(|(token, list)| (token, list.bitmap.clone()))
                             .collect();
-                        let row_ids = ngram_regex::eval_trigram_query(&trigram_query, &bitmaps);
+                        let row_ids = ngram_regex::eval_ngram_query(&ngram_query, &bitmaps);
                         Ok(SearchResult::at_most(RowAddrTreeMap::from(row_ids)))
                     }
                 }
@@ -542,12 +839,14 @@ impl ScalarIndex for NGramIndex {
             offset += BATCH_SIZE;
         }
 
-        let file = writer.finish().await?;
+        let file = writer
+            .finish_with_metadata(ngram_metadata(self.tokenization))
+            .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
-            index_version: NGRAM_INDEX_VERSION,
+            index_version: self.tokenization.index_version(),
             files: vec![file],
         })
     }
@@ -558,7 +857,10 @@ impl ScalarIndex for NGramIndex {
         dest_store: &dyn IndexStore,
         _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
+        let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
+            tokenization: self.tokenization,
+            ..NGramIndexBuilderOptions::default()
+        })?;
         let spill_files = builder.train(new_data).await?;
 
         let file = builder
@@ -568,7 +870,7 @@ impl ScalarIndex for NGramIndex {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
-            index_version: NGRAM_INDEX_VERSION,
+            index_version: self.tokenization.index_version(),
             files: vec![file],
         })
     }
@@ -578,13 +880,21 @@ impl ScalarIndex for NGramIndex {
     }
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
-        Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::NGram))
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        if self.tokenization == NGramTokenization::Trigram {
+            Ok(params)
+        } else {
+            Ok(params.with_params(&NGramIndexParams {
+                tokenization: self.tokenization,
+            }))
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct NGramIndexBuilderOptions {
     tokens_per_spill: usize,
+    tokenization: NGramTokenization,
 }
 
 // A higher value will use more RAM.  A lower value will have to do more spilling
@@ -618,6 +928,7 @@ impl Default for NGramIndexBuilderOptions {
     fn default() -> Self {
         Self {
             tokens_per_spill: *DEFAULT_TOKENS_PER_SPILL,
+            tokenization: NGramTokenization::Trigram,
         }
     }
 }
@@ -871,6 +1182,7 @@ impl NGramIndexBuilder {
 
     fn tokenize_and_partition(
         tokenizer: &TextAnalyzer,
+        tokenization: NGramTokenization,
         batch: RecordBatch,
         num_workers: usize,
     ) -> Result<Vec<Vec<(u32, u64)>>> {
@@ -884,16 +1196,26 @@ impl NGramIndexBuilder {
         let divisor = (MAX_TOKEN - MIN_TOKEN) / num_workers;
         for (text, row_id) in text_iter.zip(row_id_col.values()) {
             if let Some(text) = text {
-                tokenize_visitor(tokenizer, text, |token| {
-                    let token = ngram_to_token(token, NGRAM_N);
-                    let partition_id = (token as usize).saturating_sub(MIN_TOKEN) / divisor;
-                    partitions[partition_id % num_workers].push((token, *row_id));
-                });
+                match tokenization {
+                    NGramTokenization::Trigram => tokenize_visitor(tokenizer, text, |token| {
+                        let token = ngram_to_token(token, NGRAM_N);
+                        let partition_id = (token as usize).saturating_sub(MIN_TOKEN) / divisor;
+                        partitions[partition_id % num_workers].push((token, *row_id));
+                    }),
+                    NGramTokenization::Sparse => sparse_index_token_visitor(text, |token| {
+                        let partition_id = token as usize % num_workers;
+                        partitions[partition_id].push((token, *row_id));
+                    }),
+                }
             } else {
                 partitions[0].push((0, *row_id));
             }
         }
         Ok(partitions)
+    }
+
+    fn write_metadata(&self) -> HashMap<String, String> {
+        ngram_metadata(self.options.tokenization)
     }
 
     pub async fn train(&mut self, data: SendableRecordBatchStream) -> Result<Vec<usize>> {
@@ -920,9 +1242,11 @@ impl NGramIndexBuilder {
         let mut partitions_stream = data
             .and_then(|batch| {
                 let tokenizer = self.tokenizer.clone();
+                let tokenization = self.options.tokenization;
                 std::future::ready(Ok(tokio::task::spawn(async move {
                     Ok(Self::tokenize_and_partition(
                         &tokenizer,
+                        tokenization,
                         batch,
                         num_workers,
                     )?)
@@ -1233,7 +1557,7 @@ impl NGramIndexBuilder {
                 let mut writer = store
                     .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
                     .await?;
-                return writer.finish().await;
+                return writer.finish_with_metadata(self.write_metadata()).await;
             }
         }
 
@@ -1258,12 +1582,37 @@ impl NGramIndexBuilder {
             offset += batch_size;
         }
 
-        writer.finish().await
+        writer.finish_with_metadata(self.write_metadata()).await
     }
 }
 
 #[derive(Debug, Default)]
 pub struct NGramIndexPlugin;
+
+// Carries parsed NGram index parameters from request parsing into training.
+struct NGramTrainingRequest {
+    criteria: TrainingCriteria,
+    params: NGramIndexParams,
+}
+
+impl NGramTrainingRequest {
+    fn new(params: NGramIndexParams) -> Self {
+        Self {
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            params,
+        }
+    }
+}
+
+impl TrainingRequest for NGramTrainingRequest {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
 
 impl NGramIndexPlugin {
     pub async fn train_ngram_index(
@@ -1286,7 +1635,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
 
     fn new_training_request(
         &self,
-        _params: &str,
+        params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
@@ -1296,9 +1645,14 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             )
             .into()));
         }
-        Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-        )))
+        let parsed_params = if params.trim().is_empty() {
+            NGramIndexParams::default()
+        } else {
+            serde_json::from_str(params).map_err(|e| {
+                Error::invalid_input_source(format!("Invalid NGram index params: {e}").into())
+            })?
+        };
+        Ok(Box::new(NGramTrainingRequest::new(parsed_params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -1306,7 +1660,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        NGRAM_INDEX_VERSION
+        NGRAM_SPARSE_INDEX_VERSION
     }
 
     fn new_query_parser(
@@ -1328,7 +1682,7 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        _request: Box<dyn TrainingRequest>,
+        request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
@@ -1338,11 +1692,21 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             ));
         }
 
-        let file = Self::train_ngram_index(data, index_store).await?;
+        let request = request
+            .as_any()
+            .downcast_ref::<NGramTrainingRequest>()
+            .ok_or_else(|| Error::internal("Invalid NGram training request type"))?;
+        let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
+            tokenization: request.params.tokenization,
+            ..NGramIndexBuilderOptions::default()
+        })?;
+
+        let spill_files = builder.train(data).await?;
+        let file = builder.write_index(index_store, spill_files, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())
                 .unwrap(),
-            index_version: NGRAM_INDEX_VERSION,
+            index_version: request.params.tokenization.index_version(),
             files: vec![file],
         })
     }
@@ -1366,7 +1730,7 @@ mod tests {
     };
 
     use arrow::datatypes::UInt64Type;
-    use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{Array, BinaryArray, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
@@ -1380,14 +1744,24 @@ mod tests {
     use lance_select::RowAddrTreeMap;
     use lance_tokenizer::TextAnalyzer;
 
+    use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::{
-        ScalarIndex, SearchResult, TextQuery,
+        IndexStore, ScalarIndex, SearchResult, TextQuery,
         lance_format::LanceIndexStore,
-        ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions},
+        ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions, NGramIndexPlugin},
     };
-    use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
+    use crate::{
+        metrics::NoOpMetricsCollector,
+        scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME},
+    };
 
-    use super::{NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
+    use super::{
+        NGRAM_N, NGRAM_SPARSE_INDEX_VERSION, NGRAM_TOKENIZER, NGRAM_TRIGRAM_INDEX_VERSION,
+        NGramTokenization, POSTING_LIST_COL, POSTINGS_FILENAME, SPARSE_MAX_NGRAM_LEN,
+        SPARSE_MIN_NGRAM_LEN, TOKENS_COL, ngram_to_token, query_tokens_for_text,
+        sparse_index_token_visitor, sparse_ngram_to_token, sparse_spans_for_run, tokenize_visitor,
+    };
+    use roaring::RoaringTreemap;
 
     fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
         let mut tokens = Vec::with_capacity(text.len() * 3);
@@ -1430,6 +1804,78 @@ mod tests {
         assert_eq!(
             tokens,
             vec!["aba", "bab", "aba", "bab"] // spellchecker:disable-line
+        );
+    }
+
+    #[test]
+    fn test_sparse_span_generation_is_bounded() {
+        let run = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(20);
+        let spans = sparse_spans_for_run(&run);
+
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|span| {
+            let len = span.end - span.start;
+            (SPARSE_MIN_NGRAM_LEN..=SPARSE_MAX_NGRAM_LEN).contains(&len)
+        }));
+        assert!(spans.len() <= 2 * run.len().saturating_sub(1));
+    }
+
+    #[test]
+    fn test_sparse_covering_tokens_for_long_query_is_bounded() {
+        let literal = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(256);
+        let spans = sparse_spans_for_run(&literal);
+        let sparse_tokens = query_tokens_for_text(NGramTokenization::Sparse, &literal);
+        let mut index_tokens = HashSet::new();
+        sparse_index_token_visitor(&literal, |token| {
+            index_tokens.insert(token);
+        });
+
+        assert!(!sparse_tokens.is_empty());
+        assert!(sparse_tokens.len() <= spans.len());
+        assert!(sparse_tokens.len() <= literal.len() / SPARSE_MIN_NGRAM_LEN + 1);
+        assert!(
+            sparse_tokens
+                .iter()
+                .all(|token| index_tokens.contains(token))
+        );
+    }
+
+    #[test]
+    fn test_sparse_covering_tokens_matches_stack_builder() {
+        let literal = "sparsemarkerabcdefghijklmnopqrstuvwx";
+        let sparse_tokens = query_tokens_for_text(NGramTokenization::Sparse, literal);
+        let expected = [
+            "spa",
+            "par",
+            "arsema",
+            "mark",
+            "rkerabcdefg",
+            "fghi",
+            "hijk",
+            "jklmno",
+            "nopq",
+            "pqr",
+            "qrstuvw",
+            "vwx",
+        ]
+        .into_iter()
+        .map(|ngram| sparse_ngram_to_token(ngram.as_bytes()))
+        .collect::<HashSet<_>>();
+
+        assert_eq!(sparse_tokens.into_iter().collect::<HashSet<_>>(), expected);
+    }
+
+    #[test]
+    fn test_ngram_rejects_unknown_params() {
+        let plugin = NGramIndexPlugin;
+        let field = Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false);
+        let Err(err) = plugin.new_training_request(r#"{"tokenisation":"sparse"}"#, &field) else {
+            panic!("expected unknown ngram params to fail");
+        };
+
+        assert!(
+            err.to_string().contains("Invalid NGram index params"),
+            "{err}"
         );
     }
 
@@ -1680,6 +2126,174 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_sparse_covering_tokens_are_index_tokens() {
+        let literal = "commonmarkerabcdefghijklmnopqrstuvwx";
+        let trigram_tokens = query_tokens_for_text(NGramTokenization::Trigram, literal);
+        let sparse_tokens = query_tokens_for_text(NGramTokenization::Sparse, literal);
+        let mut index_tokens = HashSet::new();
+        sparse_index_token_visitor(literal, |token| {
+            index_tokens.insert(token);
+        });
+
+        assert!(!sparse_tokens.is_empty());
+        assert!(sparse_tokens.len() <= trigram_tokens.len());
+        assert!(
+            sparse_tokens
+                .iter()
+                .all(|token| index_tokens.contains(token))
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_ngram_search_and_metadata() {
+        let data = StringArray::from_iter_values([
+            "alpha commonmarkerabcdefghijklmnopqrstuvwx omega",
+            "alpha commonmarkerabcdefghijklmno omega",
+            "totally unrelated row",
+        ]);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
+            tokenization: NGramTokenization::Sparse,
+            ..NGramIndexBuilderOptions::default()
+        })
+        .unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        assert_eq!(index.tokenization, NGramTokenization::Sparse);
+        assert_eq!(
+            index
+                .search(
+                    &TextQuery::StringContains("commonmarkerabcdefghijklmnopqrstuvwx".to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap(),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0]))
+        );
+        assert_eq!(
+            index
+                .search(
+                    &TextQuery::Regex("commonmarkerabcdefghijklmnopqrstuvwx".to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap(),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0]))
+        );
+        assert_eq!(
+            index
+                .search(
+                    &TextQuery::Regex("commonmarker.*omega".to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap(),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0, 1]))
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_loads_postings_without_tokenization_metadata() {
+        let tmpdir = Arc::new(TempDir::default());
+        let test_store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let old_schema = Arc::new(Schema::new(vec![
+            Field::new(TOKENS_COL, DataType::UInt32, true),
+            Field::new(POSTING_LIST_COL, DataType::Binary, false),
+        ]));
+        let token = ngram_to_token("cat", NGRAM_N);
+        let bitmap = RoaringTreemap::from_iter([42]);
+        let mut bitmap_bytes = Vec::new();
+        bitmap.serialize_into(&mut bitmap_bytes).unwrap();
+        let batch = RecordBatch::try_new(
+            old_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values([token])),
+                Arc::new(BinaryArray::from_iter_values([bitmap_bytes])),
+            ],
+        )
+        .unwrap();
+        let mut writer = test_store
+            .new_index_file(POSTINGS_FILENAME, old_schema)
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let index = NGramIndex::from_store(Arc::new(test_store), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.tokenization, NGramTokenization::Trigram);
+        assert_eq!(
+            index
+                .search(&TextQuery::Regex("cat".to_string()), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([42]))
+        );
+    }
+
+    async fn train_created_index(params: &str) -> u32 {
+        let data = StringArray::from_iter_values(["alpha sparsemarkerabcdefgh"]);
+        let row_ids = UInt64Array::from_iter_values([0]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+
+        let plugin = NGramIndexPlugin;
+        let field = Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false);
+        let request = plugin.new_training_request(params, &field).unwrap();
+        let tmpdir = Arc::new(TempDir::default());
+        let test_store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        );
+
+        plugin
+            .train_index(
+                data,
+                &test_store,
+                request,
+                None,
+                Arc::new(NoopIndexBuildProgress),
+            )
+            .await
+            .unwrap()
+            .index_version
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_created_index_versions() {
+        assert_eq!(train_created_index("").await, NGRAM_TRIGRAM_INDEX_VERSION);
+        assert_eq!(
+            train_created_index(r#"{"tokenization":"sparse"}"#).await,
+            NGRAM_SPARSE_INDEX_VERSION
+        );
+    }
+
     fn test_data_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
@@ -1690,6 +2304,19 @@ mod tests {
     fn simple_data_with_nulls() -> SendableRecordBatchStream {
         let data = StringArray::from_iter(&[Some("cat"), Some("dog"), None, None, Some("cat dog")]);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = test_data_schema();
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ))
+    }
+
+    fn data_from_values(values: &[Option<&str>], first_row_id: u64) -> SendableRecordBatchStream {
+        let data = StringArray::from_iter(values.iter().copied());
+        let row_ids =
+            UInt64Array::from_iter_values((0..data.len()).map(|i| first_row_id + i as u64));
         let schema = test_data_schema();
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
@@ -1761,6 +2388,56 @@ mod tests {
         assert_eq!(index.tokens.len(), 3);
     }
 
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_update_preserves_tokenization_and_version() {
+        let literal = "commonmarkerabcdefghijklmnopqrstuvwx";
+        let data = data_from_values(
+            &[
+                Some("alpha commonmarkerabcdefghijklmnopqrstuvwx omega"),
+                Some("totally unrelated row"),
+            ],
+            0,
+        );
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
+            tokenization: NGramTokenization::Sparse,
+            ..NGramIndexBuilderOptions::default()
+        })
+        .unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        let new_tmpdir = Arc::new(TempDir::default());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let new_data = data_from_values(
+            &[Some("updated commonmarkerabcdefghijklmnopqrstuvwx row")],
+            100,
+        );
+
+        let created = index
+            .update(new_data, test_store.as_ref(), None)
+            .await
+            .unwrap();
+        assert_eq!(created.index_version, NGRAM_SPARSE_INDEX_VERSION);
+
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.tokenization, NGramTokenization::Sparse);
+        assert_eq!(
+            index
+                .search(
+                    &TextQuery::StringContains(literal.to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap(),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0, 100]))
+        );
+    }
+
     async fn row_ids_in_index(index: &NGramIndex) -> Vec<u64> {
         let mut row_ids = HashSet::new();
         for row_offset in index.tokens.values() {
@@ -1801,6 +2478,50 @@ mod tests {
 
         let null_posting_list = get_null_posting_list(&index).await;
         assert_eq!(null_posting_list, vec![100]);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_remap_preserves_tokenization_and_version() {
+        let literal = "commonmarkerabcdefghijklmnopqrstuvwx";
+        let data = data_from_values(
+            &[
+                Some("alpha commonmarkerabcdefghijklmnopqrstuvwx omega"),
+                Some("totally unrelated row"),
+            ],
+            0,
+        );
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
+            tokenization: NGramTokenization::Sparse,
+            ..NGramIndexBuilderOptions::default()
+        })
+        .unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        let new_tmpdir = Arc::new(TempDir::default());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let remapping = HashMap::from([(0, Some(10)), (1, None)]);
+        let created = index.remap(&remapping, test_store.as_ref()).await.unwrap();
+        assert_eq!(created.index_version, NGRAM_SPARSE_INDEX_VERSION);
+
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(index.tokenization, NGramTokenization::Sparse);
+        assert_eq!(
+            index
+                .search(
+                    &TextQuery::Regex(literal.to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap(),
+            SearchResult::at_most(RowAddrTreeMap::from_iter([10]))
+        );
     }
 
     #[test_log::test(tokio::test)]
@@ -1867,6 +2588,7 @@ mod tests {
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
             tokens_per_spill: 100,
+            ..NGramIndexBuilderOptions::default()
         })
         .unwrap();
 
