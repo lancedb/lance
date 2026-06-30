@@ -1159,6 +1159,19 @@ async fn test_deep_clone_cross_store(
     .unwrap();
     assert_ne!(dataset.object_store.store_prefix, "");
 
+    // Create a scalar index so the index files and the manifest index section are also
+    // copied across stores (the index section is read through the source store at commit).
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
     // Delete some rows so a deletion file is also streamed across stores.
     dataset.delete("id < 10").await.unwrap();
     let cloned_dataset = dataset
@@ -1186,6 +1199,13 @@ async fn test_deep_clone_cross_store(
         .unwrap();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 54); // 64 rows - 10 deletions
+
+    // The scalar index must have been copied and resolve against the target store, with its
+    // base reference normalized to local (no external base_paths).
+    let cloned_indices = reopened.load_indices().await.unwrap();
+    assert_eq!(cloned_indices.len(), 1);
+    assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
+    assert!(cloned_indices.iter().all(|idx| idx.base_id.is_none()));
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)
