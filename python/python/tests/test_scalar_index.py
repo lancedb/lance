@@ -5138,9 +5138,9 @@ def test_large_string_scalar_index(tmp_path, index_type):
     ds.create_scalar_index("category", index_type=index_type)
 
     indices = ds.describe_indices()
-    assert any(
-        "category" in idx.field_names for idx in indices
-    ), f"{index_type} index for large_string column not found in describe_indices()"
+    assert any("category" in idx.field_names for idx in indices), (
+        f"{index_type} index for large_string column not found in describe_indices()"
+    )
 
     result = ds.scanner(filter="category = 'alpha'").to_table()
     assert result.num_rows == 2

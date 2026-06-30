@@ -3110,7 +3110,7 @@ class LanceDataset(pa.dataset.Dataset):
                 ):
                     raise TypeError(
                         f"BTREE/ZONEMAP index column {column} must be int",
-                        ", float, bool, str, large_str, fixed-size-binary, or temporal ",
+                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "BITMAP":
                 if (
