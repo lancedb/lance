@@ -38,12 +38,6 @@ impl Index for MemWalIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> lance_core::Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "MemWalIndex is not a vector index".into(),
-        ))
-    }
-
     fn statistics(&self) -> lance_core::Result<serde_json::Value> {
         let stats = MemWalStatistics {
             num_shards: self.details.num_shards,

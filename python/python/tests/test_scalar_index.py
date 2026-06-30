@@ -648,7 +648,10 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     assert "ScalarIndexQuery" in plan
     assert "MaterializeIndex" not in plan
     assert "FlatMatchQuery" in plan
-    assert "LanceScan" in plan
+    # Flat FTS now reads via FilteredReadExec (prints as `LanceRead`) so the
+    # BTree on `id` pushes into the unindexed-fragment scan too.
+    assert "LanceRead" in plan
+    assert "LanceScan" not in plan
     assert make_fts_search(ds).to_table().num_rows == 12
 
     # Update vector index but NOT scalar index
@@ -866,6 +869,51 @@ def test_fts_custom_stop_words(tmp_path):
         with_row_id=True,
     )
     assert len(results["_rowid"].to_pylist()) == 1
+
+
+def test_fts_stop_words_respect_language_for_simple_tokenizer(tmp_path):
+    data = pa.table({"text": ["the lance data", "的 lance data"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="simple",
+        stem=False,
+    )
+
+    results = ds.to_table(full_text_query="the", with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(full_text_query="的", with_row_id=True)
+    assert results["text"].to_pylist() == ["的 lance data"]
+
+
+def test_fts_icu_stop_words_are_all_or_none(tmp_path):
+    data = pa.table({"text": ["the 的 lance data", "useful data"]})
+    ds = lance.write_dataset(data, tmp_path / "enabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=True,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 0
+    assert ds.to_table(full_text_query="lance", with_row_id=True).num_rows == 1
+
+    ds = lance.write_dataset(data, tmp_path / "disabled", mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    assert ds.to_table(full_text_query="the", with_row_id=True).num_rows == 1
+    assert ds.to_table(full_text_query="的", with_row_id=True).num_rows == 1
 
 
 def test_rowid_order(dataset):
@@ -1819,6 +1867,55 @@ def test_icu_tokenizer(tmp_path):
         with_row_id=True,
     )
     assert results["_rowid"].to_pylist() == [0]
+
+
+def test_icu_tokenizer_split_on_non_alphanumeric_default(tmp_path):
+    data = pa.table({"text": ["hello_world"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    results = ds.to_table(full_text_query="hello", prefilter=True, with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(
+        full_text_query="hello_world", prefilter=True, with_row_id=True
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_icu_tokenizer_split_on_non_alphanumeric(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "hello_world こんにちは世界",
+                "alpha.beta",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu/split",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    for query, expected_row_ids in [
+        ("hello", [0]),
+        ("world", [0]),
+        ("世界", [0]),
+        ("alpha", [1]),
+        ("beta", [1]),
+    ]:
+        results = ds.to_table(full_text_query=query, prefilter=True, with_row_id=True)
+        assert results["_rowid"].to_pylist() == expected_row_ids
 
 
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):

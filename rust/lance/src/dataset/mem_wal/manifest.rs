@@ -35,7 +35,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use lance_core::{Error, Result};
-use lance_index::mem_wal::ShardManifest;
+use lance_index::mem_wal::{ShardManifest, ShardStatus};
 use lance_io::object_store::ObjectStore;
 use lance_table::format::pb;
 use log::{info, warn};
@@ -147,6 +147,7 @@ impl ShardManifestStore {
             wal_entry_position_last_seen: 0,
             current_generation: 1,
             flushed_generations: vec![],
+            status: ShardStatus::Active,
         };
 
         match self.write(&manifest).await {
@@ -425,6 +426,21 @@ impl ShardManifestStore {
         for _ in 0..MAX_CLAIM_RETRIES {
             let current = self.read_latest().await?;
 
+            // A sealed shard is mid-drop (drop-table 2PC). Refuse the claim
+            // with a distinguishable error rather than minting a new epoch,
+            // so a caller that skips its own status check still cannot
+            // resurrect a shard being dropped. Sophon's reconcile keys on
+            // the "sealed" marker in this message to tell it apart from an
+            // ordinary epoch fence.
+            if let Some(m) = &current
+                && m.status == ShardStatus::Sealed
+            {
+                return Err(Error::invalid_input(format!(
+                    "shard {} is sealed; refusing claim (drop in flight)",
+                    self.shard_id
+                )));
+            }
+
             let (next_version, next_epoch, base_manifest) = match current {
                 Some(m) => (m.version + 1, m.writer_epoch + 1, Some(m)),
                 None => (1, 1, None),
@@ -447,6 +463,7 @@ impl ShardManifestStore {
                     wal_entry_position_last_seen: 0,
                     current_generation: 1,
                     flushed_generations: vec![],
+                    status: ShardStatus::Active,
                 }
             };
 
@@ -603,6 +620,7 @@ mod tests {
             wal_entry_position_last_seen: 0,
             current_generation: 1,
             flushed_generations: vec![],
+            status: ShardStatus::Active,
         }
     }
 
@@ -750,6 +768,51 @@ mod tests {
         assert_eq!(second_epoch, 2);
         assert_eq!(second.version, 3);
         assert_eq!(second.wal_entry_position_last_seen, 42);
+    }
+
+    #[tokio::test]
+    async fn test_claim_epoch_refuses_sealed_manifest() {
+        // A `Sealed` manifest is the drop-table 2PC in-doubt marker:
+        // `claim_epoch` must refuse it with a distinguishable error rather
+        // than mint a new epoch, so a sealed shard can't be resurrected even
+        // by a caller that skips its own status check. Rolling the status
+        // back to `Active` makes the shard claimable again (reversible).
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+
+        let (epoch, claimed) = manifest_store.claim_epoch(0).await.unwrap();
+        assert_eq!(claimed.status, ShardStatus::Active);
+
+        // Seal it (drop-table prepare).
+        let sealed = ShardManifest {
+            version: claimed.version + 1,
+            status: ShardStatus::Sealed,
+            ..claimed
+        };
+        manifest_store.write(&sealed).await.unwrap();
+
+        // The claim is refused with the distinguishable "sealed" error —
+        // and the manifest is left untouched (no new epoch minted).
+        let err = manifest_store.claim_epoch(0).await.unwrap_err();
+        assert!(
+            err.to_string().contains("sealed"),
+            "expected a distinguishable sealed-refusal error, got: {err}"
+        );
+        let after = manifest_store.read_latest().await.unwrap().unwrap();
+        assert_eq!(after.writer_epoch, sealed.writer_epoch, "no epoch minted");
+        assert_eq!(after.status, ShardStatus::Sealed);
+
+        // Roll back to Active (drop-table abort) → re-claimable.
+        let active = ShardManifest {
+            version: sealed.version + 1,
+            status: ShardStatus::Active,
+            ..sealed
+        };
+        manifest_store.write(&active).await.unwrap();
+        let (next_epoch, reclaimed) = manifest_store.claim_epoch(0).await.unwrap();
+        assert!(next_epoch > epoch, "rolled-back shard mints the next epoch");
+        assert_eq!(reclaimed.status, ShardStatus::Active);
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ pub struct InvertedIndexParams {
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
     /// - `icu`: ICU dictionary-based word segmentation
+    /// - `icu/split`: ICU segmentation with simple-style delimiter splitting
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
@@ -197,6 +198,7 @@ impl InvertedIndexParams {
     /// - `raw`: no tokenization
     /// - `ngram`: N-Gram tokenizer
     /// - `icu`: ICU dictionary-based word segmentation
+    /// - `icu/split`: ICU segmentation with simple-style delimiter splitting
     /// - `lindera/*`: Lindera tokenizer
     /// - `jieba/*`: Jieba tokenizer
     ///
@@ -355,16 +357,7 @@ impl InvertedIndexParams {
             builder = builder.filter_dynamic(Stemmer::new(self.language));
         }
         if self.remove_stop_words {
-            let stop_word_filter = match &self.custom_stop_words {
-                Some(words) => StopWordFilter::remove(words.iter().cloned()),
-                None => StopWordFilter::new(self.language).ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "removing stop words for language {:?} is not supported yet",
-                        self.language
-                    ))
-                })?,
-            };
-            builder = builder.filter_dynamic(stop_word_filter);
+            builder = builder.filter_dynamic(self.stop_word_filter()?);
         }
         if self.ascii_folding {
             builder = builder.filter_dynamic(AsciiFoldingFilter);
@@ -382,12 +375,30 @@ impl InvertedIndexParams {
         }
     }
 
+    fn stop_word_filter(&self) -> Result<StopWordFilter> {
+        match &self.custom_stop_words {
+            Some(words) => Ok(StopWordFilter::remove(words.iter().cloned())),
+            None if self.base_tokenizer == "icu" || self.base_tokenizer == "icu/split" => {
+                Ok(StopWordFilter::all())
+            }
+            None => StopWordFilter::new(self.language).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "removing stop words for language {:?} is not supported yet",
+                    self.language
+                ))
+            }),
+        }
+    }
+
     fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         match self.base_tokenizer.as_str() {
             "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
             "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
             "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
             "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
+            "icu/split" => {
+                Ok(TextAnalyzer::builder(IcuTokenizer::default().with_simple_split()).dynamic())
+            }
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
@@ -441,6 +452,7 @@ pub fn language_model_home() -> Option<PathBuf> {
 mod tests {
     use super::InvertedIndexParams;
     use lance_tokenizer::TokenStream;
+    use rstest::rstest;
 
     #[test]
     fn test_build_only_fields_are_not_serialized() {
@@ -502,5 +514,72 @@ mod tests {
         let mut tokens = Vec::new();
         stream.process(&mut |token| tokens.push(token.text.clone()));
         assert_eq!(tokens, vec!["hello", "こんにちは", "世界"]);
+    }
+
+    #[test]
+    fn test_build_icu_tokenizer_with_split_on_non_alphanumeric() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer("icu/split".to_string())
+            .stem(false)
+            .remove_stop_words(false)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_doc("hello_world こんにちは世界 alpha.beta");
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| tokens.push(token.text.clone()));
+        assert_eq!(
+            tokens,
+            vec!["hello", "world", "こんにちは", "世界", "alpha", "beta"]
+        );
+    }
+
+    #[test]
+    fn test_remove_stop_words_respects_language_for_non_icu_tokenizer() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .stem(false)
+            .base_tokenizer("simple".to_string())
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the 的 lance data");
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        assert_eq!(
+            tokens,
+            vec!["的".to_string(), "lance".to_string(), "data".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_custom_stop_words_replace_language_builtins() {
+        let mut tokenizer = InvertedIndexParams::default()
+            .stem(false)
+            .custom_stop_words(Some(vec!["lance".to_string()]))
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the lance data");
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        assert_eq!(tokens, vec!["the".to_string(), "data".to_string()]);
+    }
+
+    #[rstest]
+    #[case::icu("icu")]
+    #[case::icu_split("icu/split")]
+    fn test_icu_stop_words_use_all_builtin_lists(#[case] base_tokenizer: &str) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .stem(false)
+            .base_tokenizer(base_tokenizer.to_string())
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the 的 lance data");
+        let mut tokens = Vec::new();
+        while let Some(token) = stream.next() {
+            tokens.push(token.text.clone());
+        }
+        assert_eq!(tokens, vec!["lance".to_string(), "data".to_string()]);
     }
 }

@@ -237,14 +237,8 @@ impl HnswMemIndex {
                 fsl_ref.values().data_type()
             )));
         }
-        if fsl_ref.null_count() > 0 {
-            return Err(Error::invalid_input(format!(
-                "HNSW index column '{}' has {} null row(s); null vectors are not supported",
-                self.column,
-                fsl_ref.null_count()
-            )));
-        }
-
+        // Null-vector rows (e.g. tombstones) are skipped inside `append_batch`,
+        // which yields an empty range for an all-null batch — handled below.
         let dim = fsl_ref.value_length() as usize;
         let state = self.ensure_state(dim)?;
         let vectors = Arc::new(fsl_ref.clone());
@@ -290,14 +284,9 @@ impl HnswMemIndex {
                     fsl_ref.values().data_type()
                 )));
             }
-            if fsl_ref.null_count() > 0 {
-                return Err(Error::invalid_input(format!(
-                    "HNSW index column '{}' has {} null row(s); null vectors are not supported",
-                    self.column,
-                    fsl_ref.null_count()
-                )));
-            }
-
+            // Null-vector rows (e.g. tombstones) are skipped inside
+            // `append_batch`; an all-null batch yields an empty range, handled
+            // by the `id_range.is_empty()` continue below.
             let dim = fsl_ref.value_length() as usize;
             let current_state = match state {
                 Some(state) => {
@@ -675,5 +664,118 @@ mod tests {
 
         assert!(index.len() > 1);
         assert!(total_reader_iters > 0);
+    }
+
+    /// Build a 3-row batch whose middle vector row is null at the list level.
+    fn batch_with_null_middle(dim: usize) -> RecordBatch {
+        let mut values: Vec<f32> = Vec::new();
+        values.extend(std::iter::repeat_n(1.0f32, dim)); // row 0
+        values.extend(std::iter::repeat_n(0.0f32, dim)); // row 1 (null placeholder)
+        values.extend(std::iter::repeat_n(3.0f32, dim)); // row 2
+        let inner = Arc::new(Float32Array::from(values)) as arrow_array::ArrayRef;
+        let nulls = arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::from(vec![
+            true, false, true,
+        ]));
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            inner,
+            Some(nulls),
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                true,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![0, 1, 2])), Arc::new(fsl)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_index_skips_null_vector_row() {
+        // A null vector row gets no graph node; the surviving rows keep their
+        // original positions (the tombstone-enabling fix).
+        let dim = 4;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(16).ef_construction(64),
+            16,
+            16,
+        );
+        index.insert(&batch_with_null_middle(dim), 0).unwrap();
+        assert_eq!(index.len(), 2, "the null row is skipped");
+
+        let query = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![3.0f32; dim]),
+            dim as i32,
+        )
+        .unwrap();
+        let results = index.search(&query, 2, Some(16), u64::MAX).unwrap();
+        assert!(!results.is_empty());
+        let (best_dist, best_pos) = results[0];
+        assert!(best_dist < 1e-4, "got {}", best_dist);
+        assert_eq!(
+            best_pos, 2,
+            "row 2 resolves to its original offset, not 1, after the skip"
+        );
+        assert!(
+            results.iter().all(|(_, pos)| *pos != 1),
+            "the skipped null row must never be returned"
+        );
+    }
+
+    #[test]
+    fn test_index_all_null_batch_adds_no_nodes() {
+        // An all-null batch (e.g. an all-tombstone memtable) inserts cleanly and
+        // adds no nodes.
+        let dim = 4;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default(),
+            8,
+            8,
+        );
+        let inner = Arc::new(Float32Array::from(vec![0.0f32; dim * 2])) as arrow_array::ArrayRef;
+        let nulls =
+            arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::from(vec![false, false]));
+        let fsl = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            dim as i32,
+            inner,
+            Some(nulls),
+        )
+        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![0, 1])), Arc::new(fsl)],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        assert_eq!(index.len(), 0, "no nodes for an all-null batch");
     }
 }

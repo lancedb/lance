@@ -37,7 +37,7 @@ use pyo3::{
 use uuid::Uuid;
 
 use lance::dataset::AutoCleanupParams;
-use lance::dataset::cleanup::CleanupPolicyBuilder;
+use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
@@ -60,7 +60,9 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexExt, IndexSegment, vector::VectorIndexParams};
+use lance::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -105,7 +107,9 @@ use crate::utils::PyLance;
 use crate::{LanceReader, Scanner};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 
-use self::cleanup::CleanupStats;
+use self::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+};
 use self::commit::PyCommitLock;
 use self::io_stats::IoStats;
 
@@ -682,6 +686,89 @@ pub struct Dataset {
     pub(crate) ds: Arc<LanceDataset>,
 }
 
+impl Dataset {
+    async fn cleanup_policy(
+        &self,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+    ) -> lance_core::Result<lance::dataset::cleanup::CleanupPolicy> {
+        let mut builder = CleanupPolicyBuilder::default();
+        if let Some(v) = older_than_micros {
+            let older_than = Duration::microseconds(v);
+            builder = builder.before_timestamp(Utc::now() - older_than);
+        }
+        if let Some(v) = retain_versions {
+            builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
+        }
+        if let Some(v) = delete_unverified {
+            builder = builder.delete_unverified(v);
+        }
+        if let Some(v) = error_if_tagged_old_versions {
+            builder = builder.error_if_tagged_old_versions(v);
+        }
+        if let Some(v) = delete_rate_limit {
+            builder = builder.delete_rate_limit(v)?;
+        }
+        Ok(builder.build())
+    }
+}
+
+fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
+    CleanupStats {
+        bytes_removed: stats.bytes_removed,
+        old_versions: stats.old_versions,
+        data_files_removed: stats.data_files_removed,
+        transaction_files_removed: stats.transaction_files_removed,
+        index_files_removed: stats.index_files_removed,
+        deletion_files_removed: stats.deletion_files_removed,
+    }
+}
+
+fn cleanup_file_kind(kind: CleanupFileKind) -> &'static str {
+    match kind {
+        CleanupFileKind::Manifest => "manifest",
+        CleanupFileKind::Data => "data",
+        CleanupFileKind::Transaction => "transaction",
+        CleanupFileKind::Index => "index",
+        CleanupFileKind::Deletion => "deletion",
+        CleanupFileKind::TemporaryManifest => "temporary_manifest",
+    }
+}
+
+fn cleanup_explanation(
+    explanation: lance::dataset::cleanup::CleanupExplanation,
+) -> CleanupExplanation {
+    CleanupExplanation {
+        read_version: explanation.read_version,
+        stats: cleanup_stats(explanation.stats),
+        candidate_files: explanation
+            .candidate_files
+            .into_iter()
+            .map(|file| CleanupCandidateFile {
+                path: file.path,
+                kind: cleanup_file_kind(file.kind).to_string(),
+                unverified: file.unverified,
+                size_bytes: file.size_bytes,
+            })
+            .collect(),
+        candidate_files_truncated: explanation.candidate_files_truncated,
+        candidate_file_limit: explanation.candidate_file_limit,
+        referenced_branches: explanation
+            .referenced_branches
+            .into_iter()
+            .map(|branch| CleanupReferencedBranch {
+                name: branch.name,
+                referenced_version: branch.referenced_version,
+                cleanup_candidate: branch.cleanup_candidate,
+            })
+            .collect(),
+        warnings: explanation.warnings,
+    }
+}
+
 #[pymethods]
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
@@ -934,6 +1021,32 @@ impl Dataset {
                     index_name, err
                 )),
             })
+    }
+
+    /// Remap row addresses across compactions still recorded in the
+    /// fragment-reuse index. Rows a compaction dropped become null. The index
+    /// retains only recent rounds (older ones are pruned as index remap catches
+    /// up), so remap promptly: an address whose round was pruned is returned
+    /// unchanged, not remapped. Returns None when there is no fragment-reuse
+    /// index.
+    fn remap_row_addrs(
+        &self,
+        py: Python,
+        addrs: PyArrowType<ArrayData>,
+    ) -> PyResult<Option<PyArrowType<ArrayData>>> {
+        use lance_index::metrics::NoOpMetricsCollector;
+
+        let array = make_array(addrs.0);
+        let frag_reuse_index = rt()
+            .block_on(
+                Some(py),
+                self.ds.open_frag_reuse_index(&NoOpMetricsCollector),
+            )?
+            .map_err(|err| {
+                PyIOError::new_err(format!("failed to open fragment reuse index: {err}"))
+            })?;
+
+        Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
     }
 
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
@@ -1860,37 +1973,61 @@ impl Dataset {
         error_if_tagged_old_versions: Option<bool>,
         delete_rate_limit: Option<u64>,
     ) -> PyResult<CleanupStats> {
-        let cleanup_stats = rt()
+        let stats = rt()
             .block_on(None, async {
-                let mut builder = CleanupPolicyBuilder::default();
-                if let Some(v) = older_than_micros {
-                    let older_than = Duration::microseconds(v);
-                    builder = builder.before_timestamp(Utc::now() - older_than);
-                }
-                if let Some(v) = retain_versions {
-                    builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
-                }
-                if let Some(v) = delete_unverified {
-                    builder = builder.delete_unverified(v);
-                }
-                if let Some(v) = error_if_tagged_old_versions {
-                    builder = builder.error_if_tagged_old_versions(v);
-                }
-                if let Some(v) = delete_rate_limit {
-                    builder = builder.delete_rate_limit(v)?;
-                }
-
-                self.ds.cleanup_with_policy(builder.build()).await
+                let policy = self
+                    .cleanup_policy(
+                        older_than_micros,
+                        retain_versions,
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                        delete_rate_limit,
+                    )
+                    .await?;
+                self.ds.cleanup_with_policy(policy).await
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        Ok(CleanupStats {
-            bytes_removed: cleanup_stats.bytes_removed,
-            old_versions: cleanup_stats.old_versions,
-            data_files_removed: cleanup_stats.data_files_removed,
-            transaction_files_removed: cleanup_stats.transaction_files_removed,
-            index_files_removed: cleanup_stats.index_files_removed,
-            deletion_files_removed: cleanup_stats.deletion_files_removed,
-        })
+        Ok(cleanup_stats(stats))
+    }
+
+    /// Explain cleanup old versions from the dataset without deleting files
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, include_files = false, max_files = 1000))]
+    fn explain_cleanup_old_versions(
+        &self,
+        older_than_micros: Option<i64>,
+        retain_versions: Option<usize>,
+        delete_unverified: Option<bool>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+        include_files: bool,
+        max_files: usize,
+    ) -> PyResult<CleanupExplanation> {
+        let explanation = rt()
+            .block_on(None, async {
+                let policy = self
+                    .cleanup_policy(
+                        older_than_micros,
+                        retain_versions,
+                        delete_unverified,
+                        error_if_tagged_old_versions,
+                        delete_rate_limit,
+                    )
+                    .await?;
+                self.ds
+                    .cleanup(policy)
+                    .with_max_candidate_files(max_files)
+                    .explain()
+                    .await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let mut explanation = cleanup_explanation(explanation);
+        if !include_files {
+            explanation.candidate_files.clear();
+            explanation.candidate_files_truncated = false;
+            explanation.warnings.clear();
+        }
+        Ok(explanation)
     }
 
     fn tags_ordered(self_: PyRef<'_, Self>, order: Option<String>) -> PyResult<Py<PyAny>> {
@@ -3427,6 +3564,188 @@ impl Dataset {
             uuid,
             self.ds.clone(),
         ))
+    }
+
+    /// Perform pairwise hamming distance clustering on a partition of an IVF_FLAT index.
+    ///
+    /// This function loads a specific partition from an IVF_FLAT index on a hash column,
+    /// computes pairwise hamming distances between all hashes in the partition,
+    /// filters by threshold, and clusters the results using union-find.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the IVF_FLAT index on the hash column
+    /// partition_id : int
+    ///     The partition ID within the IVF_FLAT index
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (index_name, partition_id, hamming_threshold))]
+    fn hamming_clustering_for_ivf_partition(
+        &self,
+        py: Python<'_>,
+        index_name: &str,
+        partition_id: usize,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_ivf_partition;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_ivf_partition(
+                    ds,
+                    index_name,
+                    partition_id,
+                    hamming_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
+
+    /// Get partition information for an IVF_FLAT index.
+    ///
+    /// Parameters
+    /// ----------
+    /// index_name : str
+    ///     Name of the IVF_FLAT index
+    ///
+    /// Returns
+    /// -------
+    /// List[dict]
+    ///     List of partition info dicts with 'partition_id' and 'size'
+    #[pyo3(signature = (index_name))]
+    fn get_ivf_partition_info(
+        &self,
+        py: Python<'_>,
+        index_name: &str,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        use lance::index::vector::hamming::get_ivf_partition_info;
+
+        let ds = self.ds.as_ref();
+        let result = rt()
+            .block_on(Some(py), get_ivf_partition_info(ds, index_name))?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let partitions: PyResult<Vec<_>> = result
+            .iter()
+            .map(|p| {
+                let dict = PyDict::new(py);
+                dict.set_item("partition_id", p.partition_id)?;
+                dict.set_item("size", p.size)?;
+                Ok(dict.into())
+            })
+            .collect();
+
+        partitions
+    }
+
+    /// Perform pairwise hamming distance clustering on sampled rows from a dataset.
+    ///
+    /// This function samples N rows randomly from the dataset, extracts hashes,
+    /// computes pairwise hamming distances, and clusters the results.
+    /// It's useful for benchmarking and testing without requiring an IVF index.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    /// sample_size : int, optional
+    ///     Number of rows to sample (if None or >= total rows, uses all rows)
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (column, sample_size, hamming_threshold))]
+    fn hamming_clustering_for_sample(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        sample_size: Option<usize>,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_sample;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_sample(ds, column, sample_size, hamming_threshold),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
+    }
+
+    /// Perform pairwise hamming distance clustering on a contiguous range of rows from a fragment.
+    ///
+    /// This function reads a contiguous range of rows from a specific fragment,
+    /// extracts hashes, computes pairwise hamming distances, and clusters the results.
+    /// Unlike sampling, this reads sequential rows which is useful for distributed
+    /// processing where each worker handles a specific range of a fragment.
+    ///
+    /// Parameters
+    /// ----------
+    /// column : str
+    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    /// fragment_id : int
+    ///     The fragment ID to read from
+    /// start_row : int
+    ///     The starting row offset within the fragment
+    /// num_rows : int
+    ///     Number of rows to read from the start position
+    /// hamming_threshold : int
+    ///     Maximum hamming distance to consider as similar
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.RecordBatchReader
+    ///     A reader yielding batches with columns:
+    ///     - 'representative': uint64 - The representative row ID for each cluster
+    ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
+    #[pyo3(signature = (column, fragment_id, start_row, num_rows, hamming_threshold))]
+    fn hamming_clustering_for_range(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        fragment_id: usize,
+        start_row: usize,
+        num_rows: usize,
+        hamming_threshold: u32,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        use lance::index::vector::hamming::hamming_clustering_for_range;
+
+        let ds = self.ds.as_ref();
+        let reader = rt()
+            .block_on(
+                Some(py),
+                hamming_clustering_for_range(
+                    ds,
+                    column,
+                    fragment_id,
+                    start_row,
+                    num_rows,
+                    hamming_threshold,
+                ),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        Ok(PyArrowType(reader))
     }
 }
 

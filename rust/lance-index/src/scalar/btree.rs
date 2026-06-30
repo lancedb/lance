@@ -15,6 +15,7 @@ use super::{
     OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     compute_next_prefix,
 };
+use crate::cache_pb::{BTreeIndexHeader, RangeToFile};
 use crate::{Index, IndexType};
 use crate::{
     frag_reuse::FragReuseIndex,
@@ -45,18 +46,23 @@ use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     union::UnionExec,
 };
-use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
+use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_physical_expr::{
+    PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
+};
 use futures::{
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
     future::BoxFuture,
     stream::{self},
 };
-use lance_arrow::ipc::{read_ipc_stream_single_at, write_ipc_stream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
-    cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache},
+    cache::{
+        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+        WeakLanceCache,
+    },
     error::LanceOptionExt,
     utils::{
         tokio::get_num_compute_intensive_cpus,
@@ -67,7 +73,7 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{LanceExecutionOptions, OneShotExec, execute_plan},
 };
-use lance_select::NullableRowAddrSet;
+use lance_select::{NullableRowAddrSet, RowSetOps};
 use log::{debug, warn};
 use object_store::Error as ObjectStoreError;
 use rangemap::RangeInclusiveMap;
@@ -1402,104 +1408,56 @@ impl BTreeIndexState {
 }
 
 impl CacheCodecImpl for BTreeIndexState {
-    /// Wire format (no stability guarantees yet — the cache is rebuilt from
-    /// source on any version mismatch):
+    const TYPE_ID: &'static str = "lance.scalar.BTreeIndexState";
+    const CURRENT_VERSION: u32 = 1;
+
+    /// Wire format:
     /// ```text
-    /// u64 batch_size (LE)
-    /// u8  has_ranges (0 = None, 1 = Some)
-    /// if has_ranges:
-    ///   u32 entry_count (LE)
-    ///   per entry: u32 start | u32 end | u32 offset | u32 path_len | path bytes
-    /// lookup batch (Arrow IPC stream)
+    /// HEADER    : BTreeIndexHeader proto (batch_size + page-range mapping)
+    /// ARROW_IPC : page-lookup batch
     /// ```
-    fn serialize(&self, writer: &mut dyn std::io::Write) -> Result<()> {
-        writer.write_all(&self.batch_size.to_le_bytes())?;
-        match &self.ranges_to_files {
-            None => writer.write_all(&[0u8])?,
-            Some(ranges) => {
-                writer.write_all(&[1u8])?;
-                let count = u32::try_from(ranges.len()).map_err(|_| {
-                    Error::io("BTreeIndexState: ranges_to_files exceeds u32::MAX entries")
-                })?;
-                writer.write_all(&count.to_le_bytes())?;
-                for (range, (path, page_offset)) in ranges.iter() {
-                    writer.write_all(&range.start().to_le_bytes())?;
-                    writer.write_all(&range.end().to_le_bytes())?;
-                    writer.write_all(&page_offset.to_le_bytes())?;
-                    let path_len = u32::try_from(path.len()).map_err(|_| {
-                        Error::io("BTreeIndexState: ranges_to_files path exceeds u32::MAX bytes")
-                    })?;
-                    writer.write_all(&path_len.to_le_bytes())?;
-                    writer.write_all(path.as_bytes())?;
-                }
-            }
-        }
-        write_ipc_stream(&self.lookup_batch, writer)?;
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        let ranges_to_files = match &self.ranges_to_files {
+            None => Vec::new(),
+            Some(ranges) => ranges
+                .iter()
+                .map(|(range, (path, page_offset))| RangeToFile {
+                    start: *range.start(),
+                    end: *range.end(),
+                    page_offset: *page_offset,
+                    path: path.clone(),
+                })
+                .collect(),
+        };
+        let header = BTreeIndexHeader {
+            batch_size: self.batch_size,
+            has_ranges_to_files: self.ranges_to_files.is_some(),
+            ranges_to_files,
+        };
+        w.write_header(&header)?;
+        w.write_ipc(&self.lookup_batch)?;
         Ok(())
     }
 
-    fn deserialize(data: &bytes::Bytes) -> Result<Self> {
-        let mut offset = 0;
-        let batch_size = read_u64_le(data, &mut offset)?;
-        let has_ranges = read_u8(data, &mut offset)?;
-        let ranges_to_files = match has_ranges {
-            0 => None,
-            1 => {
-                let count = read_u32_le(data, &mut offset)? as usize;
-                let mut entries = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let start = read_u32_le(data, &mut offset)?;
-                    let end = read_u32_le(data, &mut offset)?;
-                    let page_offset = read_u32_le(data, &mut offset)?;
-                    let path_len = read_u32_le(data, &mut offset)? as usize;
-                    let path = read_bytes(data, &mut offset, path_len)?;
-                    let path = std::str::from_utf8(&path)
-                        .map_err(|e| Error::io(format!("BTreeIndexState path: {e}")))?
-                        .to_string();
-                    entries.push((start..=end, (path, page_offset)));
-                }
-                Some(Arc::new(entries.into_iter().collect()))
-            }
-            other => {
-                return Err(Error::io(format!(
-                    "BTreeIndexState: invalid has_ranges tag {other}"
-                )));
-            }
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let header: BTreeIndexHeader = r.read_header()?;
+        let ranges_to_files = if header.has_ranges_to_files {
+            let map: RangeInclusiveMap<u32, (String, u32)> = header
+                .ranges_to_files
+                .into_iter()
+                .map(|entry| (entry.start..=entry.end, (entry.path, entry.page_offset)))
+                .collect();
+            Some(Arc::new(map))
+        } else {
+            None
         };
-        let lookup_batch = read_ipc_stream_single_at(data, &mut offset)?;
+        let lookup_batch = r.read_ipc()?;
         Ok(Self {
             lookup_batch,
-            batch_size,
+            batch_size: header.batch_size,
             ranges_to_files,
         })
     }
-}
-
-fn read_bytes(data: &bytes::Bytes, offset: &mut usize, len: usize) -> Result<bytes::Bytes> {
-    if data.len() < *offset + len {
-        return Err(Error::io(format!(
-            "BTreeIndexState: short read of {len} bytes at offset {offset} (have {})",
-            data.len()
-        )));
-    }
-    let slice = data.slice(*offset..*offset + len);
-    *offset += len;
-    Ok(slice)
-}
-
-fn read_u8(data: &bytes::Bytes, offset: &mut usize) -> Result<u8> {
-    let bytes = read_bytes(data, offset, 1)?;
-    Ok(bytes[0])
-}
-
-fn read_u32_le(data: &bytes::Bytes, offset: &mut usize) -> Result<u32> {
-    let bytes = read_bytes(data, offset, 4)?;
-    Ok(u32::from_le_bytes(bytes.as_ref().try_into().unwrap()))
-}
-
-fn read_u64_le(data: &bytes::Bytes, offset: &mut usize) -> Result<u64> {
-    let bytes = read_bytes(data, offset, 8)?;
-    Ok(u64::from_le_bytes(bytes.as_ref().try_into().unwrap()))
 }
 
 /// Cache key for a [`BTreeIndexState`]. The cache it is used with is already
@@ -1595,6 +1553,66 @@ impl BTreeIndex {
         }
     }
 
+    /// For each key in `keys`, whether this index contains it — a batched
+    /// existence check returning a mask aligned to `keys`.
+    ///
+    /// The per-key sibling of `search(Equals(..))`, but one call replaces N
+    /// probes: keys are grouped by page using the same page resolution as
+    /// [`ScalarIndex::search`] (`pages_eq`), each touched page is loaded once
+    /// (session-cached), and membership is tested against the page's values via
+    /// `FlatIndex::contains_values`. Avoids the per-key `SearchResult` /
+    /// `RowAddrTreeMap` allocation when the caller only wants a yes/no.
+    ///
+    /// Intended for primary-key dedup, where keys are non-null; a null key maps
+    /// to `false`.
+    pub async fn contains_keys(
+        &self,
+        keys: &[ScalarValue],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<bool>> {
+        // Group each key (by input position) under every page whose value range
+        // could hold it. Mirrors `search`'s page selection so the two agree.
+        let mut by_page: HashMap<u32, Vec<(usize, OrderableScalarValue)>> = HashMap::new();
+        for (idx, key) in keys.iter().enumerate() {
+            if key.is_null() {
+                continue;
+            }
+            let ov = OrderableScalarValue(key.clone());
+            for matches in self.page_lookup.pages_eq(&ov)? {
+                by_page
+                    .entry(matches.page_id())
+                    .or_default()
+                    .push((idx, ov.clone()));
+            }
+        }
+
+        let index_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
+        let page_tasks = by_page.into_iter().map(|(page_number, entries)| {
+            let index_reader = index_reader.clone();
+            async move {
+                let page = self.lookup_page(page_number, index_reader, metrics).await?;
+                let needles: Vec<OrderableScalarValue> =
+                    entries.iter().map(|(_, ov)| ov.clone()).collect();
+                let present = page.contains_values(&needles)?;
+                Result::Ok((entries, present))
+            }
+        });
+
+        let mut result = vec![false; keys.len()];
+        let page_results: Vec<_> = stream::iter(page_tasks)
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .try_collect()
+            .await?;
+        for (entries, present) in page_results {
+            for (idx, ov) in entries {
+                if present.contains(&ov) {
+                    result[idx] = true;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     async fn lookup_page(
         &self,
         page_number: u32,
@@ -1628,11 +1646,28 @@ impl BTreeIndex {
         FlatIndex::try_new(serialized_page)
     }
 
+    /// Compile a sargable predicate into a physical expr against the per-page
+    /// schema ([values, ids]). Built once in `search` and shared across pages so
+    /// a large IN-list is not re-materialized for every page.
+    fn compile_predicate(&self, query: &SargableQuery) -> Result<Arc<dyn PhysicalExpr>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(BTREE_VALUES_COLUMN, self.data_type.clone(), true),
+            Field::new(BTREE_IDS_COLUMN, DataType::UInt64, false),
+        ]));
+        let df_schema = DFSchema::try_from(schema)?;
+        Ok(create_physical_expr(
+            &query.to_expr(BTREE_VALUES_COLUMN.to_string()),
+            &df_schema,
+            &ExecutionProps::default(),
+        )?)
+    }
+
     async fn search_page(
         &self,
         query: &SargableQuery,
         matches: Matches,
         index_reader: LazyIndexReader,
+        prebuilt: Option<&Arc<dyn PhysicalExpr>>,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
         let subindex = self
@@ -1640,13 +1675,12 @@ impl BTreeIndex {
             .await?;
 
         match matches {
-            Matches::Some(_) => {
-                // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
-                // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
-                // 1 and 2 and three is in page 2 and seven is in pages 8 and 9, then when searching page 2 we only need
-                // to search for X IN [5, 3]
-                subindex.search(query, metrics)
-            }
+            // For a large IsIn the predicate is compiled once (see `search`) and
+            // reused here, instead of rebuilding the whole IN-list per page.
+            Matches::Some(_) => match prebuilt {
+                Some(expr) => subindex.search_prebuilt(expr, metrics),
+                None => subindex.search(query, metrics),
+            },
             Matches::All(_) => Ok(match query {
                 // This means we hit an all-null page so just grab all row ids as true
                 SargableQuery::IsNull() => subindex.all_ignore_nulls(),
@@ -1798,13 +1832,22 @@ impl BTreeIndex {
         segments: &[Arc<Self>],
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filters: &[Option<OldIndexDataFilter>],
     ) -> Result<CreatedIndex> {
         let Some(first) = segments.first() else {
             return Err(Error::invalid_input(
                 "cannot merge BTree index without at least one source segment".to_string(),
             ));
         };
+
+        if old_data_filters.len() != segments.len() {
+            return Err(Error::invalid_input(format!(
+                "BTree merge: expected one old-data filter per source segment \
+                 (segments={}, filters={})",
+                segments.len(),
+                old_data_filters.len()
+            )));
+        }
 
         for segment in segments.iter().skip(1) {
             if segment.data_type != first.data_type {
@@ -1827,14 +1870,20 @@ impl BTreeIndex {
         }
 
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(segments.len() + 1);
-        for segment in segments {
+        for (segment, old_data_filter) in segments.iter().zip(old_data_filters) {
+            if filter_keeps_nothing(old_data_filter) {
+                continue;
+            }
             let stream = segment.data_stream().await?;
+            let stream = match segment.frag_reuse_index.clone() {
+                Some(frag_reuse_index) => remap_row_ids(stream, frag_reuse_index),
+                None => stream,
+            };
             let stream = match old_data_filter.clone() {
                 Some(filter) => filter_row_ids(stream, filter),
                 None => stream,
             };
-            let exec = Arc::new(OneShotExec::new(stream));
-            inputs.push(exec);
+            inputs.push(Arc::new(OneShotExec::new(stream)));
         }
         inputs.push(Arc::new(OneShotExec::new(new_data)));
 
@@ -1889,6 +1938,28 @@ fn filter_row_ids(
     Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
 }
 
+/// True if `filter` would keep no rows at all (its keep-set is empty), letting
+/// the merge skip reading the segment entirely.
+fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
+    match filter {
+        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
+        None => false,
+    }
+}
+
+fn remap_row_ids(
+    stream: SendableRecordBatchStream,
+    frag_reuse_index: Arc<FragReuseIndex>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let remapped = stream.map(move |batch_result| {
+        let batch = batch_result?;
+        Ok(frag_reuse_index.remap_row_ids_record_batch(batch, 1)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
+}
+
 fn wrap_bound(bound: &Bound<ScalarValue>) -> Bound<OrderableScalarValue> {
     match bound {
         Bound::Unbounded => Bound::Unbounded,
@@ -1925,12 +1996,6 @@ impl Index for BTreeIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "BTreeIndex is not vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -2104,13 +2169,27 @@ impl ScalarIndex for BTreeIndex {
             }
         }
 
+        // Compile a large IsIn predicate once and reuse it across every page;
+        // rebuilding the full IN-list per page is O(pages * values) and dominates
+        // the lookup for sets with many values.
+        let prebuilt = match query {
+            SargableQuery::IsIn(_) => Some(self.compile_predicate(query)?),
+            _ => None,
+        };
+
         let lazy_index_reader =
             LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
-                self.search_page(query, page_index, lazy_index_reader.clone(), metrics)
-                    .boxed()
+                self.search_page(
+                    query,
+                    page_index,
+                    lazy_index_reader.clone(),
+                    prebuilt.as_ref(),
+                    metrics,
+                )
+                .boxed()
             })
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
@@ -2235,7 +2314,7 @@ impl ScalarIndex for BTreeIndex {
             &[Arc::new(self.clone())],
             new_data,
             dest_store,
-            old_data_filter,
+            &[old_data_filter],
         )
         .await
     }
@@ -3286,7 +3365,23 @@ mod tests {
     };
     use crate::scalar::registry::ScalarIndexPlugin;
     use arrow_array::RecordBatch;
-    use lance_core::cache::{CacheCodecImpl, CacheKey};
+    use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey};
+
+    /// Serialize a `BTreeIndexState` body (no envelope) for tests.
+    fn serialize_state(state: &BTreeIndexState) -> Vec<u8> {
+        let mut buf = Vec::new();
+        state
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        buf
+    }
+
+    /// Deserialize a `BTreeIndexState` body (no envelope) for tests.
+    fn deserialize_state(buf: Vec<u8>) -> lance_core::Result<BTreeIndexState> {
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, BTreeIndexState::CURRENT_VERSION);
+        BTreeIndexState::deserialize(&mut reader)
+    }
     use rangemap::RangeInclusiveMap;
 
     lance_testing::define_stage_event_progress!(
@@ -3456,6 +3551,86 @@ mod tests {
                 SearchResult::exact(RowAddrTreeMap::from_iter(((idx as u64)..1000).step_by(7)))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_contains_keys_matches_search() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // 1000 distinct Int32 values [0, 1000), spread across many small pages
+        // (batch_size 64) so the keys below exercise multi-page grouping.
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowid", array::step::<UInt64Type>())
+            .into_df_exec(RowCount::from(100), BatchCount::from(10));
+        let schema = data.schema();
+        let sort_expr = PhysicalSortExpr::new_default(col("value", schema.as_ref()).unwrap());
+        let plan = Arc::new(SortExec::new([sort_expr].into(), data));
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let stream = break_stream(stream, 64);
+        let stream = stream.map_err(DataFusionError::from);
+        let stream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream;
+
+        train_btree_index(stream, test_store.as_ref(), 64, None, None)
+            .await
+            .unwrap();
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Present (range ends, mid, and adjacent values that straddle page
+        // boundaries), interleaved with absent (below/above range, and a gap).
+        let keys: Vec<i32> = vec![0, 999, 500, 1, 998, -1, 1000, 1500, 250, 251, 7, 64, 63, 65];
+        let scalar_keys: Vec<ScalarValue> =
+            keys.iter().map(|k| ScalarValue::Int32(Some(*k))).collect();
+
+        let batched = index
+            .contains_keys(&scalar_keys, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // Oracle: the per-key Equals search the batched path replaces.
+        let mut oracle = Vec::with_capacity(keys.len());
+        for k in &scalar_keys {
+            let result = index
+                .search(&SargableQuery::Equals(k.clone()), &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            oracle.push(!result.row_addrs().is_empty());
+        }
+        assert_eq!(
+            batched, oracle,
+            "contains_keys must agree with per-key Equals search; keys={keys:?}"
+        );
+
+        // And both must match ground truth: [0, 1000) present, others absent.
+        let expected: Vec<bool> = keys.iter().map(|k| (0..1000).contains(k)).collect();
+        assert_eq!(batched, expected);
+
+        // Empty input → empty mask.
+        assert!(
+            index
+                .contains_keys(&[], &NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A null key maps to false (and must not panic).
+        let with_null = vec![ScalarValue::Int32(Some(5)), ScalarValue::Int32(None)];
+        assert_eq!(
+            index
+                .contains_keys(&with_null, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            vec![true, false]
+        );
     }
 
     #[tokio::test]
@@ -5919,9 +6094,7 @@ mod tests {
     }
 
     fn assert_state_roundtrips(state: &BTreeIndexState) {
-        let mut buf = Vec::new();
-        state.serialize(&mut buf).unwrap();
-        let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        let restored = deserialize_state(serialize_state(state)).unwrap();
         assert_eq!(restored.lookup_batch, state.lookup_batch);
         assert_eq!(restored.batch_size, state.batch_size);
         assert_eq!(restored.ranges_to_files, state.ranges_to_files);
@@ -5990,9 +6163,7 @@ mod tests {
             batch_size: index.batch_size,
             ranges_to_files: index.ranges_to_files.clone(),
         };
-        let mut buf = Vec::new();
-        state.serialize(&mut buf).unwrap();
-        let restored = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap();
+        let restored = deserialize_state(serialize_state(&state)).unwrap();
         let reconstructed = restored
             .reconstruct(test_store.clone(), &LanceCache::no_cache(), None)
             .unwrap();
@@ -6028,18 +6199,57 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    /// The lookup batch must decode zero-copy through the full envelope even
+    /// though the proto header pushes the IPC section to a non-aligned offset.
     #[test]
-    fn test_btree_index_state_rejects_invalid_has_ranges_tag() {
-        // u64 batch_size (any) then a bad has_ranges tag.
+    fn test_btree_index_state_lookup_is_zero_copy() {
+        use lance_core::cache::CacheCodec;
+        const ALIGN: usize = 64;
+
+        let ranges: RangeInclusiveMap<u32, (String, u32)> =
+            [(0..=99, ("part_0_page_file.lance".to_string(), 0))]
+                .into_iter()
+                .collect();
+        let state = BTreeIndexState {
+            lookup_batch: sample_lookup_batch(),
+            batch_size: 8192,
+            ranges_to_files: Some(Arc::new(ranges)),
+        };
+
+        let codec = CacheCodec::from_impl::<BTreeIndexState>();
+        let any: Arc<dyn std::any::Any + Send + Sync> = Arc::new(state);
         let mut buf = Vec::new();
-        buf.extend_from_slice(&1000u64.to_le_bytes());
-        buf.push(7u8);
-        let err = BTreeIndexState::deserialize(&bytes::Bytes::from(buf)).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("has_ranges") && msg.contains("7"),
-            "expected error to mention the bad has_ranges tag, got: {msg}"
-        );
+        codec.serialize(&any, &mut buf).unwrap();
+
+        let mut v = vec![0u8; buf.len() + ALIGN];
+        let pad = (ALIGN - (v.as_ptr() as usize % ALIGN)) % ALIGN;
+        v[pad..pad + buf.len()].copy_from_slice(&buf);
+        let data = bytes::Bytes::from(v).slice(pad..pad + buf.len());
+
+        let restored = codec.deserialize(&data).hit().unwrap();
+        let restored = restored.downcast::<BTreeIndexState>().unwrap();
+
+        let base = data.as_ptr() as usize;
+        let end = base + data.len();
+        for col in restored.lookup_batch.columns() {
+            for buffer in col.to_data().buffers() {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= base && ptr < end,
+                    "lookup batch buffer was realigned out of the input — misaligned IPC section",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_btree_index_state_rejects_truncated_header() {
+        // A header length prefix that overruns the buffer must error rather
+        // than panic or silently misread it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes()); // claims a 100-byte header
+        buf.extend_from_slice(&[0u8; 4]); // but only 4 bytes follow
+        assert!(deserialize_state(buf).is_err());
     }
 
     #[tokio::test]

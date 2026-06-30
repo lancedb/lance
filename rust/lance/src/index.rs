@@ -29,9 +29,7 @@ use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
-};
+use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
@@ -57,7 +55,7 @@ use lance_io::utils::{
     read_version,
 };
 use lance_table::format::{Fragment, SelfDescribingFileReader};
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexFile, IndexMetadata, list_index_files_with_sizes};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
@@ -166,7 +164,8 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
         let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
-        if index_details.type_url.ends_with("InvertedIndexDetails") {
+        let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
+        if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
                 name: index_name.to_string(),
@@ -183,7 +182,10 @@ pub(crate) async fn build_index_metadata_from_segments(
                 .await?;
         }
         let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+        if is_inverted_index {
+            retain_committed_inverted_files(&mut files);
+        }
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
@@ -199,6 +201,10 @@ pub(crate) async fn build_index_metadata_from_segments(
     }
 
     Ok(new_indices)
+}
+
+fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
+    files.retain(|file| !file.path.starts_with("staging/"));
 }
 
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -283,7 +289,14 @@ fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
         .as_ref()
-        .is_some_and(|details| details.type_url.ends_with("FMIndexIndexDetails"))
+        .is_some_and(|details| details.type_url.ends_with("FMIndexDetails"))
+}
+
+fn segment_has_label_list_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("LabelListIndexDetails"))
 }
 
 // Cache keys for different index types
@@ -452,7 +465,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "BloomFilter" => IndexType::BloomFilter.to_string(),
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
-        "FMIndex" => IndexType::Fm.to_string(),
+        "FMIndex" | "FM" => IndexType::Fm.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -652,10 +665,10 @@ pub struct ScalarIndexInfo {
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
-    fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
         self.indexed_columns
             .get(col)
-            .map(|(ty, parser)| (ty, parser.as_ref() as &dyn ScalarQueryParser))
+            .map(|(ty, parser)| (ty, parser.as_ref()))
     }
 
     fn fragment_bitmap(&self, column: &str, index_name: &str) -> Option<RoaringBitmap> {
@@ -1143,7 +1156,14 @@ impl DatasetIndexExt for Dataset {
         let all_btree = source_segments.iter().all(segment_has_btree_details);
         let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
         let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
-        if !all_vector && !all_inverted && !all_bitmap && !all_btree && !all_fmindex && !all_zonemap
+        let all_label_list = source_segments.iter().all(segment_has_label_list_details);
+        if !all_vector
+            && !all_inverted
+            && !all_bitmap
+            && !all_btree
+            && !all_fmindex
+            && !all_zonemap
+            && !all_label_list
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
@@ -1164,6 +1184,8 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+        } else if all_label_list {
+            crate::index::scalar::label_list::merge_segments(self, source_segments).await?
         } else if all_zonemap {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else {
@@ -1891,9 +1913,15 @@ impl DatasetIndexInternalExt for Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
-                .reconstruct(object_store, self.metadata_cache.as_ref(), partition_cache)
+                .reconstruct(
+                    object_store,
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                    frag_reuse_index,
+                )
                 .await;
         }
 

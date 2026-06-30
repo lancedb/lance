@@ -27,6 +27,7 @@ use jni::sys::{jdouble, jint, jlong};
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
     FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    write_pk_sidecar,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
@@ -177,6 +178,42 @@ fn inner_put(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> 
     let guard =
         unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
     RT.block_on(guard.writer.put(batches))?;
+    Ok(())
+}
+
+/// Test-support: write a primary-key dedup sidecar (`_pk_index/`) for a
+/// flushed-generation dataset already staged at `gen_path`, mirroring what
+/// production flush emits. Lets Java tests stage a *faithful* flushed
+/// generation (dataset + sidecar); production always writes the sidecar during
+/// flush, so a dataset-without-sidecar is not a state the system produces.
+/// Mirrors the Python `_write_pk_sidecar` binding.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_memwal_MemWalTest_nativeWritePkSidecar(
+    mut env: JNIEnv,
+    _class: JClass,
+    gen_path: JString,
+    stream_addr: jlong,
+    pk_columns: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_write_pk_sidecar(&mut env, gen_path, stream_addr, pk_columns)
+    );
+}
+
+fn inner_write_pk_sidecar(
+    env: &mut JNIEnv,
+    gen_path: JString,
+    stream_addr: jlong,
+    pk_columns: JObject,
+) -> Result<()> {
+    let gen_path: String = env.get_string(&gen_path)?.into();
+    let pk_columns = env.get_strings(&pk_columns)?;
+    let stream_ptr = stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
+    let pk_refs: Vec<&str> = pk_columns.iter().map(String::as_str).collect();
+    RT.block_on(write_pk_sidecar(&gen_path, &batches, &pk_refs))?;
     Ok(())
 }
 

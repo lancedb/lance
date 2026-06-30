@@ -65,6 +65,8 @@ public final class InvertedIndexParams {
      *   <li>{@code "whitespace"}: splits tokens on whitespace
      *   <li>{@code "raw"}: no tokenization
      *   <li>{@code "ngram"}: N-Gram tokenizer
+     *   <li>{@code "icu"}: ICU dictionary-based Unicode word segmentation
+     *   <li>{@code "icu/split"}: ICU segmentation with simple-style delimiter splitting
      *   <li>{@code "lindera/*"}: Lindera tokenizer
      *   <li>{@code "jieba/*"}: Jieba tokenizer
      * </ul>
