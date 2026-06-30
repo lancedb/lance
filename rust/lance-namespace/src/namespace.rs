@@ -58,6 +58,37 @@ use lance_namespace_reqwest_client::models::{
 /// - [`crate::ErrorCode::Internal`] - Unexpected internal error
 ///
 /// See individual method documentation for operation-specific errors.
+///
+/// Lifecycle state of a table, reported by [`LanceNamespace::table_status`].
+///
+/// Soft-delete splits a logical `drop` (reversible, leaves data intact) from a physical
+/// `purge` (reclaims storage). Purged and never-created both report
+/// [`TableLifecycle::NotFound`] — no tombstone is retained after a purge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableLifecycle {
+    /// The table exists and is live.
+    Exists,
+    /// The table has been soft-deleted (dropped) but not yet purged.
+    SoftDeleted {
+        /// Wall-clock time of the soft-delete, in milliseconds since the Unix epoch.
+        deleted_at_ms: u64,
+    },
+    /// The table does not exist (never created, or already purged).
+    NotFound,
+}
+
+/// A soft-deleted table that is a candidate for purging, returned by
+/// [`LanceNamespace::list_purgable_tables`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgableTable {
+    /// The table id (namespace-qualified).
+    pub id: Vec<String>,
+    /// Wall-clock time of the soft-delete, in milliseconds since the Unix epoch.
+    pub deleted_at_ms: u64,
+    /// Optional TTL stamped into the marker at drop time, in milliseconds.
+    pub ttl_ms: Option<u64>,
+}
+
 #[async_trait]
 pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     /// List namespaces.
@@ -155,6 +186,45 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         _request: DeregisterTableRequest,
     ) -> Result<DeregisterTableResponse> {
         Err(Error::not_supported("deregister_table not implemented"))
+    }
+
+    /// Report the lifecycle state of a table: live, soft-deleted, or absent.
+    ///
+    /// Purged and never-created both return [`TableLifecycle::NotFound`].
+    async fn table_status(&self, _id: Option<Vec<String>>) -> Result<TableLifecycle> {
+        Err(Error::not_supported("table_status not implemented"))
+    }
+
+    /// List soft-deleted tables that are candidates for purging.
+    ///
+    /// If `deleted_before_ms` is set, only tables soft-deleted at or before that
+    /// timestamp are returned, letting a caller apply a TTL policy.
+    async fn list_purgable_tables(
+        &self,
+        _deleted_before_ms: Option<u64>,
+    ) -> Result<Vec<PurgableTable>> {
+        Err(Error::not_supported("list_purgable_tables not implemented"))
+    }
+
+    /// Un-soft-delete a table, making it live again without rewriting data (clears the
+    /// soft-delete marker). Idempotent: a table that is not soft-deleted is left
+    /// unchanged. Distinct from [`Self::restore_table`], which restores a prior version.
+    async fn undelete_table(&self, _id: Option<Vec<String>>) -> Result<()> {
+        Err(Error::not_supported("undelete_table not implemented"))
+    }
+
+    /// Purge a single soft-deleted table, physically reclaiming its storage. Returns
+    /// `true` if it was purged, `false` if it was not soft-deleted or a concurrent revive
+    /// won the race. Never purges a live table.
+    async fn purge_table(&self, _id: Option<Vec<String>>) -> Result<bool> {
+        Err(Error::not_supported("purge_table not implemented"))
+    }
+
+    /// Purge soft-deleted tables. `None` purges every currently-purgable table; a list
+    /// purges exactly those (skipping any that are not soft-deleted). Returns the ids that
+    /// were actually purged.
+    async fn purge_tables(&self, _ids: Option<Vec<Vec<String>>>) -> Result<Vec<Vec<String>>> {
+        Err(Error::not_supported("purge_tables not implemented"))
     }
 
     /// Count rows in a table.

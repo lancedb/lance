@@ -78,6 +78,7 @@ use lance_core::{Error, Result, box_error};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
+use lance_namespace::{PurgableTable, TableLifecycle};
 
 use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
@@ -189,36 +190,6 @@ pub(crate) struct TableStatus {
     pub(crate) is_soft_deleted: bool,
     /// Whether the table has a `.lance-reserved` marker file (declared but not written)
     pub(crate) has_reserved_file: bool,
-}
-
-/// Lifecycle state of a table in a directory namespace.
-///
-/// Soft-delete splits a logical `drop` (reversible, leaves data intact) from a
-/// physical `purge` (reclaims storage). `table_status` reports where a table sits
-/// in that lifecycle. Purged and never-created both report [`TableLifecycle::NotFound`]
-/// — no tombstone is retained after purge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TableLifecycle {
-    /// The table exists and is live.
-    Exists,
-    /// The table has been soft-deleted (dropped) but not yet purged.
-    SoftDeleted {
-        /// Wall-clock time of the soft-delete, in milliseconds since the Unix epoch.
-        deleted_at_ms: u64,
-    },
-    /// The table does not exist (never created, or already purged).
-    NotFound,
-}
-
-/// A soft-deleted table that is a candidate for purging.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PurgableTable {
-    /// The table name (root-level, single-segment id).
-    pub name: String,
-    /// Wall-clock time of the soft-delete, in milliseconds since the Unix epoch.
-    pub deleted_at_ms: u64,
-    /// Optional caller-supplied TTL stamped into the marker at drop time, in milliseconds.
-    pub ttl_ms: Option<u64>,
 }
 
 /// File extension for the root-level soft-delete marker (`<name>.deleted`).
@@ -2800,37 +2771,14 @@ impl DirectoryNamespace {
         }
     }
 
-    /// Reject lifecycle operations that only make sense in directory (V1) mode.
-    ///
-    /// In manifest mode the lifecycle is tracked by the manifest, not by root-level
-    /// markers, so the soft-delete/purge methods below are unsupported there.
-    fn ensure_dir_mode(&self, operation: &str) -> Result<()> {
-        if self.manifest_ns.is_some() {
-            return Err(NamespaceError::Unsupported {
-                message: format!(
-                    "{} is only supported in directory (non-manifest) mode",
-                    operation
-                ),
-            }
-            .into());
-        }
-        Ok(())
-    }
-
-    /// Report the lifecycle state of a table: live, soft-deleted, or absent.
-    ///
-    /// Purged and never-created both return [`TableLifecycle::NotFound`] — no tombstone
-    /// is retained after a purge.
-    pub async fn table_status(&self, table_name: &str) -> Result<TableLifecycle> {
-        self.record_op("table_status");
-        self.ensure_dir_mode("table_status")?;
-
+    /// Report the lifecycle state of a soft-deletable table by name. Backs the
+    /// `table_status` trait method.
+    async fn table_lifecycle(&self, table_name: &str) -> Result<TableLifecycle> {
         if let Some(marker) = self.read_delete_marker(table_name).await? {
             return Ok(TableLifecycle::SoftDeleted {
                 deleted_at_ms: marker.deleted_at_ms,
             });
         }
-
         let status = self.check_table_status(table_name).await;
         if status.exists {
             Ok(TableLifecycle::Exists)
@@ -2839,97 +2787,14 @@ impl DirectoryNamespace {
         }
     }
 
-    /// List soft-deleted tables that are candidates for purging.
-    ///
-    /// If `deleted_before_ms` is set, only tables soft-deleted at or before that
-    /// timestamp are returned, letting a caller apply a TTL policy (e.g. `now - ttl`)
-    /// while the namespace owns the listing mechanism.
-    ///
-    /// This reads each marker's body to recover `deleted_at`/`ttl`, so it is O(N) in the
-    /// number of soft-deleted tables. It is intended for an infrequent background sweep,
-    /// not the hot listing path (`list_tables` stays O(1) because it only needs the set
-    /// of deleted names, which is visible from a single root listing).
-    pub async fn list_purgable_tables(
-        &self,
-        deleted_before_ms: Option<u64>,
-    ) -> Result<Vec<PurgableTable>> {
-        self.record_op("list_purgable_tables");
-        self.ensure_dir_mode("list_purgable_tables")?;
-
-        let entries = self
-            .object_store
-            .read_dir(self.base_path.clone())
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to list directory: {:?}", e),
-                })
-            })?;
-
-        let deleted_suffix = format!(".{}", DELETED_MARKER_EXTENSION);
-        let mut purgable = Vec::new();
-        for entry in &entries {
-            let path = entry.trim_end_matches('/');
-            let Some(name) = path.strip_suffix(deleted_suffix.as_str()) else {
-                continue;
-            };
-            let Some(marker) = self.read_delete_marker(name).await? else {
-                continue;
-            };
-            if let Some(cutoff) = deleted_before_ms
-                && marker.deleted_at_ms > cutoff
-            {
-                continue;
-            }
-            purgable.push(PurgableTable {
-                name: name.to_string(),
-                deleted_at_ms: marker.deleted_at_ms,
-                ttl_ms: marker.ttl_ms,
-            });
-        }
-        Ok(purgable)
-    }
-
-    /// Purge soft-deleted tables, physically reclaiming their storage.
-    ///
-    /// When `names` is `None`, every currently-purgable table (all stable soft-deletes)
-    /// is purged. When a list is given, exactly those tables are purged; a name that is
-    /// not soft-deleted is skipped (purge never touches a live table). Returns the names
-    /// that were actually purged.
-    pub async fn purge_tables(&self, names: Option<Vec<String>>) -> Result<Vec<String>> {
-        self.record_op("purge_tables");
-        self.ensure_dir_mode("purge_tables")?;
-
-        let candidates = match names {
-            Some(names) => names,
-            None => self
-                .list_purgable_tables(None)
-                .await?
-                .into_iter()
-                .map(|t| t.name)
-                .collect(),
-        };
-
-        let mut purged = Vec::new();
-        for name in candidates {
-            if self.purge_table(&name).await? {
-                purged.push(name);
-            }
-        }
-        Ok(purged)
-    }
-
-    /// Purge a single soft-deleted table. Returns `true` if it was purged, `false` if it
-    /// was not soft-deleted (live or already gone) or a concurrent revive won the race.
+    /// Purge a single soft-deleted table by name. Returns `true` if it was purged.
+    /// Backs the `purge_table`/`purge_tables` trait methods.
     ///
     /// Race guard: purge takes the lifecycle lock before touching data, then re-reads the
     /// marker while holding it. If the marker is gone, a revive completed first — so the
     /// data is now live and must not be removed. Because revive also holds the lock for
     /// its whole operation, purge and revive can never act on the data at the same time.
-    pub async fn purge_table(&self, table_name: &str) -> Result<bool> {
-        self.record_op("purge_table");
-        self.ensure_dir_mode("purge_table")?;
-
+    async fn purge_table_by_name(&self, table_name: &str) -> Result<bool> {
         if self.read_delete_marker(table_name).await?.is_none() {
             // Not soft-deleted: never purge a live or absent table.
             return Ok(false);
@@ -2946,7 +2811,7 @@ impl DirectoryNamespace {
         Ok(purged)
     }
 
-    /// Body of [`Self::purge_table`], run while holding the lifecycle lock.
+    /// Body of [`Self::purge_table_by_name`], run while holding the lifecycle lock.
     async fn purge_locked(&self, table_name: &str) -> Result<bool> {
         // Re-check under the lock: a revive that completed between our first marker read
         // and acquiring the lock will have removed the marker and made the table live
@@ -2976,6 +2841,38 @@ impl DirectoryNamespace {
             }
             .into()),
         }
+    }
+
+    /// Clear a table's soft-delete marker by name, making it live again. Backs the
+    /// `undelete_table` trait method. Idempotent: a table that is not soft-deleted is left
+    /// as-is.
+    ///
+    /// Holds the lifecycle lock so it is mutually exclusive with a concurrent purge: once
+    /// the marker is gone the table is live, and purge (which re-checks the marker under
+    /// the same lock) will not reclaim it.
+    async fn undelete_table_by_name(&self, table_name: &str) -> Result<()> {
+        if self.read_delete_marker(table_name).await?.is_none() {
+            return Ok(());
+        }
+        if !self.acquire_lifecycle_lock(table_name, "undelete").await? {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "table {} is being purged or revived; retry the operation",
+                    table_name
+                ),
+            }
+            .into());
+        }
+        let marker_path = self.table_deleted_marker_path(table_name);
+        let result = match self.object_store.inner.delete(&marker_path).await {
+            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
+                message: format!("Failed to undelete table {}: {:?}", table_name, e),
+            })),
+        };
+        let release = self.release_lifecycle_lock(table_name).await;
+        result?;
+        release
     }
 }
 
@@ -3212,7 +3109,8 @@ impl LanceNamespace for DirectoryNamespace {
     /// In directory (V1) mode this writes a root-level `<name>.deleted` marker and leaves
     /// the table data intact, rather than physically removing it. The table is then hidden
     /// from listing/describe/open, but storage is reclaimed only by a later `purge_table`
-    /// (e.g. once a TTL elapses). Dropping a missing or already-dropped table is a no-op.
+    /// (e.g. once a TTL elapses). Dropping a missing table errors with `TableNotFound`;
+    /// re-dropping an already-soft-deleted table is an idempotent no-op.
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
         self.record_op("drop_table");
         if let Some(ref manifest_ns) = self.manifest_ns {
@@ -3223,9 +3121,15 @@ impl LanceNamespace for DirectoryNamespace {
         let table_uri = self.table_full_uri(&table_name);
         let status = self.check_table_status(&table_name).await;
 
-        // Only write a marker for a live table. A missing table is a no-op, and an
-        // already-soft-deleted one keeps its original marker (and `deleted_at`).
-        if status.exists && !status.is_soft_deleted {
+        if !status.is_soft_deleted {
+            // A missing table is an error (matches the non-soft-delete drop contract);
+            // a live table gets its marker written.
+            if !status.exists {
+                return Err(NamespaceError::TableNotFound {
+                    message: table_name,
+                }
+                .into());
+            }
             let marker_path = self.table_deleted_marker_path(&table_name);
             let body = Self::encode_delete_marker(Self::now_ms(), None);
             let put_opts = PutOptions {
@@ -3489,6 +3393,109 @@ impl LanceNamespace for DirectoryNamespace {
             location: Some(table_uri),
             ..Default::default()
         })
+    }
+
+    async fn table_status(&self, id: Option<Vec<String>>) -> Result<TableLifecycle> {
+        self.record_op("table_status");
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.table_status(id).await;
+        }
+        let table_name = Self::table_name_from_id(&id)?;
+        self.table_lifecycle(&table_name).await
+    }
+
+    /// List soft-deleted tables that are candidates for purging.
+    ///
+    /// Reads each marker's body to recover `deleted_at`/`ttl`, so it is O(N) in the number
+    /// of soft-deleted tables — intended for an infrequent background sweep, not the hot
+    /// listing path (`list_tables` stays O(1)).
+    async fn list_purgable_tables(
+        &self,
+        deleted_before_ms: Option<u64>,
+    ) -> Result<Vec<PurgableTable>> {
+        self.record_op("list_purgable_tables");
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.list_purgable_tables(deleted_before_ms).await;
+        }
+
+        let entries = self
+            .object_store
+            .read_dir(self.base_path.clone())
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!("Failed to list directory: {:?}", e),
+                })
+            })?;
+
+        let deleted_suffix = format!(".{}", DELETED_MARKER_EXTENSION);
+        let mut purgable = Vec::new();
+        for entry in &entries {
+            let path = entry.trim_end_matches('/');
+            let Some(name) = path.strip_suffix(deleted_suffix.as_str()) else {
+                continue;
+            };
+            let Some(marker) = self.read_delete_marker(name).await? else {
+                continue;
+            };
+            if let Some(cutoff) = deleted_before_ms
+                && marker.deleted_at_ms > cutoff
+            {
+                continue;
+            }
+            purgable.push(PurgableTable {
+                id: vec![name.to_string()],
+                deleted_at_ms: marker.deleted_at_ms,
+                ttl_ms: marker.ttl_ms,
+            });
+        }
+        Ok(purgable)
+    }
+
+    async fn undelete_table(&self, id: Option<Vec<String>>) -> Result<()> {
+        self.record_op("undelete_table");
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.undelete_table(id).await;
+        }
+        let table_name = Self::table_name_from_id(&id)?;
+        self.undelete_table_by_name(&table_name).await
+    }
+
+    async fn purge_table(&self, id: Option<Vec<String>>) -> Result<bool> {
+        self.record_op("purge_table");
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.purge_table(id).await;
+        }
+        let table_name = Self::table_name_from_id(&id)?;
+        self.purge_table_by_name(&table_name).await
+    }
+
+    /// Purge soft-deleted tables. `None` purges every currently-purgable table; a list
+    /// purges exactly those (skipping any not soft-deleted). Returns the purged ids.
+    async fn purge_tables(&self, ids: Option<Vec<Vec<String>>>) -> Result<Vec<Vec<String>>> {
+        self.record_op("purge_tables");
+        if let Some(ref manifest_ns) = self.manifest_ns {
+            return manifest_ns.purge_tables(ids).await;
+        }
+
+        let candidates: Vec<Vec<String>> = match ids {
+            Some(ids) => ids,
+            None => self
+                .list_purgable_tables(None)
+                .await?
+                .into_iter()
+                .map(|t| t.id)
+                .collect(),
+        };
+
+        let mut purged = Vec::new();
+        for id in candidates {
+            let table_name = Self::table_name_from_id(&Some(id.clone()))?;
+            if self.purge_table_by_name(&table_name).await? {
+                purged.push(id);
+            }
+        }
+        Ok(purged)
     }
 
     async fn alter_table_add_columns(
@@ -13059,14 +13066,17 @@ mod tests {
         let (ns, _tmp) = create_v1_namespace().await;
         create_table_named(&ns, "t", create_non_empty_test_ipc_data()).await;
 
-        assert_eq!(ns.table_status("t").await.unwrap(), TableLifecycle::Exists);
+        assert_eq!(
+            ns.table_status(Some(vec!["t".to_string()])).await.unwrap(),
+            TableLifecycle::Exists
+        );
 
         drop_table_named(&ns, "t").await;
 
         // Hidden from reads, but not physically gone: it shows up as purgable.
         assert!(ns.table_exists(table_exists_named("t")).await.is_err());
         assert!(matches!(
-            ns.table_status("t").await.unwrap(),
+            ns.table_status(Some(vec!["t".to_string()])).await.unwrap(),
             TableLifecycle::SoftDeleted { .. }
         ));
 
@@ -13076,7 +13086,7 @@ mod tests {
 
         let purgable = ns.list_purgable_tables(None).await.unwrap();
         assert_eq!(purgable.len(), 1);
-        assert_eq!(purgable[0].name, "t");
+        assert_eq!(purgable[0].id, vec!["t".to_string()]);
     }
 
     #[tokio::test]
@@ -13085,7 +13095,7 @@ mod tests {
         create_table_named(&ns, "t", create_non_empty_test_ipc_data()).await;
 
         drop_table_named(&ns, "t").await;
-        let first = match ns.table_status("t").await.unwrap() {
+        let first = match ns.table_status(Some(vec!["t".to_string()])).await.unwrap() {
             TableLifecycle::SoftDeleted { deleted_at_ms } => deleted_at_ms,
             other => panic!("expected SoftDeleted, got {:?}", other),
         };
@@ -13093,16 +13103,21 @@ mod tests {
         // A second drop must not move the deleted_at timestamp.
         drop_table_named(&ns, "t").await;
         assert_eq!(
-            ns.table_status("t").await.unwrap(),
+            ns.table_status(Some(vec!["t".to_string()])).await.unwrap(),
             TableLifecycle::SoftDeleted {
                 deleted_at_ms: first
             }
         );
 
-        // Dropping a table that never existed is a no-op, not an error.
-        drop_table_named(&ns, "ghost").await;
+        // Dropping a table that never existed errors (matches the drop_table contract;
+        // idempotency for already-dropped tables is the re-drop case above).
+        let mut ghost = DropTableRequest::new();
+        ghost.id = Some(vec!["ghost".to_string()]);
+        assert!(ns.drop_table(ghost).await.is_err());
         assert_eq!(
-            ns.table_status("ghost").await.unwrap(),
+            ns.table_status(Some(vec!["ghost".to_string()]))
+                .await
+                .unwrap(),
             TableLifecycle::NotFound
         );
     }
@@ -13127,7 +13142,10 @@ mod tests {
             resp.version
         );
 
-        assert_eq!(ns.table_status("t").await.unwrap(), TableLifecycle::Exists);
+        assert_eq!(
+            ns.table_status(Some(vec!["t".to_string()])).await.unwrap(),
+            TableLifecycle::Exists
+        );
         assert!(ns.table_exists(table_exists_named("t")).await.is_ok());
         assert!(ns.list_purgable_tables(None).await.unwrap().is_empty());
 
@@ -13192,7 +13210,7 @@ mod tests {
         let future = DirectoryNamespace::now_ms() + 60_000;
         let purgable = ns.list_purgable_tables(Some(future)).await.unwrap();
         assert_eq!(purgable.len(), 1);
-        assert_eq!(purgable[0].name, "t");
+        assert_eq!(purgable[0].id, vec!["t".to_string()]);
     }
 
     #[tokio::test]
@@ -13205,15 +13223,15 @@ mod tests {
 
         let mut purged = ns.purge_tables(None).await.unwrap();
         purged.sort();
-        assert_eq!(purged, vec!["t1".to_string(), "t2".to_string()]);
+        assert_eq!(purged, vec![vec!["t1".to_string()], vec!["t2".to_string()]]);
 
         // After purge they are gone for good (no tombstone) and nothing is left to purge.
         assert_eq!(
-            ns.table_status("t1").await.unwrap(),
+            ns.table_status(Some(vec!["t1".to_string()])).await.unwrap(),
             TableLifecycle::NotFound
         );
         assert_eq!(
-            ns.table_status("t2").await.unwrap(),
+            ns.table_status(Some(vec!["t2".to_string()])).await.unwrap(),
             TableLifecycle::NotFound
         );
         assert!(ns.list_purgable_tables(None).await.unwrap().is_empty());
@@ -13228,17 +13246,24 @@ mod tests {
 
         // Asking to purge a live table and a soft-deleted one purges only the dead one.
         let purged = ns
-            .purge_tables(Some(vec!["live".to_string(), "dead".to_string()]))
+            .purge_tables(Some(vec![
+                vec!["live".to_string()],
+                vec!["dead".to_string()],
+            ]))
             .await
             .unwrap();
-        assert_eq!(purged, vec!["dead".to_string()]);
+        assert_eq!(purged, vec![vec!["dead".to_string()]]);
 
         assert_eq!(
-            ns.table_status("live").await.unwrap(),
+            ns.table_status(Some(vec!["live".to_string()]))
+                .await
+                .unwrap(),
             TableLifecycle::Exists
         );
         assert_eq!(
-            ns.table_status("dead").await.unwrap(),
+            ns.table_status(Some(vec!["dead".to_string()]))
+                .await
+                .unwrap(),
             TableLifecycle::NotFound
         );
     }
@@ -13260,31 +13285,36 @@ mod tests {
             let revive_ns = ns.clone();
             let purge_ns = ns.clone();
             // Alternate which op is spawned first to vary the interleaving.
-            let (revive_res, purge_res) = if i % 2 == 0 {
-                let revive = tokio::spawn(async move {
-                    let mut req = CreateTableRequest::new();
-                    req.id = Some(vec!["t".to_string()]);
-                    revive_ns
-                        .create_table(req, Bytes::from(create_single_row_test_ipc_data()))
-                        .await
-                });
-                let purge = tokio::spawn(async move { purge_ns.purge_table("t").await });
-                (revive.await.unwrap(), purge.await.unwrap())
-            } else {
-                let purge = tokio::spawn(async move { purge_ns.purge_table("t").await });
-                let revive = tokio::spawn(async move {
-                    let mut req = CreateTableRequest::new();
-                    req.id = Some(vec!["t".to_string()]);
-                    revive_ns
-                        .create_table(req, Bytes::from(create_single_row_test_ipc_data()))
-                        .await
-                });
-                let purge_res = purge.await.unwrap();
-                (revive.await.unwrap(), purge_res)
-            };
+            let (revive_res, purge_res) =
+                if i % 2 == 0 {
+                    let revive = tokio::spawn(async move {
+                        let mut req = CreateTableRequest::new();
+                        req.id = Some(vec!["t".to_string()]);
+                        revive_ns
+                            .create_table(req, Bytes::from(create_single_row_test_ipc_data()))
+                            .await
+                    });
+                    let purge = tokio::spawn(async move {
+                        purge_ns.purge_table(Some(vec!["t".to_string()])).await
+                    });
+                    (revive.await.unwrap(), purge.await.unwrap())
+                } else {
+                    let purge = tokio::spawn(async move {
+                        purge_ns.purge_table(Some(vec!["t".to_string()])).await
+                    });
+                    let revive = tokio::spawn(async move {
+                        let mut req = CreateTableRequest::new();
+                        req.id = Some(vec!["t".to_string()]);
+                        revive_ns
+                            .create_table(req, Bytes::from(create_single_row_test_ipc_data()))
+                            .await
+                    });
+                    let purge_res = purge.await.unwrap();
+                    (revive.await.unwrap(), purge_res)
+                };
 
             let purged = purge_res.expect("purge_table must not error");
-            let status = ns.table_status("t").await.unwrap();
+            let status = ns.table_status(Some(vec!["t".to_string()])).await.unwrap();
 
             // The no-data-loss guarantee: a successful create means a live table.
             match revive_res {
