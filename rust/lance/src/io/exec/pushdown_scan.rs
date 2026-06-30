@@ -326,9 +326,7 @@ impl FragmentScanner {
         })
     }
 
-    pub async fn scan(
-        self,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
+    pub async fn scan(self) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
