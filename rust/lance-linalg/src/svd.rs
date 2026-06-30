@@ -153,7 +153,7 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         println!("Error: Matrix must not contain null or infinite entries.");
     }
 
-    if m == 0 || n == 0 || a.len() != m * n || !a.iter().all(|x| x.is_finite()) {
+    if a.len() == 0 || m == 0 || n == 0 || a.len() != m * n || !a.iter().all(|x| x.is_finite()) {
         return (vec![], vec![], vec![]);
     }
 
