@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, new_null_array};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use lance_core::datatypes::Schema;
@@ -49,8 +49,10 @@ pub use super::wal::{WalEntry, WalEntryData, WalFlushResult, WalFlusher};
 use super::memtable::flush::TriggerMemTableFlush;
 use super::scanner::GenerationWarmer;
 use super::wal::{
-    TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, WalTailer, empty_flush_result,
+    BatchDurableWatcher, TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState, WalTailer,
+    empty_flush_result,
 };
+use super::{TOMBSTONE, schema_with_tombstone};
 
 use super::manifest::ShardManifestStore;
 
@@ -849,7 +851,16 @@ async fn replay_memtable_from_wal(
                 // Fence sentinels deserialize to zero batches and are skipped
                 // here — they carry only a position, no rows.
                 if !entry.batches.is_empty() {
-                    memtable.insert_batches_only(entry.batches).await?;
+                    // Entries written before deletes existed lack `_tombstone`;
+                    // inject `false` so they match the extended memtable schema.
+                    // Normal entries already carry it and pass through unchanged.
+                    let target_schema = memtable.schema().clone();
+                    let batches = entry
+                        .batches
+                        .into_iter()
+                        .map(|b| ensure_tombstone_column(b, &target_schema))
+                        .collect::<Result<Vec<_>>>()?;
+                    memtable.insert_batches_only(batches).await?;
                 }
                 position = position.checked_add(1).ok_or_else(|| {
                     Error::io(format!(
@@ -894,6 +905,69 @@ fn pk_index_columns(pk_columns: &[String], pk_field_ids: &[i32]) -> Vec<(String,
         .cloned()
         .zip(pk_field_ids.iter().copied())
         .collect()
+}
+
+/// Ensure `batch` carries the `_tombstone` column required by the extended
+/// memtable schema, injecting `false` for every row when it is absent.
+///
+/// Used on the normal write path ([`ShardWriter::put`]) where callers pass
+/// base-shaped batches, and on WAL replay of entries written before deletes
+/// existed (legacy entries lack the column). A batch that already carries
+/// `_tombstone` (a normal replayed entry) is returned unchanged.
+fn ensure_tombstone_column(
+    batch: RecordBatch,
+    target_schema: &Arc<ArrowSchema>,
+) -> Result<RecordBatch> {
+    if batch.schema().column_with_name(TOMBSTONE).is_some() {
+        return Ok(batch);
+    }
+    let n = batch.num_rows();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(Arc::new(BooleanArray::from(vec![false; n])));
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+        Error::invalid_input(format!(
+            "failed to inject _tombstone column (does the batch match the base schema?): {}",
+            e
+        ))
+    })
+}
+
+/// Build a tombstone batch from a key-only `keys` batch: the primary key
+/// columns are carried through, `_tombstone` is set to `true`, and every other
+/// column in the memtable schema is null.
+///
+/// Errors if `keys` is missing a primary key column, or if a non-PK column is
+/// non-nullable (a tombstone must null it) — surfaced via the `RecordBatch`
+/// validation.
+fn build_tombstone_batch(
+    keys: &RecordBatch,
+    target_schema: &Arc<ArrowSchema>,
+    pk_columns: &[String],
+) -> Result<RecordBatch> {
+    let n = keys.num_rows();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(target_schema.fields().len());
+    for field in target_schema.fields() {
+        let name = field.name();
+        if name == TOMBSTONE {
+            columns.push(Arc::new(BooleanArray::from(vec![true; n])));
+        } else if pk_columns.iter().any(|c| c == name) {
+            let col = keys.column_by_name(name).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "delete keys batch is missing primary key column '{}'",
+                    name
+                ))
+            })?;
+            columns.push(col.clone());
+        } else {
+            columns.push(new_null_array(field.data_type(), n));
+        }
+    }
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+        Error::invalid_input(format!(
+            "failed to build tombstone batch (is every non-primary-key column nullable?): {}",
+            e
+        ))
+    })
 }
 
 /// Shared state for writer operations.
@@ -1233,6 +1307,11 @@ impl ShardWriter {
             ));
         }
 
+        // Callers pass the base schema; lance owns the `_tombstone` column and
+        // appends it here so the memtable/generation schema = base + tombstone.
+        // Idempotent, so a reopen that already extended the schema is a no-op.
+        let schema = schema_with_tombstone(&schema);
+
         let base_uri = base_uri.into();
         let shard_id = config.shard_id;
         let manifest_store = Arc::new(ShardManifestStore::new(
@@ -1528,14 +1607,7 @@ impl ShardWriter {
     /// `AlreadyExists`, indicating this writer has been fenced.
     #[instrument(name = "sw_put", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
     pub async fn put(&self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
-        if batches.is_empty() {
-            return Err(Error::invalid_input("Cannot write empty batch list"));
-        }
-        for (i, batch) in batches.iter().enumerate() {
-            if batch.num_rows() == 0 {
-                return Err(Error::invalid_input(format!("Batch {} is empty", i)));
-            }
-        }
+        Self::validate_non_empty(&batches)?;
 
         match &self.mode {
             WriterMode::MemTable {
@@ -1543,6 +1615,13 @@ impl ShardWriter {
                 writer_state,
                 backpressure,
             } => {
+                // Inject `_tombstone = false` so the batch matches the
+                // extended memtable schema; callers only ever pass base-shaped
+                // batches and never name the column.
+                let batches = batches
+                    .into_iter()
+                    .map(|b| ensure_tombstone_column(b, &writer_state.schema))
+                    .collect::<Result<Vec<_>>>()?;
                 self.put_memtable(batches, state, writer_state, backpressure)
                     .await
             }
@@ -1558,6 +1637,138 @@ impl ShardWriter {
         }
     }
 
+    /// Delete rows by primary key.
+    ///
+    /// Each batch in `keys` must carry the shard's primary key column(s); other
+    /// columns are ignored. lance builds a tombstone row per key — the primary
+    /// key plus `_tombstone = true` and null in every other column — and
+    /// appends it like an ordinary write. The tombstone is the newest value for
+    /// its key: it wins newest-per-PK resolution (suppressing the older real
+    /// row) and is then dropped from query results.
+    ///
+    /// Only supported in memtable mode. Because a tombstone nulls every non-PK
+    /// column, those columns must be nullable in the base schema; a delete
+    /// against a schema with a non-nullable non-PK column errors.
+    ///
+    /// ```
+    /// # use lance::Result;
+    /// # use lance::dataset::mem_wal::ShardWriter;
+    /// # use arrow_array::RecordBatch;
+    /// # async fn doc(writer: &ShardWriter, keys: Vec<RecordBatch>) -> Result<()> {
+    /// writer.delete(keys).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(name = "sw_delete", level = "info", skip_all, fields(batch_count = keys.len(), shard_id = %self.config.shard_id))]
+    pub async fn delete(&self, keys: Vec<RecordBatch>) -> Result<WriteResult> {
+        let (result, watcher) = self.delete_no_wait(keys).await?;
+        // Wait for durability if configured (mirrors `put` → `put_memtable`).
+        if let Some(mut watcher) = watcher {
+            watcher.wait().await?;
+        }
+        Ok(result)
+    }
+
+    /// Like [`Self::delete`], but returns the durability watcher *without*
+    /// awaiting it — the tombstone lands in the in-memory tier the instant this
+    /// returns, but the index-driven LSM read only folds it once the watcher
+    /// resolves the flush (which advances the visibility watermark and updates
+    /// the PK index). The delete analog of [`Self::put_no_wait`], so a caller
+    /// can hold an external lock across only the in-memory insert and await
+    /// durability after releasing it. MemTable mode only.
+    #[instrument(name = "sw_delete_no_wait", level = "info", skip_all, fields(batch_count = keys.len(), shard_id = %self.config.shard_id))]
+    pub async fn delete_no_wait(
+        &self,
+        keys: Vec<RecordBatch>,
+    ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
+        if keys.is_empty() {
+            return Err(Error::invalid_input("Cannot delete with empty key list"));
+        }
+        for (i, batch) in keys.iter().enumerate() {
+            if batch.num_rows() == 0 {
+                return Err(Error::invalid_input(format!("Key batch {} is empty", i)));
+            }
+        }
+
+        match &self.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                backpressure,
+            } => {
+                if writer_state.pk_columns.is_empty() {
+                    return Err(Error::invalid_input(
+                        "delete requires a primary key, but this shard has no primary key columns",
+                    ));
+                }
+                let tombstones = keys
+                    .into_iter()
+                    .map(|k| {
+                        build_tombstone_batch(&k, &writer_state.schema, &writer_state.pk_columns)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_memtable_no_wait(tombstones, state, writer_state, backpressure)
+                    .await
+            }
+            WriterMode::WalOnly { .. } => Err(Error::invalid_input(
+                "delete is only supported in memtable mode (enable_memtable = true)",
+            )),
+        }
+    }
+
+    /// Like [`Self::put`], but returns the durability watcher *without* awaiting
+    /// it. The row lands in the in-memory tier the instant this returns, but the
+    /// index-driven LSM read only surfaces it once the watcher resolves the
+    /// flush (which advances the visibility watermark and updates the indexes);
+    /// the caller awaits durability via the watcher (`None` when `durable_write`
+    /// is off).
+    ///
+    /// This lets a caller hold an *external* lock across only the in-memory
+    /// read-merge-insert and await durability after releasing it, so concurrent
+    /// flushes still coalesce. The insert stays guarded by the internal
+    /// `state_lock`, so `BatchStore`'s single-writer invariant holds regardless.
+    ///
+    /// MemTable mode only; errors in WAL-only mode (no in-memory tier).
+    #[instrument(name = "sw_put_no_wait", level = "info", skip_all, fields(batch_count = batches.len(), shard_id = %self.config.shard_id))]
+    pub async fn put_no_wait(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
+        Self::validate_non_empty(&batches)?;
+
+        match &self.mode {
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                backpressure,
+            } => {
+                // Inject `_tombstone = false` to match the extended memtable
+                // schema, mirroring `put`.
+                let batches = batches
+                    .into_iter()
+                    .map(|b| ensure_tombstone_column(b, &writer_state.schema))
+                    .collect::<Result<Vec<_>>>()?;
+                self.put_memtable_no_wait(batches, state, writer_state, backpressure)
+                    .await
+            }
+            WriterMode::WalOnly { .. } => Err(Error::invalid_input(
+                "put_no_wait is only supported in MemTable mode",
+            )),
+        }
+    }
+
+    fn validate_non_empty(batches: &[RecordBatch]) -> Result<()> {
+        if batches.is_empty() {
+            return Err(Error::invalid_input("Cannot write empty batch list"));
+        }
+        for (i, batch) in batches.iter().enumerate() {
+            if batch.num_rows() == 0 {
+                return Err(Error::invalid_input(format!("Batch {} is empty", i)));
+            }
+        }
+        Ok(())
+    }
+
     async fn put_memtable(
         &self,
         batches: Vec<RecordBatch>,
@@ -1565,6 +1776,26 @@ impl ShardWriter {
         writer_state: &Arc<SharedWriterState>,
         backpressure: &BackpressureController,
     ) -> Result<WriteResult> {
+        let (result, watcher) = self
+            .put_memtable_no_wait(batches, state_lock, writer_state, backpressure)
+            .await?;
+        // Wait for durability if configured (outside the lock).
+        if let Some(mut watcher) = watcher {
+            watcher.wait().await?;
+        }
+        Ok(result)
+    }
+
+    /// In-memory half of [`Self::put_memtable`]: insert under `state_lock`,
+    /// trigger the WAL flush, and return the watcher un-awaited for the caller
+    /// to wait on. `None` when `durable_write` is off. See [`Self::put_no_wait`].
+    async fn put_memtable_no_wait(
+        &self,
+        batches: Vec<RecordBatch>,
+        state_lock: &Arc<RwLock<WriterState>>,
+        writer_state: &Arc<SharedWriterState>,
+        backpressure: &BackpressureController,
+    ) -> Result<(WriteResult, Option<BatchDurableWatcher>)> {
         // Apply backpressure if needed (before acquiring main lock)
         backpressure
             .maybe_apply_backpressure(|| {
@@ -1578,7 +1809,7 @@ impl ShardWriter {
         let start = std::time::Instant::now();
 
         // Acquire write lock for entire operation (atomic approach)
-        let (batch_positions, mut durable_watcher, batch_store, indexes) = {
+        let (batch_positions, durable_watcher, batch_store, indexes) = {
             let mut state = state_lock.write().await;
 
             // 1. Insert all batches into memtable atomically
@@ -1609,8 +1840,9 @@ impl ShardWriter {
 
         self.stats.record_put(start.elapsed());
 
-        // Wait for durability if configured (outside the lock)
-        if self.config.durable_write {
+        // Trigger the flush here (outside the lock) so the watcher can resolve;
+        // only the `wait()` is the caller's to schedule.
+        let watcher = if self.config.durable_write {
             self.wal_flusher.trigger_flush(
                 WalFlushSource::BatchStore {
                     batch_store,
@@ -1619,10 +1851,12 @@ impl ShardWriter {
                 batch_positions.end,
                 None,
             )?;
-            durable_watcher.wait().await?;
-        }
+            Some(durable_watcher)
+        } else {
+            None
+        };
 
-        Ok(WriteResult { batch_positions })
+        Ok((WriteResult { batch_positions }, watcher))
     }
 
     async fn put_wal_only(
@@ -2749,6 +2983,645 @@ mod tests {
         (store, path, uri, temp_dir)
     }
 
+    /// Base schema with `id` marked as the unenforced primary key (delete needs
+    /// a PK). `name` is nullable so a tombstone can null it.
+    fn create_pk_test_schema() -> Arc<ArrowSchema> {
+        let mut id_metadata = std::collections::HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id = Field::new("id", DataType::Int32, false).with_metadata(id_metadata);
+        Arc::new(ArrowSchema::new(vec![
+            id,
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    fn id_only_keys(ids: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(ids.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_ensure_tombstone_column_injects_false() {
+        let base = create_test_schema();
+        let target = schema_with_tombstone(&base);
+        let out = ensure_tombstone_column(create_test_batch(&base, 0, 3), &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let ts = out
+            .column_by_name(TOMBSTONE)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(
+            (0..3).all(|i| !ts.value(i)),
+            "put injects _tombstone = false"
+        );
+        // Idempotent: a batch already carrying the column passes through.
+        let again = ensure_tombstone_column(out.clone(), &target).unwrap();
+        assert_eq!(again.schema(), out.schema());
+    }
+
+    #[test]
+    fn test_build_tombstone_batch_shape() {
+        let target = schema_with_tombstone(&create_test_schema());
+        let tomb =
+            build_tombstone_batch(&id_only_keys(&[5, 7]), &target, &["id".to_string()]).unwrap();
+        assert_eq!(tomb.schema(), target);
+        assert_eq!(tomb.num_rows(), 2);
+        let ids = tomb
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[5, 7]);
+        let name = tomb.column_by_name("name").unwrap();
+        assert!(
+            name.is_null(0) && name.is_null(1),
+            "non-PK columns are null in a tombstone"
+        );
+        let ts = tomb
+            .column_by_name(TOMBSTONE)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(ts.value(0) && ts.value(1), "_tombstone = true");
+    }
+
+    #[test]
+    fn test_build_tombstone_batch_missing_pk_errors() {
+        let target = schema_with_tombstone(&create_test_schema());
+        let keys = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "other",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        assert!(build_tombstone_batch(&keys, &target, &["id".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_build_tombstone_batch_non_nullable_nonpk_errors() {
+        // A tombstone must null every non-PK column; a non-nullable one fails.
+        let base = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let target = schema_with_tombstone(&base);
+        assert!(build_tombstone_batch(&id_only_keys(&[1]), &target, &["id".to_string()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_shard_writer_delete_round_trip() {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+        use futures::TryStreamExt;
+
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            ..Default::default()
+        };
+        let shard_id = config.shard_id;
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // ids 0..5, then delete id=2.
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.delete(vec![id_only_keys(&[2])]).await.unwrap();
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri,
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let arr = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..arr.len()).map(|i| arr.value(i)));
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0, 1, 3, 4],
+            "id=2 deleted; tombstone not surfaced"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// `delete_no_wait` lands the tombstone in the in-memory tier (visible at
+    /// the batch-store level the instant it returns) and hands back the
+    /// durability watcher *without* awaiting it. Index-driven LSM read
+    /// visibility — folding the tombstone out — follows once the watcher
+    /// resolves the flush that advances the visibility watermark and updates
+    /// the PK index. The delete analog of
+    /// `test_put_no_wait_durable_visible_then_durable`.
+    #[tokio::test]
+    async fn test_shard_writer_delete_no_wait_durable_visible_after_watcher() {
+        use crate::dataset::mem_wal::scanner::LsmScanner;
+        use futures::TryStreamExt;
+
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            ..Default::default()
+        };
+        let shard_id = config.shard_id;
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+
+        // Tombstone id=2 without blocking on durability.
+        let (_result, watcher) = writer
+            .delete_no_wait(vec![id_only_keys(&[2])])
+            .await
+            .unwrap();
+
+        // The tombstone is in the in-memory tier immediately (5 rows + 1
+        // tombstone), even though the index-driven read can't fold it until the
+        // flush behind the watcher lands. `durable_write` is on, so a watcher is
+        // returned to await.
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 6);
+        let mut watcher = watcher.expect("durable_write returns a watcher");
+
+        // Awaiting the watcher waits for the flush, which advances the
+        // visibility watermark and updates the PK index — only then does the LSM
+        // read fold the delete.
+        watcher.wait().await.unwrap();
+
+        let refs = writer.in_memory_memtable_refs().await.unwrap();
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            base_uri,
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(shard_id, refs);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let arr = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..arr.len()).map(|i| arr.value(i)));
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![0, 1, 3, 4],
+            "delete folded by the LSM read once the watcher resolves"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// With `durable_write` off, `delete_no_wait` returns no watcher (nothing to
+    /// await), but the tombstone still lands in the in-memory tier. The delete
+    /// analog of `test_put_no_wait_non_durable_returns_no_watcher`.
+    #[tokio::test]
+    async fn test_shard_writer_delete_no_wait_non_durable_returns_no_watcher() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: false,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+
+        let (_result, watcher) = writer
+            .delete_no_wait(vec![id_only_keys(&[2])])
+            .await
+            .unwrap();
+        assert!(watcher.is_none(), "non-durable delete has nothing to await");
+
+        // Tombstone landed in the in-memory tier (5 rows + 1 tombstone).
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 6);
+
+        writer.close().await.unwrap();
+    }
+
+    /// Read every surviving `id` through the full LSM read path (which folds
+    /// `NOT _tombstone` per source) over the writer's *flushed* generations,
+    /// with an optional filter. Mirrors how a query reads a WAL table after a
+    /// flush — the path the wallop fuzz exercised when it caught a deleted row
+    /// resurfacing.
+    async fn read_flushed_ids_via_lsm(
+        writer: &ShardWriter,
+        schema: Arc<ArrowSchema>,
+        base_uri: &str,
+        shard_id: Uuid,
+        filter: Option<&str>,
+    ) -> Vec<i32> {
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use futures::TryStreamExt;
+
+        let manifest = writer.manifest().await.unwrap().unwrap();
+        let mut snapshot =
+            ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
+        for fg in &manifest.flushed_generations {
+            snapshot = snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        }
+        let mut scanner = LsmScanner::without_base_table(
+            schema,
+            base_uri.to_string(),
+            vec![snapshot],
+            vec!["id".to_string()],
+        );
+        if let Some(predicate) = filter {
+            scanner = scanner.filter(predicate).unwrap();
+        }
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let arr = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..arr.len()).map(|i| arr.value(i)));
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    fn flush_test_config(shard_id: Uuid) -> ShardWriterConfig {
+        ShardWriterConfig {
+            shard_id,
+            durable_write: false,
+            sync_indexed_write: true,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        }
+    }
+
+    /// Delete a key, then flush: the tombstone and the live row land in the
+    /// *same* flushed generation, so flush-time dedup must keep the tombstone
+    /// (newest) and the read must fold it away. Regression for the wallop
+    /// phantom (deleted row resurfacing in a filtered read after flush).
+    #[tokio::test]
+    async fn test_shard_writer_delete_then_flush_round_trip() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            flush_test_config(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // ids 0..5, delete id=2, THEN flush (insert + tombstone in one gen).
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.delete(vec![id_only_keys(&[2])]).await.unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        assert_eq!(
+            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            vec![0, 1, 3, 4],
+            "id=2 deleted before flush; tombstone must not surface in a flushed-gen scan"
+        );
+        // The filtered read path (folds NOT _tombstone into the predicate) must
+        // also drop it — this is the exact wallop failure shape (`id < 3`).
+        assert_eq!(
+            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 3"))
+                .await,
+            vec![0, 1],
+            "filtered read after flush must not resurface deleted id=2"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Insert+flush, then delete+flush: the tombstone lands in a *newer*
+    /// generation than the live row, so the cross-generation block-list must
+    /// mask the older row by PK. This is the wallop scenario (seed flushed,
+    /// then delete, then flush).
+    #[tokio::test]
+    async fn test_shard_writer_delete_across_flushed_generations() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            flush_test_config(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // gen 1: ids 0..5.
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        // gen 2: tombstone for id=0 (a later generation than the live row).
+        writer.delete(vec![id_only_keys(&[0])]).await.unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        assert_eq!(
+            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            vec![1, 2, 3, 4],
+            "id=0 tombstoned in a newer gen must mask the older gen's live row"
+        );
+        assert_eq!(
+            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
+                .await,
+            Vec::<i32>::new(),
+            "filtered read 'id < 1' must not resurface cross-gen deleted id=0"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// Same as the cross-generation case, but the flushed generations carry a
+    /// BTree index on `id` (as every wallop table does). A filtered read
+    /// `id < 1` resolves through the scalar index; the `NOT _tombstone` residual
+    /// must still be applied or the deleted row leaks. This is the exact wallop
+    /// failure (BTree id + `FilteredRead 'id < 1'` resurfacing deleted id=0).
+    #[tokio::test]
+    async fn test_shard_writer_delete_across_flushed_generations_indexed() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let shard_id = Uuid::new_v4();
+        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "id_idx".to_string(),
+            field_id: 0,
+            column: "id".to_string(),
+        })];
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri.clone(),
+            flush_test_config(shard_id),
+            schema.clone(),
+            index_configs,
+        )
+        .await
+        .unwrap();
+
+        // gen 1: ids 0..5 (indexed). gen 2: tombstone for id=0.
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+        writer.delete(vec![id_only_keys(&[0])]).await.unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        assert_eq!(
+            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            vec![1, 2, 3, 4],
+            "indexed cross-gen: full scan must mask deleted id=0"
+        );
+        assert_eq!(
+            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
+                .await,
+            Vec::<i32>::new(),
+            "indexed filtered read 'id < 1' must not resurface deleted id=0 (wallop repro)"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_validation_errors() {
+        let (store, base_path, base_uri, _temp) = create_local_store().await;
+
+        // No primary key on the schema → delete is rejected.
+        let no_pk = create_test_schema();
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                durable_write: false,
+                ..Default::default()
+            },
+            no_pk,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(
+            writer.delete(vec![id_only_keys(&[1])]).await.is_err(),
+            "delete without a primary key must error"
+        );
+        // Empty key list is rejected.
+        assert!(writer.delete(vec![]).await.is_err());
+        writer.close().await.unwrap();
+    }
+
+    /// The compaction Phase-1 hard-delete primitive: a key-only `merge_insert`
+    /// with `WhenMatched::Delete` + `use_index` over a COMPOSITE join key
+    /// `(id, shard_key)` where only `id` carries a scalar index. The partial
+    /// index makes `indexed_join_keys` non-empty, so the scalar-index merge path
+    /// engages — and it must still delete exactly the `(0, 0)` row. If it
+    /// no-ops (or mismatches on the partial key), the compactor trims the WAL
+    /// tombstone while the base row survives → the wallop resurface phantom.
+    #[tokio::test]
+    async fn test_indexed_composite_key_delete_removes_row() {
+        use crate::Dataset;
+        use crate::dataset::{WhenMatched, WhenNotMatched, WhenNotMatchedBySource};
+        use crate::index::DatasetIndexExt;
+        use arrow_array::{Int64Array, RecordBatchIterator};
+        use lance_index::IndexType;
+        use lance_index::scalar::ScalarIndexParams;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("shard_key", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        // ids 0..5, shard_key = id % 8 (the wallop composite PK), value = id*100.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..5)),
+                Arc::new(Int64Array::from_iter_values((0..5).map(|i| i % 8))),
+                Arc::new(Int64Array::from_iter_values((0..5).map(|i| i * 100))),
+            ],
+        )
+        .unwrap();
+
+        let uri = format!("shared-memory://phase1-delete-{}/", Uuid::new_v4().simple());
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema.clone()),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        // Scalar index on `id` only — `shard_key` is unindexed, mirroring the
+        // WAL base table (BTree on `id`, composite PK `(id, shard_key)`).
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_btree".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Phase-1 call: key-only source `(id=0, shard_key=0)`, delete-when-matched.
+        let keys = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("shard_key", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+            ],
+        )
+        .unwrap();
+        let mut builder = crate::dataset::MergeInsertBuilder::try_new(
+            Arc::new(dataset),
+            vec!["id".to_string(), "shard_key".to_string()],
+        )
+        .unwrap();
+        builder
+            .when_matched(WhenMatched::Delete)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_not_matched_by_source(WhenNotMatchedBySource::Keep)
+            .use_index(true);
+        let job = builder.try_build().unwrap();
+        let keys_schema = keys.schema();
+        let (dataset, _stats) = job
+            .execute_reader(RecordBatchIterator::new([Ok(keys)], keys_schema))
+            .await
+            .unwrap();
+
+        // id=0 must be gone — both from a full scan and from an indexed filter.
+        let all = dataset.scan().try_into_batch().await.unwrap();
+        let mut ids: Vec<i64> = all
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "Phase-1 must hard-delete (0, 0) from base"
+        );
+
+        let filtered = dataset
+            .scan()
+            .filter("id < 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.num_rows(),
+            0,
+            "indexed filter must not resurface the deleted composite key"
+        );
+    }
+
     fn create_test_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -2811,6 +3684,75 @@ mod tests {
         assert_eq!(stats.batch_count, 1);
 
         // Close writer
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_put_no_wait_durable_visible_then_durable() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let batch = create_test_batch(&schema, 0, 10);
+        let (result, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
+        assert_eq!(result.batch_positions, 0..1);
+
+        // Row is visible in memory before durability is awaited.
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(stats.row_count, 10);
+
+        // durable_write is on, so a watcher is returned and resolves once the
+        // triggered flush lands.
+        let mut watcher = watcher.expect("durable_write returns a watcher");
+        watcher.wait().await.unwrap();
+
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_put_no_wait_non_durable_returns_no_watcher() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        let batch = create_test_batch(&schema, 0, 10);
+        let (result, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
+        assert_eq!(result.batch_positions, 0..1);
+        assert!(watcher.is_none(), "non-durable put has nothing to await");
+
+        let stats = writer.memtable_stats().await.unwrap();
+        assert_eq!(stats.row_count, 10);
+
         writer.close().await.unwrap();
     }
 
@@ -4738,6 +5680,80 @@ mod shard_writer_tests {
             .await
             .unwrap();
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
+        writer.close().await.unwrap();
+    }
+
+    /// A generation of only tombstones (delete nulls the vector, and the HNSW
+    /// skips nulls) has an empty vector index. Flushing it must succeed —
+    /// writing the data with no HNSW index for that generation — not fail the
+    /// drain with "HnswMemIndex is empty". Regression for the wallop fuzz
+    /// `flush drain failed: HnswMemIndex is empty` on a delete-only memtable.
+    #[tokio::test]
+    async fn test_flush_all_tombstone_generation_skips_empty_hnsw() {
+        let vector_dim = 32;
+        let schema = create_test_schema(vector_dim);
+        // `shared-memory` (not `memory`): the flush writes the generation dataset
+        // and the drain reopens it by URI, which a plain in-memory store wouldn't
+        // share across opens. A unique authority isolates this test.
+        let uri = format!("shared-memory://tombstone-{}/", Uuid::new_v4().simple());
+
+        // Base dataset + maintained vector index, so the writer carries an HNSW
+        // mem index.
+        let initial = create_test_batch(&schema, 0, 256, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .initialize_mem_wal()
+            .maintained_indexes(["vector_idx"])
+            .execute()
+            .await
+            .unwrap();
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(
+                shard_id,
+                ShardWriterConfig::new(shard_id).with_durable_write(false),
+            )
+            .await
+            .unwrap();
+
+        // Delete only — the memtable holds a single tombstone with a null vector,
+        // so its HNSW index is empty.
+        let keys = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![0_i64]))],
+        )
+        .unwrap();
+        writer.delete(vec![keys]).await.unwrap();
+
+        // The drain must not error on the empty HNSW.
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        // The tombstone-only generation still flushed (data without an HNSW index).
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        assert_eq!(
+            manifest.flushed_generations.len(),
+            1,
+            "the all-tombstone generation must still flush"
+        );
         writer.close().await.unwrap();
     }
 
