@@ -37,6 +37,7 @@ chrono.workspace = true
 futures.workspace = true
 http.workspace = true
 log.workspace = true
+metrics = { workspace = true, optional = true }
 moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
@@ -60,6 +61,7 @@ rstest.workspace = true
 mock_instant.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-mock = { workspace = true }
+metrics-util = { workspace = true }
 
 [[bench]]
 name = "scheduler"
@@ -67,6 +69,7 @@ harness = false
 
 [features]
 default = ["aws", "azure", "gcp"]
+metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
 gcp = ["object_store/gcp", "dep:opendal", "opendal/services-gcs", "dep:object_store_opendal"]

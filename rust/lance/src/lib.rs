@@ -81,6 +81,8 @@ pub mod datafusion;
 pub mod dataset;
 pub mod index;
 pub mod io;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod session;
 pub mod table;
 pub mod utils;
