@@ -1142,6 +1142,11 @@ impl DirectoryNamespace {
     /// Collapsing every failure into `InvalidInput`/`Internal` hides the real cause from callers;
     /// mapping per variant lets them branch on a meaningful error code (e.g. retry on
     /// `ConcurrentModification`, surface `TableNotFound` to the user).
+    ///
+    /// Commit-conflict variants are mapped consistently with `convert_lance_commit_error` in
+    /// `manifest.rs`: `CommitConflict` (retries exhausted, safe to retry) -> `Throttling`, while
+    /// semantic conflicts (`TooMuchWriteContention` / `RetryableCommitConflict` /
+    /// `IncompatibleTransaction` / `VersionConflict`) -> `ConcurrentModification`.
     fn map_mutation_error(
         err: lance_core::Error,
         operation: &str,
@@ -1173,18 +1178,24 @@ impl DirectoryNamespace {
                     ),
                 }
             }
-            lance_core::Error::CommitConflict { .. }
+            // `CommitConflict` means the version-collision retries were exhausted; the operation
+            // is safe to retry as-is, so surface it as `Throttling` (kept aligned with
+            // `convert_lance_commit_error` in manifest.rs).
+            lance_core::Error::CommitConflict { .. } => NamespaceError::Throttling {
+                message: format!(
+                    "Too many concurrent writes for {} on table at '{}', please retry later: {}",
+                    operation, table_uri, detail
+                ),
+            },
+            // Semantic conflicts: a concurrent change is incompatible with this one and retrying
+            // as-is would not help, so surface them as `ConcurrentModification` (kept aligned with
+            // `convert_lance_commit_error` in manifest.rs).
+            lance_core::Error::TooMuchWriteContention { .. }
             | lance_core::Error::RetryableCommitConflict { .. }
             | lance_core::Error::IncompatibleTransaction { .. }
             | lance_core::Error::VersionConflict { .. } => NamespaceError::ConcurrentModification {
                 message: format!(
                     "Concurrent modification detected for {} on table at '{}': {}",
-                    operation, table_uri, detail
-                ),
-            },
-            lance_core::Error::TooMuchWriteContention { .. } => NamespaceError::Throttling {
-                message: format!(
-                    "Too much write contention for {} on table at '{}': {}",
                     operation, table_uri, detail
                 ),
             },
@@ -4970,6 +4981,52 @@ mod tests {
                 expected_fragment,
                 plan
             );
+        }
+    }
+
+    fn mutation_error_code(err: lance_core::Error) -> ErrorCode {
+        match err {
+            lance_core::Error::Namespace { source, .. } => source
+                .downcast_ref::<NamespaceError>()
+                .expect("mutation error should wrap a NamespaceError")
+                .code(),
+            other => panic!("expected Namespace error, got: {other:?}"),
+        }
+    }
+
+    /// `map_mutation_error` must classify commit-conflict variants the same way as
+    /// `convert_lance_commit_error` in `manifest.rs`: `CommitConflict` is a retries-exhausted
+    /// version collision that is safe to retry (`Throttling`), while the semantic-conflict variants
+    /// map to `ConcurrentModification`.
+    #[test]
+    fn test_map_mutation_error_commit_conflict_alignment() {
+        let boxed = || -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            Box::<dyn std::error::Error + Send + Sync>::from("inner conflict")
+        };
+
+        let throttling_cases = vec![lance_core::Error::commit_conflict_source(1, boxed())];
+        for err in throttling_cases {
+            let code = mutation_error_code(DirectoryNamespace::map_mutation_error(
+                err,
+                "update",
+                "memory://t",
+            ));
+            assert_eq!(code, ErrorCode::Throttling);
+        }
+
+        let concurrent_cases = vec![
+            lance_core::Error::too_much_write_contention("contention"),
+            lance_core::Error::retryable_commit_conflict_source(1, boxed()),
+            lance_core::Error::incompatible_transaction_source(boxed()),
+            lance_core::Error::version_conflict("conflict", 0, 3),
+        ];
+        for err in concurrent_cases {
+            let code = mutation_error_code(DirectoryNamespace::map_mutation_error(
+                err,
+                "update",
+                "memory://t",
+            ));
+            assert_eq!(code, ErrorCode::ConcurrentModification);
         }
     }
 
