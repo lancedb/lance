@@ -1124,6 +1124,12 @@ async fn test_deep_clone(
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
 }
 
+// Uses an in-memory source store to force a cross-store copy. The in-memory store has
+// known platform-specific quirks on Windows (it reads back empty there; see the note in
+// tests/resource_tests.rs), so this test is gated to non-Windows. The local write side is
+// covered on Windows by `test_deep_clone` (same-store), and the cross-store streaming path
+// against real cloud stores is platform-agnostic std/tokio I/O.
+#[cfg(not(windows))]
 #[rstest]
 #[tokio::test]
 async fn test_deep_clone_cross_store(
