@@ -3761,8 +3761,12 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test for #7313: `with_position` indexing must grow `posting_lists` when
-    /// `tokens.next_id` exceeds `posting_lists.len()`, as on legacy FTS partitions.
+    /// Regression test for #7313: `with_position` indexing must not panic when
+    /// `tokens.next_id` exceeds `posting_lists.len()`. The primary guard is in
+    /// `load_fst` (index.rs), which normalizes `next_id = max_id + 1` on load so
+    /// this gap never arises from a real partition. This test verifies `process_batch`
+    /// remains robust even when a stale `next_id` reaches it directly (e.g. in tests
+    /// or via direct builder construction).
     #[tokio::test]
     async fn test_process_batch_with_position_handles_token_id_gaps() {
         const VOCAB_SIZE: usize = 1731;
