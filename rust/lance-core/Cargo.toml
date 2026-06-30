@@ -51,6 +51,7 @@ log.workspace = true
 libc = { version = "0.2" }
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 
@@ -59,3 +60,7 @@ datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "cache_batch"
+harness = false

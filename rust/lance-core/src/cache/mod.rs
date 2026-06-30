@@ -50,7 +50,10 @@ pub mod codec;
 mod entry_io;
 mod moka;
 
-pub use backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
+pub use backend::{
+    CacheBackend, CacheBatchEntry, CacheBatchLoader, CacheEntry, CacheKeyIterator,
+    CacheLoadedEntry, InternalCacheKey,
+};
 pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
 };
@@ -58,6 +61,7 @@ pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use moka::MokaCacheBackend;
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -65,7 +69,7 @@ use std::sync::{
 
 use futures::{Future, FutureExt};
 
-use crate::Result;
+use crate::{Error, Result};
 
 pub use crate::deepsize::{Context, DeepSizeOf};
 
@@ -149,6 +153,182 @@ fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
 /// and a type name.
 fn build_key(prefix: &Arc<str>, key: &str, type_name: &'static str) -> InternalCacheKey {
     InternalCacheKey::new(prefix.clone(), Arc::from(key), type_name)
+}
+
+fn build_batch_keys<K>(
+    prefix: &Arc<str>,
+    cache_keys: &[K],
+) -> Result<(Vec<InternalCacheKey>, HashMap<InternalCacheKey, K>)>
+where
+    K: CacheKey + Clone,
+{
+    let mut keys = Vec::with_capacity(cache_keys.len());
+    let mut typed_keys = HashMap::with_capacity(cache_keys.len());
+
+    for cache_key in cache_keys {
+        let key = build_key(prefix, &cache_key.key(), K::type_name());
+        if typed_keys.insert(key.clone(), cache_key.clone()).is_some() {
+            return Err(Error::invalid_input(format!(
+                "duplicate cache key in get_or_insert_with_key_batch: prefix='{}', key='{}', type='{}'",
+                key.prefix(),
+                key.key(),
+                key.type_name()
+            )));
+        }
+        keys.push(key);
+    }
+
+    Ok((keys, typed_keys))
+}
+
+/// Converts typed batch requests into the backend's type-erased batch API while
+/// keeping cache coordination and single-flight ownership inside the backend.
+async fn get_or_insert_batch_with_backend<K, F, Fut>(
+    cache: &dyn CacheBackend,
+    prefix: &Arc<str>,
+    hits: &AtomicU64,
+    misses: &AtomicU64,
+    cache_keys: Vec<K>,
+    loader: F,
+) -> Result<Vec<CacheBatchValue<K::ValueType>>>
+where
+    K: CacheKey + Clone + Send + Sync,
+    K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    F: Fn(Vec<K>) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<Vec<(K, K::ValueType)>>> + Send,
+{
+    let (keys, typed_keys) = build_batch_keys(prefix, &cache_keys)?;
+    let typed_keys = Arc::new(typed_keys);
+    let loader = Arc::new(loader);
+    let prefix = prefix.clone();
+
+    let typed_loader: CacheBatchLoader<'_> = Arc::new(move |owned_keys| {
+        let typed_keys = typed_keys.clone();
+        let loader = loader.clone();
+        let prefix = prefix.clone();
+
+        async move {
+            let mut loader_keys = Vec::with_capacity(owned_keys.len());
+            for key in &owned_keys {
+                loader_keys.push(
+                    typed_keys
+                        .get(key)
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "backend requested unknown cache key: prefix='{}', key='{}', type='{}'",
+                                key.prefix(),
+                                key.key(),
+                                key.type_name()
+                            ))
+                        })?
+                        .clone(),
+                );
+            }
+
+            loader(loader_keys)
+                .await?
+                .into_iter()
+                .map(|(cache_key, value)| {
+                    let key = build_key(&prefix, &cache_key.key(), K::type_name());
+                    let entry = Arc::new(value);
+                    let size_bytes = cache_entry_size(&*entry);
+                    Ok(CacheLoadedEntry {
+                        key,
+                        entry: entry as CacheEntry,
+                        size_bytes,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        }
+        .boxed()
+    });
+
+    let entries = cache
+        .get_or_insert_many(keys, typed_loader, K::codec())
+        .await?;
+
+    let mut values = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let CacheBatchEntry {
+            key,
+            entry,
+            was_cached,
+        } = entry;
+        if was_cached {
+            hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            misses.fetch_add(1, Ordering::Relaxed);
+        }
+        let value = entry.downcast::<K::ValueType>().map_err(|_| {
+            Error::internal(format!(
+                "cache entry type mismatch for key: prefix='{}', key='{}', type='{}'",
+                key.prefix(),
+                key.key(),
+                key.type_name()
+            ))
+        })?;
+        values.push(CacheBatchValue { value, was_cached });
+    }
+
+    Ok(values)
+}
+
+/// Preserves the typed batch contract when a WeakLanceCache has lost its
+/// backend: no cache coordination, exact loader validation, input-order output.
+async fn load_batch_without_cache<K, F, Fut>(
+    prefix: &Arc<str>,
+    cache_keys: Vec<K>,
+    loader: F,
+) -> Result<Vec<CacheBatchValue<K::ValueType>>>
+where
+    K: CacheKey + Clone + Send + Sync,
+    K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    F: FnOnce(Vec<K>) -> Fut + Send,
+    Fut: Future<Output = Result<Vec<(K, K::ValueType)>>> + Send,
+{
+    if cache_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (keys, expected_keys) = build_batch_keys(prefix, &cache_keys)?;
+    let mut loaded = HashMap::with_capacity(keys.len());
+    for (cache_key, value) in loader(cache_keys).await? {
+        let key = build_key(prefix, &cache_key.key(), K::type_name());
+        if !expected_keys.contains_key(&key) {
+            return Err(Error::invalid_input(format!(
+                "batch cache loader returned unexpected key: prefix='{}', key='{}', type='{}'",
+                key.prefix(),
+                key.key(),
+                key.type_name()
+            )));
+        }
+        let loaded_key = key.clone();
+        if loaded.insert(key, Arc::new(value)).is_some() {
+            return Err(Error::invalid_input(format!(
+                "batch cache loader returned duplicate keys: prefix='{}', key='{}', type='{}'",
+                loaded_key.prefix(),
+                loaded_key.key(),
+                loaded_key.type_name()
+            )));
+        }
+    }
+
+    let mut values = Vec::with_capacity(keys.len());
+    for key in keys {
+        let value = loaded.remove(&key).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "batch cache loader did not return expected key: prefix='{}', key='{}', type='{}'",
+                key.prefix(),
+                key.key(),
+                key.type_name()
+            ))
+        })?;
+        values.push(CacheBatchValue {
+            value,
+            was_cached: false,
+        });
+    }
+    Ok(values)
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +574,94 @@ impl LanceCache {
             self.misses.fetch_add(1, Ordering::Relaxed);
         }
 
-        Ok(entry.downcast::<K::ValueType>().unwrap())
+        entry.downcast::<K::ValueType>().map_err(|_| {
+            Error::internal(format!(
+                "cache entry type mismatch for key: prefix='{}', key='{}', type='{}'",
+                key.prefix(),
+                key.key(),
+                key.type_name()
+            ))
+        })
+    }
+
+    /// Get or insert a batch of typed cache entries.
+    ///
+    /// `cache_keys` must be unique. The returned entries follow the same order
+    /// as `cache_keys`. The loader receives only missing keys owned by this
+    /// call, preserving their input order, and must return exactly one value
+    /// for each received key.
+    ///
+    /// The loader is `Fn`, not `FnOnce`, because a backend may call it more
+    /// than once during one batch request if keys need to be retried after
+    /// another in-flight owner fails or is dropped. Custom backends that do
+    /// not override [`CacheBackend::get_or_insert_many`] use a compatibility
+    /// fallback that invokes the loader one key at a time.
+    ///
+    /// Use this when the loader can benefit from receiving multiple missing
+    /// keys at once, for example by coalescing adjacent reads. This is not a
+    /// general faster path: for isolated keys, cheap loaders, or disjoint
+    /// concurrent batches, [`get_or_insert_with_key`](Self::get_or_insert_with_key)
+    /// avoids the batch result maps and per-key coordination needed to preserve
+    /// ordering and single-flight behavior.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::borrow::Cow;
+    /// # use lance_core::{Result, cache::{CacheKey, LanceCache}};
+    /// #
+    /// # #[derive(Clone)]
+    /// # struct PageKey(u32);
+    /// #
+    /// # impl CacheKey for PageKey {
+    /// #     type ValueType = usize;
+    /// #
+    /// #     fn key(&self) -> Cow<'_, str> {
+    /// #         Cow::Owned(self.0.to_string())
+    /// #     }
+    /// #
+    /// #     fn type_name() -> &'static str {
+    /// #         "PageKey"
+    /// #     }
+    /// # }
+    /// #
+    /// # async fn example(cache: LanceCache) -> Result<()> {
+    /// let values = cache
+    ///     .get_or_insert_with_key_batch(vec![PageKey(1), PageKey(2)], |keys| async move {
+    ///         Ok(keys
+    ///             .into_iter()
+    ///             .map(|key| {
+    ///                 let value = key.0 as usize;
+    ///                 (key, value)
+    ///             })
+    ///             .collect())
+    ///     })
+    ///     .await?;
+    ///
+    /// assert_eq!(*values[0].value, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_or_insert_with_key_batch<K, F, Fut>(
+        &self,
+        cache_keys: Vec<K>,
+        loader: F,
+    ) -> Result<Vec<CacheBatchValue<K::ValueType>>>
+    where
+        K: CacheKey + Clone + Send + Sync,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+        F: Fn(Vec<K>) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<Vec<(K, K::ValueType)>>> + Send,
+    {
+        get_or_insert_batch_with_backend(
+            self.cache.as_ref(),
+            &self.prefix,
+            &self.hits,
+            &self.misses,
+            cache_keys,
+            loader,
+        )
+        .await
     }
 
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
@@ -466,8 +733,22 @@ impl WeakLanceCache {
         let cache = self.inner.upgrade()?;
         let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
         if let Some(entry) = cache.get(&key, K::codec()).await {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(entry.downcast::<K::ValueType>().unwrap())
+            match entry.downcast::<K::ValueType>() {
+                Ok(value) => {
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    Some(value)
+                }
+                Err(_) => {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "cache entry type mismatch for key: prefix='{}', key='{}', type='{}'",
+                        key.prefix(),
+                        key.key(),
+                        key.type_name()
+                    );
+                    None
+                }
+            }
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             None
@@ -518,10 +799,51 @@ impl WeakLanceCache {
             } else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(entry.downcast::<K::ValueType>().unwrap())
+            entry.downcast::<K::ValueType>().map_err(|_| {
+                Error::internal(format!(
+                    "cache entry type mismatch for key: prefix='{}', key='{}', type='{}'",
+                    key.prefix(),
+                    key.key(),
+                    key.type_name()
+                ))
+            })
         } else {
             log::warn!("WeakLanceCache: cache no longer available, computing without caching");
             loader().await.map(Arc::new)
+        }
+    }
+
+    /// Get or insert a batch of typed cache entries.
+    ///
+    /// If the backing cache is still available, this has the same semantics as
+    /// [`LanceCache::get_or_insert_with_key_batch`]. If the backing cache has
+    /// been dropped, the loader runs without caching and all returned entries
+    /// are validated, reordered to match the input keys, and marked as not
+    /// cached.
+    pub async fn get_or_insert_with_key_batch<K, F, Fut>(
+        &self,
+        cache_keys: Vec<K>,
+        loader: F,
+    ) -> Result<Vec<CacheBatchValue<K::ValueType>>>
+    where
+        K: CacheKey + Clone + Send + Sync,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+        F: Fn(Vec<K>) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<Vec<(K, K::ValueType)>>> + Send,
+    {
+        if let Some(cache) = self.inner.upgrade() {
+            get_or_insert_batch_with_backend(
+                cache.as_ref(),
+                &self.prefix,
+                &self.hits,
+                &self.misses,
+                cache_keys,
+                loader,
+            )
+            .await
+        } else {
+            log::warn!("WeakLanceCache: cache no longer available, computing without caching");
+            load_batch_without_cache(&self.prefix, cache_keys, loader).await
         }
     }
 
@@ -564,14 +886,45 @@ impl WeakLanceCache {
 
 #[derive(Debug, Clone)]
 pub struct CacheStats {
-    /// Number of times `get`, `get_unsized`, or `get_or_insert` found an item in the cache.
+    /// Number of cache operations satisfied without running this call's loader.
+    ///
+    /// For `get`/`get_unsized`, this means the entry was found in the cache.
+    /// For `get_or_insert`/batch get-or-insert, this means the entry was
+    /// either already cached or was loaded by another in-flight owner. A
+    /// get-or-insert caller that initially missed but waited for another owner
+    /// is counted here, not in `misses`.
+    ///
+    /// Batch get-or-insert calls count each returned key independently, not the
+    /// batch request as a single operation.
     pub hits: u64,
-    /// Number of times `get`, `get_unsized`, or `get_or_insert` did not find an item in the cache.
+    /// Number of cache operations that were not satisfied from cache/owner.
+    ///
+    /// For `get`/`get_unsized`, this means the entry was not found. For
+    /// `get_or_insert`/batch get-or-insert, this means the current call
+    /// executed the loader for that entry.
+    ///
+    /// Batch get-or-insert calls count each returned key independently, not the
+    /// batch request as a single operation.
     pub misses: u64,
     /// Number of entries currently in the cache.
     pub num_entries: usize,
     /// Total size in bytes of all entries in the cache.
     pub size_bytes: usize,
+}
+
+/// A typed value returned by batch get-or-insert.
+///
+/// Includes both the cache value and whether this call avoided running its
+/// loader for the key.
+#[derive(Debug, Clone)]
+pub struct CacheBatchValue<T> {
+    /// Cached or loaded value.
+    pub value: Arc<T>,
+    /// True when this call did not run the loader for this key.
+    ///
+    /// This includes ordinary cache hits and values loaded by another
+    /// in-flight owner.
+    pub was_cached: bool,
 }
 
 impl CacheStats {
@@ -595,9 +948,11 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::collections::{BTreeSet, HashMap};
     use std::marker::PhantomData;
 
+    #[derive(Clone)]
     struct TestKey<T: 'static> {
         key: String,
         _phantom: PhantomData<T>,
@@ -657,6 +1012,90 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn assert_invalid_input_contains(err: Error, snippets: &[&str]) {
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        let message = err.to_string();
+        for snippet in snippets {
+            assert!(
+                message.contains(snippet),
+                "expected error message to contain '{snippet}', got: {message}"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct HashMapBackend {
+        map: tokio::sync::Mutex<HashMap<InternalCacheKey, (CacheEntry, usize)>>,
+    }
+
+    impl HashMapBackend {
+        fn new() -> Self {
+            Self {
+                map: tokio::sync::Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CacheBackend for HashMapBackend {
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            _codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            self.map.lock().await.get(key).map(|(e, _)| e.clone())
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            size_bytes: usize,
+            _codec: Option<CacheCodec>,
+        ) {
+            self.map
+                .lock()
+                .await
+                .insert(key.clone(), (entry, size_bytes));
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: std::pin::Pin<
+                Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
+            >,
+            _codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            if let Some((entry, _)) = self.map.lock().await.get(key) {
+                Ok((entry.clone(), true))
+            } else {
+                let (entry, size) = loader.await?;
+                self.map
+                    .lock()
+                    .await
+                    .insert(key.clone(), (entry.clone(), size));
+                Ok((entry, false))
+            }
+        }
+
+        async fn invalidate_prefix(&self, prefix: &str) {
+            self.map.lock().await.retain(|k, _| !k.starts_with(prefix));
+        }
+
+        async fn clear(&self) {
+            self.map.lock().await.clear();
+        }
+
+        async fn num_entries(&self) -> usize {
+            self.map.lock().await.len()
+        }
+
+        async fn size_bytes(&self) -> usize {
+            self.map.lock().await.values().map(|(_, s)| *s).sum()
+        }
     }
 
     #[tokio::test]
@@ -862,6 +1301,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clear_does_not_cancel_in_flight_get_or_insert() {
+        let cache = LanceCache::with_capacity(1000);
+        let loader_started = Arc::new(tokio::sync::Notify::new());
+        let finish_loader = Arc::new(tokio::sync::Notify::new());
+
+        let task_cache = cache.clone();
+        let loader_started_clone = loader_started.clone();
+        let finish_loader_clone = finish_loader.clone();
+        let load = tokio::spawn(async move {
+            task_cache
+                .get_or_insert_with_key(TestKey::<Vec<i32>>::new("k"), move || {
+                    let loader_started = loader_started_clone;
+                    let finish_loader = finish_loader_clone;
+                    async move {
+                        loader_started.notify_waiters();
+                        finish_loader.notified().await;
+                        Ok(vec![1, 2, 3])
+                    }
+                })
+                .await
+        });
+
+        loader_started.notified().await;
+        cache.clear().await;
+        assert_eq!(cache.size().await, 0);
+
+        finish_loader.notify_waiters();
+        let loaded = load.await.unwrap().unwrap();
+        assert_eq!(*loaded, vec![1, 2, 3]);
+
+        let cached = cache
+            .get_with_key(&TestKey::<Vec<i32>>::new("k"))
+            .await
+            .unwrap();
+        assert_eq!(*cached, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
     async fn test_cache_get_or_insert() {
         let cache = LanceCache::with_capacity(1000);
 
@@ -888,76 +1365,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_backend() {
-        use async_trait::async_trait;
-        use tokio::sync::Mutex;
-
-        #[derive(Debug)]
-        struct HashMapBackend {
-            map: Mutex<HashMap<InternalCacheKey, (CacheEntry, usize)>>,
-        }
-
-        impl HashMapBackend {
-            fn new() -> Self {
-                Self {
-                    map: Mutex::new(HashMap::new()),
-                }
-            }
-        }
-
-        #[async_trait]
-        impl CacheBackend for HashMapBackend {
-            async fn get(
-                &self,
-                key: &InternalCacheKey,
-                _codec: Option<CacheCodec>,
-            ) -> Option<CacheEntry> {
-                self.map.lock().await.get(key).map(|(e, _)| e.clone())
-            }
-            async fn insert(
-                &self,
-                key: &InternalCacheKey,
-                entry: CacheEntry,
-                size_bytes: usize,
-                _codec: Option<CacheCodec>,
-            ) {
-                self.map
-                    .lock()
-                    .await
-                    .insert(key.clone(), (entry, size_bytes));
-            }
-            async fn get_or_insert<'a>(
-                &self,
-                key: &InternalCacheKey,
-                loader: std::pin::Pin<
-                    Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
-                >,
-                _codec: Option<CacheCodec>,
-            ) -> Result<(CacheEntry, bool)> {
-                if let Some((entry, _)) = self.map.lock().await.get(key) {
-                    Ok((entry.clone(), true))
-                } else {
-                    let (entry, size) = loader.await?;
-                    self.map
-                        .lock()
-                        .await
-                        .insert(key.clone(), (entry.clone(), size));
-                    Ok((entry, false))
-                }
-            }
-            async fn invalidate_prefix(&self, prefix: &str) {
-                self.map.lock().await.retain(|k, _| !k.starts_with(prefix));
-            }
-            async fn clear(&self) {
-                self.map.lock().await.clear();
-            }
-            async fn num_entries(&self) -> usize {
-                self.map.lock().await.len()
-            }
-            async fn size_bytes(&self) -> usize {
-                self.map.lock().await.values().map(|(_, s)| *s).sum()
-            }
-        }
-
         let cache = LanceCache::with_backend(Arc::new(HashMapBackend::new()));
 
         cache
@@ -977,6 +1384,165 @@ mod tests {
                 .is_none()
         );
         assert!(cache.keys().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_uses_backend_default_fallback() {
+        let cache = LanceCache::with_backend(Arc::new(HashMapBackend::new()));
+        let loader_calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let values = cache
+            .get_or_insert_with_key_batch(
+                vec![
+                    TestKey::<Vec<i32>>::new("1"),
+                    TestKey::<Vec<i32>>::new("2"),
+                    TestKey::<Vec<i32>>::new("3"),
+                ],
+                {
+                    let loader_calls = loader_calls.clone();
+                    move |owned_keys| {
+                        let loader_calls = loader_calls.clone();
+                        async move {
+                            loader_calls.lock().await.push(
+                                owned_keys
+                                    .iter()
+                                    .map(|key| key.key.clone())
+                                    .collect::<Vec<_>>(),
+                            );
+                            Ok(owned_keys
+                                .into_iter()
+                                .map(|key| {
+                                    let value = key.key.parse::<i32>().unwrap();
+                                    (key, vec![value])
+                                })
+                                .collect())
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![2], vec![3]]
+        );
+        assert_eq!(
+            values
+                .iter()
+                .map(|entry| entry.was_cached)
+                .collect::<Vec<_>>(),
+            vec![false, false, false]
+        );
+        assert_eq!(
+            *loader_calls.lock().await,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()]
+            ]
+        );
+
+        let cached_values = cache
+            .get_or_insert_with_key_batch(
+                vec![TestKey::<Vec<i32>>::new("2"), TestKey::<Vec<i32>>::new("3")],
+                |_| async { panic!("cached fallback keys should not call loader") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cached_values
+                .iter()
+                .map(|entry| entry.was_cached)
+                .collect::<Vec<_>>(),
+            vec![true, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_weak_get_or_insert_batch_empty_after_cache_drop_skips_loader() {
+        let weak_cache = {
+            let cache = LanceCache::with_capacity(10000);
+            WeakLanceCache::from(&cache)
+        };
+
+        let values: Vec<CacheBatchValue<Vec<i32>>> = weak_cache
+            .get_or_insert_with_key_batch(Vec::<TestKey<Vec<i32>>>::new(), |_| async {
+                panic!("empty weak-cache batch should not call loader")
+            })
+            .await
+            .unwrap();
+
+        assert!(values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_weak_get_or_insert_batch_after_cache_drop_loads_without_cache() {
+        let weak_cache = {
+            let cache = LanceCache::with_capacity(10000);
+            WeakLanceCache::from(&cache)
+        };
+
+        let values = weak_cache
+            .get_or_insert_with_key_batch(
+                vec![
+                    TestKey::<Vec<i32>>::new("2"),
+                    TestKey::<Vec<i32>>::new("1"),
+                    TestKey::<Vec<i32>>::new("3"),
+                ],
+                |keys| async move {
+                    assert_eq!(
+                        keys.iter().map(|key| key.key.as_str()).collect::<Vec<_>>(),
+                        vec!["2", "1", "3"]
+                    );
+                    Ok(vec![
+                        (keys[2].clone(), vec![3]),
+                        (keys[1].clone(), vec![1]),
+                        (keys[0].clone(), vec![2]),
+                    ])
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![2], vec![1], vec![3]]
+        );
+        assert_eq!(
+            values
+                .iter()
+                .map(|entry| entry.was_cached)
+                .collect::<Vec<_>>(),
+            vec![false, false, false]
+        );
+
+        let err = weak_cache
+            .get_or_insert_with_key_batch(vec![TestKey::<Vec<i32>>::new("1")], |_| async {
+                Ok(vec![(TestKey::<Vec<i32>>::new("2"), vec![2])])
+            })
+            .await
+            .unwrap_err();
+
+        assert_invalid_input_contains(err, &["unexpected key", "key='2'"]);
+
+        let err = weak_cache
+            .get_or_insert_with_key_batch(vec![TestKey::<Vec<i32>>::new("1")], |_| async {
+                Ok(vec![
+                    (TestKey::<Vec<i32>>::new("1"), vec![1]),
+                    (TestKey::<Vec<i32>>::new("1"), vec![10]),
+                ])
+            })
+            .await
+            .unwrap_err();
+
+        assert_invalid_input_contains(err, &["duplicate keys", "key='1'"]);
     }
 
     #[tokio::test]
@@ -1013,5 +1579,790 @@ mod tests {
         }
 
         assert_eq!(load_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_dedups_overlapping_keys() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::time::{Duration, sleep};
+
+        let cache = LanceCache::with_capacity(10000);
+        let load_counts = Arc::new(
+            (0..5)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<AtomicUsize>>(),
+        );
+
+        let (barrier_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let mut handles = Vec::new();
+        for keys in [
+            vec![
+                TestKey::<Vec<i32>>::new("1"),
+                TestKey::<Vec<i32>>::new("2"),
+                TestKey::<Vec<i32>>::new("3"),
+            ],
+            vec![
+                TestKey::<Vec<i32>>::new("2"),
+                TestKey::<Vec<i32>>::new("3"),
+                TestKey::<Vec<i32>>::new("4"),
+            ],
+        ] {
+            let cache = cache.clone();
+            let load_counts = load_counts.clone();
+            let mut barrier_rx = barrier_tx.subscribe();
+            handles.push(tokio::spawn(async move {
+                barrier_rx.recv().await.ok();
+                cache
+                    .get_or_insert_with_key_batch(keys.clone(), move |owned_keys| {
+                        let load_counts = load_counts.clone();
+                        async move {
+                            sleep(Duration::from_millis(20)).await;
+                            Ok(owned_keys
+                                .into_iter()
+                                .map(|key| {
+                                    let value = key.key.parse::<i32>().unwrap();
+                                    load_counts[value as usize].fetch_add(1, Ordering::SeqCst);
+                                    (key, vec![value])
+                                })
+                                .collect::<Vec<_>>())
+                        }
+                    })
+                    .await
+            }));
+        }
+
+        barrier_tx.send(()).unwrap();
+        let first = handles.remove(0).await.unwrap().unwrap();
+        let second = handles.remove(0).await.unwrap().unwrap();
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![2], vec![3]]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![2], vec![3], vec![4]]
+        );
+        let mut cached_by_value = HashMap::new();
+        for entry in first.iter().chain(second.iter()) {
+            cached_by_value
+                .entry(entry.value[0])
+                .or_insert_with(Vec::new)
+                .push(entry.was_cached);
+        }
+        assert_eq!(cached_by_value.get(&1).unwrap(), &vec![false]);
+        assert_eq!(cached_by_value.get(&4).unwrap(), &vec![false]);
+        assert_eq!(
+            cached_by_value
+                .get(&2)
+                .unwrap()
+                .iter()
+                .filter(|was_cached| **was_cached)
+                .count(),
+            1
+        );
+        assert_eq!(
+            cached_by_value
+                .get(&3)
+                .unwrap()
+                .iter()
+                .filter(|was_cached| **was_cached)
+                .count(),
+            1
+        );
+        for key in 1..=4 {
+            assert_eq!(load_counts[key].load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(cache.stats().await.misses, 4);
+        assert_eq!(cache.stats().await.hits, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_waits_on_in_flight_batch_owner() {
+        use std::sync::atomic::AtomicUsize;
+
+        let cache = LanceCache::with_capacity(10000);
+        let first_load_count = Arc::new(AtomicUsize::new(0));
+        let second_load_count = Arc::new(AtomicUsize::new(0));
+        let owner_started = Arc::new(tokio::sync::Notify::new());
+        let finish_owner = Arc::new(tokio::sync::Notify::new());
+        let second_loader_started = Arc::new(tokio::sync::Notify::new());
+
+        let first_cache = cache.clone();
+        let first_load_count_clone = first_load_count.clone();
+        let owner_started_clone = owner_started.clone();
+        let finish_owner_clone = finish_owner.clone();
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_insert_with_key_batch(
+                    vec![
+                        TestKey::<Vec<i32>>::new("1"),
+                        TestKey::<Vec<i32>>::new("2"),
+                        TestKey::<Vec<i32>>::new("3"),
+                    ],
+                    move |owned_keys| {
+                        let first_load_count = first_load_count_clone.clone();
+                        let owner_started = owner_started_clone.clone();
+                        let finish_owner = finish_owner_clone.clone();
+                        async move {
+                            assert_eq!(
+                                owned_keys
+                                    .iter()
+                                    .map(|key| key.key.as_str())
+                                    .collect::<Vec<_>>(),
+                                vec!["1", "2", "3"]
+                            );
+                            first_load_count.fetch_add(owned_keys.len(), Ordering::SeqCst);
+                            owner_started.notify_waiters();
+                            finish_owner.notified().await;
+                            Ok(owned_keys
+                                .into_iter()
+                                .map(|key| {
+                                    let value = key.key.parse::<i32>().unwrap();
+                                    (key, vec![value])
+                                })
+                                .collect::<Vec<_>>())
+                        }
+                    },
+                )
+                .await
+        });
+
+        owner_started.notified().await;
+
+        let second_cache = cache.clone();
+        let second_load_count_clone = second_load_count.clone();
+        let second_loader_started_clone = second_loader_started.clone();
+        let second = tokio::spawn(async move {
+            second_cache
+                .get_or_insert_with_key_batch(
+                    vec![
+                        TestKey::<Vec<i32>>::new("2"),
+                        TestKey::<Vec<i32>>::new("3"),
+                        TestKey::<Vec<i32>>::new("4"),
+                    ],
+                    move |owned_keys| {
+                        let second_load_count = second_load_count_clone.clone();
+                        let second_loader_started = second_loader_started_clone.clone();
+                        async move {
+                            second_loader_started.notify_waiters();
+                            assert_eq!(
+                                owned_keys
+                                    .iter()
+                                    .map(|key| key.key.as_str())
+                                    .collect::<Vec<_>>(),
+                                vec!["4"]
+                            );
+                            second_load_count.fetch_add(owned_keys.len(), Ordering::SeqCst);
+                            Ok(owned_keys
+                                .into_iter()
+                                .map(|key| {
+                                    let value = key.key.parse::<i32>().unwrap();
+                                    (key, vec![value])
+                                })
+                                .collect::<Vec<_>>())
+                        }
+                    },
+                )
+                .await
+        });
+
+        second_loader_started.notified().await;
+        finish_owner.notify_waiters();
+
+        let first_values = first.await.unwrap().unwrap();
+        let second_values = second.await.unwrap().unwrap();
+
+        assert_eq!(
+            first_values
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![2], vec![3]]
+        );
+        assert_eq!(
+            first_values
+                .iter()
+                .map(|entry| entry.was_cached)
+                .collect::<Vec<_>>(),
+            vec![false, false, false]
+        );
+        assert_eq!(
+            second_values
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![2], vec![3], vec![4]]
+        );
+        assert_eq!(
+            second_values
+                .iter()
+                .map(|entry| entry.was_cached)
+                .collect::<Vec<_>>(),
+            vec![true, true, false]
+        );
+        assert_eq!(first_load_count.load(Ordering::SeqCst), 3);
+        assert_eq!(second_load_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.stats().await.misses, 4);
+        assert_eq!(cache.stats().await.hits, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_dedups_high_fanout_overlap() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::time::{Duration, sleep};
+
+        let cache = LanceCache::with_capacity(10000);
+        let key_count = 64;
+        let concurrency = 8;
+        let load_counts = Arc::new(
+            (0..key_count)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<_>>(),
+        );
+        let (barrier_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        let mut handles = Vec::new();
+
+        for _ in 0..concurrency {
+            let cache = cache.clone();
+            let load_counts = load_counts.clone();
+            let mut barrier_rx = barrier_tx.subscribe();
+            handles.push(tokio::spawn(async move {
+                let keys = (0..key_count)
+                    .map(|idx| TestKey::<Vec<i32>>::new(&idx.to_string()))
+                    .collect::<Vec<_>>();
+                barrier_rx.recv().await.ok();
+                cache
+                    .get_or_insert_with_key_batch(keys, move |owned_keys| {
+                        let load_counts = load_counts.clone();
+                        async move {
+                            sleep(Duration::from_millis(10)).await;
+                            Ok(owned_keys
+                                .into_iter()
+                                .map(|key| {
+                                    let value = key.key.parse::<i32>().unwrap();
+                                    load_counts[value as usize].fetch_add(1, Ordering::SeqCst);
+                                    (key, vec![value])
+                                })
+                                .collect::<Vec<_>>())
+                        }
+                    })
+                    .await
+            }));
+        }
+
+        barrier_tx.send(()).unwrap();
+        for handle in handles {
+            let values = handle.await.unwrap().unwrap();
+            assert_eq!(
+                values
+                    .iter()
+                    .map(|entry| entry.value[0])
+                    .collect::<Vec<_>>(),
+                (0..key_count).collect::<Vec<_>>()
+            );
+        }
+
+        for key in 0..key_count {
+            assert_eq!(load_counts[key as usize].load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_shares_flights_with_single_key_get_or_insert() {
+        use std::sync::atomic::AtomicUsize;
+
+        let cache = LanceCache::with_capacity(10000);
+        let batch_load_count = Arc::new(AtomicUsize::new(0));
+        let single_load_count = Arc::new(AtomicUsize::new(0));
+        let loader_started = Arc::new(tokio::sync::Notify::new());
+        let finish_loader = Arc::new(tokio::sync::Notify::new());
+
+        let batch_cache = cache.clone();
+        let batch_load_count_clone = batch_load_count.clone();
+        let loader_started_clone = loader_started.clone();
+        let finish_loader_clone = finish_loader.clone();
+        let batch = tokio::spawn(async move {
+            batch_cache
+                .get_or_insert_with_key_batch(
+                    vec![TestKey::<Vec<i32>>::new("1"), TestKey::<Vec<i32>>::new("2")],
+                    move |owned_keys| {
+                        let batch_load_count = batch_load_count_clone.clone();
+                        let loader_started = loader_started_clone.clone();
+                        let finish_loader = finish_loader_clone.clone();
+                        async move {
+                            batch_load_count.fetch_add(owned_keys.len(), Ordering::SeqCst);
+                            loader_started.notify_waiters();
+                            finish_loader.notified().await;
+                            Ok(owned_keys
+                                .into_iter()
+                                .map(|key| {
+                                    let value = key.key.parse::<i32>().unwrap();
+                                    (key, vec![value])
+                                })
+                                .collect::<Vec<_>>())
+                        }
+                    },
+                )
+                .await
+        });
+
+        loader_started.notified().await;
+
+        let single_cache = cache.clone();
+        let single_load_count_clone = single_load_count.clone();
+        let single = tokio::spawn(async move {
+            single_cache
+                .get_or_insert_with_key(TestKey::<Vec<i32>>::new("2"), move || {
+                    let single_load_count = single_load_count_clone;
+                    async move {
+                        single_load_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![20])
+                    }
+                })
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(single_load_count.load(Ordering::SeqCst), 0);
+        finish_loader.notify_waiters();
+
+        let batch_values = batch.await.unwrap().unwrap();
+        let single_value = single.await.unwrap().unwrap();
+
+        assert_eq!(
+            batch_values
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![2]]
+        );
+        assert_eq!(
+            batch_values
+                .iter()
+                .map(|entry| entry.was_cached)
+                .collect::<Vec<_>>(),
+            vec![false, false]
+        );
+        assert_eq!(*single_value, vec![2]);
+        assert_eq!(batch_load_count.load(Ordering::SeqCst), 2);
+        assert_eq!(single_load_count.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.stats().await.misses, 2);
+        assert_eq!(cache.stats().await.hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_single_key_shares_flights_with_batch_get_or_insert() {
+        use std::sync::atomic::AtomicUsize;
+
+        let cache = LanceCache::with_capacity(10000);
+        let single_load_count = Arc::new(AtomicUsize::new(0));
+        let batch_load_count = Arc::new(AtomicUsize::new(0));
+        let loader_started = Arc::new(tokio::sync::Notify::new());
+        let finish_loader = Arc::new(tokio::sync::Notify::new());
+        let batch_loader_started = Arc::new(tokio::sync::Notify::new());
+
+        let single_cache = cache.clone();
+        let single_load_count_clone = single_load_count.clone();
+        let loader_started_clone = loader_started.clone();
+        let finish_loader_clone = finish_loader.clone();
+        let single = tokio::spawn(async move {
+            single_cache
+                .get_or_insert_with_key(TestKey::<Vec<i32>>::new("2"), move || {
+                    let single_load_count = single_load_count_clone.clone();
+                    let loader_started = loader_started_clone.clone();
+                    let finish_loader = finish_loader_clone;
+                    async move {
+                        single_load_count.fetch_add(1, Ordering::SeqCst);
+                        loader_started.notify_waiters();
+                        finish_loader.notified().await;
+                        Ok(vec![2])
+                    }
+                })
+                .await
+        });
+
+        loader_started.notified().await;
+
+        let batch_cache = cache.clone();
+        let batch_load_count_clone = batch_load_count.clone();
+        let batch_loader_started_clone = batch_loader_started.clone();
+        let batch = tokio::spawn(async move {
+            batch_cache
+                .get_or_insert_with_key_batch(
+                    vec![TestKey::<Vec<i32>>::new("1"), TestKey::<Vec<i32>>::new("2")],
+                    move |owned_keys| {
+                        let batch_load_count = batch_load_count_clone.clone();
+                        let batch_loader_started = batch_loader_started_clone.clone();
+                        async move {
+                            batch_loader_started.notify_waiters();
+                            assert_eq!(
+                                owned_keys
+                                    .iter()
+                                    .map(|key| key.key.as_str())
+                                    .collect::<Vec<_>>(),
+                                vec!["1"]
+                            );
+                            batch_load_count.fetch_add(owned_keys.len(), Ordering::SeqCst);
+                            Ok(owned_keys
+                                .into_iter()
+                                .map(|key| {
+                                    let value = key.key.parse::<i32>().unwrap();
+                                    (key, vec![value])
+                                })
+                                .collect())
+                        }
+                    },
+                )
+                .await
+        });
+
+        batch_loader_started.notified().await;
+        finish_loader.notify_waiters();
+
+        let single_value = single.await.unwrap().unwrap();
+        let batch_values = batch.await.unwrap().unwrap();
+
+        assert_eq!(*single_value, vec![2]);
+        assert_eq!(
+            batch_values
+                .iter()
+                .map(|entry| entry.value.as_ref().clone())
+                .collect::<Vec<_>>(),
+            vec![vec![1], vec![2]]
+        );
+        assert_eq!(
+            batch_values
+                .iter()
+                .map(|entry| entry.was_cached)
+                .collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        assert_eq!(single_load_count.load(Ordering::SeqCst), 1);
+        assert_eq!(batch_load_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_loader_receives_owned_keys_in_input_order() {
+        let cache = LanceCache::with_capacity(10000);
+        cache
+            .insert_with_key(&TestKey::new("key-03"), Arc::new(vec![3]))
+            .await;
+        cache
+            .insert_with_key(&TestKey::new("key-07"), Arc::new(vec![7]))
+            .await;
+
+        let keys = (0..16)
+            .map(|idx| TestKey::<Vec<i32>>::new(&format!("key-{idx:02}")))
+            .collect::<Vec<_>>();
+        let expected_owned_keys = keys
+            .iter()
+            .filter(|key| key.key != "key-03" && key.key != "key-07")
+            .map(|key| key.key.clone())
+            .collect::<Vec<_>>();
+        let observed_owned_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_owned_keys_clone = observed_owned_keys.clone();
+
+        let values = cache
+            .get_or_insert_with_key_batch(keys, move |owned_keys| {
+                let observed_owned_keys = observed_owned_keys_clone.clone();
+                async move {
+                    *observed_owned_keys.lock().unwrap() =
+                        owned_keys.iter().map(|key| key.key.clone()).collect();
+                    Ok(owned_keys
+                        .into_iter()
+                        .map(|key| {
+                            let value = key.key.strip_prefix("key-").unwrap().parse().unwrap();
+                            (key, vec![value])
+                        })
+                        .collect())
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*observed_owned_keys.lock().unwrap(), expected_owned_keys);
+        assert_eq!(
+            values
+                .iter()
+                .map(|entry| entry.value[0])
+                .collect::<Vec<_>>(),
+            (0..16).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_rejects_duplicate_input_keys() {
+        let cache = LanceCache::with_capacity(10000);
+
+        let err = cache
+            .get_or_insert_with_key_batch(
+                vec![TestKey::<Vec<i32>>::new("1"), TestKey::<Vec<i32>>::new("1")],
+                |_| async { Ok(Vec::<(TestKey<Vec<i32>>, Vec<i32>)>::new()) },
+            )
+            .await
+            .unwrap_err();
+
+        assert_invalid_input_contains(err, &["duplicate cache key", "key='1'"]);
+        assert_eq!(cache.stats().await.hits, 0);
+        assert_eq!(cache.stats().await.misses, 0);
+    }
+
+    #[rstest]
+    #[case::unexpected_key(
+        vec![(TestKey::<Vec<i32>>::new("2"), vec![2])],
+        &["unexpected key", "key='2'"]
+    )]
+    #[case::missing_key(
+        Vec::<(TestKey<Vec<i32>>, Vec<i32>)>::new(),
+        &["did not return expected key", "key='1'"]
+    )]
+    #[case::extra_key(vec![
+        (TestKey::<Vec<i32>>::new("1"), vec![1]),
+        (TestKey::<Vec<i32>>::new("2"), vec![2]),
+    ], &["unexpected key", "key='2'"])]
+    #[case::duplicate_key(vec![
+        (TestKey::<Vec<i32>>::new("1"), vec![1]),
+        (TestKey::<Vec<i32>>::new("1"), vec![10]),
+    ], &["duplicate keys", "key='1'"])]
+    #[tokio::test]
+    async fn test_get_or_insert_batch_rejects_loader_key_validation(
+        #[case] loaded: Vec<(TestKey<Vec<i32>>, Vec<i32>)>,
+        #[case] expected_message: &[&str],
+    ) {
+        let cache = LanceCache::with_capacity(10000);
+
+        let err = cache
+            .get_or_insert_with_key_batch(vec![TestKey::<Vec<i32>>::new("1")], move |_| {
+                let loaded = loaded.clone();
+                async move { Ok(loaded) }
+            })
+            .await
+            .unwrap_err();
+
+        assert_invalid_input_contains(err, expected_message);
+        assert!(
+            cache
+                .get_with_key(&TestKey::<Vec<i32>>::new("1"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_single_key_waiter_retries_after_owner_error() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::time::{Duration, timeout};
+
+        let cache = LanceCache::with_capacity(10000);
+        let owner_started = Arc::new(tokio::sync::Notify::new());
+        let fail_owner = Arc::new(tokio::sync::Notify::new());
+        let retry_load_count = Arc::new(AtomicUsize::new(0));
+
+        let owner_cache = cache.clone();
+        let owner_started_clone = owner_started.clone();
+        let fail_owner_clone = fail_owner.clone();
+        let owner = tokio::spawn(async move {
+            owner_cache
+                .get_or_insert_with_key(TestKey::<Vec<i32>>::new("1"), move || async move {
+                    owner_started_clone.notify_waiters();
+                    fail_owner_clone.notified().await;
+                    Err(Error::io("owner load failed"))
+                })
+                .await
+        });
+
+        owner_started.notified().await;
+
+        let waiter_cache = cache.clone();
+        let retry_load_count_clone = retry_load_count.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_cache
+                .get_or_insert_with_key(TestKey::<Vec<i32>>::new("1"), move || async move {
+                    retry_load_count_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![1])
+                })
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        fail_owner.notify_waiters();
+
+        let owner_err = owner.await.unwrap().unwrap_err();
+        assert!(matches!(owner_err, Error::IO { .. }));
+
+        let waiter_value = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*waiter_value, vec![1]);
+        assert_eq!(retry_load_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_single_key_waiter_retries_after_owner_cancel() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::time::{Duration, sleep, timeout};
+
+        let cache = LanceCache::with_capacity(10000);
+        let owner_started = Arc::new(tokio::sync::Notify::new());
+        let retry_load_count = Arc::new(AtomicUsize::new(0));
+
+        let owner_cache = cache.clone();
+        let owner_started_clone = owner_started.clone();
+        let owner = tokio::spawn(async move {
+            owner_cache
+                .get_or_insert_with_key(TestKey::<Vec<i32>>::new("1"), move || async move {
+                    owner_started_clone.notify_waiters();
+                    std::future::pending::<Result<Vec<i32>>>().await
+                })
+                .await
+        });
+
+        owner_started.notified().await;
+
+        let waiter_cache = cache.clone();
+        let retry_load_count_clone = retry_load_count.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_cache
+                .get_or_insert_with_key(TestKey::<Vec<i32>>::new("1"), move || async move {
+                    retry_load_count_clone.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![1])
+                })
+                .await
+        });
+
+        sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        owner.abort();
+
+        let waiter_value = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*waiter_value, vec![1]);
+        assert_eq!(retry_load_count.load(Ordering::SeqCst), 1);
+        assert!(owner.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_waiter_retries_after_owner_error() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::time::{Duration, timeout};
+
+        let cache = LanceCache::with_capacity(10000);
+        let owner_started = Arc::new(tokio::sync::Notify::new());
+        let fail_owner = Arc::new(tokio::sync::Notify::new());
+        let retry_load_count = Arc::new(AtomicUsize::new(0));
+
+        let owner_cache = cache.clone();
+        let owner_started_clone = owner_started.clone();
+        let fail_owner_clone = fail_owner.clone();
+        let owner = tokio::spawn(async move {
+            owner_cache
+                .get_or_insert_with_key_batch(vec![TestKey::<Vec<i32>>::new("1")], move |_| {
+                    let owner_started = owner_started_clone.clone();
+                    let fail_owner = fail_owner_clone.clone();
+                    async move {
+                        owner_started.notify_waiters();
+                        fail_owner.notified().await;
+                        Err(Error::io("owner load failed"))
+                    }
+                })
+                .await
+        });
+
+        owner_started.notified().await;
+
+        let waiter_cache = cache.clone();
+        let retry_load_count_clone = retry_load_count.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_cache
+                .get_or_insert_with_key_batch(vec![TestKey::<Vec<i32>>::new("1")], move |keys| {
+                    let retry_load_count = retry_load_count_clone.clone();
+                    async move {
+                        retry_load_count.fetch_add(keys.len(), Ordering::SeqCst);
+                        Ok(keys.into_iter().map(|key| (key, vec![1])).collect())
+                    }
+                })
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        fail_owner.notify_waiters();
+
+        let owner_err = owner.await.unwrap().unwrap_err();
+        assert!(matches!(owner_err, Error::IO { .. }));
+
+        let waiter_values = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*waiter_values[0].value, vec![1]);
+        assert_eq!(retry_load_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_insert_batch_waiter_retries_after_owner_cancel() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::time::{Duration, sleep, timeout};
+
+        let cache = LanceCache::with_capacity(10000);
+        let owner_started = Arc::new(tokio::sync::Notify::new());
+        let retry_load_count = Arc::new(AtomicUsize::new(0));
+
+        let owner_cache = cache.clone();
+        let owner_started_clone = owner_started.clone();
+        let owner = tokio::spawn(async move {
+            owner_cache
+                .get_or_insert_with_key_batch(vec![TestKey::<Vec<i32>>::new("1")], move |_| {
+                    let owner_started = owner_started_clone.clone();
+                    async move {
+                        owner_started.notify_waiters();
+                        std::future::pending::<Result<Vec<(TestKey<Vec<i32>>, Vec<i32>)>>>().await
+                    }
+                })
+                .await
+        });
+
+        owner_started.notified().await;
+
+        let waiter_cache = cache.clone();
+        let retry_load_count_clone = retry_load_count.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_cache
+                .get_or_insert_with_key_batch(vec![TestKey::<Vec<i32>>::new("1")], move |keys| {
+                    let retry_load_count = retry_load_count_clone.clone();
+                    async move {
+                        retry_load_count.fetch_add(keys.len(), Ordering::SeqCst);
+                        Ok(keys.into_iter().map(|key| (key, vec![1])).collect())
+                    }
+                })
+                .await
+        });
+
+        sleep(Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished());
+        owner.abort();
+
+        let waiter_values = timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*waiter_values[0].value, vec![1]);
+        assert_eq!(retry_load_count.load(Ordering::SeqCst), 1);
+        assert!(owner.await.unwrap_err().is_cancelled());
     }
 }

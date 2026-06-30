@@ -4551,6 +4551,7 @@ dependencies = [
  "async-trait",
  "byteorder",
  "bytes",
+ "criterion",
  "datafusion-common",
  "datafusion-sql",
  "futures",
