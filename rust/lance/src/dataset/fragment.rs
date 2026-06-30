@@ -3184,7 +3184,9 @@ mod tests {
     mod overlay_read {
         use std::sync::Arc;
 
-        use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_array::{
+            Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array,
+        };
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
         use lance_file::version::LanceFileVersion;
@@ -3601,6 +3603,229 @@ mod tests {
             let val = col(&batch, "val");
             assert_eq!(val.value(0), values[0]);
             assert_eq!(val.value(1), values[1]);
+        }
+
+        /// The overlay merge runs before `wrap_with_row_id_and_delete`, so the
+        /// `_rowid` system column must coexist with overlay-resolved data columns:
+        /// the row ids are unaffected by the merge and the overlay value still wins.
+        #[rstest]
+        #[tokio::test]
+        async fn test_scan_with_row_id_alongside_overlay(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "rowidov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(1000)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag
+                .scan()
+                .with_row_id()
+                .project(&["id", "val"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            // Overlay value resolves...
+            assert_eq!(col(&batch, "val").values()[0], 1000);
+            assert_eq!(&col(&batch, "val").values()[1..], &[10, 20, 30, 40, 50]);
+            // ...and the row ids for fragment 0 are the untouched physical offsets.
+            let row_ids = batch
+                .column(batch.schema().index_of("_rowid").unwrap())
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            assert_eq!(row_ids.values(), &[0, 1, 2, 3, 4, 5]);
+        }
+
+        /// When the newest overlay covers every requested offset, an older overlay
+        /// in the same plan is routed zero ranks and its value column must not be
+        /// read (the empty-ranks branch of `fetch_overlay_ranks`). The result still
+        /// resolves to the newest overlay.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_older_overlay_contributes_no_ranks(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Older covers {1, 4}; newer re-covers {1}. A take of only offset 1
+            // routes entirely to the newer overlay, leaving the older one with no
+            // ranks to fetch even though it is part of the field's plan.
+            let dataset = commit_overlay(
+                dataset,
+                "older",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+            let dataset = commit_overlay(
+                dataset,
+                "newer",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![i32_array([Some(999)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1], &full_schema(&dataset)).await.unwrap();
+            assert_eq!(col(&batch, "val").values(), &[999]);
+        }
+
+        /// A newest overlay whose value is NULL must shadow an older overlay's
+        /// non-null value at the same offset — the merge resolves to NULL, it does
+        /// not fall back to the older overlay.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_newest_null_shadows_older(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "older",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![i32_array([Some(111)])],
+                version,
+            )
+            .await;
+            let dataset = commit_overlay(
+                dataset,
+                "newer_null",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1])),
+                vec![i32_array([None])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1], &full_schema(&dataset)).await.unwrap();
+            let val = col(&batch, "val");
+            assert!(val.is_null(0), "newest NULL must win over older 111");
+        }
+
+        /// Newest-wins is resolved independently per field across multiple sparse
+        /// overlays: for the same offset, `id` can resolve to one overlay while
+        /// `val` resolves to the other, depending on which overlay newly covers
+        /// that field at that offset.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_multi_sparse_per_field_newest_wins(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Older: id covers {3}, val covers {2}.
+            let dataset = commit_overlay(
+                dataset,
+                "older",
+                0,
+                &[0, 1],
+                OverlayCoverage::sparse(vec![bitmap([3]), bitmap([2])]),
+                vec![i32_array([Some(7773)]), i32_array([Some(2772)])],
+                version,
+            )
+            .await;
+            // Newer: id covers {2}, val covers {3} — the mirror image.
+            let dataset = commit_overlay(
+                dataset,
+                "newer",
+                0,
+                &[0, 1],
+                OverlayCoverage::sparse(vec![bitmap([2]), bitmap([3])]),
+                vec![i32_array([Some(9992)]), i32_array([Some(9993)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[2, 3], &full_schema(&dataset)).await.unwrap();
+            // id: offset 2 -> newer (9992), offset 3 -> older (7773).
+            assert_eq!(col(&batch, "id").values(), &[9992, 7773]);
+            // val: offset 2 -> older (2772), offset 3 -> newer (9993).
+            assert_eq!(col(&batch, "val").values(), &[2772, 9993]);
+        }
+
+        /// A fragment with an overlay plan, but a take that touches only uncovered
+        /// offsets, must fall entirely through to the base values (the
+        /// `routing.all_fall_through()` early-return with a plan present).
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_plan_present_all_offsets_uncovered(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "ov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            // None of {0, 2, 5} are covered: the plan exists but contributes nothing.
+            let batch = frag.take(&[0, 2, 5], &full_schema(&dataset)).await.unwrap();
+            assert_eq!(col(&batch, "val").values(), &[0, 20, 50]);
+            assert_eq!(col(&batch, "id").values(), &[0, 2, 5]);
+        }
+
+        /// A dataset-level `take` spanning multiple fragments, each with its own
+        /// overlay, routes every global row index to the right fragment's overlay.
+        #[rstest]
+        #[tokio::test]
+        async fn test_dataset_take_multi_fragment_overlays(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "frag0",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(1000)])],
+                version,
+            )
+            .await;
+            let dataset = commit_overlay(
+                dataset,
+                "frag1",
+                1,
+                &[1],
+                OverlayCoverage::dense(bitmap([0])),
+                vec![i32_array([Some(6000)])],
+                version,
+            )
+            .await;
+
+            // Global rows 0 and 6 are the overlaid offset-0 rows of fragments 0 and
+            // 1; rows 1 and 7 fall through to base.
+            let batch = dataset
+                .take(&[0, 1, 6, 7], full_schema(&dataset))
+                .await
+                .unwrap();
+            assert_eq!(col(&batch, "id").values(), &[0, 1, 6, 7]);
+            assert_eq!(col(&batch, "val").values(), &[1000, 10, 6000, 70]);
         }
     }
 
