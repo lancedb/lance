@@ -929,7 +929,6 @@ impl LazyLevels {
         }
     }
 
-    /// Append the logical levels in `range` to `out`.
     fn extend_into(&self, range: Range<usize>, out: &mut Vec<u16>) {
         if range.is_empty() {
             return;

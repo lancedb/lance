@@ -608,16 +608,13 @@ fn parse_rle_block_frame(data: &LanceBuffer) -> Result<(LanceBuffer, LanceBuffer
 /// Parse an RLE block-format buffer into per-run `u16` values and cumulative
 /// logical offsets, without expanding to the full `num_values` length.
 ///
-/// Adjacent runs that share a value are coalesced into a single logical run.
-/// Because the block encoder caps run lengths at `u8::MAX` (see
-/// `RleEncoder::add_run`), a logically constant page arrives as
-/// `ceil(num_values / 255)` equal-valued runs; coalescing collapses them so the
-/// run form stays proportional to the number of distinct logical levels.
+/// Adjacent equal-valued runs are coalesced into one logical run. The block
+/// encoder caps run lengths at `u8::MAX` (see `RleEncoder::add_run`), so a
+/// logically constant page arrives as `ceil(num_values / 255)` runs; coalescing
+/// collapses them, keeping the run form proportional to the distinct level count.
 ///
-/// `offsets.len() == values.len() + 1`, `offsets[0] == 0`, and
-/// `offsets[values.len()] == num_values`. Lets the complex-all-null decoder keep
-/// highly-compressible rep/def levels in run form instead of materializing
-/// `num_values` u16s per cached page.
+/// Invariants: `offsets.len() == values.len() + 1`, `offsets[0] == 0`,
+/// `offsets[values.len()] == num_values`.
 pub(crate) fn decode_rle_u16_runs(
     data: LanceBuffer,
     num_values: u64,
@@ -661,12 +658,6 @@ pub(crate) fn decode_rle_u16_runs(
     let run_values: &[u16] = run_values.as_ref();
     let lengths: &[u8] = lengths_buffer.as_ref();
 
-    // Coalesce adjacent runs that share a value. The block encoder caps each run
-    // length at `u8::MAX` (see `RleEncoder::add_run`), so a logically constant
-    // page arrives as `ceil(num_values / 255)` equal-valued runs. Merging them
-    // keeps the cached run form proportional to the number of distinct logical
-    // levels (usually one for the all-null pages this feeds) instead of
-    // `num_values / 255`.
     let mut values: Vec<u16> = Vec::with_capacity(num_runs);
     let mut offsets: Vec<u64> = Vec::with_capacity(num_runs + 1);
     offsets.push(0u64);
@@ -685,7 +676,6 @@ pub(crate) fn decode_rle_u16_runs(
         let write = (length as u64).min(num_values - acc);
         acc += write;
         if values.last().copied() == Some(value) {
-            // Same value as the previous logical run: extend it in place.
             *offsets
                 .last_mut()
                 .expect("offsets always has a trailing entry") = acc;
@@ -731,7 +721,6 @@ mod tests {
         });
         let frame = BlockCompressor::compress(&RleEncoder::new(), block).unwrap();
 
-        // Eager expansion via the block decompressor.
         let eager =
             BlockDecompressor::decompress(&RleDecompressor::new(16), frame.clone(), num_values)
                 .unwrap();
