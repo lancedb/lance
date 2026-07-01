@@ -2663,7 +2663,7 @@ impl Dataset {
     /// copies are written through the target object store built from `store_params`.
     /// This makes the clone work across accounts/stores (e.g. between two abfss
     /// accounts): when the source and target stores are the same the copy stays
-    /// server-side, otherwise the data is streamed source -> target.
+    /// server-side, otherwise the data is streamed through this process.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
