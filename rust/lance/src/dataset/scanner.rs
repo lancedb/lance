@@ -93,7 +93,7 @@ use crate::index::vector::utils::{
 };
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
-    ScanSchedulerDiagnosticsCallback, high_bandwidth_scan_parallelism_target,
+    ScanSchedulerDiagnosticsCallback,
 };
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
@@ -2897,7 +2897,7 @@ impl Scanner {
             .with_projection(projection)
             .with_ordered_output(ordered_output)
             .with_threading_mode(FilteredReadThreadingMode::OnePartitionMultipleThreads(
-                self.filtered_read_threading_parallelism(),
+                self.batch_readahead.max(1),
             ));
 
         if let Some(fragments) = fragments {
@@ -4270,28 +4270,7 @@ impl Scanner {
             return target_parallelism.max(1);
         }
 
-        self.default_scan_parallelism()
-    }
-
-    fn filtered_read_threading_parallelism(&self) -> usize {
-        if self.target_parallelism.is_some() {
-            self.batch_readahead.max(1)
-        } else {
-            self.default_scan_parallelism()
-        }
-    }
-
-    fn default_scan_parallelism(&self) -> usize {
-        let base_parallelism = self.batch_readahead.max(1);
-        if self.dataset.object_store.is_cloud()
-            && !self.ordered
-            && self.ordering.is_none()
-            && self.nearest.is_none()
-        {
-            high_bandwidth_scan_parallelism_target(base_parallelism)
-        } else {
-            base_parallelism
-        }
+        self.batch_readahead.max(1)
     }
 
     /// Create an Execution plan with a scan node

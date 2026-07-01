@@ -140,6 +140,25 @@ fn apply_high_bandwidth_batch_size_bytes(
     }
 }
 
+fn high_bandwidth_scan_threading_mode(
+    threading_mode: FilteredReadThreadingMode,
+    is_high_bandwidth_candidate: bool,
+    scan_io_parallelism: usize,
+) -> FilteredReadThreadingMode {
+    if !is_high_bandwidth_candidate {
+        return threading_mode;
+    }
+
+    match threading_mode {
+        FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(
+                num_threads.max(scan_io_parallelism).max(1),
+            )
+        }
+        FilteredReadThreadingMode::MultiplePartitions(_) => threading_mode,
+    }
+}
+
 #[derive(Debug)]
 pub struct EvaluatedIndex {
     index_result: IndexExprResult,
@@ -473,7 +492,6 @@ impl FilteredReadStream {
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
 
-        let threading_mode = options.threading_mode;
         let fragments = options
             .fragments
             .clone()
@@ -494,6 +512,11 @@ impl FilteredReadStream {
             planned_fragment_count,
             planned_row_count,
             io_parallelism,
+        );
+        let threading_mode = high_bandwidth_scan_threading_mode(
+            options.threading_mode,
+            is_high_bandwidth_candidate,
+            scan_io_parallelism,
         );
         let fragment_readahead = options
             .fragment_readahead
@@ -2424,6 +2447,25 @@ mod tests {
                 base
             ),
             base
+        );
+    }
+
+    #[test]
+    fn test_high_bandwidth_scan_threading_only_scales_single_partition_large_scans() {
+        let base_mode = FilteredReadThreadingMode::OnePartitionMultipleThreads(8);
+        assert_eq!(
+            high_bandwidth_scan_threading_mode(base_mode, false, 256),
+            base_mode
+        );
+        assert_eq!(
+            high_bandwidth_scan_threading_mode(base_mode, true, 256),
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(256)
+        );
+
+        let partitioned_mode = FilteredReadThreadingMode::MultiplePartitions(8);
+        assert_eq!(
+            high_bandwidth_scan_threading_mode(partitioned_mode, true, 256),
+            partitioned_mode
         );
     }
 
