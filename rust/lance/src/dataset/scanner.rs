@@ -3860,15 +3860,18 @@ impl Scanner {
             // Mask data overlay files: drop fragments with a newer overlay on the vector field
             // from the index's coverage so the ANN prefilter blocks their (stale) rows, and
             // re-score them on the flat path below.
-            let (effective_segments, stale_frags) =
+            let (masked_segments, stale_frags) =
                 self.mask_overlay_stale_segments(&index_segments)?;
+            // Use masked segments when stale fragments were found; otherwise the originals.
+            let effective_segments: &[IndexMetadata] =
+                masked_segments.as_deref().unwrap_or(&index_segments);
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    self.ann(&q, &effective_segments, filter_plan).await?
+                    self.ann(&q, effective_segments, filter_plan).await?
                 }
                 DataType::List(_) => {
-                    self.multivec_ann(&q, &effective_segments, filter_plan)
+                    self.multivec_ann(&q, effective_segments, filter_plan)
                         .await?
                 }
                 _ => unreachable!(),
@@ -3891,7 +3894,7 @@ impl Scanner {
                     .knn_combined(
                         &q,
                         &index_name,
-                        &effective_segments,
+                        effective_segments,
                         &stale_frags,
                         knn_node,
                         filter_plan,
@@ -4241,20 +4244,24 @@ impl Scanner {
         Ok(stale)
     }
 
-    /// Mask data overlay files for a vector index. Returns the index segments with stale
-    /// fragments removed from their coverage bitmaps — so the ANN prefilter (built from those
-    /// bitmaps) blocks the stale rows — together with the set of stale fragment ids, which the
-    /// caller re-scores against their current vectors on the flat path.
+    /// Mask data overlay files for a vector index.
+    ///
+    /// Returns `(masked_segments, stale_frags)`:
+    /// - `masked_segments`: `Some(vec)` with stale-fragment rows removed from coverage bitmaps
+    ///   when masking was needed; `None` when no masking was necessary (use the original
+    ///   `segments` slice unchanged — this avoids cloning on the common no-overlay fast path).
+    /// - `stale_frags`: fragment ids whose ANN entries may be stale; the caller re-scores them
+    ///   against current vectors on the flat path.
     fn mask_overlay_stale_segments(
         &self,
         segments: &[IndexMetadata],
-    ) -> Result<(Vec<IndexMetadata>, RoaringBitmap)> {
+    ) -> Result<(Option<Vec<IndexMetadata>>, RoaringBitmap)> {
         let fragments = self.dataset.fragments();
         if fragments
             .iter()
             .all(|fragment| fragment.overlays.is_empty())
         {
-            return Ok((segments.to_vec(), RoaringBitmap::new()));
+            return Ok((None, RoaringBitmap::new()));
         }
         let frag_by_id: std::collections::HashMap<u32, &Fragment> =
             fragments.iter().map(|f| (f.id as u32, f)).collect();
@@ -4263,7 +4270,7 @@ impl Scanner {
             collect_stale_overlay_frags(segment, &frag_by_id, &mut stale)?;
         }
         if stale.is_empty() {
-            return Ok((segments.to_vec(), RoaringBitmap::new()));
+            return Ok((None, RoaringBitmap::new()));
         }
         let effective = segments
             .iter()
@@ -4275,7 +4282,7 @@ impl Scanner {
                 segment
             })
             .collect();
-        Ok((effective, stale))
+        Ok((Some(effective), stale))
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -13543,6 +13550,15 @@ fn collect_stale_overlay_frags(
         if fragment.overlays.is_empty() {
             continue;
         }
+        // Cheap version gate: skip the field/bitmap work if every overlay on this fragment
+        // predates the segment (already incorporated by the index).
+        if fragment
+            .overlays
+            .iter()
+            .all(|o| o.committed_version <= segment.dataset_version)
+        {
+            continue;
+        }
         if !overlay_exclusion_offsets(&fragment.overlays, &segment.fields, segment.dataset_version)?
             .is_empty()
         {
@@ -13966,5 +13982,204 @@ mod overlay_index_masking {
             !ids.contains(&35),
             "stale vector for id=35 should be dropped, got {ids:?}"
         );
+    }
+
+    /// Benchmark: measure query latency for BTree, FTS, and vector ANN with 0/4/16 overlay layers.
+    ///
+    /// Run with: cargo test -p lance --lib --release -- overlay_index_masking::bench --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "benchmark"]
+    #[allow(clippy::print_stdout)]
+    async fn bench_index_query_overlay_overhead() {
+        use std::time::Instant;
+
+        use arrow_array::{Float32Array, StringArray};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::scalar::FullTextSearchQuery;
+        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+        use lance_linalg::distance::MetricType;
+
+        use crate::index::vector::VectorIndexParams;
+
+        const DIM: i32 = 16;
+        const ROWS_PER_FRAG: i32 = 500;
+        const ITERS: u32 = 100;
+
+        // --- Build dataset --------------------------------------------------
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("age", DataType::Int32, false),
+            ArrowField::new("text", DataType::Utf8, false),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    DIM,
+                ),
+                false,
+            ),
+        ]));
+
+        let n_frags = 3i32;
+        let total = ROWS_PER_FRAG * n_frags;
+        let ids: Vec<i32> = (0..total).collect();
+        let ages: Vec<i32> = ids.iter().map(|&i| i * 10).collect();
+        let texts: Vec<String> = ids.iter().map(|&i| format!("token{i}")).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(ages)),
+                Arc::new(StringArray::from(texts)),
+                Arc::new(fsl(
+                    (0..total as usize)
+                        .map(|i| vec![i as f32; DIM as usize])
+                        .collect(),
+                    DIM,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: ROWS_PER_FRAG as usize,
+            max_rows_per_group: ROWS_PER_FRAG as usize,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Build all three indexes before committing any overlays.
+        dataset
+            .create_index(
+                &["age"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let vec_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &vec_params, true)
+            .await
+            .unwrap();
+
+        // --- Timing helper ---------------------------------------------------
+
+        async fn timeit<F, Fut>(iters: u32, mut f: F) -> f64
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            f().await; // warmup
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                f().await;
+            }
+            t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+        }
+
+        // --- Run for each overlay count -------------------------------------
+
+        println!(
+            "\n{:>10}  {:>10}  {:>10}  {:>10}",
+            "overlays", "btree_ms", "fts_ms", "vec_ms"
+        );
+
+        for num_overlays in [0u32, 4, 16] {
+            // Reopen from disk to get a fresh dataset handle.
+            let mut ds = Dataset::open(uri).await.unwrap();
+
+            // Commit N overlay layers on fragment 0, field 1 (age), offset 0.
+            // Each layer has committed_version > index.dataset_version so triggers masking.
+            for layer in 0..num_overlays {
+                ds = commit_overlay(
+                    ds,
+                    &format!("age_ol{layer}"),
+                    0,
+                    &[1],
+                    OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    vec![i32_array([Some(999)])],
+                )
+                .await;
+            }
+
+            let ds = Arc::new(ds);
+
+            // BTree filter on age (indexed)
+            let ds2 = ds.clone();
+            let btree_ms = timeit(ITERS, || {
+                let ds = ds2.clone();
+                async move {
+                    ds.scan()
+                        .filter("age = 4200")
+                        .unwrap()
+                        .project(&["age"])
+                        .unwrap()
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
+
+            // FTS: full-text search (no overlay masking implemented for FTS)
+            let ds2 = ds.clone();
+            let fts_ms = timeit(ITERS, || {
+                let ds = ds2.clone();
+                async move {
+                    ds.scan()
+                        .full_text_search(FullTextSearchQuery::new("token420".to_owned()))
+                        .unwrap()
+                        .project(&["text"])
+                        .unwrap()
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
+
+            // Vector ANN (overlay is on `age` field, not `vec`, so vector index is not stale)
+            let ds2 = ds.clone();
+            let query_vec = Float32Array::from(vec![1.0f32; DIM as usize]);
+            let vec_ms = timeit(ITERS, || {
+                let ds = ds2.clone();
+                let q = query_vec.clone();
+                async move {
+                    ds.scan()
+                        .nearest("vec", &q, 3)
+                        .unwrap()
+                        .minimum_nprobes(1)
+                        .project(&["id"])
+                        .unwrap()
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                }
+            })
+            .await;
+
+            println!("{num_overlays:>10}  {btree_ms:>10.3}  {fts_ms:>10.3}  {vec_ms:>10.3}");
+        }
     }
 }
