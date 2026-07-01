@@ -914,6 +914,29 @@ struct TableDeleteEntry {
     ranges: Vec<(i64, i64)>,
 }
 
+/// Persistent record of `alter_transaction` outcomes for a single transaction.
+///
+/// Lance's transaction file is immutable once written, so we record any
+/// modifications (status transitions, extra properties, tombstoned properties)
+/// in a namespace-owned sidecar file. The sidecar is then merged into the
+/// response of subsequent `describe_transaction` / `alter_transaction` calls.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TransactionAlteration {
+    /// The most recently applied status, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    /// User-defined properties layered on top of the immutable transaction
+    /// properties. Values here take precedence over the transaction's own
+    /// properties when both are present.
+    #[serde(default)]
+    properties: HashMap<String, String>,
+    /// Names of transaction properties that have been tombstoned via
+    /// `unset_property_action`. A tombstoned key is hidden from the response
+    /// even when the immutable transaction still carries it.
+    #[serde(default)]
+    removed_properties: std::collections::HashSet<String>,
+}
+
 impl DirectoryNamespace {
     /// Apply pagination to a list of table names
     ///
@@ -2065,12 +2088,29 @@ impl DirectoryNamespace {
     fn transaction_response(
         version: u64,
         transaction: &Transaction,
+        alteration: Option<TransactionAlteration>,
     ) -> DescribeTransactionResponse {
         let mut properties = transaction
             .transaction_properties
             .as_ref()
             .map(|properties| (**properties).clone())
             .unwrap_or_default();
+
+        // Apply persisted alterations on top of the immutable transaction
+        // properties so callers see the current effective state.
+        let mut effective_status = "SUCCEEDED".to_string();
+        if let Some(alteration) = alteration {
+            for key in &alteration.removed_properties {
+                properties.remove(key);
+            }
+            for (key, value) in alteration.properties {
+                properties.insert(key, value);
+            }
+            if let Some(status) = alteration.status {
+                effective_status = status;
+            }
+        }
+
         properties.insert("uuid".to_string(), transaction.uuid.clone());
         properties.insert("version".to_string(), version.to_string());
         properties.insert(
@@ -2086,7 +2126,7 @@ impl DirectoryNamespace {
         }
 
         DescribeTransactionResponse {
-            status: "SUCCEEDED".to_string(),
+            status: effective_status,
             properties: Some(properties),
         }
     }
@@ -2173,6 +2213,86 @@ impl DirectoryNamespace {
             message: id.to_string(),
         }
         .into())
+    }
+
+    /// Relative directory (under a table's Lance root) used to persist
+    /// alter_transaction outcomes. The Lance transaction file itself is
+    /// immutable, so we keep alterations in a namespace-owned sidecar.
+    const TRANSACTION_ALTERATIONS_DIR: &'static str = "_alter_transactions";
+
+    fn transaction_alteration_path(&self, table_uri: &str, txn_uuid: &str) -> Result<Path> {
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        Ok(table_path
+            .join(Self::TRANSACTION_ALTERATIONS_DIR)
+            .join(format!("{}.json", txn_uuid).as_str()))
+    }
+
+    async fn load_transaction_alteration(
+        &self,
+        table_uri: &str,
+        txn_uuid: &str,
+    ) -> Result<Option<TransactionAlteration>> {
+        let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
+        match self.object_store.inner.get(&path).await {
+            Ok(get_result) => {
+                let bytes = get_result.bytes().await.map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to read alter_transaction sidecar for '{}': {}",
+                            txn_uuid, e
+                        ),
+                    })
+                })?;
+                let alteration: TransactionAlteration =
+                    serde_json::from_slice(&bytes).map_err(|e| {
+                        lance_core::Error::from(NamespaceError::Internal {
+                            message: format!(
+                                "Failed to parse alter_transaction sidecar for '{}': {}",
+                                txn_uuid, e
+                            ),
+                        })
+                    })?;
+                Ok(Some(alteration))
+            }
+            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to load alter_transaction sidecar for '{}': {}",
+                    txn_uuid, e
+                ),
+            })
+            .into()),
+        }
+    }
+
+    async fn save_transaction_alteration(
+        &self,
+        table_uri: &str,
+        txn_uuid: &str,
+        alteration: &TransactionAlteration,
+    ) -> Result<()> {
+        let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
+        let bytes = serde_json::to_vec(alteration).map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to serialize alter_transaction sidecar for '{}': {}",
+                    txn_uuid, e
+                ),
+            })
+        })?;
+        self.object_store
+            .inner
+            .put(&path, bytes.into())
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to persist alter_transaction sidecar for '{}': {}",
+                        txn_uuid, e
+                    ),
+                })
+            })?;
+        Ok(())
     }
 
     fn table_full_uri(&self, table_name: &str) -> String {
@@ -3762,7 +3882,13 @@ impl LanceNamespace for DirectoryNamespace {
             .await?;
         let (version, transaction) = self.find_transaction(&dataset, &id).await?;
 
-        Ok(Self::transaction_response(version, &transaction))
+        // Merge any persisted alter_transaction changes stored in the sidecar
+        // so that describe_transaction reflects the latest altered state.
+        let sidecar = self
+            .load_transaction_alteration(&table_uri, &transaction.uuid)
+            .await?;
+
+        Ok(Self::transaction_response(version, &transaction, sidecar))
     }
 
     async fn alter_transaction(
@@ -3796,28 +3922,19 @@ impl LanceNamespace for DirectoryNamespace {
             .await?;
         let (version, transaction) = self.find_transaction(&dataset, &txn_id).await?;
 
-        // Collect current transaction properties
-        let mut properties = transaction
-            .transaction_properties
-            .as_ref()
-            .map(|props| (**props).clone())
-            .unwrap_or_default();
-        properties.insert("uuid".to_string(), transaction.uuid.clone());
-        properties.insert("version".to_string(), version.to_string());
-        properties.insert(
-            "read_version".to_string(),
-            transaction.read_version.to_string(),
-        );
-        properties.insert(
-            "operation".to_string(),
-            Self::transaction_operation_name(&transaction),
-        );
-        if let Some(tag) = &transaction.tag {
-            properties.insert("tag".to_string(), tag.clone());
-        }
+        // Reserved keys are derived from the immutable Transaction metadata and
+        // must not be modified via alter_transaction. They are only surfaced in
+        // the response for the caller's convenience.
+        const RESERVED_KEYS: &[&str] = &["uuid", "version", "read_version", "operation", "tag"];
+        let is_reserved = |key: &str| RESERVED_KEYS.iter().any(|k| *k == key);
 
-        // Process each action in the request
-        let mut final_status = "SUCCEEDED".to_string();
+        // Load the existing sidecar (if any) so alterations accumulate across
+        // successive alter_transaction calls.
+        let mut sidecar = self
+            .load_transaction_alteration(&table_uri, &transaction.uuid)
+            .await?
+            .unwrap_or_default();
+
         for action in &request.actions {
             if let Some(ref set_status) = action.set_status_action
                 && let Some(ref status) = set_status.status
@@ -3826,7 +3943,7 @@ impl LanceNamespace for DirectoryNamespace {
                 let normalized = status.to_lowercase().replace('_', "");
                 match normalized.as_str() {
                     "queued" | "running" | "succeeded" | "failed" | "canceled" => {
-                        final_status = status.clone();
+                        sidecar.status = Some(status.clone());
                     }
                     _ => {
                         return Err(NamespaceError::InvalidInput {
@@ -3843,6 +3960,15 @@ impl LanceNamespace for DirectoryNamespace {
             if let Some(ref set_property) = action.set_property_action
                 && let (Some(key), Some(value)) = (&set_property.key, &set_property.value)
             {
+                if is_reserved(key) {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "Property '{}' is reserved and cannot be modified",
+                            key
+                        ),
+                    }
+                    .into());
+                }
                 let mode = set_property
                     .mode
                     .as_deref()
@@ -3850,10 +3976,17 @@ impl LanceNamespace for DirectoryNamespace {
                     .to_lowercase();
                 match mode.as_str() {
                     "overwrite" => {
-                        properties.insert(key.clone(), value.clone());
+                        sidecar.properties.insert(key.clone(), value.clone());
                     }
                     "fail" => {
-                        if properties.contains_key(key) {
+                        // Consider both the immutable transaction properties
+                        // and any values previously written to the sidecar.
+                        let exists = sidecar.properties.contains_key(key)
+                            || transaction
+                                .transaction_properties
+                                .as_ref()
+                                .is_some_and(|props| props.contains_key(key));
+                        if exists {
                             return Err(NamespaceError::ConcurrentModification {
                                 message: format!(
                                     "Property '{}' already exists and mode is 'Fail'",
@@ -3862,11 +3995,16 @@ impl LanceNamespace for DirectoryNamespace {
                             }
                             .into());
                         }
-                        properties.insert(key.clone(), value.clone());
+                        sidecar.properties.insert(key.clone(), value.clone());
                     }
                     "skip" => {
-                        if !properties.contains_key(key) {
-                            properties.insert(key.clone(), value.clone());
+                        let exists = sidecar.properties.contains_key(key)
+                            || transaction
+                                .transaction_properties
+                                .as_ref()
+                                .is_some_and(|props| props.contains_key(key));
+                        if !exists {
+                            sidecar.properties.insert(key.clone(), value.clone());
                         }
                     }
                     _ => {
@@ -3884,17 +4022,35 @@ impl LanceNamespace for DirectoryNamespace {
             if let Some(ref unset_property) = action.unset_property_action
                 && let Some(ref key) = unset_property.key
             {
+                if is_reserved(key) {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "Property '{}' is reserved and cannot be modified",
+                            key
+                        ),
+                    }
+                    .into());
+                }
                 let mode = unset_property
                     .mode
                     .as_deref()
                     .unwrap_or("Skip")
                     .to_lowercase();
+                let exists_in_transaction = transaction
+                    .transaction_properties
+                    .as_ref()
+                    .is_some_and(|props| props.contains_key(key));
                 match mode.as_str() {
                     "skip" => {
-                        properties.remove(key);
+                        sidecar.properties.remove(key);
+                        if exists_in_transaction {
+                            // Track a tombstone so describe_transaction can
+                            // hide the immutable property from the response.
+                            sidecar.removed_properties.insert(key.clone());
+                        }
                     }
                     "fail" => {
-                        if !properties.contains_key(key) {
+                        if !sidecar.properties.contains_key(key) && !exists_in_transaction {
                             return Err(NamespaceError::InvalidInput {
                                 message: format!(
                                     "Property '{}' does not exist and mode is 'Fail'",
@@ -3903,7 +4059,10 @@ impl LanceNamespace for DirectoryNamespace {
                             }
                             .into());
                         }
-                        properties.remove(key);
+                        sidecar.properties.remove(key);
+                        if exists_in_transaction {
+                            sidecar.removed_properties.insert(key.clone());
+                        }
                     }
                     _ => {
                         return Err(NamespaceError::InvalidInput {
@@ -3918,9 +4077,22 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
+        // Persist the accumulated alterations so subsequent calls observe
+        // them. The transaction file itself is immutable in Lance, so we
+        // record alter_transaction outcomes in a namespace-owned sidecar.
+        self.save_transaction_alteration(&table_uri, &transaction.uuid, &sidecar)
+            .await?;
+
+        // Assemble the response by merging the immutable transaction metadata
+        // with the persisted alterations.
+        let final_status = sidecar
+            .status
+            .clone()
+            .unwrap_or_else(|| "SUCCEEDED".to_string());
+        let response = Self::transaction_response(version, &transaction, Some(sidecar));
         Ok(AlterTransactionResponse {
             status: final_status,
-            properties: Some(properties),
+            properties: response.properties,
         })
     }
 
@@ -13376,5 +13548,74 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_persists_changes() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+            AlterTransactionSetStatus, DescribeTransactionRequest,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        let txn_id = transaction_id.expect("scalar index should produce a transaction id");
+
+        // Alter status and set a custom property.
+        namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![
+                    AlterTransactionAction {
+                        set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                            status: Some("Canceled".to_string()),
+                        })),
+                        set_property_action: None,
+                        unset_property_action: None,
+                    },
+                    AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                            key: Some("owner".to_string()),
+                            value: Some("alice".to_string()),
+                            mode: None,
+                        })),
+                        unset_property_action: None,
+                    },
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The changes must survive across a fresh describe_transaction call,
+        // proving the alteration was persisted to the transaction file.
+        let describe_resp = namespace
+            .describe_transaction(DescribeTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let props = describe_resp.properties.expect("properties should be set");
+        assert_eq!(props.get("owner"), Some(&"alice".to_string()));
+        // The internal `_status` marker should not leak into the response but
+        // must be present on disk so subsequent alter_transaction calls can
+        // observe the previously set status.
+        assert!(!props.contains_key("_status"));
+
+        let follow_up = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(follow_up.status, "Canceled");
+        let follow_up_props = follow_up.properties.unwrap();
+        assert_eq!(follow_up_props.get("owner"), Some(&"alice".to_string()));
     }
 }
