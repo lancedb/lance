@@ -466,10 +466,14 @@ mod tests {
             let total_inner = num_rows * inner_per_row;
             let total_values = total_inner * inner_len;
             let values = Float32Array::from(
-                (0..total_values).map(|i| (start_row + i) as f32).collect::<Vec<_>>(),
+                (0..total_values)
+                    .map(|i| (start_row + i) as f32)
+                    .collect::<Vec<_>>(),
             );
             let inner_offsets = ScalarBuffer::<i32>::from(
-                (0..=total_inner).map(|i| (i * inner_len) as i32).collect::<Vec<_>>(),
+                (0..=total_inner)
+                    .map(|i| (i * inner_len) as i32)
+                    .collect::<Vec<_>>(),
             );
             let inner_list = ListArray::new(
                 Arc::new(Field::new("item", DataType::Float32, true)),
@@ -478,7 +482,9 @@ mod tests {
                 None,
             );
             let outer_offsets = ScalarBuffer::<i32>::from(
-                (0..=num_rows).map(|i| (i * inner_per_row) as i32).collect::<Vec<_>>(),
+                (0..=num_rows)
+                    .map(|i| (i * inner_per_row) as i32)
+                    .collect::<Vec<_>>(),
             );
             Arc::new(ListArray::new(
                 Arc::new(Field::new(
