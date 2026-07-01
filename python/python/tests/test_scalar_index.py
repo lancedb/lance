@@ -2165,6 +2165,87 @@ def test_zonemap_zone_size(tmp_path: Path):
     assert small_bytes_read < large_bytes_read
 
 
+@pytest.mark.parametrize("index_type", ["ZONEMAP", "BLOOMFILTER"])
+def test_address_domain_index_with_stable_row_ids(tmp_path: Path, index_type):
+    """Regression test for issue #7434.
+
+    Address-domain scalar indices (zonemap, bloom filter) report matches as
+    physical row addresses. On a stable-row-id dataset a row's stable id differs
+    from its physical address in every fragment except fragment 0, so the index
+    result must be translated back to the row-id domain before it prefilters the
+    scan. Without that translation the index silently drops matching rows in
+    fragments other than fragment 0 (often returning an empty result).
+    """
+
+    # A single value "a" is placed in non-adjacent fragments (0, 2, 4) so its
+    # matching rows span multiple fragments and diverge from fragment 0.
+    def block(v, n):
+        return [v] * n
+
+    vals = (
+        block("a", 5_000)
+        + block("b", 5_000)
+        + block("a", 5_000)
+        + block("c", 5_000)
+        + block("a", 5_000)
+    )
+    tbl = pa.table({"category": pa.array(vals, pa.string()), "id": range(len(vals))})
+    ds = lance.write_dataset(
+        tbl, tmp_path, max_rows_per_file=5_000, enable_stable_row_ids=True
+    )
+    assert ds.has_stable_row_ids
+    assert len(ds.get_fragments()) == 5
+
+    true_count = ds.scanner(
+        filter="category = 'a'", use_scalar_index=False
+    ).count_rows()
+    assert true_count == 15_000
+
+    ds.create_scalar_index("category", index_type=index_type, replace=True)
+
+    # The index must be consulted and must return the same rows as a full scan.
+    assert "ScalarIndexQuery" in ds.scanner(filter="category = 'a'").explain_plan()
+    indexed = ds.to_table(filter="category = 'a'", columns=["id"])
+    assert indexed.num_rows == true_count
+    assert sorted(indexed["id"].to_pylist()) == sorted(
+        ds.to_table(filter="category = 'a'", columns=["id"], use_scalar_index=False)[
+            "id"
+        ].to_pylist()
+    )
+
+
+def test_zonemap_with_stable_row_ids_after_compaction(tmp_path: Path):
+    """Zonemap results stay correct after a compaction relocates rows under
+    stable row ids (physical address != stable id for the surviving rows)."""
+    ds = lance.write_dataset(
+        pa.table({"x": range(0, 5_000)}),
+        tmp_path,
+        max_rows_per_file=5_000,
+        enable_stable_row_ids=True,
+    )
+    ds = lance.write_dataset(
+        pa.table({"x": range(5_000, 10_000)}),
+        tmp_path,
+        mode="append",
+        max_rows_per_file=5_000,
+        enable_stable_row_ids=True,
+    )
+    # Delete part of the first fragment, then compact so surviving rows keep
+    # their small stable ids but move to a freshly numbered fragment.
+    ds.delete("x >= 1000 AND x < 2000")
+    ds.optimize.compact_files(target_rows_per_fragment=100_000)
+    ds = lance.dataset(tmp_path)
+    assert len(ds.get_fragments()) == 1
+
+    ds.create_scalar_index("x", index_type="ZONEMAP")
+
+    filter_expr = "x >= 6000 AND x <= 6500"
+    assert "ScalarIndexQuery" in ds.scanner(filter=filter_expr).explain_plan()
+    expected = ds.to_table(filter=filter_expr, use_scalar_index=False)["x"].to_pylist()
+    actual = ds.to_table(filter=filter_expr)["x"].to_pylist()
+    assert sorted(actual) == sorted(expected) == list(range(6000, 6501))
+
+
 def test_zonemap_deletion_handling(tmp_path: Path):
     """Test zonemap deletion handling"""
     data = pa.table(

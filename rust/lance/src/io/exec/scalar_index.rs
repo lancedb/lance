@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
-    dataset::rowids::load_row_id_sequences,
+    dataset::rowids::{load_row_id_sequence, load_row_id_sequences},
     index::{
         prefilter::DatasetPreFilter,
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
@@ -42,7 +42,8 @@ use lance_index::{
     },
 };
 use lance_select::{
-    IndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
+    RowAddrSelection, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -58,6 +59,111 @@ impl ScalarIndexLoader for Dataset {
     ) -> Result<Arc<dyn ScalarIndex>> {
         open_named_scalar_index(self, column, index_name, metrics).await
     }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        // Addresses and row ids only diverge under stable row ids; otherwise the
+        // address is the row id and there is nothing to translate.
+        if !self.manifest.uses_stable_row_ids() {
+            return Ok(result);
+        }
+
+        let NullableIndexExprResult { lower, upper, .. } = result;
+        let lower = translate_addr_mask_to_row_ids(self, lower).await?;
+        let upper = translate_addr_mask_to_row_ids(self, upper).await?;
+        Ok(NullableIndexExprResult::new(lower, upper))
+    }
+}
+
+/// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
+///
+/// Address-domain index results are always positive allow-lists (`AtMost`), so
+/// a block-list here would mean a boolean op was applied before translation,
+/// which is unsupported.
+async fn translate_addr_mask_to_row_ids(
+    dataset: &Dataset,
+    mask: NullableRowAddrMask,
+) -> Result<NullableRowAddrMask> {
+    match mask {
+        NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
+            translate_addr_set_to_row_ids(dataset, set).await?,
+        )),
+        NullableRowAddrMask::BlockList(_) => Err(Error::internal(
+            "cannot translate a block-list address mask to the row-id domain",
+        )),
+    }
+}
+
+async fn translate_addr_set_to_row_ids(
+    dataset: &Dataset,
+    set: NullableRowAddrSet,
+) -> Result<NullableRowAddrSet> {
+    let selected = translate_addr_treemap_to_row_ids(dataset, set.selected_rows()).await?;
+    let nulls = translate_addr_treemap_to_row_ids(dataset, set.null_rows()).await?;
+    Ok(NullableRowAddrSet::new(selected, nulls))
+}
+
+/// Map a set of physical row addresses to their stable row ids
+///
+/// For each fragment present in `addrs`, the live rows in physical order carry
+/// the stable ids yielded by the fragment's [`RowIdSequence`] in the same
+/// order. Zipping the two (skipping deleted physical offsets) gives the
+/// `physical offset -> stable id` mapping. Addresses that point at deleted rows
+/// have no live counterpart and are dropped, which is correct: those rows are
+/// not part of the answer.
+async fn translate_addr_treemap_to_row_ids(
+    dataset: &Dataset,
+    addrs: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let mut row_ids = RowAddrTreeMap::new();
+    for (fragment_id, selection) in addrs.iter() {
+        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
+            Error::internal(format!(
+                "fragment {fragment_id} referenced by an address-domain index result \
+                 was not found in the dataset"
+            ))
+        })?;
+        let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
+
+        match selection {
+            RowAddrSelection::Full => {
+                // The whole fragment is selected: every live row's id qualifies.
+                for id in sequence.iter() {
+                    row_ids.insert(id);
+                }
+            }
+            RowAddrSelection::Partial(offsets) => {
+                let Some(max_offset) = offsets.max() else {
+                    continue;
+                };
+                let deletion_vector = file_fragment.get_deletion_vector().await?;
+                let num_physical_rows = file_fragment.physical_rows().await? as u32;
+                let mut ids = sequence.iter();
+                for physical_offset in 0..num_physical_rows {
+                    if physical_offset > max_offset {
+                        break;
+                    }
+                    let deleted = deletion_vector
+                        .as_ref()
+                        .is_some_and(|dv| dv.contains(physical_offset));
+                    if deleted {
+                        continue;
+                    }
+                    match ids.next() {
+                        Some(id) => {
+                            if offsets.contains(physical_offset) {
+                                row_ids.insert(id);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    Ok(row_ids)
 }
 
 /// An execution node that performs a scalar index search
