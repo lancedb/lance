@@ -1798,11 +1798,14 @@ mod tests {
 
         // Folded straight from the ZoneMap summaries: global [0, 9].
         assert_eq!(
-            ds.column_value_range("id").await.unwrap(),
+            ds.statistics().column_value_range("id").await.unwrap(),
             Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
         );
         // `other` has no ZoneMap index -> no precomputed range.
-        assert_eq!(ds.column_value_range("other").await.unwrap(), None);
+        assert_eq!(
+            ds.statistics().column_value_range("other").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1823,7 +1826,13 @@ mod tests {
         ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
             .await
             .unwrap();
-        assert!(ds.column_value_range("id").await.unwrap().is_some());
+        assert!(
+            ds.statistics()
+                .column_value_range("id")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // Append a fragment the index doesn't cover. Its rows may hold values
         // outside the indexed range, so any non-None range would be a subset
@@ -1833,7 +1842,10 @@ mod tests {
             .into_reader_rows(RowCount::from(5), BatchCount::from(1));
         ds.append(reader, None).await.unwrap();
 
-        assert_eq!(ds.column_value_range("id").await.unwrap(), None);
+        assert_eq!(
+            ds.statistics().column_value_range("id").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1873,7 +1885,7 @@ mod tests {
         // spans both and yields the global range, not None.
         assert_eq!(ds.load_indices_by_name("id_idx").await.unwrap().len(), 2);
         assert_eq!(
-            ds.column_value_range("id").await.unwrap(),
+            ds.statistics().column_value_range("id").await.unwrap(),
             Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
         );
     }

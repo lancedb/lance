@@ -100,6 +100,7 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
+use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
@@ -451,6 +452,12 @@ impl Dataset {
 
     pub fn tags(&self) -> Tags<'_> {
         self.refs.tags()
+    }
+
+    /// A handle for cheap, index-derived statistics about this dataset (e.g. a
+    /// column's global value range) that never scan data.
+    pub fn statistics(&self) -> DatasetStatistics<'_> {
+        DatasetStatistics::new(self)
     }
 
     pub fn branches(&self) -> Branches<'_> {
