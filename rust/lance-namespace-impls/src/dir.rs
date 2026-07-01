@@ -3962,10 +3962,7 @@ impl LanceNamespace for DirectoryNamespace {
             {
                 if is_reserved(key) {
                     return Err(NamespaceError::InvalidInput {
-                        message: format!(
-                            "Property '{}' is reserved and cannot be modified",
-                            key
-                        ),
+                        message: format!("Property '{}' is reserved and cannot be modified", key),
                     }
                     .into());
                 }
@@ -4024,10 +4021,7 @@ impl LanceNamespace for DirectoryNamespace {
             {
                 if is_reserved(key) {
                     return Err(NamespaceError::InvalidInput {
-                        message: format!(
-                            "Property '{}' is reserved and cannot be modified",
-                            key
-                        ),
+                        message: format!("Property '{}' is reserved and cannot be modified", key),
                     }
                     .into());
                 }
