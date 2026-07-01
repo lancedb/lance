@@ -92,7 +92,8 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::io::exec::filtered_read::{
-    FilteredReadExec, FilteredReadOptions, ScanSchedulerDiagnosticsCallback,
+    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
+    ScanSchedulerDiagnosticsCallback, high_bandwidth_scan_parallelism_target,
 };
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
@@ -2078,6 +2079,7 @@ impl Scanner {
                 plan,
                 LanceExecutionOptions {
                     batch_size: self.batch_size,
+                    target_partition: Some(self.execution_target_parallelism()),
                     execution_stats_callback: self.scan_stats_callback.clone(),
                     ..Default::default()
                 },
@@ -2096,6 +2098,9 @@ impl Scanner {
         if options.execution_stats_callback.is_none() {
             options.execution_stats_callback = self.scan_stats_callback.clone();
         }
+        if options.target_partition.is_none() {
+            options.target_partition = Some(self.execution_target_parallelism());
+        }
 
         execute_plan(plan, options)
     }
@@ -2103,6 +2108,7 @@ impl Scanner {
     pub(crate) fn execution_options(&self) -> LanceExecutionOptions {
         LanceExecutionOptions {
             batch_size: self.batch_size,
+            target_partition: Some(self.execution_target_parallelism()),
             execution_stats_callback: self.scan_stats_callback.clone(),
             ..Default::default()
         }
@@ -2668,9 +2674,7 @@ impl Scanner {
 
             let optimizer = get_physical_optimizer();
             let mut options = ConfigOptions::default();
-            options.execution.target_partitions = self
-                .target_parallelism
-                .unwrap_or_else(get_num_compute_intensive_cpus);
+            options.execution.target_partitions = self.execution_target_parallelism();
             for rule in optimizer.rules {
                 plan = rule.optimize(plan, &options)?;
             }
@@ -2735,9 +2739,7 @@ impl Scanner {
 
         let optimizer = get_physical_optimizer();
         let mut options = ConfigOptions::default();
-        options.execution.target_partitions = self
-            .target_parallelism
-            .unwrap_or_else(get_num_compute_intensive_cpus);
+        options.execution.target_partitions = self.execution_target_parallelism();
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -2893,7 +2895,10 @@ impl Scanner {
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
             .with_projection(projection)
-            .with_ordered_output(ordered_output);
+            .with_ordered_output(ordered_output)
+            .with_threading_mode(FilteredReadThreadingMode::OnePartitionMultipleThreads(
+                self.batch_readahead.max(1),
+            ));
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
@@ -4258,6 +4263,23 @@ impl Scanner {
 
     fn get_io_buffer_size(&self) -> u64 {
         self.io_buffer_size.unwrap_or(*DEFAULT_IO_BUFFER_SIZE)
+    }
+
+    fn execution_target_parallelism(&self) -> usize {
+        if let Some(target_parallelism) = self.target_parallelism {
+            return target_parallelism.max(1);
+        }
+
+        let base_parallelism = self.batch_readahead.max(1);
+        if self.dataset.object_store.is_cloud()
+            && !self.ordered
+            && self.ordering.is_none()
+            && self.nearest.is_none()
+        {
+            high_bandwidth_scan_parallelism_target(base_parallelism)
+        } else {
+            base_parallelism
+        }
     }
 
     /// Create an Execution plan with a scan node
@@ -12439,6 +12461,27 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert!(!filtered.options().ordered_output);
+    }
+
+    #[tokio::test]
+    async fn test_batch_readahead_propagated_to_filtered_read_threading() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_batch_readahead_threading", None)
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.batch_readahead(17);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(
+            filtered.options().threading_mode,
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(17)
+        );
+        assert_eq!(scanner.execution_options().target_partition, Some(17));
     }
 
     // The env var key scopes serial_test's lock so this test only blocks others
