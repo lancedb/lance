@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
 use arrow_array::cast::AsArray;
@@ -219,7 +218,7 @@ impl ExecutionPlan for LancePushdownScanExec {
             )
             .await?;
 
-            frag_scanner.scan().await
+            frag_scanner.scan()
         });
 
         let batch_stream = batch_stream
@@ -326,7 +325,7 @@ impl FragmentScanner {
         })
     }
 
-    pub async fn scan(self) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
+    pub fn scan(self) -> Result<impl Stream<Item = Result<RecordBatch>> + 'static + Send> {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;

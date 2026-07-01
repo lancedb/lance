@@ -375,11 +375,15 @@ pub(super) async fn add_columns_to_fragments(
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
 
-            // Check that the schema is compatible considering all the new columns must be nullable
-            let schema = Schema::try_from(output_schema.as_ref())?;
-            if !schema.all_fields_nullable() {
+            // AllNulls is metadata-only; missing columns are synthesized as nulls at
+            // read time, so only each new top-level column needs to be nullable.
+            if let Some(field) = output_schema.fields().iter().find(|f| !f.is_nullable()) {
                 return Err(Error::invalid_input_source(
-                    "All-null columns must be nullable.".into(),
+                    format!(
+                        "All-null columns must be nullable, but field '{}' is not.",
+                        field.name()
+                    )
+                    .into(),
                 ));
             }
 
@@ -2116,8 +2120,8 @@ mod test {
                 .await
                 .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("All-null columns must be nullable.")
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error: {err}"
         );
 
         let data = dataset.scan().try_into_batch().await?;
@@ -2127,6 +2131,107 @@ mod test {
         ]);
         assert_eq!(data.schema().as_ref(), &expected_schema);
         assert_eq!(data.num_rows(), num_rows as usize);
+
+        Ok(())
+    }
+
+    /// `AllNulls` accepts any nullable top-level column whatever its inner-field
+    /// nullability (Map/List/Struct with non-null children); non-nullable ones are rejected.
+    #[tokio::test]
+    async fn test_add_column_all_nulls_nested() -> Result<()> {
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let map_with_non_null_entries = DataType::Map(
+            Arc::new(ArrowField::new(
+                "entries",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("key", DataType::Utf8, false),
+                    ArrowField::new("value", DataType::Float64, true),
+                ])),
+                false,
+            )),
+            false,
+        );
+        let list_with_non_null_items =
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, false)));
+        let struct_with_non_null_child =
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]));
+
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                    ArrowField::new("cutoffs", map_with_non_null_entries.clone(), true),
+                    ArrowField::new("tags", list_with_non_null_items.clone(), true),
+                    ArrowField::new("info", struct_with_non_null_child.clone(), true),
+                ]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), num_rows as usize);
+        for (name, expected_type) in [
+            ("cutoffs", &map_with_non_null_entries),
+            ("tags", &list_with_non_null_items),
+            ("info", &struct_with_non_null_child),
+        ] {
+            let column = data.column_by_name(name).unwrap();
+            assert_eq!(
+                column.data_type(),
+                expected_type,
+                "type mismatch for {name}"
+            );
+            assert_eq!(
+                column.null_count(),
+                num_rows as usize,
+                "column {name} should be all-null"
+            );
+        }
+
+        // A non-nullable top-level field is still rejected, and the error names it.
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("non_null_cutoffs", map_with_non_null_entries, false),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error: {err}"
+        );
 
         Ok(())
     }

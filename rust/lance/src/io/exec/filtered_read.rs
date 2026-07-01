@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
-use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
@@ -1079,7 +1078,7 @@ impl FilteredReadStream {
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<ReadBatchFut>> + Send>>> {
+    ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
         let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
         if let Some(filter) = &fragment_read_task.filter {
@@ -1159,7 +1158,7 @@ impl FilteredReadStream {
             )))
             .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
 
-        let result: Pin<Box<dyn Stream<Item = Result<ReadBatchFut>> + Send>> =
+        let result: BoxStream<'static, Result<ReadBatchFut>> =
             if let Some(limit) = fragment_soft_limit {
                 Box::pin(Self::apply_soft_limit(fragment_stream, limit))
             } else {

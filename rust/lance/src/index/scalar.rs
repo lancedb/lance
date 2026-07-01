@@ -51,8 +51,8 @@ use lance_index::scalar::registry::{
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
-    ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
-    lance_format::LanceIndexStore,
+    RowIdRemapper, ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME,
+    inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
 };
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
@@ -297,8 +297,13 @@ pub(super) async fn build_scalar_index(
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
 
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
+        Error::invalid_input_source(
+            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
+        )
+    })?;
     let training_request =
-        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+        trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match preprocessed_data {
@@ -317,7 +322,7 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
-    let created_index = plugin
+    let created_index = trainer
         .train_index(
             training_data,
             &index_store,
@@ -354,8 +359,13 @@ pub(super) async fn build_bitmap_index_segment(
 
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
+        Error::invalid_input_source(
+            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
+        )
+    })?;
     let training_request =
-        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+        trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
     let criteria = training_request.criteria();
 
     progress.stage_start("load_data", None, "rows").await?;
@@ -364,7 +374,7 @@ pub(super) async fn build_bitmap_index_segment(
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
-    plugin
+    trainer
         .train_index(
             training_data,
             &index_store,
@@ -448,6 +458,9 @@ pub async fn open_scalar_index(
     let index_cache = dataset
         .index_cache
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
+
+    let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
+        frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
 
     if let Some(index) = plugin
         .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)

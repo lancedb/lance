@@ -21,6 +21,7 @@ use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, RO
 use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
+    validate_projection_names,
 };
 use crate::session::Session;
 
@@ -103,7 +104,8 @@ impl LsmScanPlanner {
     }
 
     /// Set the over-fetch multiple for the per-source limit pushdown
-    /// (see the field docs). Clamped to `>= 1.0` at use.
+    /// (see the field docs). Values below `1.0` are rejected by
+    /// [`Self::plan_scan`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = factor;
         self
@@ -148,9 +150,11 @@ impl LsmScanPlanner {
             .map(|p| p.iter().any(|c| c == ROW_ADDRESS_COLUMN))
             .unwrap_or(false);
         let keep_row_address = keep_row_address || user_wants_rowaddr;
+        validate_projection_names(projection, &self.base_schema, &[])?;
 
         // 1. Collect all data sources
         let sources = self.collector.collect()?;
+        let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
             // Return empty plan
@@ -182,7 +186,6 @@ impl LsmScanPlanner {
         // is in-memory and within-gen append duplicates are resolved by its
         // own dedup, so it is never capped here.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
-        let overfetch = self.overfetch_factor.max(1.0);
 
         let mut source_plans = Vec::new();
         for source in sources {
@@ -192,7 +195,7 @@ impl LsmScanPlanner {
                 .get(&(source.shard_id(), source.generation()))
                 .cloned();
             let fetch = match (n_needed, is_active) {
-                (Some(n), false) => Some(if blocked.is_some() {
+                (Some(n), false) => Some(if blocked.is_some() && !self.pk_columns.is_empty() {
                     ((n as f64) * overfetch).ceil() as usize
                 } else {
                     n
@@ -207,13 +210,14 @@ impl LsmScanPlanner {
             // With a limit, `k = n_needed` arms the under-fetch warning; with
             // no limit `k = 0` keeps it silent.
             let scan = match blocked {
-                Some(set) => Arc::new(PkBlockFilterExec::new(
+                Some(set) if !self.pk_columns.is_empty() => Arc::new(PkBlockFilterExec::new(
                     scan,
                     self.pk_columns.clone(),
                     set,
                     n_needed.unwrap_or(0),
-                )) as Arc<dyn ExecutionPlan>,
-                None => scan,
+                ))
+                    as Arc<dyn ExecutionPlan>,
+                _ => scan,
             };
 
             // Post-block-list cap: each source contributes at most `n_needed`
@@ -261,9 +265,9 @@ impl LsmScanPlanner {
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
         )?;
 
-        // 6. Add limit if specified
-        if let Some(limit) = limit {
-            plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), Some(limit)));
+        // 6. Add limit / offset if specified
+        if limit.is_some() || offset.unwrap_or(0) > 0 {
+            plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), limit));
         }
 
         Ok(plan)
@@ -386,7 +390,7 @@ impl LsmScanPlanner {
 
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
                 // The dedup scan applies the filter post-dedup; pushing it
@@ -939,8 +943,9 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         // Create scanner with projection (only id column)
-        let mut scanner =
-            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&["id"]);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -970,7 +975,9 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         // Create scanner with limit
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).limit(3, None);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .limit(Some(3), None)
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -987,6 +994,35 @@ mod integration_tests {
         // Count total rows
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows due to limit");
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_with_offset_without_limit() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .limit(Some(3), None)
+            .unwrap()
+            .limit(None, Some(2))
+            .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 5,
+            "offset-only scan should skip 2 rows from the 7-row deduped result"
+        );
     }
 
     #[tokio::test]
@@ -1742,13 +1778,9 @@ mod integration_tests {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&[
-            "id",
-            "_rowoffset",
-            "name",
-            "_rowaddr",
-            "_rowid",
-        ]);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id", "_rowoffset", "name", "_rowaddr", "_rowid"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -1838,7 +1870,8 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
-            .project(&["id", "_rowid", "name"]);
+            .project(&["id", "_rowid", "name"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -1901,7 +1934,8 @@ mod integration_tests {
 
         let scanner =
             LsmScanner::without_base_table(schema, base_uri, vec![], vec!["id".to_string()])
-                .project(&["id", "_rowaddr", "name", "_rowid"]);
+                .project(&["id", "_rowaddr", "name", "_rowid"])
+                .unwrap();
         let plan = scanner.create_plan().await.unwrap();
 
         let names: Vec<String> = plan
@@ -2126,7 +2160,8 @@ mod integration_tests {
             vec![shard_snapshot],
             vec!["id".to_string()],
         )
-        .limit(2, None);
+        .limit(Some(2), None)
+        .unwrap();
         let batches: Vec<RecordBatch> = scanner
             .try_into_stream()
             .await

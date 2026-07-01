@@ -69,14 +69,14 @@ use super::{
     builder::{InnerBuilder, PositionRecorder},
     iter::CompressedPostingListIterator,
 };
-use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
-    OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
+    OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery,
+    UpdateCriteria,
 };
 use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -978,7 +978,7 @@ impl InvertedIndex {
 
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
@@ -1047,7 +1047,7 @@ impl InvertedIndex {
 
     pub async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -1440,7 +1440,7 @@ impl InvertedPartition {
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
@@ -5132,7 +5132,7 @@ impl DocSet {
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -5164,7 +5164,7 @@ impl DocSet {
         row_id_col: &UInt64Array,
         num_tokens_col: &arrow_array::UInt32Array,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         // for legacy format, the row id is doc id; sorting keeps binary search viable
         if is_legacy {
