@@ -54,8 +54,7 @@ use crate::Dataset;
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
-    BATCH_SIZE_FALLBACK, LEGACY_DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
-    get_default_io_buffer_size_override,
+    BATCH_SIZE_FALLBACK, get_default_batch_size, get_default_io_buffer_size_override,
 };
 
 use super::utils::IoMetrics;
@@ -124,7 +123,7 @@ fn default_fragment_readahead_for_scan(
     if is_high_bandwidth_candidate {
         scan_io_parallelism.max(1)
     } else {
-        LEGACY_DEFAULT_FRAGMENT_READAHEAD
+        scan_io_parallelism.saturating_mul(2).max(1)
     }
 }
 
@@ -2479,6 +2478,12 @@ mod tests {
             effective_high_bandwidth_scan_row_count(100, Some(&(10..1_000))),
             100
         );
+    }
+
+    #[test]
+    fn test_default_fragment_readahead_preserves_non_high_bandwidth_fallback() {
+        assert_eq!(default_fragment_readahead_for_scan(false, 128), 256);
+        assert_eq!(default_fragment_readahead_for_scan(true, 128), 128);
     }
 
     #[test]
