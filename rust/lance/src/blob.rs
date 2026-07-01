@@ -218,7 +218,14 @@ fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField>
         let arrow_field = Field::from(field);
         if is_prepared_blob_v2_field(&arrow_field) {
             let mut normalized = field.clone();
-            normalized.children = logical_blob_lance_children()?;
+            let mut logical_children = logical_blob_lance_children()?;
+            for (logical_child, prepared_child) in
+                logical_children.iter_mut().zip(field.children.iter())
+            {
+                logical_child.id = prepared_child.id;
+                logical_child.parent_id = field.id;
+            }
+            normalized.children = logical_children;
             return Ok(normalized);
         }
         if is_logical_blob_v2_field(&arrow_field) {
@@ -1348,6 +1355,8 @@ mod tests {
         assert_eq!(normalized.fields[1].children.len(), 2);
         assert_eq!(normalized.fields[1].children[0].name, "data");
         assert_eq!(normalized.fields[1].children[1].name, "uri");
+        assert!(normalized.fields[1].children[0].id >= 0);
+        assert!(normalized.fields[1].children[1].id >= 0);
     }
 
     #[tokio::test]
