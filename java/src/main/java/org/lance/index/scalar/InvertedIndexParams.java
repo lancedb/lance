@@ -54,6 +54,7 @@ public final class InvertedIndexParams {
     private Integer maxNgramLength;
     private Boolean prefixOnly;
     private Boolean skipMerge;
+    private Integer formatVersion;
 
     /**
      * Configure the base tokenizer.
@@ -238,6 +239,23 @@ public final class InvertedIndexParams {
       return this;
     }
 
+    /**
+     * Configure the on-disk FTS format version to write when creating a new index.
+     *
+     * <p>If unset, Lance chooses the current default format.
+     *
+     * @param formatVersion FTS format version, must be 1 or 2
+     * @return this builder
+     * @throws IllegalArgumentException
+     */
+    public Builder formatVersion(int formatVersion) {
+      if (formatVersion != 1 && formatVersion != 2) {
+        throw new IllegalArgumentException("formatVersion must be 1 or 2");
+      }
+      this.formatVersion = formatVersion;
+      return this;
+    }
+
     /** Build a {@link ScalarIndexParams} instance for an inverted index. */
     public ScalarIndexParams build() {
       Map<String, Object> params = new HashMap<>();
@@ -284,6 +302,9 @@ public final class InvertedIndexParams {
       }
       if (skipMerge != null) {
         params.put("skip_merge", skipMerge);
+      }
+      if (formatVersion != null) {
+        params.put("format_version", formatVersion);
       }
 
       String json = JsonUtils.toJson(params);

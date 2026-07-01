@@ -15,6 +15,7 @@ dataset via an LSM-tree structure.  Data flows through three levels:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Union
 
@@ -337,7 +338,9 @@ class LsmScanner:
         self._raw = self._raw.filter(expr)
         return self
 
-    def limit(self, n: int, offset: Optional[int] = None) -> "LsmScanner":
+    def limit(
+        self, n: Optional[int] = None, offset: Optional[int] = None
+    ) -> "LsmScanner":
         """Limit rows returned, optionally with an offset."""
         self._raw = self._raw.limit(n, offset)
         return self
@@ -489,6 +492,9 @@ class LsmVectorSearchPlanner:
     distance_type : str, optional
         Distance metric — one of ``"l2"`` (default), ``"cosine"``,
         ``"dot"``, ``"hamming"``.
+    filter : str, optional
+        SQL predicate applied as a prefilter to every LSM source before vector
+        candidate selection.
 
     Examples
     --------
@@ -506,12 +512,15 @@ class LsmVectorSearchPlanner:
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
         distance_type: Optional[str] = None,
+        filter: Optional[str] = None,
     ) -> None:
         kwargs = {}
         if pk_columns is not None:
             kwargs["pk_columns"] = pk_columns
         if distance_type is not None:
             kwargs["distance_type"] = distance_type
+        if filter is not None:
+            kwargs["filter"] = filter
         self._raw = _LsmVectorSearchPlanner(
             dataset._ds,
             [s._raw for s in shard_snapshots],
@@ -547,22 +556,11 @@ class LsmVectorSearchPlanner:
             IVF-PQ).  Memtable arms use exact HNSW and are unaffected.
             Auto-enabled whenever stale filtering is on (see ``overfetch_factor``).
         overfetch_factor : float, optional
-            Single knob controlling **both** stale-read filtering and over-fetch
-            (default: ``1.0``):
-
-            - ``< 1.0`` (e.g. ``0.0``): stale filtering **off**.  Rows superseded
-              by a newer generation may surface.  (The global primary-key dedup
-              still runs, so it suppresses stale copies whenever both the stale
-              and the fresh row reach it.)
-            - ``== 1.0``: filtering **on**, no over-fetch.  Each source with
-              superseded rows fetches exactly ``k`` candidates and drops the stale
-              ones, so it may return fewer than ``k`` live rows.
-            - ``> 1.0``: filtering **on**, with over-fetch.  Such a source fetches
-              ``ceil(k * overfetch_factor)`` candidates so dropping the stale ones
-              still leaves ``k`` live rows.
-
-            There is no separate on/off flag: over-fetch is only meaningful while
-            filtering, so the factor encodes both.
+            Over-fetch multiple for sources with rows superseded by newer
+            generations. Must be at least ``1.0``. At ``1.0`` each affected
+            source fetches exactly ``k`` candidates; above ``1.0`` it fetches
+            ``ceil(k * overfetch_factor)`` candidates so dropping stale rows is
+            less likely to under-fill the result.
 
         Returns
         -------
@@ -570,6 +568,14 @@ class LsmVectorSearchPlanner:
             Physical plan for the vector search. Execute it via
             `to_table`, `to_reader`, or `to_batches`.
         """
+        if k <= 0:
+            raise ValueError(f"k must be positive, got {k}")
+        if nprobes <= 0:
+            raise ValueError(f"nprobes must be positive, got {nprobes}")
+        if not math.isfinite(overfetch_factor) or overfetch_factor < 1.0:
+            raise ValueError(
+                f"overfetch_factor must be finite and >= 1.0, got {overfetch_factor}"
+            )
         return ExecutionPlan(
             self._raw.plan_search(
                 query,

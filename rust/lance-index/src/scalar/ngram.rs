@@ -15,15 +15,14 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, VALUE_COLUMN_NAME,
 };
-use crate::scalar::{CreatedIndex, UpdateCriteria};
+use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::datatypes::{UInt32Type, UInt64Type};
@@ -186,7 +185,7 @@ impl CacheKey for NGramPostingListKey {
 impl NGramPostingList {
     fn try_from_batch(
         batch: RecordBatch,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
         let mut bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
@@ -213,7 +212,7 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
 }
 
@@ -298,7 +297,7 @@ impl DeepSizeOf for NGramIndex {
 impl NGramIndex {
     async fn from_store(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
@@ -374,7 +373,7 @@ impl NGramIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -967,7 +966,7 @@ impl NGramIndexBuilder {
         Ok(())
     }
 
-    async fn stream_spill_reader(
+    fn stream_spill_reader(
         reader: Arc<dyn IndexReader>,
     ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
         let num_rows = reader.num_rows();
@@ -997,7 +996,7 @@ impl NGramIndexBuilder {
         let reader = spill_store
             .open_index_file(&Self::spill_filename(id))
             .await?;
-        Self::stream_spill_reader(reader).await
+        Self::stream_spill_reader(reader)
     }
 
     fn merge_spill_states(
@@ -1203,7 +1202,7 @@ impl NGramIndexBuilder {
 
         let left_stream = Self::stream_spill(self.spill_store.clone(), new_data_num).await?;
         let old_reader = old_index.open_index_file(POSTINGS_FILENAME).await?;
-        let right_stream = Self::stream_spill_reader(old_reader).await?;
+        let right_stream = Self::stream_spill_reader(old_reader)?;
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 
@@ -1279,11 +1278,7 @@ impl NGramIndexPlugin {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for NGramIndexPlugin {
-    fn name(&self) -> &str {
-        "NGram"
-    }
-
+impl BasicTrainer for NGramIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -1298,29 +1293,6 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
         }
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-        )))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        false
-    }
-
-    fn version(&self) -> u32 {
-        NGRAM_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(TextQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            // needs_recheck: ngram results are an inexact candidate superset.
-            true,
-            // supports_regex: the ngram index can answer regex queries.
-            true,
         )))
     }
 
@@ -1346,12 +1318,46 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             files: vec![file],
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for NGramIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "NGram"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        NGRAM_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(TextQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            // needs_recheck: ngram results are an inexact candidate superset.
+            true,
+            // supports_regex: the ngram index can answer regex queries.
+            true,
+        )))
+    }
 
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(NGramIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)

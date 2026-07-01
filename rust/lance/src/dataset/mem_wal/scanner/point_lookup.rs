@@ -37,7 +37,7 @@ use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_
 use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
-    project_to_canonical, wants_row_address, wants_row_id,
+    project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
 use crate::session::Session;
 
@@ -216,6 +216,7 @@ impl LsmPointLookupPlanner {
         pk_values: &[ScalarValue],
         projection: Option<&[String]>,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        validate_projection_names(projection, &self.base_schema, &[])?;
         if pk_values.len() != self.pk_columns.len() {
             return Err(lance_core::Error::invalid_input(format!(
                 "Expected {} primary key values, got {}",
@@ -676,7 +677,7 @@ impl LsmPointLookupPlanner {
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
                 // Expose `_rowid` (the BatchStore row offset, monotonic with
                 // insert order) so we can pick the most recently inserted
@@ -1336,6 +1337,27 @@ mod tests {
                 "_rowid".to_string(),
             ],
             "empty point-lookup plan must honor user column order including system columns"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_point_lookup_rejects_missing_projection_column() {
+        let schema = create_pk_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
+
+        let projection = vec!["missing".to_string()];
+        let pk_values = vec![ScalarValue::Int32(Some(2))];
+        let err = planner
+            .plan_lookup(&pk_values, Some(&projection))
+            .await
+            .expect_err("unknown projection column should fail planning");
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing-column projection error: {err}"
         );
     }
 
