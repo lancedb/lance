@@ -6299,7 +6299,7 @@ mod shard_writer_tests {
             (0..vector_dim as usize).map(|d| (target_id as f32 * 0.1 + d as f32 * 0.01).sin()),
         );
         let mut scanner = writer.scan().await.unwrap();
-        scanner.nearest("vector", Arc::new(query), 80);
+        scanner.nearest("vector", &query, 80).unwrap();
         let result = scanner.try_into_batch().await.expect("Failed to scan");
 
         assert!(result.num_rows() > 0, "vector query returned no rows");

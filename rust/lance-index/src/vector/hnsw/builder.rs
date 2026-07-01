@@ -1239,17 +1239,23 @@ impl IvfSubIndex for HNSW {
                 // batch verbatim, re-stamped with up-to-date HNSW metadata.
                 // The IVF partition cache re-serializes loaded indices through
                 // here (`ivf/partition_serde.rs`), so this must round-trip.
+                //
+                // Merge into (not replace) the existing schema metadata: a
+                // disk-loaded batch inherits other keys from the index file
+                // schema (e.g. `INDEX_METADATA_SCHEMA_KEY`, `IVF_METADATA_KEY`),
+                // and `RecordBatch::with_schema` requires the new metadata to be
+                // a superset of the current one. Dropping those keys here makes
+                // the new schema a non-superset and fails the round-trip with
+                // "target schema is not superset of current schema".
                 let metadata = serde_json::to_string(&self.metadata())?;
-                let schema =
-                    graph
-                        .batch
-                        .schema()
-                        .as_ref()
-                        .clone()
-                        .with_metadata(HashMap::from_iter(vec![(
-                            HNSW_METADATA_KEY.to_string(),
-                            metadata,
-                        )]));
+                let mut schema_metadata = graph.batch.schema_ref().metadata().clone();
+                schema_metadata.insert(HNSW_METADATA_KEY.to_string(), metadata);
+                let schema = graph
+                    .batch
+                    .schema()
+                    .as_ref()
+                    .clone()
+                    .with_metadata(schema_metadata);
                 return Ok(graph.batch.clone().with_schema(Arc::new(schema))?);
             }
         };
@@ -1754,6 +1760,69 @@ mod tests {
             .search_basic(query, 10, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Regression for the IVF partition-cache round-trip: a disk-loaded batch
+    /// inherits extra schema metadata keys from the index file (e.g.
+    /// `INDEX_METADATA_SCHEMA_KEY`, `IVF_METADATA_KEY`). `to_batch()` on the
+    /// loaded graph must *merge* the HNSW key into that metadata rather than
+    /// replacing it -- otherwise the new schema is not a superset of the
+    /// current one and `RecordBatch::with_schema` fails with "target schema is
+    /// not superset of current schema".
+    #[tokio::test]
+    async fn test_to_batch_loaded_preserves_extra_schema_metadata() {
+        use super::HNSW_METADATA_KEY;
+
+        const DIM: usize = 24;
+        const TOTAL: usize = 512;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(16).ef_construction(50),
+        )
+        .unwrap();
+
+        // Simulate the disk-load path (`ivf/v2.rs::load_partition_entry`):
+        // the batch reaching `HNSW::load` carries the index file's schema
+        // metadata in addition to the HNSW key.
+        let built_batch = builder.to_batch().unwrap();
+        let mut metadata = built_batch.schema_ref().metadata().clone();
+        metadata.insert(
+            "lance:index_metadata".to_string(),
+            "{\"distance_type\":\"l2\"}".to_string(),
+        );
+        metadata.insert("lance:ivf".to_string(), "42".to_string());
+        let schema = built_batch
+            .schema()
+            .as_ref()
+            .clone()
+            .with_metadata(metadata);
+        let batch_with_extra =
+            RecordBatch::try_new(Arc::new(schema), built_batch.columns().to_vec()).unwrap();
+
+        let loaded = HNSW::load(batch_with_extra).unwrap();
+        assert!(matches!(loaded.inner.graph, HnswGraph::Loaded(_)));
+
+        // Before the fix this fails: the re-stamped schema dropped the extra
+        // keys, so `with_schema`'s superset check rejected the round-trip.
+        let out = loaded.to_batch().unwrap();
+        let out_metadata = out.schema_ref().metadata();
+        assert!(out_metadata.contains_key(HNSW_METADATA_KEY));
+        assert_eq!(
+            out_metadata.get("lance:index_metadata").map(String::as_str),
+            Some("{\"distance_type\":\"l2\"}"),
+        );
+        assert_eq!(
+            out_metadata.get("lance:ivf").map(String::as_str),
+            Some("42")
+        );
+
+        // The HNSW key must still decode to valid metadata after the merge.
+        let reloaded = HNSW::load(out).unwrap();
+        assert_eq!(reloaded.len(), loaded.len());
     }
 
     /// The loaded graph shares the Arrow batch and reconstructs no per-node

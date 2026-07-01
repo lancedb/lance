@@ -36,7 +36,6 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
 use roaring::RoaringBitmap;
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::MetricsCollector;
 use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
@@ -46,7 +45,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
-    ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
+    RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::{Index, IndexType};
 
@@ -1686,7 +1685,7 @@ impl FMIndexScalarIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let files = store.list_files_with_sizes().await?;
@@ -2502,7 +2501,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
-        fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let _ = details.to_msg::<pb::FmIndexDetails>().unwrap_or_default();

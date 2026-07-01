@@ -298,7 +298,7 @@ async fn main() -> lance_core::Result<()> {
                     active.schema.clone(),
                 );
                 let q_arr: ArrayRef = Arc::new(q_fsl);
-                scanner.nearest(VECTOR_COL, q_arr, 10);
+                scanner.nearest(VECTOR_COL, q_arr.as_ref(), 10)?;
                 let t = Instant::now();
                 let stream = scanner.try_into_stream().await?;
                 let _: Vec<RecordBatch> = stream.try_collect().await?;

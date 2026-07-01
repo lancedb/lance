@@ -33,11 +33,11 @@ use lance_core::{Error, ROW_ID, Result, cache::LanceCache, error::LanceOptionExt
 
 use crate::{
     Index, IndexType,
-    frag_reuse::FragReuseIndex,
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, ScalarIndex, SearchResult, UpdateCriteria,
+        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchResult,
+        UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME,
@@ -808,7 +808,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let registry = self.registry().unwrap();

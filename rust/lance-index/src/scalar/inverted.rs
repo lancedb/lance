@@ -114,14 +114,11 @@ use lance_core::Error;
 
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
-use crate::{
-    frag_reuse::FragReuseIndex,
-    scalar::{
-        CreatedIndex, ScalarIndex,
-        expression::{FtsQueryParser, ScalarQueryParser},
-        registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-        },
+use crate::scalar::{
+    CreatedIndex, RowIdRemapper, ScalarIndex,
+    expression::{FtsQueryParser, ScalarQueryParser},
+    registry::{
+        BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
     },
 };
 
@@ -300,7 +297,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(

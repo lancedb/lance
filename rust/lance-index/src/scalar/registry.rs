@@ -14,10 +14,8 @@ use lance_core::{
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
-use crate::{
-    frag_reuse::FragReuseIndex,
-    scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser},
-};
+use crate::scalar::RowIdRemapper;
+use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
 
@@ -194,7 +192,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
@@ -213,7 +211,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     async fn get_from_cache(
         &self,
         _index_store: Arc<dyn IndexStore>,
-        _frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         Ok(cache.get_unsized_with_key(&ScalarIndexCacheKey).await)
