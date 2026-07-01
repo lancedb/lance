@@ -943,114 +943,41 @@ impl TransactionAlteration {
     const F_PROPERTIES: &'static str = "properties";
     const F_REMOVED_PROPERTIES: &'static str = "removed_properties";
 
-    fn to_json(&self) -> serde_json::Value {
-        let mut obj = serde_json::Map::new();
-        if let Some(ref status) = self.status {
-            obj.insert(
-                Self::F_STATUS.to_string(),
-                serde_json::Value::String(status.clone()),
-            );
-        }
-        let props = self
-            .properties
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect::<serde_json::Map<_, _>>();
-        obj.insert(
-            Self::F_PROPERTIES.to_string(),
-            serde_json::Value::Object(props),
-        );
-        let removed = self
-            .removed_properties
-            .iter()
-            .map(|k| serde_json::Value::String(k.clone()))
-            .collect::<Vec<_>>();
-        obj.insert(
-            Self::F_REMOVED_PROPERTIES.to_string(),
-            serde_json::Value::Array(removed),
-        );
-        serde_json::Value::Object(obj)
+    /// Serialize this alteration to a JSON byte vector.
+    ///
+    /// Uses the same pattern as `dir/manifest.rs`: rely on the built-in
+    /// `Serialize` impls for `Option<String>`, `HashMap<String, String>` and
+    /// `HashSet<String>` provided by the `serde` crate (transitively pulled in
+    /// by `serde_json`), so no `serde` derive nor extra dependency is needed.
+    fn to_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(&serde_json::json!({
+            Self::F_STATUS: self.status,
+            Self::F_PROPERTIES: self.properties,
+            Self::F_REMOVED_PROPERTIES: self.removed_properties,
+        }))
     }
 
-    fn from_json(value: serde_json::Value) -> std::result::Result<Self, String> {
-        let obj = match value {
-            serde_json::Value::Object(m) => m,
-            other => {
-                return Err(format!(
-                    "expected JSON object for TransactionAlteration, got {}",
-                    other
-                ));
-            }
-        };
-
-        let status = match obj.get(Self::F_STATUS) {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(s)) => Some(s.clone()),
-            Some(other) => {
-                return Err(format!("field 'status' must be a string, got {}", other));
-            }
-        };
-
-        let mut properties = HashMap::new();
-        if let Some(props_val) = obj.get(Self::F_PROPERTIES) {
-            match props_val {
-                serde_json::Value::Null => {}
-                serde_json::Value::Object(m) => {
-                    for (k, v) in m {
-                        match v {
-                            serde_json::Value::String(s) => {
-                                properties.insert(k.clone(), s.clone());
-                            }
-                            other => {
-                                return Err(format!(
-                                    "property '{}' must be a string, got {}",
-                                    k, other
-                                ));
-                            }
-                        }
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "field 'properties' must be an object, got {}",
-                        other
-                    ));
-                }
-            }
-        }
-
-        let mut removed_properties = std::collections::HashSet::new();
-        if let Some(removed_val) = obj.get(Self::F_REMOVED_PROPERTIES) {
-            match removed_val {
-                serde_json::Value::Null => {}
-                serde_json::Value::Array(arr) => {
-                    for item in arr {
-                        match item {
-                            serde_json::Value::String(s) => {
-                                removed_properties.insert(s.clone());
-                            }
-                            other => {
-                                return Err(format!(
-                                    "field 'removed_properties' must contain strings, got {}",
-                                    other
-                                ));
-                            }
-                        }
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "field 'removed_properties' must be an array, got {}",
-                        other
-                    ));
-                }
-            }
-        }
-
+    /// Deserialize an alteration from JSON bytes, mirroring the
+    /// `serde_json::from_slice::<HashMap<String, String>>(...)` idiom already
+    /// used in `dir/manifest.rs`. Missing / null fields fall back to defaults
+    /// so that the sidecar format stays forward-compatible.
+    fn from_json_slice(bytes: &[u8]) -> serde_json::Result<Self> {
+        let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
         Ok(Self {
-            status,
-            properties,
-            removed_properties,
+            status: serde_json::from_value(
+                obj.remove(Self::F_STATUS)
+                    .unwrap_or(serde_json::Value::Null),
+            )?,
+            properties: serde_json::from_value(
+                obj.remove(Self::F_PROPERTIES)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .unwrap_or_default(),
+            removed_properties: serde_json::from_value(
+                obj.remove(Self::F_REMOVED_PROPERTIES)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .unwrap_or_default(),
         })
     }
 }
@@ -2361,15 +2288,7 @@ impl DirectoryNamespace {
                         ),
                     })
                 })?;
-                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-                    lance_core::Error::from(NamespaceError::Internal {
-                        message: format!(
-                            "Failed to parse alter_transaction sidecar for '{}': {}",
-                            txn_uuid, e
-                        ),
-                    })
-                })?;
-                let alteration = TransactionAlteration::from_json(value).map_err(|e| {
+                let alteration = TransactionAlteration::from_json_slice(&bytes).map_err(|e| {
                     lance_core::Error::from(NamespaceError::Internal {
                         message: format!(
                             "Failed to parse alter_transaction sidecar for '{}': {}",
@@ -2396,7 +2315,7 @@ impl DirectoryNamespace {
         alteration: &TransactionAlteration,
     ) -> Result<()> {
         let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
-        let bytes = serde_json::to_vec(&alteration.to_json()).map_err(|e| {
+        let bytes = alteration.to_json_bytes().map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!(
                     "Failed to serialize alter_transaction sidecar for '{}': {}",
