@@ -2079,7 +2079,6 @@ impl Scanner {
                 plan,
                 LanceExecutionOptions {
                     batch_size: self.batch_size,
-                    target_partition: Some(self.execution_target_parallelism()),
                     execution_stats_callback: self.scan_stats_callback.clone(),
                     ..Default::default()
                 },
@@ -2098,9 +2097,6 @@ impl Scanner {
         if options.execution_stats_callback.is_none() {
             options.execution_stats_callback = self.scan_stats_callback.clone();
         }
-        if options.target_partition.is_none() {
-            options.target_partition = Some(self.execution_target_parallelism());
-        }
 
         execute_plan(plan, options)
     }
@@ -2108,7 +2104,6 @@ impl Scanner {
     pub(crate) fn execution_options(&self) -> LanceExecutionOptions {
         LanceExecutionOptions {
             batch_size: self.batch_size,
-            target_partition: Some(self.execution_target_parallelism()),
             execution_stats_callback: self.scan_stats_callback.clone(),
             ..Default::default()
         }
@@ -2674,7 +2669,9 @@ impl Scanner {
 
             let optimizer = get_physical_optimizer();
             let mut options = ConfigOptions::default();
-            options.execution.target_partitions = self.execution_target_parallelism();
+            options.execution.target_partitions = self
+                .target_parallelism
+                .unwrap_or_else(get_num_compute_intensive_cpus);
             for rule in optimizer.rules {
                 plan = rule.optimize(plan, &options)?;
             }
@@ -2739,7 +2736,9 @@ impl Scanner {
 
         let optimizer = get_physical_optimizer();
         let mut options = ConfigOptions::default();
-        options.execution.target_partitions = self.execution_target_parallelism();
+        options.execution.target_partitions = self
+            .target_parallelism
+            .unwrap_or_else(get_num_compute_intensive_cpus);
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
@@ -4263,14 +4262,6 @@ impl Scanner {
 
     fn get_io_buffer_size(&self) -> u64 {
         self.io_buffer_size.unwrap_or(*DEFAULT_IO_BUFFER_SIZE)
-    }
-
-    fn execution_target_parallelism(&self) -> usize {
-        if let Some(target_parallelism) = self.target_parallelism {
-            return target_parallelism.max(1);
-        }
-
-        self.batch_readahead.max(1)
     }
 
     /// Create an Execution plan with a scan node
@@ -12472,7 +12463,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             filtered.options().threading_mode,
             FilteredReadThreadingMode::OnePartitionMultipleThreads(17)
         );
-        assert_eq!(scanner.execution_options().target_partition, Some(17));
+        assert_eq!(scanner.execution_options().target_partition, None);
     }
 
     // The env var key scopes serial_test's lock so this test only blocks others
