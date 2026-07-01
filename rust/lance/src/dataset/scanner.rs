@@ -2897,7 +2897,7 @@ impl Scanner {
             .with_projection(projection)
             .with_ordered_output(ordered_output)
             .with_threading_mode(FilteredReadThreadingMode::OnePartitionMultipleThreads(
-                self.batch_readahead.max(1),
+                self.filtered_read_threading_parallelism(),
             ));
 
         if let Some(fragments) = fragments {
@@ -4270,6 +4270,18 @@ impl Scanner {
             return target_parallelism.max(1);
         }
 
+        self.default_scan_parallelism()
+    }
+
+    fn filtered_read_threading_parallelism(&self) -> usize {
+        if self.target_parallelism.is_some() {
+            self.batch_readahead.max(1)
+        } else {
+            self.default_scan_parallelism()
+        }
+    }
+
+    fn default_scan_parallelism(&self) -> usize {
         let base_parallelism = self.batch_readahead.max(1);
         if self.dataset.object_store.is_cloud()
             && !self.ordered
