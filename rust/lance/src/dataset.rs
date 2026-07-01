@@ -2056,9 +2056,6 @@ impl Dataset {
             }
         }
 
-        const BLOB_DESCRIPTOR_CHILDREN: [&str; 5] =
-            ["kind", "position", "size", "blob_id", "blob_uri"];
-
         fn validate_file_field_matches_dataset(
             dataset_field: &lance_core::datatypes::Field,
             file_field: &lance_core::datatypes::Field,
@@ -2117,19 +2114,10 @@ impl Dataset {
             consumed_top_level_fields = idx + 1;
             idx += 1;
 
-            if has_footer_orphans && field.is_blob() && field.children.is_empty() {
-                for expected_child in BLOB_DESCRIPTOR_CHILDREN {
-                    let Some(orphan_child) = file_schema_fields.get(idx) else {
-                        return Err(Error::invalid_input(format!(
-                            "Schema mismatch: blob field '{}' is missing descriptor child '{}'",
-                            field.name, expected_child
-                        )));
-                    };
-                    if orphan_child.name != expected_child {
-                        return Err(Error::invalid_input(format!(
-                            "Schema mismatch: blob field '{}' expected descriptor child '{}' but file has '{}'",
-                            field.name, expected_child, orphan_child.name
-                        )));
+            if has_footer_orphans && field.is_blob() {
+                while let Some(orphan_child) = file_schema_fields.get(idx) {
+                    if dataset_schema.field(&orphan_child.name).is_some() {
+                        break;
                     }
                     consumed_top_level_fields = idx + 1;
                     idx += 1;

@@ -29,7 +29,7 @@ use lance_arrow::{
     BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME, FieldExt,
 };
 use lance_core::{
-    datatypes::{BlobKind, Schema as LanceSchema},
+    datatypes::{BlobKind, Field as LanceField, Schema as LanceSchema},
     utils::blob::blob_path,
 };
 use lance_io::{
@@ -149,19 +149,14 @@ fn prepared_blob_field_with_metadata(
     .with_metadata(metadata)
 }
 
-fn logical_blob_field_from_prepared(field: &Field) -> Field {
-    Field::new(
-        field.name(),
-        DataType::Struct(
-            vec![
-                Field::new("data", DataType::LargeBinary, true),
-                Field::new("uri", DataType::Utf8, true),
-            ]
-            .into(),
-        ),
-        field.is_nullable(),
-    )
-    .with_metadata(field.metadata().clone())
+fn logical_blob_lance_children() -> Result<Vec<LanceField>> {
+    [
+        Field::new("data", DataType::LargeBinary, true),
+        Field::new("uri", DataType::Utf8, true),
+    ]
+    .iter()
+    .map(LanceField::try_from)
+    .collect()
 }
 
 fn field_matches(field: &Field, name: &str, data_type: &DataType, nullable: bool) -> bool {
@@ -218,43 +213,46 @@ pub(crate) fn is_logical_blob_v2_field(field: &Field) -> bool {
     }
 }
 
-fn normalize_prepared_blob_arrow_field(field: &Field) -> Result<Field> {
+fn normalize_prepared_blob_lance_field(field: &LanceField) -> Result<LanceField> {
     if field.is_blob_v2() {
-        if is_prepared_blob_v2_field(field) {
-            return Ok(logical_blob_field_from_prepared(field));
+        let arrow_field = Field::from(field);
+        if is_prepared_blob_v2_field(&arrow_field) {
+            let mut normalized = field.clone();
+            normalized.children = logical_blob_lance_children()?;
+            return Ok(normalized);
         }
-        if is_logical_blob_v2_field(field) {
+        if is_logical_blob_v2_field(&arrow_field) {
             return Ok(field.clone());
         }
-        return Err(blob_v2_shape_error(field));
+        return Err(blob_v2_shape_error(&arrow_field));
     }
 
-    if let DataType::Struct(children) = field.data_type() {
-        let normalized_children = children
-            .iter()
-            .map(|child| normalize_prepared_blob_arrow_field(child.as_ref()))
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(Field::new(
-            field.name(),
-            DataType::Struct(normalized_children.into()),
-            field.is_nullable(),
-        )
-        .with_metadata(field.metadata().clone()));
+    if field.children.is_empty() {
+        return Ok(field.clone());
     }
 
-    Ok(field.clone())
+    let normalized_children = field
+        .children
+        .iter()
+        .map(normalize_prepared_blob_lance_field)
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(LanceField {
+        children: normalized_children,
+        ..field.clone()
+    })
 }
 
 pub(crate) fn normalize_prepared_blob_schema(schema: &LanceSchema) -> Result<LanceSchema> {
-    let arrow_schema = arrow_schema::Schema::from(schema);
-    let fields = arrow_schema
-        .fields()
+    let fields = schema
+        .fields
         .iter()
-        .map(|field| normalize_prepared_blob_arrow_field(field.as_ref()))
+        .map(normalize_prepared_blob_lance_field)
         .collect::<Result<Vec<_>>>()?;
-    let normalized =
-        arrow_schema::Schema::new_with_metadata(fields, arrow_schema.metadata().clone());
-    LanceSchema::try_from(&normalized)
+    Ok(LanceSchema {
+        fields,
+        metadata: schema.metadata.clone(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1149,8 +1147,9 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::*;
-    use arrow_array::Array;
     use arrow_array::cast::AsArray;
+    use arrow_array::{Array, StringArray};
+    use arrow_schema::Schema as ArrowSchema;
     use lance_core::utils::tempfile::TempDir;
 
     #[test]
@@ -1314,6 +1313,41 @@ mod tests {
             let err = validate_prepared_blob_array(&field, &array).unwrap_err();
             assert!(err.to_string().contains("range overflows u64"));
         }
+    }
+
+    #[test]
+    fn test_normalize_prepared_blob_schema_preserves_non_blob_fields() {
+        let mut metadata = HashMap::new();
+        metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        let prepared_field = prepared_blob_field_with_metadata("blob", true, metadata);
+        let dict_field = Field::new(
+            "dict",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        );
+        let mut schema =
+            LanceSchema::try_from(&ArrowSchema::new(vec![dict_field, prepared_field])).unwrap();
+        schema.fields[0].id = 42;
+        schema.fields[1].id = 7;
+
+        let dictionary_values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
+        schema.fields[0].set_dictionary_values(&dictionary_values);
+
+        let normalized = normalize_prepared_blob_schema(&schema).unwrap();
+
+        assert_eq!(normalized.fields[0].id, 42);
+        assert_eq!(
+            normalized.fields[0]
+                .dictionary
+                .as_ref()
+                .and_then(|dict| dict.values.as_ref())
+                .map(|values| values.len()),
+            Some(2)
+        );
+        assert_eq!(normalized.fields[1].id, 7);
+        assert_eq!(normalized.fields[1].children.len(), 2);
+        assert_eq!(normalized.fields[1].children[0].name, "data");
+        assert_eq!(normalized.fields[1].children[1].name, "uri");
     }
 
     #[tokio::test]
