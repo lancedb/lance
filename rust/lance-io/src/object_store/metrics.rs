@@ -10,8 +10,9 @@
 //! Two layers cooperate:
 //!
 //! * [`MeteredObjectStore`] wraps any [`object_store::ObjectStore`] and records
-//!   per-operation request counts, transferred bytes, latency, and errors. It
-//!   works for every store regardless of backend.
+//!   per-operation request counts, transferred bytes, latency, errors, and the
+//!   number of requests currently in flight. It works for every store
+//!   regardless of backend.
 //! * [`MeteringHttpConnector`] wraps the HTTP client used by the native cloud
 //!   stores (S3 / GCS / Azure) and records throttle responses (HTTP 429 / 503)
 //!   per attempt. Because `object_store`'s retry loop re-issues each request
@@ -51,6 +52,9 @@ const METRIC_ERRORS: &str = "lance_object_store_errors_total";
 /// Total number of throttle responses (HTTP 429 / 503) seen at the HTTP layer,
 /// labelled by `status` and `scheme`. Counts every attempt, including retries.
 const METRIC_THROTTLE: &str = "lance_object_store_throttle_total";
+/// Number of object store requests currently in flight, labelled by `operation`
+/// and `scheme`.
+const METRIC_IN_FLIGHT: &str = "lance_object_store_in_flight_requests";
 
 /// Record the outcome of a unary request: count, latency, bytes (on success), and errors.
 fn record_request<T>(
@@ -91,6 +95,32 @@ fn record_error(scheme: &str, operation: &'static str) {
         .increment(1);
 }
 
+/// Raises the in-flight gauge for an operation on creation and lowers it on
+/// drop, so the count stays balanced even if the request future or stream is
+/// cancelled or dropped before completing.
+struct InFlightGuard {
+    scheme: String,
+    operation: &'static str,
+}
+
+impl InFlightGuard {
+    fn new(scheme: &str, operation: &'static str) -> Self {
+        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => operation, "scheme" => scheme.to_owned())
+            .increment(1.0);
+        Self {
+            scheme: scheme.to_owned(),
+            operation,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => self.operation, "scheme" => self.scheme.clone())
+            .decrement(1.0);
+    }
+}
+
 #[derive(Debug)]
 pub struct MeteredObjectStore {
     target: Arc<dyn object_store::ObjectStore>,
@@ -113,6 +143,7 @@ impl object_store::ObjectStore for MeteredObjectStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         let size = bytes.content_length() as u64;
+        let _in_flight = InFlightGuard::new(&self.scheme, "put");
         let start = Instant::now();
         let result = self.target.put_opts(location, bytes, opts).await;
         record_request(&self.scheme, "put", start, size, &result);
@@ -136,6 +167,7 @@ impl object_store::ObjectStore for MeteredObjectStore {
         // distinguish it here to keep HEAD and GET as separate operations.
         let is_head = options.head;
         let operation = if is_head { "head" } else { "get" };
+        let _in_flight = InFlightGuard::new(&self.scheme, operation);
         let start = Instant::now();
         let result = self.target.get_opts(location, options).await;
         // A HEAD transfers only metadata, so it has no payload bytes.
@@ -148,6 +180,7 @@ impl object_store::ObjectStore for MeteredObjectStore {
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        let _in_flight = InFlightGuard::new(&self.scheme, "get");
         let start = Instant::now();
         let result = self.target.get_ranges(location, ranges).await;
         let bytes = match &result {
@@ -163,9 +196,14 @@ impl object_store::ObjectStore for MeteredObjectStore {
         locations: BoxStream<'static, OSResult<Path>>,
     ) -> BoxStream<'static, OSResult<Path>> {
         let scheme = self.scheme.clone();
+        let in_flight = InFlightGuard::new(&self.scheme, "delete");
         self.target
             .delete_stream(locations)
             .map(move |result| {
+                // Reference `in_flight` so this `move` closure captures (owns)
+                // the guard, keeping the gauge raised until the stream is
+                // dropped (a move closure only captures the variables it uses).
+                let _in_flight = &in_flight;
                 // Each yielded path is one delete; failures additionally bump the error counter.
                 record_count(&scheme, "delete");
                 if result.is_err() {
@@ -178,7 +216,11 @@ impl object_store::ObjectStore for MeteredObjectStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
         record_count(&self.scheme, "list");
-        meter_list_stream(self.target.list(prefix), self.scheme.clone())
+        meter_list_stream(
+            self.target.list(prefix),
+            self.scheme.clone(),
+            InFlightGuard::new(&self.scheme, "list"),
+        )
     }
 
     fn list_with_offset(
@@ -190,10 +232,12 @@ impl object_store::ObjectStore for MeteredObjectStore {
         meter_list_stream(
             self.target.list_with_offset(prefix, offset),
             self.scheme.clone(),
+            InFlightGuard::new(&self.scheme, "list"),
         )
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        let _in_flight = InFlightGuard::new(&self.scheme, "list");
         let start = Instant::now();
         let result = self.target.list_with_delimiter(prefix).await;
         record_request(&self.scheme, "list", start, 0, &result);
@@ -201,6 +245,7 @@ impl object_store::ObjectStore for MeteredObjectStore {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        let _in_flight = InFlightGuard::new(&self.scheme, "copy");
         let start = Instant::now();
         let result = self.target.copy_opts(from, to, opts).await;
         record_request(&self.scheme, "copy", start, 0, &result);
@@ -208,6 +253,7 @@ impl object_store::ObjectStore for MeteredObjectStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+        let _in_flight = InFlightGuard::new(&self.scheme, "rename");
         let start = Instant::now();
         let result = self.target.rename_opts(from, to, opts).await;
         record_request(&self.scheme, "rename", start, 0, &result);
@@ -220,9 +266,14 @@ impl object_store::ObjectStore for MeteredObjectStore {
 fn meter_list_stream(
     stream: BoxStream<'static, OSResult<ObjectMeta>>,
     scheme: String,
+    in_flight: InFlightGuard,
 ) -> BoxStream<'static, OSResult<ObjectMeta>> {
     stream
         .map(move |result| {
+            // Reference `in_flight` so this `move` closure captures (owns) the
+            // guard: a move closure only captures the variables it uses, and
+            // holding it here keeps the gauge raised until the stream is dropped.
+            let _in_flight = &in_flight;
             if result.is_err() {
                 record_error(&scheme, "list");
             }
@@ -443,7 +494,7 @@ pub use http::MeteringHttpConnector;
 mod tests {
     use super::*;
 
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use object_store::memory::InMemory;
     use object_store::{ObjectStoreExt, PutPayload};
 
@@ -459,6 +510,17 @@ mod tests {
     /// only once: the snapshotter *drains* histogram samples on every
     /// `snapshot()` call, so a second snapshot would see empty histograms.
     type Metrics = Vec<(metrics::Key, DebugValue)>;
+
+    /// Materialize the current recorder state. Histogram samples are *drained*
+    /// on each call, so a metric must be read from a single snapshot.
+    fn snapshot(snapshotter: &Snapshotter) -> Metrics {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(ck, _unit, _desc, value)| (ck.key().clone(), value))
+            .collect()
+    }
 
     /// Run an async closure with a thread-local metrics recorder installed and
     /// return the resulting metrics. Uses a current-thread runtime so all polls
@@ -476,12 +538,7 @@ mod tests {
                 .unwrap();
             rt.block_on(f());
         });
-        snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .map(|(ck, _unit, _desc, value)| (ck.key().clone(), value))
-            .collect()
+        snapshot(&snapshotter)
     }
 
     fn key_matches(key: &metrics::Key, name: &str, labels: &[(&str, &str)]) -> bool {
@@ -513,6 +570,23 @@ mod tests {
             }
         }
         0
+    }
+
+    fn gauge_value(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> f64 {
+        for (key, value) in metrics {
+            if key_matches(key, name, labels)
+                && let DebugValue::Gauge(v) = value
+            {
+                return v.0;
+            }
+        }
+        0.0
+    }
+
+    fn has_metric(metrics: &Metrics, name: &str, labels: &[(&str, &str)]) -> bool {
+        metrics
+            .iter()
+            .any(|(key, _)| key_matches(key, name, labels))
     }
 
     #[test]
@@ -752,6 +826,149 @@ mod tests {
     }
 
     #[test]
+    fn test_in_flight_guard_tracks_and_releases() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let labels = [("operation", "get"), ("scheme", "memory")];
+        metrics::with_local_recorder(&recorder, || {
+            let g1 = InFlightGuard::new("memory", "get");
+            let g2 = InFlightGuard::new("memory", "get");
+            assert_eq!(
+                gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                2.0
+            );
+            drop(g1);
+            assert_eq!(
+                gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                1.0
+            );
+            drop(g2);
+            assert_eq!(
+                gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                0.0
+            );
+        });
+    }
+
+    #[test]
+    fn test_in_flight_gauge_is_wired_and_balances() {
+        let recorded = capture_metrics(|| async {
+            let store = metered_store();
+            let path = Path::from("a/b.bin");
+            store.put(&path, payload(b"hello")).await.unwrap();
+            store.get(&path).await.unwrap();
+        });
+
+        // The gauge is emitted for each operation (guard is wired in) and, once
+        // the operation completes, balances back to zero.
+        for operation in ["put", "get"] {
+            let labels = [("operation", operation), ("scheme", "memory")];
+            assert!(has_metric(&recorded, METRIC_IN_FLIGHT, &labels));
+            assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &labels), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_list_stream_holds_in_flight_until_dropped() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let labels = [("operation", "list"), ("scheme", "memory")];
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let store = metered_store();
+                store.put(&Path::from("a/x"), payload(b"x")).await.unwrap();
+
+                // Creating the stream raises the gauge; it stays raised until the
+                // stream is dropped, even before any items are drained.
+                let stream = store.list(Some(&Path::from("a")));
+                assert_eq!(
+                    gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                    1.0
+                );
+                drop(stream);
+                assert_eq!(
+                    gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                    0.0
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn test_delete_stream_holds_in_flight_until_dropped() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let labels = [("operation", "delete"), ("scheme", "memory")];
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let store = metered_store();
+                let locations = futures::stream::iter(vec![Ok(Path::from("a/b"))]).boxed();
+
+                // Like list, creating the delete stream raises the gauge and holds
+                // it until the stream is dropped, before any items are drained.
+                let stream = store.delete_stream(locations);
+                assert_eq!(
+                    gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                    1.0
+                );
+                drop(stream);
+                assert_eq!(
+                    gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                    0.0
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn test_in_flight_released_when_operation_future_dropped() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let labels = [("operation", "get"), ("scheme", "memory")];
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let started = Arc::new(tokio::sync::Notify::new());
+                // Never signalled: the request stays blocked mid-flight.
+                let release = Arc::new(tokio::sync::Notify::new());
+                let store = (Arc::new(BlockingStore {
+                    started: started.clone(),
+                    release,
+                }) as Arc<dyn object_store::ObjectStore>)
+                    .metered("memory".into());
+
+                let path = Path::from("a/b");
+                let mut fut = Box::pin(store.get(&path));
+                // Drive the request until it is blocked inside the inner store.
+                tokio::select! {
+                    _ = &mut fut => unreachable!("the blocking store never returns"),
+                    _ = started.notified() => {}
+                }
+
+                // The gauge is raised while the request is outstanding, and
+                // dropping the future before it completes releases it.
+                assert_eq!(
+                    gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                    1.0
+                );
+                drop(fut);
+                assert_eq!(
+                    gauge_value(&snapshot(&snapshotter), METRIC_IN_FLIGHT, &labels),
+                    0.0
+                );
+            });
+        });
+    }
+
+    #[test]
     fn test_streaming_errors_are_counted() {
         let recorded = capture_metrics(|| async {
             let delete_store = (Arc::new(FailingStreamStore) as Arc<dyn object_store::ObjectStore>)
@@ -824,6 +1041,82 @@ mod tests {
 
         fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
             futures::stream::once(async { Err(test_error()) }).boxed()
+        }
+
+        fn list_with_offset(
+            &self,
+            _prefix: Option<&Path>,
+            _offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            unimplemented!()
+        }
+
+        async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> OSResult<ListResult> {
+            unimplemented!()
+        }
+
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            unimplemented!()
+        }
+
+        async fn rename_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _opts: RenameOptions,
+        ) -> OSResult<()> {
+            unimplemented!()
+        }
+    }
+
+    /// A store whose `get_opts` blocks after signalling `started`, so a request
+    /// can be observed mid-flight and then dropped before it completes.
+    #[derive(Debug)]
+    struct BlockingStore {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl std::fmt::Display for BlockingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "BlockingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for BlockingStore {
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _bytes: PutPayload,
+            _opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            unimplemented!()
+        }
+
+        async fn get_opts(&self, _location: &Path, _options: GetOptions) -> OSResult<GetResult> {
+            self.started.notify_one();
+            self.release.notified().await;
+            unreachable!("release is never signalled in the test")
+        }
+
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            unimplemented!()
+        }
+
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            unimplemented!()
         }
 
         fn list_with_offset(
