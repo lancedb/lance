@@ -73,8 +73,8 @@ use lance_namespace::models::{
     QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RenameTableRequest,
     RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
     TableVersion, TagContents as ModelTagContents, UpdateTableRequest, UpdateTableResponse,
-    UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 
 use lance_core::{Error, Result, box_error};
