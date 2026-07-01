@@ -59,6 +59,7 @@ struct Config {
     raw_completion_mode: RawCompletionMode,
     take_repetitions: u64,
     io_buffer_gib: Vec<Option<u64>>,
+    scheduler_io_capacity: Option<usize>,
     batch_size: u32,
     batch_size_bytes: Option<u64>,
     skip_batch_byte_accounting: bool,
@@ -208,7 +209,7 @@ fn usage() -> &'static str {
      [--raw-submit-mode <single|split-no-concat|split-concat>] \
      [--raw-completion-mode <unordered|ordered>] \
      [--take-repetitions <n>] \
-     [--io-buffer-gib <auto|n[,n...]>] \
+     [--io-buffer-gib <auto|n[,n...]>] [--scheduler-io-capacity <n>] \
      [--batch-size <n>] [--batch-size-bytes <n>] [--read-chunk-size <n>] \
      [--skip-batch-byte-accounting] \
      [--fragment-concurrency <n>] [--batch-concurrency <n>] \
@@ -230,6 +231,7 @@ fn parse_args() -> Result<Config> {
     let mut raw_completion_mode = RawCompletionMode::Unordered;
     let mut take_repetitions = 100u64;
     let mut io_buffer_gib = vec![Some(8)];
+    let mut scheduler_io_capacity = None;
     let mut batch_size = 8192u32;
     let mut batch_size_bytes = None;
     let mut skip_batch_byte_accounting = false;
@@ -304,6 +306,10 @@ fn parse_args() -> Result<Config> {
                     .ok_or_else(|| format!("missing value for --io-buffer-gib. {}", usage()))?;
                 io_buffer_gib = parse_io_buffer_gib(&value)?;
             }
+            "--scheduler-io-capacity" => {
+                scheduler_io_capacity =
+                    Some(parse_required_value(&mut args, "--scheduler-io-capacity")?);
+            }
             "--batch-size" => {
                 batch_size = parse_required_value(&mut args, "--batch-size")?;
             }
@@ -373,6 +379,16 @@ fn parse_args() -> Result<Config> {
     if io_buffer_gib.is_empty() {
         return Err("--io-buffer-gib must not be empty".into());
     }
+    if matches!(scheduler_io_capacity, Some(0)) {
+        return Err("--scheduler-io-capacity must be greater than zero".into());
+    }
+    if scheduler_io_capacity.is_some() && matches!(backend, Backend::Scanner | Backend::DatasetTake)
+    {
+        return Err(
+            "--scheduler-io-capacity is only supported by file-reader and scheduler-raw backends"
+                .into(),
+        );
+    }
     if batch_size == 0 {
         return Err("--batch-size must be greater than zero".into());
     }
@@ -406,6 +422,7 @@ fn parse_args() -> Result<Config> {
         raw_completion_mode,
         take_repetitions,
         io_buffer_gib,
+        scheduler_io_capacity,
         batch_size,
         batch_size_bytes,
         skip_batch_byte_accounting,
@@ -1286,8 +1303,17 @@ async fn run_scheduler_raw_case(config: &Config, io_buffer_gib: Option<u64>) -> 
     let (object_store, _) = LanceObjectStore::from_uri(&config.uri).await?;
     let scheduler_config = io_buffer_gib
         .map(|gib| SchedulerConfig::new(gib * GIB))
-        .unwrap_or_else(|| SchedulerConfig::max_bandwidth(object_store.as_ref()));
-    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        .unwrap_or_else(|| {
+            let io_parallelism = config
+                .scheduler_io_capacity
+                .unwrap_or_else(|| object_store.io_parallelism());
+            SchedulerConfig::max_bandwidth_for_io_parallelism(io_parallelism)
+        });
+    let scheduler = ScanScheduler::new_with_io_capacity(
+        object_store,
+        scheduler_config,
+        config.scheduler_io_capacity,
+    );
 
     let (selected_files, planned) = match config.raw_range_mode {
         RawRangeMode::FileSequential => {
@@ -1583,8 +1609,17 @@ async fn run_case(config: &Config, io_buffer_gib: Option<u64>) -> Result<CaseSta
     let (object_store, _) = LanceObjectStore::from_uri(&config.uri).await?;
     let scheduler_config = io_buffer_gib
         .map(|gib| SchedulerConfig::new(gib * GIB))
-        .unwrap_or_else(|| SchedulerConfig::max_bandwidth(object_store.as_ref()));
-    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        .unwrap_or_else(|| {
+            let io_parallelism = config
+                .scheduler_io_capacity
+                .unwrap_or_else(|| object_store.io_parallelism());
+            SchedulerConfig::max_bandwidth_for_io_parallelism(io_parallelism)
+        });
+    let scheduler = ScanScheduler::new_with_io_capacity(
+        object_store,
+        scheduler_config,
+        config.scheduler_io_capacity,
+    );
 
     let mut planned = Vec::new();
     let mut remaining_rows = config.limit_rows;
@@ -1949,7 +1984,7 @@ async fn main() -> Result<()> {
 
     for io_buffer_gib in &config.io_buffer_gib {
         println!(
-            "running case={} backend={} projection={} limit_rows={} io_buffer_gib={} batch_size={} fragment_concurrency={} batch_concurrency={} sample_ms={}",
+            "running case={} backend={} projection={} limit_rows={} io_buffer_gib={} scheduler_io_capacity={} batch_size={} fragment_concurrency={} batch_concurrency={} sample_ms={}",
             config.case_name,
             config.backend.name(),
             projection,
@@ -1957,6 +1992,10 @@ async fn main() -> Result<()> {
             io_buffer_gib
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "auto".to_string()),
+            config
+                .scheduler_io_capacity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "default".to_string()),
             config.batch_size,
             config.fragment_concurrency,
             config.batch_concurrency,
@@ -2019,6 +2058,7 @@ async fn main() -> Result<()> {
             "raw_submit_mode": config.raw_submit_mode.name(),
             "raw_completion_mode": config.raw_completion_mode.name(),
             "take_repetitions": config.take_repetitions,
+            "scheduler_io_capacity": config.scheduler_io_capacity,
             "raw_read_chunk_size_bytes": config.read_chunk_size.unwrap_or(DEFAULT_READ_CHUNK_SIZE),
             "planned_rows": stats.planned_rows,
             "planned_fragments": stats.planned_fragments,

@@ -758,7 +758,11 @@ impl SchedulerConfig {
     /// Configuration that should generally maximize bandwidth (not trying to save RAM
     /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
-        Self::new(32 * 1024 * 1024 * store.io_parallelism() as u64)
+        Self::max_bandwidth_for_io_parallelism(store.io_parallelism())
+    }
+
+    pub fn max_bandwidth_for_io_parallelism(io_parallelism: usize) -> Self {
+        Self::new(32 * 1024 * 1024 * io_parallelism.max(1) as u64)
     }
 
     pub fn with_lite_scheduler(self) -> Self {
@@ -777,7 +781,21 @@ impl ScanScheduler {
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
-        let io_capacity = object_store.io_parallelism();
+        Self::new_with_io_capacity(object_store, config, None)
+    }
+
+    /// Create a new scheduler with an optional per-scheduler I/O capacity override.
+    ///
+    /// The override only affects this scheduler's internal queue depth.  It does not change the
+    /// shared [`ObjectStore`] default used by other readers.
+    pub fn new_with_io_capacity(
+        object_store: Arc<ObjectStore>,
+        config: SchedulerConfig,
+        io_capacity: Option<usize>,
+    ) -> Arc<Self> {
+        let io_capacity = io_capacity
+            .unwrap_or_else(|| object_store.io_parallelism())
+            .max(1);
         let use_lite = config
             .use_lite_scheduler
             .unwrap_or_else(|| object_store.prefers_lite_scheduler());
@@ -788,10 +806,8 @@ impl ScanScheduler {
             ));
             IoQueueType::Lite(io_queue)
         } else {
-            let io_queue = Arc::new(IoQueue::new(
-                io_capacity as u32,
-                config.io_buffer_size_bytes,
-            ));
+            let io_capacity = u32::try_from(io_capacity).unwrap_or(u32::MAX);
+            let io_queue = Arc::new(IoQueue::new(io_capacity, config.io_buffer_size_bytes));
             let io_queue_clone = io_queue.clone();
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
             // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
@@ -1943,6 +1959,18 @@ mod tests {
         };
         let scheduler = ScanScheduler::new(memory_store, config);
         assert!(scheduler.uses_lite_scheduler());
+    }
+
+    #[tokio::test]
+    async fn test_scheduler_io_capacity_override() {
+        let obj_store = Arc::new(ObjectStore::memory());
+        let scheduler = ScanScheduler::new_with_io_capacity(
+            obj_store,
+            SchedulerConfig::default_for_testing(),
+            Some(17),
+        );
+
+        assert_eq!(scheduler.diagnostics().io_capacity, 17);
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
