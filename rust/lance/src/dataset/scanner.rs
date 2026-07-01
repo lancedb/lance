@@ -3582,30 +3582,62 @@ impl Scanner {
                 let unindexed_fragments = self
                     .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
 
-                // If all target fragments are unindexed, skip index entirely
-                if unindexed_fragments.len() == target_fragments.len() {
+                // Fragments whose FTS index entries may be stale due to a newer data overlay.
+                // These are excluded from the indexed path and re-evaluated on the flat path.
+                let (stale_flat_frag_ids, fresh_segments) = self
+                    .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+                    .await?;
+
+                // Fragments that need flat evaluation: unindexed + stale (deduplicated).
+                let flat_fragments: Vec<Fragment> = {
+                    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    let mut frags = Vec::new();
+                    for f in unindexed_fragments.iter().chain(
+                        target_fragments
+                            .iter()
+                            .filter(|f| stale_flat_frag_ids.contains(f.id as u32)),
+                    ) {
+                        if seen.insert(f.id as u32) {
+                            frags.push(f.clone());
+                        }
+                    }
+                    frags
+                };
+
+                // If all target fragments need flat evaluation, skip the indexed path.
+                if flat_fragments.len() == target_fragments.len() {
                     if self.fast_search {
                         return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
                     }
                     let flat_match_plan = self
-                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .plan_flat_match_query(flat_fragments, query, params, filter_plan)
                         .await?;
                     return Ok(flat_match_plan);
                 }
 
-                // Mixed case: use index + flat search for unindexed
-                let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
-                    self.dataset.clone(),
-                    query.clone(),
-                    params.clone(),
-                    prefilter_source.clone(),
-                ));
+                // Build the indexed path. When overlays made some segments stale we use
+                // `new_with_segments` to restrict the search to fresh segments only.
+                let match_plan: Arc<dyn ExecutionPlan> = match fresh_segments {
+                    Some(segs) => Arc::new(MatchQueryExec::new_with_segments(
+                        self.dataset.clone(),
+                        query.clone(),
+                        params.clone(),
+                        prefilter_source.clone(),
+                        segs,
+                    )),
+                    None => Arc::new(MatchQueryExec::new(
+                        self.dataset.clone(),
+                        query.clone(),
+                        params.clone(),
+                        prefilter_source.clone(),
+                    )),
+                };
 
-                if self.fast_search || unindexed_fragments.is_empty() {
+                if self.fast_search || flat_fragments.is_empty() {
                     (Some(match_plan), None)
                 } else {
                     let flat_match_plan = self
-                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .plan_flat_match_query(flat_fragments, query, params, filter_plan)
                         .await?;
                     (Some(match_plan), Some(flat_match_plan))
                 }
@@ -4313,6 +4345,61 @@ impl Scanner {
             collect_overlay_stale_rows_for_segment(segment, &frag_by_id, &mut stale)?;
         }
         Ok(stale)
+    }
+
+    /// Compute which FTS segments are stale due to data overlay files committed after the
+    /// index was built, and which fragments must therefore fall back to the flat text path.
+    ///
+    /// Returns `(flat_frag_ids, Some(fresh_segments))` when overlays are present:
+    /// - `flat_frag_ids`: fragment IDs that must be scanned flat (stale fragments, plus any
+    ///   other fragments co-located in a segment that covers a stale one — the whole segment is
+    ///   excluded, so all fragments it covered must move to flat).
+    /// - `fresh_segments`: the subset of FTS segments that cover no stale fragment; safe to
+    ///   pass to `MatchQueryExec::new_with_segments`.
+    ///
+    /// Returns `(empty, None)` on the fast path (no overlays, or no segments load).
+    async fn fts_stale_frags_and_fresh_segments(
+        &self,
+        column: &str,
+        target_fragments: &[Fragment],
+    ) -> Result<(RoaringBitmap, Option<Vec<IndexMetadata>>)> {
+        // Fast path: no overlays on any target fragment.
+        if target_fragments.iter().all(|f| f.overlays.is_empty()) {
+            return Ok((RoaringBitmap::new(), None));
+        }
+
+        let Some(segments) = load_segments(&self.dataset, column).await? else {
+            return Ok((RoaringBitmap::new(), None));
+        };
+
+        let frag_by_id: std::collections::HashMap<u32, &Fragment> =
+            target_fragments.iter().map(|f| (f.id as u32, f)).collect();
+        let mut stale_frag_ids = RoaringBitmap::new();
+        for seg in &segments {
+            collect_stale_overlay_frags(seg, &frag_by_id, &mut stale_frag_ids)?;
+        }
+
+        if stale_frag_ids.is_empty() {
+            // Overlays exist but none are on this FTS column or predate the index.
+            return Ok((stale_frag_ids, None));
+        }
+
+        // Any segment covering a stale fragment is excluded from the indexed path.
+        // All fragments covered by that segment (stale + co-located fresh ones) must
+        // fall to the flat path, since the indexed path no longer covers them.
+        let mut flat_frag_ids = stale_frag_ids.clone();
+        let mut fresh_segments = Vec::with_capacity(segments.len());
+        for seg in segments {
+            match &seg.fragment_bitmap {
+                Some(bm) if !bm.is_disjoint(&stale_frag_ids) => {
+                    flat_frag_ids |= bm;
+                    // exclude this segment from the indexed path
+                }
+                _ => fresh_segments.push(seg),
+            }
+        }
+
+        Ok((flat_frag_ids, Some(fresh_segments)))
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -13660,6 +13747,7 @@ mod overlay_index_masking {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_index::IndexType;
+    use lance_index::scalar::FullTextSearchQuery;
     use lance_index::scalar::ScalarIndexParams;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::DataFile;
@@ -14105,6 +14193,168 @@ mod overlay_index_masking {
         assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
         // A pure `id` query on an unaffected fragment still works correctly.
         assert_eq!(ids_matching(&dataset, "id = 2").await, vec![2]);
+    }
+
+    /// Text dataset: two fragments, 6 rows each. Schema: id (Int32), text (Utf8).
+    /// Texts are unique tokens so each row can be identified by its term.
+    async fn create_text_dataset() -> Dataset {
+        use arrow_array::StringArray;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("text", DataType::Utf8, true),
+        ]));
+        let texts: Vec<&str> = vec![
+            "apple pie",
+            "apple banana", // row 1, fragment 0 — will be overlaid in tests
+            "cherry cake",
+            "banana split",
+            "orange juice",
+            "grape vine",
+            "mango sorbet", // fragment 1 starts here
+            "pear tart",
+            "lemon curd",
+            "peach cobbler",
+            "plum pudding",
+            "fig newton",
+        ];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..12)),
+                Arc::new(StringArray::from(texts)),
+            ],
+        )
+        .unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 6,
+            max_rows_per_group: 6,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap()
+    }
+
+    async fn build_text_fts_index(dataset: &mut Dataset) {
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Collect sorted IDs of rows returned by an FTS query on `text`.
+    async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
+        use arrow_array::cast::AsArray;
+        use futures::TryStreamExt;
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new(term.to_owned()))
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = results
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// An overlay committed after the FTS index is built replaces a row's text. Searching for
+    /// the old term must not return the stale row; searching for the new term must find it.
+    #[tokio::test]
+    async fn test_fts_overlay_stale_drop_and_new_match() {
+        use arrow_array::StringArray;
+
+        let mut dataset = create_text_dataset().await;
+        build_text_fts_index(&mut dataset).await;
+
+        // fragment 0, row offset 1 (id=1): "apple banana" → "cherry mango"
+        // field ID 1 is the `text` column.
+        let dataset = commit_overlay(
+            dataset,
+            "text_overlay",
+            0,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+        )
+        .await;
+
+        // "apple" now matches only id=0 ("apple pie"); id=1's stale index entry must be dropped.
+        assert_eq!(fts_ids_matching(&dataset, "apple").await, vec![0]);
+
+        // "banana" matched id=1 and id=3 before; after overlay id=1's stale entry must be gone.
+        assert_eq!(fts_ids_matching(&dataset, "banana").await, vec![3]);
+
+        // "cherry" now matches id=1 (via flat path on stale fragment) and id=2 ("cherry cake").
+        let cherry_ids = fts_ids_matching(&dataset, "cherry").await;
+        assert!(
+            cherry_ids.contains(&1),
+            "id=1 overlay→cherry mango should be found: {cherry_ids:?}"
+        );
+        assert!(
+            cherry_ids.contains(&2),
+            "id=2 cherry cake should still be found: {cherry_ids:?}"
+        );
+
+        // "mango" now matches id=1 (overlay) and id=6 ("mango sorbet" in fragment 1).
+        let mango_ids = fts_ids_matching(&dataset, "mango").await;
+        assert!(
+            mango_ids.contains(&1),
+            "id=1 overlay→cherry mango should be found: {mango_ids:?}"
+        );
+        assert!(
+            mango_ids.contains(&6),
+            "id=6 mango sorbet should still be found: {mango_ids:?}"
+        );
+    }
+
+    /// An overlay on a field the FTS index does NOT cover must not exclude anything.
+    #[tokio::test]
+    async fn test_fts_overlay_unrelated_field_not_excluded() {
+        let mut dataset = create_text_dataset().await;
+        build_text_fts_index(&mut dataset).await;
+
+        // Overlay field 0 (id) — not covered by the FTS index on `text`.
+        let dataset = commit_overlay(
+            dataset,
+            "id_overlay_for_fts",
+            0,
+            &[0],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(999)])],
+        )
+        .await;
+
+        // FTS coverage must be unchanged — both rows containing "apple" are still returned.
+        // The `id` overlay changes row offset 1's id from 1 to 999, so the projected id column
+        // reflects the overlay even though the FTS index correctly returned that row.
+        assert_eq!(fts_ids_matching(&dataset, "apple").await, vec![0, 999]);
+        assert_eq!(fts_ids_matching(&dataset, "banana").await, vec![3, 999]);
     }
 
     /// Benchmark: measure query latency for BTree, FTS, and vector ANN with 0/4/16 overlay layers.
