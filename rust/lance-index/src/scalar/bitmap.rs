@@ -47,8 +47,8 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -193,6 +193,20 @@ impl BitmapIndexState {
             value_type: index.value_type.clone(),
             index_map: index.index_map.clone(),
         })
+    }
+
+    /// Capture the serializable state of an opened index, rejecting anything
+    /// that is not a `BitmapIndex`.
+    fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let bitmap = index
+            .as_any()
+            .downcast_ref::<BitmapIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "BitmapIndexState::from_scalar_index called with a non-bitmap index",
+                )
+            })?;
+        Self::from_index(bitmap)
     }
 
     pub(crate) fn to_bitmap_index(
@@ -1825,17 +1839,31 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let bitmap = index
-            .as_any()
-            .downcast_ref::<BitmapIndex>()
-            .ok_or_else(|| {
-                Error::internal("BitmapIndexPlugin::put_in_cache called with a non-bitmap index")
-            })?;
-        let state = BitmapIndexState::from_index(bitmap)?;
+        let state = BitmapIndexState::from_scalar_index(index.as_ref())?;
         cache
             .insert_with_key(&BitmapIndexStateKey, Arc::new(state))
             .await;
         Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            BitmapIndexStateKey,
+            load,
+            BitmapIndexState::from_scalar_index,
+            move |state| {
+                Ok(state.to_bitmap_index(index_store, cache, frag_reuse_index)?
+                    as Arc<dyn ScalarIndex>)
+            },
+        )
+        .await
     }
 
     async fn load_statistics(

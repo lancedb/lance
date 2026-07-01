@@ -38,8 +38,8 @@ use crate::pbold;
 use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+    TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
 };
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -596,6 +596,20 @@ impl LabelListIndexState {
         })
     }
 
+    /// Capture the serializable state of an opened index, rejecting anything
+    /// that is not a `LabelListIndex`.
+    fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let label_list = index
+            .as_any()
+            .downcast_ref::<LabelListIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "LabelListIndexState::from_scalar_index called with a non-label-list index",
+                )
+            })?;
+        Self::from_index(label_list)
+    }
+
     fn into_label_list_index(
         self,
         store: Arc<dyn IndexStore>,
@@ -799,19 +813,33 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let label_list = index
-            .as_any()
-            .downcast_ref::<LabelListIndex>()
-            .ok_or_else(|| {
-                Error::internal(
-                    "LabelListIndexPlugin::put_in_cache called with a non-label-list index",
-                )
-            })?;
-        let state = LabelListIndexState::from_index(label_list)?;
+        let state = LabelListIndexState::from_scalar_index(index.as_ref())?;
         cache
             .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
             .await;
         Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            LabelListIndexStateKey,
+            load,
+            LabelListIndexState::from_scalar_index,
+            move |state| {
+                Ok((*state)
+                    .clone()
+                    .into_label_list_index(index_store, cache, frag_reuse_index)?
+                    as Arc<dyn ScalarIndex>)
+            },
+        )
+        .await
     }
 }
 

@@ -7,9 +7,11 @@ use std::sync::Arc;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use futures::future::BoxFuture;
 use lance_core::{
     Result,
-    cache::{LanceCache, UnsizedCacheKey},
+    cache::{CacheKey, LanceCache, UnsizedCacheKey},
+    deepsize::DeepSizeOf,
 };
 
 use crate::progress::IndexBuildProgress;
@@ -230,6 +232,37 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Open an index through the cache: serve a warm hit, or run `load` on a
+    /// miss and cache the result.
+    ///
+    /// `load` performs the actual storage read (compat checks, `load_index`,
+    /// metrics) and is awaited at most once, only on a miss. The default is a
+    /// plain read-through / write-back over [`get_from_cache`](Self::get_from_cache)
+    /// and [`put_in_cache`](Self::put_in_cache); it does not coalesce concurrent
+    /// cold opens.
+    ///
+    /// Plugins with a serializable form should override this with
+    /// [`single_flight_open`], which routes concurrent cold opens through a
+    /// single shared load of the sized state key — so `load` runs once and the
+    /// state persists through the key's [`CacheCodec`](lance_core::cache::CacheCodec).
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if let Some(index) = self
+            .get_from_cache(index_store, frag_reuse_index, cache)
+            .await?
+        {
+            return Ok(index);
+        }
+        let index = load.await?;
+        self.put_in_cache(cache, index.clone()).await?;
+        Ok(index)
+    }
+
     /// Optional hook allowing a plugin to provide statistics without loading the index.
     async fn load_statistics(
         &self,
@@ -251,6 +284,51 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         // Return an empty JSON object as the default implementation
         Ok(serde_json::json!({}))
     }
+}
+
+/// A boxed, `Send` future that performs the storage-level load of a scalar
+/// index (compat checks, `load_index`, metrics).
+///
+/// Handed to [`ScalarIndexPlugin::get_or_insert_in_cache`] and run at most once,
+/// only on a cache miss; it is dropped un-awaited on a warm hit.
+pub type ScalarIndexLoad<'a> = BoxFuture<'a, Result<Arc<dyn ScalarIndex>>>;
+
+/// Single-flight open helper for plugins with a serializable form.
+///
+/// Concurrent cold opens of the same index coalesce onto one `load`: the winner
+/// runs `load`, converts the opened index to its sized state via `to_state`, and
+/// caches that state under `state_key` (persisted through the key's
+/// [`CacheCodec`](lance_core::cache::CacheCodec)); the losers await the same
+/// result instead of each re-reading storage. Every caller — a warm hit
+/// included — then rebuilds an `Arc<dyn ScalarIndex>` from the shared state via
+/// `from_state`, an IO-free reconstruct. `load` is dropped un-awaited on a warm
+/// hit.
+///
+/// This is the building block for [`ScalarIndexPlugin::get_or_insert_in_cache`]
+/// overrides; it mirrors the plugin's own
+/// [`put_in_cache`](ScalarIndexPlugin::put_in_cache) (`to_state`) and
+/// [`get_from_cache`](ScalarIndexPlugin::get_from_cache) (`from_state`) so those
+/// stay the single source of truth for the state representation.
+pub async fn single_flight_open<K, ToState, FromState>(
+    cache: &LanceCache,
+    state_key: K,
+    load: ScalarIndexLoad<'_>,
+    to_state: ToState,
+    from_state: FromState,
+) -> Result<Arc<dyn ScalarIndex>>
+where
+    K: CacheKey + Send,
+    K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    ToState: FnOnce(&dyn ScalarIndex) -> Result<K::ValueType> + Send,
+    FromState: FnOnce(Arc<K::ValueType>) -> Result<Arc<dyn ScalarIndex>> + Send,
+{
+    let state = cache
+        .get_or_insert_with_key(state_key, move || async move {
+            let index = load.await?;
+            to_state(index.as_ref())
+        })
+        .await?;
+    from_state(state)
 }
 
 /// In-memory cache key for a whole `Arc<dyn ScalarIndex>`.
