@@ -145,6 +145,7 @@ fn fr_options_to_proto(
         threading_mode: Some(threading_mode_to_proto(&options.threading_mode)),
         io_buffer_size_bytes: options.io_buffer_size_bytes,
         filter_schema_ipc,
+        ordered_output: Some(options.ordered_output),
     })
 }
 
@@ -196,6 +197,9 @@ async fn fr_options_from_proto(
     }
     if let Some(mode) = proto.threading_mode {
         options.threading_mode = threading_mode_from_proto(&mode)?;
+    }
+    if let Some(ordered_output) = proto.ordered_output {
+        options = options.with_ordered_output(ordered_output);
     }
 
     // Filters — require filter_schema_ipc when filters are present
@@ -615,6 +619,7 @@ mod tests {
         assert_eq!(options.fragment_readahead, back.fragment_readahead);
         assert_eq!(options.io_buffer_size_bytes, back.io_buffer_size_bytes);
         assert_eq!(options.threading_mode, back.threading_mode);
+        assert_eq!(options.ordered_output, back.ordered_output);
         assert_eq!(options.with_deleted_rows, back.with_deleted_rows);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
         assert_eq!(options.projection.with_row_id, back.projection.with_row_id);
@@ -622,6 +627,24 @@ mod tests {
             options.projection.with_row_addr,
             back.projection.with_row_addr
         );
+    }
+
+    #[tokio::test]
+    async fn test_options_from_old_proto_defaults_to_ordered_output() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
+
+        let options = FilteredReadOptions::basic_full_read(&dataset).with_ordered_output(false);
+        let mut proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        proto.ordered_output = None;
+
+        let back = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
+
+        assert!(back.ordered_output);
     }
 
     #[tokio::test]
@@ -644,6 +667,7 @@ mod tests {
         options.full_filter = Some(filter_expr);
         options.refine_filter = Some(refine_expr);
         options.threading_mode = FilteredReadThreadingMode::MultiplePartitions(4);
+        options = options.with_ordered_output(false);
 
         let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
 
@@ -660,6 +684,7 @@ mod tests {
         assert!(back.refine_filter.is_some());
         assert!(back.with_deleted_rows);
         assert_eq!(options.threading_mode, back.threading_mode);
+        assert_eq!(options.ordered_output, back.ordered_output);
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
         assert!(back.projection.with_row_id);
     }

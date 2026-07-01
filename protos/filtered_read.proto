@@ -62,6 +62,7 @@ message FilteredReadOptionsProto {
   optional uint64 io_buffer_size_bytes = 11;
   // Arrow IPC schema for decoding Substrait filters (may be wider than projection).
   optional bytes filter_schema_ipc = 12;
+  optional bool ordered_output = 13;
 }
 
 // Serializable form of FilteredReadPlan (planned/distributed mode).

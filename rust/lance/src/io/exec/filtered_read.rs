@@ -370,6 +370,8 @@ struct FilteredReadStream {
     active_partitions_counter: Arc<AtomicUsize>,
     /// The threading mode for the scan
     threading_mode: FilteredReadThreadingMode,
+    /// If true, output batches preserve fragment/task order.
+    ordered_output: bool,
     /// Range to apply to the result stream if not already pushed down in planning phase
     scan_range_after_filter: Option<Range<u64>>,
 }
@@ -461,20 +463,28 @@ impl FilteredReadStream {
 
         let global_metrics_clone = global_metrics.clone();
 
-        let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map({
-                let scan_range_after_filter = scan_range_after_filter.clone();
-                move |scoped_fragment| {
-                    let metrics = global_metrics_clone.clone();
-                    let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    SpawnedTask::spawn(
-                        Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
-                    )
-                    .map(|thread_result| thread_result.unwrap())
-                }
-            })
-            .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+        let fragment_tasks = futures::stream::iter(scoped_fragments).map({
+            let scan_range_after_filter = scan_range_after_filter.clone();
+            move |scoped_fragment| {
+                let metrics = global_metrics_clone.clone();
+                let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                SpawnedTask::spawn(
+                    Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
+                )
+                .map(|thread_result| thread_result.unwrap())
+            }
+        });
+        let task_stream = if options.ordered_output {
+            fragment_tasks
+                .buffered(fragment_readahead)
+                .try_flatten()
+                .boxed()
+        } else {
+            fragment_tasks
+                .buffer_unordered(fragment_readahead)
+                .try_flatten_unordered(Some(fragment_readahead))
+                .boxed()
+        };
 
         Ok(Self {
             output_schema,
@@ -483,6 +493,7 @@ impl FilteredReadStream {
             metrics: global_metrics,
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
+            ordered_output: options.ordered_output,
             scan_range_after_filter,
         })
     }
@@ -1010,10 +1021,10 @@ impl FilteredReadStream {
                 assert_eq!(partition, 0);
                 let output_schema = self.output_schema.clone();
                 let task_stream = self.task_stream.clone();
-                let partition_metrics_clone = partition_metrics.clone();
+                let partition_metrics_for_tasks = partition_metrics.clone();
                 let futures_stream = futures::stream::try_unfold(task_stream, {
                     move |task_stream| {
-                        let partition_metrics = partition_metrics_clone.clone();
+                        let partition_metrics = partition_metrics_for_tasks.clone();
                         async move {
                             // There is no compute we can meaningfully measure here.  The actual work is
                             // done by spawned background threads.
@@ -1025,17 +1036,18 @@ impl FilteredReadStream {
                         }
                     }
                 });
-                let partition_metrics_clone = partition_metrics.clone();
-                let base_batch_stream =
-                    futures_stream
-                        .try_buffered(num_threads)
-                        .try_filter_map(move |batch| {
-                            std::future::ready(Ok(if batch.num_rows() == 0 {
-                                None
-                            } else {
-                                Some(batch)
-                            }))
-                        });
+                let base_batch_stream = if self.ordered_output {
+                    futures_stream.try_buffered(num_threads).boxed()
+                } else {
+                    futures_stream.try_buffer_unordered(num_threads).boxed()
+                }
+                .try_filter_map(move |batch| {
+                    std::future::ready(Ok(if batch.num_rows() == 0 {
+                        None
+                    } else {
+                        Some(batch)
+                    }))
+                });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
                     Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
@@ -1048,9 +1060,10 @@ impl FilteredReadStream {
                 // no output batches were produced (inspect_ok never fires in that case).
                 let global_metrics_final = global_metrics.clone();
                 let scan_scheduler_final = scan_scheduler.clone();
+                let partition_metrics_for_batches = partition_metrics.clone();
                 let batch_stream = batch_stream
                     .inspect_ok(move |batch| {
-                        partition_metrics_clone
+                        partition_metrics_for_batches
                             .baseline_metrics
                             .record_output(batch.num_rows());
                         global_metrics.io_metrics.record(&scan_scheduler);
@@ -1338,6 +1351,8 @@ pub struct FilteredReadOptions {
     pub full_filter: Option<Expr>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
+    /// If true, emit fragment tasks in fragment order.
+    pub ordered_output: bool,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
     /// Callback used by diagnostics tools to sample the scan scheduler while a scan is running.
@@ -1374,6 +1389,7 @@ impl FilteredReadOptions {
             io_buffer_size_bytes: None,
             scan_scheduler_diagnostics_callback: None,
             only_indexed_fragments: false,
+            ordered_output: true,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
@@ -1470,6 +1486,12 @@ impl FilteredReadOptions {
     /// scheduler.
     pub fn with_fragment_readahead(mut self, fragment_readahead: usize) -> Self {
         self.fragment_readahead = Some(fragment_readahead);
+        self
+    }
+
+    /// Set whether output batches should preserve fragment order.
+    pub fn with_ordered_output(mut self, ordered_output: bool) -> Self {
+        self.ordered_output = ordered_output;
         self
     }
 
@@ -2599,6 +2621,29 @@ mod tests {
 
         // Some batches will be smaller because we don't coalesce batches across fragments
         assert_eq!(batch_sizes, vec![35, 35, 30, 35, 15, 35, 35, 30]);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_unordered_output_preserves_rows() {
+        let fixture = TestFixture::new().await;
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_batch_size(35)
+            .with_ordered_output(false);
+
+        let plan = fixture.make_plan(options).await;
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+        let mut values = batch
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        values.sort_unstable();
+
+        let expected = (0..100).chain(250..400).collect::<Vec<u32>>();
+        assert_eq!(values, expected);
     }
 
     #[test_log::test(tokio::test)]
