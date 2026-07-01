@@ -62,7 +62,7 @@ use super::utils::IoMetrics;
 
 const ENV_LANCE_DEFAULT_FRAGMENT_READAHEAD: &str = "LANCE_DEFAULT_FRAGMENT_READAHEAD";
 const HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS: usize = 16;
-const HIGH_BANDWIDTH_SCAN_MIN_ROWS: u64 = 16_777_216;
+const HIGH_BANDWIDTH_SCAN_MIN_ROWS: u64 = 64 * 1024 * 1024;
 const HIGH_BANDWIDTH_SCAN_IO_PER_CPU: usize = 4;
 const HIGH_BANDWIDTH_SCAN_MAX_IO_PARALLELISM: usize = 512;
 const HIGH_BANDWIDTH_SCAN_TARGET_BATCH_BYTES: u64 = 16 * 1024 * 1024;
@@ -566,14 +566,20 @@ impl FilteredReadStream {
             .or_else(get_default_io_buffer_size_override)
         {
             SchedulerConfig::new(io_buffer_size_bytes)
-        } else {
+        } else if is_high_bandwidth_candidate {
             SchedulerConfig::max_bandwidth_for_io_parallelism(scan_io_parallelism)
+        } else {
+            SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
-        let scan_scheduler = ScanScheduler::new_with_io_capacity(
-            obj_store,
-            scheduler_config,
-            Some(scan_io_parallelism),
-        );
+        let scan_scheduler = if is_high_bandwidth_candidate {
+            ScanScheduler::new_with_io_capacity(
+                obj_store,
+                scheduler_config,
+                Some(scan_io_parallelism),
+            )
+        } else {
+            ScanScheduler::new(obj_store, scheduler_config)
+        };
         if let Some(callback) = options.scan_scheduler_diagnostics_callback.as_ref() {
             callback.notify(ScanSchedulerDiagnosticsHandle::new(scan_scheduler.clone()));
         }
