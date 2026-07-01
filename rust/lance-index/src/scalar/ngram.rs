@@ -60,7 +60,7 @@ pub(crate) use ngram_stop_trigrams::{
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
 const POSTINGS_FILENAME: &str = "ngram_postings.lance";
-const NGRAM_INDEX_VERSION: u32 = 0;
+const NGRAM_INDEX_VERSION: u32 = 1;
 
 use std::sync::LazyLock;
 
@@ -898,6 +898,9 @@ impl NGramIndexBuilder {
             if let Some(text) = text {
                 tokenize_visitor(tokenizer, text, |token| {
                     let token = ngram_to_token(token, NGRAM_N);
+                    if is_stop_trigram_token(token) {
+                        return;
+                    }
                     let partition_id = (token as usize).saturating_sub(MIN_TOKEN) / divisor;
                     partitions[partition_id % num_workers].push((token, *row_id));
                 });
@@ -1406,12 +1409,17 @@ mod tests {
     };
     use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
 
-    use super::{NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
+    use super::{NGRAM_INDEX_VERSION, NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
 
     fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
         let mut tokens = Vec::with_capacity(text.len() * 3);
         tokenize_visitor(analyzer, text, |token| tokens.push(token.to_owned()));
         tokens
+    }
+
+    #[test]
+    fn test_ngram_index_version_tracks_stop_trigram_omission() {
+        assert_eq!(NGRAM_INDEX_VERSION, 1);
     }
 
     #[test]
@@ -1527,7 +1535,7 @@ mod tests {
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
 
         let (index, _tmpdir) = do_train(builder, data).await;
-        assert_eq!(index.tokens.len(), 21);
+        assert_eq!(index.tokens.len(), 20);
 
         // Basic search
         let res = index
@@ -1892,8 +1900,8 @@ mod tests {
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
         let (index, _tmpdir) = do_train(builder, data).await;
 
-        assert!(index.tokens.contains_key(&ngram_to_token("the", 3)));
-        assert!(index.tokens.contains_key(&ngram_to_token("and", 3)));
+        assert!(!index.tokens.contains_key(&ngram_to_token("the", 3)));
+        assert!(!index.tokens.contains_key(&ngram_to_token("and", 3)));
         assert!(index.tokens.contains_key(&ngram_to_token("xyz", 3)));
 
         let res = index
@@ -1946,6 +1954,6 @@ mod tests {
 
         let (index, _tmpdir) = do_train(builder, data).await;
 
-        assert_eq!(index.tokens.len(), 29012);
+        assert_eq!(index.tokens.len(), 28966);
     }
 }
