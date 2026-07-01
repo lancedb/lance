@@ -13594,7 +13594,6 @@ mod overlay_index_masking {
     use lance_io::utils::CachedFileSize;
     use lance_table::format::DataFile;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-    use object_store::path::Path;
     use roaring::RoaringBitmap;
 
     use lance_file::writer::{FileWriter, FileWriterOptions};
@@ -13659,7 +13658,12 @@ mod overlay_index_masking {
         let overlay_schema = dataset.schema().project_by_ids(fields, true);
 
         let filename = format!("{name}.lance");
-        let path = Path::from(format!("data/{filename}"));
+        // Use dataset.base so the path is absolute for file:// stores.
+        // to_local_path() prepends '/' to the object_store path, so a bare
+        // "data/foo.lance" would resolve to /data/foo.lance (root fs). With
+        // base we get e.g. tmp/lance-bench/data/foo.lance → /tmp/lance-bench/data/foo.lance.
+        // For memory:// stores base is empty so the result is the same as before.
+        let path = dataset.base.clone().join("data").join(filename.as_str());
         let obj_writer = dataset.object_store.create(&path).await.unwrap();
         let mut writer =
             FileWriter::try_new(obj_writer, overlay_schema, FileWriterOptions::default()).unwrap();
