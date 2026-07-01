@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use super::ngram_regex::TrigramQuery;
-use super::{NGRAM_N, ngram_to_token};
+use super::{NGRAM_N, NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
 
 /// Trigrams that are omitted from the index because they are too common to help
 /// prune candidates. All entries must be exactly three alphanumeric characters to
@@ -40,6 +40,19 @@ static STOP_TRIGRAM_TOKENS: LazyLock<HashSet<u32>> = LazyLock::new(|| {
 /// required at query time.
 pub fn is_stop_trigram_token(token: u32) -> bool {
     STOP_TRIGRAM_TOKENS.contains(&token)
+}
+
+/// Whether a `contains` pattern has at least one non-stop trigram the index can
+/// use to prune candidates.
+pub fn contains_can_use_index(substr: &str) -> bool {
+    let mut has_selective_trigram = false;
+    tokenize_visitor(&NGRAM_TOKENIZER, substr, |ngram| {
+        let token = ngram_to_token(ngram, NGRAM_N);
+        if !is_stop_trigram_token(token) {
+            has_selective_trigram = true;
+        }
+    });
+    has_selective_trigram
 }
 
 /// Remove stop-trigram requirements from a regex-derived condition.
@@ -101,5 +114,13 @@ mod tests {
             TrigramQuery::Trigram(ngram_to_token("xyz", NGRAM_N)),
         ]);
         assert_eq!(strip_stop_trigrams(query), TrigramQuery::All);
+    }
+
+    #[test]
+    fn test_contains_can_use_index_requires_selective_trigram() {
+        assert!(!contains_can_use_index("the"));
+        assert!(!contains_can_use_index("and"));
+        assert!(contains_can_use_index("theory"));
+        assert!(contains_can_use_index("uniquexyz"));
     }
 }

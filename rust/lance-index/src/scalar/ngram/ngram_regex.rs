@@ -455,7 +455,8 @@ pub fn regex_to_trigram_query(pattern: &str) -> TrigramQuery {
 /// it to the index, which would otherwise have to ask the scan to recheck every
 /// row -- a path the index result type (`AtLeast`) does not support.
 pub fn regex_can_use_index(pattern: &str) -> bool {
-    regex_to_trigram_query(pattern) != TrigramQuery::All
+    super::ngram_stop_trigrams::strip_stop_trigrams(regex_to_trigram_query(pattern))
+        != TrigramQuery::All
 }
 
 /// Collect the distinct trigram tokens referenced anywhere in the tree.
@@ -579,6 +580,14 @@ mod tests {
         // Every alternation branch is shorter than a trigram, so we must not
         // require either two-character branch as a (non-existent) trigram.
         assert_eq!(q("fo|ba"), TrigramQuery::All); // spellchecker:disable-line
+    }
+
+    #[test]
+    fn test_stop_only_pattern_cannot_use_index() {
+        assert!(!regex_can_use_index("the"));
+        assert!(!regex_can_use_index(".*the.*"));
+        assert!(regex_can_use_index("theory"));
+        assert!(regex_can_use_index("uniquexyz"));
     }
 
     #[test]

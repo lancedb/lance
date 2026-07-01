@@ -53,7 +53,9 @@ use tracing::instrument;
 mod ngram_regex;
 mod ngram_stop_trigrams;
 pub(crate) use ngram_regex::regex_can_use_index;
-pub(crate) use ngram_stop_trigrams::{is_stop_trigram_token, strip_stop_trigrams};
+pub(crate) use ngram_stop_trigrams::{
+    contains_can_use_index, is_stop_trigram_token, strip_stop_trigrams,
+};
 
 const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
@@ -896,9 +898,6 @@ impl NGramIndexBuilder {
             if let Some(text) = text {
                 tokenize_visitor(tokenizer, text, |token| {
                     let token = ngram_to_token(token, NGRAM_N);
-                    if is_stop_trigram_token(token) {
-                        return;
-                    }
                     let partition_id = (token as usize).saturating_sub(MIN_TOKEN) / divisor;
                     partitions[partition_id % num_workers].push((token, *row_id));
                 });
@@ -1528,7 +1527,7 @@ mod tests {
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
 
         let (index, _tmpdir) = do_train(builder, data).await;
-        assert_eq!(index.tokens.len(), 20);
+        assert_eq!(index.tokens.len(), 21);
 
         // Basic search
         let res = index
@@ -1893,8 +1892,8 @@ mod tests {
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
         let (index, _tmpdir) = do_train(builder, data).await;
 
-        assert!(!index.tokens.contains_key(&ngram_to_token("the", 3)));
-        assert!(!index.tokens.contains_key(&ngram_to_token("and", 3)));
+        assert!(index.tokens.contains_key(&ngram_to_token("the", 3)));
+        assert!(index.tokens.contains_key(&ngram_to_token("and", 3)));
         assert!(index.tokens.contains_key(&ngram_to_token("xyz", 3)));
 
         let res = index
@@ -1947,6 +1946,6 @@ mod tests {
 
         let (index, _tmpdir) = do_train(builder, data).await;
 
-        assert_eq!(index.tokens.len(), 28966);
+        assert_eq!(index.tokens.len(), 29012);
     }
 }
