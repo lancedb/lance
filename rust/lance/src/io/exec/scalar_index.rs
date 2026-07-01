@@ -660,6 +660,10 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
+    /// Row addresses blocked from the index result due to data overlay files committed after the
+    /// index was built. ANDead into the candidate mask before row ID materialisation so that stale
+    /// index entries never reach downstream operators.
+    overlay_block: Option<RowAddrMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -732,9 +736,17 @@ impl MaterializeIndexExec {
             dataset,
             expr,
             fragments,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Block specific row addresses from the index result. Used to exclude rows whose indexed
+    /// values are stale because a data overlay was committed after the index was built.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
+        self
     }
 
     #[instrument(name = "materialize_scalar_index", skip_all, level = "debug")]
@@ -742,6 +754,7 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        overlay_block: Option<RowAddrMask>,
         metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
         let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
@@ -769,12 +782,15 @@ impl MaterializeIndexExec {
             }
             Ok(result.upper)
         };
-        let mask = if let Some(prefilter) = prefilter {
+        let mut mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
             take_upper(expr_result)? & (*prefilter).clone()
         } else {
             take_upper(expr_result.await?)?
         };
+        if let Some(block) = overlay_block {
+            mask = mask & block;
+        }
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
@@ -906,6 +922,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.fragments.clone(),
+            self.overlay_block.clone(),
             metrics,
         );
         let stream = futures::stream::iter(vec![batch_fut])

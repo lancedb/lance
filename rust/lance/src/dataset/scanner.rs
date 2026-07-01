@@ -2958,10 +2958,11 @@ impl Scanner {
                 .fragments
                 .clone()
                 .unwrap_or_else(|| self.dataset.fragments().clone());
-            let stale_frags = self
-                .overlay_stale_index_frags(index_query, &candidate_frags)
+            let stale_rows = self
+                .overlay_stale_index_rows(index_query, &candidate_frags)
                 .await?;
-            if !stale_frags.is_empty() {
+            if !stale_rows.is_empty() {
+                let stale_frags: RoaringBitmap = stale_rows.keys().copied().collect();
                 read_options = read_options.with_overlay_stale_fragments(stale_frags);
             }
         }
@@ -4230,66 +4231,66 @@ impl Scanner {
         }
     }
 
-    /// Given an index query, split the fragments into two sets
+    /// Given an index query, split the fragments into two groups and collect per-row stale data.
     ///
-    /// The first set is the relevant fragments, which are covered by ALL indices in the query
-    /// The second set is the missing fragments, which are missed by at least one index
+    /// - `relevant_frags`: covered by ALL indices. Stale rows within them are returned separately
+    ///   so callers can block them from `MaterializeIndexExec` and re-score via a targeted take.
+    /// - `missing_frags`: not covered by at least one index; fall back to full scan + filter.
+    /// - `stale_rows`: per-fragment row offsets whose indexed values are stale due to a data
+    ///   overlay committed after the index was built (field-aware, version-gated). Empty when no
+    ///   overlays are present.
     ///
-    /// There is no point in handling the case where a fragment is covered by some (but not all)
-    /// of the indices.  If we have to do a full scan of the fragment then we do it
+    /// There is no point in partially indexing a fragment (some indices cover it, others do not).
+    /// If we have to do a full scan of a fragment for any reason, we do it entirely.
     async fn partition_frags_by_coverage(
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
+    ) -> Result<(
+        Vec<Fragment>,
+        Vec<Fragment>,
+        std::collections::HashMap<u32, RoaringBitmap>,
+    )> {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
-        // Fragments with a newer overlay on an indexed field hold values the index has not
-        // seen, so their index entries may be stale. Treat them as not covered: they fall to
-        // the flat path via `missing_frags` and are re-evaluated against their current
-        // (overlay-merged) values. Unlike the vector path, stale_frags need not be threaded
-        // further — the flat-path re-evaluation already handles them via `missing_frags`.
-        let stale_frags = self
-            .overlay_stale_index_frags(index_expr, &fragments)
+        let stale_rows = self
+            .overlay_stale_index_rows(index_expr, &fragments)
             .await?;
         let mut relevant_frags = Vec::with_capacity(fragments.len());
         let mut missing_frags = Vec::with_capacity(fragments.len());
         for fragment in fragments.iter() {
-            if covered_frags.contains(fragment.id as u32)
-                && !stale_frags.contains(fragment.id as u32)
-            {
+            if covered_frags.contains(fragment.id as u32) {
+                // Indexed fragments stay on the indexed path. Stale rows within them are blocked
+                // from the index result and re-evaluated separately via a targeted take.
                 relevant_frags.push(fragment.clone());
             } else {
                 missing_frags.push(fragment.clone());
             }
         }
-        Ok((relevant_frags, missing_frags))
+        Ok((relevant_frags, missing_frags, stale_rows))
     }
 
-    /// Fragment ids whose indexed values may be stale because an overlay committed *after* an
-    /// index was built touches a field that index covers.
+    /// Per-row stale offsets for each fragment whose indexed values may be stale because an
+    /// overlay committed *after* an index was built touches a field that index covers.
     ///
-    /// Such a fragment must be excluded from index results and re-evaluated against its current
-    /// values on the flat path — the same path already used for fragments the index never
-    /// covered. The check is field-aware (an overlay touching only unindexed fields excludes
-    /// nothing) and version-gated (an overlay with `committed_version <= index.dataset_version`
-    /// is already incorporated by the index), via [`overlay_exclusion_offsets`].
-    async fn overlay_stale_index_frags(
+    /// The check is field-aware (an overlay touching only unindexed fields excludes nothing) and
+    /// version-gated (an overlay with `committed_version <= index.dataset_version` is already
+    /// incorporated by the index), via [`overlay_exclusion_offsets`].
+    async fn overlay_stale_index_rows(
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: &[Fragment],
-    ) -> Result<RoaringBitmap> {
+    ) -> Result<std::collections::HashMap<u32, RoaringBitmap>> {
         // Overlays are rare; skip all index loading when none of the candidate fragments has one.
         if fragments
             .iter()
             .all(|fragment| fragment.overlays.is_empty())
         {
-            return Ok(RoaringBitmap::new());
+            return Ok(std::collections::HashMap::new());
         }
         let frag_by_id: std::collections::HashMap<u32, &Fragment> =
             fragments.iter().map(|f| (f.id as u32, f)).collect();
 
-        // Walk the (boolean) index expression tree to collect leaf searches. `ScalarIndexExpr`
-        // doesn't expose a visitor, so we traverse it manually.
+        // Walk the (boolean) index expression tree to collect leaf searches.
         let mut searches = Vec::new();
         let mut stack = vec![index_expr];
         while let Some(expr) = stack.pop() {
@@ -4306,7 +4307,8 @@ impl Scanner {
         // `load_named_scalar_segments` returns cached index metadata — no disk I/O on the hot
         // path. Even without the cache, this code is only reached when at least one fragment has
         // overlays (rare), so the per-leaf cost is acceptable.
-        let mut stale = RoaringBitmap::new();
+        let mut stale: std::collections::HashMap<u32, RoaringBitmap> =
+            std::collections::HashMap::new();
         for search in searches {
             let segments = load_named_scalar_segments(
                 self.dataset.as_ref(),
@@ -4315,7 +4317,7 @@ impl Scanner {
             )
             .await?;
             for segment in &segments {
-                collect_stale_overlay_frags(segment, &frag_by_id, &mut stale)?;
+                collect_overlay_stale_rows_for_segment(segment, &frag_by_id, &mut stale)?;
             }
         }
         Ok(stale)
@@ -4421,16 +4423,29 @@ impl Scanner {
 
         let needs_recheck = index_expr.needs_recheck();
 
-        // Figure out which fragments are covered by ALL indices
-        let (relevant_frags, missing_frags) = self
+        // Figure out which fragments are covered by ALL indices, and which rows within
+        // covered fragments are stale due to data overlay files.
+        let (relevant_frags, missing_frags, stale_rows) = self
             .partition_frags_by_coverage(index_expr, fragments)
             .await?;
 
-        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(MaterializeIndexExec::new(
+        // Build the MaterializeIndexExec, blocking stale row addresses so the index never
+        // emits them. Stale rows are re-scored separately via a targeted take below.
+        let mat_exec = MaterializeIndexExec::new(
             self.dataset.clone(),
             index_expr.clone(),
             Arc::new(relevant_frags),
-        ));
+        );
+        let mat_exec = if stale_rows.is_empty() {
+            mat_exec
+        } else {
+            let mut tree_map = RowAddrTreeMap::new();
+            for (&frag_id, offsets) in &stale_rows {
+                tree_map.insert_bitmap(frag_id, offsets.clone());
+            }
+            mat_exec.with_overlay_block(RowAddrMask::from_block(tree_map))
+        };
+        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(mat_exec);
 
         let refine_expr = filter_plan.refine_expr.as_ref();
 
@@ -4476,6 +4491,21 @@ impl Scanner {
             plan = Arc::new(AddRowAddrExec::try_new(plan, self.dataset.clone(), 0)?);
         }
 
+        // Both the missing-fragments path (full scan) and the stale-rows path (targeted take)
+        // need the user's projection extended with any filter columns. Compute it once.
+        let fallback_projection: Option<Projection> =
+            if !missing_frags.is_empty() || !stale_rows.is_empty() {
+                let filter = filter_plan.full_expr.as_ref().unwrap();
+                let filter_cols = Planner::column_names_in_expr(filter);
+                Some(
+                    projection
+                        .clone()
+                        .union_columns(filter_cols, OnMissing::Error)?,
+                )
+            } else {
+                None
+            };
+
         let new_data_path: Option<Arc<dyn ExecutionPlan>> = if !missing_frags.is_empty() {
             log::trace!(
                 "scalar_indexed_scan will need full scan of {} missing fragments",
@@ -4494,10 +4524,8 @@ impl Scanner {
             // If there were no extra columns then we still need the project
             // because Materialize -> Take puts the row id at the left and
             // Scan puts the row id at the right
+            let scan_projection = fallback_projection.clone().unwrap();
             let filter = filter_plan.full_expr.as_ref().unwrap();
-            let filter_cols = Planner::column_names_in_expr(filter);
-            let scan_projection = projection.union_columns(filter_cols, OnMissing::Error)?;
-
             let scan_schema = Arc::new(scan_projection.to_bare_schema());
             let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
             let planner = Planner::new(scan_arrow_schema);
@@ -4526,16 +4554,54 @@ impl Scanner {
             None
         };
 
-        if let Some(new_data_path) = new_data_path {
-            let unioned = UnionExec::try_new(vec![plan, new_data_path])?;
-            // Enforce only 1 partition.
-            let unioned = Arc::new(RepartitionExec::try_new(
+        // Stale-Take path: re-evaluate only the stale row addresses against the full filter
+        // (row-level optimization). These rows were blocked from the index result above;
+        // here we take their current (overlay-merged) values and re-apply the predicate.
+        // The schema matches `plan` via `project(…, plan.schema())`.
+        let stale_take_path: Option<Arc<dyn ExecutionPlan>> = if stale_rows.is_empty() {
+            None
+        } else {
+            let filter = filter_plan.full_expr.as_ref().unwrap();
+            let take_projection = fallback_projection.unwrap();
+
+            let stale_addrs: Vec<u64> = stale_rows
+                .iter()
+                .flat_map(|(&frag_id, offsets)| {
+                    offsets
+                        .iter()
+                        .map(move |offset| ((frag_id as u64) << 32) | offset as u64)
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    ROW_ID,
+                    DataType::UInt64,
+                    true,
+                )])),
+                vec![Arc::new(UInt64Array::from(stale_addrs))],
+            )?;
+            let stale_id_plan = Arc::new(OneShotExec::from_batch(batch));
+            let stale_node = self.take(stale_id_plan, take_projection)?;
+
+            let planner = Planner::new(stale_node.schema());
+            let optimized_filter = planner.optimize_expr(filter.clone())?;
+            let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, stale_node)?);
+            Some(Arc::new(project(filtered, plan.schema().as_ref())?))
+        };
+
+        let extra_paths: Vec<Arc<dyn ExecutionPlan>> = [new_data_path, stale_take_path]
+            .into_iter()
+            .flatten()
+            .collect();
+        if extra_paths.is_empty() {
+            Ok(plan)
+        } else {
+            let all_paths = std::iter::once(plan).chain(extra_paths).collect();
+            let unioned = UnionExec::try_new(all_paths)?;
+            Ok(Arc::new(RepartitionExec::try_new(
                 unioned,
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-            )?);
-            Ok(unioned)
-        } else {
-            Ok(plan)
+            )?))
         }
     }
 
@@ -5121,7 +5187,7 @@ impl Scanner {
         // are not in the fragments we are scanning.
         if filter_plan.is_exact_index_search() && self.fragments.is_none() {
             let index_query = filter_plan.index_query.as_ref().expect_ok()?;
-            let (_, missing_frags) = self
+            let (_, missing_frags, _) = self
                 .partition_frags_by_coverage(index_query, fragments.clone())
                 .await?;
 
@@ -13938,6 +14004,41 @@ mod overlay_index_masking {
         assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
         // An untouched indexed value is unaffected.
         assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+    }
+
+    /// Row-level BTree precision: when one row in a covered fragment is stale, only that row is
+    /// blocked from the index result and re-evaluated on the stale-Take path. Non-stale rows in
+    /// the same fragment (including one that matches the predicate) remain on the indexed path.
+    ///
+    /// Setup: fragment 0 has id=5 → age=50 (not stale). Overlay id=1 → age=50 (stale).
+    /// After the overlay two rows in fragment 0 have age=50. The row-level optimization must
+    /// return both: id=5 from the index and id=1 from the stale-Take path.
+    #[tokio::test]
+    async fn test_btree_overlay_row_level_precision() {
+        let mut dataset = create_base_dataset().await;
+        build_age_index(&mut dataset).await;
+
+        // Fragment 0: ids 0-5, ages 0,10,20,30,40,50. Overlay offset 1 (id=1): age 10→50.
+        // After this both id=1 and id=5 have age=50, in the same fragment.
+        let dataset = commit_overlay(
+            dataset,
+            "age_row_level",
+            0,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(50)])],
+        )
+        .await;
+
+        // Stale drop: id=1's old age=10 entry must not appear.
+        assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+
+        // id=5 via index + id=1 via stale-Take path — both in fragment 0.
+        assert_eq!(ids_matching(&dataset, "age = 50").await, vec![1, 5]);
+
+        // Non-stale rows in the same fragment still return correctly.
+        assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+        assert_eq!(ids_matching(&dataset, "age = 30").await, vec![3]);
     }
 
     /// An overlay touching only a non-indexed field excludes nothing from the index on `age`.
