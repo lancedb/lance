@@ -91,7 +91,9 @@ use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use crate::io::exec::filtered_read::{
+    FilteredReadExec, FilteredReadOptions, ScanSchedulerDiagnosticsCallback,
+};
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
 };
@@ -115,6 +117,7 @@ use crate::{
     io::exec::fts::{BoolSlot, BooleanQueryExec, build_boolean_query_children},
 };
 
+pub use crate::io::exec::filtered_read::ScanSchedulerDiagnosticsHandle;
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
@@ -815,6 +818,8 @@ pub struct Scanner {
     /// If set, this callback will be called after the scan with summary statistics
     scan_stats_callback: Option<ExecutionStatsCallback>,
 
+    scan_scheduler_diagnostics_callback: Option<ScanSchedulerDiagnosticsCallback>,
+
     /// Whether the result returned by the scanner must be of the size of the batch_size.
     /// By default, it is false.
     /// Mainly, if the result is returned strictly according to the batch_size,
@@ -1054,6 +1059,7 @@ impl Scanner {
             use_scalar_index: true,
             include_deleted_rows: false,
             scan_stats_callback: None,
+            scan_scheduler_diagnostics_callback: None,
             strict_batch_size: false,
             file_reader_options,
             aggregate: None,
@@ -1199,6 +1205,16 @@ impl Scanner {
     /// Set the callback to be called after the scan with summary statistics
     pub fn scan_stats_callback(&mut self, callback: ExecutionStatsCallback) -> &mut Self {
         self.scan_stats_callback = Some(callback);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn scan_scheduler_diagnostics_callback(
+        &mut self,
+        callback: impl Fn(ScanSchedulerDiagnosticsHandle) + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.scan_scheduler_diagnostics_callback =
+            Some(ScanSchedulerDiagnosticsCallback::new(callback));
         self
     }
 
@@ -2893,6 +2909,10 @@ impl Scanner {
             read_options = read_options.with_io_buffer_size(io_buffer_size_bytes);
         }
 
+        if let Some(callback) = self.scan_scheduler_diagnostics_callback.clone() {
+            read_options = read_options.with_scan_scheduler_diagnostics_callback(callback);
+        }
+
         if self.fast_search && filter_plan.has_index_query() {
             read_options = read_options.with_only_indexed_fragments();
         }
@@ -2988,6 +3008,11 @@ impl Scanner {
         if let Some(fragment) = self.fragments.as_ref() {
             filtered_read_options =
                 filtered_read_options.with_fragments(Arc::new(fragment.clone()));
+        }
+
+        if let Some(callback) = self.scan_scheduler_diagnostics_callback.clone() {
+            filtered_read_options =
+                filtered_read_options.with_scan_scheduler_diagnostics_callback(callback);
         }
 
         Ok(Arc::new(FilteredReadExec::try_new(

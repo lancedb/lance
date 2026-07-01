@@ -79,11 +79,23 @@ impl PrioritiesInFlight {
             self.in_flight.remove(pos);
         }
     }
+
+    fn len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.in_flight.is_empty()
+    }
 }
 
 struct IoQueueState {
+    // The configured number of IOPS that can be issued concurrently.
+    io_capacity: u32,
     // Number of IOPS we can issue concurrently before pausing I/O
     iops_avail: u32,
+    // The configured byte budget for unread I/O.
+    io_buffer_size: u64,
     // Number of bytes we are allowed to buffer in memory before pausing I/O
     //
     // This can dip below 0 due to I/O prioritization
@@ -106,7 +118,9 @@ struct IoQueueState {
 impl IoQueueState {
     fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
         Self {
+            io_capacity,
             iops_avail: io_capacity,
+            io_buffer_size,
             bytes_avail: io_buffer_size as i64,
             pending_requests: BinaryHeap::new(),
             priorities_in_flight: PrioritiesInFlight::new(io_capacity),
@@ -114,6 +128,60 @@ impl IoQueueState {
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
             no_backpressure: io_buffer_size == 0,
+        }
+    }
+
+    fn diagnostics(&self) -> SchedulerDiagnostics {
+        let pending_bytes = self
+            .pending_requests
+            .iter()
+            .map(IoTask::num_bytes)
+            .sum::<u64>();
+        let head_task = self.pending_requests.peek();
+        let min_in_flight_priority = if self.priorities_in_flight.is_empty() {
+            None
+        } else {
+            Some(self.priorities_in_flight.min_in_flight())
+        };
+        let head_task_priority_bypass = head_task.map(|task| {
+            self.no_backpressure
+                || task.bypass_backpressure
+                || task.priority <= self.priorities_in_flight.min_in_flight()
+        });
+        let head_task_blocked_by_iops = head_task.map(|_| self.iops_avail == 0);
+        let head_task_blocked_by_bytes = head_task.map(|task| {
+            let bypasses_bytes = self.no_backpressure
+                || task.bypass_backpressure
+                || task.priority <= self.priorities_in_flight.min_in_flight();
+            !bypasses_bytes && task.num_bytes() as i64 > self.bytes_avail
+        });
+        let head_task_can_deliver = head_task.map(|task| self.can_deliver_without_warning(task));
+        let (head_task_priority_high, head_task_priority_low) =
+            split_priority(head_task.map(|task| task.priority));
+        let (min_in_flight_priority_high, min_in_flight_priority_low) =
+            split_priority(min_in_flight_priority);
+        SchedulerDiagnostics {
+            kind: SchedulerQueueKind::Standard,
+            stats: ScanStats::default(),
+            io_capacity: u64::from(self.io_capacity),
+            iops_available: u64::from(self.iops_avail),
+            active_iops: u64::from(self.io_capacity.saturating_sub(self.iops_avail)),
+            pending_iops: self.pending_requests.len() as u64,
+            pending_bytes,
+            bytes_available: self.bytes_avail,
+            bytes_reserved: self.io_buffer_size as i64 - self.bytes_avail,
+            io_buffer_size_bytes: self.io_buffer_size,
+            priorities_in_flight: self.priorities_in_flight.len() as u64,
+            no_backpressure: self.no_backpressure,
+            head_task_bytes: head_task.map(IoTask::num_bytes),
+            head_task_priority_high,
+            head_task_priority_low,
+            min_in_flight_priority_high,
+            min_in_flight_priority_low,
+            head_task_can_deliver,
+            head_task_priority_bypass,
+            head_task_blocked_by_iops,
+            head_task_blocked_by_bytes,
         }
     }
 
@@ -136,6 +204,20 @@ impl IoQueueState {
     }
 
     fn can_deliver(&self, task: &IoTask) -> bool {
+        let can_deliver = self.can_deliver_without_warning(task);
+        if !can_deliver
+            && self.iops_avail > 0
+            && !(self.no_backpressure
+                || task.bypass_backpressure
+                || task.priority <= self.priorities_in_flight.min_in_flight())
+            && task.num_bytes() as i64 > self.bytes_avail
+        {
+            self.warn_if_needed();
+        }
+        can_deliver
+    }
+
+    fn can_deliver_without_warning(&self, task: &IoTask) -> bool {
         if self.iops_avail == 0 {
             false
         } else if self.no_backpressure
@@ -143,11 +225,8 @@ impl IoQueueState {
             || task.priority <= self.priorities_in_flight.min_in_flight()
         {
             true
-        } else if task.num_bytes() as i64 > self.bytes_avail {
-            self.warn_if_needed();
-            false
         } else {
-            true
+            task.num_bytes() as i64 <= self.bytes_avail
         }
     }
 
@@ -205,6 +284,10 @@ impl IoQueue {
         drop(state);
 
         self.notify.notify_one();
+    }
+
+    fn diagnostics(&self) -> SchedulerDiagnostics {
+        self.state.lock().unwrap().diagnostics()
     }
 
     async fn pop(&self) -> Option<IoTask> {
@@ -508,6 +591,50 @@ impl ScanStats {
             requests: stats.requests(),
             bytes_read: stats.bytes_read(),
         }
+    }
+}
+
+fn split_priority(priority: Option<u128>) -> (Option<u64>, Option<u64>) {
+    priority
+        .map(|priority| ((priority >> 64) as u64, priority as u64))
+        .unzip()
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SchedulerQueueKind {
+    Standard,
+    Lite,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerDiagnostics {
+    pub kind: SchedulerQueueKind,
+    pub stats: ScanStats,
+    pub io_capacity: u64,
+    pub iops_available: u64,
+    pub active_iops: u64,
+    pub pending_iops: u64,
+    pub pending_bytes: u64,
+    pub bytes_available: i64,
+    pub bytes_reserved: i64,
+    pub io_buffer_size_bytes: u64,
+    pub priorities_in_flight: u64,
+    pub no_backpressure: bool,
+    pub head_task_bytes: Option<u64>,
+    pub head_task_priority_high: Option<u64>,
+    pub head_task_priority_low: Option<u64>,
+    pub min_in_flight_priority_high: Option<u64>,
+    pub min_in_flight_priority_low: Option<u64>,
+    pub head_task_can_deliver: Option<bool>,
+    pub head_task_priority_bypass: Option<bool>,
+    pub head_task_blocked_by_iops: Option<bool>,
+    pub head_task_blocked_by_bytes: Option<bool>,
+}
+
+impl SchedulerDiagnostics {
+    fn with_stats(mut self, stats: ScanStats) -> Self {
+        self.stats = stats;
+        self
     }
 }
 
@@ -884,6 +1011,14 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         self.stats.snapshot()
+    }
+
+    pub fn diagnostics(&self) -> SchedulerDiagnostics {
+        let diagnostics = match &self.io_queue {
+            IoQueueType::Standard(io_queue) => io_queue.diagnostics(),
+            IoQueueType::Lite(io_queue) => io_queue.diagnostics(),
+        };
+        diagnostics.with_stats(self.stats())
     }
 
     #[cfg(test)]
@@ -1464,6 +1599,98 @@ mod tests {
         // Finally, the low priority request
         semaphore_copy.add_permits(1);
         assert!(second_fut.await.unwrap().unwrap().len() == 20);
+    }
+
+    #[tokio::test]
+    async fn test_standard_scheduler_diagnostics_tracks_queue_state() {
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, vec![0; 1000].into())
+            .await
+            .unwrap();
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut obj_store = MockObjectStore::default();
+        let semaphore_copy = semaphore.clone();
+        obj_store
+            .expect_get_opts()
+            .returning(move |location, options| {
+                let semaphore = semaphore.clone();
+                let base_store = base_store.clone();
+                let location = location.clone();
+                async move {
+                    semaphore.acquire().await.unwrap().forget();
+                    base_store.get_opts(&location, options).await
+                }
+                .boxed()
+            });
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(obj_store),
+            Url::parse("mem://").unwrap(),
+            Some(500),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+
+        let scheduler = ScanScheduler::new(
+            obj_store,
+            SchedulerConfig {
+                io_buffer_size_bytes: 1024 * 1024,
+                use_lite_scheduler: Some(false),
+            },
+        );
+        let file_scheduler = scheduler
+            .open_file(&Path::parse("foo").unwrap(), &CachedFileSize::new(1000))
+            .await
+            .unwrap();
+
+        let first_fut = timeout(
+            Duration::from_secs(10),
+            file_scheduler.submit_single(0..10, 0),
+        )
+        .boxed();
+        let second_fut = timeout(
+            Duration::from_secs(10),
+            file_scheduler.submit_single(0..20, 100),
+        )
+        .boxed();
+        let third_fut = timeout(
+            Duration::from_secs(10),
+            file_scheduler.submit_single(0..30, 0),
+        )
+        .boxed();
+
+        let diagnostics = timeout(Duration::from_secs(5), async {
+            loop {
+                let diagnostics = scheduler.diagnostics();
+                if diagnostics.active_iops == 1 && diagnostics.pending_iops == 2 {
+                    break diagnostics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(diagnostics.kind, SchedulerQueueKind::Standard);
+        assert_eq!(diagnostics.io_capacity, 1);
+        assert_eq!(diagnostics.iops_available, 0);
+        assert_eq!(diagnostics.pending_bytes, 50);
+        assert_eq!(diagnostics.bytes_reserved, 10);
+        assert_eq!(diagnostics.priorities_in_flight, 1);
+        assert_eq!(diagnostics.head_task_bytes, Some(30));
+        assert_eq!(diagnostics.head_task_blocked_by_iops, Some(true));
+        assert_eq!(diagnostics.head_task_blocked_by_bytes, Some(false));
+
+        semaphore_copy.add_permits(3);
+        assert_eq!(first_fut.await.unwrap().unwrap().len(), 10);
+        assert_eq!(third_fut.await.unwrap().unwrap().len(), 30);
+        assert_eq!(second_fut.await.unwrap().unwrap().len(), 20);
     }
 
     #[tokio::test(flavor = "multi_thread")]

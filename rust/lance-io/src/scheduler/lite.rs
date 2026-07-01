@@ -33,7 +33,7 @@ use std::{
 use bytes::Bytes;
 use lance_core::{Error, Result};
 
-use super::{BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN};
+use super::{BACKPRESSURE_DEBOUNCE, BACKPRESSURE_MIN, SchedulerDiagnostics, SchedulerQueueKind};
 
 type RunFn = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<Bytes>> + Send>> + Send>;
 
@@ -237,6 +237,7 @@ trait BackpressureThrottle: Send {
     /// Unconditionally acquire a zero-cost reservation, tracking only the priority.
     /// Used for bypass tasks that must never be blocked by backpressure.
     fn force_acquire(&mut self, priority: u128) -> BackpressureReservation;
+    fn diagnostics(&self) -> BackpressureDiagnostics;
 }
 
 // We want to allow requests that have a lower priority than any
@@ -275,9 +276,22 @@ impl PrioritiesInFlight {
             self.in_flight.remove(pos);
         }
     }
+
+    fn len(&self) -> usize {
+        self.in_flight.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackpressureDiagnostics {
+    max_bytes: u64,
+    bytes_available: i64,
+    priorities_in_flight: u64,
+    no_backpressure: bool,
 }
 
 struct SimpleBackpressureThrottle {
+    max_bytes: u64,
     start: Instant,
     last_warn: AtomicU64,
     bytes_available: i64,
@@ -293,6 +307,7 @@ impl SimpleBackpressureThrottle {
             panic!("Max bytes must be less than {}", i64::MAX);
         }
         Self {
+            max_bytes,
             start: Instant::now(),
             last_warn: AtomicU64::new(0),
             bytes_available: max_bytes as i64,
@@ -348,6 +363,15 @@ impl BackpressureThrottle for SimpleBackpressureThrottle {
         BackpressureReservation {
             num_bytes: 0,
             priority,
+        }
+    }
+
+    fn diagnostics(&self) -> BackpressureDiagnostics {
+        BackpressureDiagnostics {
+            max_bytes: self.max_bytes,
+            bytes_available: self.bytes_available,
+            priorities_in_flight: self.priorities_in_flight.len() as u64,
+            no_backpressure: self.no_backpressure,
         }
     }
 }
@@ -417,6 +441,44 @@ impl IoQueueState {
             Err(Error::internal(error.message))
         } else {
             Ok(())
+        }
+    }
+
+    fn diagnostics(&self) -> SchedulerDiagnostics {
+        let backpressure = self.backpressure_throttle.diagnostics();
+        let pending_bytes = self
+            .pending_tasks
+            .iter()
+            .filter_map(|entry| self.tasks.get(&entry.task_id))
+            .map(|task| task.num_bytes)
+            .sum::<u64>();
+        let active_iops = self
+            .tasks
+            .values()
+            .filter(|task| matches!(task.state, TaskState::Running { .. }))
+            .count() as u64;
+        SchedulerDiagnostics {
+            kind: SchedulerQueueKind::Lite,
+            stats: Default::default(),
+            io_capacity: 0,
+            iops_available: 0,
+            active_iops,
+            pending_iops: self.pending_tasks.len() as u64,
+            pending_bytes,
+            bytes_available: backpressure.bytes_available,
+            bytes_reserved: backpressure.max_bytes as i64 - backpressure.bytes_available,
+            io_buffer_size_bytes: backpressure.max_bytes,
+            priorities_in_flight: backpressure.priorities_in_flight,
+            no_backpressure: backpressure.no_backpressure,
+            head_task_bytes: None,
+            head_task_priority_high: None,
+            head_task_priority_low: None,
+            min_in_flight_priority_high: None,
+            min_in_flight_priority_low: None,
+            head_task_can_deliver: None,
+            head_task_priority_bypass: None,
+            head_task_blocked_by_iops: None,
+            head_task_blocked_by_bytes: None,
         }
     }
 }
@@ -569,6 +631,10 @@ impl IoQueue {
         for task in std::mem::take(&mut state.tasks).values_mut() {
             task.cancel();
         }
+    }
+
+    pub(super) fn diagnostics(&self) -> SchedulerDiagnostics {
+        self.state.lock().unwrap().diagnostics()
     }
 }
 
