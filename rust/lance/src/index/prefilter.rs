@@ -52,6 +52,10 @@ pub struct DatasetPreFilter {
     // Fragment IDs whose data is still in the index but has been removed from the dataset.
     // Used by FTS merge-on-read to prune stale fragments at search time.
     pub(super) deleted_fragments: Option<RoaringBitmap>,
+    // Row addresses whose index entries are stale due to a newer data overlay committed after
+    // the index was built. Computed synchronously at plan time and ANDead into the final mask
+    // so the index never returns those rows.
+    pub(super) overlay_block: Option<RowAddrMask>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -83,6 +87,7 @@ impl DatasetPreFilter {
             deleted_ids,
             filtered_ids,
             deleted_fragments: None,
+            overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
         }
     }
@@ -224,6 +229,13 @@ impl DatasetPreFilter {
     /// dataset but whose data is still present in the index (merge-on-read).
     pub fn set_deleted_fragments(&mut self, fragments: RoaringBitmap) {
         self.deleted_fragments = Some(fragments);
+    }
+
+    /// Block specific row addresses from index results because their index entries are stale
+    /// due to a data overlay committed after the index was built.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
+        self
     }
 
     /// Creates a task to load a mask that filters out deleted rows and,
@@ -383,6 +395,9 @@ impl PreFilter for DatasetPreFilter {
                 }
                 combined = combined & RowAddrMask::from_block(block_list);
             }
+            if let Some(overlay_block) = &self.overlay_block {
+                combined = combined & overlay_block.clone();
+            }
             Arc::new(combined)
         });
 
@@ -393,6 +408,7 @@ impl PreFilter for DatasetPreFilter {
         self.deleted_ids.is_none()
             && self.filtered_ids.is_none()
             && self.deleted_fragments.is_none()
+            && self.overlay_block.is_none()
     }
 
     /// Get the row id mask for this prefilter

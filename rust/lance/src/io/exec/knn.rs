@@ -60,6 +60,8 @@ use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use lance_select::RowAddrMask;
+
 use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
@@ -1099,11 +1101,17 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+/// Create a new ANN execution node, optionally blocking stale row addresses from index results.
+///
+/// `overlay_block`: when `Some`, rows whose addresses are in the block list are excluded from
+/// ANN results (their index entries may be stale due to a newer data overlay). Pass `None`
+/// when no overlay masking is needed.
 pub fn new_knn_exec(
     dataset: Arc<Dataset>,
     indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
+    overlay_block: Option<RowAddrMask>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ivf_node = ANNIvfPartitionExec::try_new(
         dataset.clone(),
@@ -1111,12 +1119,13 @@ pub fn new_knn_exec(
         query.clone(),
     )?;
 
-    let sub_index = ANNIvfSubIndexExec::try_new(
+    let sub_index = ANNIvfSubIndexExec::try_new_with_overlay(
         Arc::new(ivf_node),
         dataset,
         indices.to_vec(),
         query.clone(),
         prefilter_source,
+        overlay_block,
     )?;
 
     Ok(Arc::new(sub_index))
@@ -1377,6 +1386,10 @@ pub struct ANNIvfSubIndexExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
 
+    /// Row addresses whose index entries are stale due to a newer data overlay. Blocked from
+    /// index results at execution time via [`DatasetPreFilter::with_overlay_block`].
+    overlay_block: Option<RowAddrMask>,
+
     /// Datafusion Plan Properties
     properties: Arc<PlanProperties>,
 
@@ -1390,6 +1403,17 @@ impl ANNIvfSubIndexExec {
         indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
+    ) -> Result<Self> {
+        Self::try_new_with_overlay(input, dataset, indices, query, prefilter_source, None)
+    }
+
+    pub fn try_new_with_overlay(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        indices: Vec<IndexMetadata>,
+        query: Query,
+        prefilter_source: PreFilterSource,
+        overlay_block: Option<RowAddrMask>,
     ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
             return Err(Error::index(format!(
@@ -1409,6 +1433,7 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
+            overlay_block,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
@@ -1880,6 +1905,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 indices: self.indices.clone(),
                 query: self.query.clone(),
                 prefilter_source,
+                overlay_block: self.overlay_block.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             }
@@ -1960,11 +1986,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             PreFilterSource::None => None,
         };
 
-        let pre_filter = Arc::new(DatasetPreFilter::new(
-            ds.clone(),
-            &indices,
-            prefilter_loader,
-        ));
+        let pre_filter = {
+            let mut pf = DatasetPreFilter::new(ds.clone(), &indices, prefilter_loader);
+            if let Some(block) = self.overlay_block.clone() {
+                pf = pf.with_overlay_block(block);
+            }
+            Arc::new(pf)
+        };
 
         let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
 

@@ -12,12 +12,12 @@ use std::task::{Context, Poll};
 
 use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{Array, Float32Array, Int64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
-use datafusion::common::{DFSchema, JoinType, NullEquality, SchemaExt, exec_datafusion_err};
+use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
@@ -3861,21 +3861,30 @@ impl Scanner {
                     "Refine factor cannot be zero".to_string(),
                 ));
             }
-            // Mask data overlay files: drop fragments with a newer overlay on the vector field
-            // from the index's coverage so the ANN prefilter blocks their (stale) rows, and
-            // re-score them on the flat path below.
-            let (masked_segments, stale_frags) =
-                self.mask_overlay_stale_segments(&index_segments)?;
-            // Use masked segments when stale fragments were found; otherwise the originals.
-            let effective_segments: &[IndexMetadata] =
-                masked_segments.as_deref().unwrap_or(&index_segments);
+            // Mask data overlay files: compute which row addresses within each segment have
+            // been updated by a newer overlay so their ANN entries may be stale.
+            // These stale rows are blocked from ANN results via the prefilter and re-scored
+            // on the targeted flat path below — only the specific stale rows, not the whole
+            // fragment, so sparse overlays incur near-zero overhead.
+            let stale_rows = self.mask_overlay_stale_rows(&index_segments)?;
+            // Build a prefilter block mask for stale rows (empty = no-op fast path).
+            let overlay_block: Option<RowAddrMask> = if stale_rows.is_empty() {
+                None
+            } else {
+                let mut tree_map = RowAddrTreeMap::new();
+                for (&frag_id, offsets) in &stale_rows {
+                    tree_map.insert_bitmap(frag_id, offsets.clone());
+                }
+                Some(RowAddrMask::from_block(tree_map))
+            };
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    self.ann(&q, effective_segments, filter_plan).await?
+                    self.ann(&q, &index_segments, filter_plan, overlay_block.clone())
+                        .await?
                 }
                 DataType::List(_) => {
-                    self.multivec_ann(&q, effective_segments, filter_plan)
+                    self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
                         .await?
                 }
                 _ => unreachable!(),
@@ -3898,8 +3907,8 @@ impl Scanner {
                     .knn_combined(
                         &q,
                         &index_name,
-                        effective_segments,
-                        &stale_frags,
+                        &index_segments,
+                        &stale_rows,
                         knn_node,
                         filter_plan,
                     )
@@ -4037,11 +4046,11 @@ impl Scanner {
         q: &Query,
         index_name: &str,
         indexed_segments: &[IndexMetadata],
-        stale_frags: &RoaringBitmap,
+        stale_rows: &std::collections::HashMap<u32, RoaringBitmap>,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut fallback_fragments = if let Some(target_fragments) = &self.fragments {
+        let fallback_fragments = if let Some(target_fragments) = &self.fragments {
             let indexed_fragments = self.get_indexed_frags(indexed_segments);
             target_fragments
                 .iter()
@@ -4054,42 +4063,42 @@ impl Scanner {
             self.dataset.unindexed_fragments(index_name).await?
         };
 
-        // Fragments masked off the index by a newer overlay are blocked from the ANN
-        // via the prefilter; add them here so their current vectors are re-scored on the flat
-        // path and can re-enter the top-k. They are indexed fragments, so they cannot already be
-        // in the unindexed fallback set above.
-        if !stale_frags.is_empty() {
-            for fragment in self.dataset.fragments().iter() {
-                if stale_frags.contains(fragment.id as u32) {
-                    fallback_fragments.push(fragment.clone());
-                }
-            }
+        let has_fallback = !fallback_fragments.is_empty();
+        let has_stale = !stale_rows.is_empty();
+
+        if !has_fallback && !has_stale {
+            return Ok(knn_node);
         }
 
-        if !fallback_fragments.is_empty() {
-            let q = q.clone();
-            debug_assert!(q.metric_type.is_some());
+        let q = q.clone();
+        debug_assert!(q.metric_type.is_some());
 
-            // If the vector column is not present, we need to take the vector column, so
-            // that the distance value is comparable with the flat search ones.
-            if knn_node.schema().column_with_name(&q.column).is_none() {
-                let vector_projection = self
-                    .dataset
-                    .empty_projection()
-                    .union_column(&q.column, OnMissing::Error)
-                    .unwrap();
-                knn_node = self.take(knn_node, vector_projection)?;
-            }
+        // Ensure the vector column is present for distance computation.
+        if knn_node.schema().column_with_name(&q.column).is_none() {
+            let vector_projection = self
+                .dataset
+                .empty_projection()
+                .union_column(&q.column, OnMissing::Error)
+                .unwrap();
+            knn_node = self.take(knn_node, vector_projection)?;
+        }
 
-            let mut columns = vec![q.column.clone()];
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                let filter_columns = Planner::column_names_in_expr(expr);
-                columns.extend(filter_columns);
-            }
+        let mut columns = vec![q.column.clone()];
+        if let Some(expr) = filter_plan.full_expr.as_ref() {
+            let filter_columns = Planner::column_names_in_expr(expr);
+            columns.extend(filter_columns);
+        }
+
+        // Collect flat-path plans; union order matches original (flat before ANN) so test snapshots
+        // and downstream plan analyses remain stable.
+        let mut flat_inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+
+        // Flat KNN for unindexed (new-data) fragments.
+        if has_fallback {
             let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            // Note: we could try and use the scalar indices here to reduce the scope of this scan but the
-            // most common case is that fragments that are newer than the vector index are going to be newer
-            // than the scalar indices anyways
+            // Note: we could try and use the scalar indices here to reduce the scope of this scan
+            // but the most common case is that fragments newer than the vector index are also
+            // newer than the scalar indices.
             let mut scan_node = self.scan_fragments(
                 true,
                 false,
@@ -4098,41 +4107,67 @@ impl Scanner {
                 false,
                 vector_scan_projection,
                 Arc::new(fallback_fragments),
-                // Can't pushdown limit/offset in an ANN search
                 None,
-                // We are re-ordering anyways, so no need to get data in data
-                // in a deterministic order.
                 false,
             );
-
             if let Some(expr) = filter_plan.full_expr.as_ref() {
-                // If there is a prefilter we need to manually apply it to the new data
                 scan_node = Arc::new(LanceFilterExec::try_new(expr.clone(), scan_node)?);
             }
-            // first we do flat search on just the new data
-            let topk_appended = self.flat_knn(scan_node, &q)?;
-
-            // To do a union, we need to make the schemas match. Right now
-            // knn_node: _distance, _rowid, vector
-            // topk_appended: vector, <filter columns?>, _rowid, _distance
-            let topk_appended = project(topk_appended, knn_node.schema().as_ref())?;
-            assert!(
-                topk_appended
-                    .schema()
-                    .equivalent_names_and_types(&knn_node.schema())
-            );
-            // union
-            let unioned = UnionExec::try_new(vec![Arc::new(topk_appended), knn_node])?;
-            // Enforce only 1 partition.
-            let unioned = RepartitionExec::try_new(
-                unioned,
-                datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-            )?;
-            // then we do a flat search on KNN(new data) + ANN(indexed data)
-            return self.flat_knn(Arc::new(unioned), &q);
+            let topk_fallback = self.flat_knn(scan_node, &q)?;
+            let topk_fallback: Arc<dyn ExecutionPlan> =
+                Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
+            flat_inputs.push(topk_fallback);
         }
 
-        Ok(knn_node)
+        // Flat KNN for stale rows only (row-level precision).
+        // Only specific row addresses need re-scoring, not the whole fragment, so sparse overlays
+        // incur near-zero overhead.
+        if has_stale {
+            let stale_addrs: Vec<u64> = stale_rows
+                .iter()
+                .flat_map(|(&frag_id, offsets)| {
+                    offsets
+                        .iter()
+                        .map(move |offset| ((frag_id as u64) << 32) | offset as u64)
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    ROW_ID,
+                    DataType::UInt64,
+                    true,
+                )])),
+                vec![Arc::new(UInt64Array::from(stale_addrs))],
+            )?;
+            let stale_id_plan = Arc::new(OneShotExec::from_batch(batch));
+
+            // Fetch vector + filter columns for the stale rows.
+            let mut take_proj = self
+                .dataset
+                .empty_projection()
+                .union_column(&q.column, OnMissing::Error)?;
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
+                let filter_columns = Planner::column_names_in_expr(expr);
+                take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
+            }
+            let mut stale_node = self.take(stale_id_plan, take_proj)?;
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
+                stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
+            }
+            let topk_stale = self.flat_knn(stale_node, &q)?;
+            let topk_stale: Arc<dyn ExecutionPlan> =
+                Arc::new(project(topk_stale, knn_node.schema().as_ref())?);
+            flat_inputs.push(topk_stale);
+        }
+
+        // Union: flat paths first (matching original order), then ANN results.
+        flat_inputs.push(knn_node);
+        let unioned = UnionExec::try_new(flat_inputs)?;
+        let unioned = RepartitionExec::try_new(
+            unioned,
+            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
+        )?;
+        self.flat_knn(Arc::new(unioned), &q)
     }
 
     #[async_recursion]
@@ -4254,45 +4289,30 @@ impl Scanner {
         Ok(stale)
     }
 
-    /// Mask data overlay files for a vector index.
+    /// Compute per-row stale data for a vector index's segments.
     ///
-    /// Returns `(masked_segments, stale_frags)`:
-    /// - `masked_segments`: `Some(vec)` with stale-fragment rows removed from coverage bitmaps
-    ///   when masking was needed; `None` when no masking was necessary (use the original
-    ///   `segments` slice unchanged — this avoids cloning on the common no-overlay fast path).
-    /// - `stale_frags`: fragment ids whose ANN entries may be stale; the caller re-scores them
-    ///   against current vectors on the flat path.
-    fn mask_overlay_stale_segments(
+    /// Returns a map from fragment_id to the set of row offsets within that fragment that are stale
+    /// (their vector values have been updated by a newer overlay since the index was built). An
+    /// empty map means no stale rows — the fast path where no masking is needed.
+    fn mask_overlay_stale_rows(
         &self,
         segments: &[IndexMetadata],
-    ) -> Result<(Option<Vec<IndexMetadata>>, RoaringBitmap)> {
+    ) -> Result<std::collections::HashMap<u32, RoaringBitmap>> {
         let fragments = self.dataset.fragments();
         if fragments
             .iter()
             .all(|fragment| fragment.overlays.is_empty())
         {
-            return Ok((None, RoaringBitmap::new()));
+            return Ok(std::collections::HashMap::new());
         }
         let frag_by_id: std::collections::HashMap<u32, &Fragment> =
             fragments.iter().map(|f| (f.id as u32, f)).collect();
-        let mut stale = RoaringBitmap::new();
+        let mut stale: std::collections::HashMap<u32, RoaringBitmap> =
+            std::collections::HashMap::new();
         for segment in segments {
-            collect_stale_overlay_frags(segment, &frag_by_id, &mut stale)?;
+            collect_overlay_stale_rows_for_segment(segment, &frag_by_id, &mut stale)?;
         }
-        if stale.is_empty() {
-            return Ok((None, RoaringBitmap::new()));
-        }
-        let effective = segments
-            .iter()
-            .map(|segment| {
-                let mut segment = segment.clone();
-                if let Some(bitmap) = segment.fragment_bitmap.as_mut() {
-                    *bitmap -= &stale;
-                }
-                segment
-            })
-            .collect();
-        Ok((Some(effective), stale))
+        Ok(stale)
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -4862,11 +4882,18 @@ impl Scanner {
         q: &Query,
         index: &[IndexMetadata],
         filter_plan: &ExprFilterPlan,
+        overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self
             .prefilter_source(filter_plan, self.get_indexed_frags(index))
             .await?;
-        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
+        let inner_fanout_search = new_knn_exec(
+            self.dataset.clone(),
+            index,
+            q,
+            prefilter_source,
+            overlay_block,
+        )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -4893,6 +4920,7 @@ impl Scanner {
         q: &Query,
         index: &[IndexMetadata],
         filter_plan: &ExprFilterPlan,
+        overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // we split the query procedure into two steps:
         // 1. collect the candidates by vector searching on each query vector
@@ -4925,6 +4953,7 @@ impl Scanner {
                 index,
                 &query,
                 prefilter_source.clone(),
+                overlay_block.clone(),
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
@@ -13573,6 +13602,47 @@ fn collect_stale_overlay_frags(
             .is_empty()
         {
             stale.insert(frag_id);
+        }
+    }
+    Ok(())
+}
+
+/// Like [`collect_stale_overlay_frags`] but with row-level granularity: instead of marking the
+/// whole fragment stale, it computes exactly which row offsets within each covered fragment are
+/// stale and accumulates them into `stale` (fragment_id → stale row offsets).
+///
+/// Used by the vector ANN path to block only the affected rows from ANN results and
+/// re-score only those rows on the flat path, keeping overhead proportional to the number of
+/// overlaid rows rather than the whole fragment size.
+fn collect_overlay_stale_rows_for_segment(
+    segment: &IndexMetadata,
+    frag_by_id: &std::collections::HashMap<u32, &Fragment>,
+    stale: &mut std::collections::HashMap<u32, RoaringBitmap>,
+) -> Result<()> {
+    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
+        return Ok(());
+    };
+    for frag_id in coverage.iter() {
+        let Some(fragment) = frag_by_id.get(&frag_id) else {
+            continue;
+        };
+        if fragment.overlays.is_empty() {
+            continue;
+        }
+        if fragment
+            .overlays
+            .iter()
+            .all(|o| o.committed_version <= segment.dataset_version)
+        {
+            continue;
+        }
+        let excluded = overlay_exclusion_offsets(
+            &fragment.overlays,
+            &segment.fields,
+            segment.dataset_version,
+        )?;
+        if !excluded.is_empty() {
+            *stale.entry(frag_id).or_default() |= &excluded;
         }
     }
     Ok(())
