@@ -960,10 +960,20 @@ impl FtsMemIndex {
 
     /// Create a new FTS index with custom tokenizer parameters.
     pub fn with_params(field_id: i32, column_name: String, params: InvertedIndexParams) -> Self {
-        let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)
-            .expect("Failed to build tokenizer");
+        Self::try_with_params(field_id, column_name, params)
+            .expect("invalid MemWAL FTS index parameters")
+    }
+
+    /// Try to create a new FTS index with custom tokenizer parameters.
+    pub fn try_with_params(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+    ) -> Result<Self> {
+        params.validate_format_version()?;
+        let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)?;
         let writer_tokenizer = pool.template.box_clone();
-        Self {
+        Ok(Self {
             field_id,
             column_name,
             params,
@@ -972,7 +982,7 @@ impl FtsMemIndex {
             state: ArcSwap::from(IndexState::empty()),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
             merge: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     /// Override the tail freeze threshold (docs) — the analogue of Lucene's
@@ -2338,12 +2348,23 @@ impl FtsIndexConfig {
         column: String,
         params: InvertedIndexParams,
     ) -> Self {
-        Self {
+        Self::try_with_params(name, field_id, column, params)
+            .expect("invalid MemWAL FTS index config parameters")
+    }
+
+    pub fn try_with_params(
+        name: String,
+        field_id: i32,
+        column: String,
+        params: InvertedIndexParams,
+    ) -> Result<Self> {
+        params.validate_format_version()?;
+        Ok(Self {
             name,
             field_id,
             column,
             params,
-        }
+        })
     }
 }
 
@@ -4670,6 +4691,18 @@ mod tests {
         let builder = index.to_index_builder(42, 3).unwrap();
         // The builder can be consumed by callers; we just check it built.
         assert!(builder.id() > 0 || builder.id() == 42);
+    }
+
+    #[test]
+    fn test_to_index_builder_supports_block_size_256() {
+        let schema = create_test_schema();
+        let params = InvertedIndexParams::default().block_size(256).unwrap();
+        let index = FtsMemIndex::try_with_params(1, "description".to_string(), params).unwrap();
+        let batch = create_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        let builder = index.to_index_builder(42, 3).unwrap();
+        assert_eq!(builder.id(), 42);
     }
 
     #[test]
