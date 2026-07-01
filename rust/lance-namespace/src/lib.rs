@@ -21,7 +21,7 @@ pub mod schema;
 
 // Re-export the trait at the crate root
 pub use lance_core::{Error, Result};
-pub use namespace::LanceNamespace;
+pub use namespace::{LanceNamespace, PurgableTable, TableLifecycle};
 
 // Re-export error types
 pub use error::{ErrorCode, NamespaceError, Result as NamespaceResult};
