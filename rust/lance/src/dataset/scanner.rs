@@ -3346,6 +3346,10 @@ impl Scanner {
                 self.fragments_covered_by_fts_query(&query).await?,
             )
             .await?;
+        // TODO: FTS does not yet mask data overlay files. A fragment with an overlay
+        // on an FTS-indexed field committed after the index was built may return stale hits. The
+        // fix requires identifying stale FTS segments (analogous to `overlay_stale_index_frags`)
+        // and routing their fragments to the flat-text fallback path.
         let fts_exec = self
             .plan_fts(&query, &params, filter_plan, &prefilter_source)
             .await?;
@@ -13990,6 +13994,45 @@ mod overlay_index_masking {
         );
     }
 
+    /// A compound boolean predicate (age AND id) exercises the ScalarIndexExpr tree-walk in
+    /// `overlay_stale_index_frags`. An overlay on `age` marks fragment 0 stale from the `age`
+    /// index's perspective, so the compound query must re-evaluate fragment 0 on the flat path.
+    #[tokio::test]
+    async fn test_overlay_stale_with_compound_index_expression() {
+        let mut dataset = create_base_dataset().await;
+        // Build BTree indexes on both columns so a compound filter can use both.
+        build_age_index(&mut dataset).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Fragment 0 covers id=0..5, age=0..50. Overlay changes id=1's age from 10 to 999.
+        let dataset = commit_overlay(
+            dataset,
+            "age_compound",
+            0,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(999)])],
+        )
+        .await;
+
+        // Compound query: both the `age` and `id` index are involved. The overlay on `age`
+        // makes fragment 0 stale for the `age` index; it falls to the flat path, which uses
+        // the merged (overlay) value. Result: the stale age=10 hit is gone, age=999 appears.
+        assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+        assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+        // A pure `id` query on an unaffected fragment still works correctly.
+        assert_eq!(ids_matching(&dataset, "id = 2").await, vec![2]);
+    }
+
     /// Benchmark: measure query latency for BTree, FTS, and vector ANN with 0/4/16 overlay layers.
     ///
     /// Run with: cargo test -p lance --lib --release -- overlay_index_masking::bench --ignored --nocapture
@@ -14000,7 +14043,6 @@ mod overlay_index_masking {
         use std::time::Instant;
 
         use arrow_array::{Float32Array, StringArray};
-        use lance_core::utils::tempfile::TempStrDir;
         use lance_index::scalar::FullTextSearchQuery;
         use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
         use lance_linalg::distance::MetricType;
@@ -14013,8 +14055,8 @@ mod overlay_index_masking {
 
         // --- Build dataset --------------------------------------------------
 
-        let tmp = TempStrDir::default();
-        let uri = tmp.as_str();
+        // Use an in-memory store so the benchmark works in release builds (no filesystem perms needed).
+        let uri = "memory://";
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
@@ -14111,15 +14153,13 @@ mod overlay_index_masking {
             "overlays", "btree_ms", "fts_ms", "vec_ms"
         );
 
+        // Commit overlays incrementally: 0 → 4 → 16 total. Each layer covers fragment 0,
+        // field 1 (age), offset 0. They are committed after index build, so they trigger masking.
+        let mut committed = 0u32;
         for num_overlays in [0u32, 4, 16] {
-            // Reopen from disk to get a fresh dataset handle.
-            let mut ds = Dataset::open(uri).await.unwrap();
-
-            // Commit N overlay layers on fragment 0, field 1 (age), offset 0.
-            // Each layer has committed_version > index.dataset_version so triggers masking.
-            for layer in 0..num_overlays {
-                ds = commit_overlay(
-                    ds,
+            for layer in committed..num_overlays {
+                dataset = commit_overlay(
+                    dataset,
                     &format!("age_ol{layer}"),
                     0,
                     &[1],
@@ -14128,8 +14168,9 @@ mod overlay_index_masking {
                 )
                 .await;
             }
+            committed = num_overlays;
 
-            let ds = Arc::new(ds);
+            let ds = Arc::new(dataset.clone()); // cheap Arc/manifest clone
 
             // BTree filter on age (indexed)
             let ds2 = ds.clone();
