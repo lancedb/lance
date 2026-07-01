@@ -2260,8 +2260,7 @@ impl DirectoryNamespace {
                     "Failed to load alter_transaction sidecar for '{}': {}",
                     txn_uuid, e
                 ),
-            })
-            .into()),
+            })),
         }
     }
 
@@ -3926,7 +3925,7 @@ impl LanceNamespace for DirectoryNamespace {
         // must not be modified via alter_transaction. They are only surfaced in
         // the response for the caller's convenience.
         const RESERVED_KEYS: &[&str] = &["uuid", "version", "read_version", "operation", "tag"];
-        let is_reserved = |key: &str| RESERVED_KEYS.iter().any(|k| *k == key);
+        let is_reserved = |key: &str| RESERVED_KEYS.contains(&key);
 
         // Load the existing sidecar (if any) so alterations accumulate across
         // successive alter_transaction calls.
