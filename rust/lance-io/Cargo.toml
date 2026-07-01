@@ -78,6 +78,7 @@ tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
 tos-test = ["tos"]
+hdfs = ["dep:opendal", "opendal/services-hdfs", "dep:object_store_opendal"]
 test-util = []
 
 [lints]

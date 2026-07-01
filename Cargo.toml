@@ -166,8 +166,9 @@ moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
 object_store = { version = "0.13.2" }
-opendal = { version = "0.57" }
-object_store_opendal = { version = "0.57" }
+# TODO: switch back to a crates.io release after apache/opendal#7815 is published.
+opendal = { git = "https://github.com/hfutatzhanghb/opendal", rev = "3a603c4812f5b73b265fde72203e96325f0cd94a" }
+object_store_opendal = { git = "https://github.com/hfutatzhanghb/opendal", rev = "3a603c4812f5b73b265fde72203e96325f0cd94a" }
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.15.0", features = ["flamegraph"] }

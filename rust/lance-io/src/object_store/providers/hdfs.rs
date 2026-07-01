@@ -1,0 +1,454 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! HDFS object store provider backed by OpenDAL.
+//!
+//! HDFS support is optional and requires the `hdfs` Cargo feature. Dataset URIs
+//! use the form `hdfs://<name-node-or-nameservice>/<path>`, for example
+//! `hdfs://namenode:9000/user/lance/dataset` or
+//! `hdfs://mycluster/user/lance/dataset` for an HA nameservice.
+//!
+//! Configuration priority is `storage_options`, environment variables, then
+//! the URI authority:
+//!
+//! | `storage_options` key | Environment variable | OpenDAL option |
+//! | --- | --- | --- |
+//! | `hdfs_name_node` | `HDFS_NAME_NODE` | `name_node` |
+//! | `hdfs_user` | `HADOOP_USER_NAME`, then `HDFS_USER` | `user` |
+//! | `hdfs_kerberos_ticket_cache_path` | None | `kerberos_ticket_cache_path` |
+//! | `hdfs_atomic_write_dir` | None | `atomic_write_dir` |
+//!
+//! OpenDAL's HDFS service depends on `hdrs` and `hdfs-sys`. Building and
+//! running it requires a local Java and Hadoop native environment. In
+//! particular, configure `JAVA_HOME`, `HADOOP_HOME`, `CLASSPATH`, and the
+//! platform library path so that `libjvm` and, when dynamically linked,
+//! `libhdfs` can be discovered.
+
+use std::collections::HashMap;
+use std::fmt::{Debug, Display, Formatter};
+use std::ops::Range;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use futures::FutureExt;
+use futures::stream::BoxStream;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, RenameTargetMode, path::Path,
+};
+use object_store_opendal::OpendalStore;
+use opendal::raw::percent_decode_path;
+use opendal::{Operator, services::Hdfs};
+use url::Url;
+
+use crate::object_store::{
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+};
+use lance_core::error::{Error, Result};
+
+/// HDFS object store provider backed by OpenDAL.
+#[derive(Default, Debug)]
+pub struct HdfsStoreProvider;
+
+impl HdfsStoreProvider {
+    fn operator_error(error: impl std::fmt::Display, name_node: &str, has_user: bool) -> Error {
+        Error::io(format!(
+            "Failed to create HDFS operator: {error}. name_node={name_node}, has_user={has_user}"
+        ))
+    }
+
+    fn build_config<I, K, V>(
+        base_path: &Url,
+        storage_options: &StorageOptions,
+        env_vars: I,
+    ) -> Result<HashMap<String, String>>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        base_path
+            .host_str()
+            .ok_or_else(|| Error::invalid_input("HDFS URI must contain namenode host"))?;
+
+        let env_vars = env_vars
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let value = value.into();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some((key.as_ref().to_string(), value))
+                }
+            })
+            .collect::<HashMap<_, _>>();
+
+        let name_node = storage_options
+            .0
+            .get("hdfs_name_node")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .or_else(|| env_vars.get("HDFS_NAME_NODE").cloned())
+            .unwrap_or_else(|| format!("hdfs://{}", base_path.authority()));
+
+        let mut config = HashMap::from([
+            ("name_node".to_string(), name_node),
+            ("root".to_string(), "/".to_string()),
+            ("rename_overwrite".to_string(), "false".to_string()),
+        ]);
+
+        let user = storage_options
+            .0
+            .get("hdfs_user")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .or_else(|| env_vars.get("HADOOP_USER_NAME").cloned())
+            .or_else(|| env_vars.get("HDFS_USER").cloned());
+        if let Some(user) = user {
+            config.insert("user".to_string(), user);
+        }
+
+        for (storage_key, config_key) in [
+            (
+                "hdfs_kerberos_ticket_cache_path",
+                "kerberos_ticket_cache_path",
+            ),
+            ("hdfs_atomic_write_dir", "atomic_write_dir"),
+        ] {
+            if let Some(value) = storage_options.0.get(storage_key).filter(|v| !v.is_empty()) {
+                config.insert(config_key.to_string(), value.clone());
+            }
+        }
+
+        Ok(config)
+    }
+
+    /// Calculate the object store prefix from the resolved effective NameNode.
+    ///
+    /// The prefix identifies the datastore for caching and must reflect the
+    /// actual HDFS cluster the client connects to — not just the URI authority.
+    /// NameNode resolution follows the same priority as `build_config`:
+    /// `hdfs_name_node` → `HDFS_NAME_NODE` → URI authority.
+    fn calculate_object_store_prefix_with_env(
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+        env_vars: &HashMap<String, String>,
+    ) -> Result<String> {
+        let authority = storage_options
+            .and_then(|opts| opts.get("hdfs_name_node"))
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .or_else(|| env_vars.get("HDFS_NAME_NODE").cloned())
+            .unwrap_or_else(|| url.authority().to_string());
+
+        Ok(format!("{}${}", url.scheme(), authority))
+    }
+}
+
+struct HdfsObjectStore {
+    inner: OpendalStore,
+    operator: Operator,
+}
+
+impl HdfsObjectStore {
+    fn new(operator: Operator) -> Self {
+        Self {
+            inner: OpendalStore::new(operator.clone()),
+            operator,
+        }
+    }
+
+    fn format_opendal_error(err: opendal::Error, path: &Path) -> object_store::Error {
+        match err.kind() {
+            opendal::ErrorKind::NotFound => object_store::Error::NotFound {
+                path: path.to_string(),
+                source: Box::new(err),
+            },
+            opendal::ErrorKind::AlreadyExists => object_store::Error::AlreadyExists {
+                path: path.to_string(),
+                source: Box::new(err),
+            },
+            opendal::ErrorKind::Unsupported => object_store::Error::NotSupported {
+                source: Box::new(err),
+            },
+            opendal::ErrorKind::ConditionNotMatch => object_store::Error::Precondition {
+                path: path.to_string(),
+                source: Box::new(err),
+            },
+            kind => object_store::Error::Generic {
+                store: kind.into_static(),
+                source: Box::new(err),
+            },
+        }
+    }
+}
+
+impl Debug for HdfsObjectStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HdfsObjectStore")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl Display for HdfsObjectStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for HdfsObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: RenameOptions,
+    ) -> object_store::Result<()> {
+        if !matches!(options.target_mode, RenameTargetMode::Create) {
+            return self.inner.rename_opts(from, to, options).await;
+        }
+
+        self.operator
+            .rename(
+                &percent_decode_path(from.as_ref()),
+                &percent_decode_path(to.as_ref()),
+            )
+            .into_send()
+            .await
+            .map_err(|err| Self::format_opendal_error(err, to))
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for HdfsStoreProvider {
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let config = Self::build_config(&base_path, &storage_options, std::env::vars())?;
+
+        let name_node = config
+            .get("name_node")
+            .cloned()
+            .unwrap_or_else(|| "<missing>".to_string());
+        let has_user = config.contains_key("user");
+        let operator = Operator::from_iter::<Hdfs>(config)
+            .map_err(|error| Self::operator_error(error, &name_node, has_user))?
+            .finish();
+        let opendal_store = Arc::new(HdfsObjectStore::new(operator));
+
+        Ok(ObjectStore {
+            scheme: "hdfs".to_string(),
+            inner: opendal_store,
+            block_size,
+            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
+            use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+            list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(false),
+            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+            download_retry_count: storage_options.download_retry_count(),
+            io_tracker: Default::default(),
+            store_prefix: self
+                .calculate_object_store_prefix(&base_path, params.storage_options())?,
+        })
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        let env_vars = std::env::vars().collect::<HashMap<String, String>>();
+        Self::calculate_object_store_prefix_with_env(url, storage_options, &env_vars)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object_store::ObjectStoreProvider;
+    use object_store::path::Path;
+
+    #[test]
+    fn test_hdfs_store_paths() {
+        let provider = HdfsStoreProvider;
+        let cases = [
+            ("hdfs://namenode:9000/path/to/file", "path/to/file"),
+            ("hdfs://namenode/path/to/file", "path/to/file"),
+            ("hdfs://namenode:9000/", ""),
+            (
+                "hdfs://namenode:9000/user/data/dataset/file.parquet",
+                "user/data/dataset/file.parquet",
+            ),
+            ("hdfs://ht-hdfsqa/user/data/file.txt", "user/data/file.txt"),
+        ];
+
+        for (url, expected_path) in cases {
+            let path = provider.extract_path(&Url::parse(url).unwrap()).unwrap();
+            assert_eq!(path, Path::from(expected_path));
+        }
+    }
+
+    #[test]
+    fn test_hdfs_config_from_url() {
+        let url = Url::parse("hdfs://namenode:9000/test").unwrap();
+        let config = HdfsStoreProvider::build_config(
+            &url,
+            &StorageOptions::default(),
+            Vec::<(&str, &str)>::new(),
+        )
+        .unwrap();
+
+        assert_eq!(config.get("name_node").unwrap(), "hdfs://namenode:9000");
+        assert_eq!(config.get("root").unwrap(), "/");
+        assert_eq!(config.get("rename_overwrite").unwrap(), "false");
+    }
+
+    #[test]
+    fn test_hdfs_storage_options_override_environment_and_url() {
+        let url = Url::parse("hdfs://url-namenode:9000/test").unwrap();
+        let storage_options = StorageOptions(HashMap::from([
+            (
+                "hdfs_name_node".to_string(),
+                "hdfs://option-namenode:8020".to_string(),
+            ),
+            ("hdfs_user".to_string(), "option-user".to_string()),
+            (
+                "hdfs_kerberos_ticket_cache_path".to_string(),
+                "/tmp/krb5cc".to_string(),
+            ),
+            (
+                "hdfs_atomic_write_dir".to_string(),
+                "/tmp/atomic".to_string(),
+            ),
+        ]));
+        let env_vars = [
+            ("HDFS_NAME_NODE", "hdfs://env-namenode:9000"),
+            ("HADOOP_USER_NAME", "env-user"),
+        ];
+
+        let config = HdfsStoreProvider::build_config(&url, &storage_options, env_vars).unwrap();
+
+        assert_eq!(
+            config.get("name_node").unwrap(),
+            "hdfs://option-namenode:8020"
+        );
+        assert_eq!(config.get("user").unwrap(), "option-user");
+        assert_eq!(
+            config.get("kerberos_ticket_cache_path").unwrap(),
+            "/tmp/krb5cc"
+        );
+        assert_eq!(config.get("atomic_write_dir").unwrap(), "/tmp/atomic");
+        assert_eq!(config.get("rename_overwrite").unwrap(), "false");
+    }
+
+    #[test]
+    fn test_hdfs_config_from_environment() {
+        let url = Url::parse("hdfs://url-namenode:9000/test").unwrap();
+        let env_vars = [
+            ("HDFS_NAME_NODE", "hdfs://env-namenode:9000"),
+            ("HADOOP_USER_NAME", "env-user"),
+        ];
+
+        let config =
+            HdfsStoreProvider::build_config(&url, &StorageOptions::default(), env_vars).unwrap();
+
+        assert_eq!(config.get("name_node").unwrap(), "hdfs://env-namenode:9000");
+        assert_eq!(config.get("user").unwrap(), "env-user");
+    }
+
+    #[test]
+    fn test_hdfs_config_rejects_url_without_host() {
+        let url = Url::parse("hdfs:///test").unwrap();
+        let error = HdfsStoreProvider::build_config(
+            &url,
+            &StorageOptions::default(),
+            Vec::<(&str, &str)>::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("namenode host"));
+    }
+
+    #[test]
+    fn test_hdfs_operator_error_includes_connection_context() {
+        let error = HdfsStoreProvider::operator_error(
+            std::io::Error::other("native client unavailable"),
+            "hdfs://namenode:9000",
+            true,
+        );
+        let message = error.to_string();
+
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(message.contains("native client unavailable"));
+        assert!(message.contains("name_node=hdfs://namenode:9000"));
+        assert!(message.contains("has_user=true"));
+    }
+}

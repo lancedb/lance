@@ -224,6 +224,22 @@ mvn clean package
 ```
 This command executes the base Maven build process to compile all Java code in the `java` directory and generate the JNI native library.
 
+HDFS-enabled Build:
+
+HDFS support is not enabled by default because it introduces additional native dependencies and requires a Java and Hadoop environment. To build the Java SDK and JNI native library with HDFS support, pass the `hdfs` Cargo feature through the Rust Maven plugin:
+
+```shell
+mvn clean package -Dfeatures=hdfs
+```
+
+For a release build with HDFS support:
+
+```shell
+mvn clean package -Drust.release.build=true -Dfeatures=hdfs
+```
+
+The resulting native library requires the Hadoop native client libraries at runtime. Configure `JAVA_HOME`, Hadoop configuration, and the platform library path, such as `LD_LIBRARY_PATH`, before loading the Java SDK.
+
 Java-Only Build: 
 
 ```shell
@@ -241,8 +257,10 @@ This will enable product environment optimization configurations (e.g., code shr
 If you only want to build rust code(`lance-jni`), you can run the following command:
 
 ```shell
-cd lance-jni && cargo build
+cd lance-jni && cargo build --features hdfs
 ```
+
+Omit `--features hdfs` to build the JNI native library without HDFS support.
 
 The java module uses `spotless` maven plugin to format the code and check the license header. 
 And it is applied in the `validate` phase automatically.

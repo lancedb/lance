@@ -249,6 +249,75 @@ ds = lance.dataset(
 | `tos_secret_access_key` | Secret access key used for TOS authentication. Optional if credentials are provided by environment. |
 | `tos_security_token` | Security token for temporary credentials. Optional. |
 
+## HDFS Configuration
+
+HDFS support is optional and must be enabled when building Lance. For Rust builds,
+enable the `hdfs` feature on `lance`. For Java builds, see the
+[Java HDFS build instructions](https://github.com/lance-format/lance/tree/main/java#hdfs-enabled-build).
+Prebuilt Lance packages may not include HDFS support.
+
+To build the Python package with HDFS support from source:
+
+```bash
+cd python
+uv run maturin build --release --features hdfs
+```
+
+Use an `hdfs://` URI containing a NameNode address or an HDFS high-availability
+nameservice:
+
+```python
+import lance
+
+ds = lance.dataset("hdfs://namenode:9000/user/lance/my-dataset")
+```
+
+For high-availability clusters configured in Hadoop XML files, the URI authority
+can be the nameservice:
+
+```python
+ds = lance.dataset("hdfs://mycluster/user/lance/my-dataset")
+```
+
+Explicit `storage_options` take priority over environment variables. If neither
+specifies a NameNode, Lance uses the URI authority.
+
+```python
+ds = lance.dataset(
+    "hdfs://namenode:9000/user/lance/my-dataset",
+    storage_options={
+        "hdfs_name_node": "hdfs://namenode:8020",
+        "hdfs_user": "lance",
+        "hdfs_kerberos_ticket_cache_path": "/tmp/krb5cc_lance",
+        "hdfs_atomic_write_dir": "/tmp/lance-hdfs-atomic",
+    },
+)
+```
+
+| `storage_options` key | Environment variable | Description |
+|-----------------------|----------------------|-------------|
+| `hdfs_name_node` | `HDFS_NAME_NODE` | NameNode URI or HA nameservice. Defaults to the `hdfs://` URI authority. |
+| `hdfs_user` | `HADOOP_USER_NAME`, then `HDFS_USER` | HDFS user name. The storage option takes priority, followed by the environment variables in the listed order. |
+| `hdfs_kerberos_ticket_cache_path` | None | Path to the Kerberos ticket cache used to authenticate with HDFS. |
+| `hdfs_atomic_write_dir` | None | HDFS directory used by OpenDAL for atomic writes. |
+
+Lance's HDFS provider uses OpenDAL's HDFS service, which depends on `hdrs` and
+`hdfs-sys`. Building and running an HDFS-enabled artifact requires a local Java
+and Hadoop native environment:
+
+```bash
+export JAVA_HOME=/path/to/java
+export HADOOP_HOME=/path/to/hadoop
+export CLASSPATH="$(${HADOOP_HOME}/bin/hadoop classpath --glob)"
+export LD_LIBRARY_PATH="${JAVA_HOME}/lib/server:${HADOOP_HOME}/lib/native:${LD_LIBRARY_PATH}"
+```
+
+`hdfs-sys` dynamically links `libjvm`. If it uses a dynamically linked
+`libhdfs`, `${HADOOP_HOME}/lib/native` must also be discoverable through the
+platform library path. Ensure the Hadoop configuration directory, commonly
+`${HADOOP_HOME}/etc/hadoop`, is included in the Hadoop classpath for HA,
+Kerberos, and other cluster-specific settings.
+
 ## Tencent Cloud COS Configuration
 
 [COS (Cloud Object Storage)](https://cloud.tencent.com/product/cos) credentials can be set in environment variables prefixed

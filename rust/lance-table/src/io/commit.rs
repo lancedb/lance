@@ -762,7 +762,7 @@ pub fn list_detached_manifests<'a>(
         .boxed()
 }
 
-fn make_staging_manifest_path(base: &Path) -> Result<Path> {
+pub(super) fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     let id = uuid::Uuid::new_v4().to_string();
     Path::parse(format!("{base}-{id}")).map_err(|e| Error::io_source(Box::new(e)))
 }
@@ -1094,6 +1094,8 @@ pub async fn commit_handler_from_url(
         "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "shared-memory" => {
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
+        #[cfg(feature = "hdfs")]
+        "hdfs" => Ok(Arc::new(RenameCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -1979,6 +1981,16 @@ mod tests {
                 "{url} should route to ConditionalPutCommitHandler",
             );
         }
+    }
+
+    #[cfg(feature = "hdfs")]
+    #[tokio::test]
+    async fn test_commit_handler_from_url_hdfs_uses_rename() {
+        let handler = commit_handler_from_url("hdfs://namenode:9000/ds", &None)
+            .await
+            .unwrap();
+
+        assert_eq!(format!("{:?}", handler), "RenameCommitHandler");
     }
 
     /// A [CommitLock] whose lease records whether it was released, so we can
