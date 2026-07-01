@@ -2122,6 +2122,10 @@ class LanceDataset(pa.dataset.Dataset):
         this API allows you to open binary blob data as a regular Python file-like
         object. For more details, see :py:class:`lance.BlobFile`.
 
+        If you plan to read each selected blob completely with ``read()`` or
+        ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
+        payloads with Lance's planned batched reader.
+
         Exactly one of ids, addresses, or indices must be specified.
 
         Parameters
@@ -2170,7 +2174,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Unlike :py:meth:`take_blobs`, which returns file-like :py:class:`lance.BlobFile`
         handles for random access, this API plans and executes batched reads and
-        returns materialized blob payloads.
+        returns materialized blob payloads. Use this API for training loaders,
+        batch preprocessing, and other workflows that need complete blob bytes.
 
         Exactly one of ids, addresses, or indices must be specified.
 
@@ -3203,6 +3208,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
+        format_version: Optional[Union[int, str]] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -3237,7 +3243,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 5 types of scalar indices available today.
+        Lance supports the following scalar index types:
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -3308,6 +3314,11 @@ class LanceDataset(pa.dataset.Dataset):
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
+        format_version: int or str, optional
+            This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
+            format version to write when creating a new index. Accepts ``1``,
+            ``2``, ``"v1"``, or ``"v2"``. If unset, Lance chooses the current
+            default format.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -3336,6 +3347,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "icu": ICU dictionary-based Unicode word segmentation.
+            * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
@@ -3413,6 +3426,8 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["index_uuid"] = index_uuid
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
+        if format_version is not None:
+            kwargs["format_version"] = format_version
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 

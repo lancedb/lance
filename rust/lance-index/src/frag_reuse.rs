@@ -10,14 +10,39 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use roaring::RoaringBitmap;
+use lance_select::RowAddrTreeMap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
 
 pub use lance_table::system_index::frag_reuse::*;
 
+use crate::scalar::RowIdRemapper;
 use crate::{Index, IndexType};
+
+impl RowIdRemapper for FragReuseIndex {
+    fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+        self.remap_row_id(row_id)
+    }
+
+    fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+        self.remap_row_addrs_tree_map(row_addrs)
+    }
+
+    fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
+        self.remap_row_ids_roaring_tree_map(row_ids)
+    }
+
+    fn remap_row_ids_record_batch(
+        &self,
+        batch: RecordBatch,
+        row_id_idx: usize,
+    ) -> Result<RecordBatch> {
+        self.remap_row_ids_record_batch(batch, row_id_idx)
+    }
+}
 
 #[derive(Serialize)]
 struct FragReuseStatistics {

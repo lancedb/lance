@@ -103,6 +103,29 @@ impl MergeState {
                 // Delete action - only delete, don't write back
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
+                    let row_id = row_id_array.value(row_idx);
+
+                    // A source with duplicate keys matches the same target row
+                    // more than once; apply the same dedupe policy as updates.
+                    // (Target-only deletes from `delete_not_matched_by_source`
+                    // also reach here but never duplicate, so they never trip
+                    // `Fail`.)
+                    if !self.processed_row_ids.insert(row_id) {
+                        match self.source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    batch,
+                                    row_idx,
+                                    &self.on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                self.metrics.num_skipped_duplicates.add(1);
+                                return Ok(None); // Skip this duplicate row
+                            }
+                        }
+                    }
+
                     self.delete_row_addrs.insert(row_addr);
                     self.metrics.num_deleted_rows.add(1);
                 }

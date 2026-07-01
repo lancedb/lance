@@ -47,7 +47,7 @@ jobs:
         run: cargo fmt --check
       - name: Rust Clippy
         working-directory: java/lance-jni
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   build-and-test-java:
     runs-on: ubuntu-24.04-4x

@@ -19,6 +19,7 @@ use futures::TryStreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
     FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    parse_filter_expr as parse_lsm_filter_expr,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
@@ -545,7 +546,11 @@ impl PyLsmScanner {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
         let cols: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        slf.inner = Some(scanner.project(&cols));
+        slf.inner = Some(
+            scanner
+                .project(&cols)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 
@@ -563,18 +568,22 @@ impl PyLsmScanner {
         Ok(slf)
     }
 
-    /// Limit the number of rows returned.
-    #[pyo3(signature = (n, offset=None))]
+    /// Limit the number of rows returned, optionally with an offset.
+    #[pyo3(signature = (n=None, offset=None))]
     pub fn limit(
         mut slf: PyRefMut<'_, Self>,
-        n: usize,
+        n: Option<usize>,
         offset: Option<usize>,
     ) -> PyResult<PyRefMut<'_, Self>> {
         let scanner = slf
             .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
-        slf.inner = Some(scanner.limit(n, offset));
+        slf.inner = Some(
+            scanner
+                .limit(n.map(|n| n as i64), offset.map(|o| o as i64))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 
@@ -729,13 +738,14 @@ pub struct PyLsmVectorSearchPlanner {
 #[pymethods]
 impl PyLsmVectorSearchPlanner {
     #[new]
-    #[pyo3(signature = (dataset, shard_snapshots, vector_column, pk_columns=None, distance_type=None))]
+    #[pyo3(signature = (dataset, shard_snapshots, vector_column, pk_columns=None, distance_type=None, filter=None))]
     pub fn new(
         dataset: &Bound<'_, PyDataset>,
         shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
         vector_column: String,
         pk_columns: Option<Vec<String>>,
         distance_type: Option<String>,
+        filter: Option<String>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
         let snapshots: Vec<ShardSnapshot> = shard_snapshots
@@ -751,9 +761,16 @@ impl PyLsmVectorSearchPlanner {
         let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
 
         let vector_dim = get_vector_dim(&ds, &vector_column)?;
+        let filter = filter
+            .as_deref()
+            .map(|filter| {
+                parse_lsm_filter_expr(base_schema.as_ref(), filter)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+            .transpose()?;
 
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
-        let planner = LsmVectorSearchPlanner::new(
+        let mut planner = LsmVectorSearchPlanner::new(
             collector,
             pk_cols,
             base_schema.clone(),
@@ -761,6 +778,9 @@ impl PyLsmVectorSearchPlanner {
             dist_type,
         )
         .with_dataset(ds);
+        if let Some(filter) = filter {
+            planner = planner.with_filter(Some(filter));
+        }
 
         Ok(Self {
             planner,

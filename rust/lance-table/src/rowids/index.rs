@@ -5,10 +5,10 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use super::{RowIdSequence, U64Segment};
-use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
 
 /// An index of row ids
@@ -46,18 +46,10 @@ impl RowIdIndex {
                 RawIndexChunk::NonOverlapping(chunk) => {
                     final_chunks.push(chunk);
                 }
-                RawIndexChunk::Overlapping(range, overlapping_chunks) => {
-                    debug_assert_eq!(
-                        range.end() - range.start() + 1,
-                        overlapping_chunks
-                            .iter()
-                            .map(|(_, (seq, _))| seq.len() as u64)
-                            .sum::<u64>(),
-                        "Wrong range for {:?}, chunks: {:?}",
-                        range,
-                        overlapping_chunks,
-                    );
-                    // Merge overlapping chunks.
+                RawIndexChunk::Overlapping(_range, overlapping_chunks) => {
+                    // Intersecting row-id ranges don't imply intersecting id sets;
+                    // sparse ids and deletion holes leave the union short of the span.
+                    // The real invariant (no id in two fragments) is checked in the merge.
                     let merged_chunk = merge_overlapping_chunks(overlapping_chunks)?;
                     final_chunks.push(merged_chunk);
                 }
@@ -357,6 +349,14 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
         values.extend(row_ids.iter().zip(row_addrs.iter()));
     }
     values.sort_by_key(|(row_id, _)| *row_id);
+    // A duplicate row id here means two fragments claim the same live id: a
+    // corrupt index, not a resolvable sparse-coverage case.
+    if let Some(w) = values.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(Error::internal(format!(
+            "row id index corrupt: stable row id {} is live in multiple fragments",
+            w[0].0
+        )));
+    }
     let row_id_segment = U64Segment::from_iter(values.iter().map(|(row_id, _)| *row_id));
     let address_segment = U64Segment::from_iter(values.iter().map(|(_, row_addr)| *row_addr));
 
@@ -522,6 +522,41 @@ mod tests {
         assert_eq!(index.get(50), Some(RowAddress::new_from_parts(1, 0)));
         assert_eq!(index.get(51), Some(RowAddress::new_from_parts(0, 50)));
         assert_eq!(index.get(99), Some(RowAddress::new_from_parts(0, 98)));
+    }
+
+    #[test]
+    fn test_overlapping_chunks_sparse_with_deletions() {
+        // Interleaved (overlapping) id ranges plus a deletion that leaves a hole,
+        // so the union doesn't tile the span. Every live id must still resolve.
+        let fragment_indices = vec![
+            FragmentRowIdIndex {
+                fragment_id: 10,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::SortedArray(
+                    vec![1, 3, 5, 7, 9].into(),
+                )])),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            },
+            FragmentRowIdIndex {
+                fragment_id: 20,
+                row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::SortedArray(
+                    vec![0, 2, 4, 6, 8].into(),
+                )])),
+                // Delete offset 2 (id 4) -> a hole in the span.
+                deletion_vector: Arc::new(DeletionVector::from_iter(vec![2])),
+            },
+        ];
+
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+
+        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(20, 0)));
+        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(10, 0)));
+        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(20, 1)));
+        assert_eq!(index.get(3), Some(RowAddress::new_from_parts(10, 1)));
+        assert_eq!(index.get(4), None);
+        // Surviving ids keep their original offsets (the hole is not compacted).
+        assert_eq!(index.get(6), Some(RowAddress::new_from_parts(20, 3)));
+        assert_eq!(index.get(8), Some(RowAddress::new_from_parts(20, 4)));
+        assert_eq!(index.get(9), Some(RowAddress::new_from_parts(10, 4)));
     }
 
     #[test]

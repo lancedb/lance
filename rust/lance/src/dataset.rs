@@ -42,7 +42,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -654,6 +655,24 @@ impl Dataset {
                     }
                     _ => Error::io_source(err.into()),
                 })?;
+
+        // A stale cached size yields a bogus footer offset. Detect it (the block
+        // lacks the trailing magic) and retry with the true size, like
+        // read_manifest.
+        if manifest_location.size.is_some() && !last_block.ends_with(MAGIC) {
+            let manifest_location = ManifestLocation {
+                size: None,
+                ..manifest_location.clone()
+            };
+            return Box::pin(Self::load_manifest(
+                object_store,
+                &manifest_location,
+                uri,
+                session,
+            ))
+            .await;
+        }
+
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.

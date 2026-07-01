@@ -418,60 +418,6 @@ impl LanceCache {
             .await?;
         Some(outer.as_ref().clone())
     }
-
-    /// Single-flight get-or-insert for an unsized (trait-object) value.
-    ///
-    /// The [`UnsizedCacheKey`] analogue of [`get_or_insert_with_key`]: concurrent
-    /// callers for the same key run `loader` at most once (the backend dedups)
-    /// and share the resulting `Arc`. A warm hit returns the cached value with no
-    /// load. Use this for `Arc<dyn Trait>` values, where the load is expensive
-    /// (I/O + deserialization) and worth coalescing across racing callers.
-    ///
-    /// A failing `loader` is not cached: the error is propagated to the waiters
-    /// and the next call retries, so a transient I/O failure cannot poison the
-    /// entry.
-    ///
-    /// [`get_or_insert_with_key`]: Self::get_or_insert_with_key
-    pub async fn get_or_insert_unsized_with_key<K, F, Fut>(
-        &self,
-        cache_key: K,
-        loader: F,
-    ) -> Result<Arc<K::ValueType>>
-    where
-        K: UnsizedCacheKey,
-        K::ValueType: DeepSizeOf + Send + Sync + 'static,
-        F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = Result<Arc<K::ValueType>>> + Send,
-    {
-        let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-
-        let typed_loader = Box::pin(async move {
-            let value = loader().await?;
-            // Extra Arc layer mirrors `insert_unsized_with_key` so the downcast matches.
-            let wrapper = Arc::new(value);
-            let size = cache_entry_size(&*wrapper);
-            Ok((wrapper as CacheEntry, size))
-        });
-
-        let (entry, was_cached) = self.cache.get_or_insert(&key, typed_loader, None).await?;
-
-        if was_cached {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Unreachable unless two keys collide on (prefix, key, type_name) with
-        // different value types (a bug): the entry is `codec=None`, so backends
-        // keep it in memory as-is. Error out rather than panic in a library path.
-        let wrapper = entry.downcast::<Arc<K::ValueType>>().map_err(|_| {
-            crate::Error::internal(format!(
-                "cache entry for `{}` was not the expected type",
-                K::type_name(),
-            ))
-        })?;
-        Ok(wrapper.as_ref().clone())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,55 +1012,6 @@ mod tests {
             assert_eq!(*result, vec![1, 2, 3]);
         }
 
-        assert_eq!(load_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_get_or_insert_unsized_dedup() {
-        use futures::future::try_join_all;
-        use std::sync::atomic::AtomicUsize;
-
-        #[derive(Debug, DeepSizeOf)]
-        struct MyType(i32);
-
-        trait MyTrait: DeepSizeOf + Send + Sync + std::any::Any {
-            fn value(&self) -> i32;
-        }
-
-        impl MyTrait for MyType {
-            fn value(&self) -> i32 {
-                self.0
-            }
-        }
-
-        let load_count = Arc::new(AtomicUsize::new(0));
-        let cache = LanceCache::with_capacity(10000);
-
-        // The loader's `yield_now` lets the other callers register as waiters
-        // before the winner finishes, so single-flight is actually exercised.
-        let opens = (0..5).map(|_| {
-            let cache = cache.clone();
-            let load_count = load_count.clone();
-            async move {
-                cache
-                    .get_or_insert_unsized_with_key(
-                        TestUnsizedKey::<dyn MyTrait>::new("key"),
-                        || async move {
-                            load_count.fetch_add(1, Ordering::SeqCst);
-                            tokio::task::yield_now().await;
-                            Ok(Arc::new(MyType(42)) as Arc<dyn MyTrait>)
-                        },
-                    )
-                    .await
-            }
-        });
-
-        let results = try_join_all(opens).await.unwrap();
-        for result in results {
-            assert_eq!(result.value(), 42);
-        }
-
-        // Single-flight: one load despite 5 racing callers.
         assert_eq!(load_count.load(Ordering::SeqCst), 1);
     }
 }
