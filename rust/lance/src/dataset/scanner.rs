@@ -14042,26 +14042,31 @@ mod overlay_index_masking {
     async fn bench_index_query_overlay_overhead() {
         use std::time::Instant;
 
-        use arrow_array::{Float32Array, StringArray};
-        use lance_index::scalar::FullTextSearchQuery;
-        use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+        use arrow_array::Float32Array;
         use lance_linalg::distance::MetricType;
 
         use crate::index::vector::VectorIndexParams;
 
-        const DIM: i32 = 16;
-        const ROWS_PER_FRAG: i32 = 500;
-        const ITERS: u32 = 100;
+        const DIM: i32 = 32;
+        const ROWS: i32 = 1_000_000;
+        const ROWS_PER_FRAG: i32 = 100_000; // 10 fragments
+        const ITERS: u32 = 10; // large scans — 10 is enough for stable averages
 
-        // --- Build dataset --------------------------------------------------
+        // Fixed disk path so timings are comparable across runs. Deleted and recreated fresh.
+        let uri = "/tmp/lance-bench-overlay-oss1325";
+        if std::path::Path::new(uri).exists() {
+            std::fs::remove_dir_all(uri).unwrap();
+        }
 
-        // Use an in-memory store so the benchmark works in release builds (no filesystem perms needed).
-        let uri = "memory://";
+        // --- Build 1M-row dataset on local disk --------------------------------
+        // Schema: id(0), age(1), vec(2) — 3 top-level fields.
+        // Lance field IDs (depth-first): id=0, age=1, vec=2, vec.item=3.
+
+        println!("Building {ROWS}-row dataset at {uri} (this takes ~30 s)...");
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", DataType::Int32, false),
             ArrowField::new("age", DataType::Int32, false),
-            ArrowField::new("text", DataType::Utf8, false),
             ArrowField::new(
                 "vec",
                 DataType::FixedSizeList(
@@ -14072,24 +14077,28 @@ mod overlay_index_masking {
             ),
         ]));
 
-        let n_frags = 3i32;
-        let total = ROWS_PER_FRAG * n_frags;
-        let ids: Vec<i32> = (0..total).collect();
-        let ages: Vec<i32> = ids.iter().map(|&i| i * 10).collect();
-        let texts: Vec<String> = ids.iter().map(|&i| format!("token{i}")).collect();
+        let row_ids: Vec<i32> = (0..ROWS).collect();
+        let ages: Vec<i32> = row_ids.iter().map(|&i| i * 10).collect();
+        // Build the 128 MB flat float array directly (avoids 1M per-row Vec allocations).
+        let flat_vecs: Vec<f32> = (0..(ROWS as usize * DIM as usize))
+            .map(|j| (j / DIM as usize) as f32 % 1000.0)
+            .collect();
+        let vec_col = Arc::new(
+            arrow_array::FixedSizeListArray::try_new(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM,
+                Arc::new(Float32Array::from(flat_vecs)),
+                None,
+            )
+            .unwrap(),
+        );
 
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(row_ids)),
                 Arc::new(Int32Array::from(ages)),
-                Arc::new(StringArray::from(texts)),
-                Arc::new(fsl(
-                    (0..total as usize)
-                        .map(|i| vec![i as f32; DIM as usize])
-                        .collect(),
-                    DIM,
-                )),
+                vec_col,
             ],
         )
         .unwrap();
@@ -14104,7 +14113,7 @@ mod overlay_index_masking {
             .await
             .unwrap();
 
-        // Build all three indexes before committing any overlays.
+        println!("Building BTree index on age...");
         dataset
             .create_index(
                 &["age"],
@@ -14115,21 +14124,20 @@ mod overlay_index_masking {
             )
             .await
             .unwrap();
+
+        println!("Building IVF_FLAT(1 partition) index on vec...");
         dataset
             .create_index(
-                &["text"],
-                IndexType::Inverted,
+                &["vec"],
+                IndexType::Vector,
                 None,
-                &InvertedIndexParams::default(),
+                &VectorIndexParams::ivf_flat(1, MetricType::L2),
                 true,
             )
             .await
             .unwrap();
-        let vec_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
-        dataset
-            .create_index(&["vec"], IndexType::Vector, None, &vec_params, true)
-            .await
-            .unwrap();
+
+        println!("Indexes built.\n");
 
         // --- Timing helper ---------------------------------------------------
 
@@ -14146,39 +14154,49 @@ mod overlay_index_masking {
             t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
         }
 
-        // --- Run for each overlay count -------------------------------------
-
+        // === Scenario A: BTree query overhead ================================
+        //
+        // Overlay on `age` (field 1), covering only offset 0 of fragment 0.
+        // Fragment granularity: the entire fragment 0 (100k rows) falls to flat-scan.
+        //
+        // btree_cold: `age = 420` → id=42 → in fragment 0 (rows 0..99999).
+        //   With overlays: 100k-row flat scan + per-overlay merge instead of index lookup.
+        //   Without overlays: O(log n) BTree lookup.
+        //
+        // btree_warm: `age = 1000420` → id=100042 → in fragment 1 (rows 100000..199999).
+        //   Always served by the BTree index regardless of overlay count on fragment 0.
+        //   This isolates the index-lookup baseline.
+        println!("=== Scenario A: BTree (overlay on `age`, fragment 0 becomes stale) ===");
         println!(
-            "\n{:>10}  {:>10}  {:>10}  {:>10}",
-            "overlays", "btree_ms", "fts_ms", "vec_ms"
+            "{:>10}  {:>14}  {:>14}",
+            "overlays", "cold_frag0_ms", "warm_frag1_ms"
         );
 
-        // Commit overlays incrementally: 0 → 4 → 16 total. Each layer covers fragment 0,
-        // field 1 (age), offset 0. They are committed after index build, so they trigger masking.
-        let mut committed = 0u32;
-        for num_overlays in [0u32, 4, 16] {
-            for layer in committed..num_overlays {
+        let mut committed_a = 0u32;
+        for num_overlays in [0u32, 1, 4, 16] {
+            // Commit only the delta since the last iteration.
+            for layer in committed_a..num_overlays {
                 dataset = commit_overlay(
                     dataset,
                     &format!("age_ol{layer}"),
-                    0,
-                    &[1],
+                    0,    // fragment 0
+                    &[1], // field 1 = age
                     OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
                     vec![i32_array([Some(999)])],
                 )
                 .await;
             }
-            committed = num_overlays;
+            committed_a = num_overlays;
 
-            let ds = Arc::new(dataset.clone()); // cheap Arc/manifest clone
+            let ds = Arc::new(dataset.clone());
 
-            // BTree filter on age (indexed)
+            // Cold path: stale fragment falls to flat scan when overlays > 0.
             let ds2 = ds.clone();
-            let btree_ms = timeit(ITERS, || {
+            let cold_ms = timeit(ITERS, || {
                 let ds = ds2.clone();
                 async move {
                     ds.scan()
-                        .filter("age = 4200")
+                        .filter("age = 420")
                         .unwrap()
                         .project(&["age"])
                         .unwrap()
@@ -14189,15 +14207,15 @@ mod overlay_index_masking {
             })
             .await;
 
-            // FTS: full-text search (no overlay masking implemented for FTS)
+            // Warm path: fragment 1 never stale, always index-served.
             let ds2 = ds.clone();
-            let fts_ms = timeit(ITERS, || {
+            let warm_ms = timeit(ITERS, || {
                 let ds = ds2.clone();
                 async move {
                     ds.scan()
-                        .full_text_search(FullTextSearchQuery::new("token420".to_owned()))
+                        .filter("age = 1000420")
                         .unwrap()
-                        .project(&["text"])
+                        .project(&["age"])
                         .unwrap()
                         .try_into_batch()
                         .await
@@ -14206,15 +14224,45 @@ mod overlay_index_masking {
             })
             .await;
 
-            // Vector ANN (overlay is on `age` field, not `vec`, so vector index is not stale)
+            println!("{num_overlays:>10}  {cold_ms:>14.1}  {warm_ms:>14.1}");
+        }
+
+        // === Scenario B: Vector ANN overhead =================================
+        //
+        // Overlay on `vec` (field 2), covering only offset 0 of fragment 0.
+        // The field-aware check means the 16 age overlays from Scenario A do NOT affect
+        // the vector index (they touch field 1, not field 2). Only a vec overlay (field 2)
+        // marks fragment 0 stale for the vector index.
+        //
+        // With a vec overlay: 100k rows of fragment 0 are excluded from ANN prefilter
+        // bitmaps and re-scored brute-force (O(100k × DIM) distance computations).
+        println!("\n=== Scenario B: Vector ANN (overlay on `vec`, 100k rows brute-forced) ===");
+        println!("{:>12}  {:>10}", "vec_overlays", "ann_ms");
+
+        let query_vec = Float32Array::from(vec![0.5f32; DIM as usize]);
+
+        for num_vec_overlays in [0u32, 1] {
+            if num_vec_overlays == 1 {
+                dataset = commit_overlay(
+                    dataset,
+                    "vec_ol0",
+                    0,    // fragment 0
+                    &[2], // field 2 = vec (FixedSizeList top-level field)
+                    OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    vec![fsl(vec![vec![0.0f32; DIM as usize]], DIM)],
+                )
+                .await;
+            }
+
+            let ds = Arc::new(dataset.clone());
             let ds2 = ds.clone();
-            let query_vec = Float32Array::from(vec![1.0f32; DIM as usize]);
-            let vec_ms = timeit(ITERS, || {
+            let qv = query_vec.clone();
+            let ann_ms = timeit(ITERS, || {
                 let ds = ds2.clone();
-                let q = query_vec.clone();
+                let q = qv.clone();
                 async move {
                     ds.scan()
-                        .nearest("vec", &q, 3)
+                        .nearest("vec", &q, 10)
                         .unwrap()
                         .minimum_nprobes(1)
                         .project(&["id"])
@@ -14226,7 +14274,7 @@ mod overlay_index_masking {
             })
             .await;
 
-            println!("{num_overlays:>10}  {btree_ms:>10.3}  {fts_ms:>10.3}  {vec_ms:>10.3}");
+            println!("{num_vec_overlays:>12}  {ann_ms:>10.1}");
         }
     }
 }
