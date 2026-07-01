@@ -770,17 +770,21 @@ impl CoreFieldDecoderStrategy {
         &self,
         field: &Field,
         column_infos: &mut ColumnInfoIter,
+        split_fullzip_pages: bool,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
-            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                column_info.as_ref(),
-                self.decompressor_strategy.as_ref(),
-                self.cache_repetition_index,
-                field,
-            )?);
+            let scheduler = Box::new(
+                StructuralPrimitiveFieldScheduler::try_new_with_fullzip_page_splitting(
+                    column_info.as_ref(),
+                    self.decompressor_strategy.as_ref(),
+                    self.cache_repetition_index,
+                    field,
+                    split_fullzip_pages,
+                )?,
+            );
 
             // advance to the next top level column
             column_infos.next_top_level();
@@ -792,12 +796,15 @@ impl CoreFieldDecoderStrategy {
                 if field.is_packed_struct() {
                     // Packed struct
                     let column_info = column_infos.expect_next()?;
-                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                        column_info.as_ref(),
-                        self.decompressor_strategy.as_ref(),
-                        self.cache_repetition_index,
-                        field,
-                    )?);
+                    let scheduler = Box::new(
+                        StructuralPrimitiveFieldScheduler::try_new_with_fullzip_page_splitting(
+                            column_info.as_ref(),
+                            self.decompressor_strategy.as_ref(),
+                            self.cache_repetition_index,
+                            field,
+                            split_fullzip_pages,
+                        )?,
+                    );
 
                     // advance to the next top level column
                     column_infos.next_top_level();
@@ -816,12 +823,15 @@ impl CoreFieldDecoderStrategy {
                         )
                     }) {
                         let column_info = column_infos.expect_next()?;
-                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                            column_info.as_ref(),
-                            self.decompressor_strategy.as_ref(),
-                            self.cache_repetition_index,
-                            field,
-                        )?);
+                        let scheduler = Box::new(
+                            StructuralPrimitiveFieldScheduler::try_new_with_fullzip_page_splitting(
+                                column_info.as_ref(),
+                                self.decompressor_strategy.as_ref(),
+                                self.cache_repetition_index,
+                                field,
+                                split_fullzip_pages,
+                            )?,
+                        );
                         column_infos.next_top_level();
                         return Ok(scheduler);
                     }
@@ -829,8 +839,11 @@ impl CoreFieldDecoderStrategy {
 
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
-                    let field_scheduler =
-                        self.create_structural_field_scheduler(field, column_infos)?;
+                    let field_scheduler = self.create_structural_field_scheduler(
+                        field,
+                        column_infos,
+                        split_fullzip_pages,
+                    )?;
                     child_schedulers.push(field_scheduler);
                 }
 
@@ -842,8 +855,11 @@ impl CoreFieldDecoderStrategy {
             }
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                let child_scheduler = self.create_structural_field_scheduler(
+                    child,
+                    column_infos,
+                    split_fullzip_pages,
+                )?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -851,8 +867,11 @@ impl CoreFieldDecoderStrategy {
                 if matches!(inner.data_type(), DataType::Struct(_)) =>
             {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                let child_scheduler = self.create_structural_field_scheduler(
+                    child,
+                    column_infos,
+                    split_fullzip_pages,
+                )?;
                 Ok(Box::new(StructuralFixedSizeListScheduler::new(
                     child_scheduler,
                     *dimension,
@@ -866,8 +885,11 @@ impl CoreFieldDecoderStrategy {
                     return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into()));
                 }
                 let entries_child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(entries_child, column_infos)?;
+                let child_scheduler = self.create_structural_field_scheduler(
+                    entries_child,
+                    column_infos,
+                    split_fullzip_pages,
+                )?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -1081,6 +1103,36 @@ impl DecodeBatchScheduler {
         filter: &FilterExpression,
         decoder_config: &DecoderConfig,
     ) -> Result<Self> {
+        Self::try_new_with_fullzip_page_splitting(
+            schema,
+            column_indices,
+            column_infos,
+            file_buffer_positions_and_sizes,
+            num_rows,
+            _decoder_plugins,
+            io,
+            cache,
+            filter,
+            decoder_config,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn try_new_with_fullzip_page_splitting<'a>(
+        schema: &'a Schema,
+        column_indices: &[u32],
+        column_infos: &[Arc<ColumnInfo>],
+        file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
+        num_rows: u64,
+        _decoder_plugins: Arc<DecoderPlugins>,
+        io: Arc<dyn EncodingsIo>,
+        cache: Arc<LanceCache>,
+        filter: &FilterExpression,
+        decoder_config: &DecoderConfig,
+        split_fullzip_pages: bool,
+    ) -> Result<Self> {
         assert!(num_rows > 0);
         let buffers = FileBuffers {
             positions_and_sizes: file_buffer_positions_and_sizes,
@@ -1101,8 +1153,11 @@ impl DecodeBatchScheduler {
             let mut column_iter = ColumnInfoIter::new(column_infos.to_vec(), column_indices);
 
             let strategy = CoreFieldDecoderStrategy::from_decoder_config(decoder_config);
-            let mut root_scheduler =
-                strategy.create_structural_field_scheduler(&root_field, &mut column_iter)?;
+            let mut root_scheduler = strategy.create_structural_field_scheduler(
+                &root_field,
+                &mut column_iter,
+                split_fullzip_pages,
+            )?;
 
             let context = SchedulerContext::new(io, cache.clone());
             root_scheduler.initialize(filter, &context).await?;
@@ -2296,6 +2351,7 @@ async fn create_scheduler_decoder(
     config: SchedulerDecoderConfig,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     let num_rows = requested_rows.num_rows();
+    let is_range_scan = matches!(requested_rows, RequestedRows::Ranges(_));
 
     let is_structural = column_infos[0].is_structural();
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
@@ -2322,7 +2378,7 @@ async fn create_scheduler_decoder(
     // unless that metadata is already in the cache.  This metadata loading
     // happens as part of this call and should be parallelized if reading
     // multiple files.
-    let mut decode_scheduler = DecodeBatchScheduler::try_new(
+    let mut decode_scheduler = DecodeBatchScheduler::try_new_with_fullzip_page_splitting(
         target_schema.as_ref(),
         &column_indices,
         &column_infos,
@@ -2333,6 +2389,7 @@ async fn create_scheduler_decoder(
         config.cache,
         &filter,
         &config.decoder_config,
+        is_range_scan,
     )
     .await?;
 
@@ -3132,7 +3189,7 @@ mod tests {
 
         let mut structural_columns = ColumnInfoIter::new(vec![], &[]);
         let err = strategy
-            .create_structural_field_scheduler(&field, &mut structural_columns)
+            .create_structural_field_scheduler(&field, &mut structural_columns, false)
             .unwrap_err();
         assert!(
             err.to_string()
