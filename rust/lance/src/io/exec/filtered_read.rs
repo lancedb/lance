@@ -62,7 +62,7 @@ use super::utils::IoMetrics;
 
 const ENV_LANCE_DEFAULT_FRAGMENT_READAHEAD: &str = "LANCE_DEFAULT_FRAGMENT_READAHEAD";
 const HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS: usize = 16;
-const HIGH_BANDWIDTH_SCAN_MIN_ROWS: u64 = 1_048_576;
+const HIGH_BANDWIDTH_SCAN_MIN_ROWS: u64 = 16_777_216;
 const HIGH_BANDWIDTH_SCAN_IO_PER_CPU: usize = 4;
 const HIGH_BANDWIDTH_SCAN_MAX_IO_PARALLELISM: usize = 512;
 const HIGH_BANDWIDTH_SCAN_TARGET_BATCH_BYTES: u64 = 16 * 1024 * 1024;
@@ -2377,22 +2377,52 @@ mod tests {
     #[test]
     fn test_high_bandwidth_scan_io_parallelism_requires_cloud_unordered_large_scan() {
         let base = 8;
-        let boosted = high_bandwidth_scan_io_parallelism(true, false, 16, 1_048_576, base);
+        let boosted = high_bandwidth_scan_io_parallelism(
+            true,
+            false,
+            HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+            HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+            base,
+        );
         assert!(boosted >= base);
         assert_eq!(
-            high_bandwidth_scan_io_parallelism(false, false, 16, 1_048_576, base),
+            high_bandwidth_scan_io_parallelism(
+                false,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base
+            ),
             base
         );
         assert_eq!(
-            high_bandwidth_scan_io_parallelism(true, true, 16, 1_048_576, base),
+            high_bandwidth_scan_io_parallelism(
+                true,
+                true,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base
+            ),
             base
         );
         assert_eq!(
-            high_bandwidth_scan_io_parallelism(true, false, 15, 1_048_576, base),
+            high_bandwidth_scan_io_parallelism(
+                true,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS - 1,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base
+            ),
             base
         );
         assert_eq!(
-            high_bandwidth_scan_io_parallelism(true, false, 16, 1_048_575, base),
+            high_bandwidth_scan_io_parallelism(
+                true,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS - 1,
+                base
+            ),
             base
         );
     }
