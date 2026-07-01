@@ -39,6 +39,7 @@ use lance_core::{
 use log::trace;
 
 use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
+use crate::encodings::physical::rle::decode_rle_u16_runs;
 use crate::utils::bytepack::ByteUnpacker;
 use crate::{
     compression::{
@@ -743,16 +744,230 @@ impl StructuralPageDecoder for MiniBlockDecoder {
     }
 }
 
+/// How a complex-all-null page's rep/def level buffer is compressed on disk.
+/// Captured at scheduler construction so `initialize` can keep RLE levels in run
+/// form instead of expanding them.
+#[derive(Debug, Clone)]
+pub(crate) enum LevelCodec {
+    /// Raw little-endian u16 levels (no block compression).
+    Uncompressed,
+    /// RLE-compressed levels; decoded lazily into [`LazyLevels::Rle`].
+    Rle,
+    /// Any other block compression; decoded eagerly into [`LazyLevels::Dense`]
+    /// (these encodings don't expand, so laziness buys nothing).
+    Block(Arc<dyn BlockDecompressor>),
+}
+
+/// Rep/def levels for a complex-all-null page.
+///
+/// All-null pages have near-constant levels that RLE-compress to a handful of
+/// runs but expand to `num_values` u16s. `Rle` keeps the runs un-expanded so a
+/// cached page costs O(runs) instead of O(num_values); the decoder materializes
+/// only the per-drain slices it touches. `Dense` is the eager fallback for
+/// non-RLE encodings.
+#[derive(Debug, Clone)]
+enum LazyLevels {
+    Dense(ScalarBuffer<u16>),
+    /// `values[r]` is the level for run `r`, covering logical indices
+    /// `offsets[r]..offsets[r + 1]`. Adjacent runs always have distinct values
+    /// (`decode_rle_u16_runs` coalesces equal-valued runs), so `values.len()` is
+    /// the number of logical level changes, not the number of on-disk RLE runs.
+    /// Invariants: `offsets.len() == values.len() + 1`, `offsets[0] == 0`,
+    /// `offsets` strictly increasing, `offsets[last] == len`.
+    Rle {
+        values: ScalarBuffer<u16>,
+        offsets: Arc<[u64]>,
+    },
+}
+
+/// Monotonic forward cursor into a [`LazyLevels`] sequence.
+///
+/// Drains seek to strictly increasing rows, so each [`LazyLevels::seek_row_start`]
+/// resumes from the last position instead of rescanning — every run is visited at
+/// most once per page, keeping a full decode O(runs), not O(rows).
+#[derive(Debug, Default, Clone, Copy)]
+struct LevelCursor {
+    /// Logical level index where the current row begins.
+    level: usize,
+    /// Row index at `level` (the number of `max_rep` occurrences before it).
+    row: u64,
+    /// Run index containing `level`. Unused for [`LazyLevels::Dense`].
+    run: usize,
+}
+
+impl LazyLevels {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(buf) => buf.len(),
+            Self::Rle { offsets, .. } => offsets[offsets.len() - 1] as usize,
+        }
+    }
+
+    /// Run index containing logical position `i`. Caller guarantees `i < len()`.
+    #[inline]
+    fn run_of(offsets: &[u64], i: usize) -> usize {
+        // `offsets[0] == 0 <= i`, so `partition_point >= 1` and never underflows.
+        offsets.partition_point(|&o| o <= i as u64) - 1
+    }
+
+    /// Advance `cursor` to the start of row `target_row`, returning that row's
+    /// starting level index.
+    ///
+    /// Rows begin at `max_rep` positions, so this finds the `target_row`-th one.
+    /// `target_row` must be `>= cursor.row`: the cursor only moves forward, which
+    /// is what keeps a full page decode O(runs) rather than O(rows).
+    fn seek_row_start(
+        &self,
+        cursor: &mut LevelCursor,
+        target_row: u64,
+        max_rep: u16,
+    ) -> Result<usize> {
+        debug_assert!(target_row >= cursor.row);
+        let mut need = target_row - cursor.row;
+        if need == 0 {
+            return Ok(cursor.level);
+        }
+        match self {
+            Self::Dense(buf) => {
+                let mut level = cursor.level;
+                while need > 0 {
+                    if level >= buf.len() {
+                        return Err(Error::internal(
+                            "Invalid complex all-null layout: repetition buffer too short",
+                        ));
+                    }
+                    if buf[level] != max_rep {
+                        return Err(Error::internal(
+                            "Invalid complex all-null layout: row did not start at max repetition level",
+                        ));
+                    }
+                    level += 1;
+                    while level < buf.len() && buf[level] != max_rep {
+                        level += 1;
+                    }
+                    need -= 1;
+                }
+                cursor.level = level;
+                cursor.row = target_row;
+                Ok(level)
+            }
+            Self::Rle { values, offsets } => {
+                let mut level = cursor.level;
+                let mut run = cursor.run;
+                while need > 0 {
+                    if run >= values.len() {
+                        return Err(Error::internal(
+                            "Invalid complex all-null layout: repetition buffer too short",
+                        ));
+                    }
+                    if values[run] != max_rep {
+                        return Err(Error::internal(
+                            "Invalid complex all-null layout: row did not start at max repetition level",
+                        ));
+                    }
+                    let run_end = offsets[run + 1] as usize;
+                    let avail = (run_end - level) as u64;
+                    if need < avail {
+                        // Target lands inside this max-rep run.
+                        level += need as usize;
+                        need = 0;
+                    } else {
+                        // Consume every row start in this run, then skip the
+                        // trailing non-max-rep runs to reach the next row start.
+                        need -= avail;
+                        run += 1;
+                        while run < values.len() && values[run] != max_rep {
+                            run += 1;
+                        }
+                        level = if run < values.len() {
+                            offsets[run] as usize
+                        } else {
+                            self.len()
+                        };
+                    }
+                }
+                cursor.level = level;
+                cursor.row = target_row;
+                cursor.run = run;
+                Ok(level)
+            }
+        }
+    }
+
+    /// Count of levels in `range` that are `<= max`, resuming from `*run_cursor`
+    /// and leaving it on the last run that overlaps `range`.
+    ///
+    /// Successive calls must pass ascending, non-overlapping ranges (`range.start
+    /// >=` the previous `range.end`) so runs are swept at most once per page.
+    fn count_le_cursor(&self, run_cursor: &mut usize, range: Range<usize>, max: u16) -> u64 {
+        if range.is_empty() {
+            return 0;
+        }
+        match self {
+            Self::Dense(buf) => buf[range].iter().filter(|&&d| d <= max).count() as u64,
+            Self::Rle { values, offsets } => {
+                let mut r = *run_cursor;
+                // Advance to the first run overlapping the range.
+                while r < values.len() && (offsets[r + 1] as usize) <= range.start {
+                    r += 1;
+                }
+                let mut count = 0u64;
+                let mut cur = r;
+                while cur < values.len() && (offsets[cur] as usize) < range.end {
+                    if values[cur] <= max {
+                        let lo = (offsets[cur] as usize).max(range.start);
+                        let hi = (offsets[cur + 1] as usize).min(range.end);
+                        count += (hi - lo) as u64;
+                    }
+                    cur += 1;
+                }
+                // Resume the next (ascending) range from the last overlapping run;
+                // `cur > r` because `range` is non-empty.
+                *run_cursor = cur - 1;
+                count
+            }
+        }
+    }
+
+    /// Append the logical levels in `range` to `out`.
+    fn extend_into(&self, range: Range<usize>, out: &mut Vec<u16>) {
+        if range.is_empty() {
+            return;
+        }
+        match self {
+            Self::Dense(buf) => out.extend_from_slice(&buf[range]),
+            Self::Rle { values, offsets } => {
+                let mut r = Self::run_of(offsets, range.start);
+                while r < values.len() && (offsets[r] as usize) < range.end {
+                    let lo = (offsets[r] as usize).max(range.start);
+                    let hi = (offsets[r + 1] as usize).min(range.end);
+                    if hi > lo {
+                        out.resize(out.len() + (hi - lo), values[r]);
+                    }
+                    r += 1;
+                }
+            }
+        }
+    }
+
+    fn deep_size(&self) -> usize {
+        match self {
+            Self::Dense(buf) => buf.len() * 2,
+            Self::Rle { values, offsets } => values.len() * 2 + offsets.len() * 8,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CachedComplexAllNullState {
-    rep: Option<ScalarBuffer<u16>>,
-    def: Option<ScalarBuffer<u16>>,
+    rep: Option<LazyLevels>,
+    def: Option<LazyLevels>,
 }
 
 impl DeepSizeOf for CachedComplexAllNullState {
     fn deep_size_of_children(&self, _ctx: &mut Context) -> usize {
-        self.rep.as_ref().map(|buf| buf.len() * 2).unwrap_or(0)
-            + self.def.as_ref().map(|buf| buf.len() * 2).unwrap_or(0)
+        self.rep.as_ref().map(|l| l.deep_size()).unwrap_or(0)
+            + self.def.as_ref().map(|l| l.deep_size()).unwrap_or(0)
     }
 }
 
@@ -778,18 +993,18 @@ pub struct ComplexAllNullScheduler {
     repdef: Option<Arc<CachedComplexAllNullState>>,
     max_rep: u16,
     max_visible_level: u16,
-    rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
-    def_decompressor: Option<Arc<dyn BlockDecompressor>>,
+    rep_codec: LevelCodec,
+    def_codec: LevelCodec,
     num_rep_values: u64,
     num_def_values: u64,
 }
 
 impl ComplexAllNullScheduler {
-    pub fn new(
+    pub(crate) fn new(
         buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
         def_meaning: Arc<[DefinitionInterpretation]>,
-        rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
-        def_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        rep_codec: LevelCodec,
+        def_codec: LevelCodec,
         num_rep_values: u64,
         num_def_values: u64,
     ) -> Self {
@@ -805,8 +1020,8 @@ impl ComplexAllNullScheduler {
             repdef: None,
             max_rep,
             max_visible_level,
-            rep_decompressor,
-            def_decompressor,
+            rep_codec,
+            def_codec,
             num_rep_values,
             num_def_values,
         }
@@ -833,8 +1048,8 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
         }
 
         let data = io.submit_request(reads, 0);
-        let rep_decompressor = self.rep_decompressor.clone();
-        let def_decompressor = self.def_decompressor.clone();
+        let rep_codec = self.rep_codec.clone();
+        let def_codec = self.def_codec.clone();
         let num_rep_values = self.num_rep_values;
         let num_def_values = self.num_def_values;
 
@@ -842,71 +1057,64 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             let data = data.await?;
             let mut data_iter = data.into_iter();
 
-            let decompress_levels = |compressed_bytes: Bytes,
-                                     decompressor: &Arc<dyn BlockDecompressor>,
-                                     num_values: u64,
-                                     level_type: &str|
-             -> Result<ScalarBuffer<u16>> {
-                let compressed_buffer = LanceBuffer::from_bytes(compressed_bytes, 1);
-                let decompressed = decompressor.decompress(compressed_buffer, num_values)?;
-                match decompressed {
-                    DataBlock::FixedWidth(block) => {
-                        if block.num_values != num_values {
-                            return Err(Error::invalid_input_source(format!(
-                                "Unexpected {} level count after decompression: expected {}, got {}",
-                                level_type, num_values, block.num_values
-                            )
-                            .into()));
-                        }
-                        if block.bits_per_value != 16 {
-                            return Err(Error::invalid_input_source(format!(
-                                "Unexpected {} level bit width after decompression: expected 16, got {}",
-                                level_type, block.bits_per_value
-                            )
-                            .into()));
-                        }
-                        Ok(block.data.borrow_to_typed_slice::<u16>())
+            // RLE levels are kept in run form (`LazyLevels::Rle`); everything else
+            // expands eagerly to `LazyLevels::Dense`, exactly as before.
+            let build_levels = |compressed_bytes: Bytes,
+                                codec: &LevelCodec,
+                                num_values: u64,
+                                level_type: &str|
+             -> Result<LazyLevels> {
+                match codec {
+                    LevelCodec::Uncompressed => {
+                        let buffer = LanceBuffer::from_bytes(compressed_bytes, 2);
+                        Ok(LazyLevels::Dense(buffer.borrow_to_typed_slice::<u16>()))
                     }
-                    _ => Err(Error::invalid_input_source(format!(
-                        "Expected fixed-width data block for {} levels",
-                        level_type
-                    )
-                    .into())),
+                    LevelCodec::Rle => {
+                        let frame = LanceBuffer::from_bytes(compressed_bytes, 1);
+                        let (values, offsets) = decode_rle_u16_runs(frame, num_values)?;
+                        Ok(LazyLevels::Rle { values, offsets })
+                    }
+                    LevelCodec::Block(decompressor) => {
+                        let frame = LanceBuffer::from_bytes(compressed_bytes, 1);
+                        let decompressed = decompressor.decompress(frame, num_values)?;
+                        match decompressed {
+                            DataBlock::FixedWidth(block) => {
+                                if block.num_values != num_values {
+                                    return Err(Error::invalid_input_source(format!(
+                                        "Unexpected {} level count after decompression: expected {}, got {}",
+                                        level_type, num_values, block.num_values
+                                    )
+                                    .into()));
+                                }
+                                if block.bits_per_value != 16 {
+                                    return Err(Error::invalid_input_source(format!(
+                                        "Unexpected {} level bit width after decompression: expected 16, got {}",
+                                        level_type, block.bits_per_value
+                                    )
+                                    .into()));
+                                }
+                                Ok(LazyLevels::Dense(block.data.borrow_to_typed_slice::<u16>()))
+                            }
+                            _ => Err(Error::invalid_input_source(format!(
+                                "Expected fixed-width data block for {} levels",
+                                level_type
+                            )
+                            .into())),
+                        }
+                    }
                 }
             };
 
             let rep = if has_rep {
                 let rep = data_iter.next().unwrap();
-                if let Some(rep_decompressor) = rep_decompressor.as_ref() {
-                    Some(decompress_levels(
-                        rep,
-                        rep_decompressor,
-                        num_rep_values,
-                        "repetition",
-                    )?)
-                } else {
-                    let rep = LanceBuffer::from_bytes(rep, 2);
-                    let rep = rep.borrow_to_typed_slice::<u16>();
-                    Some(rep)
-                }
+                Some(build_levels(rep, &rep_codec, num_rep_values, "repetition")?)
             } else {
                 None
             };
 
             let def = if has_def {
                 let def = data_iter.next().unwrap();
-                if let Some(def_decompressor) = def_decompressor.as_ref() {
-                    Some(decompress_levels(
-                        def,
-                        def_decompressor,
-                        num_def_values,
-                        "definition",
-                    )?)
-                } else {
-                    let def = LanceBuffer::from_bytes(def, 2);
-                    let def = def.borrow_to_typed_slice::<u16>();
-                    Some(def)
-                }
+                Some(build_levels(def, &def_codec, num_def_values, "definition")?)
             } else {
                 None
             };
@@ -944,8 +1152,8 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             def_meaning: self.def_meaning.clone(),
             max_rep: self.max_rep,
             max_visible_level: self.max_visible_level,
-            cursor_row: 0,
-            cursor_level: 0,
+            rep_cursor: LevelCursor::default(),
+            def_run_cursor: 0,
         }) as Box<dyn StructuralPageDecoder>;
         let page_load_task = PageLoadTask {
             decoder_fut: std::future::ready(Ok(decoder)).boxed(),
@@ -958,14 +1166,16 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
 #[derive(Debug)]
 pub struct ComplexAllNullPageDecoder {
     ranges: VecDeque<Range<u64>>,
-    rep: Option<ScalarBuffer<u16>>,
-    def: Option<ScalarBuffer<u16>>,
+    rep: Option<LazyLevels>,
+    def: Option<LazyLevels>,
     num_rows: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
     max_rep: u16,
     max_visible_level: u16,
-    cursor_row: u64,
-    cursor_level: usize,
+    /// Monotonic cursor into `rep` tracking the current row's level start.
+    rep_cursor: LevelCursor,
+    /// Monotonic run cursor into `def` for `count_le_cursor`.
+    def_run_cursor: usize,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -987,73 +1197,57 @@ impl ComplexAllNullPageDecoder {
         ranges
     }
 
-    fn take_row(&mut self) -> Result<(Range<usize>, u64)> {
-        let start = self.cursor_level;
-        let end = if let Some(rep) = &self.rep {
-            if start >= rep.len() {
-                return Err(Error::internal(
-                    "Invalid complex all-null layout: repetition buffer too short",
-                ));
+    /// Level index at which row `target_row` starts, advancing the monotonic
+    /// repetition cursor. Callers must request non-decreasing `target_row`.
+    fn seek_row_start(&mut self, target_row: u64) -> Result<usize> {
+        match &self.rep {
+            Some(rep) => rep.seek_row_start(&mut self.rep_cursor, target_row, self.max_rep),
+            None => {
+                // Without repetition every level is its own row.
+                self.rep_cursor.row = target_row;
+                self.rep_cursor.level = target_row as usize;
+                Ok(target_row as usize)
             }
-            if rep[start] != self.max_rep {
-                return Err(Error::internal(
-                    "Invalid complex all-null layout: row did not start at max repetition level",
-                ));
-            }
-            let mut end = start + 1;
-            while end < rep.len() && rep[end] != self.max_rep {
-                end += 1;
-            }
-            end
-        } else {
-            start + 1
-        };
-
-        let visible = if let Some(def) = &self.def {
-            if end > def.len() {
-                return Err(Error::internal(
-                    "Invalid complex all-null layout: definition buffer too short",
-                ));
-            }
-            def[start..end]
-                .iter()
-                .filter(|d| **d <= self.max_visible_level)
-                .count() as u64
-        } else {
-            (end - start) as u64
-        };
-
-        self.cursor_level = end;
-        self.cursor_row += 1;
-        Ok((start..end, visible))
+        }
     }
 
-    fn skip_to_row(&mut self, target_row: u64) -> Result<()> {
-        while self.cursor_row < target_row {
-            self.take_row()?;
+    /// Number of visible items in the level range `levels` (definition levels
+    /// `<= max_visible_level`), advancing the monotonic definition cursor.
+    fn count_visible(&mut self, levels: Range<usize>) -> Result<u64> {
+        match &self.def {
+            Some(def) => {
+                if levels.end > def.len() {
+                    return Err(Error::internal(
+                        "Invalid complex all-null layout: definition buffer too short",
+                    ));
+                }
+                Ok(def.count_le_cursor(&mut self.def_run_cursor, levels, self.max_visible_level))
+            }
+            None => Ok((levels.end - levels.start) as u64),
         }
-        Ok(())
     }
 }
 
 impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
-        let mut level_slices: Vec<Range<usize>> = Vec::new();
+        let mut level_slices: Vec<Range<usize>> = Vec::with_capacity(drained_ranges.len());
         let mut visible_items_total = 0;
 
+        // Each row range is one contiguous level slice `[start_row_level,
+        // end_row_level)`, so we seek both boundaries and count its visibility at
+        // once rather than per row. The cursors only move forward, keeping a full
+        // page decode O(runs), not O(rows).
         for range in drained_ranges {
-            self.skip_to_row(range.start)?;
-            for _ in range.start..range.end {
-                let (level_range, visible) = self.take_row()?;
-                visible_items_total += visible;
-                if let Some(last) = level_slices.last_mut()
-                    && last.end == level_range.start
-                {
-                    last.end = level_range.end;
-                    continue;
-                }
-                level_slices.push(level_range);
+            let level_start = self.seek_row_start(range.start)?;
+            let level_end = self.seek_row_start(range.end)?;
+            visible_items_total += self.count_visible(level_start..level_end)?;
+            if let Some(last) = level_slices.last_mut()
+                && last.end == level_start
+            {
+                last.end = level_end;
+            } else {
+                level_slices.push(level_start..level_end);
             }
         }
 
@@ -1078,14 +1272,14 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
 pub struct DecodeComplexAllNullTask {
     level_slices: Vec<Range<usize>>,
     visible_items_total: u64,
-    rep: Option<ScalarBuffer<u16>>,
-    def: Option<ScalarBuffer<u16>>,
+    rep: Option<LazyLevels>,
+    def: Option<LazyLevels>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     max_visible_level: u16,
 }
 
 impl DecodeComplexAllNullTask {
-    fn decode_level(&self, levels: &Option<ScalarBuffer<u16>>) -> Option<Vec<u16>> {
+    fn decode_level(&self, levels: &Option<LazyLevels>) -> Option<Vec<u16>> {
         levels.as_ref().map(|levels| {
             let num_levels = self
                 .level_slices
@@ -1094,7 +1288,7 @@ impl DecodeComplexAllNullTask {
                 .sum();
             let mut referenced_levels = Vec::with_capacity(num_levels);
             for range in &self.level_slices {
-                referenced_levels.extend(levels[range.start..range.end].iter().copied());
+                levels.extend_into(range.clone(), &mut referenced_levels);
             }
             referenced_levels
         })
@@ -3381,25 +3575,33 @@ impl StructuralPrimitiveFieldScheduler {
                 {
                     Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
                 } else {
-                    let rep_decompressor = constant_layout
-                        .rep_compression
-                        .as_ref()
-                        .map(|encoding| decompressors.create_block_decompressor(encoding))
-                        .transpose()?
-                        .map(Arc::from);
-
-                    let def_decompressor = constant_layout
-                        .def_compression
-                        .as_ref()
-                        .map(|encoding| decompressors.create_block_decompressor(encoding))
-                        .transpose()?
-                        .map(Arc::from);
+                    // RLE levels are kept lazily in run form; other block
+                    // compressions keep flowing through the eager decompressor.
+                    let level_codec =
+                        |encoding: Option<&CompressiveEncoding>| -> Result<LevelCodec> {
+                            match encoding {
+                                None => Ok(LevelCodec::Uncompressed),
+                                Some(enc)
+                                    if matches!(
+                                        enc.compression.as_ref(),
+                                        Some(Compression::Rle(_))
+                                    ) =>
+                                {
+                                    Ok(LevelCodec::Rle)
+                                }
+                                Some(enc) => Ok(LevelCodec::Block(Arc::from(
+                                    decompressors.create_block_decompressor(enc)?,
+                                ))),
+                            }
+                        };
+                    let rep_codec = level_codec(constant_layout.rep_compression.as_ref())?;
+                    let def_codec = level_codec(constant_layout.def_compression.as_ref())?;
 
                     Box::new(ComplexAllNullScheduler::new(
                         page_info.buffer_offsets_and_sizes.clone(),
                         def_meaning.into(),
-                        rep_decompressor,
-                        def_decompressor,
+                        rep_codec,
+                        def_codec,
                         constant_layout.num_rep_values,
                         constant_layout.num_def_values,
                     )) as Box<dyn StructuralPageScheduler>
@@ -7958,6 +8160,339 @@ mod tests {
         let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+
+    #[tokio::test]
+    async fn test_complex_all_null_constant_def_round_trip() {
+        use arrow_array::ListArray;
+
+        // Every row is a null list => constant def levels => a single RLE run,
+        // exercising the lazy run-form decode end to end.
+        let list_array = ListArray::from_iter_primitive::<arrow_array::types::Int32Type, _, _>(
+            (0..5000).map(|_| None::<Vec<Option<i32>>>),
+        );
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[test]
+    fn lazy_levels_rle_matches_dense() {
+        use arrow_buffer::ScalarBuffer;
+
+        use super::{LazyLevels, LevelCursor};
+
+        // Runs: 3x2, 1x1, 3x3, 0x2  =>  [3,3,1,3,3,3,0,0]
+        let rle = LazyLevels::Rle {
+            values: ScalarBuffer::<u16>::from(vec![3u16, 1, 3, 0]),
+            offsets: Arc::from(vec![0u64, 2, 3, 6, 8]),
+        };
+        let expanded: Vec<u16> = vec![3, 3, 1, 3, 3, 3, 0, 0];
+        let dense = LazyLevels::Dense(ScalarBuffer::<u16>::from(expanded.clone()));
+        let n = expanded.len();
+
+        assert_eq!(rle.len(), n);
+        assert_eq!(dense.len(), n);
+
+        // Rows begin at each `max_rep` (3) position; row `num_rows` maps to `len`.
+        let max_rep = 3u16;
+        let row_starts: Vec<usize> = (0..n).filter(|&i| expanded[i] == max_rep).collect();
+        for target in 0..=row_starts.len() as u64 {
+            let want = row_starts.get(target as usize).copied().unwrap_or(n);
+            let (mut c_rle, mut c_dense) = (LevelCursor::default(), LevelCursor::default());
+            assert_eq!(
+                rle.seek_row_start(&mut c_rle, target, max_rep).unwrap(),
+                want,
+                "seek_row_start({target})"
+            );
+            assert_eq!(
+                dense.seek_row_start(&mut c_dense, target, max_rep).unwrap(),
+                want
+            );
+        }
+
+        // `count_le_cursor` (fresh cursor per range) and `extend_into` agree with
+        // the dense reference on every sub-range.
+        for start in 0..=n {
+            for end in start..=n {
+                for max in [0u16, 1, 2, 3] {
+                    let want = expanded[start..end].iter().filter(|&&d| d <= max).count() as u64;
+                    let (mut r_cur, mut d_cur) = (0usize, 0usize);
+                    assert_eq!(
+                        rle.count_le_cursor(&mut r_cur, start..end, max),
+                        want,
+                        "count_le_cursor({start}..{end}, {max})"
+                    );
+                    assert_eq!(dense.count_le_cursor(&mut d_cur, start..end, max), want);
+                }
+                let (mut got_rle, mut got_dense) = (Vec::new(), Vec::new());
+                rle.extend_into(start..end, &mut got_rle);
+                dense.extend_into(start..end, &mut got_dense);
+                assert_eq!(
+                    got_rle,
+                    expanded[start..end].to_vec(),
+                    "extend_into({start}..{end})"
+                );
+                assert_eq!(got_dense, expanded[start..end].to_vec());
+            }
+        }
+    }
+
+    /// Fuzz parity for the run-oriented complex-all-null drain: the cursor walk
+    /// over `LazyLevels` must yield the exact coalesced level slices and visible
+    /// count that a brute-force reference over the fully expanded levels does, for
+    /// both `Dense` and `Rle` forms and arbitrarily shaped range requests.
+    mod complex_all_null_drain_parity {
+        use std::{ops::Range, sync::Arc};
+
+        use arrow_buffer::ScalarBuffer;
+        use proptest::prelude::*;
+
+        use super::super::{LazyLevels, LevelCursor};
+        use crate::Result;
+
+        #[derive(Debug, Clone)]
+        struct DrainInput {
+            max_rep: u16,
+            max_visible: u16,
+            rep: Option<Vec<u16>>,
+            def: Option<Vec<u16>>,
+            ranges: Vec<Range<u64>>,
+        }
+
+        fn dense_levels(levels: &[u16]) -> LazyLevels {
+            LazyLevels::Dense(ScalarBuffer::from(levels.to_vec()))
+        }
+
+        /// Build the coalesced run form (adjacent equal values merged), matching
+        /// the invariant `decode_rle_u16_runs` produces.
+        fn rle_levels(levels: &[u16]) -> LazyLevels {
+            let mut values: Vec<u16> = Vec::new();
+            let mut offsets: Vec<u64> = vec![0];
+            for (i, &v) in levels.iter().enumerate() {
+                if values.last() == Some(&v) {
+                    *offsets.last_mut().unwrap() = (i + 1) as u64;
+                } else {
+                    values.push(v);
+                    offsets.push((i + 1) as u64);
+                }
+            }
+            LazyLevels::Rle {
+                values: ScalarBuffer::from(values),
+                offsets: Arc::from(offsets),
+            }
+        }
+
+        fn seek(
+            rep: Option<&LazyLevels>,
+            cursor: &mut LevelCursor,
+            row: u64,
+            max_rep: u16,
+        ) -> Result<usize> {
+            match rep {
+                Some(rep) => rep.seek_row_start(cursor, row, max_rep),
+                None => {
+                    cursor.row = row;
+                    cursor.level = row as usize;
+                    Ok(row as usize)
+                }
+            }
+        }
+
+        /// Mirror of `ComplexAllNullPageDecoder::drain`, driving the real
+        /// `seek_row_start` / `count_le_cursor` with monotonic cursors.
+        fn simulate_drain(
+            rep: Option<&LazyLevels>,
+            def: Option<&LazyLevels>,
+            max_rep: u16,
+            max_visible: u16,
+            ranges: &[Range<u64>],
+        ) -> Result<(Vec<Range<usize>>, u64)> {
+            let mut rep_cursor = LevelCursor::default();
+            let mut def_run_cursor = 0usize;
+            let mut slices: Vec<Range<usize>> = Vec::new();
+            let mut visible = 0u64;
+            for range in ranges {
+                let level_start = seek(rep, &mut rep_cursor, range.start, max_rep)?;
+                let level_end = seek(rep, &mut rep_cursor, range.end, max_rep)?;
+                visible += match def {
+                    Some(def) => def.count_le_cursor(
+                        &mut def_run_cursor,
+                        level_start..level_end,
+                        max_visible,
+                    ),
+                    None => (level_end - level_start) as u64,
+                };
+                match slices.last_mut() {
+                    Some(last) if last.end == level_start => last.end = level_end,
+                    _ => slices.push(level_start..level_end),
+                }
+            }
+            Ok((slices, visible))
+        }
+
+        /// Independent brute-force reference over fully expanded levels.
+        fn reference_drain(
+            rep: Option<&[u16]>,
+            def: Option<&[u16]>,
+            max_rep: u16,
+            max_visible: u16,
+            ranges: &[Range<u64>],
+        ) -> (Vec<Range<usize>>, u64) {
+            let total_levels = rep
+                .map(|r| r.len())
+                .or_else(|| def.map(|d| d.len()))
+                .unwrap_or(0);
+            // Level index where each row starts (or `total_levels` for the end row).
+            let row_starts: Vec<usize> = match rep {
+                Some(rep) => (0..rep.len()).filter(|&i| rep[i] == max_rep).collect(),
+                None => (0..total_levels).collect(),
+            };
+            let level_of_row = |row: u64| {
+                row_starts
+                    .get(row as usize)
+                    .copied()
+                    .unwrap_or(total_levels)
+            };
+
+            let mut slices: Vec<Range<usize>> = Vec::new();
+            let mut visible = 0u64;
+            for range in ranges {
+                let ls = level_of_row(range.start);
+                let le = level_of_row(range.end);
+                visible += match def {
+                    Some(def) => def[ls..le].iter().filter(|&&d| d <= max_visible).count() as u64,
+                    None => (le - ls) as u64,
+                };
+                match slices.last_mut() {
+                    Some(last) if last.end == ls => last.end = le,
+                    _ => slices.push(ls..le),
+                }
+            }
+            (slices, visible)
+        }
+
+        fn ranges_strategy(num_rows: u64) -> BoxedStrategy<Vec<Range<u64>>> {
+            if num_rows == 0 {
+                return Just(Vec::new()).boxed();
+            }
+            // (gap, len) pairs; a zero gap yields ranges adjacent in row space,
+            // which exercises the level-slice coalescing path.
+            proptest::collection::vec((0u64..=3, 1u64..=4), 0..=8)
+                .prop_map(move |pairs| {
+                    let mut ranges = Vec::new();
+                    let mut pos = 0u64;
+                    for (gap, len) in pairs {
+                        pos = pos.saturating_add(gap);
+                        if pos >= num_rows {
+                            break;
+                        }
+                        let end = (pos + len).min(num_rows);
+                        ranges.push(pos..end);
+                        pos = end;
+                    }
+                    ranges
+                })
+                .boxed()
+        }
+
+        fn drain_input() -> impl Strategy<Value = DrainInput> {
+            (
+                1u16..=3,
+                0u16..=3,
+                any::<bool>(),
+                any::<bool>(),
+                1usize..=48,
+            )
+                .prop_flat_map(|(max_rep, max_visible, has_rep, has_def, len)| {
+                    // Complex-all-null always has definition levels when there is
+                    // no repetition, so force `def` present in that case.
+                    let has_def = has_def || !has_rep;
+                    let rep = if has_rep {
+                        proptest::collection::vec(0u16..=max_rep, len)
+                            .prop_map(move |mut v| {
+                                // Row 0 must start at a max-rep boundary.
+                                v[0] = max_rep;
+                                Some(v)
+                            })
+                            .boxed()
+                    } else {
+                        Just(None).boxed()
+                    };
+                    let def = if has_def {
+                        proptest::collection::vec(0u16..=(max_visible + 2), len)
+                            .prop_map(Some)
+                            .boxed()
+                    } else {
+                        Just(None).boxed()
+                    };
+                    (Just(max_rep), Just(max_visible), rep, def)
+                })
+                .prop_flat_map(|(max_rep, max_visible, rep, def)| {
+                    let num_rows = match &rep {
+                        Some(rep) => rep.iter().filter(|&&v| v == max_rep).count() as u64,
+                        None => def.as_ref().map(|d| d.len() as u64).unwrap_or(0),
+                    };
+                    ranges_strategy(num_rows).prop_map(move |ranges| DrainInput {
+                        max_rep,
+                        max_visible,
+                        rep: rep.clone(),
+                        def: def.clone(),
+                        ranges,
+                    })
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            #[test]
+            fn drain_matches_reference(input in drain_input()) {
+                let DrainInput { max_rep, max_visible, rep, def, ranges } = input;
+
+                let reference =
+                    reference_drain(rep.as_deref(), def.as_deref(), max_rep, max_visible, &ranges);
+
+                let rep_dense = rep.as_deref().map(dense_levels);
+                let def_dense = def.as_deref().map(dense_levels);
+                let got_dense =
+                    simulate_drain(rep_dense.as_ref(), def_dense.as_ref(), max_rep, max_visible, &ranges)
+                        .unwrap();
+                prop_assert_eq!(&got_dense, &reference, "dense form diverged from reference");
+
+                let rep_rle = rep.as_deref().map(rle_levels);
+                let def_rle = def.as_deref().map(rle_levels);
+                let got_rle =
+                    simulate_drain(rep_rle.as_ref(), def_rle.as_ref(), max_rep, max_visible, &ranges)
+                        .unwrap();
+                prop_assert_eq!(&got_rle, &reference, "rle form diverged from reference");
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_levels_rle_is_compact() {
+        use arrow_buffer::ScalarBuffer;
+
+        use super::LazyLevels;
+
+        let single_run = |n: u64| LazyLevels::Rle {
+            values: ScalarBuffer::<u16>::from(vec![1u16]),
+            offsets: Arc::from(vec![0u64, n]),
+        };
+        // Run-form footprint is independent of the logical length...
+        assert_eq!(
+            single_run(100).deep_size(),
+            single_run(10_000_000).deep_size()
+        );
+        assert!(single_run(10_000_000).deep_size() < 100);
+        assert_eq!(single_run(10_000_000).len(), 10_000_000);
+        // ...while Dense pays 2 bytes per value.
+        assert_eq!(
+            LazyLevels::Dense(ScalarBuffer::<u16>::from(vec![1u16; 1000])).deep_size(),
+            2000
+        );
     }
 
     // https://github.com/lance-format/lance/issues/6681

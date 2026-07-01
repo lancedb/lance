@@ -54,7 +54,9 @@
 //! When used in the block compression path, the encoded output is a single buffer:
 //! `[8-byte header: values buffer size][values buffer][run_lengths buffer]`.
 
-use arrow_buffer::ArrowNativeType;
+use std::sync::Arc;
+
+use arrow_buffer::{ArrowNativeType, ScalarBuffer};
 use log::trace;
 
 use crate::buffer::LanceBuffer;
@@ -560,39 +562,149 @@ impl MiniBlockDecompressor for RleDecompressor {
 
 impl BlockDecompressor for RleDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        // fetch the values_size
-        if data.len() < 8 {
-            return Err(Error::invalid_input_source(
-                format!("Insufficient data size: {}", data.len()).into(),
-            ));
-        }
-
-        let values_size_bytes: [u8; 8] =
-            data[..8].try_into().expect("slice length already checked");
-        let values_size: u64 = u64::from_le_bytes(values_size_bytes);
-
-        // parse values
-        let values_start: usize = 8;
-        let values_size: usize = values_size.try_into().map_err(|_| {
-            Error::invalid_input_source(
-                format!("Invalid values buffer size: {}", values_size).into(),
-            )
-        })?;
-        let lengths_start = values_start
-            .checked_add(values_size)
-            .ok_or_else(|| Error::invalid_input_source("Invalid RLE values buffer size".into()))?;
-
-        if data.len() < lengths_start {
-            return Err(Error::invalid_input_source(
-                format!("Insufficient data size: {}", data.len()).into(),
-            ));
-        }
-
-        let values_buffer = data.slice_with_length(values_start, values_size);
-        let lengths_buffer = data.slice_with_length(lengths_start, data.len() - lengths_start);
-
+        let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
         self.decode_data(vec![values_buffer, lengths_buffer], num_values)
     }
+}
+
+/// Split an RLE block-format buffer into its `(values, lengths)` sub-buffers.
+/// Frame: `[values_size: u64-le][values bytes][run-length bytes (u8 per run)]`.
+fn parse_rle_block_frame(data: &LanceBuffer) -> Result<(LanceBuffer, LanceBuffer)> {
+    if data.len() < 8 {
+        return Err(Error::invalid_input_source(
+            format!("Insufficient data size: {}", data.len()).into(),
+        ));
+    }
+
+    let values_size_bytes: [u8; 8] = data[..8].try_into().expect("slice length already checked");
+    let values_size: usize = u64::from_le_bytes(values_size_bytes)
+        .try_into()
+        .map_err(|_| {
+            Error::invalid_input_source(
+                format!(
+                    "Invalid values buffer size: {}",
+                    u64::from_le_bytes(values_size_bytes)
+                )
+                .into(),
+            )
+        })?;
+
+    let values_start: usize = 8;
+    let lengths_start = values_start
+        .checked_add(values_size)
+        .ok_or_else(|| Error::invalid_input_source("Invalid RLE values buffer size".into()))?;
+
+    if data.len() < lengths_start {
+        return Err(Error::invalid_input_source(
+            format!("Insufficient data size: {}", data.len()).into(),
+        ));
+    }
+
+    let values_buffer = data.slice_with_length(values_start, values_size);
+    let lengths_buffer = data.slice_with_length(lengths_start, data.len() - lengths_start);
+    Ok((values_buffer, lengths_buffer))
+}
+
+/// Parse an RLE block-format buffer into per-run `u16` values and cumulative
+/// logical offsets, without expanding to the full `num_values` length.
+///
+/// Adjacent runs that share a value are coalesced into a single logical run.
+/// Because the block encoder caps run lengths at `u8::MAX` (see
+/// `RleEncoder::add_run`), a logically constant page arrives as
+/// `ceil(num_values / 255)` equal-valued runs; coalescing collapses them so the
+/// run form stays proportional to the number of distinct logical levels.
+///
+/// `offsets.len() == values.len() + 1`, `offsets[0] == 0`, and
+/// `offsets[values.len()] == num_values`. Lets the complex-all-null decoder keep
+/// highly-compressible rep/def levels in run form instead of materializing
+/// `num_values` u16s per cached page.
+pub(crate) fn decode_rle_u16_runs(
+    data: LanceBuffer,
+    num_values: u64,
+) -> Result<(ScalarBuffer<u16>, Arc<[u64]>)> {
+    if num_values == 0 {
+        return Ok((ScalarBuffer::from(Vec::<u16>::new()), Arc::from(vec![0u64])));
+    }
+
+    let (values_buffer, lengths_buffer) = parse_rle_block_frame(&data)?;
+
+    const TYPE_SIZE: usize = std::mem::size_of::<u16>();
+    if !values_buffer.len().is_multiple_of(TYPE_SIZE) {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Invalid RLE u16 values buffer: {} bytes (not divisible by {})",
+                values_buffer.len(),
+                TYPE_SIZE
+            )
+            .into(),
+        ));
+    }
+
+    let num_runs = values_buffer.len() / TYPE_SIZE;
+    if num_runs != lengths_buffer.len() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Inconsistent RLE buffers: {} runs but {} length entries",
+                num_runs,
+                lengths_buffer.len()
+            )
+            .into(),
+        ));
+    }
+    if num_runs == 0 {
+        return Err(Error::invalid_input_source(
+            format!("Empty RLE buffers but expected {} values", num_values).into(),
+        ));
+    }
+
+    let run_values = values_buffer.borrow_to_typed_slice::<u16>();
+    let run_values: &[u16] = run_values.as_ref();
+    let lengths: &[u8] = lengths_buffer.as_ref();
+
+    // Coalesce adjacent runs that share a value. The block encoder caps each run
+    // length at `u8::MAX` (see `RleEncoder::add_run`), so a logically constant
+    // page arrives as `ceil(num_values / 255)` equal-valued runs. Merging them
+    // keeps the cached run form proportional to the number of distinct logical
+    // levels (usually one for the all-null pages this feeds) instead of
+    // `num_values / 255`.
+    let mut values: Vec<u16> = Vec::with_capacity(num_runs);
+    let mut offsets: Vec<u64> = Vec::with_capacity(num_runs + 1);
+    offsets.push(0u64);
+    let mut acc: u64 = 0;
+    for (&value, &length) in run_values.iter().zip(lengths.iter()) {
+        if length == 0 {
+            return Err(Error::invalid_input_source(
+                "RLE decoding encountered a zero run length".into(),
+            ));
+        }
+        if acc >= num_values {
+            // Encoded runs overshoot the logical length; mirror the eager
+            // decoder (`decode_generic`) by truncating the trailing runs.
+            break;
+        }
+        let write = (length as u64).min(num_values - acc);
+        acc += write;
+        if values.last().copied() == Some(value) {
+            // Same value as the previous logical run: extend it in place.
+            *offsets
+                .last_mut()
+                .expect("offsets always has a trailing entry") = acc;
+        } else {
+            values.push(value);
+            offsets.push(acc);
+        }
+    }
+
+    if acc != num_values {
+        return Err(Error::invalid_input_source(
+            format!("RLE runs cover {} values, expected {}", acc, num_values).into(),
+        ));
+    }
+
+    // `ScalarBuffer::from(Vec)` keeps the Vec's capacity, so drop the
+    // over-estimate to keep the cached run form compact.
+    values.shrink_to_fit();
+    Ok((ScalarBuffer::from(values), Arc::from(offsets)))
 }
 
 #[cfg(test)]
@@ -602,6 +714,99 @@ mod tests {
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
     use crate::{buffer::LanceBuffer, compression::BlockDecompressor};
     use arrow_array::Int32Array;
+
+    #[test]
+    fn decode_rle_u16_runs_matches_eager() {
+        // Near-constant u16 levels (the all-null shape): a few long runs.
+        let mut levels: Vec<u16> = vec![1u16; 1000];
+        levels.extend(std::iter::repeat_n(0u16, 500));
+        levels.extend(std::iter::repeat_n(2u16, 300));
+        let num_values = levels.len() as u64;
+
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(levels.clone())),
+            bits_per_value: 16,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let frame = BlockCompressor::compress(&RleEncoder::new(), block).unwrap();
+
+        // Eager expansion via the block decompressor.
+        let eager =
+            BlockDecompressor::decompress(&RleDecompressor::new(16), frame.clone(), num_values)
+                .unwrap();
+        let DataBlock::FixedWidth(eager) = eager else {
+            panic!("expected fixed-width block");
+        };
+        assert_eq!(
+            eager.data.borrow_to_typed_slice::<u16>().as_ref(),
+            levels.as_slice()
+        );
+
+        // Lazy run form preserves boundaries and expands identically.
+        let (values, offsets) = decode_rle_u16_runs(frame, num_values).unwrap();
+        assert_eq!(offsets[0], 0);
+        assert_eq!(*offsets.last().unwrap(), num_values);
+        assert_eq!(values.len() + 1, offsets.len());
+        // The encoder splits each value into <=255-length runs (4 + 2 + 2 = 8
+        // on-disk runs here); decode coalesces them back to 3 logical runs.
+        assert_eq!(values.len(), 3);
+
+        let mut expanded = Vec::with_capacity(num_values as usize);
+        for r in 0..values.len() {
+            let len = (offsets[r + 1] - offsets[r]) as usize;
+            expanded.extend(std::iter::repeat_n(values[r], len));
+        }
+        assert_eq!(expanded, levels);
+    }
+
+    #[test]
+    fn decode_rle_u16_runs_empty() {
+        let (values, offsets) = decode_rle_u16_runs(LanceBuffer::empty(), 0).unwrap();
+        assert_eq!(values.len(), 0);
+        assert_eq!(offsets.as_ref(), &[0u64]);
+    }
+
+    #[test]
+    fn decode_rle_u16_runs_coalesces_equal_runs() {
+        // A logically constant page is emitted as ceil(N / 255) equal-valued
+        // runs (the encoder caps run lengths at 255); decode must collapse them
+        // to a single logical run so the cached form is O(1), not O(N / 255).
+        let num_values = 5000u64;
+        let constant: Vec<u16> = vec![7u16; num_values as usize];
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(constant)),
+            bits_per_value: 16,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        let frame = BlockCompressor::compress(&RleEncoder::new(), block).unwrap();
+        let (values, offsets) = decode_rle_u16_runs(frame, num_values).unwrap();
+        assert_eq!(values.as_ref(), &[7u16]);
+        assert_eq!(offsets.as_ref(), &[0u64, num_values]);
+
+        // Distinct adjacent values must not be merged: alternating single-value
+        // runs stay separate and still expand to the original.
+        let alternating: Vec<u16> = (0..200u16).map(|i| i % 2).collect();
+        let n = alternating.len() as u64;
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(alternating.clone())),
+            bits_per_value: 16,
+            num_values: n,
+            block_info: BlockInfo::new(),
+        });
+        let frame = BlockCompressor::compress(&RleEncoder::new(), block).unwrap();
+        let (values, offsets) = decode_rle_u16_runs(frame, n).unwrap();
+        assert_eq!(values.len() as u64, n, "no two adjacent values are equal");
+        assert_eq!(offsets.len() as u64, n + 1);
+        let mut expanded = Vec::with_capacity(n as usize);
+        for r in 0..values.len() {
+            let len = (offsets[r + 1] - offsets[r]) as usize;
+            expanded.extend(std::iter::repeat_n(values[r], len));
+        }
+        assert_eq!(expanded, alternating);
+    }
+
     // ========== Core Functionality Tests ==========
 
     #[test]
