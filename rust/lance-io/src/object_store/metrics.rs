@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use futures::StreamExt;
 use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -291,10 +291,19 @@ struct MeteredMultipartUpload {
 #[async_trait::async_trait]
 impl MultipartUpload for MeteredMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        record_count(&self.scheme, "put");
-        metrics::counter!(METRIC_BYTES, "operation" => "put", "scheme" => self.scheme.clone())
-            .increment(data.content_length() as u64);
-        self.target.put_part(data)
+        // Each part upload is a distinct `put` request, so it records the same
+        // count / bytes / latency / error set as a unary put.
+        let scheme = self.scheme.clone();
+        let size = data.content_length() as u64;
+        let inner = self.target.put_part(data);
+        async move {
+            let _in_flight = InFlightGuard::new(&scheme, "put");
+            let start = Instant::now();
+            let result = inner.await;
+            record_request(&scheme, "put", start, size, &result);
+            result
+        }
+        .boxed()
     }
 
     async fn complete(&mut self) -> OSResult<PutResult> {
@@ -809,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multipart_counts_each_part_as_put_without_latency() {
+    fn test_multipart_records_each_part_as_put() {
         let recorded = capture_metrics(|| async {
             let store = metered_store();
             let mut upload = store.put_multipart(&Path::from("a/big")).await.unwrap();
@@ -821,8 +830,27 @@ mod tests {
         let labels = [("operation", "put"), ("scheme", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 2);
         assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 12);
-        // Individual parts don't record a latency histogram (unlike unary put).
-        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 0);
+        // Each part records its own latency sample, like a unary put.
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 2);
+        // A successful part upload records no error.
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &labels), 0);
+    }
+
+    #[test]
+    fn test_multipart_part_error_is_counted() {
+        let recorded = capture_metrics(|| async {
+            let store = (Arc::new(FailingStreamStore) as Arc<dyn object_store::ObjectStore>)
+                .metered("memory".into());
+            let mut upload = store.put_multipart(&Path::from("a/big")).await.unwrap();
+            let _ = upload.put_part(payload(b"data")).await;
+        });
+
+        let labels = [("operation", "put"), ("scheme", "memory")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &labels), 1);
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
+        // A failed part transfers no counted bytes.
+        assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 0);
     }
 
     #[test]
@@ -1025,7 +1053,7 @@ mod tests {
             _location: &Path,
             _opts: PutMultipartOptions,
         ) -> OSResult<Box<dyn MultipartUpload>> {
-            unimplemented!()
+            Ok(Box::new(FailingUpload))
         }
 
         async fn get_opts(&self, _location: &Path, _options: GetOptions) -> OSResult<GetResult> {
@@ -1065,6 +1093,26 @@ mod tests {
             _to: &Path,
             _opts: RenameOptions,
         ) -> OSResult<()> {
+            unimplemented!()
+        }
+    }
+
+    /// A [`MultipartUpload`] whose part uploads always fail, used to exercise the
+    /// error branch of the metered `put_part`.
+    #[derive(Debug)]
+    struct FailingUpload;
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for FailingUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+            async { Err(test_error()) }.boxed()
+        }
+
+        async fn complete(&mut self) -> OSResult<PutResult> {
+            unimplemented!()
+        }
+
+        async fn abort(&mut self) -> OSResult<()> {
             unimplemented!()
         }
     }
