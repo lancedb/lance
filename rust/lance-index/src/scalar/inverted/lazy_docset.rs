@@ -24,7 +24,7 @@ use lance_core::ROW_ID;
 use lance_core::Result;
 use tokio::sync::OnceCell;
 
-use crate::frag_reuse::FragReuseIndex;
+use crate::scalar::RowIdRemapper;
 use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
 use crate::scalar::{IndexReader, IndexStore};
 use lance_select::mask::RowAddrMask;
@@ -63,7 +63,7 @@ pub struct DeferredDocSet {
     store: Arc<dyn IndexStore>,
     docs_path: String,
     is_legacy: bool,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
     /// `sum(num_tokens)` cached on first compute.
@@ -122,7 +122,7 @@ impl LazyDocSet {
         docs_path: String,
         num_rows: usize,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         Self::Deferred(Box::new(DeferredDocSet {
             store,

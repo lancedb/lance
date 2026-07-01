@@ -34,8 +34,10 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
+    InvertedListFormatVersion,
     query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -934,6 +936,68 @@ async fn test_fts_unindexed_data() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_fts_v1_remains_queryable_after_append_optimize() {
+    let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
+    let text_col = StringArray::from(vec!["alpha original", "beta original"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, "memory://test.lance", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap()[0].index_version, 1);
+
+    let appended = StringArray::from(vec!["alpha appended"]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new(
+            "text",
+            appended.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(appended) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let results = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("alpha".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 2);
+    assert!(
+        dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.index_version == 1)
+    );
 }
 
 #[tokio::test]

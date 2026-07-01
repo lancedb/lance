@@ -22,6 +22,9 @@ use crate::pbold;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
+use crate::scalar::inverted::{
+    InvertedListFormatVersion, default_fts_format_version, resolve_fts_format_version,
+};
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
     AsciiFoldingFilter, IcuTokenizer, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
@@ -120,6 +123,18 @@ pub struct InvertedIndexParams {
     /// The effective worker count is clamped to `[1, num_cpus - 2]`.
     #[serde(rename = "num_workers", skip_serializing, default)]
     pub(crate) num_workers: Option<usize>,
+
+    /// On-disk FTS format version to write when creating a new index.
+    ///
+    /// This is a build-time only parameter and is not persisted with the index.
+    /// If unset, Lance writes the current default FTS format.
+    #[serde(
+        rename = "format_version",
+        skip_serializing,
+        default,
+        deserialize_with = "deserialize_format_version"
+    )]
+    pub(crate) format_version: Option<InvertedListFormatVersion>,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -167,6 +182,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             prefix_only: details.prefix_only,
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
+            format_version: defaults.format_version,
         })
     }
 }
@@ -181,6 +197,37 @@ fn default_min_ngram_length() -> u32 {
 
 fn default_max_ngram_length() -> u32 {
     3
+}
+
+fn deserialize_format_version<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<InvertedListFormatVersion>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => resolve_fts_format_version(Some(&value))
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        serde_json::Value::Number(value) => {
+            let Some(value) = value.as_u64() else {
+                return Err(serde::de::Error::custom(
+                    "FTS format_version must be 1 or 2",
+                ));
+            };
+            resolve_fts_format_version(Some(&value.to_string()))
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+        other => Err(serde::de::Error::custom(format!(
+            "FTS format_version must be 1 or 2, got {other}"
+        ))),
+    }
 }
 
 impl Default for InvertedIndexParams {
@@ -222,6 +269,7 @@ impl InvertedIndexParams {
             prefix_only: false,
             memory_limit_mb: None,
             num_workers: None,
+            format_version: None,
         }
     }
 
@@ -324,6 +372,21 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Set the on-disk FTS format version to use when creating a new index.
+    ///
+    /// If unset, Lance writes the current default FTS format. Existing indexes
+    /// keep their own on-disk format during update and optimize operations.
+    pub fn format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
+        self.format_version = Some(format_version);
+        self
+    }
+
+    /// Resolve the requested FTS format version, falling back to Lance's default.
+    pub fn resolved_format_version(&self) -> InvertedListFormatVersion {
+        self.format_version
+            .unwrap_or_else(default_fts_format_version)
+    }
+
     /// Serialize params for the build/training path, including build-only fields.
     pub fn to_training_json(&self) -> serde_json::Result<serde_json::Value> {
         let mut value = serde_json::to_value(self)?;
@@ -340,6 +403,12 @@ impl InvertedIndexParams {
             object.insert(
                 "num_workers".to_string(),
                 serde_json::Value::from(num_workers),
+            );
+        }
+        if let Some(format_version) = self.format_version {
+            object.insert(
+                "format_version".to_string(),
+                serde_json::Value::from(format_version.index_version()),
             );
         }
         Ok(value)
@@ -450,7 +519,7 @@ pub fn language_model_home() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::InvertedIndexParams;
+    use super::{InvertedIndexParams, InvertedListFormatVersion};
     use lance_tokenizer::TokenStream;
     use rstest::rstest;
 
@@ -458,10 +527,12 @@ mod tests {
     fn test_build_only_fields_are_not_serialized() {
         let params = InvertedIndexParams::default()
             .memory_limit_mb(4096)
-            .num_workers(7);
+            .num_workers(7)
+            .format_version(InvertedListFormatVersion::V1);
         let json = serde_json::to_value(&params).unwrap();
         assert!(json.get("memory_limit").is_none());
         assert!(json.get("num_workers").is_none());
+        assert!(json.get("format_version").is_none());
     }
 
     #[test]
@@ -483,23 +554,38 @@ mod tests {
         let obj = json.as_object_mut().unwrap();
         obj.insert("memory_limit".to_string(), serde_json::Value::from(4096));
         obj.insert("num_workers".to_string(), serde_json::Value::from(3));
+        obj.insert("format_version".to_string(), serde_json::Value::from("v1"));
 
         let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
         assert_eq!(params.memory_limit_mb, Some(4096));
         assert_eq!(params.num_workers, Some(3));
+        assert_eq!(params.format_version, Some(InvertedListFormatVersion::V1));
     }
 
     #[test]
     fn test_training_json_serializes_build_only_fields() {
         let params = InvertedIndexParams::default()
             .memory_limit_mb(4096)
-            .num_workers(3);
+            .num_workers(3)
+            .format_version(InvertedListFormatVersion::V1);
         let json = params.to_training_json().unwrap();
         assert_eq!(
             json.get("memory_limit"),
             Some(&serde_json::Value::from(4096))
         );
         assert_eq!(json.get("num_workers"), Some(&serde_json::Value::from(3)));
+        assert_eq!(
+            json.get("format_version"),
+            Some(&serde_json::Value::from(1))
+        );
+    }
+
+    #[test]
+    fn test_default_format_version_resolves_to_v2() {
+        assert_eq!(
+            InvertedIndexParams::default().resolved_format_version(),
+            InvertedListFormatVersion::V2
+        );
     }
 
     #[test]
