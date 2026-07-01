@@ -62,6 +62,7 @@ use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -96,6 +97,10 @@ pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
 
+use crate::blob::{
+    PyDedicatedBlobWriter, PyLanceBlobSession, PyLanceBlobWriter, PyPackedBlobWriter,
+    PyPreparedBlobValue,
+};
 use crate::executor::BackgroundExecutor;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -257,6 +262,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
+    m.add_class::<PyPreparedBlobValue>()?;
+    m.add_class::<PyLanceBlobSession>()?;
+    m.add_class::<PyLanceBlobWriter>()?;
+    m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileSession>()?;

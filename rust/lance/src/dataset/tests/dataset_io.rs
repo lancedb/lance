@@ -33,7 +33,10 @@ use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-use lance_file::version::LanceFileVersion;
+use lance_file::{
+    version::LanceFileVersion,
+    writer::{FileWriter, FileWriterOptions},
+};
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::BasePath;
@@ -325,6 +328,118 @@ async fn test_create_data_file_uses_base_object_store() {
 
     assert_eq!(data_file.base_id, Some(base.id));
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+#[tokio::test]
+async fn test_create_data_file_rejects_nested_schema_mismatch() {
+    let dataset_uri = format!(
+        "memory://test_create_data_file_rejects_nested_schema_mismatch/{}",
+        uuid::Uuid::new_v4()
+    );
+
+    let dataset_struct_fields = vec![
+        ArrowField::new("a", DataType::Int32, true),
+        ArrowField::new("b", DataType::Int32, true),
+    ];
+    let dataset_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "s",
+        DataType::Struct(dataset_struct_fields.clone().into()),
+        true,
+    )]));
+    let dataset_struct = StructArray::try_new(
+        dataset_struct_fields.clone().into(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+        ],
+        None,
+    )
+    .unwrap();
+    let dataset_batch =
+        RecordBatch::try_new(dataset_schema.clone(), vec![Arc::new(dataset_struct)]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(dataset_batch)], dataset_schema),
+        &dataset_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    async fn write_replacement_file(
+        dataset: &Dataset,
+        file_name: &str,
+        struct_fields: Vec<ArrowField>,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(struct_fields.clone().into()),
+            true,
+        )]));
+        let values = struct_fields
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| Arc::new(Int32Array::from(vec![idx as i32])) as ArrayRef)
+            .collect::<Vec<_>>();
+        let struct_array = StructArray::try_new(struct_fields.into(), values, None).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array) as ArrayRef]).unwrap();
+
+        let object_writer = dataset
+            .object_store
+            .create(&dataset.data_dir().join(file_name))
+            .await
+            .unwrap();
+        let mut writer = FileWriter::try_new(
+            object_writer,
+            crate::datatypes::Schema::try_from(schema.as_ref()).unwrap(),
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    write_replacement_file(
+        &dataset,
+        "nested_reordered.lance",
+        vec![
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, true),
+        ],
+    )
+    .await;
+    let err = dataset
+        .create_data_file("nested_reordered.lance", None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Schema mismatch"),
+        "unexpected error: {err}"
+    );
+
+    write_replacement_file(
+        &dataset,
+        "nested_unknown.lance",
+        vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ],
+    )
+    .await;
+    let err = dataset
+        .create_data_file("nested_unknown.lance", None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Schema mismatch"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]

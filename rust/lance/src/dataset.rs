@@ -1993,58 +1993,190 @@ impl Dataset {
             file_metadata.minor_version as u32,
         )?;
 
-        // Get top-level column names from file schema in file order
-        let column_names: Vec<&str> = file_metadata
-            .file_schema
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect();
-
-        // Project dataset schema by file column names to get dataset field IDs
-        let projected_ds_schema = self.schema().project(&column_names)?;
-
-        // Walk both schemas in parallel to build fields and column_indices
         let is_structural = file_version >= LanceFileVersion::V2_1;
-        let ds_fields: Vec<_> = projected_ds_schema.fields_pre_order().collect();
-        let file_fields: Vec<_> = file_metadata.file_schema.fields_pre_order().collect();
+        let physical_columns = file_metadata.column_metadatas.len();
+        let has_footer_orphans = file_metadata.file_schema.fields.len() > physical_columns;
+        let dataset_schema = self.schema();
+        let mut represented_columns = 0usize;
+        let mut column_names = Vec::new();
+        let mut consumed_top_level_fields = 0usize;
 
-        if ds_fields.len() != file_fields.len() {
+        fn physical_column_count(
+            field: &lance_core::datatypes::Field,
+            is_structural: bool,
+        ) -> usize {
+            if !is_structural {
+                return 1 + field
+                    .children
+                    .iter()
+                    .map(|child| physical_column_count(child, is_structural))
+                    .sum::<usize>();
+            }
+
+            if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
+                1
+            } else {
+                field
+                    .children
+                    .iter()
+                    .map(|child| physical_column_count(child, is_structural))
+                    .sum()
+            }
+        }
+
+        fn collect_columns(
+            field: &lance_core::datatypes::Field,
+            is_structural: bool,
+            fields: &mut Vec<i32>,
+            column_indices: &mut Vec<i32>,
+            curr_column_idx: &mut i32,
+        ) {
+            let contributes = !is_structural
+                || field.children.is_empty()
+                || field.is_blob()
+                || field.is_packed_struct();
+            let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
+
+            if contributes {
+                fields.push(field.id);
+                column_indices.push(*curr_column_idx);
+                *curr_column_idx += 1;
+            }
+
+            if recurse {
+                for child in &field.children {
+                    collect_columns(
+                        child,
+                        is_structural,
+                        fields,
+                        column_indices,
+                        curr_column_idx,
+                    );
+                }
+            }
+        }
+
+        const BLOB_DESCRIPTOR_CHILDREN: [&str; 5] =
+            ["kind", "position", "size", "blob_id", "blob_uri"];
+
+        fn validate_file_field_matches_dataset(
+            dataset_field: &lance_core::datatypes::Field,
+            file_field: &lance_core::datatypes::Field,
+            path: &str,
+        ) -> Result<()> {
+            if dataset_field.name != file_field.name {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: expected field '{}' but file has '{}'",
+                    path, file_field.name
+                )));
+            }
+
+            if dataset_field.is_blob() && file_field.is_blob() {
+                return Ok(());
+            }
+
+            if dataset_field.children.len() != file_field.children.len() {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: field '{}' has {} children in dataset schema but {} children in file schema",
+                    path,
+                    dataset_field.children.len(),
+                    file_field.children.len()
+                )));
+            }
+
+            for (dataset_child, file_child) in
+                dataset_field.children.iter().zip(&file_field.children)
+            {
+                let child_path = format!("{}.{}", path, dataset_child.name);
+                validate_file_field_matches_dataset(dataset_child, file_child, &child_path)?;
+            }
+
+            Ok(())
+        }
+
+        let file_schema_fields = &file_metadata.file_schema.fields;
+        let mut idx = 0usize;
+        while represented_columns < physical_columns {
+            let Some(field) = file_schema_fields.get(idx) else {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: file schema ended after representing {} physical columns but file has {} columns",
+                    represented_columns, physical_columns
+                )));
+            };
+
+            let Some(dataset_field) = dataset_schema.field(&field.name) else {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: file has extra field '{}'",
+                    field.name
+                )));
+            };
+            validate_file_field_matches_dataset(dataset_field, field, &field.name)?;
+
+            represented_columns += physical_column_count(field, is_structural);
+            column_names.push(field.name.as_str());
+            consumed_top_level_fields = idx + 1;
+            idx += 1;
+
+            if has_footer_orphans && field.is_blob() && field.children.is_empty() {
+                for expected_child in BLOB_DESCRIPTOR_CHILDREN {
+                    let Some(orphan_child) = file_schema_fields.get(idx) else {
+                        return Err(Error::invalid_input(format!(
+                            "Schema mismatch: blob field '{}' is missing descriptor child '{}'",
+                            field.name, expected_child
+                        )));
+                    };
+                    if orphan_child.name != expected_child {
+                        return Err(Error::invalid_input(format!(
+                            "Schema mismatch: blob field '{}' expected descriptor child '{}' but file has '{}'",
+                            field.name, expected_child, orphan_child.name
+                        )));
+                    }
+                    consumed_top_level_fields = idx + 1;
+                    idx += 1;
+                }
+            }
+        }
+
+        if represented_columns != physical_columns {
             return Err(Error::invalid_input(format!(
-                "Schema mismatch: dataset projection has {} fields but file has {} fields",
-                ds_fields.len(),
-                file_fields.len()
+                "Schema mismatch: file schema represents {} physical columns but file has {} columns",
+                represented_columns, physical_columns
             )));
         }
+
+        if let Some(field) = file_schema_fields.get(consumed_top_level_fields) {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: file has extra field '{}'",
+                field.name
+            )));
+        }
+
+        let projected_ds_schema = self.schema().project(&column_names)?;
 
         let mut fields = Vec::new();
         let mut column_indices = Vec::new();
         let mut curr_column_idx: i32 = 0;
-        let mut packed_struct_fields_num: usize = 0;
+        for field in &projected_ds_schema.fields {
+            collect_columns(
+                field,
+                is_structural,
+                &mut fields,
+                &mut column_indices,
+                &mut curr_column_idx,
+            );
+        }
 
-        for (ds_field, file_field) in ds_fields.iter().zip(file_fields.iter()) {
-            if ds_field.name != file_field.name {
-                return Err(Error::invalid_input(format!(
-                    "Schema mismatch: expected field '{}' but file has '{}'",
-                    ds_field.name, file_field.name
-                )));
-            }
+        if curr_column_idx as usize != physical_columns {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: dataset projection maps to {} physical columns but file has {} columns",
+                curr_column_idx, physical_columns
+            )));
+        }
 
-            if packed_struct_fields_num > 0 {
-                packed_struct_fields_num -= 1;
-                continue;
-            }
-
-            if file_field.is_packed_struct() {
-                fields.push(ds_field.id);
-                column_indices.push(curr_column_idx);
-                curr_column_idx += 1;
-                packed_struct_fields_num = file_field.children.len();
-            } else if file_field.children.is_empty() || !is_structural {
-                fields.push(ds_field.id);
-                column_indices.push(curr_column_idx);
-                curr_column_idx += 1;
-            }
+        if fields.is_empty() && physical_columns > 0 {
+            return Err(Error::invalid_input(
+                "Schema mismatch: file has columns but none matched the dataset schema",
+            ));
         }
 
         let file_size_nz = NonZero::new(file_size);

@@ -7,12 +7,14 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import uuid
 
 import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
@@ -941,6 +943,65 @@ def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
 
     assert ds.to_table(columns=["blob"]).column("blob").to_pylist() == [None] * 4
     assert ds.take_blobs("blob", indices=range(4)) == []
+
+
+def test_blob_session_writes_prepared_packed_blob_for_data_replacement(tmp_path):
+    dataset_uri = tmp_path / "test_blob_session_data_replacement"
+    logical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            lance.blob_field("blob"),
+        ]
+    )
+    initial = pa.table(
+        [
+            pa.array([0], type=pa.uint32()),
+            lance.blob_array([b"initial"]),
+        ],
+        schema=logical_schema,
+    )
+    ds = lance.write_dataset(initial, dataset_uri, data_storage_version="2.2")
+
+    file_id = str(uuid.uuid4())
+    data_file_path = dataset_uri / "data" / f"{file_id}.lance"
+    data_file_name = f"{file_id}.lance"
+
+    blob_session = lance.LanceBlobSession(str(data_file_path))
+    blob_writer = blob_session.open_writer("blob")
+    packed = blob_writer.new_packed()
+    assert packed.path == blob_session.blob_path(packed.blob_id)
+    packed.write_blob(b"replacement")
+    blob_writer.extend(packed.finish())
+
+    physical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            blob_writer.field,
+        ]
+    )
+    replacement = pa.record_batch(
+        [
+            pa.array([1], type=pa.uint32()),
+            blob_writer.finish(),
+        ],
+        schema=physical_schema,
+    )
+
+    with LanceFileWriter(
+        str(data_file_path), schema=physical_schema, version="2.2"
+    ) as file_writer:
+        file_writer.write_batch(replacement)
+
+    data_file = lance.fragment.DataFile.create(ds, data_file_name)
+    operation = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    ds = lance.LanceDataset.commit(ds, operation, read_version=ds.version)
+
+    assert ds.to_table(columns=["id"]).column("id").to_pylist() == [1]
+    blobs = ds.take_blobs("blob", indices=[0])
+    assert len(blobs) == 1
+    assert blobs[0].readall() == b"replacement"
 
 
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):

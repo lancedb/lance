@@ -37,6 +37,7 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
+use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
@@ -1012,6 +1013,7 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     validate_external_blob_write_params(&params)?;
+    let normalized_converted_schema = normalize_prepared_blob_schema(&converted_schema)?;
 
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
@@ -1052,13 +1054,16 @@ pub async fn write_fragments_internal(
                         .data_storage_format
                         .lance_file_version()?,
                 );
-                (converted_schema, data_storage_version)
+                (normalized_converted_schema, data_storage_version)
             }
         }
     } else {
         // Brand new dataset, use the schema from the data and the storage version
         // from the user or the default.
-        (converted_schema, params.storage_version_or_default())
+        (
+            normalized_converted_schema,
+            params.storage_version_or_default(),
+        )
     };
 
     if storage_version < LanceFileVersion::V2_2 && schema.fields_pre_order().any(|f| f.is_blob_v2())
