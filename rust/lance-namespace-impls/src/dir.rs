@@ -920,21 +920,139 @@ struct TableDeleteEntry {
 /// modifications (status transitions, extra properties, tombstoned properties)
 /// in a namespace-owned sidecar file. The sidecar is then merged into the
 /// response of subsequent `describe_transaction` / `alter_transaction` calls.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+///
+/// Serialization is implemented manually via `serde_json::Value` to avoid
+/// pulling in `serde`'s `derive` feature for this crate.
+#[derive(Debug, Clone, Default)]
 struct TransactionAlteration {
     /// The most recently applied status, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     status: Option<String>,
     /// User-defined properties layered on top of the immutable transaction
     /// properties. Values here take precedence over the transaction's own
     /// properties when both are present.
-    #[serde(default)]
     properties: HashMap<String, String>,
     /// Names of transaction properties that have been tombstoned via
     /// `unset_property_action`. A tombstoned key is hidden from the response
     /// even when the immutable transaction still carries it.
-    #[serde(default)]
     removed_properties: std::collections::HashSet<String>,
+}
+
+impl TransactionAlteration {
+    /// JSON field names used for the sidecar on-disk representation.
+    const F_STATUS: &'static str = "status";
+    const F_PROPERTIES: &'static str = "properties";
+    const F_REMOVED_PROPERTIES: &'static str = "removed_properties";
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(ref status) = self.status {
+            obj.insert(
+                Self::F_STATUS.to_string(),
+                serde_json::Value::String(status.clone()),
+            );
+        }
+        let props = self
+            .properties
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect::<serde_json::Map<_, _>>();
+        obj.insert(
+            Self::F_PROPERTIES.to_string(),
+            serde_json::Value::Object(props),
+        );
+        let removed = self
+            .removed_properties
+            .iter()
+            .map(|k| serde_json::Value::String(k.clone()))
+            .collect::<Vec<_>>();
+        obj.insert(
+            Self::F_REMOVED_PROPERTIES.to_string(),
+            serde_json::Value::Array(removed),
+        );
+        serde_json::Value::Object(obj)
+    }
+
+    fn from_json(value: serde_json::Value) -> std::result::Result<Self, String> {
+        let obj = match value {
+            serde_json::Value::Object(m) => m,
+            other => {
+                return Err(format!(
+                    "expected JSON object for TransactionAlteration, got {}",
+                    other
+                ));
+            }
+        };
+
+        let status = match obj.get(Self::F_STATUS) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(other) => {
+                return Err(format!("field 'status' must be a string, got {}", other));
+            }
+        };
+
+        let mut properties = HashMap::new();
+        if let Some(props_val) = obj.get(Self::F_PROPERTIES) {
+            match props_val {
+                serde_json::Value::Null => {}
+                serde_json::Value::Object(m) => {
+                    for (k, v) in m {
+                        match v {
+                            serde_json::Value::String(s) => {
+                                properties.insert(k.clone(), s.clone());
+                            }
+                            other => {
+                                return Err(format!(
+                                    "property '{}' must be a string, got {}",
+                                    k, other
+                                ));
+                            }
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "field 'properties' must be an object, got {}",
+                        other
+                    ));
+                }
+            }
+        }
+
+        let mut removed_properties = std::collections::HashSet::new();
+        if let Some(removed_val) = obj.get(Self::F_REMOVED_PROPERTIES) {
+            match removed_val {
+                serde_json::Value::Null => {}
+                serde_json::Value::Array(arr) => {
+                    for item in arr {
+                        match item {
+                            serde_json::Value::String(s) => {
+                                removed_properties.insert(s.clone());
+                            }
+                            other => {
+                                return Err(format!(
+                                    "field 'removed_properties' must contain strings, got {}",
+                                    other
+                                ));
+                            }
+                        }
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "field 'removed_properties' must be an array, got {}",
+                        other
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            status,
+            properties,
+            removed_properties,
+        })
+    }
 }
 
 impl DirectoryNamespace {
@@ -2243,15 +2361,22 @@ impl DirectoryNamespace {
                         ),
                     })
                 })?;
-                let alteration: TransactionAlteration =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        lance_core::Error::from(NamespaceError::Internal {
-                            message: format!(
-                                "Failed to parse alter_transaction sidecar for '{}': {}",
-                                txn_uuid, e
-                            ),
-                        })
-                    })?;
+                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to parse alter_transaction sidecar for '{}': {}",
+                            txn_uuid, e
+                        ),
+                    })
+                })?;
+                let alteration = TransactionAlteration::from_json(value).map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to parse alter_transaction sidecar for '{}': {}",
+                            txn_uuid, e
+                        ),
+                    })
+                })?;
                 Ok(Some(alteration))
             }
             Err(ObjectStoreError::NotFound { .. }) => Ok(None),
@@ -2271,7 +2396,7 @@ impl DirectoryNamespace {
         alteration: &TransactionAlteration,
     ) -> Result<()> {
         let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
-        let bytes = serde_json::to_vec(alteration).map_err(|e| {
+        let bytes = serde_json::to_vec(&alteration.to_json()).map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
                 message: format!(
                     "Failed to serialize alter_transaction sidecar for '{}': {}",
@@ -13303,40 +13428,40 @@ mod tests {
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
-        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
 
-        if let Some(txn_id) = transaction_id {
-            // First verify the transaction exists
-            let describe_resp = namespace
-                .describe_transaction(DescribeTransactionRequest {
-                    id: Some(vec!["users".to_string(), txn_id.clone()]),
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(describe_resp.status, "SUCCEEDED");
+        // First verify the transaction exists
+        let describe_resp = namespace
+            .describe_transaction(DescribeTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(describe_resp.status, "SUCCEEDED");
 
-            // Alter the transaction status
-            let response = namespace
-                .alter_transaction(AlterTransactionRequest {
-                    id: Some(vec!["users".to_string(), txn_id.clone()]),
-                    actions: vec![AlterTransactionAction {
-                        set_status_action: Some(Box::new(AlterTransactionSetStatus {
-                            status: Some("Canceled".to_string()),
-                        })),
-                        set_property_action: None,
-                        unset_property_action: None,
-                    }],
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(response.status, "Canceled");
-            assert!(response.properties.is_some());
-            let props = response.properties.unwrap();
-            assert_eq!(props.get("uuid"), Some(&txn_id));
-            assert_eq!(props.get("operation"), Some(&"CreateIndex".to_string()));
-        }
+        // Alter the transaction status
+        let response = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "Canceled");
+        assert!(response.properties.is_some());
+        let props = response.properties.unwrap();
+        assert_eq!(props.get("uuid"), Some(&txn_id));
+        assert_eq!(props.get("operation"), Some(&"CreateIndex".to_string()));
     }
 
     #[tokio::test]
@@ -13347,29 +13472,29 @@ mod tests {
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
-        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
 
-        if let Some(txn_id) = transaction_id {
-            let response = namespace
-                .alter_transaction(AlterTransactionRequest {
-                    id: Some(vec!["users".to_string(), txn_id.clone()]),
-                    actions: vec![AlterTransactionAction {
-                        set_status_action: None,
-                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
-                            key: Some("custom_key".to_string()),
-                            value: Some("custom_value".to_string()),
-                            mode: None,
-                        })),
-                        unset_property_action: None,
-                    }],
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(response.status, "SUCCEEDED");
-            let props = response.properties.unwrap();
-            assert_eq!(props.get("custom_key"), Some(&"custom_value".to_string()));
-        }
+        let response = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: None,
+                    set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                        key: Some("custom_key".to_string()),
+                        value: Some("custom_value".to_string()),
+                        mode: None,
+                    })),
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "SUCCEEDED");
+        let props = response.properties.unwrap();
+        assert_eq!(props.get("custom_key"), Some(&"custom_value".to_string()));
     }
 
     #[tokio::test]
@@ -13380,27 +13505,46 @@ mod tests {
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
-        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
 
-        if let Some(txn_id) = transaction_id {
-            // Try to set a property that already exists (uuid) with Fail mode
-            let result = namespace
-                .alter_transaction(AlterTransactionRequest {
-                    id: Some(vec!["users".to_string(), txn_id.clone()]),
-                    actions: vec![AlterTransactionAction {
-                        set_status_action: None,
-                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
-                            key: Some("uuid".to_string()),
-                            value: Some("new_value".to_string()),
-                            mode: Some("Fail".to_string()),
-                        })),
-                        unset_property_action: None,
-                    }],
-                    ..Default::default()
-                })
-                .await;
-            assert!(result.is_err());
-        }
+        // First, set a non-reserved property so it exists in the sidecar.
+        namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: None,
+                    set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                        key: Some("custom_key".to_string()),
+                        value: Some("initial_value".to_string()),
+                        mode: None,
+                    })),
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Now try to set the same property again with Fail mode, which must
+        // exercise the mode='Fail' branch (not the reserved-key guard).
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: None,
+                    set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                        key: Some("custom_key".to_string()),
+                        value: Some("new_value".to_string()),
+                        mode: Some("Fail".to_string()),
+                    })),
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -13412,40 +13556,40 @@ mod tests {
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
-        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
 
-        if let Some(txn_id) = transaction_id {
-            // First set a custom property, then unset it
-            let response = namespace
-                .alter_transaction(AlterTransactionRequest {
-                    id: Some(vec!["users".to_string(), txn_id.clone()]),
-                    actions: vec![
-                        AlterTransactionAction {
-                            set_status_action: None,
-                            set_property_action: Some(Box::new(AlterTransactionSetProperty {
-                                key: Some("temp_key".to_string()),
-                                value: Some("temp_value".to_string()),
-                                mode: None,
-                            })),
-                            unset_property_action: None,
-                        },
-                        AlterTransactionAction {
-                            set_status_action: None,
-                            set_property_action: None,
-                            unset_property_action: Some(Box::new(AlterTransactionUnsetProperty {
-                                key: Some("temp_key".to_string()),
-                                mode: None,
-                            })),
-                        },
-                    ],
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
-            assert_eq!(response.status, "SUCCEEDED");
-            let props = response.properties.unwrap();
-            assert!(!props.contains_key("temp_key"));
-        }
+        // First set a custom property, then unset it
+        let response = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![
+                    AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                            key: Some("temp_key".to_string()),
+                            value: Some("temp_value".to_string()),
+                            mode: None,
+                        })),
+                        unset_property_action: None,
+                    },
+                    AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: None,
+                        unset_property_action: Some(Box::new(AlterTransactionUnsetProperty {
+                            key: Some("temp_key".to_string()),
+                            mode: None,
+                        })),
+                    },
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "SUCCEEDED");
+        let props = response.properties.unwrap();
+        assert!(!props.contains_key("temp_key"));
     }
 
     #[tokio::test]
@@ -13456,24 +13600,24 @@ mod tests {
 
         let (namespace, _temp_dir) = create_test_namespace().await;
         create_scalar_table(&namespace, "users").await;
-        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
 
-        if let Some(txn_id) = transaction_id {
-            let result = namespace
-                .alter_transaction(AlterTransactionRequest {
-                    id: Some(vec!["users".to_string(), txn_id.clone()]),
-                    actions: vec![AlterTransactionAction {
-                        set_status_action: Some(Box::new(AlterTransactionSetStatus {
-                            status: Some("InvalidStatus".to_string()),
-                        })),
-                        set_property_action: None,
-                        unset_property_action: None,
-                    }],
-                    ..Default::default()
-                })
-                .await;
-            assert!(result.is_err());
-        }
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("InvalidStatus".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

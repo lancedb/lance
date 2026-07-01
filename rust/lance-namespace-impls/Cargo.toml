@@ -13,8 +13,8 @@ rust-version.workspace = true
 
 [features]
 default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
-rest = ["dep:reqwest"]
-rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http"]
+rest = ["dep:reqwest", "dep:serde"]
+rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp", "lance/gcp"]
 dir-aws = ["lance-io/aws", "lance/aws"]
@@ -24,8 +24,8 @@ dir-huggingface = ["lance-io/huggingface", "lance/huggingface"]
 dir-goosefs = ["lance-io/goosefs", "lance/goosefs"]
 # Credential vending features
 credential-vendor-aws = ["dep:aws-sdk-sts", "dep:aws-config", "dep:sha2", "dep:base64"]
-credential-vendor-gcp = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:ring", "dep:rustls-pki-types"]
-credential-vendor-azure = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:chrono", "dep:hmac", "dep:quick-xml"]
+credential-vendor-gcp = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:base64", "dep:ring", "dep:rustls-pki-types"]
+credential-vendor-azure = ["dep:reqwest", "dep:serde", "dep:sha2", "dep:base64", "dep:chrono", "dep:hmac", "dep:quick-xml"]
 
 [dependencies]
 lance-namespace.workspace = true
@@ -58,12 +58,12 @@ datafusion-physical-plan = { workspace = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true, features = ["trace", "cors", "normalize-path"] }
+serde = { workspace = true, optional = true }
 
 # Common dependencies
 async-trait.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["sync", "full"] }
-serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 futures.workspace = true
 log.workspace = true
