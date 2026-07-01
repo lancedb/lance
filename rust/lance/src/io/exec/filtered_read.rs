@@ -79,6 +79,15 @@ fn is_high_bandwidth_scan_candidate(
         && planned_row_count >= HIGH_BANDWIDTH_SCAN_MIN_ROWS
 }
 
+fn effective_high_bandwidth_scan_row_count(
+    planned_row_count: u64,
+    scan_range_after_filter: Option<&Range<u64>>,
+) -> u64 {
+    scan_range_after_filter
+        .map(|range| range.end.saturating_sub(range.start).min(planned_row_count))
+        .unwrap_or(planned_row_count)
+}
+
 pub(crate) fn high_bandwidth_scan_parallelism_target(base_parallelism: usize) -> usize {
     let base_parallelism = base_parallelism.max(1);
     let total_runtime_threads =
@@ -499,7 +508,10 @@ impl FilteredReadStream {
 
         let io_parallelism = dataset.object_store.io_parallelism();
         let planned_fragment_count = plan.planned_fragment_count();
-        let planned_row_count = plan.planned_row_count();
+        let planned_row_count = effective_high_bandwidth_scan_row_count(
+            plan.planned_row_count(),
+            plan.scan_range_after_filter.as_ref(),
+        );
         let is_high_bandwidth_candidate = is_high_bandwidth_scan_candidate(
             dataset.object_store.is_cloud(),
             options.ordered_output,
@@ -2453,6 +2465,19 @@ mod tests {
                 base
             ),
             base
+        );
+    }
+
+    #[test]
+    fn test_high_bandwidth_scan_row_count_uses_post_filter_range() {
+        assert_eq!(effective_high_bandwidth_scan_row_count(100, None), 100);
+        assert_eq!(
+            effective_high_bandwidth_scan_row_count(100, Some(&(10..30))),
+            20
+        );
+        assert_eq!(
+            effective_high_bandwidth_scan_row_count(100, Some(&(10..1_000))),
+            100
         );
     }
 
