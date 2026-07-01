@@ -92,8 +92,7 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::io::exec::filtered_read::{
-    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
-    ScanSchedulerDiagnosticsCallback,
+    FilteredReadExec, FilteredReadOptions, ScanSchedulerDiagnosticsCallback,
 };
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
@@ -2894,10 +2893,7 @@ impl Scanner {
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
             .with_projection(projection)
-            .with_ordered_output(ordered_output)
-            .with_threading_mode(FilteredReadThreadingMode::OnePartitionMultipleThreads(
-                self.batch_readahead.max(1),
-            ));
+            .with_ordered_output(ordered_output);
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
@@ -12446,23 +12442,16 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
-    async fn test_batch_readahead_propagated_to_filtered_read_threading() {
+    async fn test_batch_readahead_does_not_set_execution_target_partition() {
         let data = lance_datagen::gen_batch()
             .col("x", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(8), BatchCount::from(1));
-        let dataset = Dataset::write(data, "memory://test_batch_readahead_threading", None)
+        let dataset = Dataset::write(data, "memory://test_batch_readahead_target_partition", None)
             .await
             .unwrap();
 
         let mut scanner = dataset.scan();
         scanner.batch_readahead(17);
-        let plan = scanner.create_plan().await.unwrap();
-        let filtered = find_filtered_read(plan.as_ref())
-            .expect("expected a FilteredReadExec in the scan plan");
-        assert_eq!(
-            filtered.options().threading_mode,
-            FilteredReadThreadingMode::OnePartitionMultipleThreads(17)
-        );
         assert_eq!(scanner.execution_options().target_partition, None);
     }
 
