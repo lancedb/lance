@@ -69,14 +69,14 @@ use super::{
     builder::{InnerBuilder, PositionRecorder},
     iter::CompressedPostingListIterator,
 };
-use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexReader, IndexStore, MetricsCollector,
-    OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery, UpdateCriteria,
+    OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery,
+    UpdateCriteria,
 };
 use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
@@ -133,15 +133,21 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
-fn resolve_fts_format_version(
+pub fn resolve_fts_format_version(
     value: Option<&str>,
 ) -> std::result::Result<InvertedListFormatVersion, Error> {
-    value.unwrap_or("1").parse()
+    match value {
+        Some(value) => value.parse(),
+        None => Ok(default_fts_format_version()),
+    }
+}
+
+pub fn default_fts_format_version() -> InvertedListFormatVersion {
+    InvertedListFormatVersion::V2
 }
 
 pub fn current_fts_format_version() -> InvertedListFormatVersion {
-    resolve_fts_format_version(std::env::var("LANCE_FTS_FORMAT_VERSION").ok().as_deref())
-        .expect("failed to parse LANCE_FTS_FORMAT_VERSION")
+    default_fts_format_version()
 }
 
 pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
@@ -150,8 +156,8 @@ pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum InvertedListFormatVersion {
-    #[default]
     V1,
+    #[default]
     V2,
 }
 
@@ -418,6 +424,7 @@ pub struct InvertedIndex {
     store: Arc<dyn IndexStore>,
     tokenizer: Box<dyn LanceTokenizer>,
     token_set_format: TokenSetFormat,
+    format_version: InvertedListFormatVersion,
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
     corpus_stats: Arc<OnceCell<(u64, usize)>>,
     // Fragments which are contained in the index, but no longer in the dataset.
@@ -430,6 +437,7 @@ impl Debug for InvertedIndex {
         f.debug_struct("InvertedIndex")
             .field("params", &self.params)
             .field("token_set_format", &self.token_set_format)
+            .field("format_version", &self.format_version)
             .field("partitions", &self.partitions)
             .field("deleted_fragments", &self.deleted_fragments)
             .finish()
@@ -473,14 +481,7 @@ async fn resolve_deferred_candidates(
 
 impl InvertedIndex {
     fn format_version(&self) -> InvertedListFormatVersion {
-        self.partitions
-            .first()
-            .map(|partition| {
-                InvertedListFormatVersion::from_posting_tail_codec(
-                    partition.inverted_list.posting_tail_codec(),
-                )
-            })
-            .unwrap_or_else(current_fts_format_version)
+        self.format_version
     }
 
     fn index_version(&self) -> u32 {
@@ -977,7 +978,7 @@ impl InvertedIndex {
 
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         log::warn!("loading legacy FTS index");
@@ -1026,6 +1027,7 @@ impl InvertedIndex {
             store: store.clone(),
             tokenizer,
             token_set_format: TokenSetFormat::Arrow,
+            format_version: InvertedListFormatVersion::V1,
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
@@ -1045,7 +1047,7 @@ impl InvertedIndex {
 
     pub async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -1076,6 +1078,7 @@ impl InvertedIndex {
                     .map(|name| TokenSetFormat::from_str(name))
                     .transpose()?
                     .unwrap_or(TokenSetFormat::Arrow);
+                let format_version = parse_format_version_from_metadata(&reader.schema().metadata)?;
 
                 // Load deleted_fragments if present (optional for backward compatibility)
                 let deleted_fragments = if reader.num_rows() > 0 {
@@ -1121,6 +1124,7 @@ impl InvertedIndex {
                     store,
                     tokenizer,
                     token_set_format,
+                    format_version,
                     partitions,
                     corpus_stats: Arc::new(OnceCell::new()),
                     deleted_fragments,
@@ -1381,8 +1385,9 @@ impl ScalarIndex for InvertedIndex {
             // Empty tokenizer metadata only appears in legacy simple-tokenizer indexes.
             params.base_tokenizer = "simple".to_string();
         }
+        params = params.format_version(self.format_version());
 
-        let params_json = serde_json::to_string(&params)?;
+        let params_json = params.to_training_json()?.to_string();
 
         Ok(ScalarIndexParams {
             index_type: BuiltinIndexType::Inverted.as_str().to_string(),
@@ -1435,7 +1440,7 @@ impl InvertedPartition {
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
@@ -5127,7 +5132,7 @@ impl DocSet {
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -5159,7 +5164,7 @@ impl DocSet {
         row_id_col: &UInt64Array,
         num_tokens_col: &arrow_array::UInt32Array,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         // for legacy format, the row id is doc id; sorting keeps binary search viable
         if is_legacy {
@@ -6030,10 +6035,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_fts_format_version_defaults_to_v1() {
+    fn test_resolve_fts_format_version_defaults_to_v2() {
         assert_eq!(
             resolve_fts_format_version(None).unwrap(),
-            InvertedListFormatVersion::V1
+            InvertedListFormatVersion::V2
         );
         assert_eq!(
             resolve_fts_format_version(Some("2")).unwrap(),

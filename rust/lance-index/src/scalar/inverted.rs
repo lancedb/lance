@@ -114,12 +114,11 @@ use lance_core::Error;
 
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
-use crate::{
-    frag_reuse::FragReuseIndex,
-    scalar::{
-        CreatedIndex, ScalarIndex,
-        expression::{FtsQueryParser, ScalarQueryParser},
-        registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest},
+use crate::scalar::{
+    CreatedIndex, RowIdRemapper, ScalarIndex,
+    expression::{FtsQueryParser, ScalarQueryParser},
+    registry::{
+        BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
     },
 };
 
@@ -147,6 +146,7 @@ impl InvertedIndexPlugin {
             }
         });
 
+        let format_version = params.resolved_format_version();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
@@ -154,7 +154,7 @@ impl InvertedIndexPlugin {
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: current_fts_format_version().index_version(),
+            index_version: format_version.index_version(),
             files,
         })
     }
@@ -193,11 +193,7 @@ impl TrainingRequest for InvertedIndexTrainingRequest {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for InvertedIndexPlugin {
-    fn name(&self) -> &str {
-        "Inverted"
-    }
-
+impl BasicTrainer for InvertedIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -217,33 +213,6 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
         let params = serde_json::from_str::<InvertedIndexParams>(params)?;
         Ok(Box::new(InvertedIndexTrainingRequest::new(params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        false
-    }
-
-    fn version(&self) -> u32 {
-        max_supported_fts_format_version().index_version()
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        let Ok(index_details) = _index_details.to_msg::<pbold::InvertedIndexDetails>() else {
-            return None;
-        };
-
-        if Self::can_accelerate_queries(&index_details) {
-            Some(Box::new(FtsQueryParser::new(
-                index_name,
-                self.name().to_string(),
-            )))
-        } else {
-            None
-        }
     }
 
     /// Train a new index
@@ -280,6 +249,44 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         )
         .await
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for InvertedIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Inverted"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        max_supported_fts_format_version().index_version()
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        let Ok(index_details) = _index_details.to_msg::<pbold::InvertedIndexDetails>() else {
+            return None;
+        };
+
+        if Self::can_accelerate_queries(&index_details) {
+            Some(Box::new(FtsQueryParser::new(
+                index_name,
+                self.name().to_string(),
+            )))
+        } else {
+            None
+        }
+    }
 
     /// Load an index from storage
     ///
@@ -289,7 +296,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(

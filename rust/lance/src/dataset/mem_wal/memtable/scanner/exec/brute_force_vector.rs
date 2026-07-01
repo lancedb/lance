@@ -15,7 +15,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
+use arrow_array::{Array, BooleanArray, Float32Array, RecordBatch, UInt64Array, cast::AsArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
@@ -27,12 +27,13 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 
 use super::super::builder::VectorQuery;
+use super::newest_pk_positions;
 use super::vector::DISTANCE_COLUMN;
 use crate::dataset::mem_wal::write::BatchStore;
 
@@ -53,6 +54,14 @@ pub struct MemTableBruteForceVectorExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     with_row_id: bool,
+    /// Optional prefilter predicate, compiled against the memtable schema.
+    /// Applied per row before the top-k cut so the KNN only ranks matching
+    /// rows (true prefilter, not a lossy post-filter on the top-k).
+    filter: Option<PhysicalExprRef>,
+    /// Primary-key columns. When set, only the newest version of each PK is
+    /// eligible for top-k. With a filter, this evaluates the predicate against
+    /// the current PK version instead of falling back to a stale older version.
+    pk_columns: Option<Vec<String>>,
 }
 
 impl Debug for MemTableBruteForceVectorExec {
@@ -108,7 +117,47 @@ impl MemTableBruteForceVectorExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             with_row_id,
+            filter: None,
+            pk_columns: None,
         })
+    }
+
+    /// Attach an optional prefilter predicate (compiled against the memtable
+    /// schema). Rows that fail the predicate are excluded before the top-k cut.
+    pub fn with_filter(mut self, filter: Option<PhysicalExprRef>) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Provide the primary-key columns so search keeps only the newest version
+    /// of each PK (see `pk_columns`).
+    pub fn with_pk_columns(mut self, pk_columns: Option<Vec<String>>) -> Self {
+        self.pk_columns = pk_columns.filter(|columns| !columns.is_empty());
+        self
+    }
+
+    /// Evaluate the prefilter predicate against a memtable batch, returning a
+    /// keep-mask (`true` = retain). `Ok(None)` when no filter is configured.
+    fn filter_mask(&self, batch: &RecordBatch) -> Result<Option<BooleanArray>> {
+        let Some(ref predicate) = self.filter else {
+            return Ok(None);
+        };
+        let values = predicate
+            .evaluate(batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .map_err(|e| {
+                Error::invalid_input(format!("vector prefilter evaluation failed: {}", e))
+            })?;
+        let mask = values
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "vector prefilter predicate did not evaluate to boolean".to_string(),
+                )
+            })?
+            .clone();
+        Ok(Some(mask))
     }
 
     /// Last row position visible under `max_visible_batch_position`, or `None`
@@ -167,6 +216,24 @@ impl MemTableBruteForceVectorExec {
         let distance_type = self.query.distance_type.unwrap_or(DEFAULT_DISTANCE_TYPE);
         let batch_func = distance_type.arrow_batch_func();
 
+        // When PK columns are configured, only the newest version of each PK is
+        // eligible. This keeps top-k slots from being consumed by superseded
+        // rows and makes filtered search evaluate the predicate against the
+        // current version of the PK.
+        let newest_positions = if let Some(pk_columns) = &self.pk_columns {
+            Some(
+                newest_pk_positions(
+                    &self.batch_store,
+                    pk_columns,
+                    self.max_visible_batch_position,
+                    max_visible_row,
+                )
+                .map_err(|e| Error::invalid_input(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
         // Walk batches in append order. `current_row` is the global row offset
         // of the *next* row about to be visited; rows past `max_visible_row`
         // are dropped before they reach the heap.
@@ -207,10 +274,26 @@ impl MemTableBruteForceVectorExec {
                 ))
             })?;
 
+            // Prefilter: drop rows that fail the predicate before they reach the
+            // top-k heap (a NULL predicate result excludes the row, matching SQL).
+            let filter_mask = self.filter_mask(&stored_batch.data)?;
+
             for row in 0..n {
                 let pos = current_row + row as u64;
                 if pos > max_visible_row {
                     break;
+                }
+                // Skip superseded versions: only the newest version of each PK is
+                // eligible, so a newer non-matching version excludes the PK.
+                if let Some(ref newest) = newest_positions
+                    && !newest.contains(&pos)
+                {
+                    continue;
+                }
+                if let Some(ref mask) = filter_mask
+                    && (!mask.is_valid(row) || !mask.value(row))
+                {
+                    continue;
                 }
                 if distances.is_null(row) {
                     continue;
@@ -407,10 +490,11 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array};
+    use arrow_array::{BooleanArray, FixedSizeListArray, Float32Array, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::physical_plan::common::collect;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{Expr, SessionContext, col, lit};
+    use lance_datafusion::planner::Planner;
 
     fn make_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -423,6 +507,18 @@ mod tests {
         ]))
     }
 
+    fn make_schema_with_active() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+            Field::new("active", DataType::Boolean, true),
+        ]))
+    }
+
     fn make_batch(schema: SchemaRef, ids: &[i32], vectors: &[[f32; 2]]) -> RecordBatch {
         let id_array = Arc::new(Int32Array::from(ids.to_vec())) as Arc<dyn Array>;
         let values: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
@@ -432,6 +528,23 @@ mod tests {
             Arc::new(FixedSizeListArray::try_new(field, 2, inner, None).expect("build fsl"))
                 as Arc<dyn Array>;
         RecordBatch::try_new(schema, vec![id_array, vec_array]).expect("build batch")
+    }
+
+    fn make_batch_with_active(
+        schema: SchemaRef,
+        ids: &[i32],
+        vectors: &[[f32; 2]],
+        active: &[Option<bool>],
+    ) -> RecordBatch {
+        let id_array = Arc::new(Int32Array::from(ids.to_vec())) as Arc<dyn Array>;
+        let values: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        let inner = Arc::new(Float32Array::from(values));
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vec_array =
+            Arc::new(FixedSizeListArray::try_new(field, 2, inner, None).expect("build fsl"))
+                as Arc<dyn Array>;
+        let active_array = Arc::new(BooleanArray::from(active.to_vec())) as Arc<dyn Array>;
+        RecordBatch::try_new(schema, vec![id_array, vec_array, active_array]).expect("build batch")
     }
 
     fn store_with_batches(batches: Vec<RecordBatch>) -> Arc<BatchStore> {
@@ -458,10 +571,32 @@ mod tests {
         }
     }
 
+    fn physical_filter(schema: SchemaRef, expr: Expr) -> PhysicalExprRef {
+        let planner = Planner::new(schema);
+        let optimized = planner.optimize_expr(expr).expect("optimize filter");
+        planner
+            .create_physical_expr(&optimized)
+            .expect("create physical filter")
+    }
+
     async fn execute_to_batches(exec: Arc<dyn ExecutionPlan>) -> Vec<RecordBatch> {
         let ctx = SessionContext::new();
         let stream = exec.execute(0, ctx.task_ctx()).expect("execute");
         collect(stream).await.expect("collect")
+    }
+
+    fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let id_arr = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<arrow_array::types::Int32Type>();
+            for row in 0..batch.num_rows() {
+                ids.push(id_arr.value(row));
+            }
+        }
+        ids
     }
 
     #[tokio::test]
@@ -636,5 +771,122 @@ mod tests {
         // Row offsets are insert-order: id=10 → 0, id=11 → 1, id=12 → 2.
         pairs.sort_by_key(|(id, _)| *id);
         assert_eq!(pairs, vec![(10, 0), (11, 1), (12, 2)]);
+    }
+
+    #[tokio::test]
+    async fn prefilter_null_predicate_excludes_rows() {
+        let schema = make_schema_with_active();
+        let batch = make_batch_with_active(
+            schema.clone(),
+            &[1, 2, 3],
+            &[[0.0, 0.0], [3.0, 0.0], [1.0, 0.0]],
+            &[None, Some(true), Some(false)],
+        );
+        let store = store_with_batches(vec![batch]);
+        let query = query_for([0.0, 0.0], 3);
+        let filter = physical_filter(schema.clone(), col("active").eq(lit(true)));
+        let exec = Arc::new(
+            MemTableBruteForceVectorExec::new(store, query, usize::MAX, None, schema, false)
+                .expect("ctor")
+                .with_filter(Some(filter)),
+        );
+
+        let out = execute_to_batches(exec).await;
+        assert_eq!(
+            ids_from_batches(&out),
+            vec![2],
+            "NULL predicate results must be excluded from vector prefilter candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefilter_with_pk_columns_drops_stale_matching_version() {
+        let schema = make_schema_with_active();
+        let batch = make_batch_with_active(
+            schema.clone(),
+            &[5, 5],
+            &[[0.0, 0.0], [10.0, 0.0]],
+            &[Some(true), Some(false)],
+        );
+        let store = store_with_batches(vec![batch]);
+        let query = query_for([0.0, 0.0], 10);
+        let filter = physical_filter(schema.clone(), col("active").eq(lit(true)));
+        let exec = Arc::new(
+            MemTableBruteForceVectorExec::new(store, query, usize::MAX, None, schema, false)
+                .expect("ctor")
+                .with_filter(Some(filter))
+                .with_pk_columns(Some(vec!["id".to_string()])),
+        );
+
+        let out = execute_to_batches(exec).await;
+        assert!(
+            out.iter().all(|batch| batch.num_rows() == 0),
+            "the older matching vector version must not leak when the newest PK fails the filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn pk_columns_keep_newest_version_without_filter() {
+        let schema = make_schema();
+        let batch = make_batch(schema.clone(), &[5, 5], &[[0.0, 0.0], [10.0, 0.0]]);
+        let store = store_with_batches(vec![batch]);
+        let query = query_for([0.0, 0.0], 10);
+        let exec = Arc::new(
+            MemTableBruteForceVectorExec::new(
+                store,
+                query,
+                usize::MAX,
+                None,
+                schema,
+                /* with_row_id = */ true,
+            )
+            .expect("ctor")
+            .with_pk_columns(Some(vec!["id".to_string()])),
+        );
+
+        let out = execute_to_batches(exec).await;
+        let row_ids: Vec<u64> = out
+            .iter()
+            .flat_map(|batch| {
+                let row_ids = batch
+                    .column_by_name(lance_core::ROW_ID)
+                    .unwrap()
+                    .as_primitive::<arrow_array::types::UInt64Type>();
+                (0..batch.num_rows())
+                    .map(|row| row_ids.value(row))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            row_ids,
+            vec![1],
+            "brute-force vector PK recency must keep only the newest duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_pk_columns_do_not_collapse_results() {
+        let schema = make_schema();
+        let batch = make_batch(
+            schema.clone(),
+            &[1, 2, 3],
+            &[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+        );
+        let store = store_with_batches(vec![batch]);
+        let query = query_for([0.0, 0.0], 3);
+        let exec = Arc::new(
+            MemTableBruteForceVectorExec::new(store, query, usize::MAX, None, schema, false)
+                .expect("ctor")
+                .with_pk_columns(Some(vec![])),
+        );
+
+        let out = execute_to_batches(exec).await;
+        let mut ids = ids_from_batches(&out);
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "empty PK columns should behave like no PK columns, not one empty tuple key"
+        );
     }
 }
