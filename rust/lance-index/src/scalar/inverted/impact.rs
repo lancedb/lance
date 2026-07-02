@@ -16,42 +16,11 @@ pub struct ImpactSkipData {
     level0_len: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImpactScore {
     pub score: f32,
     pub entries_scanned: usize,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ImpactScoreCache {
-    scores: Vec<f32>,
-}
-
-impl ImpactScoreCache {
-    fn entry_score<S: Scorer + ?Sized>(
-        &mut self,
-        impacts: &ImpactSkipData,
-        entry_idx: usize,
-        query_weight: f32,
-        scorer: &S,
-    ) -> f32 {
-        if query_weight <= 0.0 {
-            return 0.0;
-        }
-
-        if entry_idx >= self.scores.len() {
-            self.scores.resize(impacts.entries.len(), f32::NAN);
-        } else {
-            let score = self.scores[entry_idx];
-            if !score.is_nan() {
-                return score;
-            }
-        }
-
-        let score = impacts.entry_score(entry_idx, query_weight, scorer);
-        self.scores[entry_idx] = score;
-        score
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +60,18 @@ impl ImpactSkipData {
         level1_len(self.level0_len)
     }
 
+    /// Last doc id covered by the level0 entry of `block_idx`, or `None` when
+    /// the entry is missing or malformed (callers must fall back to a coarser
+    /// bound in that case).
+    pub(crate) fn level0_doc_up_to(&self, block_idx: usize) -> Option<u32> {
+        if block_idx >= self.level0_len || self.entries.is_null(block_idx) {
+            return None;
+        }
+        decode_header(self.entries.value(block_idx))
+            .ok()
+            .map(|header| header.doc_up_to)
+    }
+
     pub(crate) fn level1_doc_up_to(&self, group_idx: usize) -> Option<u32> {
         if group_idx >= level1_len(self.level0_len) {
             return None;
@@ -104,7 +85,8 @@ impl ImpactSkipData {
             .map(|header| header.doc_up_to)
     }
 
-    #[cfg(test)]
+    /// Max score of the docs covered by the level0 entry of `block_idx`.
+    /// Malformed entries yield `f32::INFINITY` so pruning stays safe.
     pub fn level0_score<S: Scorer + ?Sized>(
         &self,
         block_idx: usize,
@@ -117,17 +99,19 @@ impl ImpactSkipData {
         self.entry_score(block_idx, query_weight, scorer)
     }
 
-    pub fn level0_score_cached<S: Scorer + ?Sized>(
+    /// Max score of the docs covered by the level1 entry of `group_idx`
+    /// (a span of [`IMPACT_LEVEL1_BLOCKS`] level0 blocks). Malformed entries
+    /// yield `f32::INFINITY` so pruning stays safe.
+    pub fn level1_score<S: Scorer + ?Sized>(
         &self,
-        block_idx: usize,
+        group_idx: usize,
         query_weight: f32,
         scorer: &S,
-        cache: &mut ImpactScoreCache,
     ) -> f32 {
-        if block_idx >= self.level0_len {
+        if group_idx >= level1_len(self.level0_len) {
             return 0.0;
         }
-        cache.entry_score(self, block_idx, query_weight, scorer)
+        self.entry_score(self.level0_len + group_idx, query_weight, scorer)
     }
 
     #[cfg(test)]
@@ -151,27 +135,7 @@ impl ImpactSkipData {
         )
     }
 
-    pub fn max_score_up_to_cached<S, F>(
-        &self,
-        start_block_idx: usize,
-        up_to: u64,
-        block_least_doc_id: F,
-        query_weight: f32,
-        scorer: &S,
-        cache: &mut ImpactScoreCache,
-    ) -> ImpactScore
-    where
-        S: Scorer + ?Sized,
-        F: FnMut(usize) -> u32,
-    {
-        self.max_score_up_to_with(
-            start_block_idx,
-            up_to,
-            block_least_doc_id,
-            |impacts, entry_idx| cache.entry_score(impacts, entry_idx, query_weight, scorer),
-        )
-    }
-
+    #[cfg(test)]
     fn max_score_up_to_with<E, F>(
         &self,
         start_block_idx: usize,
@@ -498,23 +462,42 @@ mod tests {
     }
 
     #[test]
-    fn impact_score_cache_matches_uncached_scores() {
+    fn impact_level1_score_covers_level0_scores_in_group() {
         let blocks = (0..40)
             .map(|block| vec![(block as u32, 1 + block as u32 % 3, 10)])
             .collect::<Vec<_>>();
         let impacts = build_impact_skip_data(&blocks).unwrap();
         let scorer = MemBM25Scorer::new(400, 40, HashMap::from([(String::from("token"), 40usize)]));
-        let mut cache = ImpactScoreCache::default();
 
-        let uncached_level0 = impacts.level0_score(3, 1.0, &scorer);
-        let cached_level0 = impacts.level0_score_cached(3, 1.0, &scorer, &mut cache);
-        assert_eq!(cached_level0, uncached_level0);
+        for group_idx in 0..impacts.level1_len() {
+            let group_score = impacts.level1_score(group_idx, 1.0, &scorer);
+            let group_start = group_idx * IMPACT_LEVEL1_BLOCKS;
+            let group_end = ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(impacts.level0_len());
+            for block_idx in group_start..group_end {
+                let block_score = impacts.level0_score(block_idx, 1.0, &scorer);
+                assert!(
+                    group_score + 1e-6 >= block_score,
+                    "level1 score {} must cover level0 score {} of block {}",
+                    group_score,
+                    block_score,
+                    block_idx
+                );
+            }
+        }
+    }
 
-        let uncached = impacts.max_score_up_to(0, 31, |idx| idx as u32, 1.0, &scorer);
-        let cached =
-            impacts.max_score_up_to_cached(0, 31, |idx| idx as u32, 1.0, &scorer, &mut cache);
-        assert_eq!(cached.score, uncached.score);
-        assert_eq!(cached.entries_scanned, uncached.entries_scanned);
+    #[test]
+    fn impact_level0_doc_up_to_reports_block_bounds() {
+        let blocks = vec![
+            vec![(0, 1, 10), (5, 2, 20)],
+            vec![(7, 1, 10), (12, 1, 10)],
+            vec![(20, 3, 30)],
+        ];
+        let impacts = build_impact_skip_data(&blocks).unwrap();
+        assert_eq!(impacts.level0_doc_up_to(0), Some(5));
+        assert_eq!(impacts.level0_doc_up_to(1), Some(12));
+        assert_eq!(impacts.level0_doc_up_to(2), Some(20));
+        assert_eq!(impacts.level0_doc_up_to(3), None);
     }
 
     #[test]
@@ -534,11 +517,8 @@ mod tests {
         assert!(score.score.is_finite());
         assert_eq!(score.entries_scanned, 1);
 
-        let mut cache = ImpactScoreCache::default();
-        assert_eq!(
-            impacts.level0_score_cached(1, 1.0, &scorer, &mut cache),
-            f32::INFINITY
-        );
+        assert_eq!(impacts.level0_score(1, 1.0, &scorer), f32::INFINITY);
+        assert_eq!(impacts.level0_doc_up_to(1), None);
     }
 
     #[test]
