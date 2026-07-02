@@ -1019,7 +1019,7 @@ pub async fn write_fragments_internal(
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
-                converted_schema.check_compatible(
+                normalized_converted_schema.check_compatible(
                     dataset.schema(),
                     &SchemaCompareOptions {
                         // We don't care if the user claims their data is nullable / non-nullable.  We will
@@ -1031,9 +1031,12 @@ pub async fn write_fragments_internal(
                         ..Default::default()
                     },
                 )?;
-                validate_blob_threshold_metadata_for_append(&converted_schema, dataset.schema())?;
+                validate_blob_threshold_metadata_for_append(
+                    &normalized_converted_schema,
+                    dataset.schema(),
+                )?;
                 let write_schema = dataset.schema().project_by_schema(
-                    &converted_schema,
+                    &normalized_converted_schema,
                     OnMissing::Error,
                     OnTypeMismatch::Error,
                 )?;

@@ -2024,6 +2024,10 @@ impl Dataset {
             }
         }
 
+        fn field_contains_blob(field: &lance_core::datatypes::Field) -> bool {
+            field.is_blob() || field.children.iter().any(field_contains_blob)
+        }
+
         fn collect_columns(
             field: &lance_core::datatypes::Field,
             is_structural: bool,
@@ -2114,7 +2118,7 @@ impl Dataset {
             consumed_top_level_fields = idx + 1;
             idx += 1;
 
-            if has_footer_orphans && field.is_blob() {
+            if has_footer_orphans && field_contains_blob(field) {
                 while let Some(orphan_child) = file_schema_fields.get(idx) {
                     if dataset_schema.field(&orphan_child.name).is_some() {
                         break;

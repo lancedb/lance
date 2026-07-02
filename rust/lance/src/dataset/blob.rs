@@ -3310,6 +3310,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_append_uses_blob_session_prepared_blob_column() {
+        let test_dir = TempStrDir::default();
+        let logical_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            blob_field("blob", true),
+        ]));
+        let mut initial_builder = BlobArrayBuilder::new(1);
+        initial_builder.push_bytes(b"initial").unwrap();
+        let initial_batch = RecordBatch::try_new(
+            logical_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+                initial_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(initial_batch)], logical_schema.clone()),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let file_id = Uuid::new_v4().to_string();
+        let data_file_path = dataset.data_dir().join(format!("{file_id}.lance").as_str());
+        let blob_session = LanceBlobSession::try_new(
+            dataset.object_store.as_ref().clone(),
+            data_file_path.clone(),
+        )
+        .unwrap();
+        let mut blob_writer = blob_session.open_writer("blob");
+        blob_writer
+            .push_inline(Bytes::from_static(b"append"))
+            .unwrap();
+        let prepared_column = blob_writer.finish().unwrap();
+        let (prepared_field, prepared_array) = prepared_column.into_parts();
+        let append_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            prepared_field,
+        ]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
+                prepared_array,
+            ],
+        )
+        .unwrap();
+
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(append_batch)], append_schema),
+                dataset,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let ids = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let id_values = ids.column(0).as_primitive::<UInt32Type>();
+        assert_eq!(id_values.values(), &[0, 1]);
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"initial");
+        assert_eq!(blobs[1].read().await.unwrap().as_ref(), b"append");
+    }
+
+    #[tokio::test]
+    async fn test_data_replacement_uses_blob_session_prepared_nested_blob_column() {
+        let test_dir = TempStrDir::default();
+        let mut initial_builder = BlobArrayBuilder::new(1);
+        initial_builder.push_bytes(b"initial").unwrap();
+        let (logical_schema, initial_batch) =
+            nested_blob_v2_batch(initial_builder.finish().unwrap());
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(initial_batch)], logical_schema.clone()),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let file_id = Uuid::new_v4().to_string();
+        let data_file_name = format!("{file_id}.lance");
+        let data_file_path = dataset.data_dir().join(data_file_name.as_str());
+        let blob_session = LanceBlobSession::try_new(
+            dataset.object_store.as_ref().clone(),
+            data_file_path.clone(),
+        )
+        .unwrap();
+        let mut blob_writer = blob_session.open_writer("blob");
+        let mut packed = blob_writer.new_packed().await.unwrap();
+        packed.write_blob(b"nested-replacement").await.unwrap();
+        blob_writer.extend(packed.finish().await.unwrap()).unwrap();
+        let prepared_column = blob_writer.finish().unwrap();
+        let (prepared_field, prepared_array) = prepared_column.into_parts();
+
+        let info_fields = vec![Field::new("name", DataType::Utf8, false), prepared_field];
+        let info_array = Arc::new(
+            StructArray::try_new(
+                info_fields.clone().into(),
+                vec![
+                    Arc::new(StringArray::from(vec!["replacement"])) as ArrayRef,
+                    prepared_array,
+                ],
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let replacement_schema = Arc::new(Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(info_fields.into()),
+            true,
+        )]));
+        let replacement_batch =
+            RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
+
+        let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+        let mut file_writer = FileWriter::try_new(
+            object_writer,
+            crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        file_writer.write_batch(&replacement_batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let data_file = dataset
+            .create_data_file(&data_file_name, None)
+            .await
+            .unwrap();
+        let transaction = Transaction {
+            read_version: dataset.manifest.version,
+            uuid: Uuid::new_v4().hyphenated().to_string(),
+            operation: Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, data_file)],
+            },
+            tag: None,
+            transaction_properties: None,
+        };
+        let dataset = Arc::new(
+            CommitBuilder::new(dataset)
+                .execute(transaction)
+                .await
+                .unwrap(),
+        );
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0], "info.blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(
+            blobs[0].read().await.unwrap().as_ref(),
+            b"nested-replacement"
+        );
+        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+    }
+
+    #[tokio::test]
     async fn test_write_and_take_nested_blob_v2() {
         let test_dir = TempStrDir::default();
         let packed_payload = vec![0x4A; super::INLINE_MAX + 1024];
