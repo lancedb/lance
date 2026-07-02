@@ -262,6 +262,10 @@ impl PrioritiesInFlight {
         self.in_flight.first().copied().unwrap_or(u128::MAX)
     }
 
+    fn contains(&self, prio: u128) -> bool {
+        self.in_flight.binary_search(&prio).is_ok()
+    }
+
     fn push(&mut self, prio: u128) {
         let pos = match self.in_flight.binary_search(&prio) {
             Ok(pos) => pos,
@@ -325,6 +329,10 @@ impl BackpressureThrottle for SimpleBackpressureThrottle {
         if self.no_backpressure
             || self.bytes_available >= num_bytes as i64
             || self.priorities_in_flight.min_in_flight() >= priority
+            // Chunks from an admitted logical request must keep moving.  A
+            // higher-priority request may be scheduled later and remain
+            // unconsumed while the caller awaits this request.
+            || self.priorities_in_flight.contains(priority)
         {
             self.bytes_available -= num_bytes as i64;
             self.priorities_in_flight.push(priority);
@@ -801,5 +809,23 @@ mod tests {
         bypass.await.unwrap();
         normal_tx.send(Bytes::from_static(b"done")).unwrap();
         normal.await.unwrap();
+    }
+
+    #[test]
+    fn test_same_priority_reservation_continues_after_higher_priority() {
+        let mut throttle = SimpleBackpressureThrottle::new(10, 128);
+
+        let low_priority_first = throttle.try_acquire(6, 10).unwrap();
+        let high_priority = throttle.try_acquire(4, 0).unwrap();
+        let low_priority_next = throttle.try_acquire(6, 10);
+
+        assert!(
+            low_priority_next.is_some(),
+            "chunks from an already admitted logical request should continue"
+        );
+
+        throttle.release(low_priority_first);
+        throttle.release(high_priority);
+        throttle.release(low_priority_next.unwrap());
     }
 }
