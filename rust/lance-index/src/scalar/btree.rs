@@ -1391,7 +1391,6 @@ impl DeepSizeOf for BTreeIndexState {
 }
 
 impl BTreeIndexState {
-    /// Capture the serializable state of an opened `BTreeIndex`.
     fn from_index(index: &dyn ScalarIndex) -> Result<Self> {
         let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
             Error::internal("BTreeIndexState::from_index called with a non-BTree index")

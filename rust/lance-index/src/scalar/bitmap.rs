@@ -195,8 +195,6 @@ impl BitmapIndexState {
         })
     }
 
-    /// Capture the serializable state of an opened index, rejecting anything
-    /// that is not a `BitmapIndex`.
     fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
         let bitmap = index
             .as_any()

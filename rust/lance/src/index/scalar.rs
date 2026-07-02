@@ -462,12 +462,9 @@ pub async fn open_scalar_index(
     let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
         frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
 
-    // The storage read runs only on a cold miss, and at most once even under
-    // concurrent opens (the plugin coalesces via `get_or_insert_in_cache`). The
-    // compatibility check is only needed on first load: a warm hit means the
-    // index was already validated when it was originally opened in this session,
-    // so it stays inside this cold-load future and we skip the extra
-    // `open_index_file` IOP.
+    // Runs only on a cold miss, and at most once even under concurrent opens
+    // (the plugin coalesces). The compat check lives here because a warm hit was
+    // already validated this session, saving the extra `open_index_file` IOP.
     let load: ScalarIndexLoad = Box::pin({
         let index_store = index_store.clone();
         let frag_reuse_index = frag_reuse_index.clone();
@@ -1079,8 +1076,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Reopen so the index cache is cold; the concurrent opens below all race
-        // to populate it.
+        // Reopen so the index cache is cold for the concurrent opens below.
         let ds = DatasetBuilder::from_uri(uri).load().await.unwrap();
         let id_field = ds.schema().field("id").unwrap().id;
         let index_meta = ds
@@ -1092,9 +1088,8 @@ mod tests {
             .cloned()
             .expect("btree index on `id`");
 
-        // Eight concurrent cold opens of the same index. Single-flight: the loader
-        // (which calls `record_index_load`) runs exactly once; the rest share its
-        // result instead of each re-reading the index and rebuilding the lookup.
+        // Eight concurrent cold opens; single-flight means the loader (which calls
+        // `record_index_load`) runs exactly once, not once per open.
         let metrics = LocalMetricsCollector::default();
         let indices =
             try_join_all((0..8).map(|_| open_scalar_index(&ds, "id", &index_meta, &metrics)))
