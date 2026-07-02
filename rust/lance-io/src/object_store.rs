@@ -69,6 +69,7 @@ const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
     feature = "tencent",
     feature = "huggingface",
     feature = "tos",
+    feature = "goosefs",
 ))]
 const DEFAULT_CLOUD_BLOCK_SIZE: usize = 64 * 1024; // 64KB block size
 
