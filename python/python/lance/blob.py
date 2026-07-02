@@ -273,9 +273,11 @@ class BlobColumn:
     file-like objects.
 
     This can be useful for working with medium-to-small binary objects that need
-    to interface with APIs that expect file-like objects.  For very large binary
-    objects (4-8MB or more per value) you might be better off creating a blob column
-    and using :py:meth:`lance.Dataset.take_blobs` to access the blob data.
+    to interface with APIs that expect file-like objects. For very large binary
+    objects (4-8MB or more per value) you might be better off creating a blob
+    column. Use :py:meth:`lance.Dataset.read_blobs` when you need complete blob
+    bytes, or :py:meth:`lance.Dataset.take_blobs` when you need lazy file-like
+    access.
     """
 
     def __init__(self, blob_column: Union[pa.Array, pa.ChunkedArray]):

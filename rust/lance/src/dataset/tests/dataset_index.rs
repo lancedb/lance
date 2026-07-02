@@ -3743,3 +3743,68 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
         "Index files should never use legacy format, even for legacy datasets"
     );
 }
+
+#[tokio::test]
+async fn test_manifest_read_recovers_from_stale_size() {
+    // A cached `ManifestLocation.size` can lag the real object: a reader may pick
+    // up a size from a stale listing/hint while another writer is committing
+    // concurrently. Reading the manifest (or its index section) with that stale
+    // size must not fail with a spurious "file size is too small" error. The
+    // reader should drop the cached size, fetch the true size, and succeed.
+    use crate::session::Session;
+    use lance_table::io::commit::ManifestLocation;
+    use lance_table::io::manifest::read_manifest_indexes;
+
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let real_location = dataset.manifest_location().clone();
+    assert!(real_location.size.is_some());
+
+    // A deliberately-too-small size stands in for a stale cached size. Without the
+    // retry, both reads below decode a bogus footer offset and fail with
+    // "file size is too small".
+    let stale_location = ManifestLocation {
+        size: Some(1),
+        ..real_location.clone()
+    };
+
+    let session = Session::default();
+    let manifest = Dataset::load_manifest(
+        dataset.object_store.as_ref(),
+        &stale_location,
+        test_uri.as_ref(),
+        &session,
+    )
+    .await
+    .expect("load_manifest should recover from a stale manifest size");
+    assert_eq!(manifest.version, real_location.version);
+
+    let indices = read_manifest_indexes(dataset.object_store.as_ref(), &stale_location, &manifest)
+        .await
+        .expect("read_manifest_indexes should recover from a stale manifest size");
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].name, "id_idx");
+}

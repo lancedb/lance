@@ -27,7 +27,7 @@ use jni::sys::{jdouble, jint, jlong};
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
     FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
-    write_pk_sidecar,
+    parse_filter_expr as parse_lsm_filter_expr, write_pk_sidecar,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
@@ -398,7 +398,7 @@ fn inner_scanner_project(env: &mut JNIEnv, this: JObject, columns: JObject) -> R
     let columns = env.get_strings(&columns)?;
     with_lsm_scanner(env, &this, |scanner| {
         let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
-        Ok(scanner.project(&cols))
+        Ok(scanner.project(&cols)?)
     })
 }
 
@@ -420,7 +420,7 @@ fn inner_scanner_filter(env: &mut JNIEnv, this: JObject, expr: JString) -> Resul
 pub extern "system" fn Java_org_lance_memwal_LsmScanner_nativeLimit(
     mut env: JNIEnv,
     this: JObject,
-    limit: jlong,
+    limit: JObject,
     offset: JObject,
 ) {
     ok_or_throw_without_return!(env, inner_scanner_limit(&mut env, this, limit, offset));
@@ -429,13 +429,12 @@ pub extern "system" fn Java_org_lance_memwal_LsmScanner_nativeLimit(
 fn inner_scanner_limit(
     env: &mut JNIEnv,
     this: JObject,
-    limit: jlong,
+    limit: JObject,
     offset: JObject,
 ) -> Result<()> {
-    let offset = env.get_u64_opt(&offset)?.map(|v| v as usize);
-    with_lsm_scanner(env, &this, |scanner| {
-        Ok(scanner.limit(limit as usize, offset))
-    })
+    let limit = env.get_u64_opt(&limit)?.map(|v| v as i64);
+    let offset = env.get_u64_opt(&offset)?.map(|v| v as i64);
+    with_lsm_scanner(env, &this, |scanner| Ok(scanner.limit(limit, offset)?))
 }
 
 #[unsafe(no_mangle)]
@@ -825,6 +824,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmVectorSearchPlanner_nativeCreate
     vector_column: JString,
     pk_columns: JObject,
     distance_type: JObject,
+    filter: JObject,
 ) {
     ok_or_throw_without_return!(
         env,
@@ -836,6 +836,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmVectorSearchPlanner_nativeCreate
             vector_column,
             pk_columns,
             distance_type,
+            filter,
         )
     );
 }
@@ -849,11 +850,13 @@ fn inner_create_vector_planner(
     vector_column: JString,
     pk_columns: JObject,
     distance_type: JObject,
+    filter: JObject,
 ) -> Result<()> {
     let snapshots = read_shard_snapshots(env, &shard_snapshots)?;
     let vector_column: String = env.get_string(&vector_column)?.into();
     let pk_columns = env.get_strings_opt(&pk_columns)?;
     let distance_type = env.get_string_opt(&distance_type)?;
+    let filter = env.get_string_opt(&filter)?;
     let dataset = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&dataset, NATIVE_DATASET) }?;
@@ -866,9 +869,13 @@ fn inner_create_vector_planner(
     let base_schema = Arc::new(ArrowSchema::from(dataset.schema()));
     let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
     let vector_dim = get_vector_dim(&dataset, &vector_column)?;
+    let filter = filter
+        .as_deref()
+        .map(|filter| parse_lsm_filter_expr(base_schema.as_ref(), filter).map_err(Error::from))
+        .transpose()?;
 
     let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots);
-    let planner = LsmVectorSearchPlanner::new(
+    let mut planner = LsmVectorSearchPlanner::new(
         collector,
         pk_columns,
         base_schema.clone(),
@@ -876,6 +883,9 @@ fn inner_create_vector_planner(
         dist_type,
     )
     .with_dataset(dataset);
+    if let Some(filter) = filter {
+        planner = planner.with_filter(Some(filter));
+    }
 
     let blocking = BlockingLsmVectorSearchPlanner {
         planner,

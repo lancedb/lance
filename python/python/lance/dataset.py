@@ -2122,6 +2122,10 @@ class LanceDataset(pa.dataset.Dataset):
         this API allows you to open binary blob data as a regular Python file-like
         object. For more details, see :py:class:`lance.BlobFile`.
 
+        If you plan to read each selected blob completely with ``read()`` or
+        ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
+        payloads with Lance's planned batched reader.
+
         Exactly one of ids, addresses, or indices must be specified.
 
         Parameters
@@ -2170,7 +2174,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Unlike :py:meth:`take_blobs`, which returns file-like :py:class:`lance.BlobFile`
         handles for random access, this API plans and executes batched reads and
-        returns materialized blob payloads.
+        returns materialized blob payloads. Use this API for training loaders,
+        batch preprocessing, and other workflows that need complete blob bytes.
 
         Exactly one of ids, addresses, or indices must be specified.
 

@@ -161,12 +161,12 @@ impl From<Vec<bf16>> for BFloat16Array {
     fn from(data: Vec<bf16>) -> Self {
         let mut buffer = MutableBuffer::with_capacity(data.len() * 2);
 
-        let bytes = data.iter().flat_map(|val| {
-            let bytes = val.to_bits().to_le_bytes();
-            bytes.to_vec()
-        });
+        // Write each value's little-endian bytes straight into the buffer. Going
+        // through an intermediate `Vec` per element would allocate once per value.
+        for val in &data {
+            buffer.extend_from_slice(&val.to_bits().to_le_bytes());
+        }
 
-        buffer.extend(bytes);
         let array_data = ArrayData::builder(DataType::FixedSizeBinary(2))
             .len(data.len())
             .add_buffer(buffer.into());

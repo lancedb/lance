@@ -706,10 +706,14 @@ async fn run_read(args: &Args, uri: &str, corpus: &[String]) -> Result<serde_jso
         if *is_phrase {
             scanner.full_text_phrase(TEXT_COL, q, 0);
         } else {
-            scanner.full_text_search(TEXT_COL, q);
+            scanner.full_text_search(
+                FullTextSearchQuery::new(q.to_string())
+                    .with_column(TEXT_COL.to_string())
+                    .unwrap(),
+            )?;
         }
-        scanner.project(&["id"]);
-        scanner.limit(args.top_k, None);
+        scanner.project(&["id"])?;
+        scanner.limit(Some(args.top_k as i64), None)?;
         let t0 = Instant::now();
         let stream = scanner.try_into_stream().await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
