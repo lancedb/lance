@@ -114,6 +114,7 @@ use lance_core::datatypes::{BlobHandling, BlobKind};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_index::frag_reuse::FragReuseGroup;
+use lance_index::is_system_index;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
@@ -1410,7 +1411,11 @@ impl CandidateBin {
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
     let indices = dataset.load_indices().await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
-    for index in indices.iter() {
+    // System indices (fragment-reuse, mem-wal) don't define data coverage and
+    // aren't remapped per rewrite group, so they must not constrain compaction
+    // bins -- otherwise deferred compaction's fragment-reuse index repeatedly
+    // splits the small-fragment run and they never coalesce.
+    for index in indices.iter().filter(|idx| !is_system_index(idx)) {
         if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
@@ -3400,6 +3405,69 @@ mod tests {
                 compact_read_versions
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_deferred_compaction_not_split_by_frag_reuse_index() {
+        // A deferred compaction creates a fragment-reuse index covering its
+        // output. Later small fragments must still compact together with that
+        // (FRI-covered) output: the FRI is a system index and must not split the
+        // compaction bin. Without the fix the FRI-covered fragment is isolated,
+        // so only the new fragments merge and the count never returns to one.
+        let data = sample_data();
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        // Two small fragments -> deferred compaction folds them into one,
+        // creating the fragment-reuse index.
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 400))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Append two more small fragments, then compact again.
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(400, 400))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 200,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(
+            dataset.get_fragments().len(),
+            1,
+            "FRI-covered fragment must compact together with the new fragments"
+        );
     }
 
     #[tokio::test]

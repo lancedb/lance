@@ -2658,6 +2658,127 @@ mod tests {
         t
     }
 
+    // An update-style merge_insert leaves the source and new fragments with
+    // overlapping id ranges; a scattered delete punches holes in that range. A
+    // filtered `with_row_id` scan must still resolve every id (round-tripped via take).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_insert_then_delete_resolves_overlapping_row_ids() {
+        use arrow_array::ArrayRef;
+        use arrow_array::types::UInt64Type;
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("slug", DataType::Utf8, false),
+            Field::new("title", DataType::Utf8, false),
+            Field::new("category", DataType::Utf8, false),
+        ]));
+        let mk = |slugs: Vec<String>, titles: Vec<String>| {
+            let cats: Vec<String> = (0..slugs.len())
+                .map(|i| ["A", "B", "C", "D", "E"][i % 5].to_string())
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(slugs)) as ArrayRef,
+                    Arc::new(StringArray::from(titles)) as ArrayRef,
+                    Arc::new(StringArray::from(cats)) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        };
+
+        // Empty dataset with stable row ids; write-seed 40 rows (ids 0..40).
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(mk(vec![], vec![]))], schema.clone()),
+            uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+        ds.append(
+            RecordBatchIterator::new(
+                vec![Ok(mk(
+                    (1..=40).map(|i| format!("t{i}")).collect(),
+                    (1..=40).map(|i| format!("r{i}")).collect(),
+                ))],
+                schema.clone(),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Update every other row (so the new fragment's ids interleave with -- and
+        // its range overlaps -- the source's) plus a few inserts.
+        let mut slugs: Vec<String> = (1..=40).step_by(2).map(|i| format!("t{i}")).collect();
+        let mut titles: Vec<String> = (1..=40).step_by(2).map(|i| format!("e{i}")).collect();
+        for i in 41..=45 {
+            slugs.push(format!("t{i}"));
+            titles.push(format!("e{i}"));
+        }
+        let mut b = MergeInsertBuilder::try_new(Arc::new(ds), vec!["slug".into()]).unwrap();
+        b.when_matched(WhenMatched::UpdateAll);
+        b.when_not_matched(WhenNotMatched::InsertAll);
+        let (ds, _) = b
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new(
+                vec![Ok(mk(slugs, titles))],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+
+        // Scattered delete -> interior holes in the overlapped id range.
+        let mut ds = (*ds).clone();
+        let ds = (*ds.delete("category = 'A'").await.unwrap().new_dataset).clone();
+
+        // The `with_row_id` scan builds the RowIdIndex; every scanned id must
+        // round-trip through take_rows.
+        let batches: Vec<RecordBatch> = ds
+            .scan()
+            .with_row_id()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let row_ids: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name(ROW_ID)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        let scanned_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let taken = ds.take_rows(&row_ids, ds.schema().clone()).await.unwrap();
+        assert_eq!(taken.num_rows(), scanned_rows);
+
+        // A point lookup on a surviving row resolves to exactly one row.
+        let filtered: Vec<RecordBatch> = ds
+            .scan()
+            .with_row_id()
+            .filter("slug = 't30'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let n: usize = filtered.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(n, 1, "expected exactly one row for slug='t30'");
+    }
+
     async fn check_then_refresh_dataset(
         new_data: RecordBatch,
         mut job: MergeInsertJob,
