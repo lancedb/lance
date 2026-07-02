@@ -84,7 +84,11 @@ pub async fn read_fixed_stride_array(
 /// followed by the message itself.
 pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize) -> Result<M> {
     let file_size = reader.size().await?;
-    if pos > file_size {
+    // A message is a u32 length prefix followed by its body; both must lie before
+    // the end. A `pos` too close to the end means the reader size is too small
+    // (e.g. a stale cached size). Reject it rather than slice a short buffer and
+    // panic.
+    if pos + 4 > file_size {
         return Err(Error::io("file size is too small".to_string()));
     }
 
@@ -96,7 +100,9 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
         let remaining_range = range.end..min(4 + pos + msg_len, file_size);
         let remaining_bytes = reader.get_range(remaining_range).await?;
         let buf = [buf, remaining_bytes].concat();
-        assert!(buf.len() >= msg_len + 4);
+        if buf.len() < msg_len + 4 {
+            return Err(Error::io("file size is too small".to_string()));
+        }
         Ok(M::decode(&buf[4..4 + msg_len])?)
     } else {
         Ok(M::decode(&buf[4..4 + msg_len])?)

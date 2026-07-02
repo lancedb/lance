@@ -83,6 +83,8 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "`paste` is used by datafusion" },
     { id = "RUSTSEC-2023-0071", reason = "`rsa` is used by opendal via reqsign" },
     { id = "RUSTSEC-2025-0119", reason = "`number_prefix` used by hf-hub in examples" },
+    { id = "RUSTSEC-2026-0194", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
+    { id = "RUSTSEC-2026-0195", reason = "`quick-xml` <0.41 pulled transitively via object_store (datafusion) and reqsign-aws-v4 (opendal); upstream must upgrade first" },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
