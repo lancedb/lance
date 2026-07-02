@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::OnceLock;
+
 use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::{Array, LargeBinaryArray};
 use lance_core::{Error, Result};
@@ -10,10 +12,22 @@ use super::scorer::Scorer;
 pub const IMPACT_LEVEL1_BLOCKS: usize = 32;
 const SMALL_FRONTIER_FREQ_LIMIT: usize = 256;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ImpactSkipData {
     entries: LargeBinaryArray,
     level0_len: usize,
+    // Per-entry max doc weight (level0 entries then level1 entries), baked on
+    // first use. Doc weights depend only on (freq, doc_len) and the scorer's
+    // index-wide stats (e.g. BM25 avgdl), not on the query, so one pass over
+    // the frontiers serves every query for the lifetime of the cached list.
+    // Malformed entries bake to INFINITY so pruning stays safe.
+    doc_weight_bounds: OnceLock<Box<[f32]>>,
+}
+
+impl PartialEq for ImpactSkipData {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries && self.level0_len == other.level0_len
+    }
 }
 
 #[cfg(test)]
@@ -43,7 +57,32 @@ impl ImpactSkipData {
         Ok(Self {
             entries,
             level0_len,
+            doc_weight_bounds: OnceLock::new(),
         })
+    }
+
+    fn doc_weight_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> &[f32] {
+        self.doc_weight_bounds.get_or_init(|| {
+            (0..self.entries.len())
+                .map(|entry_idx| self.entry_max_doc_weight(entry_idx, scorer))
+                .collect()
+        })
+    }
+
+    fn entry_max_doc_weight<S: Scorer + ?Sized>(&self, entry_idx: usize, scorer: &S) -> f32 {
+        let bytes = self.entries.value(entry_idx);
+        let Ok(header) = decode_header(bytes) else {
+            return f32::INFINITY;
+        };
+        let mut max_doc_weight = 0.0_f32;
+        let mut offset = 8usize;
+        for _ in 0..header.pair_count {
+            let freq = read_u32_le(bytes, offset);
+            let doc_len = read_u32_le(bytes, offset + 4);
+            max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
+            offset += 8;
+        }
+        max_doc_weight
     }
 
     pub fn entries(&self) -> &LargeBinaryArray {
@@ -93,10 +132,10 @@ impl ImpactSkipData {
         query_weight: f32,
         scorer: &S,
     ) -> f32 {
-        if block_idx >= self.level0_len {
+        if block_idx >= self.level0_len || query_weight <= 0.0 {
             return 0.0;
         }
-        self.entry_score(block_idx, query_weight, scorer)
+        query_weight * self.doc_weight_bounds(scorer)[block_idx]
     }
 
     /// Max score of the docs covered by the level1 entry of `group_idx`
@@ -108,10 +147,10 @@ impl ImpactSkipData {
         query_weight: f32,
         scorer: &S,
     ) -> f32 {
-        if group_idx >= level1_len(self.level0_len) {
+        if group_idx >= level1_len(self.level0_len) || query_weight <= 0.0 {
             return 0.0;
         }
-        self.entry_score(self.level0_len + group_idx, query_weight, scorer)
+        query_weight * self.doc_weight_bounds(scorer)[self.level0_len + group_idx]
     }
 
     #[cfg(test)]
@@ -198,6 +237,7 @@ impl ImpactSkipData {
         }
     }
 
+    #[cfg(test)]
     fn entry_score<S: Scorer + ?Sized>(
         &self,
         entry_idx: usize,

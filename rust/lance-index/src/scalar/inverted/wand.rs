@@ -64,8 +64,14 @@ struct WandStats {
 }
 
 static WAND_STATS: LazyLock<Option<Box<WandStats>>> = LazyLock::new(|| {
-    (std::env::var("LANCE_WAND_STATS").as_deref() == Ok("1")).then(Box::default)
+    std::env::var("LANCE_WAND_STATS")
+        .as_deref()
+        .is_ok_and(|v| v == "1" || v == "2")
+        .then(Box::default)
 });
+
+static WAND_STATS_VERBOSE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_WAND_STATS").as_deref() == Ok("2"));
 
 #[inline(always)]
 fn wand_stats() -> Option<&'static WandStats> {
@@ -1747,8 +1753,30 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
             prev_first_essential = first_essential;
             num_windows += 1;
+            if let Some(stats) = wand_stats() {
+                stats.refreshes.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .group_skips
+                    .fetch_add(first_essential as u64, Ordering::Relaxed);
+                if *WAND_STATS_VERBOSE
+                    && num_windows <= 4
+                    && stats.searches.load(Ordering::Relaxed).is_multiple_of(797)
+                {
+                    eprintln!(
+                        "[msc_sample] window={} threshold={} first_essential={} window_span={} bounds={:?}",
+                        num_windows,
+                        self.threshold,
+                        first_essential,
+                        window_max.saturating_sub(window_min),
+                        clauses.iter().map(|c| c.bound).collect::<Vec<_>>(),
+                    );
+                }
+            }
 
             if first_essential == clauses.len() {
+                if let Some(stats) = wand_stats() {
+                    stats.window_skips.fetch_add(1, Ordering::Relaxed);
+                }
                 // No clause combination inside this window can beat the
                 // threshold: skip it wholesale.
                 window_min = match window_max {
@@ -4065,9 +4093,13 @@ mod tests {
         let (candidate, score) = wand.next().unwrap().unwrap();
         assert_eq!(candidate.doc_id(), target);
         assert_eq!(score, 10.0);
+        // The doc-weight bounds bake exactly once (one doc_weight call per
+        // frontier pair across all entries); beyond that only the returned
+        // candidate is scored.
+        let total_entries = (IMPACT_LEVEL1_BLOCKS + 1) + 2;
         assert!(
-            scored.load(Ordering::Relaxed) <= 8,
-            "group skipping should bound the low group once instead of once per block; scored={}",
+            scored.load(Ordering::Relaxed) <= total_entries + 8,
+            "bounds should be baked once instead of recomputed per window; scored={}",
             scored.load(Ordering::Relaxed)
         );
     }
@@ -4091,18 +4123,24 @@ mod tests {
 
         let first_score = posting.block_max_score(&scorer);
         assert_eq!(first_score, 1.0);
-        assert_eq!(scored.load(Ordering::Relaxed), 1);
+        // Baking the doc-weight bounds visits every frontier pair once: two
+        // level0 entries plus one level1 entry for this list.
+        let baked = scored.load(Ordering::Relaxed);
+        assert!(baked >= 2);
         {
             let compressed = unsafe { &mut *posting.compressed_state_ptr() };
-            assert_eq!(compressed.level0_cache, Some((0, BLOCK_SIZE as u32 - 1, first_score)));
+            assert_eq!(
+                compressed.level0_cache,
+                Some((0, BLOCK_SIZE as u32 - 1, first_score))
+            );
         }
 
         let second_score = posting.block_max_score(&scorer);
         assert_eq!(second_score, first_score);
         assert_eq!(
             scored.load(Ordering::Relaxed),
-            1,
-            "second request for the same block should use the anchored level0 memo"
+            baked,
+            "repeated block max scores must not recompute doc weights"
         );
 
         posting.shallow_next(BLOCK_SIZE as u64);
@@ -4110,33 +4148,8 @@ mod tests {
         assert_eq!(next_block_score, 2.0);
         assert_eq!(
             scored.load(Ordering::Relaxed),
-            2,
-            "moving to a different block should miss the block-index memo"
-        );
-
-        let mut posting = PostingIterator::new(
-            String::from("term"),
-            0,
-            0,
-            generate_impact_posting_list_with_freqs(
-                (0..total).collect(),
-                (0..total)
-                    .map(|doc_id| if doc_id < BLOCK_SIZE as u32 { 1 } else { 2 })
-                    .collect(),
-                vec![1; total as usize],
-            ),
-            total as usize,
-        );
-        let first_score = posting.block_max_score(&scorer);
-        assert_eq!(first_score, 1.0);
-        assert_eq!(scored.load(Ordering::Relaxed), 3);
-        posting.next(BLOCK_SIZE as u64);
-        let next_block_score = posting.block_max_score(&scorer);
-        assert_eq!(next_block_score, 2.0);
-        assert_eq!(
-            scored.load(Ordering::Relaxed),
-            4,
-            "next() into another block should miss the block-index memo"
+            baked,
+            "other blocks answer from the baked bounds without rescoring"
         );
     }
 
