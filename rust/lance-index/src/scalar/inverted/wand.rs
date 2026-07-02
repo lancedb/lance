@@ -877,6 +877,91 @@ impl PostingIterator {
         }
     }
 
+    /// Bulk-score every posting in `[current doc, up_to]` into the window
+    /// accumulator (slot = doc - window_min) and leave the iterator on the
+    /// first doc beyond `up_to`. This is the Lucene `nextDocsAndScores`
+    /// equivalent: it walks the decompressed block arrays directly, with no
+    /// per-doc heap traffic.
+    fn collect_window_scores<S: Scorer + ?Sized>(
+        &mut self,
+        window_min: u64,
+        up_to: u64,
+        clause_idx: usize,
+        docs: &DocSet,
+        scorer: &S,
+        acc: &mut WindowAccumulator,
+    ) {
+        if self
+            .doc()
+            .is_some_and(|doc| doc.doc_id() < window_min)
+        {
+            self.next(window_min);
+        }
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                'blocks: while let Some(doc) = self.current_doc {
+                    if doc.doc_id() > up_to {
+                        break;
+                    }
+                    let block_idx = posting_block_idx(self.index, list.block_size);
+                    let block_offset = posting_block_offset(self.index, list.block_size);
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                    for offset in block_offset..compressed.doc_ids.len() {
+                        let doc_id = compressed.doc_ids[offset];
+                        if u64::from(doc_id) > up_to {
+                            self.index =
+                                posting_block_start(block_idx, list.block_size) + offset;
+                            self.block_idx = block_idx;
+                            self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id,
+                                frequency: compressed.freqs[offset],
+                            }));
+                            break 'blocks;
+                        }
+                        let freq = compressed.freqs[offset];
+                        let doc_length = docs.num_tokens(doc_id);
+                        let score = self.query_weight * scorer.doc_weight(freq, doc_length);
+                        let slot = (u64::from(doc_id) - window_min) as usize;
+                        acc.add(clause_idx, slot, score, freq);
+                    }
+                    // Block exhausted: step into the next block (or finish).
+                    let next_start = posting_block_start(block_idx + 1, list.block_size);
+                    if next_start >= list.length as usize {
+                        self.index = list.length as usize;
+                        self.block_idx = posting_block_idx(self.index, list.block_size);
+                        self.current_doc = None;
+                        break;
+                    }
+                    self.index = next_start;
+                    self.block_idx = block_idx + 1;
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx + 1) };
+                    self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                        doc_id: compressed.doc_ids[0],
+                        frequency: compressed.freqs[0],
+                    }));
+                }
+            }
+            PostingList::Plain(_) => {
+                while let Some(doc) = self.doc() {
+                    let doc_id = doc.doc_id();
+                    if doc_id > up_to {
+                        break;
+                    }
+                    let doc_length = match &doc {
+                        DocInfo::Raw(raw) => docs.num_tokens(raw.doc_id),
+                        DocInfo::Located(located) => docs.num_tokens_by_row_id(located.row_id),
+                    };
+                    let score = self.score(scorer, doc.frequency(), doc_length);
+                    let slot = (doc_id - window_min) as usize;
+                    acc.add(clause_idx, slot, score, doc.frequency());
+                    self.next(doc_id + 1);
+                }
+            }
+        }
+    }
+
     #[inline]
     fn next_block_first_doc(&self) -> Option<u64> {
         match self.list {
@@ -887,6 +972,51 @@ impl PostingIterator {
                 Some(self.block_least_doc_id(list, self.block_idx + 1) as u64)
             }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index + 1).cloned(),
+        }
+    }
+}
+
+/// Inner window span (in doc ids) of the bulk MAXSCORE path. Same as Lucene's
+/// `MaxScoreBulkScorer.INNER_WINDOW_SIZE`.
+const MAXSCORE_INNER_WINDOW: usize = 1 << 12;
+
+/// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
+/// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
+/// paths can recover (term, freq) pairs of the essential clauses.
+struct WindowAccumulator {
+    scores: Vec<f32>,
+    freqs: Vec<u32>,
+    words: Vec<u64>,
+    num_clauses: usize,
+}
+
+impl WindowAccumulator {
+    fn new(num_clauses: usize) -> Self {
+        Self {
+            scores: vec![0.0; MAXSCORE_INNER_WINDOW],
+            freqs: vec![0; num_clauses * MAXSCORE_INNER_WINDOW],
+            words: vec![0; MAXSCORE_INNER_WINDOW / 64],
+            num_clauses,
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, clause_idx: usize, slot: usize, score: f32, freq: u32) {
+        self.scores[slot] += score;
+        self.freqs[clause_idx * MAXSCORE_INNER_WINDOW + slot] = freq;
+        self.words[slot >> 6] |= 1u64 << (slot & 63);
+    }
+
+    #[inline]
+    fn clause_freq(&self, clause_idx: usize, slot: usize) -> u32 {
+        self.freqs[clause_idx * MAXSCORE_INNER_WINDOW + slot]
+    }
+
+    #[inline]
+    fn clear_slot(&mut self, slot: usize) {
+        self.scores[slot] = 0.0;
+        for clause_idx in 0..self.num_clauses {
+            self.freqs[clause_idx * MAXSCORE_INNER_WINDOW + slot] = 0;
         }
     }
 }
@@ -1188,6 +1318,22 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
+        // Top-k disjunctions over compressed lists go through the bulk
+        // MAXSCORE path (Lucene MaxScoreBulkScorer style): it streams whole
+        // blocks of the essential clauses into a window accumulator instead of
+        // advancing doc-at-a-time through a heap, which is where the classic
+        // WAND loop spends most of its time.
+        if self.operator == Operator::Or
+            && params.phrase_slop.is_none()
+            && !self.head.is_empty()
+            && self
+                .head
+                .iter()
+                .all(|posting| posting.posting.is_compressed())
+        {
+            return self.maxscore_search(params, mask, metrics);
+        }
+
         // Deferred-row_id path: when the DocSet was built without
         // row_ids, wand emits candidates carrying just the
         // partition-local doc_id; the outer caller resolves them to
@@ -1473,6 +1619,308 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .map(
                 |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
                     addr: CandidateAddr::RowId(doc.row_id),
+                    posting_doc_id,
+                    freqs,
+                    doc_length,
+                },
+            )
+            .collect())
+    }
+
+    /// Bulk MAXSCORE top-k disjunction, mirroring Lucene's MaxScoreBulkScorer.
+    ///
+    /// Per outer window (bounded by the essential clauses' block boundaries):
+    /// clauses are partitioned into a non-essential prefix — sorted by window
+    /// max score, as many as fit under the threshold — and the essential rest.
+    /// Essential clauses stream their postings into a window accumulator in
+    /// bulk; only accumulated candidates that could still beat the threshold
+    /// probe the non-essential clauses. No per-doc heap maintenance happens
+    /// anywhere on this path.
+    fn maxscore_search(
+        &mut self,
+        params: &FtsSearchParams,
+        mask: Arc<RowAddrMask>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        struct MaxScoreClause {
+            posting: Box<PostingIterator>,
+            bound: f32,
+            prefix_bound: f32,
+        }
+
+        #[inline]
+        fn float_sum_upper(sum: f32, num_terms: usize) -> f32 {
+            // Mirror of Lucene MathUtil.sumUpperBound: widen the float sum so
+            // it stays a true upper bound of the exact sum.
+            sum + sum.abs() * (num_terms as f32) * f32::EPSILON
+        }
+
+        let limit = params.limit.unwrap_or(usize::MAX);
+        let docs_has_row_ids = self.docs.has_row_ids();
+        let mut clauses = std::mem::take(&mut self.head)
+            .into_vec()
+            .into_iter()
+            .map(|head| MaxScoreClause {
+                posting: head.posting,
+                bound: 0.0,
+                prefix_bound: 0.0,
+            })
+            .collect::<Vec<_>>();
+
+        let mut acc = WindowAccumulator::new(clauses.len());
+        let mut candidates: BinaryHeap<Reverse<(ScoredDoc, Vec<(u32, u32)>, u32, u64)>> =
+            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut num_comparisons = 0usize;
+        // Adaptive minimum window size (Lucene): grow windows when they yield
+        // too few candidates to amortize the per-window bound computations.
+        let mut min_window_size = 1u64;
+        let mut num_windows = 0u64;
+        let mut prev_first_essential = 0usize;
+
+        let mut window_min = clauses
+            .iter()
+            .filter_map(|clause| clause.posting.doc().map(|doc| doc.doc_id()))
+            .min()
+            .unwrap_or(TERMINATED_DOC_ID);
+
+        while window_min < TERMINATED_DOC_ID {
+            clauses.retain(|clause| clause.posting.doc().is_some());
+            if clauses.is_empty() {
+                break;
+            }
+            self.raise_to_shared_floor(params.wand_factor);
+
+            // Window boundary from the previous window's essential clauses
+            // only: dense non-essential clauses must not fragment the window.
+            let first_window_lead = prev_first_essential.min(clauses.len() - 1);
+            let mut window_max = TERMINATED_DOC_ID;
+            for clause in &mut clauses {
+                let doc = clause
+                    .posting
+                    .doc()
+                    .map(|doc| doc.doc_id())
+                    .expect("exhausted clauses were retained out");
+                clause.posting.shallow_next(doc.max(window_min));
+            }
+            for clause in &clauses[first_window_lead..] {
+                window_max = window_max.min(clause.posting.block_end_doc());
+            }
+            if clauses.len() > 1 {
+                // Target at least 32 candidates per clause per window on
+                // average before shrinking windows back to block granularity.
+                if (num_comparisons as u64) < num_windows * 32 * clauses.len() as u64 {
+                    min_window_size = (min_window_size * 2).min(MAXSCORE_INNER_WINDOW as u64);
+                } else {
+                    min_window_size = 1;
+                }
+                window_max = window_max.max(window_min.saturating_add(min_window_size - 1));
+            }
+
+            for clause in &mut clauses {
+                let doc = clause
+                    .posting
+                    .doc()
+                    .map(|doc| doc.doc_id())
+                    .expect("exhausted clauses were retained out");
+                clause.bound = if doc > window_max {
+                    0.0
+                } else {
+                    clause
+                        .posting
+                        .block_max_score_up_to_with_stats(window_max, &self.scorer)
+                        .score
+                };
+            }
+            clauses.sort_unstable_by(|a, b| a.bound.total_cmp(&b.bound));
+            let mut first_essential = 0;
+            let mut prefix = 0.0_f32;
+            if self.threshold > 0.0 {
+                for i in 0..clauses.len() {
+                    let widened = float_sum_upper(prefix + clauses[i].bound, i + 1);
+                    if widened > self.threshold {
+                        break;
+                    }
+                    prefix += clauses[i].bound;
+                    clauses[i].prefix_bound = prefix;
+                    first_essential = i + 1;
+                }
+            }
+            prev_first_essential = first_essential;
+            num_windows += 1;
+
+            if first_essential == clauses.len() {
+                // No clause combination inside this window can beat the
+                // threshold: skip it wholesale.
+                window_min = match window_max {
+                    TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                    max => max + 1,
+                };
+                continue;
+            }
+
+            let total_non_essential_bound = if first_essential > 0 {
+                clauses[first_essential - 1].prefix_bound
+            } else {
+                0.0
+            };
+
+            // Stream the essential clauses through inner windows.
+            let mut inner_min = window_min;
+            loop {
+                let mut next_essential_doc = TERMINATED_DOC_ID;
+                for clause in &clauses[first_essential..] {
+                    if let Some(doc) = clause.posting.doc() {
+                        next_essential_doc = next_essential_doc.min(doc.doc_id());
+                    }
+                }
+                inner_min = inner_min.max(next_essential_doc);
+                if inner_min == TERMINATED_DOC_ID || inner_min > window_max {
+                    break;
+                }
+                let inner_max =
+                    window_max.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
+
+                for (clause_idx, clause) in clauses.iter_mut().enumerate().skip(first_essential) {
+                    clause.posting.collect_window_scores(
+                        inner_min,
+                        inner_max,
+                        clause_idx,
+                        self.docs,
+                        &self.scorer,
+                        &mut acc,
+                    );
+                }
+
+                // Drain candidates in doc order, completing them with the
+                // non-essential clauses ordered by descending bound.
+                for word_idx in 0..acc.words.len() {
+                    let mut word = acc.words[word_idx];
+                    if word == 0 {
+                        continue;
+                    }
+                    acc.words[word_idx] = 0;
+                    while word != 0 {
+                        let bit = word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        let slot = (word_idx << 6) | bit;
+                        let doc = inner_min + slot as u64;
+                        let mut score = acc.scores[slot];
+                        num_comparisons += 1;
+
+                        if self.threshold > 0.0
+                            && score + total_non_essential_bound <= self.threshold
+                        {
+                            acc.clear_slot(slot);
+                            continue;
+                        }
+
+                        let row_id = if docs_has_row_ids {
+                            self.docs.row_id(doc as u32)
+                        } else {
+                            doc
+                        };
+                        if docs_has_row_ids
+                            && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id))
+                        {
+                            acc.clear_slot(slot);
+                            continue;
+                        }
+
+                        let doc_length = self.docs.num_tokens(doc as u32);
+                        let mut rejected = false;
+                        for i in (0..first_essential).rev() {
+                            if self.threshold > 0.0
+                                && score + clauses[i].prefix_bound <= self.threshold
+                            {
+                                rejected = true;
+                                break;
+                            }
+                            let posting = &mut clauses[i].posting;
+                            if posting.doc().is_some_and(|d| d.doc_id() < doc) {
+                                posting.next(doc);
+                            }
+                            if let Some(d) = posting.doc()
+                                && d.doc_id() == doc
+                            {
+                                score += posting.score(&self.scorer, d.frequency(), doc_length);
+                            }
+                        }
+
+                        if !rejected {
+                            let full = candidates.len() >= limit;
+                            let beats_kth = !full
+                                || score > candidates.peek().unwrap().0.0.score.0;
+                            if beats_kth {
+                                let freqs = clauses
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, clause)| {
+                                        if i >= first_essential {
+                                            let freq = acc.clause_freq(i, slot);
+                                            (freq > 0)
+                                                .then(|| (clause.posting.term_index(), freq))
+                                        } else {
+                                            clause.posting.doc().and_then(|d| {
+                                                (d.doc_id() == doc).then(|| {
+                                                    (clause.posting.term_index(), d.frequency())
+                                                })
+                                            })
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                if full {
+                                    candidates.pop();
+                                }
+                                candidates.push(Reverse((
+                                    ScoredDoc::new(row_id, score),
+                                    freqs,
+                                    doc_length,
+                                    doc,
+                                )));
+                                if candidates.len() == limit {
+                                    let kth = candidates.peek().unwrap().0.0.score.0;
+                                    self.update_threshold(kth, params.wand_factor);
+                                }
+                            }
+                        }
+                        acc.clear_slot(slot);
+                    }
+                }
+                if inner_max >= window_max {
+                    break;
+                }
+                inner_min = inner_max + 1;
+            }
+
+            window_min = match window_max {
+                TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                max => max + 1,
+            };
+        }
+
+        if let Some(stats) = wand_stats() {
+            stats
+                .candidates
+                .fetch_add(num_comparisons as u64, Ordering::Relaxed);
+            let searches = stats.searches.fetch_add(1, Ordering::Relaxed) + 1;
+            if searches.is_multiple_of(2048) {
+                wand_stats_dump(stats);
+            }
+        }
+        metrics.record_comparisons(num_comparisons);
+
+        let to_addr = |row_id_slot: u64| {
+            if docs_has_row_ids {
+                CandidateAddr::RowId(row_id_slot)
+            } else {
+                CandidateAddr::Pending(row_id_slot as u32)
+            }
+        };
+        Ok(candidates
+            .into_iter()
+            .map(
+                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                    addr: to_addr(doc.row_id),
                     posting_doc_id,
                     freqs,
                     doc_length,
