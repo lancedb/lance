@@ -3270,7 +3270,6 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
                     Ok(LoadedPageShard {
                         decoder: page_decoder,
                         path: cur_path,
-                        load_permit: None,
                     })
                 }
                 .boxed();
