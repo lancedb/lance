@@ -8,7 +8,10 @@ use std::{
     fmt::Debug,
     iter,
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     vec,
 };
 
@@ -98,6 +101,35 @@ const DEFAULT_DICT_DIVISOR: u64 = 2;
 const DEFAULT_DICT_MAX_CARDINALITY: u64 = 100_000;
 const DEFAULT_DICT_SIZE_RATIO: f64 = 0.8;
 const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
+const ENV_LANCE_FULLZIP_PAGE_LOAD_TARGET_BYTES: &str = "LANCE_FULLZIP_PAGE_LOAD_TARGET_BYTES";
+const DEFAULT_FULLZIP_PAGE_LOAD_TARGET_BYTES: u64 = 8 * 1024 * 1024;
+static FULLZIP_ALIGNMENT_COPY_COUNT: AtomicU64 = AtomicU64::new(0);
+static FULLZIP_ALIGNMENT_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn fullzip_alignment_copy_stats() -> (u64, u64) {
+    (
+        FULLZIP_ALIGNMENT_COPY_COUNT.load(Ordering::Relaxed),
+        FULLZIP_ALIGNMENT_COPY_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(test)]
+fn reset_fullzip_alignment_copy_stats() {
+    FULLZIP_ALIGNMENT_COPY_COUNT.store(0, Ordering::Relaxed);
+    FULLZIP_ALIGNMENT_COPY_BYTES.store(0, Ordering::Relaxed);
+}
+
+fn fullzip_page_load_target_bytes() -> Option<u64> {
+    static TARGET_BYTES: OnceLock<Option<u64>> = OnceLock::new();
+    *TARGET_BYTES.get_or_init(|| {
+        env::var(ENV_LANCE_FULLZIP_PAGE_LOAD_TARGET_BYTES)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|value| if value == 0 { None } else { Some(value) })
+            .unwrap_or(Some(DEFAULT_FULLZIP_PAGE_LOAD_TARGET_BYTES))
+    })
+}
 
 struct PageLoadTask {
     decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
@@ -2132,6 +2164,10 @@ pub struct FullZipScheduler {
     cached_state: Option<Arc<FullZipCacheableState>>,
     /// Whether repetition index metadata should be cached during initialize.
     enable_cache: bool,
+    /// Whether full-page fixed-width reads may be split into smaller load tasks.
+    split_large_pages: bool,
+    /// Required row multiple for split chunks, used by row-multiplying wrappers.
+    split_row_alignment: u64,
 }
 
 impl FullZipScheduler {
@@ -2218,6 +2254,8 @@ impl FullZipScheduler {
             bits_per_offset,
             cached_state: None,
             enable_cache: false,
+            split_large_pages: false,
+            split_row_alignment: 1,
         })
     }
 
@@ -2348,6 +2386,110 @@ impl FullZipScheduler {
             .collect()
     }
 
+    fn chunk_simple_ranges(
+        ranges: &[Range<u64>],
+        rows_in_page: u64,
+        data_buf_position: u64,
+        total_bytes_per_value: u64,
+        target_rows: Option<u64>,
+    ) -> Vec<(Vec<Range<u64>>, u64, u64)> {
+        let mut chunks = Vec::new();
+        let mut current_ranges = Vec::new();
+        let mut current_rows = 0;
+        let mut current_priority_offset = 0;
+        let flush_current = |chunks: &mut Vec<(Vec<Range<u64>>, u64, u64)>,
+                             current_ranges: &mut Vec<Range<u64>>,
+                             current_rows: &mut u64,
+                             current_priority_offset: &mut u64| {
+            if *current_rows > 0 {
+                chunks.push((
+                    std::mem::take(current_ranges),
+                    *current_rows,
+                    *current_priority_offset,
+                ));
+                *current_rows = 0;
+                *current_priority_offset = 0;
+            }
+        };
+        for range in ranges {
+            debug_assert!(range.end <= rows_in_page);
+            let mut start_row = range.start;
+            while start_row < range.end {
+                if current_rows == 0 {
+                    current_priority_offset = start_row;
+                }
+                let available_rows = target_rows
+                    .map(|target_rows| target_rows.saturating_sub(current_rows).max(1))
+                    .unwrap_or(range.end - start_row);
+                let end_row = (start_row + available_rows).min(range.end);
+                let start = data_buf_position + start_row * total_bytes_per_value;
+                let end = data_buf_position + end_row * total_bytes_per_value;
+                current_ranges.push(start..end);
+                current_rows += end_row - start_row;
+                start_row = end_row;
+                if target_rows
+                    .map(|target_rows| current_rows >= target_rows)
+                    .unwrap_or(false)
+                {
+                    flush_current(
+                        &mut chunks,
+                        &mut current_ranges,
+                        &mut current_rows,
+                        &mut current_priority_offset,
+                    );
+                }
+            }
+        }
+        flush_current(
+            &mut chunks,
+            &mut current_ranges,
+            &mut current_rows,
+            &mut current_priority_offset,
+        );
+        chunks
+    }
+
+    fn aligned_split_target_rows(
+        target_bytes: u64,
+        total_bytes_per_value: u64,
+        alignment: u64,
+    ) -> u64 {
+        debug_assert!(total_bytes_per_value > 0);
+        let target_rows = (target_bytes / total_bytes_per_value).max(1);
+        let alignment = alignment.max(1);
+        if target_rows < alignment {
+            alignment
+        } else {
+            (target_rows / alignment) * alignment
+        }
+    }
+
+    fn schedule_simple_chunks(
+        chunks: Vec<(Vec<Range<u64>>, u64, u64)>,
+        io: &Arc<dyn EncodingsIo>,
+        priority: u64,
+        details: Arc<FullZipDecodeDetails>,
+        bits_per_offset: u8,
+        lazy_rows: Option<u64>,
+    ) -> Vec<PageLoadTask> {
+        chunks
+            .into_iter()
+            .map(|(byte_ranges, chunk_rows, priority_offset)| {
+                let io = io.clone();
+                let priority = priority + priority_offset;
+                let io_future = if lazy_rows
+                    .map(|lazy_rows| chunk_rows >= lazy_rows)
+                    .unwrap_or(false)
+                {
+                    async move { io.submit_request(byte_ranges, priority).await }.boxed()
+                } else {
+                    io.submit_request(byte_ranges, priority).boxed()
+                };
+                Self::create_page_load_task(io_future, chunk_rows, details.clone(), bits_per_offset)
+            })
+            .collect::<Vec<_>>()
+    }
+
     /// Computes the ranges in the repetition index that need to be loaded
     fn compute_rep_index_ranges(
         ranges: &[Range<u64>],
@@ -2450,7 +2592,7 @@ impl FullZipScheduler {
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
         // Convert row ranges to item ranges (i.e. multiply by items per row)
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
+        let num_rows: u64 = ranges.iter().map(|r| r.end - r.start).sum();
 
         let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor else {
             unreachable!()
@@ -2470,24 +2612,47 @@ impl FullZipScheduler {
         let bytes_per_value = bits_per_value / 8;
         let bytes_per_cw = self.details.ctrl_word_parser.bytes_per_word();
         let total_bytes_per_value = bytes_per_value + bytes_per_cw as u64;
-        let byte_ranges = ranges
-            .iter()
-            .map(|r| {
-                debug_assert!(r.end <= self.rows_in_page);
-                let start = self.data_buf_position + r.start * total_bytes_per_value;
-                let end = self.data_buf_position + r.end * total_bytes_per_value;
-                start..end
-            })
-            .collect::<Vec<_>>();
-
-        let io_future = io.submit_request(byte_ranges, self.priority);
-        let page_load_task = Self::create_page_load_task(
-            io_future,
-            num_rows,
+        if total_bytes_per_value == 0 {
+            return Err(Error::internal(
+                "Invalid encoding: per-row byte width must be greater than 0",
+            ));
+        }
+        let target_rows =
+            if self.split_large_pages && Self::covers_entire_page(ranges, self.rows_in_page) {
+                fullzip_page_load_target_bytes().map(|target_bytes| {
+                    Self::aligned_split_target_rows(
+                        target_bytes,
+                        total_bytes_per_value,
+                        self.split_row_alignment,
+                    )
+                })
+            } else {
+                None
+            };
+        let chunks = Self::chunk_simple_ranges(
+            ranges,
+            self.rows_in_page,
+            self.data_buf_position,
+            total_bytes_per_value,
+            target_rows,
+        );
+        let page_load_tasks = Self::schedule_simple_chunks(
+            chunks,
+            io,
+            self.priority,
             self.details.clone(),
             self.bits_per_offset,
+            target_rows,
         );
-        Ok(vec![page_load_task])
+
+        debug_assert_eq!(
+            page_load_tasks
+                .iter()
+                .map(|task| task.num_rows)
+                .sum::<u64>(),
+            num_rows
+        );
+        Ok(page_load_tasks)
     }
 }
 
@@ -3064,32 +3229,68 @@ struct FixedFullZipDecodeTask {
     bytes_per_value: usize,
 }
 
+fn align_fixed_width_data_if_needed(mut fixed_data: FixedWidthDataBlock) -> FixedWidthDataBlock {
+    if fixed_data.bits_per_value.is_multiple_of(8) {
+        let bytes_per_value = (fixed_data.bits_per_value / 8) as usize;
+        let alignment = bytes_per_value.next_power_of_two().min(8);
+        if alignment > 1 && fixed_data.data.as_ptr().align_offset(alignment) != 0 {
+            FULLZIP_ALIGNMENT_COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+            FULLZIP_ALIGNMENT_COPY_BYTES.fetch_add(fixed_data.data.len() as u64, Ordering::Relaxed);
+            fixed_data.data = LanceBuffer::copy_slice(&fixed_data.data);
+        }
+    }
+    fixed_data
+}
+
 impl DecodePageTask for FixedFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        // Multiply by 2 to make a stab at the size of the output buffer (which will be decompressed and thus bigger)
-        let estimated_size_bytes = self
-            .data
-            .iter()
-            .map(|task_item| task_item.data.data_size() as usize)
-            .sum::<usize>()
-            * 2;
-        let mut data_builder =
-            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
-
         if self.details.ctrl_word_parser.bytes_per_word() == 0 {
             // Fast path, no need to unzip because there is no rep/def
-            //
-            // We decompress each buffer and add it to our output buffer
+            let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor else {
+                unreachable!()
+            };
+            if self.data.len() == 1 {
+                let task_item = self.data.into_iter().next().unwrap();
+                let PerValueDataBlock::Fixed(fixed_data) = task_item.data else {
+                    unreachable!()
+                };
+                debug_assert_eq!(fixed_data.num_values, task_item.rows_in_buf);
+                let decompressed = decompressor.decompress(
+                    align_fixed_width_data_if_needed(fixed_data),
+                    task_item.rows_in_buf,
+                )?;
+                let unraveler = RepDefUnraveler::new(
+                    None,
+                    None,
+                    self.details.def_meaning.clone(),
+                    self.num_rows as u64,
+                );
+
+                return Ok(DecodedPage {
+                    data: decompressed,
+                    repdef: unraveler,
+                });
+            }
+
+            // Multiply by 2 to make a stab at the size of the output buffer
+            // (which will be decompressed and thus bigger).
+            let estimated_size_bytes = self
+                .data
+                .iter()
+                .map(|task_item| task_item.data.data_size() as usize)
+                .sum::<usize>()
+                * 2;
+            let mut data_builder =
+                DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
             for task_item in self.data.into_iter() {
                 let PerValueDataBlock::Fixed(fixed_data) = task_item.data else {
                     unreachable!()
                 };
-                let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor
-                else {
-                    unreachable!()
-                };
                 debug_assert_eq!(fixed_data.num_values, task_item.rows_in_buf);
-                let decompressed = decompressor.decompress(fixed_data, task_item.rows_in_buf)?;
+                let decompressed = decompressor.decompress(
+                    align_fixed_width_data_if_needed(fixed_data),
+                    task_item.rows_in_buf,
+                )?;
                 data_builder.append(&decompressed, 0..task_item.rows_in_buf);
             }
 
@@ -3106,6 +3307,16 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             })
         } else {
             // Slow path, unzipping needed
+            // Multiply by 2 to make a stab at the size of the output buffer
+            // (which will be decompressed and thus bigger).
+            let estimated_size_bytes = self
+                .data
+                .iter()
+                .map(|task_item| task_item.data.data_size() as usize)
+                .sum::<usize>()
+                * 2;
+            let mut data_builder =
+                DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
             let mut rep = Vec::with_capacity(self.num_rows);
             let mut def = Vec::with_capacity(self.num_rows);
 
@@ -3312,6 +3523,24 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Self> {
+        Self::try_new_with_fullzip_page_splitting(
+            column_info,
+            decompressors,
+            cache_repetition_index,
+            target_field,
+            false,
+            1,
+        )
+    }
+
+    pub(crate) fn try_new_with_fullzip_page_splitting(
+        column_info: &ColumnInfo,
+        decompressors: &dyn DecompressionStrategy,
+        cache_repetition_index: bool,
+        target_field: &Field,
+        split_fullzip_pages: bool,
+        fullzip_split_row_alignment: u64,
+    ) -> Result<Self> {
         let page_schedulers = column_info
             .page_infos
             .iter()
@@ -3323,6 +3552,8 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    split_fullzip_pages,
+                    fullzip_split_row_alignment,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3339,6 +3570,8 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        split_fullzip_pages: bool,
+        fullzip_split_row_alignment: u64,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
@@ -3358,6 +3591,8 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                 )?;
                 scheduler.enable_cache = cache_repetition_index;
+                scheduler.split_large_pages = split_fullzip_pages;
+                scheduler.split_row_alignment = fullzip_split_row_alignment.max(1);
                 Box::new(scheduler)
             }
             Layout::ConstantLayout(constant_layout) => {
@@ -3412,6 +3647,8 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    split_fullzip_pages,
+                    fullzip_split_row_alignment,
                 )?;
                 let def_meaning = blob
                     .layers
@@ -3443,6 +3680,8 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        split_fullzip_pages: bool,
+        fullzip_split_row_alignment: u64,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
@@ -3451,6 +3690,8 @@ impl StructuralPrimitiveFieldScheduler {
             decompressors,
             cache_repetition_index,
             target_field,
+            split_fullzip_pages,
+            fullzip_split_row_alignment,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
@@ -5780,10 +6021,11 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::{
-        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, MiniBlockChunk, MiniBlockCompressed,
-        MiniBlockRepIndex, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedFullZipDecodeTask,
+        FixedPerValueDecompressor, FixedWidthDataBlock, FullZipCacheableState,
+        FullZipDecodeDetails, FullZipDecodeTaskItem, FullZipReadSource, FullZipRepIndexDetails,
+        FullZipScheduler, MiniBlockChunk, MiniBlockCompressed, MiniBlockRepIndex,
+        PerValueDataBlock, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
         VariableFullZipDecoder,
     };
     use crate::buffer::LanceBuffer;
@@ -5794,10 +6036,11 @@ mod tests {
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
-    use crate::decoder::PageEncoding;
+    use crate::decoder::{DecodePageTask, PageEncoding};
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
+    use crate::encodings::physical::value::ValueDecompressor;
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
@@ -6636,6 +6879,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            split_large_pages: false,
+            split_row_alignment: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -6670,6 +6915,266 @@ mod tests {
         let mut data = source.fetch(&ranges, 0).await.unwrap();
         assert_eq!(data.pop_front().unwrap().as_ref(), &[0, 1, 2]);
         assert_eq!(data.pop_front().unwrap().as_ref(), &[4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_fixed_fullzip_single_task_decode_is_zero_copy() {
+        let data = LanceBuffer::copy_slice(&[0_u8, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+        let data_ptr = data.as_ptr();
+        let task = FixedFullZipDecodeTask {
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(
+                    ValueDecompressor::from_flat(&pb21::Flat {
+                        bits_per_value: 32,
+                        data: None,
+                    }),
+                )),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::AllValidItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            data: vec![FullZipDecodeTaskItem {
+                data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                    data,
+                    bits_per_value: 32,
+                    num_values: 4,
+                    block_info: BlockInfo::new(),
+                }),
+                rows_in_buf: 4,
+            }],
+            num_rows: 4,
+            bytes_per_value: 4,
+        };
+
+        let decoded = Box::new(task).decode().unwrap();
+        let DataBlock::FixedWidth(block) = decoded.data else {
+            panic!("expected fixed-width block");
+        };
+        assert_eq!(block.data.as_ptr(), data_ptr);
+        assert_eq!(
+            block.data.as_ref(),
+            &[0_u8, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn test_fixed_fullzip_single_task_decode_copies_unaligned_data() {
+        super::reset_fullzip_alignment_copy_stats();
+        let source =
+            LanceBuffer::copy_slice(&[255_u8, 0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+        let data = source.slice_with_length(1, 16);
+        let data_ptr = data.as_ptr();
+        let task = FixedFullZipDecodeTask {
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(
+                    ValueDecompressor::from_flat(&pb21::Flat {
+                        bits_per_value: 32,
+                        data: None,
+                    }),
+                )),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::AllValidItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            data: vec![FullZipDecodeTaskItem {
+                data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                    data,
+                    bits_per_value: 32,
+                    num_values: 4,
+                    block_info: BlockInfo::new(),
+                }),
+                rows_in_buf: 4,
+            }],
+            num_rows: 4,
+            bytes_per_value: 4,
+        };
+
+        let decoded = Box::new(task).decode().unwrap();
+        let DataBlock::FixedWidth(block) = decoded.data else {
+            panic!("expected fixed-width block");
+        };
+        assert_ne!(block.data.as_ptr(), data_ptr);
+        assert_eq!(super::fullzip_alignment_copy_stats(), (1, 16));
+        assert_eq!(
+            block.data.as_ref(),
+            &[0_u8, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn test_fullzip_simple_ranges_chunk_by_target_rows() {
+        let chunks = FullZipScheduler::chunk_simple_ranges(&[0..10], 100, 1024, 4, Some(3));
+        assert_eq!(
+            chunks,
+            vec![
+                (vec![1024..1036], 3, 0),
+                (vec![1036..1048], 3, 3),
+                (vec![1048..1060], 3, 6),
+                (vec![1060..1064], 1, 9),
+            ]
+        );
+
+        let unsplit = FullZipScheduler::chunk_simple_ranges(&[2..5], 100, 1024, 4, None);
+        assert_eq!(unsplit, vec![(vec![1032..1044], 3, 2)]);
+
+        let sparse =
+            FullZipScheduler::chunk_simple_ranges(&[0..1, 10..11, 20..21], 100, 1024, 4, Some(4));
+        assert_eq!(
+            sparse,
+            vec![(vec![1024..1028, 1064..1068, 1104..1108], 3, 0)]
+        );
+    }
+
+    #[test]
+    fn test_fullzip_split_target_rows_aligns_to_row_multiple() {
+        assert_eq!(FullZipScheduler::aligned_split_target_rows(10, 1, 3), 9);
+        assert_eq!(FullZipScheduler::aligned_split_target_rows(2, 1, 3), 3);
+
+        let target_rows = FullZipScheduler::aligned_split_target_rows(10, 1, 3);
+        let chunks =
+            FullZipScheduler::chunk_simple_ranges(&[0..27], 27, 1024, 1, Some(target_rows));
+        assert_eq!(
+            chunks.iter().map(|(_, rows, _)| *rows).collect::<Vec<_>>(),
+            vec![9, 9, 9]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_simple_rejects_zero_width_rows() {
+        #[derive(Debug)]
+        struct ZeroWidthDecompressor;
+
+        impl FixedPerValueDecompressor for ZeroWidthDecompressor {
+            fn decompress(
+                &self,
+                _data: FixedWidthDataBlock,
+                _num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                unimplemented!("zero-width test should fail before decoding")
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                0
+            }
+        }
+
+        let scheduler = FullZipScheduler {
+            data_buf_position: 0,
+            data_buf_size: 0,
+            rep_index: None,
+            priority: 0,
+            rows_in_page: 8,
+            bits_per_offset: 32,
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(ZeroWidthDecompressor)),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::AllValidItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            cached_state: None,
+            enable_cache: false,
+            split_large_pages: true,
+            split_row_alignment: 1,
+        };
+        let io = Arc::new(crate::BufferScheduler::new(bytes::Bytes::new()))
+            as Arc<dyn crate::EncodingsIo>;
+
+        let err = match scheduler.schedule_ranges_simple(&[0..8], &io) {
+            Ok(_) => panic!("expected zero-width fullzip scheduling to fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("per-row byte width must be greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_simple_chunk_schedule_is_lazy() {
+        use futures::{FutureExt, future::BoxFuture};
+        use std::ops::Range;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Clone)]
+        struct RecordingScheduler {
+            data: bytes::Bytes,
+            requests: Arc<Mutex<Vec<Vec<Range<u64>>>>>,
+        }
+
+        impl RecordingScheduler {
+            fn new(data: bytes::Bytes) -> Self {
+                Self {
+                    data,
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                }
+            }
+
+            fn requests(&self) -> Vec<Vec<Range<u64>>> {
+                self.requests.lock().unwrap().clone()
+            }
+        }
+
+        impl crate::EncodingsIo for RecordingScheduler {
+            fn submit_request(
+                &self,
+                ranges: Vec<Range<u64>>,
+                _priority: u64,
+            ) -> BoxFuture<'static, crate::Result<Vec<bytes::Bytes>>> {
+                self.requests.lock().unwrap().push(ranges.clone());
+                let data = ranges
+                    .into_iter()
+                    .map(|range| self.data.slice(range.start as usize..range.end as usize))
+                    .collect::<Vec<_>>();
+                std::future::ready(Ok(data)).boxed()
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestFixedDecompressor;
+
+        impl FixedPerValueDecompressor for TestFixedDecompressor {
+            fn decompress(
+                &self,
+                _data: FixedWidthDataBlock,
+                _num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                unimplemented!("Test decompressor")
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+        }
+
+        let data_start = 128_u64;
+        let io = Arc::new(RecordingScheduler::new(bytes::Bytes::from(vec![0; 1024])));
+        let details = Arc::new(FullZipDecodeDetails {
+            value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
+            def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::AllValidItem]),
+            ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+            max_rep: 0,
+            max_visible_def: 0,
+        });
+        let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
+        let tasks = FullZipScheduler::schedule_simple_chunks(
+            vec![(vec![data_start..(data_start + 16)], 4, 0)],
+            &io_dyn,
+            7,
+            details,
+            32,
+            Some(4),
+        );
+        assert!(
+            io.requests().is_empty(),
+            "full simple chunks should defer data I/O until the page future is polled"
+        );
+
+        let _ = tasks.into_iter().next().unwrap().decoder_fut.await.unwrap();
+        assert_eq!(io.requests(), vec![vec![data_start..(data_start + 16)]]);
     }
 
     #[tokio::test]
@@ -6756,6 +7261,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: true,
+            split_large_pages: false,
+            split_row_alignment: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -6865,6 +7372,8 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            split_large_pages: false,
+            split_row_alignment: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
