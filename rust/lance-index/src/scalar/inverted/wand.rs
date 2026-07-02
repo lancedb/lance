@@ -1773,6 +1773,172 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 0.0
             };
 
+            // Single essential clause (the common case once the threshold is
+            // competitive): stream it directly against the non-essential
+            // prefix, skipping the accumulator entirely.
+            if first_essential + 1 == clauses.len() {
+                let (non_essential, essential) = clauses.split_at_mut(first_essential);
+                let posting = &mut essential[0].posting;
+                if posting
+                    .doc()
+                    .is_some_and(|doc| doc.doc_id() < window_min)
+                {
+                    posting.next(window_min);
+                }
+                let essential_term = posting.term_index();
+                let essential_weight = posting.query_weight;
+
+                macro_rules! consider_candidate {
+                    ($doc:expr, $freq:expr) => {{
+                        let doc = $doc;
+                        let freq = $freq;
+                        num_comparisons += 1;
+                        let doc_length = self.docs.num_tokens(doc as u32);
+                        let score = essential_weight * self.scorer.doc_weight(freq, doc_length);
+                        if !(self.threshold > 0.0
+                            && score + total_non_essential_bound <= self.threshold)
+                        {
+                            let row_id = if docs_has_row_ids {
+                                self.docs.row_id(doc as u32)
+                            } else {
+                                doc
+                            };
+                            let masked_out = docs_has_row_ids
+                                && (row_id == RowAddress::TOMBSTONE_ROW
+                                    || !mask.selected(row_id));
+                            if !masked_out {
+                                let mut total = score;
+                                let mut rejected = false;
+                                for i in (0..non_essential.len()).rev() {
+                                    if self.threshold > 0.0
+                                        && total + non_essential[i].prefix_bound
+                                            <= self.threshold
+                                    {
+                                        rejected = true;
+                                        break;
+                                    }
+                                    let probe = &mut non_essential[i].posting;
+                                    if probe.doc().is_some_and(|d| d.doc_id() < doc) {
+                                        probe.next(doc);
+                                    }
+                                    if let Some(d) = probe.doc()
+                                        && d.doc_id() == doc
+                                    {
+                                        total += probe.score(
+                                            &self.scorer,
+                                            d.frequency(),
+                                            doc_length,
+                                        );
+                                    }
+                                }
+
+                                if !rejected {
+                                    let full = candidates.len() >= limit;
+                                    let beats_kth = !full
+                                        || total > candidates.peek().unwrap().0.0.score.0;
+                                    if beats_kth {
+                                        let mut freqs =
+                                            Vec::with_capacity(non_essential.len() + 1);
+                                        freqs.push((essential_term, freq));
+                                        for clause in non_essential.iter() {
+                                            if let Some(d) = clause.posting.doc()
+                                                && d.doc_id() == doc
+                                            {
+                                                freqs.push((
+                                                    clause.posting.term_index(),
+                                                    d.frequency(),
+                                                ));
+                                            }
+                                        }
+                                        if full {
+                                            candidates.pop();
+                                        }
+                                        candidates.push(Reverse((
+                                            ScoredDoc::new(row_id, total),
+                                            freqs,
+                                            doc_length,
+                                            doc,
+                                        )));
+                                        if candidates.len() == limit {
+                                            let kth =
+                                                candidates.peek().unwrap().0.0.score.0;
+                                            self.update_threshold(kth, params.wand_factor);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }};
+                }
+
+                match posting.list {
+                    PostingList::Compressed(ref list) => {
+                        'stream: while let Some(cur) = posting.current_doc {
+                            if cur.doc_id() > window_max {
+                                break;
+                            }
+                            let block_idx =
+                                posting_block_idx(posting.index, list.block_size);
+                            let block_offset =
+                                posting_block_offset(posting.index, list.block_size);
+                            let compressed = unsafe {
+                                &mut *posting.ensure_compressed_block_ptr(list, block_idx)
+                            };
+                            for offset in block_offset..compressed.doc_ids.len() {
+                                let doc_id = compressed.doc_ids[offset];
+                                if u64::from(doc_id) > window_max {
+                                    posting.index =
+                                        posting_block_start(block_idx, list.block_size)
+                                            + offset;
+                                    posting.block_idx = block_idx;
+                                    posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                        doc_id,
+                                        frequency: compressed.freqs[offset],
+                                    }));
+                                    break 'stream;
+                                }
+                                consider_candidate!(u64::from(doc_id), compressed.freqs[offset]);
+                            }
+                            let next_start =
+                                posting_block_start(block_idx + 1, list.block_size);
+                            if next_start >= list.length as usize {
+                                posting.index = list.length as usize;
+                                posting.block_idx =
+                                    posting_block_idx(posting.index, list.block_size);
+                                posting.current_doc = None;
+                                break;
+                            }
+                            posting.index = next_start;
+                            posting.block_idx = block_idx + 1;
+                            let compressed = unsafe {
+                                &mut *posting
+                                    .ensure_compressed_block_ptr(list, block_idx + 1)
+                            };
+                            posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: compressed.doc_ids[0],
+                                frequency: compressed.freqs[0],
+                            }));
+                        }
+                    }
+                    PostingList::Plain(_) => {
+                        while let Some(cur) = posting.doc() {
+                            let doc = cur.doc_id();
+                            if doc > window_max {
+                                break;
+                            }
+                            consider_candidate!(doc, cur.frequency());
+                            posting.next(doc + 1);
+                        }
+                    }
+                }
+
+                window_min = match window_max {
+                    TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                    max => max + 1,
+                };
+                continue;
+            }
+
             // Stream the essential clauses through inner windows.
             let mut inner_min = window_min;
             loop {
