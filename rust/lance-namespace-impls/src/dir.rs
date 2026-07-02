@@ -77,6 +77,9 @@ use lance_namespace::models::{
 };
 
 use lance_core::{Error, Result, box_error};
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
+};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
@@ -4901,9 +4904,16 @@ impl LanceNamespace for DirectoryNamespace {
                     .map_err(|e| NamespaceError::InvalidInput {
                         message: format!("Invalid full text search: {:?}", e),
                     })?;
+            } else if let Some(ref structured_query) = fts_query.structured_query {
+                // Structured FTS: map the namespace query model into the engine FtsQuery.
+                let engine_query = build_engine_fts_query(&structured_query.query)?;
+                let fts = FullTextSearchQuery::new_query(engine_query);
+                scanner
+                    .full_text_search(fts)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid full text search: {:?}", e),
+                    })?;
             }
-            // Note: structured_query would require more complex parsing
-            // For now, we only support string_query
         }
 
         // Apply column projection if specified
@@ -5319,10 +5329,126 @@ impl LanceNamespace for DirectoryNamespace {
     }
 }
 
+/// Maps a namespace structured `FtsQuery` model into the engine `FtsQuery`. Mirrors the mapping the
+/// JNI scanner performs, so the local `queryTable` path honors `structured_query` the same way a
+/// `fragment.newScan(fullTextQuery)` does.
+fn build_engine_fts_query(
+    query: &lance_namespace::models::FtsQuery,
+) -> std::result::Result<FtsQuery, NamespaceError> {
+    if let Some(ref m) = query.r#match {
+        Ok(FtsQuery::Match(build_engine_match_query(m)?))
+    } else if let Some(ref p) = query.phrase {
+        let mut phrase = PhraseQuery::new(p.terms.clone());
+        if let Some(ref column) = p.column {
+            phrase = phrase.with_column(Some(column.clone()));
+        }
+        if let Some(slop) = p.slop {
+            phrase = phrase.with_slop(slop as u32);
+        }
+        Ok(FtsQuery::Phrase(phrase))
+    } else if let Some(ref mm) = query.multi_match {
+        let match_queries = mm
+            .match_queries
+            .iter()
+            .map(build_engine_match_query)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
+    } else if let Some(ref b) = query.boolean {
+        let mut clauses: Vec<(Occur, FtsQuery)> = Vec::new();
+        for clause in &b.must {
+            clauses.push((Occur::Must, build_engine_fts_query(clause)?));
+        }
+        for clause in &b.should {
+            clauses.push((Occur::Should, build_engine_fts_query(clause)?));
+        }
+        for clause in &b.must_not {
+            clauses.push((Occur::MustNot, build_engine_fts_query(clause)?));
+        }
+        Ok(FtsQuery::Boolean(BooleanQuery::new(clauses)))
+    } else if let Some(ref boost) = query.boost {
+        let positive = build_engine_fts_query(&boost.positive)?;
+        let negative = build_engine_fts_query(&boost.negative)?;
+        Ok(FtsQuery::Boost(BoostQuery::new(
+            positive,
+            negative,
+            boost.negative_boost,
+        )))
+    } else {
+        Err(NamespaceError::InvalidInput {
+            message: "structured_query.query must set exactly one of match, phrase, multi_match, \
+                      boolean, or boost"
+                .to_string(),
+        })
+    }
+}
+
+fn build_engine_match_query(
+    m: &lance_namespace::models::MatchQuery,
+) -> std::result::Result<MatchQuery, NamespaceError> {
+    let mut match_query = MatchQuery::new(m.terms.clone());
+    if let Some(ref column) = m.column {
+        match_query = match_query.with_column(Some(column.clone()));
+    }
+    if let Some(boost) = m.boost {
+        match_query = match_query.with_boost(boost);
+    }
+    if let Some(fuzziness) = m.fuzziness {
+        match_query = match_query.with_fuzziness(Some(fuzziness as u32));
+    }
+    if let Some(max_expansions) = m.max_expansions {
+        match_query = match_query.with_max_expansions(max_expansions as usize);
+    }
+    if let Some(ref operator) = m.operator {
+        let op =
+            Operator::try_from(operator.as_str()).map_err(|e| NamespaceError::InvalidInput {
+                message: format!("Invalid FTS operator: {:?}", e),
+            })?;
+        match_query = match_query.with_operator(op);
+    }
+    if let Some(prefix_length) = m.prefix_length {
+        match_query = match_query.with_prefix_length(prefix_length as u32);
+    }
+    Ok(match_query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_ipc::reader::{FileReader, StreamReader};
+
+    #[test]
+    fn test_build_engine_fts_query_match() {
+        let mut ns_match = lance_namespace::models::MatchQuery::new("hello world".to_string());
+        ns_match.column = Some("body".to_string());
+        ns_match.operator = Some("AND".to_string());
+        ns_match.fuzziness = Some(1);
+        ns_match.max_expansions = Some(30);
+        ns_match.boost = Some(2.0);
+        ns_match.prefix_length = Some(2);
+
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.r#match = Some(Box::new(ns_match));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Match(m) => {
+                assert_eq!(m.terms, "hello world");
+                assert_eq!(m.column, Some("body".to_string()));
+                assert_eq!(m.operator, Operator::And);
+                assert_eq!(m.fuzziness, Some(1));
+                assert_eq!(m.max_expansions, 30);
+                assert_eq!(m.boost, 2.0);
+                assert_eq!(m.prefix_length, 2);
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_requires_a_variant() {
+        // An FtsQuery with no variant set is rejected rather than silently ignored.
+        let empty = lance_namespace::models::FtsQuery::new();
+        assert!(build_engine_fts_query(&empty).is_err());
+    }
     use lance::dataset::Dataset;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
