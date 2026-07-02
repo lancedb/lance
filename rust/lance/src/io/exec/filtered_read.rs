@@ -39,7 +39,7 @@ use lance_datafusion::utils::{
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig, SchedulerDiagnostics};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
     IndexExprResult, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
 };
@@ -299,50 +299,6 @@ pub enum FilteredReadThreadingMode {
     MultiplePartitions(usize),
 }
 
-#[derive(Clone)]
-pub struct ScanSchedulerDiagnosticsHandle {
-    scan_scheduler: Arc<ScanScheduler>,
-}
-
-impl std::fmt::Debug for ScanSchedulerDiagnosticsHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScanSchedulerDiagnosticsHandle").finish()
-    }
-}
-
-impl ScanSchedulerDiagnosticsHandle {
-    fn new(scan_scheduler: Arc<ScanScheduler>) -> Self {
-        Self { scan_scheduler }
-    }
-
-    pub fn diagnostics(&self) -> SchedulerDiagnostics {
-        self.scan_scheduler.diagnostics()
-    }
-}
-
-#[derive(Clone)]
-pub struct ScanSchedulerDiagnosticsCallback {
-    callback: Arc<dyn Fn(ScanSchedulerDiagnosticsHandle) + Send + Sync>,
-}
-
-impl std::fmt::Debug for ScanSchedulerDiagnosticsCallback {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScanSchedulerDiagnosticsCallback").finish()
-    }
-}
-
-impl ScanSchedulerDiagnosticsCallback {
-    pub fn new(callback: impl Fn(ScanSchedulerDiagnosticsHandle) + Send + Sync + 'static) -> Self {
-        Self {
-            callback: Arc::new(callback),
-        }
-    }
-
-    fn notify(&self, handle: ScanSchedulerDiagnosticsHandle) {
-        (self.callback)(handle);
-    }
-}
-
 /// The stream of filtered rows that satisfies the FilteredReadExec node
 ///
 /// This represents a scan of a Lance dataset.  Upon creation of the stream we will
@@ -443,9 +399,6 @@ impl FilteredReadStream {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
         let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
-        if let Some(callback) = options.scan_scheduler_diagnostics_callback.as_ref() {
-            callback.notify(ScanSchedulerDiagnosticsHandle::new(scan_scheduler.clone()));
-        }
 
         // Get scan_range_after_filter from the plan
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
@@ -1340,8 +1293,6 @@ pub struct FilteredReadOptions {
     pub threading_mode: FilteredReadThreadingMode,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
-    /// Callback used by diagnostics tools to sample the scan scheduler while a scan is running.
-    pub scan_scheduler_diagnostics_callback: Option<ScanSchedulerDiagnosticsCallback>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
 }
@@ -1372,7 +1323,6 @@ impl FilteredReadOptions {
             refine_filter: None,
             full_filter: None,
             io_buffer_size_bytes: None,
-            scan_scheduler_diagnostics_callback: None,
             only_indexed_fragments: false,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
@@ -1524,15 +1474,6 @@ impl FilteredReadOptions {
     /// See [`crate::dataset::scanner::Scanner::io_buffer_size`] for more details.
     pub fn with_io_buffer_size(mut self, io_buffer_size: u64) -> Self {
         self.io_buffer_size_bytes = Some(io_buffer_size);
-        self
-    }
-
-    /// Install a diagnostics callback for the scan scheduler used by this read.
-    pub fn with_scan_scheduler_diagnostics_callback(
-        mut self,
-        callback: ScanSchedulerDiagnosticsCallback,
-    ) -> Self {
-        self.scan_scheduler_diagnostics_callback = Some(callback);
         self
     }
 
@@ -2190,7 +2131,6 @@ impl ExecutionPlan for FilteredReadExec {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::index::DatasetIndexExt;
     use arrow::{
@@ -2396,27 +2336,6 @@ mod tests {
                 .create_filter_plan(expr, &index_info, use_scalar_index)
                 .unwrap()
         }
-    }
-
-    #[tokio::test]
-    async fn test_scan_scheduler_diagnostics_callback_is_called() {
-        let fixture = TestFixture::new().await;
-        let callback_called = Arc::new(AtomicBool::new(false));
-        let callback_called_copy = callback_called.clone();
-        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
-            .with_scan_scheduler_diagnostics_callback(ScanSchedulerDiagnosticsCallback::new(
-                move |handle| {
-                    let diagnostics = handle.diagnostics();
-                    assert_eq!(diagnostics.stats.bytes_read, 0);
-                    callback_called_copy.store(true, Ordering::SeqCst);
-                },
-            ));
-
-        let plan = fixture.make_plan(options).await;
-        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
-        let _ = stream.try_collect::<Vec<_>>().await.unwrap();
-
-        assert!(callback_called.load(Ordering::SeqCst));
     }
 
     async fn dataset_with_bloom_filter_nulls() -> (TempStrDir, Arc<Dataset>) {

@@ -29,6 +29,7 @@ mod lite;
 const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
+const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
 
 // Global counter of how many IOPS we have issued
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -131,7 +132,11 @@ impl IoQueueState {
         }
     }
 
-    fn diagnostics(&self) -> SchedulerDiagnostics {
+    fn scheduler_state_event(&self) -> Option<SchedulerStateEvent> {
+        if !tracing::enabled!(target: SCHEDULER_STATE_EVENT_TARGET, tracing::Level::TRACE) {
+            return None;
+        }
+
         let pending_bytes = self
             .pending_requests
             .iter()
@@ -156,13 +161,14 @@ impl IoQueueState {
             !bypasses_bytes && task.num_bytes() as i64 > self.bytes_avail
         });
         let head_task_can_deliver = head_task.map(|task| self.can_deliver_without_warning(task));
+        let head_task_bytes = head_task.map(IoTask::num_bytes);
         let (head_task_priority_high, head_task_priority_low) =
             split_priority(head_task.map(|task| task.priority));
         let (min_in_flight_priority_high, min_in_flight_priority_low) =
             split_priority(min_in_flight_priority);
-        SchedulerDiagnostics {
-            kind: SchedulerQueueKind::Standard,
-            stats: ScanStats::default(),
+
+        Some(SchedulerStateEvent {
+            queue_kind: "standard",
             io_capacity: u64::from(self.io_capacity),
             iops_available: u64::from(self.iops_avail),
             active_iops: u64::from(self.io_capacity.saturating_sub(self.iops_avail)),
@@ -173,7 +179,7 @@ impl IoQueueState {
             io_buffer_size_bytes: self.io_buffer_size,
             priorities_in_flight: self.priorities_in_flight.len() as u64,
             no_backpressure: self.no_backpressure,
-            head_task_bytes: head_task.map(IoTask::num_bytes),
+            head_task_bytes,
             head_task_priority_high,
             head_task_priority_low,
             min_in_flight_priority_high,
@@ -182,7 +188,7 @@ impl IoQueueState {
             head_task_priority_bypass,
             head_task_blocked_by_iops,
             head_task_blocked_by_bytes,
-        }
+        })
     }
 
     fn warn_if_needed(&self) {
@@ -262,13 +268,15 @@ struct IoQueue {
     state: Mutex<IoQueueState>,
     // Used to signal new I/O requests have arrived that might potentially be runnable
     notify: Notify,
+    stats: IoStats,
 }
 
 impl IoQueue {
-    fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
+    fn new(io_capacity: u32, io_buffer_size: u64, stats: IoStats) -> Self {
         Self {
             state: Mutex::new(IoQueueState::new(io_capacity, io_buffer_size)),
             notify: Notify::new(),
+            stats,
         }
     }
 
@@ -279,15 +287,14 @@ impl IoQueue {
             task.priority >> 64,
             task.priority & 0xFFFFFFFFFFFFFFFF
         );
-        let mut state = self.state.lock().unwrap();
-        state.pending_requests.push(task);
-        drop(state);
+        let event = {
+            let mut state = self.state.lock().unwrap();
+            state.pending_requests.push(task);
+            state.scheduler_state_event()
+        };
+        emit_scheduler_state_event(event, &self.stats);
 
         self.notify.notify_one();
-    }
-
-    fn diagnostics(&self) -> SchedulerDiagnostics {
-        self.state.lock().unwrap().diagnostics()
     }
 
     async fn pop(&self) -> Option<IoTask> {
@@ -295,6 +302,9 @@ impl IoQueue {
             {
                 let mut state = self.state.lock().unwrap();
                 if let Some(task) = state.next_task() {
+                    let event = state.scheduler_state_event();
+                    drop(state);
+                    emit_scheduler_state_event(event, &self.stats);
                     return Some(task);
                 }
 
@@ -308,29 +318,39 @@ impl IoQueue {
     }
 
     fn on_iop_complete(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.iops_avail += 1;
-        drop(state);
+        let event = {
+            let mut state = self.state.lock().unwrap();
+            state.iops_avail += 1;
+            state.scheduler_state_event()
+        };
+        emit_scheduler_state_event(event, &self.stats);
 
         self.notify.notify_one();
     }
 
     fn on_bytes_consumed(&self, bytes: u64, priority: u128, num_reqs: usize) {
-        let mut state = self.state.lock().unwrap();
-        state.bytes_avail += bytes as i64;
-        for _ in 0..num_reqs {
-            state.priorities_in_flight.remove(priority);
-        }
-        drop(state);
+        let event = {
+            let mut state = self.state.lock().unwrap();
+            state.bytes_avail += bytes as i64;
+            for _ in 0..num_reqs {
+                state.priorities_in_flight.remove(priority);
+            }
+            state.scheduler_state_event()
+        };
+        emit_scheduler_state_event(event, &self.stats);
 
         self.notify.notify_one();
     }
 
     fn close(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.done_scheduling = true;
-        let pending_requests = std::mem::take(&mut state.pending_requests);
-        drop(state);
+        let (pending_requests, event) = {
+            let mut state = self.state.lock().unwrap();
+            state.done_scheduling = true;
+            let pending_requests = std::mem::take(&mut state.pending_requests);
+            let event = state.scheduler_state_event();
+            (pending_requests, event)
+        };
+        emit_scheduler_state_event(event, &self.stats);
         for request in pending_requests {
             request.cancel();
         }
@@ -600,41 +620,75 @@ fn split_priority(priority: Option<u128>) -> (Option<u64>, Option<u64>) {
         .unzip()
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum SchedulerQueueKind {
-    Standard,
-    Lite,
-}
-
 #[derive(Debug, Clone, Copy)]
-pub struct SchedulerDiagnostics {
-    pub kind: SchedulerQueueKind,
-    pub stats: ScanStats,
-    pub io_capacity: u64,
-    pub iops_available: u64,
-    pub active_iops: u64,
-    pub pending_iops: u64,
-    pub pending_bytes: u64,
-    pub bytes_available: i64,
-    pub bytes_reserved: i64,
-    pub io_buffer_size_bytes: u64,
-    pub priorities_in_flight: u64,
-    pub no_backpressure: bool,
-    pub head_task_bytes: Option<u64>,
-    pub head_task_priority_high: Option<u64>,
-    pub head_task_priority_low: Option<u64>,
-    pub min_in_flight_priority_high: Option<u64>,
-    pub min_in_flight_priority_low: Option<u64>,
-    pub head_task_can_deliver: Option<bool>,
-    pub head_task_priority_bypass: Option<bool>,
-    pub head_task_blocked_by_iops: Option<bool>,
-    pub head_task_blocked_by_bytes: Option<bool>,
+pub(super) struct SchedulerStateEvent {
+    pub(super) queue_kind: &'static str,
+    pub(super) io_capacity: u64,
+    pub(super) iops_available: u64,
+    pub(super) active_iops: u64,
+    pub(super) pending_iops: u64,
+    pub(super) pending_bytes: u64,
+    pub(super) bytes_available: i64,
+    pub(super) bytes_reserved: i64,
+    pub(super) io_buffer_size_bytes: u64,
+    pub(super) priorities_in_flight: u64,
+    pub(super) no_backpressure: bool,
+    pub(super) head_task_bytes: Option<u64>,
+    pub(super) head_task_priority_high: Option<u64>,
+    pub(super) head_task_priority_low: Option<u64>,
+    pub(super) min_in_flight_priority_high: Option<u64>,
+    pub(super) min_in_flight_priority_low: Option<u64>,
+    pub(super) head_task_can_deliver: Option<bool>,
+    pub(super) head_task_priority_bypass: Option<bool>,
+    pub(super) head_task_blocked_by_iops: Option<bool>,
+    pub(super) head_task_blocked_by_bytes: Option<bool>,
 }
 
-impl SchedulerDiagnostics {
-    fn with_stats(mut self, stats: ScanStats) -> Self {
-        self.stats = stats;
-        self
+impl SchedulerStateEvent {
+    fn trace(self, stats: ScanStats) {
+        tracing::event!(
+            target: SCHEDULER_STATE_EVENT_TARGET,
+            tracing::Level::TRACE,
+            queue_kind = self.queue_kind,
+            scheduler_iops = stats.iops,
+            scheduler_requests = stats.requests,
+            scheduler_bytes_read = stats.bytes_read,
+            io_capacity = self.io_capacity,
+            iops_available = self.iops_available,
+            active_iops = self.active_iops,
+            pending_iops = self.pending_iops,
+            pending_bytes = self.pending_bytes,
+            bytes_available = self.bytes_available,
+            bytes_reserved = self.bytes_reserved,
+            io_buffer_size_bytes = self.io_buffer_size_bytes,
+            priorities_in_flight = self.priorities_in_flight,
+            no_backpressure = self.no_backpressure,
+            head_task_bytes_present = self.head_task_bytes.is_some(),
+            head_task_bytes = self.head_task_bytes.unwrap_or_default(),
+            head_task_priority_high_present = self.head_task_priority_high.is_some(),
+            head_task_priority_high = self.head_task_priority_high.unwrap_or_default(),
+            head_task_priority_low_present = self.head_task_priority_low.is_some(),
+            head_task_priority_low = self.head_task_priority_low.unwrap_or_default(),
+            min_in_flight_priority_high_present = self.min_in_flight_priority_high.is_some(),
+            min_in_flight_priority_high = self.min_in_flight_priority_high.unwrap_or_default(),
+            min_in_flight_priority_low_present = self.min_in_flight_priority_low.is_some(),
+            min_in_flight_priority_low = self.min_in_flight_priority_low.unwrap_or_default(),
+            head_task_can_deliver_present = self.head_task_can_deliver.is_some(),
+            head_task_can_deliver = self.head_task_can_deliver.unwrap_or(false),
+            head_task_priority_bypass_present = self.head_task_priority_bypass.is_some(),
+            head_task_priority_bypass = self.head_task_priority_bypass.unwrap_or(false),
+            head_task_blocked_by_iops_present = self.head_task_blocked_by_iops.is_some(),
+            head_task_blocked_by_iops = self.head_task_blocked_by_iops.unwrap_or(false),
+            head_task_blocked_by_bytes_present = self.head_task_blocked_by_bytes.is_some(),
+            head_task_blocked_by_bytes = self.head_task_blocked_by_bytes.unwrap_or(false),
+            "Scheduler state"
+        );
+    }
+}
+
+pub(super) fn emit_scheduler_state_event(event: Option<SchedulerStateEvent>, stats: &IoStats) {
+    if let Some(event) = event {
+        event.trace(stats.snapshot());
     }
 }
 
@@ -778,6 +832,7 @@ impl ScanScheduler {
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
+        let stats = IoStats::new();
         let use_lite = config
             .use_lite_scheduler
             .unwrap_or_else(|| object_store.prefers_lite_scheduler());
@@ -785,12 +840,14 @@ impl ScanScheduler {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
                 config.io_buffer_size_bytes,
+                stats.clone(),
             ));
             IoQueueType::Lite(io_queue)
         } else {
             let io_queue = Arc::new(IoQueue::new(
                 io_capacity as u32,
                 config.io_buffer_size_bytes,
+                stats.clone(),
             ));
             let io_queue_clone = io_queue.clone();
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
@@ -802,7 +859,7 @@ impl ScanScheduler {
         Arc::new(Self {
             object_store,
             io_queue,
-            stats: IoStats::new(),
+            stats,
         })
     }
 
@@ -1011,14 +1068,6 @@ impl ScanScheduler {
 
     pub fn stats(&self) -> ScanStats {
         self.stats.snapshot()
-    }
-
-    pub fn diagnostics(&self) -> SchedulerDiagnostics {
-        let diagnostics = match &self.io_queue {
-            IoQueueType::Standard(io_queue) => io_queue.diagnostics(),
-            IoQueueType::Lite(io_queue) => io_queue.diagnostics(),
-        };
-        diagnostics.with_stats(self.stats())
     }
 
     #[cfg(test)]
@@ -1284,6 +1333,47 @@ mod tests {
             priority,
             bypass_backpressure,
         }
+    }
+
+    #[test]
+    fn test_scheduler_state_event_fields() {
+        use tracing_mock::{expect, subscriber};
+
+        let event = expect::event()
+            .with_target(SCHEDULER_STATE_EVENT_TARGET)
+            .at_level(tracing::Level::TRACE)
+            .with_fields(
+                expect::field("queue_kind")
+                    .with_value(&"standard")
+                    .and(expect::field("scheduler_iops").with_value(&7u64))
+                    .and(expect::field("scheduler_requests").with_value(&3u64))
+                    .and(expect::field("scheduler_bytes_read").with_value(&4096u64))
+                    .and(expect::field("io_capacity").with_value(&4u64))
+                    .and(expect::field("pending_iops").with_value(&1u64))
+                    .and(expect::field("bytes_available").with_value(&128i64))
+                    .and(expect::field("head_task_bytes_present").with_value(&true))
+                    .and(expect::field("head_task_bytes").with_value(&1u64))
+                    .and(expect::field("head_task_can_deliver_present").with_value(&true))
+                    .and(expect::field("head_task_can_deliver").with_value(&true)),
+            );
+        let (subscriber, handle) = subscriber::mock().event(event).run_with_handle();
+
+        let stats = IoStats::new();
+        stats.add_scan_stats(&ScanStats {
+            iops: 7,
+            requests: 3,
+            bytes_read: 4096,
+        });
+        let mut state = IoQueueState::new(4, 192);
+        state.iops_avail = 2;
+        state.bytes_avail = 128;
+        state.pending_requests.push(make_task(1, false));
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_scheduler_state_event(state.scheduler_state_event(), &stats);
+        });
+
+        handle.assert_finished();
     }
 
     #[test]
@@ -1602,7 +1692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_standard_scheduler_diagnostics_tracks_queue_state() {
+    async fn test_standard_scheduler_state_tracks_queue_state() {
         let some_path = Path::parse("foo").unwrap();
         let base_store = Arc::new(InMemory::new());
         base_store
@@ -1665,11 +1755,50 @@ mod tests {
         )
         .boxed();
 
-        let diagnostics = timeout(Duration::from_secs(5), async {
+        let io_queue = match &scheduler.io_queue {
+            IoQueueType::Standard(io_queue) => io_queue.clone(),
+            IoQueueType::Lite(_) => unreachable!("test forces the standard scheduler"),
+        };
+        let (
+            io_capacity,
+            iops_available,
+            pending_bytes,
+            bytes_reserved,
+            priorities_in_flight,
+            head_task_bytes,
+            head_task_blocked_by_iops,
+            head_task_blocked_by_bytes,
+        ) = timeout(Duration::from_secs(5), async {
             loop {
-                let diagnostics = scheduler.diagnostics();
-                if diagnostics.active_iops == 1 && diagnostics.pending_iops == 2 {
-                    break diagnostics;
+                let observed = {
+                    let state = io_queue.state.lock().unwrap();
+                    let active_iops = state.io_capacity.saturating_sub(state.iops_avail);
+                    if active_iops == 1 && state.pending_requests.len() == 2 {
+                        let pending_bytes = state
+                            .pending_requests
+                            .iter()
+                            .map(IoTask::num_bytes)
+                            .sum::<u64>();
+                        let head_task = state.pending_requests.peek().unwrap();
+                        let bypasses_bytes = state.no_backpressure
+                            || head_task.bypass_backpressure
+                            || head_task.priority <= state.priorities_in_flight.min_in_flight();
+                        Some((
+                            state.io_capacity,
+                            state.iops_avail,
+                            pending_bytes,
+                            state.io_buffer_size as i64 - state.bytes_avail,
+                            state.priorities_in_flight.len(),
+                            head_task.num_bytes(),
+                            state.iops_avail == 0,
+                            !bypasses_bytes && head_task.num_bytes() as i64 > state.bytes_avail,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(observed) = observed {
+                    break observed;
                 }
                 tokio::task::yield_now().await;
             }
@@ -1677,15 +1806,14 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(diagnostics.kind, SchedulerQueueKind::Standard);
-        assert_eq!(diagnostics.io_capacity, 1);
-        assert_eq!(diagnostics.iops_available, 0);
-        assert_eq!(diagnostics.pending_bytes, 50);
-        assert_eq!(diagnostics.bytes_reserved, 10);
-        assert_eq!(diagnostics.priorities_in_flight, 1);
-        assert_eq!(diagnostics.head_task_bytes, Some(30));
-        assert_eq!(diagnostics.head_task_blocked_by_iops, Some(true));
-        assert_eq!(diagnostics.head_task_blocked_by_bytes, Some(false));
+        assert_eq!(io_capacity, 1);
+        assert_eq!(iops_available, 0);
+        assert_eq!(pending_bytes, 50);
+        assert_eq!(bytes_reserved, 10);
+        assert_eq!(priorities_in_flight, 1);
+        assert_eq!(head_task_bytes, 30);
+        assert!(head_task_blocked_by_iops);
+        assert!(!head_task_blocked_by_bytes);
 
         semaphore_copy.add_permits(3);
         assert_eq!(first_fut.await.unwrap().unwrap().len(), 10);

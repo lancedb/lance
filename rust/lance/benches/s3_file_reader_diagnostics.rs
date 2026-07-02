@@ -22,9 +22,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance::dataset::ProjectionRequest;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::fragment::{FileFragment, FragReadConfig};
-use lance::dataset::scanner::{
-    ExecutionStatsCallback, ExecutionSummaryCounts, ScanSchedulerDiagnosticsHandle,
-};
+use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts};
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::format::pb21;
@@ -32,17 +30,51 @@ use lance_file::reader::{
     DEFAULT_READ_CHUNK_SIZE, FileReader as LanceFileReader, FileReaderOptions,
 };
 use lance_io::object_store::ObjectStore as LanceObjectStore;
-use lance_io::scheduler::{
-    FileScheduler, ScanScheduler, ScanStats, SchedulerConfig, SchedulerDiagnostics,
-    SchedulerQueueKind,
-};
+use lance_io::scheduler::{FileScheduler, ScanScheduler, ScanStats, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use serde_json::{Value, json};
+use tracing::field::{Field, Visit};
+use tracing::subscriber::Interest;
+use tracing::{Event, Metadata, Subscriber};
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::prelude::*;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 const GIB: u64 = 1024 * 1024 * 1024;
+const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SchedulerQueueKind {
+    Standard,
+    Lite,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SchedulerDiagnostics {
+    kind: SchedulerQueueKind,
+    stats: ScanStats,
+    io_capacity: u64,
+    iops_available: u64,
+    active_iops: u64,
+    pending_iops: u64,
+    pending_bytes: u64,
+    bytes_available: i64,
+    bytes_reserved: i64,
+    io_buffer_size_bytes: u64,
+    priorities_in_flight: u64,
+    no_backpressure: bool,
+    head_task_bytes: Option<u64>,
+    head_task_priority_high: Option<u64>,
+    head_task_priority_low: Option<u64>,
+    min_in_flight_priority_high: Option<u64>,
+    min_in_flight_priority_low: Option<u64>,
+    head_task_can_deliver: Option<bool>,
+    head_task_priority_bypass: Option<bool>,
+    head_task_blocked_by_iops: Option<bool>,
+    head_task_blocked_by_bytes: Option<bool>,
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -719,32 +751,6 @@ fn diagnostics_json(diagnostics: SchedulerDiagnostics) -> Value {
     })
 }
 
-fn empty_scheduler_diagnostics() -> SchedulerDiagnostics {
-    SchedulerDiagnostics {
-        kind: SchedulerQueueKind::Standard,
-        stats: ScanStats::default(),
-        io_capacity: 0,
-        iops_available: 0,
-        active_iops: 0,
-        pending_iops: 0,
-        pending_bytes: 0,
-        bytes_available: 0,
-        bytes_reserved: 0,
-        io_buffer_size_bytes: 0,
-        priorities_in_flight: 0,
-        no_backpressure: false,
-        head_task_bytes: None,
-        head_task_priority_high: None,
-        head_task_priority_low: None,
-        min_in_flight_priority_high: None,
-        min_in_flight_priority_low: None,
-        head_task_can_deliver: None,
-        head_task_priority_bypass: None,
-        head_task_blocked_by_iops: None,
-        head_task_blocked_by_bytes: None,
-    }
-}
-
 #[derive(Debug, Default)]
 struct ExecutionStatsHolder {
     collected_stats: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
@@ -763,27 +769,246 @@ impl ExecutionStatsHolder {
     }
 }
 
-#[derive(Debug, Default)]
-struct SchedulerDiagnosticsHandleHolder {
-    handle: Arc<Mutex<Option<ScanSchedulerDiagnosticsHandle>>>,
+#[derive(Debug, Clone, Default)]
+struct SchedulerDiagnosticsCollector {
+    latest: Arc<Mutex<Option<SchedulerDiagnostics>>>,
 }
 
-impl SchedulerDiagnosticsHandleHolder {
-    fn get_setter(&self) -> impl Fn(ScanSchedulerDiagnosticsHandle) + Send + Sync + 'static {
-        let handle = self.handle.clone();
-        move |new_handle| {
-            *handle.lock().unwrap() = Some(new_handle);
-        }
+impl SchedulerDiagnosticsCollector {
+    fn clear(&self) {
+        *self.latest.lock().unwrap() = None;
+    }
+
+    fn observe(&self, diagnostics: SchedulerDiagnostics) {
+        *self.latest.lock().unwrap() = Some(diagnostics);
     }
 
     fn snapshot(&self, io_buffer_gib: Option<u64>) -> SchedulerDiagnostics {
-        self.handle
+        self.latest
             .lock()
             .unwrap()
             .as_ref()
-            .map(|handle| handle.diagnostics())
+            .copied()
             .unwrap_or_else(|| diagnostics_from_scan_stats(ScanStats::default(), io_buffer_gib))
     }
+}
+
+#[derive(Debug, Clone)]
+struct SchedulerDiagnosticsLayer {
+    collector: SchedulerDiagnosticsCollector,
+}
+
+impl SchedulerDiagnosticsLayer {
+    fn new(collector: SchedulerDiagnosticsCollector) -> Self {
+        Self { collector }
+    }
+}
+
+fn is_scheduler_state_metadata(metadata: &Metadata<'_>) -> bool {
+    // The scheduler uses `tracing::enabled!` before constructing the event;
+    // that guard registers a HINT callsite, not an EVENT callsite.
+    metadata.target() == SCHEDULER_STATE_EVENT_TARGET && *metadata.level() == tracing::Level::TRACE
+}
+
+impl<S> Layer<S> for SchedulerDiagnosticsLayer
+where
+    S: Subscriber,
+{
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if is_scheduler_state_metadata(metadata) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn enabled(&self, metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        is_scheduler_state_metadata(metadata)
+    }
+
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        if !is_scheduler_state_metadata(event.metadata()) {
+            return;
+        }
+        let mut visitor = SchedulerDiagnosticsVisitor::default();
+        event.record(&mut visitor);
+        if let Some(diagnostics) = visitor.into_diagnostics() {
+            self.collector.observe(diagnostics);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SchedulerDiagnosticsVisitor {
+    kind: Option<SchedulerQueueKind>,
+    scheduler_iops: Option<u64>,
+    scheduler_requests: Option<u64>,
+    scheduler_bytes_read: Option<u64>,
+    io_capacity: Option<u64>,
+    iops_available: Option<u64>,
+    active_iops: Option<u64>,
+    pending_iops: Option<u64>,
+    pending_bytes: Option<u64>,
+    bytes_available: Option<i64>,
+    bytes_reserved: Option<i64>,
+    io_buffer_size_bytes: Option<u64>,
+    priorities_in_flight: Option<u64>,
+    no_backpressure: Option<bool>,
+    head_task_bytes_present: bool,
+    head_task_bytes: Option<u64>,
+    head_task_priority_high_present: bool,
+    head_task_priority_high: Option<u64>,
+    head_task_priority_low_present: bool,
+    head_task_priority_low: Option<u64>,
+    min_in_flight_priority_high_present: bool,
+    min_in_flight_priority_high: Option<u64>,
+    min_in_flight_priority_low_present: bool,
+    min_in_flight_priority_low: Option<u64>,
+    head_task_can_deliver_present: bool,
+    head_task_can_deliver: Option<bool>,
+    head_task_priority_bypass_present: bool,
+    head_task_priority_bypass: Option<bool>,
+    head_task_blocked_by_iops_present: bool,
+    head_task_blocked_by_iops: Option<bool>,
+    head_task_blocked_by_bytes_present: bool,
+    head_task_blocked_by_bytes: Option<bool>,
+}
+
+impl SchedulerDiagnosticsVisitor {
+    fn into_diagnostics(self) -> Option<SchedulerDiagnostics> {
+        Some(SchedulerDiagnostics {
+            kind: self.kind?,
+            stats: ScanStats {
+                iops: self.scheduler_iops.unwrap_or_default(),
+                requests: self.scheduler_requests.unwrap_or_default(),
+                bytes_read: self.scheduler_bytes_read.unwrap_or_default(),
+            },
+            io_capacity: self.io_capacity.unwrap_or_default(),
+            iops_available: self.iops_available.unwrap_or_default(),
+            active_iops: self.active_iops.unwrap_or_default(),
+            pending_iops: self.pending_iops.unwrap_or_default(),
+            pending_bytes: self.pending_bytes.unwrap_or_default(),
+            bytes_available: self.bytes_available.unwrap_or_default(),
+            bytes_reserved: self.bytes_reserved.unwrap_or_default(),
+            io_buffer_size_bytes: self.io_buffer_size_bytes.unwrap_or_default(),
+            priorities_in_flight: self.priorities_in_flight.unwrap_or_default(),
+            no_backpressure: self.no_backpressure.unwrap_or(false),
+            head_task_bytes: optional_u64(self.head_task_bytes_present, self.head_task_bytes),
+            head_task_priority_high: optional_u64(
+                self.head_task_priority_high_present,
+                self.head_task_priority_high,
+            ),
+            head_task_priority_low: optional_u64(
+                self.head_task_priority_low_present,
+                self.head_task_priority_low,
+            ),
+            min_in_flight_priority_high: optional_u64(
+                self.min_in_flight_priority_high_present,
+                self.min_in_flight_priority_high,
+            ),
+            min_in_flight_priority_low: optional_u64(
+                self.min_in_flight_priority_low_present,
+                self.min_in_flight_priority_low,
+            ),
+            head_task_can_deliver: optional_bool(
+                self.head_task_can_deliver_present,
+                self.head_task_can_deliver,
+            ),
+            head_task_priority_bypass: optional_bool(
+                self.head_task_priority_bypass_present,
+                self.head_task_priority_bypass,
+            ),
+            head_task_blocked_by_iops: optional_bool(
+                self.head_task_blocked_by_iops_present,
+                self.head_task_blocked_by_iops,
+            ),
+            head_task_blocked_by_bytes: optional_bool(
+                self.head_task_blocked_by_bytes_present,
+                self.head_task_blocked_by_bytes,
+            ),
+        })
+    }
+}
+
+impl Visit for SchedulerDiagnosticsVisitor {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        match field.name() {
+            "no_backpressure" => self.no_backpressure = Some(value),
+            "head_task_bytes_present" => self.head_task_bytes_present = value,
+            "head_task_priority_high_present" => self.head_task_priority_high_present = value,
+            "head_task_priority_low_present" => self.head_task_priority_low_present = value,
+            "min_in_flight_priority_high_present" => {
+                self.min_in_flight_priority_high_present = value;
+            }
+            "min_in_flight_priority_low_present" => {
+                self.min_in_flight_priority_low_present = value;
+            }
+            "head_task_can_deliver_present" => self.head_task_can_deliver_present = value,
+            "head_task_can_deliver" => self.head_task_can_deliver = Some(value),
+            "head_task_priority_bypass_present" => {
+                self.head_task_priority_bypass_present = value;
+            }
+            "head_task_priority_bypass" => self.head_task_priority_bypass = Some(value),
+            "head_task_blocked_by_iops_present" => {
+                self.head_task_blocked_by_iops_present = value;
+            }
+            "head_task_blocked_by_iops" => self.head_task_blocked_by_iops = Some(value),
+            "head_task_blocked_by_bytes_present" => {
+                self.head_task_blocked_by_bytes_present = value;
+            }
+            "head_task_blocked_by_bytes" => self.head_task_blocked_by_bytes = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        match field.name() {
+            "bytes_available" => self.bytes_available = Some(value),
+            "bytes_reserved" => self.bytes_reserved = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "scheduler_iops" => self.scheduler_iops = Some(value),
+            "scheduler_requests" => self.scheduler_requests = Some(value),
+            "scheduler_bytes_read" => self.scheduler_bytes_read = Some(value),
+            "io_capacity" => self.io_capacity = Some(value),
+            "iops_available" => self.iops_available = Some(value),
+            "active_iops" => self.active_iops = Some(value),
+            "pending_iops" => self.pending_iops = Some(value),
+            "pending_bytes" => self.pending_bytes = Some(value),
+            "io_buffer_size_bytes" => self.io_buffer_size_bytes = Some(value),
+            "priorities_in_flight" => self.priorities_in_flight = Some(value),
+            "head_task_bytes" => self.head_task_bytes = Some(value),
+            "head_task_priority_high" => self.head_task_priority_high = Some(value),
+            "head_task_priority_low" => self.head_task_priority_low = Some(value),
+            "min_in_flight_priority_high" => self.min_in_flight_priority_high = Some(value),
+            "min_in_flight_priority_low" => self.min_in_flight_priority_low = Some(value),
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "queue_kind" {
+            self.kind = match value {
+                "standard" => Some(SchedulerQueueKind::Standard),
+                "lite" => Some(SchedulerQueueKind::Lite),
+                _ => None,
+            };
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+fn optional_u64(present: bool, value: Option<u64>) -> Option<u64> {
+    present.then(|| value.unwrap_or_default())
+}
+
+fn optional_bool(present: bool, value: Option<bool>) -> Option<bool> {
+    present.then(|| value.unwrap_or(false))
 }
 
 fn diagnostics_from_scan_stats(
@@ -893,7 +1118,12 @@ fn sample_json(
     })
 }
 
-async fn run_scanner_case(config: &Config, io_buffer_gib: Option<u64>) -> Result<CaseStats> {
+async fn run_scanner_case(
+    config: &Config,
+    io_buffer_gib: Option<u64>,
+    scheduler_diagnostics: &SchedulerDiagnosticsCollector,
+) -> Result<CaseStats> {
+    scheduler_diagnostics.clear();
     let dataset = Arc::new(
         DatasetBuilder::from_uri(&config.uri)
             .with_version(config.dataset_version)
@@ -923,7 +1153,6 @@ async fn run_scanner_case(config: &Config, io_buffer_gib: Option<u64>) -> Result
 
     let counters = Arc::new(SharedCounters::default());
     let stats_holder = ExecutionStatsHolder::default();
-    let scheduler_diagnostics_holder = SchedulerDiagnosticsHandleHolder::default();
     let cpu_before = read_cpu_sample();
     let started = Instant::now();
 
@@ -934,8 +1163,7 @@ async fn run_scanner_case(config: &Config, io_buffer_gib: Option<u64>) -> Result
     scanner
         .batch_size(config.batch_size as usize)
         .scan_in_order(false)
-        .scan_stats_callback(stats_holder.get_setter())
-        .scan_scheduler_diagnostics_callback(scheduler_diagnostics_holder.get_setter());
+        .scan_stats_callback(stats_holder.get_setter());
     if config.batch_concurrency > 0 {
         scanner
             .batch_readahead(config.batch_concurrency)
@@ -996,7 +1224,7 @@ async fn run_scanner_case(config: &Config, io_buffer_gib: Option<u64>) -> Result
                 samples.push(sample_json(
                     started,
                     counters.as_ref(),
-                    scheduler_diagnostics_holder.snapshot(io_buffer_gib),
+                    scheduler_diagnostics.snapshot(io_buffer_gib),
                     0,
                     0,
                     &mut last_sample,
@@ -1011,7 +1239,7 @@ async fn run_scanner_case(config: &Config, io_buffer_gib: Option<u64>) -> Result
         .consume()
         .ok_or("scanner execution stats callback did not run")?;
     let scheduler_stats = scan_stats_from_execution_summary(&summary);
-    let mut final_diagnostics = scheduler_diagnostics_holder.snapshot(io_buffer_gib);
+    let mut final_diagnostics = scheduler_diagnostics.snapshot(io_buffer_gib);
     final_diagnostics.stats = scheduler_stats;
     let cpu_after = read_cpu_sample();
     samples.push(sample_json(
@@ -1046,7 +1274,11 @@ async fn run_scanner_case(config: &Config, io_buffer_gib: Option<u64>) -> Result
     })
 }
 
-async fn run_dataset_take_case(config: &Config) -> Result<CaseStats> {
+async fn run_dataset_take_case(
+    config: &Config,
+    scheduler_diagnostics: &SchedulerDiagnosticsCollector,
+) -> Result<CaseStats> {
+    scheduler_diagnostics.clear();
     let dataset = DatasetBuilder::from_uri(&config.uri)
         .with_version(config.dataset_version)
         .load()
@@ -1133,7 +1365,7 @@ async fn run_dataset_take_case(config: &Config) -> Result<CaseStats> {
             }
             Some((total - idle) as f64 / total as f64 * 100.0)
         }),
-        scheduler_diagnostics: empty_scheduler_diagnostics(),
+        scheduler_diagnostics: scheduler_diagnostics.snapshot(None),
         counters,
         samples: Vec::new(),
     })
@@ -1273,7 +1505,12 @@ fn push_split_ranges(ranges: &mut Vec<Range<u64>>, range: Range<u64>, chunk_size
     }
 }
 
-async fn run_scheduler_raw_case(config: &Config, io_buffer_gib: Option<u64>) -> Result<CaseStats> {
+async fn run_scheduler_raw_case(
+    config: &Config,
+    io_buffer_gib: Option<u64>,
+    scheduler_diagnostics: &SchedulerDiagnosticsCollector,
+) -> Result<CaseStats> {
+    scheduler_diagnostics.clear();
     let target_bytes = config
         .target_bytes
         .ok_or("--target-bytes is required for --backend scheduler-raw")?;
@@ -1529,7 +1766,7 @@ async fn run_scheduler_raw_case(config: &Config, io_buffer_gib: Option<u64>) -> 
                 samples.push(sample_json(
                     started,
                     counters.as_ref(),
-                    scheduler.diagnostics(),
+                    scheduler_diagnostics.snapshot(io_buffer_gib),
                     in_flight.len(),
                     planned.len().saturating_sub(next_range),
                     &mut last_sample,
@@ -1538,10 +1775,12 @@ async fn run_scheduler_raw_case(config: &Config, io_buffer_gib: Option<u64>) -> 
         }
     }
     counters.arrow_bytes.store(bytes_read, Ordering::Relaxed);
+    let mut final_diagnostics = scheduler_diagnostics.snapshot(io_buffer_gib);
+    final_diagnostics.stats = scheduler.stats();
     samples.push(sample_json(
         started,
         counters.as_ref(),
-        scheduler.diagnostics(),
+        final_diagnostics,
         in_flight.len(),
         0,
         &mut last_sample,
@@ -1566,13 +1805,18 @@ async fn run_scheduler_raw_case(config: &Config, io_buffer_gib: Option<u64>) -> 
             }
             Some((total - idle) as f64 / total as f64 * 100.0)
         }),
-        scheduler_diagnostics: scheduler.diagnostics(),
+        scheduler_diagnostics: final_diagnostics,
         counters,
         samples,
     })
 }
 
-async fn run_case(config: &Config, io_buffer_gib: Option<u64>) -> Result<CaseStats> {
+async fn run_case(
+    config: &Config,
+    io_buffer_gib: Option<u64>,
+    scheduler_diagnostics: &SchedulerDiagnosticsCollector,
+) -> Result<CaseStats> {
+    scheduler_diagnostics.clear();
     let dataset = Arc::new(
         DatasetBuilder::from_uri(&config.uri)
             .with_version(config.dataset_version)
@@ -1845,7 +2089,7 @@ async fn run_case(config: &Config, io_buffer_gib: Option<u64>) -> Result<CaseSta
                 samples.push(sample_json(
                     started,
                     counters.as_ref(),
-                    scheduler.diagnostics(),
+                    scheduler_diagnostics.snapshot(io_buffer_gib),
                     in_flight.len(),
                     rx.len(),
                     &mut last_sample,
@@ -1855,10 +2099,12 @@ async fn run_case(config: &Config, io_buffer_gib: Option<u64>) -> Result<CaseSta
     }
     producer.await??;
 
+    let mut final_diagnostics = scheduler_diagnostics.snapshot(io_buffer_gib);
+    final_diagnostics.stats = scheduler.stats();
     samples.push(sample_json(
         started,
         counters.as_ref(),
-        scheduler.diagnostics(),
+        final_diagnostics,
         in_flight.len(),
         rx.len(),
         &mut last_sample,
@@ -1884,7 +2130,7 @@ async fn run_case(config: &Config, io_buffer_gib: Option<u64>) -> Result<CaseSta
             }
             Some((total - idle) as f64 / total as f64 * 100.0)
         }),
-        scheduler_diagnostics: scheduler.diagnostics(),
+        scheduler_diagnostics: final_diagnostics,
         counters,
         samples,
     })
@@ -1932,6 +2178,15 @@ async fn main() -> Result<()> {
     if config.describe_layout {
         return describe_layout(&config).await;
     }
+    let scheduler_diagnostics = SchedulerDiagnosticsCollector::default();
+    let subscriber = tracing_subscriber::registry().with(SchedulerDiagnosticsLayer::new(
+        scheduler_diagnostics.clone(),
+    ));
+    tracing::subscriber::set_global_default(subscriber).map_err(|error| {
+        std::io::Error::other(format!(
+            "failed to install scheduler diagnostics subscriber: {error}"
+        ))
+    })?;
 
     fs::create_dir_all(&config.out_dir)?;
     let output_path = format!(
@@ -1963,10 +2218,16 @@ async fn main() -> Result<()> {
             config.sample_ms
         );
         let stats = match config.backend {
-            Backend::FileReader => run_case(&config, *io_buffer_gib).await?,
-            Backend::Scanner => run_scanner_case(&config, *io_buffer_gib).await?,
-            Backend::SchedulerRaw => run_scheduler_raw_case(&config, *io_buffer_gib).await?,
-            Backend::DatasetTake => run_dataset_take_case(&config).await?,
+            Backend::FileReader => {
+                run_case(&config, *io_buffer_gib, &scheduler_diagnostics).await?
+            }
+            Backend::Scanner => {
+                run_scanner_case(&config, *io_buffer_gib, &scheduler_diagnostics).await?
+            }
+            Backend::SchedulerRaw => {
+                run_scheduler_raw_case(&config, *io_buffer_gib, &scheduler_diagnostics).await?
+            }
+            Backend::DatasetTake => run_dataset_take_case(&config, &scheduler_diagnostics).await?,
         };
         let elapsed_secs = stats.elapsed.as_secs_f64();
         let scheduler_stats = stats.scheduler_diagnostics.stats;
