@@ -2196,11 +2196,13 @@ def test_zonemap_deletion_handling(tmp_path: Path):
 
 @pytest.mark.parametrize("index_type", ["ZONEMAP", "BLOOMFILTER"])
 def test_address_domain_index_not_query_with_stable_row_ids(tmp_path, index_type):
-    """Regression test: NOT / != queries must not crash on stable-row-id datasets.
+    """Regression test: != queries return correct results on stable-row-id datasets.
 
-    Address-domain indices (zonemap, bloom filter) translate their AllowList
-    results to the row-id domain.  A NOT over such a result produces a BlockList,
-    which must also be handled correctly — not returned as an internal error.
+    Address-domain indices (zonemap, bloom filter) search returns physical row
+    addresses. Translation to row IDs happens at the Query leaf before the NOT
+    node is evaluated, so the NOT operates on a correctly translated AllowList.
+    Without the address-to-row-id translation the AllowList contains wrong IDs,
+    and the subsequent NOT excludes the wrong rows.
     """
     vals = list(range(5_000)) + list(range(5_000, 10_000))
     tbl = pa.table({"x": vals})
@@ -2211,8 +2213,8 @@ def test_address_domain_index_not_query_with_stable_row_ids(tmp_path, index_type
 
     ds.create_scalar_index("x", index_type=index_type, replace=True)
 
-    # A != filter produces a NOT(index result), yielding a BlockList.
-    # Before the fix this returned an internal error instead of results.
+    # Without address translation the NOT excludes the wrong rows, producing an
+    # incorrect result set rather than crashing.
     expected = ds.to_table(filter="x != 42", use_scalar_index=False)["x"].to_pylist()
     actual = ds.to_table(filter="x != 42")["x"].to_pylist()
     assert sorted(actual) == sorted(expected)
