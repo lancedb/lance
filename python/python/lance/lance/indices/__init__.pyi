@@ -48,6 +48,7 @@ def train_pq_model(
     max_iters: int,
     ivf_model: pa.Array,
     fragment_ids: Optional[list[int]] = None,
+    num_bits: int = 8,
 ) -> pa.Array: ...
 def transform_vectors(
     dataset,
@@ -58,6 +59,9 @@ def transform_vectors(
     ivf_centroids: pa.Array,
     pq_codebook: pa.Array,
     dst_uri: str,
+    fragments: list,
+    partitions_ds_uri: Optional[str] = None,
+    num_bits: int = 8,
 ): ...
 def build_rq_model(
     dimension: int,
