@@ -1290,7 +1290,7 @@ impl DecodeBatchScheduler {
     /// * `ranges` - The ranges of rows to load
     /// * `sink` - A channel to send the decode tasks
     /// * `scheduler` An I/O scheduler to issue I/O requests
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     pub fn schedule_ranges(
         &mut self,
         ranges: &[Range<u64>],
@@ -1326,7 +1326,7 @@ impl DecodeBatchScheduler {
     /// * `range` - The range of rows to load
     /// * `sink` - A channel to send the decode tasks
     /// * `scheduler` An I/O scheduler to issue I/O requests
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     pub fn schedule_range(
         &mut self,
         range: Range<u64>,
@@ -1640,7 +1640,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
     ///
     /// Note that `scheduled_need` is cumulative.  E.g. this method
     /// should be called with 5, 10, 15 and not 5, 5, 5
-    #[instrument(skip_all)]
+    #[instrument(level = "debug", skip_all)]
     fn wait_for_io(&mut self, scheduled_need: u64, to_take: u64) -> Result<u64> {
         while self.rows_scheduled < scheduled_need && !self.messages.is_empty() {
             let message = self.messages.pop_front().unwrap()?;
