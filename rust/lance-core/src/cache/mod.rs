@@ -691,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn test_cache_weighs_key_footprint() {
         // A long key must count toward the weighted size; otherwise many small
-        // values stored under long keys (e.g. dataset URIs) would blow past the
+        // values under long, high-cardinality keys would blow past the
         // configured capacity because only the value size was charged.
         let cache = LanceCache::with_capacity(usize::MAX);
         let long_key = "k".repeat(10_000);
@@ -707,15 +707,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_internal_cache_key_counts_string_bytes() {
-        // Both owned strings are charged; the `&'static str` type name is a
-        // borrow and contributes nothing.
-        let key = InternalCacheKey::new(Arc::from("a-prefix"), Arc::from("a-key"), "SomeType");
-        let size = key.deep_size_of();
+    #[tokio::test]
+    async fn test_cache_shared_prefix_not_charged_per_entry() {
+        // The prefix `Arc<str>` is shared by every entry under a cache handle and
+        // is not freed when a single entry is evicted, so it must not be weighed
+        // per entry. Many entries under a 10 KB prefix should stay far below what
+        // a per-entry prefix charge (~entries * prefix_len) would produce.
+        let cache = LanceCache::with_capacity(usize::MAX).with_key_prefix(&"p".repeat(10_000));
+        for i in 0..100 {
+            cache
+                .insert_with_key(&TestKey::<Vec<i32>>::new(&i.to_string()), Arc::new(vec![1]))
+                .await;
+        }
+
+        let size_bytes = cache.size_bytes().await;
+        // Charging the prefix per entry would be ~100 * 10 KB ≈ 1 MB; the
+        // marginal cost is ~100 * (struct + tiny key + value) ≈ a few KB.
         assert!(
-            size >= std::mem::size_of::<InternalCacheKey>() + "a-prefix".len() + "a-key".len(),
-            "deep_size_of {size} should cover the struct and both strings"
+            size_bytes < 100 * 1024,
+            "shared prefix must not be charged per entry, got {size_bytes}"
         );
     }
 

@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
-use crate::deepsize::DeepSizeOf;
 
 use super::CacheCodec;
 use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
@@ -21,13 +20,16 @@ struct MokaCacheEntry {
     size_bytes: usize,
 }
 
-/// Footprint moka pays to store a key: the [`InternalCacheKey`] struct, its
-/// owned string bytes, and the `Arc` moka wraps it in. Counted per entry so
-/// eviction reflects key-heavy workloads (e.g. long dataset URIs as prefixes),
+/// Marginal, reclaimable cost of one entry's key: the [`InternalCacheKey`]
+/// struct plus the unique `key` string's heap bytes. Counted per entry so
+/// eviction reflects key-heavy workloads (e.g. long, high-cardinality keys),
 /// which the value size alone ignores.
+///
+/// The `prefix` `Arc<str>` is deliberately excluded: it is shared by every
+/// entry under a cache handle and is not freed when a single entry is evicted,
+/// so charging it per entry would systematically over-count.
 fn key_footprint(key: &InternalCacheKey) -> usize {
-    // Mirror `cache_entry_size`'s Arc accounting: two atomic counters.
-    key.deep_size_of() + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+    std::mem::size_of::<InternalCacheKey>() + key.key().len()
 }
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
