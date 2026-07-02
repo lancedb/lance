@@ -106,16 +106,16 @@ const DEFAULT_FULLZIP_PAGE_LOAD_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 static FULLZIP_ALIGNMENT_COPY_COUNT: AtomicU64 = AtomicU64::new(0);
 static FULLZIP_ALIGNMENT_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
 
-#[doc(hidden)]
-pub fn fullzip_alignment_copy_stats() -> (u64, u64) {
+#[cfg(test)]
+fn fullzip_alignment_copy_stats() -> (u64, u64) {
     (
         FULLZIP_ALIGNMENT_COPY_COUNT.load(Ordering::Relaxed),
         FULLZIP_ALIGNMENT_COPY_BYTES.load(Ordering::Relaxed),
     )
 }
 
-#[doc(hidden)]
-pub fn reset_fullzip_alignment_copy_stats() {
+#[cfg(test)]
+fn reset_fullzip_alignment_copy_stats() {
     FULLZIP_ALIGNMENT_COPY_COUNT.store(0, Ordering::Relaxed);
     FULLZIP_ALIGNMENT_COPY_BYTES.store(0, Ordering::Relaxed);
 }
@@ -2166,6 +2166,8 @@ pub struct FullZipScheduler {
     enable_cache: bool,
     /// Whether full-page fixed-width reads may be split into smaller load tasks.
     split_large_pages: bool,
+    /// Required row multiple for split chunks, used by row-multiplying wrappers.
+    split_row_alignment: u64,
 }
 
 impl FullZipScheduler {
@@ -2253,6 +2255,7 @@ impl FullZipScheduler {
             cached_state: None,
             enable_cache: false,
             split_large_pages: false,
+            split_row_alignment: 1,
         })
     }
 
@@ -2446,6 +2449,21 @@ impl FullZipScheduler {
         chunks
     }
 
+    fn aligned_split_target_rows(
+        target_bytes: u64,
+        total_bytes_per_value: u64,
+        alignment: u64,
+    ) -> u64 {
+        debug_assert!(total_bytes_per_value > 0);
+        let target_rows = (target_bytes / total_bytes_per_value).max(1);
+        let alignment = alignment.max(1);
+        if target_rows < alignment {
+            alignment
+        } else {
+            (target_rows / alignment) * alignment
+        }
+    }
+
     fn schedule_simple_chunks(
         chunks: Vec<(Vec<Range<u64>>, u64, u64)>,
         io: &Arc<dyn EncodingsIo>,
@@ -2594,10 +2612,20 @@ impl FullZipScheduler {
         let bytes_per_value = bits_per_value / 8;
         let bytes_per_cw = self.details.ctrl_word_parser.bytes_per_word();
         let total_bytes_per_value = bytes_per_value + bytes_per_cw as u64;
+        if total_bytes_per_value == 0 {
+            return Err(Error::internal(
+                "Invalid encoding: per-row byte width must be greater than 0",
+            ));
+        }
         let target_rows =
             if self.split_large_pages && Self::covers_entire_page(ranges, self.rows_in_page) {
-                fullzip_page_load_target_bytes()
-                    .map(|target_bytes| (target_bytes / total_bytes_per_value).max(1))
+                fullzip_page_load_target_bytes().map(|target_bytes| {
+                    Self::aligned_split_target_rows(
+                        target_bytes,
+                        total_bytes_per_value,
+                        self.split_row_alignment,
+                    )
+                })
             } else {
                 None
             };
@@ -3501,6 +3529,7 @@ impl StructuralPrimitiveFieldScheduler {
             cache_repetition_index,
             target_field,
             false,
+            1,
         )
     }
 
@@ -3510,6 +3539,7 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
         split_fullzip_pages: bool,
+        fullzip_split_row_alignment: u64,
     ) -> Result<Self> {
         let page_schedulers = column_info
             .page_infos
@@ -3523,6 +3553,7 @@ impl StructuralPrimitiveFieldScheduler {
                     cache_repetition_index,
                     target_field,
                     split_fullzip_pages,
+                    fullzip_split_row_alignment,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3540,6 +3571,7 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
         split_fullzip_pages: bool,
+        fullzip_split_row_alignment: u64,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
@@ -3560,6 +3592,7 @@ impl StructuralPrimitiveFieldScheduler {
                 )?;
                 scheduler.enable_cache = cache_repetition_index;
                 scheduler.split_large_pages = split_fullzip_pages;
+                scheduler.split_row_alignment = fullzip_split_row_alignment.max(1);
                 Box::new(scheduler)
             }
             Layout::ConstantLayout(constant_layout) => {
@@ -3615,6 +3648,7 @@ impl StructuralPrimitiveFieldScheduler {
                     cache_repetition_index,
                     target_field,
                     split_fullzip_pages,
+                    fullzip_split_row_alignment,
                 )?;
                 let def_meaning = blob
                     .layers
@@ -3647,6 +3681,7 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
         split_fullzip_pages: bool,
+        fullzip_split_row_alignment: u64,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
@@ -3656,6 +3691,7 @@ impl StructuralPrimitiveFieldScheduler {
             cache_repetition_index,
             target_field,
             split_fullzip_pages,
+            fullzip_split_row_alignment,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
@@ -6844,6 +6880,7 @@ mod tests {
             cached_state: None,
             enable_cache: false,
             split_large_pages: false,
+            split_row_alignment: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -6987,6 +7024,72 @@ mod tests {
         assert_eq!(
             sparse,
             vec![(vec![1024..1028, 1064..1068, 1104..1108], 3, 0)]
+        );
+    }
+
+    #[test]
+    fn test_fullzip_split_target_rows_aligns_to_row_multiple() {
+        assert_eq!(FullZipScheduler::aligned_split_target_rows(10, 1, 3), 9);
+        assert_eq!(FullZipScheduler::aligned_split_target_rows(2, 1, 3), 3);
+
+        let target_rows = FullZipScheduler::aligned_split_target_rows(10, 1, 3);
+        let chunks =
+            FullZipScheduler::chunk_simple_ranges(&[0..27], 27, 1024, 1, Some(target_rows));
+        assert_eq!(
+            chunks.iter().map(|(_, rows, _)| *rows).collect::<Vec<_>>(),
+            vec![9, 9, 9]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_simple_rejects_zero_width_rows() {
+        #[derive(Debug)]
+        struct ZeroWidthDecompressor;
+
+        impl FixedPerValueDecompressor for ZeroWidthDecompressor {
+            fn decompress(
+                &self,
+                _data: FixedWidthDataBlock,
+                _num_rows: u64,
+            ) -> crate::Result<DataBlock> {
+                unimplemented!("zero-width test should fail before decoding")
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                0
+            }
+        }
+
+        let scheduler = FullZipScheduler {
+            data_buf_position: 0,
+            data_buf_size: 0,
+            rep_index: None,
+            priority: 0,
+            rows_in_page: 8,
+            bits_per_offset: 32,
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(ZeroWidthDecompressor)),
+                def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::AllValidItem]),
+                ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                max_rep: 0,
+                max_visible_def: 0,
+            }),
+            cached_state: None,
+            enable_cache: false,
+            split_large_pages: true,
+            split_row_alignment: 1,
+        };
+        let io = Arc::new(crate::BufferScheduler::new(bytes::Bytes::new()))
+            as Arc<dyn crate::EncodingsIo>;
+
+        let err = match scheduler.schedule_ranges_simple(&[0..8], &io) {
+            Ok(_) => panic!("expected zero-width fullzip scheduling to fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("per-row byte width must be greater than 0"),
+            "unexpected error: {err}"
         );
     }
 
@@ -7159,6 +7262,7 @@ mod tests {
             cached_state: None,
             enable_cache: true,
             split_large_pages: false,
+            split_row_alignment: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -7269,6 +7373,7 @@ mod tests {
             cached_state: None,
             enable_cache: false,
             split_large_pages: false,
+            split_row_alignment: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
