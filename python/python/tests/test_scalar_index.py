@@ -2194,6 +2194,31 @@ def test_zonemap_deletion_handling(tmp_path: Path):
     assert ids == [0, 2, 4, 6, 8]
 
 
+@pytest.mark.parametrize("index_type", ["ZONEMAP", "BLOOMFILTER"])
+def test_address_domain_index_not_query_with_stable_row_ids(tmp_path, index_type):
+    """Regression test: NOT / != queries must not crash on stable-row-id datasets.
+
+    Address-domain indices (zonemap, bloom filter) translate their AllowList
+    results to the row-id domain.  A NOT over such a result produces a BlockList,
+    which must also be handled correctly — not returned as an internal error.
+    """
+    vals = list(range(5_000)) + list(range(5_000, 10_000))
+    tbl = pa.table({"x": vals})
+    ds = lance.write_dataset(
+        tbl, tmp_path, max_rows_per_file=5_000, enable_stable_row_ids=True
+    )
+    assert ds.has_stable_row_ids
+
+    ds.create_scalar_index("x", index_type=index_type, replace=True)
+
+    # A != filter produces a NOT(index result), yielding a BlockList.
+    # Before the fix this returned an internal error instead of results.
+    expected = ds.to_table(filter="x != 42", use_scalar_index=False)["x"].to_pylist()
+    actual = ds.to_table(filter="x != 42")["x"].to_pylist()
+    assert sorted(actual) == sorted(expected)
+    assert len(actual) == 9_999
+
+
 def test_zonemap_index_remapping(tmp_path: Path):
     """Test zonemap index remapping after compaction and optimization"""
     # Create a dataset with 5 fragments by writing data in chunks
