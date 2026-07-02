@@ -135,7 +135,7 @@ impl ImpactSkipData {
         &self,
         start_block_idx: usize,
         up_to: u64,
-        _block_least_doc_id: F,
+        block_least_doc_id: F,
         query_weight: f32,
         scorer: &S,
     ) -> ImpactScore
@@ -143,41 +143,54 @@ impl ImpactSkipData {
         S: Scorer + ?Sized,
         F: FnMut(usize) -> u32,
     {
-        self.max_score_up_to_with(start_block_idx, up_to, |impacts, entry_idx| {
-            impacts.entry_score(entry_idx, query_weight, scorer)
-        })
+        self.max_score_up_to_with(
+            start_block_idx,
+            up_to,
+            block_least_doc_id,
+            |impacts, entry_idx| impacts.entry_score(entry_idx, query_weight, scorer),
+        )
     }
 
-    pub fn max_score_up_to_cached<S>(
+    pub fn max_score_up_to_cached<S, F>(
         &self,
         start_block_idx: usize,
         up_to: u64,
+        block_least_doc_id: F,
         query_weight: f32,
         scorer: &S,
         cache: &mut ImpactScoreCache,
     ) -> ImpactScore
     where
         S: Scorer + ?Sized,
+        F: FnMut(usize) -> u32,
     {
-        self.max_score_up_to_with(start_block_idx, up_to, |impacts, entry_idx| {
-            cache.entry_score(impacts, entry_idx, query_weight, scorer)
-        })
+        self.max_score_up_to_with(
+            start_block_idx,
+            up_to,
+            block_least_doc_id,
+            |impacts, entry_idx| cache.entry_score(impacts, entry_idx, query_weight, scorer),
+        )
     }
 
-    fn max_score_up_to_with<E>(
+    fn max_score_up_to_with<E, F>(
         &self,
         start_block_idx: usize,
         up_to: u64,
+        mut block_least_doc_id: F,
         mut entry_score: E,
     ) -> ImpactScore
     where
         E: FnMut(&Self, usize) -> f32,
+        F: FnMut(usize) -> u32,
     {
         let mut block_idx = start_block_idx;
         let mut max_score = 0.0_f32;
         let mut entries_scanned = 0usize;
 
         while block_idx < self.level0_len {
+            if u64::from(block_least_doc_id(block_idx)) > up_to {
+                break;
+            }
             let group_idx = block_idx / IMPACT_LEVEL1_BLOCKS;
             let group_start = group_idx * IMPACT_LEVEL1_BLOCKS;
             let group_end = ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(self.level0_len);
@@ -498,7 +511,8 @@ mod tests {
         assert_eq!(cached_level0, uncached_level0);
 
         let uncached = impacts.max_score_up_to(0, 31, |idx| idx as u32, 1.0, &scorer);
-        let cached = impacts.max_score_up_to_cached(0, 31, 1.0, &scorer, &mut cache);
+        let cached =
+            impacts.max_score_up_to_cached(0, 31, |idx| idx as u32, 1.0, &scorer, &mut cache);
         assert_eq!(cached.score, uncached.score);
         assert_eq!(cached.entries_scanned, uncached.entries_scanned);
     }
