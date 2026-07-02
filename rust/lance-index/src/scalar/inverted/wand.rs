@@ -1787,6 +1787,24 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
                 let essential_term = posting.term_index();
                 let essential_weight = posting.query_weight;
+                // Lucene's required-clause refinement: when the essential
+                // clause plus every non-essential clause EXCEPT the strongest
+                // still cannot beat the threshold, competitive docs must also
+                // match that strongest non-essential clause — leapfrog with it
+                // and skip scoring the essential docs it can't match.
+                let required_idx = if !non_essential.is_empty() && self.threshold > 0.0 {
+                    let without_best = essential[0].bound
+                        + if non_essential.len() >= 2 {
+                            non_essential[non_essential.len() - 2].prefix_bound
+                        } else {
+                            0.0
+                        };
+                    (float_sum_upper(without_best, non_essential.len())
+                        <= self.threshold)
+                        .then_some(non_essential.len() - 1)
+                } else {
+                    None
+                };
 
                 macro_rules! consider_candidate {
                     ($doc:expr, $freq:expr) => {{
@@ -1884,7 +1902,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             let compressed = unsafe {
                                 &mut *posting.ensure_compressed_block_ptr(list, block_idx)
                             };
-                            for offset in block_offset..compressed.doc_ids.len() {
+                            let mut offset = block_offset;
+                            while offset < compressed.doc_ids.len() {
                                 let doc_id = compressed.doc_ids[offset];
                                 if u64::from(doc_id) > window_max {
                                     posting.index =
@@ -1897,7 +1916,39 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                     }));
                                     break 'stream;
                                 }
+                                if let Some(required) = required_idx {
+                                    let probe = &mut non_essential[required].posting;
+                                    if probe
+                                        .doc()
+                                        .is_some_and(|d| d.doc_id() < u64::from(doc_id))
+                                    {
+                                        probe.next(u64::from(doc_id));
+                                    }
+                                    match probe.doc() {
+                                        Some(d) if d.doc_id() == u64::from(doc_id) => {}
+                                        Some(d) => {
+                                            // Leapfrog the essential clause to the
+                                            // required clause's next doc.
+                                            debug_assert!(d.doc_id() > u64::from(doc_id));
+                                            let target =
+                                                d.doc_id().min(u32::MAX as u64) as u32;
+                                            offset += compressed.doc_ids[offset..]
+                                                .partition_point(|&id| id < target);
+                                            continue;
+                                        }
+                                        None => {
+                                            // The required clause is exhausted:
+                                            // nothing else in this window can win.
+                                            offset += compressed.doc_ids[offset..]
+                                                .partition_point(|&id| {
+                                                    u64::from(id) <= window_max
+                                                });
+                                            continue;
+                                        }
+                                    }
+                                }
                                 consider_candidate!(u64::from(doc_id), compressed.freqs[offset]);
+                                offset += 1;
                             }
                             let next_start =
                                 posting_block_start(block_idx + 1, list.block_size);
