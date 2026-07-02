@@ -4,6 +4,7 @@
 pub mod builder;
 mod cache_codec;
 mod encoding;
+mod impact;
 mod index;
 mod iter;
 pub mod json;

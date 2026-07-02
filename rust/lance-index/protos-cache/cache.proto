@@ -31,6 +31,8 @@ message CompressedPostingHeader {
   // Number of documents in each compressed posting block. Older cache entries
   // omit this field and decode as the legacy 128-doc block size.
   uint32 block_size = 6;
+  // Whether an impact IPC section follows the posting/position sections.
+  bool has_impacts = 7;
 }
 
 // Header for a serialized `PlainPostingList` cache entry. Followed by an Arrow
