@@ -221,7 +221,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use bytes::Bytes;
-use futures::future::{BoxFuture, MaybeDone, maybe_done};
+use futures::future::{BoxFuture, MaybeDone, maybe_done, try_join_all};
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
@@ -231,10 +231,13 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
 use lance_core::utils::parse::parse_env_as_bool;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use log::{debug, trace, warn};
 use prost::Message;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
+use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use lance_core::error::LanceOptionExt;
 use lance_core::{ArrowResult, Error, Result};
@@ -267,6 +270,8 @@ const ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE: &str =
     "LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE";
 const ENV_LANCE_READ_CACHE_REPETITION_INDEX: &str = "LANCE_READ_CACHE_REPETITION_INDEX";
 const ENV_LANCE_INLINE_SCHEDULING_THRESHOLD: &str = "LANCE_INLINE_SCHEDULING_THRESHOLD";
+const ENV_LANCE_STRUCTURAL_PAGE_LOAD_AHEAD: &str = "LANCE_STRUCTURAL_PAGE_LOAD_AHEAD";
+const ENV_LANCE_IO_THREADS: &str = "LANCE_IO_THREADS";
 
 // If a request is for at most this many rows we skip the scheduler-task spawn
 // and run scheduling inline as part of the `schedule_and_decode` await.
@@ -285,6 +290,23 @@ fn inline_scheduling_threshold() -> u64 {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_INLINE_SCHEDULING_THRESHOLD)
+    })
+}
+
+fn structural_page_load_ahead() -> usize {
+    static LOAD_AHEAD: OnceLock<usize> = OnceLock::new();
+    *LOAD_AHEAD.get_or_init(|| {
+        std::env::var(ENV_LANCE_STRUCTURAL_PAGE_LOAD_AHEAD)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .or_else(|| {
+                std::env::var(ENV_LANCE_IO_THREADS)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|v| *v > 0)
+            })
+            .unwrap_or_else(|| get_num_compute_intensive_cpus().max(1))
     })
 }
 
@@ -1843,9 +1865,15 @@ impl StructuralBatchDecodeStream {
                     let scan_line = scan_line?;
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for message in scan_line.decoders {
-                        let unloaded_page = message.into_structural();
-                        let loaded_page = unloaded_page.0.await?;
-                        self.root_decoder.accept_page(loaded_page)?;
+                        match message {
+                            MessageType::UnloadedPage(unloaded_page) => {
+                                let loaded_page = unloaded_page.0.await?;
+                                self.root_decoder.accept_page(loaded_page)?;
+                            }
+                            MessageType::DecoderReady(_) => {
+                                panic!("Expected structural page but got legacy decoder")
+                            }
+                        }
                     }
                 }
                 None => {
@@ -1924,9 +1952,9 @@ impl StructuralBatchDecodeStream {
                 let task = async move {
                     let next_task = next_task?;
                     let (batch, data_size) = if spawn_batch_decode_tasks {
-                        tokio::spawn(
-                            async move { next_task.into_batch(emitted_batch_size_warning) },
-                        )
+                        tokio::task::spawn_blocking(move || {
+                            next_task.into_batch(emitted_batch_size_warning)
+                        })
                         .await
                         .map_err(|err| Error::wrapped(err.into()))??
                     } else {
@@ -2045,20 +2073,25 @@ pub struct SchedulerDecoderConfig {
     pub batch_size_bytes: Option<u64>,
 }
 
-fn check_scheduler_on_drop(
+fn check_background_tasks_on_drop(
     stream: BoxStream<'static, ReadBatchTask>,
-    scheduler_handle: tokio::task::JoinHandle<()>,
+    task_handles: Vec<tokio::task::JoinHandle<()>>,
 ) -> BoxStream<'static, ReadBatchTask> {
     // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
     // will panic if the scheduler panicked).  This let's us check if the scheduler panicked
     // when the stream finishes.
-    let abort_handle = scheduler_handle.abort_handle();
-    let mut scheduler_handle = Some(scheduler_handle);
+    let abort_handles = task_handles
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect::<Vec<_>>();
+    let mut task_handles = Some(task_handles);
     let check_scheduler = stream::unfold((), move |_| {
-        let handle = scheduler_handle.take();
+        let handles = task_handles.take();
         async move {
-            if let Some(handle) = handle {
-                handle.await.unwrap();
+            if let Some(handles) = handles {
+                for handle in handles {
+                    handle.await.unwrap();
+                }
             }
             None
         }
@@ -2066,14 +2099,16 @@ fn check_scheduler_on_drop(
     stream
         .chain(check_scheduler)
         .on_drop(move || {
-            // Abort the scheduler task on early drop. The scheduler task holds
+            // Abort background tasks on early drop. The scheduler task holds
             // a reference to the I/O scheduler (via config.io) which keeps the
             // ScanScheduler alive. If the scheduler task is stuck waiting for
             // initialization I/O (which is blocked on backpressure that will
             // never drain because no one is consuming the stream), we need to
             // abort it so it releases its I/O reference and allows the
             // ScanScheduler to drop and cancel pending I/O.
-            abort_handle.abort();
+            for abort_handle in &abort_handles {
+                abort_handle.abort();
+            }
         })
         .boxed()
 }
@@ -2115,6 +2150,138 @@ pub fn create_decode_stream(
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
         Ok(BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream())
     }
+}
+
+async fn load_structural_decoder_message(
+    message: Result<DecoderMessage>,
+    loaded_message_permits: Arc<Semaphore>,
+) -> Result<DecoderMessage> {
+    let message = message?;
+    let has_page = message
+        .decoders
+        .iter()
+        .any(|message| matches!(message, MessageType::UnloadedPage(_)));
+    let mut load_permit = if has_page {
+        // Limit pre-accept loaded messages, not pages or total decoded bytes.
+        // A single structural scan line can contain more pages than the
+        // loader depth and must not self-deadlock.
+        Some(
+            loaded_message_permits
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::internal("structural page load limiter unexpectedly closed"))?,
+        )
+    } else {
+        None
+    };
+    let decoders = try_join_all(
+        message
+            .decoders
+            .into_iter()
+            .map(load_structural_message_type),
+    )
+    .await?;
+    let decoders = decoders
+        .into_iter()
+        .map(|message| loaded_structural_message_to_message(message, &mut load_permit))
+        .collect();
+    Ok(DecoderMessage {
+        scheduled_so_far: message.scheduled_so_far,
+        decoders,
+    })
+}
+
+enum LoadedStructuralMessageType {
+    DecoderReady(crate::previous::decoder::DecoderReady),
+    LoadedPage(LoadedPageShard),
+}
+
+async fn load_structural_message_type(message: MessageType) -> Result<LoadedStructuralMessageType> {
+    match message {
+        MessageType::UnloadedPage(unloaded_page) => {
+            let loaded_page = unloaded_page.0.await?;
+            Ok(LoadedStructuralMessageType::LoadedPage(loaded_page))
+        }
+        MessageType::DecoderReady(decoder_ready) => {
+            Ok(LoadedStructuralMessageType::DecoderReady(decoder_ready))
+        }
+    }
+}
+
+fn loaded_structural_message_to_message(
+    message: LoadedStructuralMessageType,
+    load_permit: &mut Option<OwnedSemaphorePermit>,
+) -> MessageType {
+    match message {
+        LoadedStructuralMessageType::DecoderReady(decoder_ready) => {
+            MessageType::DecoderReady(decoder_ready)
+        }
+        LoadedStructuralMessageType::LoadedPage(loaded_page) => {
+            let load_permit = load_permit.take();
+            MessageType::UnloadedPage(UnloadedPageShard(
+                async move {
+                    let _load_permit = load_permit;
+                    Ok(loaded_page)
+                }
+                .boxed(),
+            ))
+        }
+    }
+}
+
+fn spawn_structural_page_loader(
+    source: mpsc::Receiver<Result<DecoderMessage>>,
+    sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_structural_page_loader_with_load_ahead(source, sink, structural_page_load_ahead().max(1))
+}
+
+fn spawn_structural_page_loader_with_load_ahead(
+    source: mpsc::Receiver<Result<DecoderMessage>>,
+    sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
+    load_ahead: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn(async move {
+        let load_ahead = load_ahead.max(1);
+        let loaded_page_permits = Arc::new(Semaphore::new(load_ahead));
+        let loaded = stream::unfold(source, |mut source| async move {
+            source.recv().await.map(|message| (message, source))
+        })
+        .map(|message| load_structural_decoder_message(message, loaded_page_permits.clone()))
+        .buffered(load_ahead);
+        futures::pin_mut!(loaded);
+
+        while let Some(message) = loaded.next().await {
+            let is_err = message.is_err();
+            if sink.send(message).is_err() || is_err {
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_structural_scheduler(
+    scheduling: impl FnOnce() + Send + 'static,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let (done_tx, done_rx) = oneshot::channel::<std::thread::Result<()>>();
+    std::thread::Builder::new()
+        .name("lance-structural-scheduler".to_string())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(scheduling));
+            let _ = done_tx.send(result);
+        })
+        .map_err(|err| {
+            Error::io(format!(
+                "failed to spawn structural scheduler thread: {err}"
+            ))
+        })?;
+
+    Ok(tokio::task::spawn(async move {
+        match done_rx.await {
+            Ok(Ok(())) | Err(_) => {}
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+        }
+    }))
 }
 
 /// Creates a iterator that decodes a set of messages in a blocking fashion
@@ -2222,21 +2389,77 @@ async fn create_scheduler_decoder(
         }
         Ok(decode_stream)
     } else {
-        // Spawn the (still synchronous) scheduling work so that decoder
-        // messages can stream into the channel while the consumer is
-        // already pulling from the decode stream.
-        let scheduling = async move {
-            match requested_rows {
+        if is_structural {
+            let scheduler_buffer = structural_page_load_ahead().max(1);
+            let (unloaded_tx, unloaded_rx) = mpsc::channel(scheduler_buffer);
+            let scheduling = move || {
+                match requested_rows {
                 RequestedRows::Ranges(ranges) => {
-                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
+                    decode_scheduler.do_schedule_ranges(
+                        &ranges,
+                        &filter,
+                        config.io,
+                        |msg| match unloaded_tx.blocking_send(msg) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                debug!(
+                                    "schedule_ranges aborting early since decoder appears to have been dropped"
+                                );
+                                false
+                            }
+                        },
+                        None,
+                    )
                 }
                 RequestedRows::Indices(indices) => {
-                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+                    debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
+                    if !indices.is_empty() {
+                        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+                        decode_scheduler.do_schedule_ranges(
+                            &ranges,
+                            &filter,
+                            config.io,
+                            |msg| match unloaded_tx.blocking_send(msg) {
+                                Ok(()) => true,
+                                Err(_) => {
+                                    debug!(
+                                        "schedule_take aborting early since decoder appears to have been dropped"
+                                    );
+                                    false
+                                }
+                            },
+                            None,
+                        )
+                    }
                 }
             }
-        };
-        let scheduler_handle = tokio::task::spawn(scheduling);
-        Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
+            };
+            let scheduler_handle = spawn_structural_scheduler(scheduling)?;
+            let page_loader_handle = spawn_structural_page_loader(unloaded_rx, tx);
+            Ok(check_background_tasks_on_drop(
+                decode_stream,
+                vec![scheduler_handle, page_loader_handle],
+            ))
+        } else {
+            // Spawn the (still synchronous) scheduling work so that decoder
+            // messages can stream into the channel while the consumer is
+            // already pulling from the decode stream.
+            let scheduling = async move {
+                match requested_rows {
+                    RequestedRows::Ranges(ranges) => {
+                        decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
+                    }
+                    RequestedRows::Indices(indices) => {
+                        decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
+                    }
+                }
+            };
+            let scheduler_handle = tokio::task::spawn(scheduling);
+            Ok(check_background_tasks_on_drop(
+                decode_stream,
+                vec![scheduler_handle],
+            ))
+        }
     }
 }
 
@@ -2763,7 +2986,7 @@ impl MessageType {
         match self {
             Self::DecoderReady(decoder) => decoder,
             Self::UnloadedPage(_) => {
-                panic!("Expected DecoderReady but got UnloadedPage")
+                panic!("Expected DecoderReady but got structural page")
             }
         }
     }
@@ -2999,6 +3222,338 @@ mod tests {
             ArrowField::new("d", DataType::Int32, false),
         ]));
         assert_eq!(estimate_bytes_per_row(&struct_type), 16.0);
+    }
+
+    #[derive(Debug)]
+    struct TestPageDecoder;
+
+    #[derive(Debug)]
+    struct TestPageTask;
+
+    impl DecodePageTask for TestPageTask {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            panic!("test page task should not be decoded")
+        }
+    }
+
+    impl StructuralPageDecoder for TestPageDecoder {
+        fn drain(&mut self, _num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+            Ok(Box::new(TestPageTask))
+        }
+
+        fn num_rows(&self) -> u64 {
+            1
+        }
+    }
+
+    fn test_path(path: u32) -> VecDeque<u32> {
+        VecDeque::from([path])
+    }
+
+    fn test_loaded_page(path: VecDeque<u32>) -> LoadedPageShard {
+        LoadedPageShard {
+            decoder: Box::new(TestPageDecoder),
+            path,
+        }
+    }
+
+    fn ready_test_page(path: u32) -> MessageType {
+        MessageType::UnloadedPage(UnloadedPageShard(
+            async move { Ok(test_loaded_page(test_path(path))) }.boxed(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_load_structural_decoder_message_holds_permit_until_consumed() {
+        let path = test_path(0);
+        let unloaded_page = UnloadedPageShard(async move { Ok(test_loaded_page(path)) }.boxed());
+        let permits = Arc::new(Semaphore::new(1));
+        let message = load_structural_decoder_message(
+            Ok(DecoderMessage {
+                scheduled_so_far: 10,
+                decoders: vec![MessageType::UnloadedPage(unloaded_page)],
+            }),
+            permits.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(message.scheduled_so_far, 10);
+        assert_eq!(permits.available_permits(), 0);
+        match message.decoders.into_iter().next().unwrap() {
+            MessageType::UnloadedPage(loaded_page) => {
+                let loaded_page = loaded_page.0.await.unwrap();
+                assert_eq!(loaded_page.path, test_path(0));
+            }
+            other => panic!("expected unloaded page, got {other:?}"),
+        }
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_structural_page_loader_preserves_ordered_delivery() {
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let (release_first_tx, release_first_rx) = oneshot::channel::<()>();
+        let (second_polled_tx, second_polled_rx) = oneshot::channel::<()>();
+
+        let first = MessageType::UnloadedPage(UnloadedPageShard(
+            async move {
+                release_first_rx.await.map_err(|err| {
+                    Error::internal(format!("test release channel dropped: {err}"))
+                })?;
+                Ok(test_loaded_page(test_path(1)))
+            }
+            .boxed(),
+        ));
+        let second = MessageType::UnloadedPage(UnloadedPageShard(
+            async move {
+                let _ = second_polled_tx.send(());
+                Ok(test_loaded_page(test_path(2)))
+            }
+            .boxed(),
+        ));
+
+        let loader = spawn_structural_page_loader_with_load_ahead(source_rx, sink_tx, 2);
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 1,
+                decoders: vec![first],
+            }))
+            .await
+            .unwrap();
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 2,
+                decoders: vec![second],
+            }))
+            .await
+            .unwrap();
+        drop(source_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_polled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), sink_rx.recv())
+                .await
+                .is_err()
+        );
+
+        release_first_tx.send(()).unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.scheduled_so_far, 1);
+        assert_eq!(second.scheduled_so_far, 2);
+        let first_page = first
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        let second_page = second
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        assert_eq!(first_page.path, test_path(1));
+        assert_eq!(second_page.path, test_path(2));
+        loader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_structural_page_loader_forwards_load_errors() {
+        let (source_tx, source_rx) = mpsc::channel(1);
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let failing_page = MessageType::UnloadedPage(UnloadedPageShard(
+            async move { Err(Error::internal("test structural page load failure")) }.boxed(),
+        ));
+
+        let loader = spawn_structural_page_loader_with_load_ahead(source_rx, sink_tx, 1);
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 1,
+                decoders: vec![failing_page],
+            }))
+            .await
+            .unwrap();
+        drop(source_tx);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Err(err) = err else {
+            panic!("expected structural page load error")
+        };
+        assert!(
+            err.to_string()
+                .contains("test structural page load failure")
+        );
+        assert!(sink_rx.recv().await.is_none());
+        loader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_structural_page_loader_load_ahead_one_delivers_messages() {
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+
+        let loader = spawn_structural_page_loader_with_load_ahead(source_rx, sink_tx, 1);
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 1,
+                decoders: vec![ready_test_page(1)],
+            }))
+            .await
+            .unwrap();
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 2,
+                decoders: vec![ready_test_page(2)],
+            }))
+            .await
+            .unwrap();
+        drop(source_tx);
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.scheduled_so_far, 1);
+        let first_page = first
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        assert_eq!(first_page.path, test_path(1));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.scheduled_so_far, 2);
+        let second_page = second
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        assert_eq!(second_page.path, test_path(2));
+        assert!(sink_rx.recv().await.is_none());
+        loader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_schedule_and_decode_structural_page_loader_roundtrip() {
+        use crate::encoder::{EncodingOptions, default_encoding_strategy, encode_batch};
+        use crate::version::LanceFileVersion;
+        use arrow_array::Int32Array;
+
+        let num_rows = 512;
+        let input_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("a", DataType::Int32, false),
+                ArrowField::new("b", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows)) as ArrayRef,
+                Arc::new(Int32Array::from_iter_values(
+                    (0..num_rows).map(|value| value * 10),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let version = LanceFileVersion::V2_1;
+        let schema = Schema::try_from(input_batch.schema().as_ref()).unwrap();
+        let encoded = encode_batch(
+            &input_batch,
+            Arc::new(schema),
+            default_encoding_strategy(version).as_ref(),
+            &EncodingOptions {
+                version,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let io_scheduler =
+            Arc::new(BufferScheduler::new(encoded.data.clone())) as Arc<dyn EncodingsIo>;
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
+        let stream = schedule_and_decode(
+            encoded.page_table.clone(),
+            RequestedRows::Ranges(vec![0_u64..128, 256..384]),
+            FilterExpression::no_filter(),
+            encoded.top_level_columns.clone(),
+            encoded.schema.clone(),
+            SchedulerDecoderConfig {
+                decoder_plugins: Arc::<DecoderPlugins>::default(),
+                batch_size: 128,
+                io: io_scheduler,
+                cache,
+                decoder_config: DecoderConfig {
+                    inline_scheduling: Some(false),
+                    ..Default::default()
+                },
+                batch_size_bytes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let batches = stream
+            .then(|task| async move { task.task.await.unwrap() })
+            .collect::<Vec<_>>()
+            .await;
+        let batch_refs = batches.iter().collect::<Vec<_>>();
+        let actual =
+            arrow_select::concat::concat_batches(&input_batch.schema(), batch_refs.iter().copied())
+                .unwrap();
+        let expected_values = (0..128).chain(256..384).collect::<Vec<i32>>();
+        let expected_batch = RecordBatch::try_new(
+            input_batch.schema(),
+            vec![
+                Arc::new(Int32Array::from(expected_values.clone())) as ArrayRef,
+                Arc::new(Int32Array::from(
+                    expected_values
+                        .into_iter()
+                        .map(|value| value * 10)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        assert_eq!(actual.column(0).as_ref(), expected_batch.column(0).as_ref());
+        assert_eq!(actual.column(1).as_ref(), expected_batch.column(1).as_ref());
     }
 
     /// Helper: encode a batch, then decode it as a stream with optional
