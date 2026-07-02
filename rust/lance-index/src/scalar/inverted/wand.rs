@@ -1769,6 +1769,41 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     TERMINATED_DOC_ID => TERMINATED_DOC_ID,
                     max => max + 1,
                 };
+                // Single live clause: instead of re-running the window
+                // machinery once per block, scan the baked per-block bounds
+                // for the next block that can beat the threshold. This is the
+                // slab form of Lucene's getSkipUpTo and turns dead stretches
+                // of a dominant term into a tight load-mul-compare loop.
+                if clauses.len() == 1
+                    && window_min != TERMINATED_DOC_ID
+                    && self.threshold > 0.0
+                {
+                    let posting = &clauses[0].posting;
+                    if let PostingList::Compressed(ref list) = posting.list
+                        && let Some(impacts) = list.impacts.as_ref()
+                    {
+                        let bounds = impacts.level0_doc_weight_bounds(&self.scorer);
+                        let query_weight = posting.query_weight;
+                        // Position by binary search on the first-doc slab: the
+                        // deep cursor lags arbitrarily far behind during long
+                        // skip runs, and walking from it re-scans the same
+                        // blocks on every dead window.
+                        let first_docs = list.block_first_docs();
+                        let mut block_idx = first_docs
+                            .partition_point(|&first| u64::from(first) <= window_min)
+                            .saturating_sub(1);
+                        while block_idx < bounds.len()
+                            && query_weight * bounds[block_idx] <= self.threshold
+                        {
+                            block_idx += 1;
+                        }
+                        window_min = if block_idx < bounds.len() {
+                            window_min.max(u64::from(list.block_least_doc_id(block_idx)))
+                        } else {
+                            TERMINATED_DOC_ID
+                        };
+                    }
+                }
                 continue;
             }
 
@@ -1837,7 +1872,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                     }
                                 }
 
-                                if !rejected {
+                                // Match the classic path's emission rule: a
+                                // candidate must beat the running threshold,
+                                // which drops zero-score matches (e.g. terms
+                                // with idf 0) exactly like Wand::next does.
+                                if !rejected && total > self.threshold {
                                     let full = candidates.len() >= limit;
                                     let beats_kth = !full
                                         || total > candidates.peek().unwrap().0.0.score.0;
@@ -2026,7 +2065,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             }
                         }
 
-                        if !rejected {
+                        if !rejected && score > self.threshold {
                             let full = candidates.len() >= limit;
                             let beats_kth = !full
                                 || score > candidates.peek().unwrap().0.0.score.0;

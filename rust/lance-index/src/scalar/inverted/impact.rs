@@ -147,6 +147,12 @@ impl ImpactSkipData {
         &self.baked_bounds(scorer).0
     }
 
+    /// Baked per-block max doc weights (level0 entries only), for bulk skip
+    /// scans over dead ranges without per-block window bookkeeping.
+    pub(crate) fn level0_doc_weight_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> &[f32] {
+        &self.baked_bounds(scorer).0[..self.level0_len]
+    }
+
     /// List-wide max doc weight, from the baked bounds. The tightest valid
     /// global score bound for this list is `query_weight * this`, matching
     /// what the non-impact format stores as `max_score` at build time — but
