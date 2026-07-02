@@ -19,13 +19,11 @@ pub struct ImpactSkipData {
     // Last doc id covered by each entry (level0 entries then level1 entries),
     // decoded once at construction; u32::MAX marks malformed entries.
     entry_doc_up_tos: Arc<[u32]>,
-    // Per-entry max doc weight (level0 entries then level1 entries), baked on
-    // first use. Doc weights depend only on (freq, doc_len) and the scorer's
-    // index-wide stats (e.g. BM25 avgdl), not on the query, so one pass over
-    // the frontiers serves every query for the lifetime of the cached list.
-    // Shared behind an Arc so the per-query clones of a cached list all reuse
-    // the same slab. Malformed entries bake to INFINITY so pruning stays safe.
-    doc_weight_bounds: Arc<OnceLock<Box<[f32]>>>,
+    // Per-entry max doc weight plus the list-wide max, baked on first use and
+    // shared across the per-query clones of a cached list. Doc weights depend
+    // only on (freq, doc_len) and index-wide stats (e.g. BM25 avgdl), not the
+    // query. Malformed entries bake to INFINITY so pruning stays safe.
+    doc_weight_bounds: Arc<OnceLock<(Box<[f32]>, f32)>>,
 }
 
 impl PartialEq for ImpactSkipData {
@@ -34,11 +32,28 @@ impl PartialEq for ImpactSkipData {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImpactScore {
     pub score: f32,
     pub entries_scanned: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ImpactScoreCache {}
+
+impl ImpactScoreCache {
+    fn entry_score<S: Scorer + ?Sized>(
+        &mut self,
+        impacts: &ImpactSkipData,
+        entry_idx: usize,
+        query_weight: f32,
+        scorer: &S,
+    ) -> f32 {
+        if query_weight <= 0.0 {
+            return 0.0;
+        }
+        query_weight * impacts.doc_weight_bounds(scorer)[entry_idx]
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -76,28 +91,50 @@ impl ImpactSkipData {
         })
     }
 
-    fn doc_weight_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> &[f32] {
+    fn baked_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> &(Box<[f32]>, f32) {
         self.doc_weight_bounds.get_or_init(|| {
-            (0..self.entries.len())
-                .map(|entry_idx| self.entry_max_doc_weight(entry_idx, scorer))
-                .collect()
+            let per_entry = (0..self.entries.len())
+                .map(|entry_idx| {
+                    let bytes = self.entries.value(entry_idx);
+                    let Ok(header) = decode_header(bytes) else {
+                        return f32::INFINITY;
+                    };
+                    let mut max_doc_weight = 0.0_f32;
+                    let mut offset = 8usize;
+                    for _ in 0..header.pair_count {
+                        let freq = read_u32_le(bytes, offset);
+                        let doc_len = read_u32_le(bytes, offset + 4);
+                        max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
+                        offset += 8;
+                    }
+                    max_doc_weight
+                })
+                .collect::<Box<[f32]>>();
+            // The level1 entries cover every block, so their max is the
+            // list-wide max doc weight; fall back to level0 entries for lists
+            // too short to have a level1 entry.
+            let global = if per_entry.len() > self.level0_len {
+                per_entry[self.level0_len..]
+                    .iter()
+                    .copied()
+                    .fold(0.0_f32, f32::max)
+            } else {
+                per_entry.iter().copied().fold(0.0_f32, f32::max)
+            };
+            (per_entry, global)
         })
     }
 
-    fn entry_max_doc_weight<S: Scorer + ?Sized>(&self, entry_idx: usize, scorer: &S) -> f32 {
-        let bytes = self.entries.value(entry_idx);
-        let Ok(header) = decode_header(bytes) else {
-            return f32::INFINITY;
-        };
-        let mut max_doc_weight = 0.0_f32;
-        let mut offset = 8usize;
-        for _ in 0..header.pair_count {
-            let freq = read_u32_le(bytes, offset);
-            let doc_len = read_u32_le(bytes, offset + 4);
-            max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
-            offset += 8;
-        }
-        max_doc_weight
+    fn doc_weight_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> &[f32] {
+        &self.baked_bounds(scorer).0
+    }
+
+    /// List-wide max doc weight, from the baked bounds. The tightest valid
+    /// global score bound for this list is `query_weight * this`, matching
+    /// what the non-impact format stores as `max_score` at build time — but
+    /// computed against the current index stats.
+    pub fn global_max_doc_weight<S: Scorer + ?Sized>(&self, scorer: &S) -> f32 {
+        self.baked_bounds(scorer).1
     }
 
     pub fn entries(&self) -> &LargeBinaryArray {
@@ -114,19 +151,6 @@ impl ImpactSkipData {
         level1_len(self.level0_len)
     }
 
-    /// Last doc id covered by the level0 entry of `block_idx`, or `None` when
-    /// the entry is missing or malformed (callers must fall back to a coarser
-    /// bound in that case).
-    pub(crate) fn level0_doc_up_to(&self, block_idx: usize) -> Option<u32> {
-        if block_idx >= self.level0_len {
-            return None;
-        }
-        match self.entry_doc_up_tos[block_idx] {
-            u32::MAX => None,
-            doc_up_to => Some(doc_up_to),
-        }
-    }
-
     pub(crate) fn level1_doc_up_to(&self, group_idx: usize) -> Option<u32> {
         if group_idx >= level1_len(self.level0_len) {
             return None;
@@ -137,33 +161,30 @@ impl ImpactSkipData {
         }
     }
 
-    /// Max score of the docs covered by the level0 entry of `block_idx`.
-    /// Malformed entries yield `f32::INFINITY` so pruning stays safe.
+    #[cfg(test)]
     pub fn level0_score<S: Scorer + ?Sized>(
         &self,
         block_idx: usize,
         query_weight: f32,
         scorer: &S,
     ) -> f32 {
-        if block_idx >= self.level0_len || query_weight <= 0.0 {
+        if block_idx >= self.level0_len {
             return 0.0;
         }
-        query_weight * self.doc_weight_bounds(scorer)[block_idx]
+        self.entry_score(block_idx, query_weight, scorer)
     }
 
-    /// Max score of the docs covered by the level1 entry of `group_idx`
-    /// (a span of [`IMPACT_LEVEL1_BLOCKS`] level0 blocks). Malformed entries
-    /// yield `f32::INFINITY` so pruning stays safe.
-    pub fn level1_score<S: Scorer + ?Sized>(
+    pub fn level0_score_cached<S: Scorer + ?Sized>(
         &self,
-        group_idx: usize,
+        block_idx: usize,
         query_weight: f32,
         scorer: &S,
+        cache: &mut ImpactScoreCache,
     ) -> f32 {
-        if group_idx >= level1_len(self.level0_len) || query_weight <= 0.0 {
+        if block_idx >= self.level0_len {
             return 0.0;
         }
-        query_weight * self.doc_weight_bounds(scorer)[self.level0_len + group_idx]
+        cache.entry_score(self, block_idx, query_weight, scorer)
     }
 
     #[cfg(test)]
@@ -171,7 +192,7 @@ impl ImpactSkipData {
         &self,
         start_block_idx: usize,
         up_to: u64,
-        block_least_doc_id: F,
+        _block_least_doc_id: F,
         query_weight: f32,
         scorer: &S,
     ) -> ImpactScore
@@ -179,34 +200,41 @@ impl ImpactSkipData {
         S: Scorer + ?Sized,
         F: FnMut(usize) -> u32,
     {
-        self.max_score_up_to_with(
-            start_block_idx,
-            up_to,
-            block_least_doc_id,
-            |impacts, entry_idx| impacts.entry_score(entry_idx, query_weight, scorer),
-        )
+        self.max_score_up_to_with(start_block_idx, up_to, |impacts, entry_idx| {
+            impacts.entry_score(entry_idx, query_weight, scorer)
+        })
     }
 
-    #[cfg(test)]
-    fn max_score_up_to_with<E, F>(
+    pub fn max_score_up_to_cached<S>(
         &self,
         start_block_idx: usize,
         up_to: u64,
-        mut block_least_doc_id: F,
+        query_weight: f32,
+        scorer: &S,
+        cache: &mut ImpactScoreCache,
+    ) -> ImpactScore
+    where
+        S: Scorer + ?Sized,
+    {
+        self.max_score_up_to_with(start_block_idx, up_to, |impacts, entry_idx| {
+            cache.entry_score(impacts, entry_idx, query_weight, scorer)
+        })
+    }
+
+    fn max_score_up_to_with<E>(
+        &self,
+        start_block_idx: usize,
+        up_to: u64,
         mut entry_score: E,
     ) -> ImpactScore
     where
         E: FnMut(&Self, usize) -> f32,
-        F: FnMut(usize) -> u32,
     {
         let mut block_idx = start_block_idx;
         let mut max_score = 0.0_f32;
         let mut entries_scanned = 0usize;
 
         while block_idx < self.level0_len {
-            if u64::from(block_least_doc_id(block_idx)) > up_to {
-                break;
-            }
             let group_idx = block_idx / IMPACT_LEVEL1_BLOCKS;
             let group_start = group_idx * IMPACT_LEVEL1_BLOCKS;
             let group_end = ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(self.level0_len);
@@ -515,42 +543,22 @@ mod tests {
     }
 
     #[test]
-    fn impact_level1_score_covers_level0_scores_in_group() {
+    fn impact_score_cache_matches_uncached_scores() {
         let blocks = (0..40)
             .map(|block| vec![(block as u32, 1 + block as u32 % 3, 10)])
             .collect::<Vec<_>>();
         let impacts = build_impact_skip_data(&blocks).unwrap();
         let scorer = MemBM25Scorer::new(400, 40, HashMap::from([(String::from("token"), 40usize)]));
+        let mut cache = ImpactScoreCache::default();
 
-        for group_idx in 0..impacts.level1_len() {
-            let group_score = impacts.level1_score(group_idx, 1.0, &scorer);
-            let group_start = group_idx * IMPACT_LEVEL1_BLOCKS;
-            let group_end = ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(impacts.level0_len());
-            for block_idx in group_start..group_end {
-                let block_score = impacts.level0_score(block_idx, 1.0, &scorer);
-                assert!(
-                    group_score + 1e-6 >= block_score,
-                    "level1 score {} must cover level0 score {} of block {}",
-                    group_score,
-                    block_score,
-                    block_idx
-                );
-            }
-        }
-    }
+        let uncached_level0 = impacts.level0_score(3, 1.0, &scorer);
+        let cached_level0 = impacts.level0_score_cached(3, 1.0, &scorer, &mut cache);
+        assert_eq!(cached_level0, uncached_level0);
 
-    #[test]
-    fn impact_level0_doc_up_to_reports_block_bounds() {
-        let blocks = vec![
-            vec![(0, 1, 10), (5, 2, 20)],
-            vec![(7, 1, 10), (12, 1, 10)],
-            vec![(20, 3, 30)],
-        ];
-        let impacts = build_impact_skip_data(&blocks).unwrap();
-        assert_eq!(impacts.level0_doc_up_to(0), Some(5));
-        assert_eq!(impacts.level0_doc_up_to(1), Some(12));
-        assert_eq!(impacts.level0_doc_up_to(2), Some(20));
-        assert_eq!(impacts.level0_doc_up_to(3), None);
+        let uncached = impacts.max_score_up_to(0, 31, |idx| idx as u32, 1.0, &scorer);
+        let cached = impacts.max_score_up_to_cached(0, 31, 1.0, &scorer, &mut cache);
+        assert_eq!(cached.score, uncached.score);
+        assert_eq!(cached.entries_scanned, uncached.entries_scanned);
     }
 
     #[test]
@@ -570,8 +578,11 @@ mod tests {
         assert!(score.score.is_finite());
         assert_eq!(score.entries_scanned, 1);
 
-        assert_eq!(impacts.level0_score(1, 1.0, &scorer), f32::INFINITY);
-        assert_eq!(impacts.level0_doc_up_to(1), None);
+        let mut cache = ImpactScoreCache::default();
+        assert_eq!(
+            impacts.level0_score_cached(1, 1.0, &scorer, &mut cache),
+            f32::INFINITY
+        );
     }
 
     #[test]
