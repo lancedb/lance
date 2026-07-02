@@ -5124,7 +5124,7 @@ def test_vector_filter_fts_search(tmp_path):
 
 @pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "ZONEMAP"])
 def test_large_string_scalar_index(tmp_path, index_type):
-    """large_string (Arrow LargeUtf8) columns must be accepted by BTREE and ZONEMAP."""
+    """large_string (LargeUtf8) must be accepted by BTREE, BITMAP, and ZONEMAP."""
     table = pa.table(
         {
             "id": pa.array([1, 2, 3], pa.int32()),
