@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::{Array, LargeBinaryArray};
@@ -16,12 +16,16 @@ const SMALL_FRONTIER_FREQ_LIMIT: usize = 256;
 pub struct ImpactSkipData {
     entries: LargeBinaryArray,
     level0_len: usize,
+    // Last doc id covered by each entry (level0 entries then level1 entries),
+    // decoded once at construction; u32::MAX marks malformed entries.
+    entry_doc_up_tos: Arc<[u32]>,
     // Per-entry max doc weight (level0 entries then level1 entries), baked on
     // first use. Doc weights depend only on (freq, doc_len) and the scorer's
     // index-wide stats (e.g. BM25 avgdl), not on the query, so one pass over
     // the frontiers serves every query for the lifetime of the cached list.
-    // Malformed entries bake to INFINITY so pruning stays safe.
-    doc_weight_bounds: OnceLock<Box<[f32]>>,
+    // Shared behind an Arc so the per-query clones of a cached list all reuse
+    // the same slab. Malformed entries bake to INFINITY so pruning stays safe.
+    doc_weight_bounds: Arc<OnceLock<Box<[f32]>>>,
 }
 
 impl PartialEq for ImpactSkipData {
@@ -54,10 +58,21 @@ impl ImpactSkipData {
                 level0_len
             )));
         }
+        let entry_doc_up_tos = (0..entries.len())
+            .map(|entry_idx| {
+                if entries.is_null(entry_idx) {
+                    return u32::MAX;
+                }
+                decode_header(entries.value(entry_idx))
+                    .map(|header| header.doc_up_to)
+                    .unwrap_or(u32::MAX)
+            })
+            .collect::<Arc<[u32]>>();
         Ok(Self {
             entries,
             level0_len,
-            doc_weight_bounds: OnceLock::new(),
+            entry_doc_up_tos,
+            doc_weight_bounds: Arc::new(OnceLock::new()),
         })
     }
 
@@ -103,25 +118,23 @@ impl ImpactSkipData {
     /// the entry is missing or malformed (callers must fall back to a coarser
     /// bound in that case).
     pub(crate) fn level0_doc_up_to(&self, block_idx: usize) -> Option<u32> {
-        if block_idx >= self.level0_len || self.entries.is_null(block_idx) {
+        if block_idx >= self.level0_len {
             return None;
         }
-        decode_header(self.entries.value(block_idx))
-            .ok()
-            .map(|header| header.doc_up_to)
+        match self.entry_doc_up_tos[block_idx] {
+            u32::MAX => None,
+            doc_up_to => Some(doc_up_to),
+        }
     }
 
     pub(crate) fn level1_doc_up_to(&self, group_idx: usize) -> Option<u32> {
         if group_idx >= level1_len(self.level0_len) {
             return None;
         }
-        let entry_idx = self.level0_len.checked_add(group_idx)?;
-        if entry_idx >= self.entries.len() || self.entries.is_null(entry_idx) {
-            return None;
+        match self.entry_doc_up_tos[self.level0_len + group_idx] {
+            u32::MAX => None,
+            doc_up_to => Some(doc_up_to),
         }
-        decode_header(self.entries.value(entry_idx))
-            .ok()
-            .map(|header| header.doc_up_to)
     }
 
     /// Max score of the docs covered by the level0 entry of `block_idx`.

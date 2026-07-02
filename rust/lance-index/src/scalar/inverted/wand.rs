@@ -154,9 +154,6 @@ struct CompressedState {
     // (entry_idx, doc_up_to, max_score). See `impact_level0`/`impact_level1`.
     level0_cache: Option<(usize, u32, f32)>,
     level1_cache: Option<(usize, u32, f32)>,
-    // First doc id of the tail (remainder) block. Unlike full blocks, reading
-    // it requires decoding the tail codec, so memoize it per iterator.
-    tail_first_doc: Option<u32>,
 }
 
 impl CompressedState {
@@ -172,7 +169,6 @@ impl CompressedState {
             block_max_window: BlockMaxWindow::new(),
             level0_cache: None,
             level1_cache: None,
-            tail_first_doc: None,
         }
     }
 
@@ -366,20 +362,6 @@ impl Ord for PostingIterator {
 impl PostingIterator {
     #[inline]
     fn block_least_doc_id(&self, list: &CompressedPostingList, block_idx: usize) -> u32 {
-        // Full blocks store their first doc id in the header (two loads), so
-        // caching them buys nothing. The tail block requires decoding the tail
-        // codec, so memoize just that one.
-        if block_idx + 1 == list.blocks.len()
-            && !(list.length as usize).is_multiple_of(list.block_size)
-        {
-            let compressed = unsafe { &mut *self.compressed_state_ptr() };
-            if let Some(doc_id) = compressed.tail_first_doc {
-                return doc_id;
-            }
-            let doc_id = list.block_least_doc_id(block_idx);
-            compressed.tail_first_doc = Some(doc_id);
-            return doc_id;
-        }
         list.block_least_doc_id(block_idx)
     }
 
@@ -1009,21 +991,20 @@ impl WindowAccumulator {
     #[inline]
     fn add(&mut self, clause_idx: usize, slot: usize, score: f32, freq: u32) {
         self.scores[slot] += score;
-        self.freqs[clause_idx * MAXSCORE_INNER_WINDOW + slot] = freq;
+        // Doc-major layout: one slot's clause frequencies share a cache line.
+        self.freqs[slot * self.num_clauses + clause_idx] = freq;
         self.words[slot >> 6] |= 1u64 << (slot & 63);
     }
 
     #[inline]
     fn clause_freq(&self, clause_idx: usize, slot: usize) -> u32 {
-        self.freqs[clause_idx * MAXSCORE_INNER_WINDOW + slot]
+        self.freqs[slot * self.num_clauses + clause_idx]
     }
 
     #[inline]
     fn clear_slot(&mut self, slot: usize) {
         self.scores[slot] = 0.0;
-        for clause_idx in 0..self.num_clauses {
-            self.freqs[clause_idx * MAXSCORE_INNER_WINDOW + slot] = 0;
-        }
+        self.freqs[slot * self.num_clauses..(slot + 1) * self.num_clauses].fill(0);
     }
 }
 
