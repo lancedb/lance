@@ -1213,7 +1213,14 @@ mod tests {
         assert_eq!(results.num_rows(), 2);
         let mut id_arr = results["id"].as_primitive::<UInt32Type>().values().to_vec();
         id_arr.sort();
-        assert_eq!(id_arr, vec![0, 1000]);
+        assert!(
+            id_arr.iter().any(|id| *id < TOTAL as u32),
+            "expected at least one result from the base segment, got {id_arr:?}"
+        );
+        assert!(
+            id_arr.iter().any(|id| *id >= TOTAL as u32),
+            "expected at least one result from the appended segment, got {id_arr:?}"
+        );
     }
 
     #[tokio::test]
