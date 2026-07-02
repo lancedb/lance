@@ -689,6 +689,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_weighs_key_footprint() {
+        // A long key must count toward the weighted size; otherwise many small
+        // values stored under long keys (e.g. dataset URIs) would blow past the
+        // configured capacity because only the value size was charged.
+        let cache = LanceCache::with_capacity(usize::MAX);
+        let long_key = "k".repeat(10_000);
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new(&long_key), Arc::new(vec![1]))
+            .await;
+
+        let size_bytes = cache.size_bytes().await;
+        assert!(
+            size_bytes >= long_key.len(),
+            "weighted size {size_bytes} should include the {}-byte key",
+            long_key.len()
+        );
+    }
+
+    #[test]
+    fn test_internal_cache_key_counts_string_bytes() {
+        // Both owned strings are charged; the `&'static str` type name is a
+        // borrow and contributes nothing.
+        let key = InternalCacheKey::new(Arc::from("a-prefix"), Arc::from("a-key"), "SomeType");
+        let size = key.deep_size_of();
+        assert!(
+            size >= std::mem::size_of::<InternalCacheKey>() + "a-prefix".len() + "a-key".len(),
+            "deep_size_of {size} should cover the struct and both strings"
+        );
+    }
+
+    #[tokio::test]
     async fn test_cache_trait_objects() {
         #[derive(Debug, DeepSizeOf)]
         struct MyType(i32);

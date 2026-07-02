@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
+use crate::deepsize::{Context, DeepSizeOf};
 
 use super::CacheCodec;
 
@@ -64,6 +65,13 @@ impl InternalCacheKey {
     /// Returns true if this key's prefix starts with the given string.
     pub fn starts_with(&self, prefix: &str) -> bool {
         self.prefix.starts_with(prefix)
+    }
+}
+
+impl DeepSizeOf for InternalCacheKey {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        // `type_name` is a `&'static str` borrow, so it owns no heap memory.
+        self.prefix.deep_size_of_children(context) + self.key.deep_size_of_children(context)
     }
 }
 

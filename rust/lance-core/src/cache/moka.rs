@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
+use crate::deepsize::DeepSizeOf;
 
 use super::CacheCodec;
 use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
@@ -18,6 +19,15 @@ use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKe
 struct MokaCacheEntry {
     entry: CacheEntry,
     size_bytes: usize,
+}
+
+/// Footprint moka pays to store a key: the [`InternalCacheKey`] struct, its
+/// owned string bytes, and the `Arc` moka wraps it in. Counted per entry so
+/// eviction reflects key-heavy workloads (e.g. long dataset URIs as prefixes),
+/// which the value size alone ignores.
+fn key_footprint(key: &InternalCacheKey) -> usize {
+    // Mirror `cache_entry_size`'s Arc accounting: two atomic counters.
+    key.deep_size_of() + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
 }
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
@@ -40,7 +50,12 @@ impl MokaCacheBackend {
     pub fn with_capacity(capacity: usize) -> Self {
         let cache = moka::future::Cache::builder()
             .max_capacity(capacity as u64)
-            .weigher(|_, v: &MokaCacheEntry| v.size_bytes.try_into().unwrap_or(u32::MAX))
+            .weigher(|key: &InternalCacheKey, entry: &MokaCacheEntry| {
+                key_footprint(key)
+                    .saturating_add(entry.size_bytes)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+            })
             .support_invalidation_closures()
             .build();
         Self { cache }
@@ -148,6 +163,9 @@ impl CacheBackend for MokaCacheBackend {
         // Iterate rather than using `weighted_size()` because moka's
         // weighted_size can be stale without `run_pending_tasks()`, which
         // is async and can't be called from this synchronous context.
-        self.cache.iter().map(|(_, v)| v.size_bytes).sum()
+        self.cache
+            .iter()
+            .map(|(key, entry)| key_footprint(key.as_ref()) + entry.size_bytes)
+            .sum()
     }
 }
