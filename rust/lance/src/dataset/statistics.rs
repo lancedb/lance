@@ -90,10 +90,9 @@ impl DatasetStatisticsExt for Dataset {
 
 /// A read-only handle for cheap, index-derived statistics about a [`Dataset`].
 ///
-/// Obtained via [`Dataset::statistics`]. Groups the dataset's statistics
-/// accessors behind one handle so they don't accrete as one-off methods on
-/// [`Dataset`]. Every accessor is served from index metadata and never scans
-/// data.
+/// Obtained via [`Dataset::statistics`]. Groups statistics accessors behind one
+/// handle instead of accreting one-off methods on [`Dataset`]. Every accessor is
+/// served from index metadata and never scans data.
 #[derive(Debug, Clone, Copy)]
 pub struct DatasetStatistics<'a> {
     dataset: &'a Dataset,

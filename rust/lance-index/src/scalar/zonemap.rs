@@ -187,8 +187,7 @@ impl ZoneMapIndex {
         Some((min?.clone(), max?.clone()))
     }
 
-    /// A scalar bound usable for the global range: present (not all-null) and,
-    /// for floats, not NaN.
+    /// A scalar usable as a global-range bound: non-null and, for floats, non-NaN.
     fn scalar_is_finite_bound(v: &ScalarValue) -> bool {
         !v.is_null() && !Self::scalar_is_nan(v)
     }
