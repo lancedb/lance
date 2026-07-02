@@ -20,14 +20,8 @@ struct MokaCacheEntry {
     size_bytes: usize,
 }
 
-/// Marginal, reclaimable cost of one entry's key: the [`InternalCacheKey`]
-/// struct plus the unique `key` string's heap bytes. Counted per entry so
-/// eviction reflects key-heavy workloads (e.g. long, high-cardinality keys),
-/// which the value size alone ignores.
-///
-/// The `prefix` `Arc<str>` is deliberately excluded: it is shared by every
-/// entry under a cache handle and is not freed when a single entry is evicted,
-/// so charging it per entry would systematically over-count.
+/// Per-entry key cost for eviction: the struct plus the unique `key` bytes.
+/// Excludes the shared `prefix` `Arc<str>`, which isn't freed per eviction.
 fn key_footprint(key: &InternalCacheKey) -> usize {
     std::mem::size_of::<InternalCacheKey>() + key.key().len()
 }

@@ -690,43 +690,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_weighs_key_footprint() {
-        // A long key must count toward the weighted size; otherwise many small
-        // values under long, high-cardinality keys would blow past the
-        // configured capacity because only the value size was charged.
+        // Weighted size charges the key's unique bytes, not just the value.
         let cache = LanceCache::with_capacity(usize::MAX);
-        let long_key = "k".repeat(10_000);
+        let key = "k".repeat(10_000);
+        let value = Arc::new(vec![1_i32]);
+        let expected =
+            std::mem::size_of::<InternalCacheKey>() + key.len() + cache_entry_size(&*value);
         cache
-            .insert_with_key(&TestKey::<Vec<i32>>::new(&long_key), Arc::new(vec![1]))
+            .insert_with_key(&TestKey::<Vec<i32>>::new(&key), value)
             .await;
-
-        let size_bytes = cache.size_bytes().await;
-        assert!(
-            size_bytes >= long_key.len(),
-            "weighted size {size_bytes} should include the {}-byte key",
-            long_key.len()
-        );
+        assert_eq!(cache.size_bytes().await, expected);
     }
 
     #[tokio::test]
     async fn test_cache_shared_prefix_not_charged_per_entry() {
-        // The prefix `Arc<str>` is shared by every entry under a cache handle and
-        // is not freed when a single entry is evicted, so it must not be weighed
-        // per entry. Many entries under a 10 KB prefix should stay far below what
-        // a per-entry prefix charge (~entries * prefix_len) would produce.
+        // The shared prefix contributes nothing per entry (it isn't freed on a
+        // single eviction); only struct + unique key + value are charged.
         let cache = LanceCache::with_capacity(usize::MAX).with_key_prefix(&"p".repeat(10_000));
         for i in 0..100 {
             cache
-                .insert_with_key(&TestKey::<Vec<i32>>::new(&i.to_string()), Arc::new(vec![1]))
+                .insert_with_key(
+                    &TestKey::<Vec<i32>>::new(&i.to_string()),
+                    Arc::new(vec![1_i32]),
+                )
                 .await;
         }
-
-        let size_bytes = cache.size_bytes().await;
-        // Charging the prefix per entry would be ~100 * 10 KB ≈ 1 MB; the
-        // marginal cost is ~100 * (struct + tiny key + value) ≈ a few KB.
-        assert!(
-            size_bytes < 100 * 1024,
-            "shared prefix must not be charged per entry, got {size_bytes}"
-        );
+        let value_cost = cache_entry_size(&vec![1_i32]);
+        let key_bytes: usize = (0..100).map(|i| i.to_string().len()).sum();
+        let expected = 100 * (std::mem::size_of::<InternalCacheKey>() + value_cost) + key_bytes;
+        assert_eq!(cache.size_bytes().await, expected);
     }
 
     #[tokio::test]
