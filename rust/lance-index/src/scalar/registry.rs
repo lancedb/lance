@@ -206,7 +206,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// The default implementation reads an in-memory `Arc<dyn ScalarIndex>` entry.
     /// Plugins whose index has a serializable representation should override this
     /// (together with [`put_in_cache`](Self::put_in_cache)) to store that
-    /// representation under a sized [`CacheKey`](lance_core::cache::CacheKey) with
+    /// representation under a sized [`CacheKey`] with
     /// a codec, and reconstruct the index here. `index_store` and
     /// `frag_reuse_index` are provided so the override can rebuild the index
     /// without re-reading metadata.
