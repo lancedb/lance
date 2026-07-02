@@ -46,6 +46,11 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
         .parse::<u64>()
         .unwrap_or(10)
 });
+// Experimental bulk MAXSCORE path for top-k disjunctions (Lucene
+// MaxScoreBulkScorer style). Off by default: on high-df workloads it streams
+// more scored docs per query than the block-max WAND loop has to touch.
+static USE_MAXSCORE_SEARCH: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() == Ok("1"));
 
 // ==== temporary diagnostics for benchmarking (LANCE_WAND_STATS=1); revert before merge ====
 #[derive(Default)]
@@ -1305,12 +1310,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
-        // Top-k disjunctions over compressed lists go through the bulk
+        // Top-k disjunctions over compressed lists can opt into the bulk
         // MAXSCORE path (Lucene MaxScoreBulkScorer style): it streams whole
         // blocks of the essential clauses into a window accumulator instead of
-        // advancing doc-at-a-time through a heap, which is where the classic
-        // WAND loop spends most of its time.
-        if self.operator == Operator::Or
+        // advancing doc-at-a-time through a heap.
+        if *USE_MAXSCORE_SEARCH
+            && self.operator == Operator::Or
             && params.phrase_slop.is_none()
             && !self.head.is_empty()
             && self
