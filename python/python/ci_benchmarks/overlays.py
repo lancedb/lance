@@ -24,23 +24,30 @@ import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
 from lance.file import LanceFileWriter  # noqa: E402
 
+# Default width for the ``embedding`` dtype. Individual benchmarks override it
+# via ``embedding_dim`` to model narrow vs. wide (e.g. 3072-d) value columns.
 EMBEDDING_DIM = 128
 
 
-def value_type(dtype: str) -> pa.DataType:
+def value_type(dtype: str, embedding_dim: int = EMBEDDING_DIM) -> pa.DataType:
     if dtype == "int32":
         return pa.int32()
     if dtype == "embedding":
-        return pa.list_(pa.float32(), EMBEDDING_DIM)
+        return pa.list_(pa.float32(), embedding_dim)
     raise ValueError(f"unknown overlay benchmark dtype {dtype!r}")
 
 
-def _gen_values(dtype: str, n: int, rng: np.random.Generator) -> pa.Array:
+def _gen_values(
+    dtype: str,
+    n: int,
+    rng: np.random.Generator,
+    embedding_dim: int = EMBEDDING_DIM,
+) -> pa.Array:
     if dtype == "int32":
         return pa.array(rng.integers(0, 1 << 30, size=n, dtype=np.int32))
     if dtype == "embedding":
-        flat = rng.random(n * EMBEDDING_DIM, dtype=np.float32)
-        return pa.FixedSizeListArray.from_arrays(pa.array(flat), EMBEDDING_DIM)
+        flat = rng.random(n * embedding_dim, dtype=np.float32)
+        return pa.FixedSizeListArray.from_arrays(pa.array(flat), embedding_dim)
     raise ValueError(f"unknown overlay benchmark dtype {dtype!r}")
 
 
@@ -51,16 +58,19 @@ def make_base_dataset(
     dtype: str,
     version: str,
     payload_dim: int = 0,
+    embedding_dim: int = EMBEDDING_DIM,
 ) -> lance.LanceDataset:
     """Create a base dataset with an ``id`` key and a ``val`` payload column.
 
     ``val`` is the column overlays target. ``rows_per_file`` controls the number
-    of fragments (``num_rows // rows_per_file``). When ``payload_dim`` > 0 an
-    extra ``payload`` fixed-size-list float32 column of that width is added,
-    making rows wider so the cost of rewriting whole rows (update / merge_insert)
-    can be compared against overlaying just ``val``.
+    of fragments (``num_rows // rows_per_file``). ``embedding_dim`` sets the width
+    of the ``val`` column when ``dtype`` is ``embedding`` (e.g. 3072 for a wide
+    embedding). When ``payload_dim`` > 0 an extra ``payload`` fixed-size-list
+    float32 column of that width is added, making rows wider so the cost of
+    rewriting whole rows (update / merge_insert) can be compared against
+    overlaying just ``val``.
     """
-    vtype = value_type(dtype)
+    vtype = value_type(dtype, embedding_dim)
     fields = {"id": pa.int64(), "val": vtype}
     if payload_dim:
         fields["payload"] = pa.list_(pa.float32(), payload_dim)
@@ -72,7 +82,7 @@ def make_base_dataset(
         while written < num_rows:
             n = min(rows_per_file, num_rows - written)
             ids = pa.array(range(written, written + n), pa.int64())
-            cols = [ids, _gen_values(dtype, n, rng)]
+            cols = [ids, _gen_values(dtype, n, rng, embedding_dim)]
             if payload_dim:
                 flat = rng.random(n * payload_dim, dtype=np.float32)
                 cols.append(
@@ -122,6 +132,7 @@ def commit_overlay_layers(
     dtype: str,
     *,
     seed: int = 0,
+    embedding_dim: int = EMBEDDING_DIM,
 ) -> lance.LanceDataset:
     """Commit ``num_layers`` overlays on ``val``, each covering the same offsets
     in every fragment so that all layers must be consulted on read (the case
@@ -135,7 +146,7 @@ def commit_overlay_layers(
         groups = []
         for frag in ds.get_fragments():
             offsets = coverage_offsets(frag.count_rows(), fraction, pattern)
-            values = _gen_values(dtype, len(offsets), rng)
+            values = _gen_values(dtype, len(offsets), rng, embedding_dim)
             batch = pa.record_batch([values], names=["val"])
             name = f"overlay_l{layer}_f{frag.fragment_id}.lance"
             path = os.path.join(data_dir, name)

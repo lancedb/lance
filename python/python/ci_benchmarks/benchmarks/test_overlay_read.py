@@ -26,6 +26,13 @@ NUM_ROWS_EMBEDDING = 100_000
 ROWS_PER_FILE = NUM_ROWS  # single fragment: isolates overlay-layer scaling
 TAKE_ROWS = 100
 
+# Wide value column: a 3072-d float32 embedding is 12 KiB/row, ~750x an int32
+# cell. Fewer rows keep the base file to ~1.2 GiB while each cell still dominates
+# read cost, so the merge/interleave a scan pays per overlay layer moves real
+# payload rather than 4-byte integers.
+WIDE_EMBEDDING_DIM = 3072
+NUM_ROWS_WIDE = 100_000
+
 
 def _take_indices(num_rows: int) -> list:
     rng = random.Random(0)
@@ -93,3 +100,45 @@ def test_overlay_read_dtype(benchmark, tmp_path, record_property, workload, dtyp
     ds = make_base_dataset(base, num_rows, num_rows, dtype, "2.1")
     ds = commit_overlay_layers(ds, base, 4, 0.01, "stride", dtype)
     _run_read(benchmark, record_property, base, ds, workload, num_rows)
+
+
+# Mirror test_overlay_read_scaling but on a wide 3072-d embedding column, so the
+# take/scan-vs-layers story can be read for a fat value column rather than a
+# 4-byte one. Pinned to the 2.1 format (v2.0 layer scaling is already covered by
+# the narrow scan above; the wide-column question is about per-layer payload).
+@pytest.mark.parametrize("workload", ["take", "scan"])
+@pytest.mark.parametrize("num_overlays", [0, 4, 16])
+@pytest.mark.parametrize(
+    "fraction,pattern",
+    [(0.01, "contiguous"), (0.01, "stride")],
+    ids=["1pct-contiguous", "1pct-stride"],
+)
+def test_overlay_read_wide(
+    benchmark,
+    tmp_path,
+    record_property,
+    workload,
+    num_overlays,
+    fraction,
+    pattern,
+):
+    base = str(tmp_path / "ds")
+    ds = make_base_dataset(
+        base,
+        NUM_ROWS_WIDE,
+        NUM_ROWS_WIDE,
+        "embedding",
+        "2.1",
+        embedding_dim=WIDE_EMBEDDING_DIM,
+    )
+    if num_overlays:
+        ds = commit_overlay_layers(
+            ds,
+            base,
+            num_overlays,
+            fraction,
+            pattern,
+            "embedding",
+            embedding_dim=WIDE_EMBEDDING_DIM,
+        )
+    _run_read(benchmark, record_property, base, ds, workload, NUM_ROWS_WIDE)

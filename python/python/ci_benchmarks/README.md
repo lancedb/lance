@@ -104,7 +104,8 @@ is needed:
 - `test_overlay_write.py` — bytes written updating 1% of a column via an overlay vs.
   `update` / `merge_insert` / full rewrite.
 - `test_overlay_read.py` — take and scan time + cold read IO as overlay layers,
-  coverage fraction, fragmentation, and data type vary.
+  coverage fraction, fragmentation, and value width (narrow `int32` vs. a wide
+  3072-d embedding) vary.
 
 ```bash
 pytest python/ci_benchmarks/benchmarks/test_overlay_read.py -s
