@@ -9,6 +9,7 @@ BLOOMFILTER, JSON, FTS) created with one version of Lance can be read
 and written by other versions.
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -140,6 +141,8 @@ class BitmapLabelListIndex(UpgradeDowngradeTest):
 class NgramIndex(UpgradeDowngradeTest):
     """Test NGRAM index compatibility (introduced in 0.36.0)."""
 
+    EXPECT_INDEX_ENV = "LANCE_COMPAT_EXPECT_NGRAM_INDEX"
+
     def __init__(self, path: Path):
         self.path = path
 
@@ -167,9 +170,12 @@ class NgramIndex(UpgradeDowngradeTest):
         # word7, word70-79, word700-799 = 111 results
         assert table.num_rows == 111
 
-        # Verify index is used
-        explain = ds.scanner(filter="contains(ngram, 'word7')").explain_plan()
-        assert "ScalarIndexQuery" in explain
+        if os.environ.get(self.EXPECT_INDEX_ENV) == "1":
+            # Verify the current runtime still uses readable NGRAM indices. Older
+            # compatibility runtimes may ignore newer on-disk index versions and
+            # fall back to filtered scans.
+            explain = ds.scanner(filter="contains(ngram, 'word7')").explain_plan()
+            assert "ScalarIndexQuery" in explain
 
     def check_write(self):
         """Verify can insert data and optimize NGRAM index."""
@@ -183,6 +189,11 @@ class NgramIndex(UpgradeDowngradeTest):
         ds.insert(data)
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
+
+    def current_env(self, method_name: str):
+        if method_name == "check_read":
+            return {self.EXPECT_INDEX_ENV: "1"}
+        return {}
 
 
 @compat_test(min_version="0.36.0")
