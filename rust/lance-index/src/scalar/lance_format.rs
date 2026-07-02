@@ -51,9 +51,12 @@ pub struct LanceIndexStore {
 
 impl DeepSizeOf for LanceIndexStore {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // Exclude the shared, session-scoped `metadata_cache` (accounted once by
+        // `Session::deep_size_of_children`): it is not this store's own footprint, and
+        // sizing it here makes every opened index that holds a store report the whole
+        // cache as its own bytes — inflating and N-times double-counting it.
         self.object_store.deep_size_of_children(context)
             + self.index_dir.as_ref().deep_size_of_children(context)
-            + self.metadata_cache.deep_size_of_children(context)
     }
 }
 
@@ -604,6 +607,46 @@ mod tests {
             128 * 1024 * 1024,
         ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+    }
+
+    #[tokio::test]
+    async fn test_store_deep_size_excludes_metadata_cache() {
+        // The metadata cache is session-scoped and shared; a store must not count
+        // it as its own footprint, so growing the cache must not change store size.
+        struct BlobKey;
+        impl lance_core::cache::CacheKey for BlobKey {
+            type ValueType = Vec<u8>;
+            fn key(&self) -> std::borrow::Cow<'_, str> {
+                std::borrow::Cow::Borrowed("blob")
+            }
+            fn type_name() -> &'static str {
+                "Vec<u8>"
+            }
+        }
+
+        let index_dir = TempDir::default();
+        let test_path = index_dir.obj_path();
+        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
+        let store = LanceIndexStore::new(object_store, test_path, cache.clone());
+
+        let before = store.deep_size_of();
+        cache
+            .insert_with_key(&BlobKey, Arc::new(vec![0u8; 4 * 1024 * 1024]))
+            .await;
+        // Force moka to commit the write so a cache-inclusive size would grow.
+        let _ = cache.size_bytes().await;
+        let after = store.deep_size_of();
+
+        assert_eq!(
+            before, after,
+            "store deep size must exclude the shared metadata cache"
+        );
     }
 
     async fn train_index(
