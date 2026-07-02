@@ -771,6 +771,7 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column_infos: &mut ColumnInfoIter,
         split_fullzip_pages: bool,
+        fullzip_split_row_alignment: u64,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
@@ -783,6 +784,7 @@ impl CoreFieldDecoderStrategy {
                     self.cache_repetition_index,
                     field,
                     split_fullzip_pages,
+                    fullzip_split_row_alignment,
                 )?,
             );
 
@@ -803,6 +805,7 @@ impl CoreFieldDecoderStrategy {
                             self.cache_repetition_index,
                             field,
                             split_fullzip_pages,
+                            fullzip_split_row_alignment,
                         )?,
                     );
 
@@ -830,6 +833,7 @@ impl CoreFieldDecoderStrategy {
                                 self.cache_repetition_index,
                                 field,
                                 split_fullzip_pages,
+                                fullzip_split_row_alignment,
                             )?,
                         );
                         column_infos.next_top_level();
@@ -843,6 +847,7 @@ impl CoreFieldDecoderStrategy {
                         field,
                         column_infos,
                         split_fullzip_pages,
+                        fullzip_split_row_alignment,
                     )?;
                     child_schedulers.push(field_scheduler);
                 }
@@ -859,6 +864,7 @@ impl CoreFieldDecoderStrategy {
                     child,
                     column_infos,
                     split_fullzip_pages,
+                    fullzip_split_row_alignment,
                 )?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
@@ -866,11 +872,23 @@ impl CoreFieldDecoderStrategy {
             DataType::FixedSizeList(inner, dimension)
                 if matches!(inner.data_type(), DataType::Struct(_)) =>
             {
+                let child_split_row_alignment = fullzip_split_row_alignment
+                    .checked_mul(*dimension as u64)
+                    .ok_or_else(|| {
+                        Error::invalid_input_source(
+                            format!(
+                                "FixedSizeList dimension {} overflows fullzip split row alignment {}",
+                                dimension, fullzip_split_row_alignment
+                            )
+                            .into(),
+                        )
+                    })?;
                 let child = field.children.first().expect_ok()?;
                 let child_scheduler = self.create_structural_field_scheduler(
                     child,
                     column_infos,
                     split_fullzip_pages,
+                    child_split_row_alignment,
                 )?;
                 Ok(Box::new(StructuralFixedSizeListScheduler::new(
                     child_scheduler,
@@ -889,6 +907,7 @@ impl CoreFieldDecoderStrategy {
                     entries_child,
                     column_infos,
                     split_fullzip_pages,
+                    fullzip_split_row_alignment,
                 )?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
@@ -1157,6 +1176,7 @@ impl DecodeBatchScheduler {
                 &root_field,
                 &mut column_iter,
                 split_fullzip_pages,
+                1,
             )?;
 
             let context = SchedulerContext::new(io, cache.clone());
@@ -1729,10 +1749,6 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
                         self.root_decoder
                             .accept_message(RootDecoderMessage::LoadedPage(loaded_page))?;
                     }
-                    MessageType::LoadedPage(loaded_page) => {
-                        self.root_decoder
-                            .accept_message(RootDecoderMessage::LoadedPage(loaded_page))?;
-                    }
                     MessageType::DecoderReady(decoder_ready) => {
                         // The root decoder we can ignore
                         if !decoder_ready.path.is_empty() {
@@ -1927,9 +1943,6 @@ impl StructuralBatchDecodeStream {
                         match message {
                             MessageType::UnloadedPage(unloaded_page) => {
                                 let loaded_page = unloaded_page.0.await?;
-                                self.root_decoder.accept_page(loaded_page)?;
-                            }
-                            MessageType::LoadedPage(loaded_page) => {
                                 self.root_decoder.accept_page(loaded_page)?;
                             }
                             MessageType::DecoderReady(_) => {
@@ -2216,47 +2229,78 @@ pub fn create_decode_stream(
 
 async fn load_structural_decoder_message(
     message: Result<DecoderMessage>,
-    loaded_page_permits: Arc<Semaphore>,
+    loaded_message_permits: Arc<Semaphore>,
 ) -> Result<DecoderMessage> {
     let message = message?;
-    let mut decoders = try_join_all(
+    let has_page = message
+        .decoders
+        .iter()
+        .any(|message| matches!(message, MessageType::UnloadedPage(_)));
+    let mut load_permit = if has_page {
+        // Limit pre-accept loaded messages, not pages or total decoded bytes.
+        // A single structural scan line can contain more pages than the
+        // loader depth and must not self-deadlock.
+        Some(
+            loaded_message_permits
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::internal("structural page load limiter unexpectedly closed"))?,
+        )
+    } else {
+        None
+    };
+    let decoders = try_join_all(
         message
             .decoders
             .into_iter()
             .map(load_structural_message_type),
     )
     .await?;
-    if decoders
-        .iter()
-        .any(|message| matches!(message, MessageType::LoadedPage(_)))
-    {
-        // Limit loaded messages, not pages. A single structural scan line can
-        // contain more pages than the loader depth and must not self-deadlock.
-        let permit = loaded_page_permits
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::internal("structural page load limiter unexpectedly closed"))?;
-        if let Some(MessageType::LoadedPage(loaded_page)) = decoders
-            .iter_mut()
-            .find(|message| matches!(message, MessageType::LoadedPage(_)))
-        {
-            loaded_page.load_permit = Some(permit);
-        }
-    }
+    let decoders = decoders
+        .into_iter()
+        .map(|message| loaded_structural_message_to_message(message, &mut load_permit))
+        .collect();
     Ok(DecoderMessage {
         scheduled_so_far: message.scheduled_so_far,
         decoders,
     })
 }
 
-async fn load_structural_message_type(message: MessageType) -> Result<MessageType> {
+enum LoadedStructuralMessageType {
+    DecoderReady(crate::previous::decoder::DecoderReady),
+    LoadedPage(LoadedPageShard),
+}
+
+async fn load_structural_message_type(message: MessageType) -> Result<LoadedStructuralMessageType> {
     match message {
         MessageType::UnloadedPage(unloaded_page) => {
             let loaded_page = unloaded_page.0.await?;
-            Ok(MessageType::LoadedPage(loaded_page))
+            Ok(LoadedStructuralMessageType::LoadedPage(loaded_page))
         }
-        MessageType::LoadedPage(loaded_page) => Ok(MessageType::LoadedPage(loaded_page)),
-        MessageType::DecoderReady(decoder_ready) => Ok(MessageType::DecoderReady(decoder_ready)),
+        MessageType::DecoderReady(decoder_ready) => {
+            Ok(LoadedStructuralMessageType::DecoderReady(decoder_ready))
+        }
+    }
+}
+
+fn loaded_structural_message_to_message(
+    message: LoadedStructuralMessageType,
+    load_permit: &mut Option<OwnedSemaphorePermit>,
+) -> MessageType {
+    match message {
+        LoadedStructuralMessageType::DecoderReady(decoder_ready) => {
+            MessageType::DecoderReady(decoder_ready)
+        }
+        LoadedStructuralMessageType::LoadedPage(loaded_page) => {
+            let load_permit = load_permit.take();
+            MessageType::UnloadedPage(UnloadedPageShard(
+                async move {
+                    let _load_permit = load_permit;
+                    Ok(loaded_page)
+                }
+                .boxed(),
+            ))
+        }
     }
 }
 
@@ -2264,8 +2308,16 @@ fn spawn_structural_page_loader(
     source: mpsc::Receiver<Result<DecoderMessage>>,
     sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_structural_page_loader_with_load_ahead(source, sink, structural_page_load_ahead().max(1))
+}
+
+fn spawn_structural_page_loader_with_load_ahead(
+    source: mpsc::Receiver<Result<DecoderMessage>>,
+    sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
+    load_ahead: usize,
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn(async move {
-        let load_ahead = structural_page_load_ahead().max(1);
+        let load_ahead = load_ahead.max(1);
         let loaded_page_permits = Arc::new(Semaphore::new(load_ahead));
         let loaded = stream::unfold(source, |mut source| async move {
             source.recv().await.map(|message| (message, source))
@@ -3004,15 +3056,13 @@ pub enum MessageType {
     // order and the message is an unloaded decoder.  These can be awaited, in order, and
     // the decoder does not have to worry about waiting for I/O.
     UnloadedPage(UnloadedPageShard),
-    // A structural page that has been loaded by the async page-load prefetcher.
-    LoadedPage(LoadedPageShard),
 }
 
 impl MessageType {
     pub fn into_legacy(self) -> crate::previous::decoder::DecoderReady {
         match self {
             Self::DecoderReady(decoder) => decoder,
-            Self::UnloadedPage(_) | Self::LoadedPage(_) => {
+            Self::UnloadedPage(_) => {
                 panic!("Expected DecoderReady but got structural page")
             }
         }
@@ -3021,9 +3071,6 @@ impl MessageType {
     pub fn into_structural(self) -> UnloadedPageShard {
         match self {
             Self::UnloadedPage(unloaded) => unloaded,
-            Self::LoadedPage(_) => {
-                panic!("Expected UnloadedPage but got LoadedPage")
-            }
             Self::DecoderReady(_) => {
                 panic!("Expected UnloadedPage but got DecoderReady")
             }
@@ -3084,7 +3131,6 @@ pub struct LoadedPageShard {
     // handled through indirect I/O at the moment and so they don't
     // need to be represented (yet)
     pub path: VecDeque<u32>,
-    pub(crate) load_permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct DecodedArray {
@@ -3189,7 +3235,7 @@ mod tests {
 
         let mut structural_columns = ColumnInfoIter::new(vec![], &[]);
         let err = strategy
-            .create_structural_field_scheduler(&field, &mut structural_columns, false)
+            .create_structural_field_scheduler(&field, &mut structural_columns, false, 1)
             .unwrap_err();
         assert!(
             err.to_string()
@@ -3213,6 +3259,86 @@ mod tests {
                 .contains("dimension must be a positive integer"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fullzip_split_preserves_fsl_struct_row_contract() {
+        let dimension = 3_i32;
+        // The default fullzip split target is 8MiB. For Int32 this is
+        // 2,097,152 child rows, which is not divisible by dimension 3.
+        let aligned_child_rows_per_chunk = 2_097_150_u64;
+        let child_rows = aligned_child_rows_per_chunk * 2;
+        let parent_rows = child_rows / dimension as u64;
+
+        let item_struct = DataType::Struct(Fields::from(vec![Arc::new(ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        ))]));
+        let fsl_type = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", item_struct, false)),
+            dimension,
+        );
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("values", fsl_type, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let page_layout = crate::format::ProtobufUtils21::fixed_full_zip_layout(
+            0,
+            0,
+            32,
+            crate::format::ProtobufUtils21::flat(32, None),
+            &[crate::repdef::DefinitionInterpretation::AllValidItem],
+            child_rows as u32,
+            child_rows as u32,
+        );
+        let page_info = PageInfo {
+            num_rows: child_rows,
+            priority: 0,
+            encoding: PageEncoding::Structural(page_layout),
+            buffer_offsets_and_sizes: Arc::from([(0, child_rows * 4)]),
+        };
+        let column_info = Arc::new(ColumnInfo::new(
+            0,
+            Arc::from([page_info]),
+            vec![],
+            pb::ColumnEncoding {
+                column_encoding: Some(column_encoding::ColumnEncoding::Values(())),
+            },
+        ));
+        let io = Arc::new(BufferScheduler::new(Bytes::new())) as Arc<dyn EncodingsIo>;
+        let cache = Arc::new(LanceCache::no_cache());
+        let mut scheduler = DecodeBatchScheduler::try_new_with_fullzip_page_splitting(
+            &schema,
+            &[0],
+            &[column_info],
+            &vec![],
+            parent_rows,
+            Arc::new(DecoderPlugins::default()),
+            io.clone(),
+            cache,
+            &FilterExpression::no_filter(),
+            &DecoderConfig::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let messages = scheduler
+            .schedule_ranges_to_vec(&[0..parent_rows], &FilterExpression::no_filter(), io, None)
+            .unwrap();
+
+        assert!(
+            messages.len() > 1,
+            "test must exercise the split fullzip path"
+        );
+        assert_eq!(messages.last().unwrap().scheduled_so_far, parent_rows);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.scheduled_so_far)
+                .collect::<Vec<_>>(),
+            vec![aligned_child_rows_per_chunk / dimension as u64, parent_rows]
         );
     }
 
@@ -3277,20 +3403,27 @@ mod tests {
         }
     }
 
+    fn test_path(path: u32) -> VecDeque<u32> {
+        VecDeque::from([path])
+    }
+
+    fn test_loaded_page(path: VecDeque<u32>) -> LoadedPageShard {
+        LoadedPageShard {
+            decoder: Box::new(TestPageDecoder),
+            path,
+        }
+    }
+
+    fn ready_test_page(path: u32) -> MessageType {
+        MessageType::UnloadedPage(UnloadedPageShard(
+            async move { Ok(test_loaded_page(test_path(path))) }.boxed(),
+        ))
+    }
+
     #[tokio::test]
-    async fn test_load_structural_decoder_message_marks_loaded_pages() {
-        let mut path = VecDeque::new();
-        path.push_back(0);
-        let unloaded_page = UnloadedPageShard(
-            async move {
-                Ok(LoadedPageShard {
-                    decoder: Box::new(TestPageDecoder),
-                    path,
-                    load_permit: None,
-                })
-            }
-            .boxed(),
-        );
+    async fn test_load_structural_decoder_message_holds_permit_until_consumed() {
+        let path = test_path(0);
+        let unloaded_page = UnloadedPageShard(async move { Ok(test_loaded_page(path)) }.boxed());
         let permits = Arc::new(Semaphore::new(1));
         let message = load_structural_decoder_message(
             Ok(DecoderMessage {
@@ -3305,12 +3438,192 @@ mod tests {
         assert_eq!(message.scheduled_so_far, 10);
         assert_eq!(permits.available_permits(), 0);
         match message.decoders.into_iter().next().unwrap() {
-            MessageType::LoadedPage(loaded_page) => {
-                assert!(loaded_page.load_permit.is_some());
+            MessageType::UnloadedPage(loaded_page) => {
+                let loaded_page = loaded_page.0.await.unwrap();
+                assert_eq!(loaded_page.path, test_path(0));
             }
-            other => panic!("expected loaded page, got {other:?}"),
+            other => panic!("expected unloaded page, got {other:?}"),
         }
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_structural_page_loader_preserves_ordered_delivery() {
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let (release_first_tx, release_first_rx) = oneshot::channel::<()>();
+        let (second_polled_tx, second_polled_rx) = oneshot::channel::<()>();
+
+        let first = MessageType::UnloadedPage(UnloadedPageShard(
+            async move {
+                release_first_rx.await.map_err(|err| {
+                    Error::internal(format!("test release channel dropped: {err}"))
+                })?;
+                Ok(test_loaded_page(test_path(1)))
+            }
+            .boxed(),
+        ));
+        let second = MessageType::UnloadedPage(UnloadedPageShard(
+            async move {
+                let _ = second_polled_tx.send(());
+                Ok(test_loaded_page(test_path(2)))
+            }
+            .boxed(),
+        ));
+
+        let loader = spawn_structural_page_loader_with_load_ahead(source_rx, sink_tx, 2);
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 1,
+                decoders: vec![first],
+            }))
+            .await
+            .unwrap();
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 2,
+                decoders: vec![second],
+            }))
+            .await
+            .unwrap();
+        drop(source_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_polled_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), sink_rx.recv())
+                .await
+                .is_err()
+        );
+
+        release_first_tx.send(()).unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.scheduled_so_far, 1);
+        assert_eq!(second.scheduled_so_far, 2);
+        let first_page = first
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        let second_page = second
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        assert_eq!(first_page.path, test_path(1));
+        assert_eq!(second_page.path, test_path(2));
+        loader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_structural_page_loader_forwards_load_errors() {
+        let (source_tx, source_rx) = mpsc::channel(1);
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        let failing_page = MessageType::UnloadedPage(UnloadedPageShard(
+            async move { Err(Error::internal("test structural page load failure")) }.boxed(),
+        ));
+
+        let loader = spawn_structural_page_loader_with_load_ahead(source_rx, sink_tx, 1);
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 1,
+                decoders: vec![failing_page],
+            }))
+            .await
+            .unwrap();
+        drop(source_tx);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Err(err) = err else {
+            panic!("expected structural page load error")
+        };
+        assert!(
+            err.to_string()
+                .contains("test structural page load failure")
+        );
+        assert!(sink_rx.recv().await.is_none());
+        loader.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_structural_page_loader_load_ahead_one_delivers_messages() {
+        let (source_tx, source_rx) = mpsc::channel(2);
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+
+        let loader = spawn_structural_page_loader_with_load_ahead(source_rx, sink_tx, 1);
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 1,
+                decoders: vec![ready_test_page(1)],
+            }))
+            .await
+            .unwrap();
+        source_tx
+            .send(Ok(DecoderMessage {
+                scheduled_so_far: 2,
+                decoders: vec![ready_test_page(2)],
+            }))
+            .await
+            .unwrap();
+        drop(source_tx);
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.scheduled_so_far, 1);
+        let first_page = first
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        assert_eq!(first_page.path, test_path(1));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sink_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.scheduled_so_far, 2);
+        let second_page = second
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_structural()
+            .0
+            .await
+            .unwrap();
+        assert_eq!(second_page.path, test_path(2));
+        assert!(sink_rx.recv().await.is_none());
+        loader.await.unwrap();
     }
 
     #[tokio::test]
@@ -3355,7 +3668,7 @@ mod tests {
         ));
         let stream = schedule_and_decode(
             encoded.page_table.clone(),
-            RequestedRows::Ranges(vec![0..encoded.num_rows]),
+            RequestedRows::Ranges(vec![0_u64..128, 256..384]),
             FilterExpression::no_filter(),
             encoded.top_level_columns.clone(),
             encoded.schema.clone(),
@@ -3382,8 +3695,22 @@ mod tests {
         let actual =
             arrow_select::concat::concat_batches(&input_batch.schema(), batch_refs.iter().copied())
                 .unwrap();
-        assert_eq!(actual.column(0).as_ref(), input_batch.column(0).as_ref());
-        assert_eq!(actual.column(1).as_ref(), input_batch.column(1).as_ref());
+        let expected_values = (0..128).chain(256..384).collect::<Vec<i32>>();
+        let expected_batch = RecordBatch::try_new(
+            input_batch.schema(),
+            vec![
+                Arc::new(Int32Array::from(expected_values.clone())) as ArrayRef,
+                Arc::new(Int32Array::from(
+                    expected_values
+                        .into_iter()
+                        .map(|value| value * 10)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        assert_eq!(actual.column(0).as_ref(), expected_batch.column(0).as_ref());
+        assert_eq!(actual.column(1).as_ref(), expected_batch.column(1).as_ref());
     }
 
     /// Helper: encode a batch, then decode it as a stream with optional
