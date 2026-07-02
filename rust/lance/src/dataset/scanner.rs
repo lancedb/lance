@@ -2893,7 +2893,10 @@ impl Scanner {
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
             .with_projection(projection)
-            .with_ordered_output(ordered_output);
+            .with_ordered_output(ordered_output)
+            .with_high_bandwidth_scan(
+                !ordered_output && self.ordering.is_none() && self.nearest.is_none(),
+            );
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
@@ -12287,6 +12290,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert!(filtered.options().ordered_output);
+        assert!(!filtered.options().high_bandwidth_scan_enabled());
 
         // Actually read the data to ensure version columns are materialized
         let batches = scanner
@@ -12432,6 +12436,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert!(filtered.options().ordered_output);
+        assert!(!filtered.options().high_bandwidth_scan_enabled());
 
         let mut scanner = dataset.scan();
         scanner.scan_in_order(false);
@@ -12439,6 +12444,62 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert!(!filtered.options().ordered_output);
+        assert!(filtered.options().high_bandwidth_scan_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_high_bandwidth_scan_not_enabled_for_order_by_or_nearest() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(4)),
+            )
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(
+            data,
+            "memory://test_high_bandwidth_scan_not_enabled_for_order_by_or_nearest",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut ordered_scan = dataset.scan();
+        ordered_scan
+            .order_by(Some(vec![ColumnOrdering {
+                column_name: "x".to_string(),
+                ascending: true,
+                nulls_first: true,
+            }]))
+            .unwrap();
+        let plan = ordered_scan.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the order_by scan plan");
+        assert!(!filtered.options().ordered_output);
+        assert!(!filtered.options().high_bandwidth_scan_enabled());
+
+        let query = Float32Array::from(vec![0.0, 0.0, 0.0, 0.0]);
+        let mut nearest_scan = dataset.scan();
+        nearest_scan.nearest("vec", &query, 1).unwrap();
+        let plan = nearest_scan.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the nearest scan plan");
+        assert!(!filtered.options().ordered_output);
+        assert!(!filtered.options().high_bandwidth_scan_enabled());
+    }
+
+    #[tokio::test]
+    async fn test_batch_readahead_does_not_set_execution_target_partition() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_batch_readahead_target_partition", None)
+            .await
+            .unwrap();
+
+        let mut scanner = dataset.scan();
+        scanner.batch_readahead(17);
+        assert_eq!(scanner.execution_options().target_partition, None);
     }
 
     // The env var key scopes serial_test's lock so this test only blocks others

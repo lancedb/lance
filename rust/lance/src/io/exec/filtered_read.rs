@@ -30,7 +30,8 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::parse::str_is_truthy;
+use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus};
 use lance_core::{Error, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
@@ -54,11 +55,159 @@ use crate::Dataset;
 use crate::dataset::fragment::{FileFragment, FragReadConfig};
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
-    BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size,
-    get_default_io_buffer_size_override,
+    BATCH_SIZE_FALLBACK, get_default_batch_size, get_default_io_buffer_size_override,
 };
 
 use super::utils::IoMetrics;
+
+const ENV_LANCE_DEFAULT_FRAGMENT_READAHEAD: &str = "LANCE_DEFAULT_FRAGMENT_READAHEAD";
+const ENV_LANCE_HIGH_BANDWIDTH_SCAN: &str = "LANCE_HIGH_BANDWIDTH_SCAN";
+const ENV_LANCE_IO_THREADS: &str = "LANCE_IO_THREADS";
+const HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS: usize = 16;
+const HIGH_BANDWIDTH_SCAN_MIN_ROWS: u64 = 64 * 1024 * 1024;
+const HIGH_BANDWIDTH_SCAN_IO_PER_CPU: usize = 4;
+const HIGH_BANDWIDTH_SCAN_MAX_IO_PARALLELISM: usize = 512;
+const HIGH_BANDWIDTH_SCAN_TARGET_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+
+fn is_high_bandwidth_scan_candidate(
+    enable_high_bandwidth_scan: bool,
+    is_cloud_store: bool,
+    ordered_output: bool,
+    planned_fragment_count: usize,
+    planned_row_count: u64,
+) -> bool {
+    enable_high_bandwidth_scan
+        && high_bandwidth_scan_policy_enabled()
+        && is_cloud_store
+        && !ordered_output
+        && planned_fragment_count >= HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS
+        && planned_row_count >= HIGH_BANDWIDTH_SCAN_MIN_ROWS
+}
+
+fn effective_high_bandwidth_scan_row_count(
+    planned_row_count: u64,
+    scan_range_after_filter: Option<&Range<u64>>,
+) -> u64 {
+    scan_range_after_filter
+        .map(|range| range.end.saturating_sub(range.start).min(planned_row_count))
+        .unwrap_or(planned_row_count)
+}
+
+fn high_bandwidth_scan_policy_enabled() -> bool {
+    std::env::var(ENV_LANCE_HIGH_BANDWIDTH_SCAN)
+        .ok()
+        .map(|value| str_is_truthy(value.trim()))
+        .unwrap_or(true)
+}
+
+fn explicit_io_parallelism_override() -> Option<usize> {
+    std::env::var(ENV_LANCE_IO_THREADS)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.max(1))
+}
+
+fn high_bandwidth_scan_parallelism_cap(
+    target_partitions_cap: Option<usize>,
+    io_parallelism_cap: Option<usize>,
+) -> Option<usize> {
+    match (target_partitions_cap, io_parallelism_cap) {
+        (Some(target), Some(io)) => Some(target.min(io).max(1)),
+        (Some(target), None) => Some(target.max(1)),
+        (None, Some(io)) => Some(io.max(1)),
+        (None, None) => None,
+    }
+}
+
+pub(crate) fn high_bandwidth_scan_parallelism_target(
+    base_parallelism: usize,
+    parallelism_cap: Option<usize>,
+) -> usize {
+    let base_parallelism = base_parallelism.max(1);
+    let total_runtime_threads =
+        get_num_compute_intensive_cpus().saturating_add(*IO_CORE_RESERVATION);
+    let cpu_scaled_target = total_runtime_threads
+        .saturating_mul(HIGH_BANDWIDTH_SCAN_IO_PER_CPU)
+        .min(HIGH_BANDWIDTH_SCAN_MAX_IO_PARALLELISM);
+    let target = base_parallelism.max(cpu_scaled_target);
+    parallelism_cap
+        .map(|cap| target.min(cap.max(1)))
+        .unwrap_or(target)
+        .max(1)
+}
+
+fn high_bandwidth_scan_io_parallelism(
+    enable_high_bandwidth_scan: bool,
+    is_cloud_store: bool,
+    ordered_output: bool,
+    planned_fragment_count: usize,
+    planned_row_count: u64,
+    base_io_parallelism: usize,
+    parallelism_cap: Option<usize>,
+) -> usize {
+    let base_io_parallelism = base_io_parallelism.max(1);
+    if !is_high_bandwidth_scan_candidate(
+        enable_high_bandwidth_scan,
+        is_cloud_store,
+        ordered_output,
+        planned_fragment_count,
+        planned_row_count,
+    ) {
+        return base_io_parallelism;
+    }
+    high_bandwidth_scan_parallelism_target(base_io_parallelism, parallelism_cap)
+}
+
+fn default_fragment_readahead_for_scan(
+    is_high_bandwidth_candidate: bool,
+    scan_io_parallelism: usize,
+) -> usize {
+    if is_high_bandwidth_candidate {
+        scan_io_parallelism.max(1)
+    } else {
+        scan_io_parallelism.saturating_mul(2).max(1)
+    }
+}
+
+fn default_fragment_readahead_override() -> Option<usize> {
+    std::env::var(ENV_LANCE_DEFAULT_FRAGMENT_READAHEAD)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn apply_high_bandwidth_batch_size_bytes(
+    file_reader_options: &mut Option<FileReaderOptions>,
+    is_high_bandwidth_candidate: bool,
+) {
+    if !is_high_bandwidth_candidate {
+        return;
+    }
+
+    let options = file_reader_options.get_or_insert_with(Default::default);
+    if options.batch_size_bytes.is_none() {
+        options.batch_size_bytes = Some(HIGH_BANDWIDTH_SCAN_TARGET_BATCH_BYTES);
+    }
+}
+
+fn high_bandwidth_scan_threading_mode(
+    threading_mode: FilteredReadThreadingMode,
+    is_high_bandwidth_candidate: bool,
+    scan_io_parallelism: usize,
+) -> FilteredReadThreadingMode {
+    if !is_high_bandwidth_candidate {
+        return threading_mode;
+    }
+
+    match threading_mode {
+        FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(
+                num_threads.max(scan_io_parallelism).max(1),
+            )
+        }
+        FilteredReadThreadingMode::MultiplePartitions(_) => threading_mode,
+    }
+}
 
 #[derive(Debug)]
 pub struct EvaluatedIndex {
@@ -393,24 +542,60 @@ impl FilteredReadStream {
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
 
-        let threading_mode = options.threading_mode;
-
-        let io_parallelism = dataset.object_store.io_parallelism();
-        let fragment_readahead = options
-            .fragment_readahead
-            .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
-            .max(1);
-
         let fragments = options
             .fragments
             .clone()
             .unwrap_or_else(|| dataset.fragments().clone());
 
+        let io_parallelism = dataset.object_store.io_parallelism();
+        let planned_fragment_count = plan.planned_fragment_count();
+        let planned_row_count = effective_high_bandwidth_scan_row_count(
+            plan.planned_row_count(),
+            plan.scan_range_after_filter.as_ref(),
+        );
+        let high_bandwidth_parallelism_cap = high_bandwidth_scan_parallelism_cap(
+            options.high_bandwidth_scan_parallelism_cap,
+            explicit_io_parallelism_override(),
+        );
+        let is_high_bandwidth_candidate = is_high_bandwidth_scan_candidate(
+            options.enable_high_bandwidth_scan,
+            dataset.object_store.is_cloud(),
+            options.ordered_output,
+            planned_fragment_count,
+            planned_row_count,
+        );
+        let scan_io_parallelism = high_bandwidth_scan_io_parallelism(
+            options.enable_high_bandwidth_scan,
+            dataset.object_store.is_cloud(),
+            options.ordered_output,
+            planned_fragment_count,
+            planned_row_count,
+            io_parallelism,
+            high_bandwidth_parallelism_cap,
+        );
+        let threading_mode = high_bandwidth_scan_threading_mode(
+            options.threading_mode,
+            is_high_bandwidth_candidate,
+            scan_io_parallelism,
+        );
+        let fragment_readahead = options
+            .fragment_readahead
+            .unwrap_or_else(|| {
+                default_fragment_readahead_override().unwrap_or_else(|| {
+                    default_fragment_readahead_for_scan(
+                        is_high_bandwidth_candidate,
+                        scan_io_parallelism,
+                    )
+                })
+            })
+            .max(1);
+
         log::debug!(
-            "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
+            "Filtered read on {} fragments with frag_readahead={}, io_parallelism={}, scan_io_parallelism={}",
             fragments.len(),
             fragment_readahead,
-            io_parallelism
+            io_parallelism,
+            scan_io_parallelism
         );
 
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
@@ -427,7 +612,7 @@ impl FilteredReadStream {
             .collect::<Vec<_>>();
         let loaded_fragments = futures::stream::iter(frag_futs)
             // Cannot use unordered because we need to populate logical_offset based on user-provided order
-            .try_buffered(io_parallelism)
+            .try_buffered(scan_io_parallelism)
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -441,10 +626,20 @@ impl FilteredReadStream {
             .or_else(get_default_io_buffer_size_override)
         {
             SchedulerConfig::new(io_buffer_size_bytes)
+        } else if is_high_bandwidth_candidate {
+            SchedulerConfig::max_bandwidth_for_io_parallelism(scan_io_parallelism)
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
-        let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
+        let scan_scheduler = if is_high_bandwidth_candidate {
+            ScanScheduler::new_with_io_capacity(
+                obj_store,
+                scheduler_config,
+                Some(scan_io_parallelism),
+            )
+        } else {
+            ScanScheduler::new(obj_store, scheduler_config)
+        };
         if let Some(callback) = options.scan_scheduler_diagnostics_callback.as_ref() {
             callback.notify(ScanSchedulerDiagnosticsHandle::new(scan_scheduler.clone()));
         }
@@ -453,6 +648,11 @@ impl FilteredReadStream {
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
 
         // Convert plan to scoped fragments for I/O
+        let mut options = options;
+        apply_high_bandwidth_batch_size_bytes(
+            &mut options.file_reader_options,
+            is_high_bandwidth_candidate,
+        );
         let scoped_fragments = Self::plan_to_scoped_fragments(
             &plan,
             &loaded_fragments,
@@ -1359,6 +1559,17 @@ pub struct FilteredReadOptions {
     pub scan_scheduler_diagnostics_callback: Option<ScanSchedulerDiagnosticsCallback>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
+    /// If true, large cloud unordered scans may opt into the high-bandwidth policy.
+    ///
+    /// This is intentionally separate from `ordered_output`: `order_by` and `nearest`
+    /// also make the physical scan unordered, but they are not plain throughput scans.
+    enable_high_bandwidth_scan: bool,
+    /// Upper bound for automatic high-bandwidth parallelism.
+    ///
+    /// `target_partitions` sets this when callers explicitly constrain DataFusion
+    /// execution parallelism. `LANCE_IO_THREADS` is checked separately at execution
+    /// time and has the same opt-out effect for I/O parallelism.
+    high_bandwidth_scan_parallelism_cap: Option<usize>,
 }
 
 impl FilteredReadOptions {
@@ -1389,6 +1600,8 @@ impl FilteredReadOptions {
             io_buffer_size_bytes: None,
             scan_scheduler_diagnostics_callback: None,
             only_indexed_fragments: false,
+            enable_high_bandwidth_scan: false,
+            high_bandwidth_scan_parallelism_cap: None,
             ordered_output: true,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
@@ -1493,6 +1706,32 @@ impl FilteredReadOptions {
     pub fn with_ordered_output(mut self, ordered_output: bool) -> Self {
         self.ordered_output = ordered_output;
         self
+    }
+
+    /// Set the threading mode to use for the scan.
+    pub fn with_threading_mode(mut self, threading_mode: FilteredReadThreadingMode) -> Self {
+        self.threading_mode = threading_mode;
+        self
+    }
+
+    /// Allow automatic high-bandwidth behavior for large cloud unordered scans.
+    pub(crate) fn with_high_bandwidth_scan(mut self, enable_high_bandwidth_scan: bool) -> Self {
+        self.enable_high_bandwidth_scan = enable_high_bandwidth_scan;
+        self
+    }
+
+    /// Cap automatic high-bandwidth parallelism.
+    pub(crate) fn with_high_bandwidth_scan_parallelism_cap(
+        mut self,
+        parallelism_cap: Option<usize>,
+    ) -> Self {
+        self.high_bandwidth_scan_parallelism_cap = parallelism_cap.map(|cap| cap.max(1));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn high_bandwidth_scan_enabled(&self) -> bool {
+        self.enable_high_bandwidth_scan
     }
 
     /// Specify the filter plan to use for the scan.
@@ -1622,6 +1861,21 @@ struct FilteredReadInternalPlan {
 }
 
 impl FilteredReadInternalPlan {
+    fn planned_fragment_count(&self) -> usize {
+        self.rows
+            .values()
+            .filter(|ranges| !ranges.is_empty())
+            .count()
+    }
+
+    fn planned_row_count(&self) -> u64 {
+        self.rows
+            .values()
+            .flat_map(|ranges| ranges.iter())
+            .map(|range| range.end - range.start)
+            .sum()
+    }
+
     /// Convert internal plan (ranges) to external plan (bitmap) for distributed execution
     fn to_external_plan(&self) -> FilteredReadPlan {
         let mut rows = RowAddrTreeMap::new();
@@ -1827,6 +2081,7 @@ impl FilteredReadExec {
                 n.min(target_partitions).max(1),
             );
         }
+        options = options.with_high_bandwidth_scan_parallelism_cap(Some(target_partitions.max(1)));
         let batch_size_bytes = options
             .file_reader_options
             .as_ref()
@@ -2241,6 +2496,150 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_high_bandwidth_scan_io_parallelism_requires_cloud_unordered_large_scan() {
+        let base = 8;
+        let boosted = high_bandwidth_scan_io_parallelism(
+            true,
+            true,
+            false,
+            HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+            HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+            base,
+            None,
+        );
+        assert!(boosted >= base);
+        assert_eq!(
+            high_bandwidth_scan_io_parallelism(
+                false,
+                true,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base,
+                None,
+            ),
+            base
+        );
+        assert_eq!(
+            high_bandwidth_scan_io_parallelism(
+                true,
+                false,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base,
+                None,
+            ),
+            base
+        );
+        assert_eq!(
+            high_bandwidth_scan_io_parallelism(
+                true,
+                true,
+                true,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base,
+                None,
+            ),
+            base
+        );
+        assert_eq!(
+            high_bandwidth_scan_io_parallelism(
+                true,
+                true,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS - 1,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base,
+                None,
+            ),
+            base
+        );
+        assert_eq!(
+            high_bandwidth_scan_io_parallelism(
+                true,
+                true,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS - 1,
+                base,
+                None,
+            ),
+            base
+        );
+    }
+
+    #[test]
+    fn test_high_bandwidth_scan_parallelism_respects_explicit_caps() {
+        assert_eq!(
+            high_bandwidth_scan_parallelism_cap(Some(16), None),
+            Some(16)
+        );
+        assert_eq!(
+            high_bandwidth_scan_parallelism_cap(None, Some(12)),
+            Some(12)
+        );
+        assert_eq!(
+            high_bandwidth_scan_parallelism_cap(Some(16), Some(12)),
+            Some(12)
+        );
+        assert_eq!(high_bandwidth_scan_parallelism_cap(None, None), None);
+
+        let base = 64;
+        assert_eq!(
+            high_bandwidth_scan_io_parallelism(
+                true,
+                true,
+                false,
+                HIGH_BANDWIDTH_SCAN_MIN_FRAGMENTS,
+                HIGH_BANDWIDTH_SCAN_MIN_ROWS,
+                base,
+                Some(16),
+            ),
+            16
+        );
+    }
+
+    #[test]
+    fn test_high_bandwidth_scan_row_count_uses_post_filter_range() {
+        assert_eq!(effective_high_bandwidth_scan_row_count(100, None), 100);
+        assert_eq!(
+            effective_high_bandwidth_scan_row_count(100, Some(&(10..30))),
+            20
+        );
+        assert_eq!(
+            effective_high_bandwidth_scan_row_count(100, Some(&(10..1_000))),
+            100
+        );
+    }
+
+    #[test]
+    fn test_default_fragment_readahead_preserves_non_high_bandwidth_fallback() {
+        assert_eq!(default_fragment_readahead_for_scan(false, 128), 256);
+        assert_eq!(default_fragment_readahead_for_scan(true, 128), 128);
+    }
+
+    #[test]
+    fn test_high_bandwidth_scan_threading_only_scales_single_partition_large_scans() {
+        let base_mode = FilteredReadThreadingMode::OnePartitionMultipleThreads(8);
+        assert_eq!(
+            high_bandwidth_scan_threading_mode(base_mode, false, 256),
+            base_mode
+        );
+        assert_eq!(
+            high_bandwidth_scan_threading_mode(base_mode, true, 256),
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(256)
+        );
+
+        let partitioned_mode = FilteredReadThreadingMode::MultiplePartitions(8);
+        assert_eq!(
+            high_bandwidth_scan_threading_mode(partitioned_mode, true, 256),
+            partitioned_mode
+        );
+    }
 
     struct TestFixture {
         _tmp_path: TempStrDir,
