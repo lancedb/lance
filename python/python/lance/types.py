@@ -12,7 +12,7 @@ from . import dataset
 from .dependencies import (
     _check_for_hugging_face,
     _check_for_pandas,
-    _check_for_pydantic,
+    _is_pydantic_base_model,
 )
 from .dependencies import pandas as pd
 
@@ -151,17 +151,14 @@ def _coerce_reader(
     elif (
         isinstance(data_obj, list)
         and len(data_obj) > 0
-        and _check_for_pydantic(data_obj[0])
+        and _is_pydantic_base_model(data_obj[0])
     ):
-        from pydantic import BaseModel
-
-        if isinstance(data_obj[0], BaseModel):
-            dicts = [
-                item.model_dump() if hasattr(item, "model_dump") else item.dict()
-                for item in data_obj
-            ]
-            batch = pa.RecordBatch.from_pylist(dicts, schema=schema)
-            return pa.RecordBatchReader.from_batches(batch.schema, [batch])
+        dicts = [
+            item.model_dump() if hasattr(item, "model_dump") else item.dict()
+            for item in data_obj
+        ]
+        batch = pa.RecordBatch.from_pylist(dicts, schema=schema)
+        return pa.RecordBatchReader.from_batches(batch.schema, [batch])
     # for other iterables, assume they are of type Iterable[RecordBatch]
     elif isinstance(data_obj, Iterable):
         if schema is not None:

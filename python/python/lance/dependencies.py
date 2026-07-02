@@ -219,6 +219,14 @@ def _check_for_pydantic(obj: Any, *, check_type: bool = True) -> bool:
     )
 
 
+def _is_pydantic_base_model(obj: Any) -> bool:
+    if not _PYDANTIC_AVAILABLE:
+        return False
+    from pydantic import BaseModel
+
+    return isinstance(obj, BaseModel)
+
+
 __all__ = [
     # lazy-load third party libs
     "datasets",
@@ -233,6 +241,7 @@ __all__ = [
     "_check_for_polars",
     "_check_for_pydantic",
     "_check_for_torch",
+    "_is_pydantic_base_model",
     "_LazyModule",
     # exported flags/guards
     "_NUMPY_AVAILABLE",
