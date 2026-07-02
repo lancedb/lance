@@ -3670,13 +3670,17 @@ class LanceDataset(pa.dataset.Dataset):
                 if _check_for_numpy(pq_codebook) and isinstance(
                     pq_codebook, np.ndarray
                 ):
+                    num_bits = kwargs.get("num_bits", 8)
+                    expected_centroids = 2**num_bits
                     if (
                         len(pq_codebook.shape) != 3
                         or pq_codebook.shape[0] != num_sub_vectors
-                        or pq_codebook.shape[1] != 256
+                        or pq_codebook.shape[1] != expected_centroids
                     ):
                         raise ValueError(
-                            f"PQ codebook must be 3D array: (sub_vectors, 256, dim), "
+                            "PQ codebook must be 3D array: "
+                            f"(sub_vectors, {expected_centroids}, dim) "
+                            f"for num_bits={num_bits}, "
                             f"got {pq_codebook.shape}"
                         )
                     if pq_codebook.dtype not in [np.float16, np.float32, np.float64]:
@@ -3798,10 +3802,9 @@ class LanceDataset(pa.dataset.Dataset):
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
-            array of K-mean centroids for PQ codebook.
-
-            Note: ``nbits`` is always 8 for now.
+            A ``num_sub_vectors x (2 ^ num_bits) x
+            (dimensions // num_sub_vectors)`` array of K-mean centroids for PQ
+            codebook. ``num_bits`` defaults to 8.
             If not provided, a new PQ model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
