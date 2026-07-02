@@ -1179,10 +1179,21 @@ impl ManifestNamespace {
         index_uuid: Uuid,
     ) -> Result<ManifestTrainedIndex> {
         let index_store = LanceIndexStore::from_dataset_for_new(dataset, &index_uuid)?;
-        let plugin = registry.get_plugin_by_name(&input.params.index_type)?;
-        let training_request = plugin
+        let trainer = registry
+            .get_plugin_by_name(&input.params.index_type)?
+            .basic_trainer()
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.",
+                        input.params.index_type
+                    )
+                    .into(),
+                )
+            })?;
+        let training_request = trainer
             .new_training_request(input.params.params.as_deref().unwrap_or("{}"), &input.field)?;
-        let created_index = plugin
+        let created_index = trainer
             .train_index(
                 input.stream,
                 &index_store,

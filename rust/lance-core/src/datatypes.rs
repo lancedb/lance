@@ -117,7 +117,7 @@ impl LogicalType {
         self.0.starts_with("fixed_size_list:struct:")
     }
 
-    fn is_struct(&self) -> bool {
+    pub fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
 

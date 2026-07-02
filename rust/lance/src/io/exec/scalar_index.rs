@@ -103,7 +103,7 @@ impl ScalarIndexExec {
         ));
         Self {
             dataset,
-            expr,
+            expr: expr.optimize(),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,

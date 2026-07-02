@@ -20,6 +20,12 @@ ICU uses Unicode word boundary rules and bundled dictionary data for complex scr
 ds.create_scalar_index("text", "INVERTED", base_tokenizer="icu")
 ```
 
+Use `icu/split` when mixed-language text also contains punctuation-delimited identifiers that should be searchable by part.
+
+```python
+ds.create_scalar_index("text", "INVERTED", base_tokenizer="icu/split")
+```
+
 ## Language Models of Jieba
 
 ### Downloading the Model

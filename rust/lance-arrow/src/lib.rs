@@ -291,7 +291,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float32Array::from_iter_values(
+                    Arc::new(Float32Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int8Array>()
@@ -299,7 +299,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int8Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f32)),
+                            .map(|x| x.map(|y| y as f32)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -310,7 +310,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float32Array::from_iter_values(
+                    Arc::new(Float32Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int16Array>()
@@ -318,7 +318,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int16Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f32)),
+                            .map(|x| x.map(|y| y as f32)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -329,7 +329,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float32Array::from_iter_values(
+                    Arc::new(Float32Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int32Array>()
@@ -337,7 +337,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int32Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f32)),
+                            .map(|x| x.map(|y| y as f32)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -348,7 +348,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float64Array::from_iter_values(
+                    Arc::new(Float64Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<Int64Array>()
@@ -356,7 +356,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to Int64Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f64)),
+                            .map(|x| x.map(|y| y as f64)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -367,7 +367,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float64Array::from_iter_values(
+                    Arc::new(Float64Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<UInt8Array>()
@@ -375,7 +375,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to UInt8Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f64)),
+                            .map(|x| x.map(|y| y as f64)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -386,7 +386,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                         field.is_nullable(),
                     )),
                     *size,
-                    Arc::new(Float64Array::from_iter_values(
+                    Arc::new(Float64Array::from_iter(
                         self.values()
                             .as_any()
                             .downcast_ref::<UInt32Array>()
@@ -394,7 +394,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
                                 "Fail to cast primitive array to UInt32Type".to_string(),
                             ))?
                             .into_iter()
-                            .filter_map(|x| x.map(|y| y as f64)),
+                            .map(|x| x.map(|y| y as f64)),
                     )),
                     self.nulls().cloned(),
                 )),
@@ -1562,6 +1562,63 @@ mod tests {
     use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
     use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
+
+    #[test]
+    fn test_convert_to_floating_point_preserves_inner_nulls() {
+        // A FixedSizeList<Int8> with a null inner element must convert to a
+        // FixedSizeList<Float32> with the null kept in place. Dropping it would
+        // shorten the values array and shift every later element (and, when the
+        // remaining count is not a multiple of the list size, panic).
+        let values = Int8Array::from(vec![Some(1), None, Some(3), Some(4)]);
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int8, true)),
+            2,
+            Arc::new(values),
+            None,
+        );
+
+        let converted = fsl.convert_to_floating_point().unwrap();
+
+        assert_eq!(converted.len(), 2);
+        let conv_values = converted
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(conv_values.len(), 4);
+        assert_eq!(conv_values.value(0), 1.0);
+        assert!(conv_values.is_null(1));
+        assert_eq!(conv_values.value(2), 3.0);
+        assert_eq!(conv_values.value(3), 4.0);
+    }
+
+    #[test]
+    fn test_convert_to_floating_point_preserves_inner_nulls_f64_arm() {
+        // The Float64-producing arms (Int64/UInt8/UInt32) share the same fix as the
+        // Float32 arms; cover one representative (UInt8 -> Float64) so both branch
+        // families are exercised.
+        let values = UInt8Array::from(vec![Some(10u8), None, Some(30), Some(40)]);
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::UInt8, true)),
+            2,
+            Arc::new(values),
+            None,
+        );
+
+        let converted = fsl.convert_to_floating_point().unwrap();
+
+        assert_eq!(converted.len(), 2);
+        let conv_values = converted
+            .values()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(conv_values.len(), 4);
+        assert_eq!(conv_values.value(0), 10.0);
+        assert!(conv_values.is_null(1));
+        assert_eq!(conv_values.value(2), 30.0);
+        assert_eq!(conv_values.value(3), 40.0);
+    }
 
     #[test]
     fn test_merge_recursive() {
