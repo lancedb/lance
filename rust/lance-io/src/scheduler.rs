@@ -996,6 +996,12 @@ impl FileScheduler {
                 let orig_range = &request[orig_index];
                 let byte_offset = updated_range.start as usize;
 
+                if orig_range.is_empty() {
+                    final_bytes.push(Bytes::new());
+                    orig_index += 1;
+                    continue;
+                }
+
                 if is_overlapping(updated_range, orig_range) {
                     // We need to undo the coalescing and splitting done earlier
                     let start = orig_range.start as usize - byte_offset;
@@ -1275,6 +1281,36 @@ mod tests {
             );
         }
         assert_eq!(11, scheduler.stats().iops);
+    }
+
+    #[tokio::test]
+    async fn test_empty_ranges_preserve_result_order() {
+        let tmp_file = TempObjFile::default();
+
+        let obj_store = Arc::new(ObjectStore::local());
+
+        const DATA_SIZE: u64 = 1024;
+        let some_data = (0..DATA_SIZE).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        obj_store.put(&tmp_file, &some_data).await.unwrap();
+
+        let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+
+        let file_scheduler = scheduler
+            .open_file(&tmp_file, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+
+        let bytes = file_scheduler
+            .submit_request(vec![0..0, 10..13, 20..20, 30..32, 32..32], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.len(), 5);
+        assert!(bytes[0].is_empty());
+        assert_eq!(bytes[1], Bytes::copy_from_slice(&some_data[10..13]));
+        assert!(bytes[2].is_empty());
+        assert_eq!(bytes[3], Bytes::copy_from_slice(&some_data[30..32]));
+        assert!(bytes[4].is_empty());
     }
 
     #[tokio::test]

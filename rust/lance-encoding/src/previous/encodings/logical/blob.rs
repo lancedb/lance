@@ -193,9 +193,18 @@ impl LogicalPageDecoder for BlobFieldDecoder {
             let end = (loaded_need + 1).min(self.num_rows) as usize;
             let positions = self.positions.values().slice(start, end - start);
             let sizes = self.sizes.values().slice(start, end - start);
+            // Only submit ranges for rows that actually have out-of-line data
+            // (`size > 0`). A zero-length row -- an empty blob (position=0,
+            // size=0) or a null (position=1, size=0) -- must NOT be submitted:
+            // its degenerate `x..x` range never "overlaps" anything in the
+            // scheduler's coalescing/reassembly step (`is_overlapping` is
+            // always false for an empty interval), so the scheduler would drop
+            // that entry and misalign the bytes for every subsequent row,
+            // reading them back empty. We splice empty `Bytes` back in below.
             let ranges = positions
                 .iter()
                 .zip(sizes.iter())
+                .filter(|(_, size)| **size != 0)
                 .map(|(position, size)| *position..(*position + *size))
                 .collect::<Vec<_>>();
             let validity = positions
@@ -206,10 +215,25 @@ impl LogicalPageDecoder for BlobFieldDecoder {
             // Run the I/O before mutating decoder state, so a failed load
             // leaves the decoder untouched and `wait_for_loaded` is the single,
             // clean point of failure.
-            let bytes = self
+            let loaded_bytes = self
                 .io
                 .submit_request(ranges, self.base_priority + start as u64)
                 .await?;
+            // Re-expand to one entry per row: fetched bytes for `size > 0` rows
+            // (in order), empty `Bytes` for the zero-length rows we skipped.
+            let mut loaded_iter = loaded_bytes.into_iter();
+            let bytes = sizes
+                .iter()
+                .map(|size| {
+                    if *size == 0 {
+                        Bytes::new()
+                    } else {
+                        loaded_iter
+                            .next()
+                            .expect("one loaded buffer per non-empty blob range")
+                    }
+                })
+                .collect::<Vec<_>>();
             self.validity.push_back(validity);
             self.loaded.extend(bytes);
             self.rows_loaded = end as u64;
