@@ -336,6 +336,11 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
 
     let stream_codec = proto_to_position_stream_codec(header.position_stream_codec());
     let positions = read_position_sections(r, header.position_storage(), stream_codec)?;
+    let block_size = if header.block_size == 0 {
+        LEGACY_BLOCK_SIZE
+    } else {
+        validate_block_size(header.block_size as usize)?
+    };
     let impacts = if r.version() >= 2 && header.has_impacts {
         let batch = r.read_ipc()?;
         let entries = batch
@@ -344,14 +349,13 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
             .downcast_ref::<LargeBinaryArray>()
             .ok_or_else(|| Error::io("impacts column is not a LargeBinaryArray".to_string()))?
             .clone();
-        Some(ImpactSkipData::new(entries, blocks.len())?)
+        Some(ImpactSkipData::new(
+            entries,
+            blocks.len(),
+            super::impact::ImpactFormat::for_block_size(block_size),
+        )?)
     } else {
         None
-    };
-    let block_size = if header.block_size == 0 {
-        LEGACY_BLOCK_SIZE
-    } else {
-        validate_block_size(header.block_size as usize)?
     };
 
     Ok(CompressedPostingList::new(
@@ -525,7 +529,12 @@ mod tests {
             builder.append_value(entry);
         }
         let array = builder.finish();
-        ImpactSkipData::new(array, level0_len).unwrap()
+        ImpactSkipData::new(
+            array,
+            level0_len,
+            super::super::impact::ImpactFormat::FixedU32,
+        )
+        .unwrap()
     }
 
     /// Serialize a codec body (no envelope) into a standalone buffer.

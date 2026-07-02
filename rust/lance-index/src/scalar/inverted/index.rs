@@ -4067,7 +4067,11 @@ impl CompressedPostingList {
             .column_by_name(IMPACT_COL)
             .map(|col| {
                 let entries = col.as_list::<i32>().value(0).as_binary::<i64>().clone();
-                ImpactSkipData::new(entries, blocks.len())
+                ImpactSkipData::new(
+                    entries,
+                    blocks.len(),
+                    super::impact::ImpactFormat::for_block_size(block_size),
+                )
             })
             .transpose()?;
 

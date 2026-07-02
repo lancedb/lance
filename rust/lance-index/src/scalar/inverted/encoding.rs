@@ -146,13 +146,106 @@ fn encode_posting_block_payload(
             compress_sorted_block_with::<BitPacker4x>(doc_ids, &mut buffer, block)?;
             compress_block_with::<BitPacker4x>(frequencies, &mut buffer, block)?;
         }
+        // 256-doc blocks (format V3) store frequencies with patched FOR:
+        // outliers no longer widen the whole block, which matters because one
+        // large tf per block otherwise doubles the frequency payload.
         BitPacker8x::BLOCK_LEN => {
             compress_sorted_block_with::<BitPacker8x>(doc_ids, &mut buffer, block)?;
-            compress_block_with::<BitPacker8x>(frequencies, &mut buffer, block)?;
+            compress_pfor_block_with::<BitPacker8x>(frequencies, &mut buffer, block)?;
         }
         _ => unreachable!("validated posting block size should be supported"),
     }
     Ok(())
+}
+
+/// Patched FOR (Lucene PForUtil style): pick the body bit width that
+/// minimizes total bytes, pack all values masked to that width, and append
+/// up to [`PFOR_MAX_EXCEPTIONS`] exceptions as (index u8, high-bits varint).
+const PFOR_MAX_EXCEPTIONS: usize = 31;
+
+#[inline]
+fn u32_bits(value: u32) -> usize {
+    (32 - value.leading_zeros()) as usize
+}
+
+#[inline]
+fn varint_u32_len(value: u32) -> usize {
+    u32_bits(value).max(1).div_ceil(7)
+}
+
+fn compress_pfor_block_with<P: BitPacker>(
+    data: &[u32],
+    buffer: &mut [u8],
+    builder: &mut impl Write,
+) -> Result<()> {
+    debug_assert_eq!(data.len(), P::BLOCK_LEN);
+    let max_bits = data.iter().map(|&v| u32_bits(v)).max().unwrap_or(0);
+    let mut best_width = max_bits;
+    let mut best_cost = P::BLOCK_LEN * max_bits / 8;
+    for width in (0..max_bits).rev() {
+        let mut exceptions = 0usize;
+        let mut exception_bytes = 0usize;
+        for &value in data {
+            if u32_bits(value) > width {
+                exceptions += 1;
+                exception_bytes += 1 + varint_u32_len(value >> width);
+            }
+        }
+        if exceptions > PFOR_MAX_EXCEPTIONS {
+            break;
+        }
+        let cost = P::BLOCK_LEN * width / 8 + exception_bytes;
+        if cost < best_cost {
+            best_cost = cost;
+            best_width = width;
+        }
+    }
+
+    let mask = if best_width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << best_width) - 1
+    };
+    let mut body = [0u32; MAX_POSTING_BLOCK_SIZE];
+    let mut exception_buf = Vec::new();
+    let mut exception_count = 0u8;
+    for (index, &value) in data.iter().enumerate() {
+        body[index] = value & mask;
+        if u32_bits(value) > best_width {
+            exception_buf.push(index as u8);
+            encode_varint_u32(&mut exception_buf, value >> best_width);
+            exception_count += 1;
+        }
+    }
+    let compressor = P::new();
+    let num_bytes = compressor.compress(&body[..P::BLOCK_LEN], buffer, best_width as u8);
+    let _ = builder.write(&[best_width as u8, exception_count])?;
+    let _ = builder.write(&buffer[..num_bytes])?;
+    let _ = builder.write(&exception_buf)?;
+    Ok(())
+}
+
+fn decompress_pfor_block_with<P: BitPacker>(
+    block: &[u8],
+    buffer: &mut [u32],
+    res: &mut Vec<u32>,
+) -> usize {
+    debug_assert!(buffer.len() >= P::BLOCK_LEN);
+    let buffer = &mut buffer[..P::BLOCK_LEN];
+    let width = block[0];
+    let exception_count = block[1] as usize;
+    let compressor = P::new();
+    let num_bytes = compressor.decompress(&block[2..], buffer, width);
+    let mut offset = 2 + num_bytes;
+    for _ in 0..exception_count {
+        let index = block[offset] as usize;
+        offset += 1;
+        let high = decode_varint_u32(block, &mut offset)
+            .expect("pfor exception high bits should be a valid varint");
+        buffer[index] |= high << width;
+    }
+    res.extend_from_slice(buffer);
+    offset
 }
 
 pub fn encode_remainder_posting_block_into(
@@ -297,7 +390,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
 }
 
 #[inline]
-fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
+pub fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
     while value >= 0x80 {
         dst.push((value as u8) | 0x80);
         value >>= 7;
@@ -440,7 +533,7 @@ impl PositionBlockBuilder {
 }
 
 #[inline]
-fn decode_varint_u32(src: &[u8], offset: &mut usize) -> Result<u32> {
+pub fn decode_varint_u32(src: &[u8], offset: &mut usize) -> Result<u32> {
     let mut value = 0u32;
     let mut shift = 0u32;
     while *offset < src.len() {
@@ -803,7 +896,7 @@ pub fn decompress_posting_block(
         BitPacker8x::BLOCK_LEN => {
             let num_bytes = decompress_sorted_block_with::<BitPacker8x>(block, buffer, doc_ids);
             block = &block[num_bytes..];
-            let num_bytes = decompress_block_with::<BitPacker8x>(block, buffer, frequencies);
+            let num_bytes = decompress_pfor_block_with::<BitPacker8x>(block, buffer, frequencies);
             block = &block[num_bytes..];
         }
         _ => unreachable!("validated posting block size should be supported"),
@@ -1049,9 +1142,13 @@ mod tests {
         let doc_num_bits = block[8];
         let doc_bytes = BitPacker8x::compressed_block_size(doc_num_bits);
         let freq_header_offset = 9 + doc_bytes;
+        // 256-doc blocks use patched FOR for frequencies:
+        // [width u8][exception_count u8][body][exceptions...]
         let freq_num_bits = block[freq_header_offset];
+        let exception_count = block[freq_header_offset + 1] as usize;
+        assert_eq!(exception_count, 0, "uniform freqs need no exceptions");
         let freq_bytes = BitPacker8x::compressed_block_size(freq_num_bits);
-        assert_eq!(block.len(), freq_header_offset + 1 + freq_bytes);
+        assert_eq!(block.len(), freq_header_offset + 2 + freq_bytes);
 
         let (decoded_doc_ids, decoded_frequencies) =
             decompress_posting_list_with_tail_codec_and_block_size(
