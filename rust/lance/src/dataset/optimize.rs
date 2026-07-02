@@ -7436,4 +7436,93 @@ mod tests {
             ]
         );
     }
+
+    // Compaction should materialize a fully-deleted fragment: drop it from both
+    // the index's data and its coverage, so searches stay on the fast path
+    // instead of masking a fragment that no longer exists.
+    #[tokio::test]
+    async fn test_compaction_materializes_deleted_fragment() {
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        // 10 fragments x 100 rows, i = 0..1000. Fragment 4 holds i in [400,500).
+        let mut dataset = Dataset::write(
+            data_gen.batch(1_000),
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BTree,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Fully delete fragment 4 (removed from the manifest, never compacted).
+        dataset.delete("i >= 400 AND i < 500").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 9);
+
+        // Inline compaction (not deferred): indexes are remapped immediately.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100_000,
+                materialize_deletions: true,
+                defer_index_remap: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Coverage: the deleted fragment 4 must be gone, leaving exactly the
+        // live fragments (without the fix, fragment 4 lingers in the bitmap).
+        let index = dataset
+            .load_index_by_name("i_idx")
+            .await
+            .unwrap()
+            .expect("index must exist");
+        let bitmap = index
+            .fragment_bitmap
+            .expect("index must store a fragment bitmap");
+        assert!(
+            !bitmap.contains(4),
+            "deleted fragment 4 still covered by the index: {bitmap:?}"
+        );
+        let live: roaring::RoaringBitmap = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .collect();
+        assert_eq!(
+            bitmap, live,
+            "index coverage should equal the live fragments"
+        );
+
+        // Data: an indexed filtered scan resolves row addresses and takes. If the
+        // deleted fragment's rows survived in the index data while its coverage
+        // was trimmed, this take would error on a missing fragment.
+        let batch = dataset
+            .scan()
+            .filter("i >= 400 AND i < 500")
+            .unwrap()
+            .project(&["i"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("indexed scan over the deleted range must succeed");
+        assert_eq!(batch.num_rows(), 0, "deleted fragment rows resurfaced");
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 900);
+    }
 }

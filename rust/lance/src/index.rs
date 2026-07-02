@@ -481,6 +481,46 @@ pub trait IndexBuilder {
     async fn build(&self) -> Result<()>;
 }
 
+/// `addr -> None` drops for every row of a fragment this index still covers
+/// that is no longer in the dataset (fully deleted before compaction). The
+/// fragments are gone from the current manifest, so their rows are enumerated
+/// from the dataset version the index was built at. Returns `None` if that
+/// version can't be loaded (e.g. already cleaned up), leaving those rows to
+/// query-time masking as before.
+async fn deleted_fragment_row_id_drops(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Option<HashMap<u64, Option<u64>>>> {
+    let Some(coverage) = index.fragment_bitmap.as_ref() else {
+        return Ok(None);
+    };
+    let live: RoaringBitmap = dataset
+        .get_fragments()
+        .iter()
+        .map(|f| f.id() as u32)
+        .collect();
+    let dead = coverage - &live;
+    if dead.is_empty() {
+        return Ok(None);
+    }
+    let Ok(old) = dataset.checkout_version(index.dataset_version).await else {
+        return Ok(None);
+    };
+    let mut drops = HashMap::new();
+    for frag in old.get_fragments() {
+        let fid = frag.id() as u32;
+        if !dead.contains(fid) {
+            continue;
+        }
+        if let Some(rows) = frag.metadata().physical_rows {
+            for offset in 0..rows as u32 {
+                drops.insert(u64::from(RowAddress::new_from_parts(fid, offset)), None);
+            }
+        }
+    }
+    Ok(Some(drops))
+}
+
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
@@ -498,6 +538,25 @@ pub(crate) async fn remap_index(
             "Remapping indices with multiple fields is not supported".to_string(),
         ));
     }
+
+    // Materialize fully-deleted fragments. A fragment deleted before this
+    // compaction is gone from the manifest but may still be covered by this
+    // index: it was never part of a rewrite group, so its rows are absent from
+    // `row_id_map` and would survive the rebuild, keeping the index's coverage
+    // pinned to a fragment that no longer exists and forcing searches onto the
+    // masked slow path. Map every such row to None so it is dropped from the
+    // rebuilt index; coverage is trimmed to match at commit time (see
+    // Transaction::recalculate_fragment_bitmap).
+    let augmented_map;
+    let row_id_map = match deleted_fragment_row_id_drops(dataset, matched).await? {
+        Some(extra) if !extra.is_empty() => {
+            let mut m = row_id_map.clone();
+            m.extend(extra);
+            augmented_map = m;
+            &augmented_map
+        }
+        _ => row_id_map,
+    };
 
     if row_id_map.values().all(|v| v.is_none()) {
         let deleted_bitmap = RoaringBitmap::from_iter(
