@@ -1770,8 +1770,7 @@ impl ManifestNamespace {
         indices: Option<Vec<IndexMetadata>>,
         transaction: Transaction,
     ) -> std::result::Result<(), CommitError> {
-        let use_rle_v2 = manifest.uses_rle_v2();
-        apply_feature_flags(manifest, false, false, use_rle_v2).map_err(CommitError::from)?;
+        apply_feature_flags(manifest, false, false).map_err(CommitError::from)?;
         let timestamp_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

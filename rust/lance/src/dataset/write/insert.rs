@@ -21,9 +21,7 @@ use object_store::path::Path;
 use crate::Dataset;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::{
-    Operation, TRANSACTION_PROPERTY_REQUIRES_RLE_V2, Transaction, TransactionBuilder,
-};
+use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
 use crate::{Error, Result};
 use tracing::info;
@@ -275,34 +273,10 @@ impl<'a> InsertBuilder<'a> {
                 .unwrap_or(0),
             operation,
         )
-        .transaction_properties(Self::transaction_properties(context))
+        .transaction_properties(context.params.transaction_properties.clone())
         .build();
 
         Ok(transaction)
-    }
-
-    fn transaction_properties(context: &WriteContext<'_>) -> Option<Arc<HashMap<String, String>>> {
-        let requires_rle_v2 = context.params.enable_rle_v2
-            || context
-                .dest
-                .dataset()
-                .map(|ds| ds.manifest().uses_rle_v2())
-                .unwrap_or(false);
-        if !requires_rle_v2 {
-            return context.params.transaction_properties.clone();
-        }
-
-        let mut properties = context
-            .params
-            .transaction_properties
-            .as_deref()
-            .cloned()
-            .unwrap_or_default();
-        properties.insert(
-            TRANSACTION_PROPERTY_REQUIRES_RLE_V2.to_string(),
-            "true".to_string(),
-        );
-        Some(Arc::new(properties))
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {

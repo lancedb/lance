@@ -115,7 +115,6 @@ message Manifest {
   // * 1 << 3: table config is present
   // * 1 << 4: dataset uses multiple base paths
   // * 1 << 5: transaction file writes are disabled
-  // * 1 << 6: dataset may contain RLE v2 pages
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.

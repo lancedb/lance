@@ -20,8 +20,6 @@ use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::spill::{SpillReceiver, SpillSender, create_replay_spill};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_encoding::compression::DefaultCompressionStrategy;
-use lance_encoding::encoder::{FieldEncodingStrategy, StructuralEncodingStrategy};
 use lance_file::previous::writer::{
     FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
 };
@@ -315,6 +313,7 @@ pub struct WriteParams {
     ///
     /// Newer versions are more efficient but the data can only be read by more recent versions
     /// of lance.
+    /// Lance file version 2.3 enables RLE v2 run length widths by default.
     ///
     /// If not specified then the latest stable version will be used.
     pub data_storage_version: Option<LanceFileVersion>,
@@ -324,14 +323,6 @@ pub struct WriteParams {
     /// This makes compaction more efficient, since with stable row ids no
     /// secondary indices need to be updated to point to new row ids.
     pub enable_stable_row_ids: bool,
-
-    /// If set to true, a new dataset may contain RLE pages with 16-bit or
-    /// 32-bit run lengths.
-    ///
-    /// This can only be enabled when creating a new dataset. Existing datasets
-    /// that already have the RLE v2 feature flag inherit it automatically.
-    /// Existing datasets without the flag reject this option.
-    pub enable_rle_v2: bool,
 
     /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
     /// These allow constant-time lookups for the latest manifest on object storage.
@@ -417,7 +408,6 @@ impl Default for WriteParams {
             commit_handler: None,
             data_storage_version: None,
             enable_stable_row_ids: false,
-            enable_rle_v2: false,
             enable_v2_manifest_paths: true,
             session: None,
             auto_cleanup: None,
@@ -440,14 +430,6 @@ impl WriteParams {
         Self {
             data_storage_version: Some(version),
             ..Default::default()
-        }
-    }
-
-    /// Allow a new dataset to contain RLE pages with 16-bit or 32-bit run lengths.
-    pub fn with_rle_v2(self) -> Self {
-        Self {
-            enable_rle_v2: true,
-            ..self
         }
     }
 
@@ -587,8 +569,6 @@ pub async fn do_write_fragments(
     storage_version: LanceFileVersion,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<Vec<Fragment>> {
-    validate_rle_v2_write(dataset, &params, storage_version)?;
-
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
 
@@ -616,10 +596,6 @@ pub async fn do_write_fragments(
         .map(|ds| ds.session.store_registry())
         .unwrap_or_else(|| params.store_registry());
     let source_store_params = params.store_params.clone().unwrap_or_default();
-    let enable_rle_v2 = params.enable_rle_v2
-        || dataset
-            .map(|ds| ds.manifest().uses_rle_v2())
-            .unwrap_or(false);
 
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
@@ -633,7 +609,6 @@ pub async fn do_write_fragments(
         source_store_registry,
         source_store_params,
         params.blob_pack_file_size_threshold,
-        enable_rle_v2,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -1118,28 +1093,6 @@ pub async fn write_fragments_internal(
     Ok((fragments, schema))
 }
 
-fn validate_rle_v2_write(
-    dataset: Option<&Dataset>,
-    params: &WriteParams,
-    storage_version: LanceFileVersion,
-) -> Result<()> {
-    let existing_uses_rle_v2 = dataset
-        .map(|ds| ds.manifest().uses_rle_v2())
-        .unwrap_or(false);
-    if params.enable_rle_v2 && dataset.is_some() && !existing_uses_rle_v2 {
-        return Err(Error::invalid_input(
-            "RLE v2 can only be enabled when creating a new dataset",
-        ));
-    }
-    if (params.enable_rle_v2 || existing_uses_rle_v2) && storage_version < LanceFileVersion::V2_1 {
-        return Err(Error::invalid_input(format!(
-            "RLE v2 requires file version >= 2.1 (got {:?})",
-            storage_version
-        )));
-    }
-    Ok(())
-}
-
 fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
     schema
         .fields_pre_order()
@@ -1309,7 +1262,6 @@ pub(super) async fn open_update_writer(
             add_data_dir: true,
             external_base_resolver,
             source_store_registry: dataset.session.store_registry(),
-            enable_rle_v2: dataset.manifest().uses_rle_v2(),
             ..Default::default()
         },
     )
@@ -1326,7 +1278,6 @@ struct WriterOptions {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
-    enable_rle_v2: bool,
 }
 
 async fn open_writer_with_options(
@@ -1345,7 +1296,6 @@ async fn open_writer_with_options(
         source_store_registry,
         source_store_params,
         blob_pack_file_size_threshold,
-        enable_rle_v2,
     } = options;
 
     let data_file_key = generate_random_filename();
@@ -1379,18 +1329,6 @@ async fn open_writer_with_options(
             schema.clone(),
             FileWriterOptions {
                 format_version: Some(storage_version),
-                encoding_strategy: if enable_rle_v2 {
-                    Some(Arc::new(StructuralEncodingStrategy {
-                        compression_strategy: Arc::new(
-                            DefaultCompressionStrategy::new()
-                                .with_version(storage_version)
-                                .with_rle_v2(),
-                        ),
-                        version: storage_version,
-                    }) as Arc<dyn FieldEncodingStrategy>)
-                } else {
-                    None
-                },
                 ..Default::default()
             },
         )?;
@@ -1449,7 +1387,6 @@ struct WriterGenerator {
     source_store_registry: Arc<ObjectStoreRegistry>,
     source_store_params: ObjectStoreParams,
     blob_pack_file_size_threshold: Option<usize>,
-    enable_rle_v2: bool,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
 }
@@ -1468,7 +1405,6 @@ impl WriterGenerator {
         source_store_registry: Arc<ObjectStoreRegistry>,
         source_store_params: ObjectStoreParams,
         blob_pack_file_size_threshold: Option<usize>,
-        enable_rle_v2: bool,
     ) -> Self {
         Self {
             object_store,
@@ -1482,7 +1418,6 @@ impl WriterGenerator {
             source_store_registry,
             source_store_params,
             blob_pack_file_size_threshold,
-            enable_rle_v2,
             next_base_index: AtomicUsize::new(0),
         }
     }
@@ -1517,7 +1452,6 @@ impl WriterGenerator {
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
-                    enable_rle_v2: self.enable_rle_v2,
                 },
             )
             .await?
@@ -1536,7 +1470,6 @@ impl WriterGenerator {
                     source_store_registry: self.source_store_registry.clone(),
                     source_store_params: self.source_store_params.clone(),
                     blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
-                    enable_rle_v2: self.enable_rle_v2,
                 },
             )
             .await?
@@ -2247,7 +2180,6 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
-            false,
         );
 
         // Create a writer
@@ -2366,7 +2298,6 @@ mod tests {
             Arc::new(ObjectStoreRegistry::default()),
             ObjectStoreParams::default(),
             None,
-            false,
         );
 
         // Create test batch
@@ -3201,54 +3132,6 @@ mod tests {
         // Verify original dataset is still intact
         assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
         assert_eq!(dataset.schema().fields.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_do_write_fragments_rejects_rle_v2_for_existing_unflagged_dataset() {
-        use arrow_array::record_batch;
-
-        let temp_dir = TempDir::default();
-        let dataset_uri = format!("file://{}", temp_dir.std_path().display());
-        let batch = record_batch!(("id", Int32, [1, 2, 3])).unwrap();
-        let dataset = InsertBuilder::new(&dataset_uri)
-            .execute(vec![batch.clone()])
-            .await
-            .unwrap();
-
-        let arrow_schema = batch.schema();
-        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let stream = RecordBatchStreamAdapter::new(
-            arrow_schema,
-            futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)]),
-        );
-
-        let result = do_write_fragments(
-            Some(&dataset),
-            dataset.object_store.clone(),
-            &dataset.base,
-            &schema,
-            Box::pin(stream),
-            WriteParams {
-                mode: WriteMode::Append,
-                enable_rle_v2: true,
-                ..Default::default()
-            },
-            dataset
-                .manifest()
-                .data_storage_format
-                .lance_file_version()
-                .unwrap(),
-            None,
-        )
-        .await;
-
-        assert!(matches!(result, Err(Error::InvalidInput { .. })));
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("only be enabled when creating a new dataset")
-        );
     }
 
     #[tokio::test]

@@ -143,8 +143,6 @@ pub struct DefaultCompressionStrategy {
     params: CompressionParams,
     /// The lance file version for compatibilities.
     version: LanceFileVersion,
-    /// Whether the writer may emit RLE v2 run length widths.
-    enable_rle_v2: bool,
 }
 
 fn try_bss_for_mini_block(
@@ -170,7 +168,7 @@ fn try_bss_for_mini_block(
 fn try_rle_for_mini_block(
     data: &FixedWidthDataBlock,
     params: &CompressionFieldParams,
-    enable_rle_v2: bool,
+    use_rle_v2: bool,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
@@ -196,7 +194,7 @@ fn try_rle_for_mini_block(
 
     let num_values = data.num_values;
     let raw_bytes = (num_values as u128) * (type_size as u128);
-    let (run_length_width, rle_bytes) = if enable_rle_v2 {
+    let (run_length_width, rle_bytes) = if use_rle_v2 {
         select_run_length_width_and_size(&data.data, data.num_values, data.bits_per_value).ok()?
     } else {
         // Estimate the encoded size.
@@ -231,7 +229,7 @@ fn try_rle_for_block(
     data: &FixedWidthDataBlock,
     version: LanceFileVersion,
     params: &CompressionFieldParams,
-    enable_rle_v2: bool,
+    use_rle_v2: bool,
 ) -> Result<Option<(Box<dyn BlockCompressor>, CompressiveEncoding)>> {
     if version < LanceFileVersion::V2_2 {
         return Ok(None);
@@ -248,7 +246,7 @@ fn try_rle_for_block(
         .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
     if (run_count as f64) < (data.num_values as f64) * threshold {
-        let run_length_width = if enable_rle_v2 {
+        let run_length_width = if use_rle_v2 {
             select_run_length_width(&data.data, data.num_values, data.bits_per_value)?
         } else {
             RunLengthWidth::U8
@@ -404,7 +402,6 @@ impl DefaultCompressionStrategy {
         Self {
             params,
             version: LanceFileVersion::default(),
-            enable_rle_v2: false,
         }
     }
 
@@ -414,10 +411,8 @@ impl DefaultCompressionStrategy {
         self
     }
 
-    /// Allow this strategy to emit RLE v2 run length widths.
-    pub fn with_rle_v2(mut self) -> Self {
-        self.enable_rle_v2 = true;
-        self
+    fn use_rle_v2(&self) -> bool {
+        self.version.resolve() >= LanceFileVersion::V2_3
     }
 
     /// Parse compression parameters from field metadata
@@ -483,7 +478,7 @@ impl DefaultCompressionStrategy {
         }
 
         let base = try_bss_for_mini_block(data, params)
-            .or_else(|| try_rle_for_mini_block(data, params, self.enable_rle_v2))
+            .or_else(|| try_rle_for_mini_block(data, params, self.use_rle_v2()))
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
 
@@ -691,7 +686,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 if let Some((compressor, encoding)) =
-                    try_rle_for_block(fixed_width, self.version, &field_params, self.enable_rle_v2)?
+                    try_rle_for_block(fixed_width, self.version, &field_params, self.use_rle_v2())?
                 {
                     return Ok((compressor, encoding));
                 }
@@ -1718,7 +1713,7 @@ mod tests {
         data.compute_stat();
         let data = DataBlock::FixedWidth(data);
 
-        let strategy = DefaultCompressionStrategy::new().with_rle_v2();
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         let (_compressed, encoding) = compressor.compress(data).unwrap();
         let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
@@ -1755,7 +1750,7 @@ mod tests {
         data.compute_stat();
         let data = DataBlock::FixedWidth(data);
 
-        let strategy = DefaultCompressionStrategy::new().with_rle_v2();
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         let debug_str = format!("{compressor:?}");
         assert!(debug_str.contains("RleEncoder"));
