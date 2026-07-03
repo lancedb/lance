@@ -25,6 +25,7 @@ use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_io::object_store::ObjectStore;
@@ -549,7 +550,7 @@ impl InvertedIndexBuilder {
 
     pub async fn remap(
         &mut self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         src_store: Arc<dyn IndexStore>,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
@@ -874,7 +875,7 @@ impl InnerBuilder {
         self.posting_lists = posting_lists;
     }
 
-    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
         // for the docs, we need to remove the rows that are removed from the doc set,
         // and update the row ids of the rows that are updated
         let removed = self.docs.remap(mapping);
@@ -913,7 +914,7 @@ impl InnerBuilder {
                 mapping.insert(*row_id, None);
             }
         }
-        self.remap(&mapping).await
+        self.remap(&RowAddrRemap::direct(mapping)).await
     }
 
     pub fn merge_from(&mut self, other: Self) -> Result<()> {
@@ -4083,7 +4084,10 @@ mod tests {
         // Remap the index via the ScalarIndex trait method
         use crate::scalar::ScalarIndex;
         let mapping = HashMap::from([(0u64, Some(50 << 32))]);
-        index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+        index
+            .remap(&RowAddrRemap::direct(mapping), dest_store.as_ref())
+            .await
+            .unwrap();
 
         // Reload from dest and verify deleted fragments are preserved
         let remapped_index = InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache())

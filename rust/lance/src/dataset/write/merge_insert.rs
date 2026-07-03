@@ -43,7 +43,10 @@ use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
-use super::{CommitBuilder, WriteParams, write_fragments_internal};
+use super::{
+    CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
@@ -351,6 +354,14 @@ struct MergeInsertParams {
     source_dedupe_behavior: SourceDedupeBehavior,
     // Number of inner commit retries for manifest version conflicts. Default is 20.
     commit_retries: Option<u32>,
+    // Target base IDs for routing new fragments, mirroring WriteParams::target_bases.
+    target_bases: Option<Vec<u32>>,
+    // Target base names or path URIs (unresolved), mirroring
+    // WriteParams::target_base_names_or_paths. Resolved at execution time.
+    target_base_names_or_paths: Option<Vec<String>>,
+    // Target all registered bases, mirroring WriteParams::target_all_bases.
+    // Some(include_primary); resolved at execution time.
+    target_all_bases: Option<bool>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -471,6 +482,9 @@ impl MergeInsertBuilder {
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
                 commit_retries: None,
+                target_bases: None,
+                target_base_names_or_paths: None,
+                target_all_bases: None,
             },
         })
     }
@@ -569,6 +583,46 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Write new fragments produced by this merge insert to these base IDs.
+    ///
+    /// New data files are distributed across the target bases round-robin,
+    /// the same way a normal write with [`WriteParams::target_bases`] routes
+    /// them. The IDs must be registered in the dataset manifest, or
+    /// [`super::PRIMARY_BASE_ID`] (0) to include the dataset's primary
+    /// storage in the rotation (e.g. `vec![0, 1, 2]` spreads across primary
+    /// plus bases 1 and 2). Data files that patch existing fragments and
+    /// deletion files are always written to the dataset's primary storage.
+    ///
+    /// Cannot be combined with [`Self::target_base_names_or_paths`].
+    pub fn target_bases(&mut self, base_ids: Vec<u32>) -> &mut Self {
+        self.params.target_bases = Some(base_ids);
+        self
+    }
+
+    /// Like [`Self::target_bases`], but referencing bases by name or path URI.
+    ///
+    /// References are resolved against the base paths registered in the
+    /// dataset manifest when the merge insert executes. An entry equal to the
+    /// dataset's URI includes the dataset's primary storage in the rotation.
+    ///
+    /// Cannot be combined with [`Self::target_bases`].
+    pub fn target_base_names_or_paths(&mut self, refs: Vec<String>) -> &mut Self {
+        self.params.target_base_names_or_paths = Some(refs);
+        self
+    }
+
+    /// Write new fragments produced by this merge insert to every base
+    /// registered in the dataset manifest, resolved when the merge executes.
+    /// When `include_primary` is true the dataset's primary storage
+    /// participates in the rotation as the first slot.
+    ///
+    /// Cannot be combined with [`Self::target_bases`] or
+    /// [`Self::target_base_names_or_paths`].
+    pub fn target_all_bases(&mut self, include_primary: bool) -> &mut Self {
+        self.params.target_all_bases = Some(include_primary);
+        self
+    }
+
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
         if !self.params.insert_not_matched
@@ -579,11 +633,63 @@ impl MergeInsertBuilder {
                 "The merge insert job is not configured to change the data in any way",
             ));
         }
+        if self.params.target_bases.is_some() && self.params.target_base_names_or_paths.is_some() {
+            return Err(Error::invalid_input(
+                "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
+            ));
+        }
+        if self.params.target_all_bases.is_some()
+            && (self.params.target_bases.is_some()
+                || self.params.target_base_names_or_paths.is_some())
+        {
+            return Err(Error::invalid_input(
+                "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
+            ));
+        }
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
         })
     }
+}
+
+/// Resolve the merge insert target bases against the base paths registered in
+/// the dataset manifest. Returns `None` when no target bases were requested.
+/// Base id [`super::PRIMARY_BASE_ID`] and the dataset's URI refer to the
+/// dataset's primary storage.
+///
+/// Resolution runs once per execution attempt so retries validate against the
+/// manifest version they are writing to.
+async fn resolve_target_bases(
+    dataset: &Dataset,
+    params: &MergeInsertParams,
+) -> Result<Option<Vec<TargetBaseInfo>>> {
+    if params.target_bases.is_none()
+        && params.target_base_names_or_paths.is_none()
+        && params.target_all_bases.is_none()
+    {
+        return Ok(None);
+    }
+    // Reuse the normal write path resolution (validation, name/path lookup,
+    // and per-base credential handling) through a parameter shim.
+    let mut write_params = WriteParams {
+        mode: WriteMode::Append,
+        target_bases: params.target_bases.clone(),
+        target_base_names_or_paths: params.target_base_names_or_paths.clone(),
+        target_all_bases: params.target_all_bases,
+        session: Some(dataset.session.clone()),
+        store_params: dataset.store_params.as_deref().cloned(),
+        base_store_params: dataset.base_store_params.as_deref().cloned(),
+        ..Default::default()
+    };
+    validate_and_resolve_target_bases_with_primary(
+        &mut write_params,
+        Some(&dataset.manifest.base_paths),
+        &dataset.object_store,
+        &dataset.base,
+        dataset.uri(),
+    )
+    .await
 }
 
 enum SchemaComparison {
@@ -981,7 +1087,11 @@ impl MergeInsertJob {
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
         current_version: u64,
+        target_bases_info: Option<Vec<TargetBaseInfo>>,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
+        // Shared across the per-group tasks spawned below; only new fragments
+        // are routed to target bases, column patches stay in primary storage.
+        let target_bases_info = Arc::new(target_bases_info);
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(&LanceExecutionOptions {
@@ -1029,7 +1139,38 @@ impl MergeInsertJob {
         let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
-        while let Some((frag_id, batches)) = group_stream.next().await.transpose()? {
+        // Best-effort removal of uncommitted files after a mid-update failure.
+        // Aborts in-flight tasks first, then deletes the new fragments written
+        // so far (including ones routed to target bases). Column-patch files
+        // from completed tasks stay in primary storage where regular dataset
+        // cleanup can reclaim them.
+        async fn cleanup_on_failure(
+            dataset: &Dataset,
+            target_bases_info: &Option<Vec<TargetBaseInfo>>,
+            new_fragments: &Mutex<Vec<Fragment>>,
+            tasks: &mut JoinSet<Result<usize>>,
+        ) {
+            tasks.shutdown().await;
+            let written = new_fragments.lock().unwrap().clone();
+            cleanup_data_fragments(
+                &dataset.object_store,
+                &dataset.base,
+                target_bases_info.as_deref(),
+                &written,
+            )
+            .await;
+        }
+
+        loop {
+            let (frag_id, batches) = match group_stream.next().await.transpose() {
+                Ok(Some(group)) => group,
+                Ok(None) => break,
+                Err(e) => {
+                    cleanup_on_failure(&dataset, &target_bases_info, &new_fragments, &mut tasks)
+                        .await;
+                    return Err(e.into());
+                }
+            };
             async fn handle_fragment(
                 dataset: Arc<Dataset>,
                 fragment: FileFragment,
@@ -1241,6 +1382,7 @@ impl MergeInsertJob {
                 batches: Vec<RecordBatch>,
                 new_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
+                target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -1272,7 +1414,7 @@ impl MergeInsertJob {
                     write_schema,
                     stream,
                     Default::default(), // TODO: support write params.
-                    None,               // Merge insert doesn't use target_bases
+                    (*target_bases_info).clone(),
                 )
                 .await?;
 
@@ -1300,15 +1442,26 @@ impl MergeInsertJob {
                 }
 
                 if let Some(res) = tasks.join_next().await {
-                    let size = res??;
-                    reservation.shrink(size);
+                    match res.map_err(Error::from).and_then(|size| size) {
+                        Ok(size) => reservation.shrink(size),
+                        Err(e) => {
+                            cleanup_on_failure(
+                                &dataset,
+                                &target_bases_info,
+                                &new_fragments,
+                                &mut tasks,
+                            )
+                            .await;
+                            return Err(e);
+                        }
+                    }
                 }
             }
 
             match frag_id.first() {
                 Some(ScalarValue::UInt64(Some(frag_id))) => {
                     let frag_id = *frag_id;
-                    let fragment = dataset.get_fragment(frag_id as usize).ok_or_else(|| {
+                    let Some(fragment) = dataset.get_fragment(frag_id as usize) else {
                         error!(
                             fragment_id = frag_id,
                             dataset_uri = %dataset.uri(),
@@ -1317,15 +1470,22 @@ impl MergeInsertJob {
                             branch = ?dataset.manifest().branch,
                             "Non-existent fragment id returned from merge result",
                         );
-                        Error::internal(format!(
+                        cleanup_on_failure(
+                            &dataset,
+                            &target_bases_info,
+                            &new_fragments,
+                            &mut tasks,
+                        )
+                        .await;
+                        return Err(Error::internal(format!(
                             "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
                             frag_id,
                             dataset.uri(),
                             dataset.manifest().version,
                             dataset.manifest_location().path,
                             dataset.manifest().branch.as_deref().unwrap_or("main"),
-                        ))
-                    })?;
+                        )));
+                    };
                     let metadata = fragment.metadata.clone();
 
                     let fut = handle_fragment(
@@ -1345,10 +1505,13 @@ impl MergeInsertJob {
                         batches,
                         new_fragments.clone(),
                         memory_size,
+                        target_bases_info.clone(),
                     );
                     tasks.spawn(fut);
                 }
                 _ => {
+                    cleanup_on_failure(&dataset, &target_bases_info, &new_fragments, &mut tasks)
+                        .await;
                     return Err(Error::internal(format!(
                         "Got non-fragment id from merge result: {:?}",
                         frag_id
@@ -1358,8 +1521,14 @@ impl MergeInsertJob {
         }
 
         while let Some(res) = tasks.join_next().await {
-            let size = res??;
-            reservation.shrink(size);
+            match res.map_err(Error::from).and_then(|size| size) {
+                Ok(size) => reservation.shrink(size),
+                Err(e) => {
+                    cleanup_on_failure(&dataset, &target_bases_info, &new_fragments, &mut tasks)
+                        .await;
+                    return Err(e);
+                }
+            }
         }
         let mut updated_fragments = Arc::try_unwrap(updated_fragments)
             .unwrap()
@@ -1767,6 +1936,8 @@ impl MergeInsertJob {
             });
         }
 
+        let target_bases_info = resolve_target_bases(&self.dataset, &self.params).await?;
+
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
@@ -1868,6 +2039,7 @@ impl MergeInsertJob {
                 self.dataset.clone(),
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
+                target_bases_info,
             )
             .await?;
 
@@ -1886,6 +2058,7 @@ impl MergeInsertJob {
             // we can't use affected rows here.
             (operation, None)
         } else {
+            let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
@@ -1893,48 +2066,66 @@ impl MergeInsertJob {
                 self.dataset.schema().clone(),
                 Box::pin(stream),
                 WriteParams::default(),
-                None, // Merge insert doesn't use target_bases
+                target_bases_info,
             )
             .await?;
 
-            if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
-                let fragment_sizes = new_fragments
-                    .iter()
-                    .map(|f| f.physical_rows.unwrap() as u64);
-
-                let sequences = lance_table::rowids::rechunk_sequences(
-                    [row_id_sequence.clone()],
-                    fragment_sizes,
-                    true,
-                )
-                .map_err(|e| {
-                    Error::internal(format!(
-                        "Captured row ids not equal to number of rows written: {}",
-                        e
-                    ))
-                })?;
-
-                for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                    let serialized = lance_table::rowids::write_row_ids(&sequence);
-                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
-                }
-            }
-
-            // Apply deletions
-            let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
-
-            let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    let addresses: Vec<u64> = removed_row_ids
+            // The new data files exist but are not committed yet; clean them up
+            // (including files routed to target bases) if any later step fails.
+            let post_write_result: Result<RoaringTreemap> = async {
+                if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
+                    let fragment_sizes = new_fragments
                         .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>();
-                    addresses
-                } else {
-                    removed_row_ids
-                };
+                        .map(|f| f.physical_rows.unwrap() as u64);
 
-            let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec.into_iter());
+                    let sequences = lance_table::rowids::rechunk_sequences(
+                        [row_id_sequence.clone()],
+                        fragment_sizes,
+                        true,
+                    )
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "Captured row ids not equal to number of rows written: {}",
+                            e
+                        ))
+                    })?;
+
+                    for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                        let serialized = lance_table::rowids::write_row_ids(&sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    }
+                }
+
+                // Apply deletions
+                let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
+
+                let removed_row_addr_vec =
+                    if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+                        let addresses: Vec<u64> = removed_row_ids
+                            .iter()
+                            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                            .collect::<Vec<_>>();
+                        addresses
+                    } else {
+                        removed_row_ids
+                    };
+
+                Ok(RoaringTreemap::from_iter(removed_row_addr_vec.into_iter()))
+            }
+            .await;
+            let removed_row_addrs = match post_write_result {
+                Ok(removed_row_addrs) => removed_row_addrs,
+                Err(e) => {
+                    cleanup_data_fragments(
+                        &self.dataset.object_store,
+                        &self.dataset.base,
+                        cleanup_bases.as_deref(),
+                        &new_fragments,
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
 
             let deletions_result = Self::apply_deletions(&self.dataset, &removed_row_addrs).await;
             let (old_fragments, removed_fragment_ids) = match deletions_result {
@@ -1943,6 +2134,7 @@ impl MergeInsertJob {
                     cleanup_data_fragments(
                         &self.dataset.object_store,
                         &self.dataset.base,
+                        cleanup_bases.as_deref(),
                         &new_fragments,
                     )
                     .await;
@@ -2180,6 +2372,10 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         // Update stats with the current attempt count
         data.stats.num_attempts = self.attempt_count.load(Ordering::SeqCst);
 
+        // The dataset argument is the refreshed per-attempt dataset (the same
+        // manifest execute_impl resolved against); keep a handle so conflict
+        // cleanup resolves bases added between attempts.
+        let cleanup_dataset = dataset.clone();
         let mut commit_builder =
             CommitBuilder::new(dataset).with_skip_auto_cleanup(self.job.params.skip_auto_cleanup);
         if let Some(commit_retries) = self.job.params.commit_retries {
@@ -2188,9 +2384,36 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         if let Some(affected_rows) = data.affected_rows {
             commit_builder = commit_builder.with_affected_rows(affected_rows);
         }
-        let new_dataset = commit_builder.execute(data.transaction).await?;
 
-        Ok((Arc::new(new_dataset), data.stats))
+        let new_fragments = match &data.transaction.operation {
+            Operation::Update { new_fragments, .. } => new_fragments.clone(),
+            _ => Vec::new(),
+        };
+        match commit_builder.execute(data.transaction).await {
+            Ok(new_dataset) => Ok((Arc::new(new_dataset), data.stats)),
+            Err(e) => {
+                // A retryable conflict discards this attempt and re-executes it,
+                // so its data files are provably uncommitted; remove them
+                // (including files routed to target bases, which version cleanup
+                // never scans). Other commit errors may be ambiguous about
+                // whether the manifest was written, so leave the files alone.
+                if matches!(e, Error::RetryableCommitConflict { .. }) && !new_fragments.is_empty() {
+                    let target_bases_info =
+                        resolve_target_bases(&cleanup_dataset, &self.job.params)
+                            .await
+                            .ok()
+                            .flatten();
+                    cleanup_data_fragments(
+                        &cleanup_dataset.object_store,
+                        &cleanup_dataset.base,
+                        target_bases_info.as_deref(),
+                        &new_fragments,
+                    )
+                    .await;
+                }
+                Err(e)
+            }
+        }
     }
 
     fn update_dataset(&mut self, dataset: Arc<Dataset>) {

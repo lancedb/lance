@@ -7,12 +7,15 @@ import subprocess
 import sys
 import tarfile
 import textwrap
+import uuid
+from pathlib import Path
 
 import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+from lance.file import LanceFileSession
 from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
@@ -43,6 +46,11 @@ def _external_blob_table(blob_path, payload=b"hello"):
     blob_path.parent.mkdir(parents=True, exist_ok=True)
     blob_path.write_bytes(payload)
     return pa.table({"blob": lance.blob_array([blob_path.as_uri()])})
+
+
+def _blob_sidecar_path(data_dir, data_file_key, blob_id):
+    sidecar_name = f"{int(f'{blob_id:032b}'[::-1], 2):032b}.blob"
+    return data_dir / data_file_key / sidecar_name
 
 
 def _add_columns_blob_v2_values(tmp_path):
@@ -588,10 +596,14 @@ def test_blob_field_threshold_metadata():
         "blob",
         inline_size_threshold=16 * 1024,
         dedicated_size_threshold=2 * 1024 * 1024,
+        pack_file_size_threshold=512 * 1024 * 1024,
     )
 
     assert field.metadata[b"lance-encoding:blob-inline-size-threshold"] == b"16384"
     assert field.metadata[b"lance-encoding:blob-dedicated-size-threshold"] == b"2097152"
+    assert (
+        field.metadata[b"lance-encoding:blob-pack-file-size-threshold"] == b"536870912"
+    )
 
 
 @pytest.mark.parametrize(
@@ -644,6 +656,30 @@ def test_blob_field_threshold_metadata():
             OverflowError,
             "dedicated_size_threshold must fit in a Rust usize",
             id="overflow_dedicated",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 0},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="zero_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": -1},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="negative_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": True},
+            TypeError,
+            "pack_file_size_threshold must be an int",
+            id="bool_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 2**100},
+            OverflowError,
+            "pack_file_size_threshold must fit in a Rust usize",
+            id="overflow_pack_file",
         ),
     ],
 )
@@ -704,6 +740,50 @@ def test_blob_extension_append_rejects_explicit_threshold_mismatch(tmp_path):
     lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
 
     append_schema = pa.schema([lance.blob_field("blob", inline_size_threshold=1024)])
+    append = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=append_schema,
+    )
+
+    with pytest.raises(
+        OSError, match="Cannot append data with blob threshold metadata"
+    ):
+        lance.write_dataset(append, dataset_path, mode="append")
+
+
+def test_blob_extension_pack_file_threshold_metadata_persists_after_reopen(
+    tmp_path: Path,
+):
+    dataset_path = tmp_path / "test_ds_v2_pack_file_threshold_persists"
+    threshold = 512 * 1024 * 1024
+    schema = pa.schema([lance.blob_field("blob", pack_file_size_threshold=threshold)])
+    table = pa.table({"blob": lance.blob_array([b"x"])}, schema=schema)
+
+    lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+    reopened = lance.dataset(dataset_path)
+
+    assert (
+        reopened.schema.field("blob").metadata[
+            b"lance-encoding:blob-pack-file-size-threshold"
+        ]
+        == str(threshold).encode()
+    )
+
+
+def test_blob_extension_append_rejects_pack_file_threshold_mismatch(tmp_path: Path):
+    dataset_path = tmp_path / "test_ds_v2_append_pack_file_mismatch"
+    initial_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=512 * 1024 * 1024)]
+    )
+    initial = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=initial_schema,
+    )
+    lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
+
+    append_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=256 * 1024 * 1024)]
+    )
     append = pa.table(
         {"blob": lance.blob_array([b"x" * 2048])},
         schema=append_schema,
@@ -941,6 +1021,68 @@ def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
 
     assert ds.to_table(columns=["blob"]).column("blob").to_pylist() == [None] * 4
     assert ds.take_blobs("blob", indices=range(4)) == []
+
+
+def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement(
+    tmp_path,
+):
+    dataset_uri = tmp_path / "test_blob_descriptor_array_builder_data_replacement"
+    logical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            lance.blob_field("blob"),
+        ]
+    )
+    initial = pa.table(
+        [
+            pa.array([0], type=pa.uint32()),
+            lance.blob_array([b"initial"]),
+        ],
+        schema=logical_schema,
+    )
+    ds = lance.write_dataset(initial, dataset_uri, data_storage_version="2.2")
+
+    file_id = str(uuid.uuid4())
+    data_file_name = f"{file_id}.lance"
+    blob_id = 1
+    blob_path = _blob_sidecar_path(dataset_uri / "data", file_id, blob_id)
+
+    files = LanceFileSession(dataset_uri / "data")
+    blob_writer = lance.BlobDescriptorArrayBuilder("blob")
+    packed = files.open_packed_blob_writer(data_file_name, blob_id)
+    assert packed.path.endswith(blob_path.relative_to(dataset_uri).as_posix())
+    packed.write_blob(b"replacement")
+    blob_writer.extend(packed.finish())
+
+    physical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            blob_writer.field,
+        ]
+    )
+    replacement = pa.record_batch(
+        [
+            pa.array([1], type=pa.uint32()),
+            blob_writer.finish(),
+        ],
+        schema=physical_schema,
+    )
+
+    with files.open_writer(
+        data_file_name, schema=physical_schema, version="2.2"
+    ) as file_writer:
+        file_writer.write_batch(replacement)
+
+    data_file = lance.fragment.DataFile.create(ds, data_file_name)
+    operation = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    ds = lance.LanceDataset.commit(ds, operation, read_version=ds.version)
+
+    assert ds.to_table(columns=["id"]).column("id").to_pylist() == [1]
+    blobs = ds.take_blobs("blob", indices=[0])
+    assert len(blobs) == 1
+    assert blobs[0].readall() == b"replacement"
 
 
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):

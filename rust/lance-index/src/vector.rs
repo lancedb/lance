@@ -4,9 +4,10 @@
 //! Vector Index
 //!
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::fmt::Debug;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_schema::Field;
@@ -408,7 +409,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// If an old row id is not in the mapping then it should be
     /// left alone.
-    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()>;
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;

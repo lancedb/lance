@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -1333,7 +1334,7 @@ impl ScalarIndex for InvertedIndex {
 
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let files = self
@@ -5253,16 +5254,16 @@ impl DocSet {
 
     // remap the row ids to the new row ids
     // returns the removed doc ids
-    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Vec<u32> {
+    pub fn remap(&mut self, mapping: &RowAddrRemap) -> Vec<u32> {
         let mut removed = Vec::new();
         let len = self.len();
         let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
         let num_tokens = std::mem::replace(&mut self.num_tokens, Vec::with_capacity(len));
         self.total_tokens = 0;
         for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
-            match mapping.get(&row_id) {
+            match mapping.get(row_id) {
                 Some(Some(new_row_id)) => {
-                    self.row_ids.push(*new_row_id);
+                    self.row_ids.push(new_row_id);
                     self.num_tokens.push(num_token);
                     self.total_tokens += num_token as u64;
                 }
@@ -6318,7 +6319,7 @@ mod tests {
         let mut builder = index.into_builder().await.unwrap();
 
         let mapping = HashMap::from([(0, None), (2, Some(3))]);
-        builder.remap(&mapping).await.unwrap();
+        builder.remap(&RowAddrRemap::direct(mapping)).await.unwrap();
 
         // after remap, the doc 0 is removed, and the doc 2 is updated to 3
         assert_eq!(builder.tokens.len(), 1);
@@ -6333,7 +6334,7 @@ mod tests {
 
         // remap to delete all docs
         let mapping = HashMap::from([(1, None), (3, None)]);
-        builder.remap(&mapping).await.unwrap();
+        builder.remap(&RowAddrRemap::direct(mapping)).await.unwrap();
 
         assert_eq!(builder.tokens.len(), 0);
         assert_eq!(builder.posting_lists.len(), 0);

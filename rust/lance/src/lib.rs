@@ -90,7 +90,11 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
 }
 
-pub use blob::{BlobArrayBuilder, BlobFieldOptions, blob_field, blob_field_with_options};
+pub use blob::{
+    BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
+    BlobFieldOptions, BlobRange, DedicatedBlobWriter, PackedBlobWriter, blob_field,
+    blob_field_with_options,
+};
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;
 

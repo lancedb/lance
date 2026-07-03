@@ -5,6 +5,16 @@
 //!
 //! To improve Arrow-RS ergonomic
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+// lance-arrow reinterprets value bytes as native numeric types in
+// `FloatArray::as_slice` for `bf16` (rust/lance-arrow/src/bfloat16.rs), which
+// requires the host byte order to match the on-disk byte order Lance writes.
+// Lance writes little-endian; building on a big-endian target would silently
+// produce wrong numeric values.
+#[cfg(not(target_endian = "little"))]
+compile_error!("lance-arrow only supports little-endian targets");
+
 use std::sync::Arc;
 use std::{collections::HashMap, ptr::NonNull};
 
@@ -54,6 +64,9 @@ pub const BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY: &str =
     "lance-encoding:blob-dedicated-size-threshold";
 /// Metadata key for overriding the inline blob size threshold (in bytes)
 pub const BLOB_INLINE_SIZE_THRESHOLD_META_KEY: &str = "lance-encoding:blob-inline-size-threshold";
+/// Metadata key for overriding the maximum size (in bytes) of a packed blob sidecar file
+pub const BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY: &str =
+    "lance-encoding:blob-pack-file-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
 

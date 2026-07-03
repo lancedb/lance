@@ -2248,27 +2248,24 @@ impl Transaction {
                             && file.file_major_version == new_file.file_major_version
                             && file.file_minor_version == new_file.file_minor_version
                         {
-                            // assign the new file path / size to the fragment
+                            // assign the new file path / size / base to the fragment
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
+                            file.base_id = new_file.base_id;
                         }
                         columns_covered.extend(file.fields.iter());
                     }
                     // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
                     // Then it means it's a all-NULL column that is being replaced with real data
-                    // just add it to the final fragments
+                    // just add it to the final fragments. Push the DataFile as
+                    // given so every field (including base_id) is preserved.
                     if columns_covered.is_disjoint(&new_file.fields.iter().collect()) {
-                        new_frag.add_file(
-                            new_file.path.clone(),
-                            new_file.fields.to_vec(),
-                            new_file.column_indices.to_vec(),
-                            &LanceFileVersion::try_from_major_minor(
-                                new_file.file_major_version,
-                                new_file.file_minor_version,
-                            )
-                            .expect("Expected valid file version"),
-                            new_file.file_size_bytes.get(),
-                        );
+                        LanceFileVersion::try_from_major_minor(
+                            new_file.file_major_version,
+                            new_file.file_minor_version,
+                        )
+                        .expect("Expected valid file version");
+                        new_frag.files.push(new_file.clone());
                     }
 
                     // Nothing changed in the current fragment, which is not expected -- error out

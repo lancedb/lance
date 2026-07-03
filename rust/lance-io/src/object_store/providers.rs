@@ -215,6 +215,12 @@ impl ObjectStoreRegistry {
         base_path: Url,
         params: &ObjectStoreParams,
     ) -> Result<Arc<ObjectStore>> {
+        // Base-scoped storage options (`base_<id>.<key>`) are directives for
+        // other registered base paths; resolve them away before building or
+        // caching a store for this location. Params already resolved for a
+        // base contain no scoped entries, so this is a no-op for them.
+        let params = params.scoped_to_base(None);
+        let params = params.as_ref();
         let scheme = base_path.scheme();
         let Some(provider) = self.get_provider(scheme) else {
             return Err(self.scheme_not_found_error(scheme));
@@ -392,6 +398,36 @@ mod tests {
             "dummy$blah",
             provider.calculate_object_store_prefix(&url, None).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_store_resolves_base_scoped_options() {
+        use crate::object_store::StorageOptionsAccessor;
+
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory://test").unwrap();
+
+        let with_scoped = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("shared".to_string(), "value".to_string()),
+                    ("base_1.account_key".to_string(), "base1-key".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let without_scoped = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("shared".to_string(), "value".to_string())]),
+            ))),
+            ..Default::default()
+        };
+
+        // Base-scoped entries are resolved away before the store is built and
+        // cached, so params with and without them yield the same cached store.
+        let store_scoped = registry.get_store(url.clone(), &with_scoped).await.unwrap();
+        let store_plain = registry.get_store(url, &without_scoped).await.unwrap();
+        assert!(Arc::ptr_eq(&store_scoped, &store_plain));
     }
 
     #[test]
