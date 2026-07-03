@@ -4215,3 +4215,82 @@ async fn test_merge_insert_conflict_retry_cleans_routed_files() {
         );
     }
 }
+
+/// `target_all_bases` on merge insert resolves to every registered base at
+/// execution time, with primary storage first when included.
+#[tokio::test]
+async fn test_merge_insert_target_all_bases() {
+    let fixture = multi_base_fixture(false).await;
+    let dataset = Arc::new(fixture.dataset);
+
+    // Single new file: with primary included it takes the first slot.
+    let source = multi_base_batch(&[20], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_all_bases(true)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let new_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .filter(|f| f.metadata.id >= 3)
+        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .collect();
+    assert_eq!(new_files, vec![None]);
+
+    // Without primary the first slot is the lowest registered base id.
+    let max_id = dataset.manifest.max_fragment_id().unwrap();
+    let source = multi_base_batch(&[21], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_all_bases(false)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let new_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .filter(|f| f.metadata.id > max_id)
+        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .collect();
+    assert_eq!(new_files, vec![Some(1)]);
+
+    // Cannot be combined with explicit target bases.
+    let err = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![1])
+        .target_all_bases(true)
+        .try_build()
+        .err()
+        .unwrap();
+    assert!(
+        err.to_string()
+            .contains("Cannot specify target_all_bases together with"),
+        "unexpected error: {}",
+        err
+    );
+
+    let expected_new: Vec<_> = [20, 21]
+        .iter()
+        .map(|id| expected_row(*id, 1000, "new"))
+        .collect();
+    let all_rows = collect_multi_base_rows(&dataset).await;
+    for row in expected_new {
+        assert!(all_rows.contains(&row), "missing row {:?}", row);
+    }
+}

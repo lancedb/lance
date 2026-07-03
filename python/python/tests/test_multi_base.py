@@ -82,6 +82,26 @@ class TestMultiBase:
             data.sort_values("id").reset_index(drop=True),
         )
 
+    def test_write_target_all_bases(self):
+        """target_all_bases=True rotates across primary and all initial bases."""
+        data = self.create_test_data(300)
+
+        dataset = lance.write_dataset(
+            data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.path1_uri, name="path1"),
+                DatasetBasePath(self.path2_uri, name="path2"),
+            ],
+            target_all_bases=True,
+            max_rows_per_file=100,
+        )
+
+        base_ids = [f.data_files()[0].base_id for f in dataset.get_fragments()]
+        assert base_ids == [None, 1, 2]
+        assert len(dataset.to_table()) == 300
+
     def test_base_scoped_storage_options(self):
         """base_<id>.<key> storage options flow through write and read."""
         data = self.create_test_data(200)
@@ -1553,3 +1573,36 @@ class TestMergeInsertMultiBase:
             if fragment.fragment_id > 1:
                 for data_file in fragment.data_files():
                     assert self.base_name_of(dataset, data_file) is None
+
+    def test_merge_insert_target_all_bases(self):
+        """target_all_bases spreads new files across all bases, primary first."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [300], "value": ["inserted_300"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_all_bases()
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 101
+        # A single new file lands in the first slot: primary storage.
+        newest = max(f.fragment_id for f in dataset.get_fragments())
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id == newest:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) is None
+
+        new_data = pd.DataFrame({"id": [301], "value": ["inserted_301"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_all_bases(include_primary=False)
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 102
+        newest = max(f.fragment_id for f in dataset.get_fragments())
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id == newest:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) == "base1"

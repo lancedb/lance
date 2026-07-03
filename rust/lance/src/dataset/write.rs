@@ -393,6 +393,13 @@ pub struct WriteParams {
     /// An entry equal to the dataset's URI targets the dataset's primary storage.
     pub target_base_names_or_paths: Option<Vec<String>>,
 
+    /// Target every base registered in the dataset manifest, resolved when the
+    /// write executes. `Some(include_primary)`: when `include_primary` is true
+    /// the dataset's primary storage participates in the rotation as the first
+    /// slot. Cannot be combined with `target_bases` or
+    /// `target_base_names_or_paths`.
+    pub target_all_bases: Option<bool>,
+
     /// Allow writing external blob URIs that cannot be mapped to any registered
     /// non-dataset-root base path. When disabled, such rows are rejected.
     pub allow_external_blob_outside_bases: bool,
@@ -430,6 +437,7 @@ impl Default for WriteParams {
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
+            target_all_bases: None,
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
@@ -525,6 +533,19 @@ impl WriteParams {
     pub fn with_target_base_names_or_paths(self, references: Vec<String>) -> Self {
         Self {
             target_base_names_or_paths: Some(references),
+            ..self
+        }
+    }
+
+    /// Target every base registered in the dataset manifest, resolved when the
+    /// write executes. When `include_primary` is true the dataset's primary
+    /// storage participates in the rotation as the first slot.
+    ///
+    /// Cannot be combined with [`Self::with_target_bases`] or
+    /// [`Self::with_target_base_names_or_paths`].
+    pub fn with_target_all_bases(self, include_primary: bool) -> Self {
+        Self {
+            target_all_bases: Some(include_primary),
             ..self
         }
     }
@@ -830,6 +851,12 @@ pub async fn validate_and_resolve_target_bases(
         ));
     }
 
+    if params.target_all_bases.is_some() {
+        return Err(Error::invalid_input(
+            "target_all_bases requires dataset context to resolve; use the write or merge insert APIs to apply it.",
+        ));
+    }
+
     // Step 2: Assign IDs to initial_bases and add them to all_bases
     let mut all_bases: HashMap<u32, BasePath> = existing_base_paths.cloned().unwrap_or_default();
     if let Some(initial_bases) = &mut params.initial_bases {
@@ -934,6 +961,45 @@ pub(crate) async fn validate_and_resolve_target_bases_with_primary(
     primary_base_dir: &Path,
     primary_uri: &str,
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
+    // Expand an all-bases request into an explicit id list (primary first,
+    // then registered bases in ascending id order) and continue below.
+    if let Some(include_primary) = params.target_all_bases {
+        if params.target_bases.is_some() || params.target_base_names_or_paths.is_some() {
+            return Err(Error::invalid_input(
+                "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
+            ));
+        }
+        let mut ids: Vec<u32> = existing_base_paths
+            .map(|bases| bases.keys().copied().collect())
+            .unwrap_or_default();
+        // CREATE mode registers initial_bases in the same write; assign their
+        // ids here (the delegate keeps non-zero ids as-is) so they join the
+        // rotation.
+        if let Some(initial_bases) = &mut params.initial_bases {
+            let mut next_id = ids.iter().max().map(|id| id + 1).unwrap_or(1);
+            for base_path in initial_bases.iter_mut() {
+                if base_path.id == 0 {
+                    base_path.id = next_id;
+                    next_id += 1;
+                }
+                ids.push(base_path.id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        if include_primary {
+            ids.insert(0, PRIMARY_BASE_ID);
+        }
+        if ids.is_empty() {
+            return Err(Error::invalid_input(
+                "target_all_bases found no registered bases and include_primary is false. \
+                 Register bases or include primary storage.",
+            ));
+        }
+        params.target_bases = Some(ids);
+        params.target_all_bases = None;
+    }
+
     let has_primary_ids = params
         .target_bases
         .as_ref()
@@ -4209,5 +4275,209 @@ mod tests {
         assert_eq!(file_bases, vec![None, Some(2)]);
 
         assert_eq!(dataset.count_rows(None).await.unwrap(), 21);
+    }
+
+    /// `target_all_bases` resolves to every registered base at execution
+    /// time, with primary storage as the first slot when included.
+    #[tokio::test]
+    async fn test_multi_base_target_all_bases() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = "memory://all_bases_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen.batch(3),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        is_dataset_root: true,
+                        path: base1_uri.clone(),
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        is_dataset_root: false,
+                        path: base2_uri.clone(),
+                    },
+                ]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // All bases including primary: slots are [primary, base1, base2].
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen2.batch(9),
+            Arc::new(dataset),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(1)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+
+        // Without primary: slots are [base1, base2].
+        let mut data_gen3 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen3.batch(6),
+            Arc::new(dataset),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                }
+                .with_target_all_bases(false),
+            ),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(4)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![Some(1), Some(2)]);
+
+        // Cannot be combined with explicit target bases.
+        let mut data_gen4 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let result = Dataset::write(
+            data_gen4.batch(3),
+            Arc::new(dataset),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    target_bases: Some(vec![1]),
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot specify target_all_bases together with")
+        );
+
+        // On a dataset with no registered bases: include_primary=true is a
+        // no-op rotation over primary, false is rejected.
+        let plain_uri = "memory://all_bases_plain";
+        let mut data_gen5 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let plain = Dataset::write(data_gen5.batch(3), plain_uri, None)
+            .await
+            .unwrap();
+        let mut data_gen6 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let plain = Dataset::write(
+            data_gen6.batch(3),
+            Arc::new(plain),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            plain.get_fragments().iter().all(|f| f
+                .metadata
+                .files
+                .iter()
+                .all(|file| file.base_id.is_none()))
+        );
+        let mut data_gen7 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let result = Dataset::write(
+            data_gen7.batch(3),
+            Arc::new(plain),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }
+                .with_target_all_bases(false),
+            ),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("target_all_bases found no registered bases")
+        );
+
+        // CREATE mode: initial_bases join the rotation before their ids are
+        // committed to a manifest.
+        let create_uri = "memory://all_bases_create";
+        let mut data_gen8 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen8.batch(9),
+            create_uri,
+            Some(
+                WriteParams {
+                    mode: WriteMode::Create,
+                    max_rows_per_file: 3,
+                    initial_bases: Some(vec![
+                        BasePath {
+                            id: 0,
+                            name: Some("base1".to_string()),
+                            is_dataset_root: true,
+                            path: format!("{}/base1", create_uri),
+                        },
+                        BasePath {
+                            id: 0,
+                            name: Some("base2".to_string()),
+                            is_dataset_root: false,
+                            path: format!("{}/base2", create_uri),
+                        },
+                    ]),
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
     }
 }

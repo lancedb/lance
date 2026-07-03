@@ -359,6 +359,9 @@ struct MergeInsertParams {
     // Target base names or path URIs (unresolved), mirroring
     // WriteParams::target_base_names_or_paths. Resolved at execution time.
     target_base_names_or_paths: Option<Vec<String>>,
+    // Target all registered bases, mirroring WriteParams::target_all_bases.
+    // Some(include_primary); resolved at execution time.
+    target_all_bases: Option<bool>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -481,6 +484,7 @@ impl MergeInsertBuilder {
                 commit_retries: None,
                 target_bases: None,
                 target_base_names_or_paths: None,
+                target_all_bases: None,
             },
         })
     }
@@ -607,6 +611,18 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Write new fragments produced by this merge insert to every base
+    /// registered in the dataset manifest, resolved when the merge executes.
+    /// When `include_primary` is true the dataset's primary storage
+    /// participates in the rotation as the first slot.
+    ///
+    /// Cannot be combined with [`Self::target_bases`] or
+    /// [`Self::target_base_names_or_paths`].
+    pub fn target_all_bases(&mut self, include_primary: bool) -> &mut Self {
+        self.params.target_all_bases = Some(include_primary);
+        self
+    }
+
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
         if !self.params.insert_not_matched
@@ -620,6 +636,14 @@ impl MergeInsertBuilder {
         if self.params.target_bases.is_some() && self.params.target_base_names_or_paths.is_some() {
             return Err(Error::invalid_input(
                 "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
+            ));
+        }
+        if self.params.target_all_bases.is_some()
+            && (self.params.target_bases.is_some()
+                || self.params.target_base_names_or_paths.is_some())
+        {
+            return Err(Error::invalid_input(
+                "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
         Ok(MergeInsertJob {
@@ -640,7 +664,10 @@ async fn resolve_target_bases(
     dataset: &Dataset,
     params: &MergeInsertParams,
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
-    if params.target_bases.is_none() && params.target_base_names_or_paths.is_none() {
+    if params.target_bases.is_none()
+        && params.target_base_names_or_paths.is_none()
+        && params.target_all_bases.is_none()
+    {
         return Ok(None);
     }
     // Reuse the normal write path resolution (validation, name/path lookup,
@@ -649,6 +676,7 @@ async fn resolve_target_bases(
         mode: WriteMode::Append,
         target_bases: params.target_bases.clone(),
         target_base_names_or_paths: params.target_base_names_or_paths.clone(),
+        target_all_bases: params.target_all_bases,
         session: Some(dataset.session.clone()),
         store_params: dataset.store_params.as_deref().cloned(),
         base_store_params: dataset.base_store_params.as_deref().cloned(),
