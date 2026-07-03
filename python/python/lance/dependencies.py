@@ -227,6 +227,10 @@ def _is_pydantic_base_model(obj: Any) -> bool:
     return isinstance(obj, BaseModel)
 
 
+def model_to_dict(obj: Any) -> dict[str, Any]:
+    return obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
+
+
 __all__ = [
     # lazy-load third party libs
     "datasets",
@@ -243,6 +247,7 @@ __all__ = [
     "_check_for_torch",
     "_is_pydantic_base_model",
     "_LazyModule",
+    "model_to_dict",
     # exported flags/guards
     "_NUMPY_AVAILABLE",
     "_PANDAS_AVAILABLE",

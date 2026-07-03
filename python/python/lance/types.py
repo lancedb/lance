@@ -13,6 +13,7 @@ from .dependencies import (
     _check_for_hugging_face,
     _check_for_pandas,
     _is_pydantic_base_model,
+    model_to_dict,
 )
 from .dependencies import pandas as pd
 
@@ -153,10 +154,7 @@ def _coerce_reader(
         and len(data_obj) > 0
         and _is_pydantic_base_model(data_obj[0])
     ):
-        dicts = [
-            item.model_dump() if hasattr(item, "model_dump") else item.dict()
-            for item in data_obj
-        ]
+        dicts = [model_to_dict(item) for item in data_obj]
         batch = pa.RecordBatch.from_pylist(dicts, schema=schema)
         return pa.RecordBatchReader.from_batches(batch.schema, [batch])
     # for other iterables, assume they are of type Iterable[RecordBatch]

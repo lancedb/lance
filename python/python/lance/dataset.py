@@ -47,6 +47,7 @@ from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
+    model_to_dict,
     torch,
 )
 from .dependencies import numpy as np
@@ -936,10 +937,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
         if uri is None:
             uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
-        dicts = [
-            item.model_dump() if hasattr(item, "model_dump") else item.dict()
-            for item in data
-        ]
+        dicts = [model_to_dict(item) for item in data]
         schema = _pydantic_model_to_schema(model_class)
         table = pa.Table.from_pylist(dicts, schema=schema)
         return write_dataset(table, uri, mode=mode, **kwargs)
