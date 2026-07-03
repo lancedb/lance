@@ -2352,9 +2352,36 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         if let Some(affected_rows) = data.affected_rows {
             commit_builder = commit_builder.with_affected_rows(affected_rows);
         }
-        let new_dataset = commit_builder.execute(data.transaction).await?;
 
-        Ok((Arc::new(new_dataset), data.stats))
+        let new_fragments = match &data.transaction.operation {
+            Operation::Update { new_fragments, .. } => new_fragments.clone(),
+            _ => Vec::new(),
+        };
+        match commit_builder.execute(data.transaction).await {
+            Ok(new_dataset) => Ok((Arc::new(new_dataset), data.stats)),
+            Err(e) => {
+                // A retryable conflict discards this attempt and re-executes it,
+                // so its data files are provably uncommitted; remove them
+                // (including files routed to target bases, which version cleanup
+                // never scans). Other commit errors may be ambiguous about
+                // whether the manifest was written, so leave the files alone.
+                if matches!(e, Error::RetryableCommitConflict { .. }) && !new_fragments.is_empty() {
+                    let target_bases_info =
+                        resolve_target_bases(&self.job.dataset, &self.job.params)
+                            .await
+                            .ok()
+                            .flatten();
+                    cleanup_data_fragments(
+                        &self.job.dataset.object_store,
+                        &self.job.dataset.base,
+                        target_bases_info.as_deref(),
+                        &new_fragments,
+                    )
+                    .await;
+                }
+                Err(e)
+            }
+        }
     }
 
     fn update_dataset(&mut self, dataset: Arc<Dataset>) {

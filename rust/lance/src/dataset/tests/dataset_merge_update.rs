@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use std::vec;
 
 use crate::dataset::ROW_ID;
@@ -4122,4 +4124,94 @@ async fn test_merge_insert_target_bases_include_primary() {
 
     let dataset = Dataset::open(dataset.uri()).await.unwrap();
     assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+}
+
+/// Merge insert attempts discarded by a retryable commit conflict must clean
+/// up the data files they routed to target bases; after concurrent merges the
+/// bases must contain only files referenced by the final manifest.
+#[tokio::test]
+async fn test_merge_insert_conflict_retry_cleans_routed_files() {
+    let fixture = multi_base_fixture(false).await;
+    let dataset = Arc::new(fixture.dataset);
+    let concurrency: u32 = 5;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(concurrency as usize));
+    let mut handles = Vec::new();
+    for i in 0..concurrency {
+        // Every task starts from the same dataset version and updates the same
+        // row, so all but one attempt per round hit a retryable conflict.
+        let dataset = dataset.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let source = multi_base_batch(&[1, 100 + i as i32], 1000 + i as i32, "new");
+            let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .conflict_retries(20)
+                .retry_timeout(Duration::from_secs(60))
+                .target_bases(vec![1, 2])
+                .try_build()
+                .unwrap();
+            let reader = Box::new(RecordBatchIterator::new(
+                vec![Ok(source)],
+                multi_base_schema(),
+            ));
+            job.execute(reader_to_stream(reader)).await.unwrap()
+        }));
+    }
+    let mut total_attempts = 0;
+    for handle in handles {
+        let (_dataset, stats) = handle.await.unwrap();
+        total_attempts += stats.num_attempts;
+    }
+    assert!(
+        total_attempts > concurrency,
+        "expected at least one conflicted attempt, got {} attempts",
+        total_attempts
+    );
+
+    let dataset = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(
+        dataset.count_rows(None).await.unwrap(),
+        9 + concurrency as usize
+    );
+
+    let mut referenced: HashSet<(Option<u32>, String)> = HashSet::new();
+    for fragment in dataset.get_fragments() {
+        for file in &fragment.metadata.files {
+            referenced.insert((file.base_id, file.path.to_string()));
+        }
+    }
+    let list_files = |dir: &std::path::Path| -> Vec<String> {
+        if !dir.exists() {
+            return vec![];
+        }
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|ext| ext == "lance") {
+                    Some(path.file_name().unwrap().to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    for name in list_files(&fixture.base1_dir.join("data")) {
+        assert!(
+            referenced.contains(&(Some(1), name.clone())),
+            "orphaned file in base1: {}",
+            name
+        );
+    }
+    for name in list_files(&fixture.base2_dir) {
+        assert!(
+            referenced.contains(&(Some(2), name.clone())),
+            "orphaned file in base2: {}",
+            name
+        );
+    }
 }
