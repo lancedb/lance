@@ -46,6 +46,15 @@ pub async fn filtered_read_exec_to_proto(
     exec: &FilteredReadExec,
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
+    if exec.is_take() {
+        // TODO: define a proto representation for the streaming row input so
+        // take-mode reads can participate in distributed plan pushdown
+        return Err(Error::not_supported_source(
+            "a FilteredReadExec that takes rows from an input plan cannot be serialized"
+                .to_string()
+                .into(),
+        ));
+    }
     let table = table_identifier_from_dataset(exec.dataset()).await?;
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns

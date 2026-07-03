@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use super::TakeExec;
+use super::filtered_read::FilteredReadExec;
 use arrow_schema::Schema as ArrowSchema;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
@@ -18,11 +19,28 @@ use datafusion::{
 };
 use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
 
-/// Rule that eliminates [TakeExec] nodes that are immediately followed by another [TakeExec].
+/// Rule that eliminates take nodes that are immediately followed by another
+/// take node, fetching the union of the columns in a single node instead.
+///
+/// A "take" is either a [TakeExec] (legacy storage) or a take-mode
+/// [FilteredReadExec] (see `FilteredReadExec::is_take`); the scanner emits
+/// stacked takes in some plan shapes (e.g. filter columns then projection
+/// columns).
 #[derive(Debug)]
 pub struct CoalesceTake;
 
 impl CoalesceTake {
+    /// Whether `plan` is a take node this rule knows how to collapse
+    fn as_take(plan: &Arc<dyn ExecutionPlan>) -> Option<&dyn ExecutionPlan> {
+        if plan.as_any().is::<TakeExec>() {
+            Some(plan.as_ref())
+        } else if let Some(filtered_read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+            filtered_read.is_take().then_some(plan.as_ref())
+        } else {
+            None
+        }
+    }
+
     fn field_order_differs(old_schema: &ArrowSchema, new_schema: &ArrowSchema) -> bool {
         old_schema
             .fields
@@ -48,8 +66,8 @@ impl CoalesceTake {
     }
 
     fn collapse_takes(
-        inner_take: &TakeExec,
-        outer_take: &TakeExec,
+        inner_take: &dyn ExecutionPlan,
+        outer_take: &dyn ExecutionPlan,
         outer_exec: Arc<dyn ExecutionPlan>,
     ) -> Arc<dyn ExecutionPlan> {
         let inner_take_input = inner_take.children()[0].clone();
@@ -78,21 +96,21 @@ impl PhysicalOptimizerRule for CoalesceTake {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
             .transform_down(|plan| {
-                if let Some(outer_take) = plan.as_any().downcast_ref::<TakeExec>() {
+                if let Some(outer_take) = Self::as_take(&plan) {
                     let child = outer_take.children()[0];
-                    // Case 1: TakeExec -> TakeExec
-                    if let Some(inner_take) = child.as_any().downcast_ref::<TakeExec>() {
+                    // Case 1: take -> take
+                    if let Some(inner_take) = Self::as_take(child) {
                         return Ok(Transformed::yes(Self::collapse_takes(
                             inner_take,
                             outer_take,
                             plan.clone(),
                         )));
-                    // Case 2: TakeExec -> CoalesceBatchesExec -> TakeExec
+                    // Case 2: take -> CoalesceBatchesExec -> take
                     } else if let Some(exec_child) =
                         child.as_any().downcast_ref::<CoalesceBatchesExec>()
                     {
                         let inner_child = exec_child.children()[0].clone();
-                        if let Some(inner_take) = inner_child.as_any().downcast_ref::<TakeExec>() {
+                        if let Some(inner_take) = Self::as_take(&inner_child) {
                             return Ok(Transformed::yes(Self::collapse_takes(
                                 inner_take,
                                 outer_take,

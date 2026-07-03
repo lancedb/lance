@@ -5,9 +5,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
+use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
@@ -31,7 +34,7 @@ use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, datatypes::Projection};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result, datatypes::Projection};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
@@ -41,7 +44,8 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
-    IndexExprResult, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
+    IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges,
+    ranges_to_bitmap, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
@@ -1504,12 +1508,78 @@ pub struct FilteredReadExec {
     options: FilteredReadOptions,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    index_input: Option<Arc<dyn ExecutionPlan>>,
+    input: FilteredReadInput,
     // Precomputed internal plan
     plan: Arc<OnceCell<FilteredReadInternalPlan>>,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
     // multiple partitions, each partition will share the stream.
     running_stream: Arc<AsyncMutex<Option<FilteredReadStream>>>,
+}
+
+/// How the (optional) input plan tells the node which rows to read.
+///
+/// Both plan-carrying variants communicate the same information — "which
+/// rows" — in different encodings.  `IndexQuery` is a row *set*: exactly one
+/// batch in the serialized [`IndexExprResult`] wire layout.  `TakeRows` is a
+/// row *stream*: ordinary record batches with a `_rowid` or `_rowaddr`
+/// column, where any additional columns (e.g. `_distance`) are carried
+/// through to the output.  Each `TakeRows` batch is converted to an in-memory
+/// [`IndexExprResult`] internally, so it is the streaming generalization of
+/// `IndexQuery`.
+///
+/// The variant is chosen by [`FilteredReadExec::try_new`] from the input
+/// plan's schema: the wire layouts are unmistakable (binary mask columns),
+/// anything else must carry a row id or row address column.
+#[derive(Debug)]
+enum FilteredReadInput {
+    /// Scan the dataset with no input plan
+    FullScan,
+    /// Scan the dataset, scoped by the serialized [`IndexExprResult`]
+    /// produced by this plan (e.g. [`ScalarIndexExec`], `_rowid IN (...)`)
+    ///
+    /// [`ScalarIndexExec`]: super::scalar_index::ScalarIndexExec
+    IndexQuery(Arc<dyn ExecutionPlan>),
+    /// Take: read the projected fields for the rows produced by this plan and
+    /// merge them into its batches, preserving row order, duplicates, and
+    /// payload columns (the same contract as [`TakeExec`](super::TakeExec))
+    TakeRows(TakeRowsInput),
+}
+
+impl FilteredReadInput {
+    /// The input plan driving an index-query scan, if any
+    fn index_query(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        match self {
+            Self::IndexQuery(plan) => Some(plan),
+            _ => None,
+        }
+    }
+
+    /// The child plan, regardless of encoding
+    fn child(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        match self {
+            Self::FullScan => None,
+            Self::IndexQuery(plan) => Some(plan),
+            Self::TakeRows(take) => Some(&take.input),
+        }
+    }
+}
+
+/// State derived at construction for a take-mode read
+#[derive(Debug)]
+struct TakeRowsInput {
+    input: Arc<dyn ExecutionPlan>,
+    /// The input column identifying rows: [`ROW_ID`] or [`ROW_ADDR`].
+    ///
+    /// `_rowid` works on any dataset (the mask is resolved through each
+    /// fragment's row id sequence); `_rowaddr` only when row addresses
+    /// coincide with row ids (no stable row ids).
+    key_column: &'static str,
+    /// `options.projection` minus the fields already present in the input
+    /// schema — the fields this node actually reads
+    fields_to_take: Projection,
+    /// A copy of the node options whose projection is `fields_to_take` plus
+    /// the key column, used to plan and read the fragments
+    read_options: FilteredReadOptions,
 }
 
 /// Public plan for distributed execution - uses bitmap for flexibility
@@ -1558,10 +1628,164 @@ impl FilteredReadInternalPlan {
 }
 
 impl FilteredReadExec {
+    /// Create a new filtered read.
+    ///
+    /// `index_input` generalizes to "a plan that tells this node which rows to
+    /// read" and accepts two encodings, detected from the plan's schema:
+    ///
+    /// - A serialized [`IndexExprResult`] batch (the wire layout emitted by
+    ///   [`ScalarIndexExec`](super::scalar_index::ScalarIndexExec)): a row
+    ///   *set* scoping a scan.  This is the classic behavior.
+    /// - Any other plan carrying a `_rowid` or `_rowaddr` column: a row
+    ///   *stream* to take.  The node reads `options.projection` for exactly
+    ///   those rows and merges the columns into the input's batches,
+    ///   preserving row order, duplicates, and the input's other columns —
+    ///   the same contract as [`TakeExec`](super::TakeExec).  Fields already
+    ///   present in the input schema are not re-read.
     pub fn try_new(
         dataset: Arc<Dataset>,
-        mut options: FilteredReadOptions,
+        options: FilteredReadOptions,
         index_input: Option<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Self> {
+        if let Some(input) = index_input {
+            if Self::is_index_query_schema(input.schema().as_ref()) {
+                Self::try_new_scan(dataset, options, FilteredReadInput::IndexQuery(input))
+            } else {
+                Self::try_new_take_rows(dataset, options, input)
+            }
+        } else {
+            Self::try_new_scan(dataset, options, FilteredReadInput::FullScan)
+        }
+    }
+
+    /// Whether `schema` is one of the serialized [`IndexExprResult`] wire
+    /// layouts (see [`IndexExprResultWireFormat`])
+    fn is_index_query_schema(schema: &arrow_schema::Schema) -> bool {
+        [
+            IndexExprResultWireFormat::TwoMask,
+            IndexExprResultWireFormat::ThreeVariant,
+        ]
+        .iter()
+        .any(|format| schema.fields() == format.schema().fields())
+    }
+
+    /// Construct a take-mode read: fetch `options.projection` for the rows
+    /// produced by `input` and merge the columns into its batches
+    fn try_new_take_rows(
+        dataset: Arc<Dataset>,
+        options: FilteredReadOptions,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Self> {
+        if dataset.is_legacy_storage() {
+            return Err(Error::not_supported_source(
+                "taking rows through FilteredReadExec requires the v2 storage format"
+                    .to_string()
+                    .into(),
+            ));
+        }
+        if options.refine_filter.is_some() || options.full_filter.is_some() {
+            return Err(Error::invalid_input_source(
+                "filters are not supported when taking rows from an input plan".into(),
+            ));
+        }
+        if options.scan_range_before_filter.is_some() || options.scan_range_after_filter.is_some() {
+            return Err(Error::invalid_input_source(
+                "scan ranges are not supported when taking rows from an input plan".into(),
+            ));
+        }
+        if options.with_deleted_rows || options.only_indexed_fragments {
+            return Err(Error::invalid_input_source(
+                "with_deleted_rows / only_indexed_fragments are not supported when taking rows from an input plan".into(),
+            ));
+        }
+        if options.projection.with_row_id || options.projection.with_row_addr {
+            return Err(Error::invalid_input_source(
+                "a take cannot be used to insert the row id / row address; the input plan must provide them".into(),
+            ));
+        }
+
+        let input_schema = input.schema();
+        let has_row_id = input_schema.column_with_name(ROW_ID).is_some();
+        let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
+        let key_column = if has_row_id {
+            ROW_ID
+        } else if has_row_addr {
+            if dataset.manifest.uses_stable_row_ids() {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "cannot take rows by '{}' on a dataset with stable row ids; the input plan must provide '{}'",
+                        ROW_ADDR, ROW_ID
+                    )
+                    .into(),
+                ));
+            }
+            ROW_ADDR
+        } else {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "the input plan of a take must have a column named '{}' or '{}'",
+                    ROW_ADDR, ROW_ID
+                )
+                .into(),
+            ));
+        };
+
+        let fields_to_take = options
+            .projection
+            .clone()
+            .subtract_arrow_schema(input_schema.as_ref(), OnMissing::Ignore)?;
+        if !fields_to_take.has_data_fields() {
+            return Err(Error::invalid_input_source(
+                "the input plan already contains every projected field; there is nothing to read"
+                    .into(),
+            ));
+        }
+
+        let output_schema = Arc::new(arrow_schema::Schema::from(
+            &super::TakeExec::calculate_output_schema(
+                dataset.schema(),
+                input_schema.as_ref(),
+                &fields_to_take,
+            ),
+        ));
+        // Take mode transforms the input stream in place, so partitioning and
+        // emission behavior follow the input
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(EquivalenceProperties::new(output_schema)),
+        );
+
+        let read_projection = if key_column == ROW_ID {
+            fields_to_take.clone().with_row_id()
+        } else {
+            fields_to_take.clone().with_row_addr()
+        };
+        let mut read_options = options.clone();
+        read_options.projection = read_projection;
+
+        Ok(Self {
+            dataset,
+            options,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+            input: FilteredReadInput::TakeRows(TakeRowsInput {
+                input,
+                key_column,
+                fields_to_take,
+                read_options,
+            }),
+            plan: Arc::new(OnceCell::new()),
+            running_stream: Arc::new(AsyncMutex::new(None)),
+        })
+    }
+
+    fn try_new_scan(
+        dataset: Arc<Dataset>,
+        mut options: FilteredReadOptions,
+        input: FilteredReadInput,
     ) -> Result<Self> {
         if options.with_deleted_rows {
             // Ensure we have the row id column if with_deleted_rows is set
@@ -1577,7 +1801,7 @@ impl FilteredReadExec {
             // Validate that there's a filter when using scan_range_after_filter
             if options.full_filter.is_none()
                 && options.refine_filter.is_none()
-                && index_input.is_none()
+                && input.index_query().is_none()
             {
                 return Err(Error::invalid_input_source("scan_range_after_filter requires a filter to be applied. Use scan_range_before_filter for unfiltered scans."
                     .into()));
@@ -1616,7 +1840,7 @@ impl FilteredReadExec {
             properties,
             running_stream: Arc::new(AsyncMutex::new(None)),
             metrics,
-            index_input,
+            input,
             plan: Arc::new(OnceCell::new()),
         })
     }
@@ -1715,11 +1939,18 @@ impl FilteredReadExec {
 
     /// Get the existing plan or create it if it doesn't exist
     pub async fn get_or_create_plan(&self, ctx: Arc<TaskContext>) -> Result<FilteredReadPlan> {
+        if self.is_take() {
+            return Err(Error::not_supported_source(
+                "a FilteredReadExec that takes rows from an input plan does not have a precomputable plan"
+                    .to_string()
+                    .into(),
+            ));
+        }
         let internal_plan = Self::get_or_create_plan_impl(
             &self.plan,
             self.dataset.clone(),
             &self.options,
-            self.index_input.as_ref(),
+            self.input.index_query(),
             0,
             ctx,
         )
@@ -1751,7 +1982,7 @@ impl FilteredReadExec {
             .as_ref()
             .and_then(|o| o.batch_size_bytes);
         let metrics = self.metrics.clone();
-        let index_input = self.index_input.clone();
+        let index_input = self.input.index_query().cloned();
         let plan_cell = self.plan.clone();
 
         let stream = futures::stream::once(async move {
@@ -1807,18 +2038,344 @@ impl FilteredReadExec {
         &self.options
     }
 
+    /// The plan producing the serialized index-query result, if this node is
+    /// an index-query scan
     pub fn index_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
-        self.index_input.as_ref()
+        self.input.index_query()
+    }
+
+    /// Whether this node takes rows from an input plan (see
+    /// [`Self::try_new`]) rather than scanning the dataset
+    pub fn is_take(&self) -> bool {
+        matches!(self.input, FilteredReadInput::TakeRows(_))
     }
 
     /// Return the pre-computed plan if one exists, without triggering initialization.
     pub fn plan(&self) -> Option<FilteredReadPlan> {
         self.plan.get().map(|p| p.to_external_plan())
     }
+
+    fn execute_take(
+        &self,
+        take: &TakeRowsInput,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let input_stream = take.input.execute(partition, context)?;
+        let dataset = self.dataset.clone();
+        let read_options = take.read_options.clone();
+        let key_column = take.key_column;
+        let new_fields_schema = Arc::new(arrow_schema::Schema::from(
+            &take.fields_to_take.to_bare_schema(),
+        ));
+        let output_schema = self.schema();
+        let metrics = self.metrics.clone();
+
+        // ScanScheduler::new launches the I/O scheduler in the background and
+        // we aren't allowed to do work in `execute`, so defer creation of the
+        // take stream until first polled.
+        let lazy_stream = futures::stream::once(async move {
+            let take_stream = Arc::new(FilteredReadTakeStream::new(
+                dataset,
+                read_options,
+                key_column,
+                new_fields_schema,
+                output_schema,
+                &metrics,
+                partition,
+            ));
+            take_stream.apply(input_stream)
+        })
+        .flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            lazy_stream,
+        )))
+    }
+}
+
+/// Executes the take mode of a [`FilteredReadExec`] (see
+/// [`FilteredReadInput::TakeRows`]).
+///
+/// Each input batch is converted into an in-memory exact [`IndexExprResult`]
+/// and pushed through the same planning and read pipeline as an index-query
+/// scan (`plan_scan` → `plan_to_scoped_fragments` → `read_fragment`).  The
+/// freshly read columns are then aligned to the input's row order and merged
+/// into the batch, so row order, duplicates, and payload columns are all
+/// preserved.
+struct FilteredReadTakeStream {
+    dataset: Arc<Dataset>,
+    /// Node options whose projection is the fields to read plus the key column
+    read_options: FilteredReadOptions,
+    /// The input column identifying rows: [`ROW_ID`] or [`ROW_ADDR`]
+    key_column: &'static str,
+    /// Arrow schema of just the fields being read, used to strip the key
+    /// column from the read data before the merge
+    new_fields_schema: SchemaRef,
+    output_schema: SchemaRef,
+    scan_scheduler: Arc<ScanScheduler>,
+    /// Fragment metadata, loaded on the first batch and reused afterwards
+    loaded_fragments: OnceCell<Vec<LoadedFragment>>,
+    global_metrics: Arc<FilteredReadGlobalMetrics>,
+    baseline_metrics: BaselineMetrics,
+}
+
+impl FilteredReadTakeStream {
+    fn new(
+        dataset: Arc<Dataset>,
+        read_options: FilteredReadOptions,
+        key_column: &'static str,
+        new_fields_schema: SchemaRef,
+        output_schema: SchemaRef,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+    ) -> Self {
+        let obj_store = dataset.object_store.clone();
+        let scheduler_config = if let Some(io_buffer_size_bytes) = read_options
+            .io_buffer_size_bytes
+            .or_else(get_default_io_buffer_size_override)
+        {
+            SchedulerConfig::new(io_buffer_size_bytes)
+        } else {
+            SchedulerConfig::max_bandwidth(obj_store.as_ref())
+        };
+        let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
+        Self {
+            dataset,
+            read_options,
+            key_column,
+            new_fields_schema,
+            output_schema,
+            scan_scheduler,
+            loaded_fragments: OnceCell::new(),
+            global_metrics: Arc::new(FilteredReadGlobalMetrics::new(metrics)),
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+        }
+    }
+
+    async fn load_fragments(&self) -> Result<&Vec<LoadedFragment>> {
+        self.loaded_fragments
+            .get_or_try_init(|| async {
+                let io_parallelism = self.dataset.object_store.io_parallelism();
+                let fragments = self
+                    .read_options
+                    .fragments
+                    .clone()
+                    .unwrap_or_else(|| self.dataset.fragments().clone());
+                let frag_futs = fragments
+                    .iter()
+                    .map(|frag| {
+                        Result::Ok(FilteredReadStream::load_fragment(
+                            self.dataset.clone(),
+                            frag.clone(),
+                            /*include_deleted_rows=*/ false,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                futures::stream::iter(frag_futs)
+                    .try_buffered(io_parallelism)
+                    .try_collect::<Vec<_>>()
+                    .await
+            })
+            .await
+    }
+
+    async fn map_batch(
+        self: Arc<Self>,
+        batch: RecordBatch,
+        batch_index: u32,
+    ) -> DataFusionResult<RecordBatch> {
+        if batch.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+        }
+        let compute_timer = self.baseline_metrics.elapsed_compute().timer();
+        let keys_arr = batch.column_by_name(self.key_column).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "the take input lost its '{}' column",
+                self.key_column
+            ))
+        })?;
+        let keys = keys_arr.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "expected the take input column '{}' to be UInt64 but it was {}",
+                self.key_column,
+                keys_arr.data_type()
+            ))
+        })?;
+
+        // Null keys identify rows that don't exist in the dataset; they are
+        // excluded here and the rows are dropped by the unmatched filter below
+        let row_ids = if keys.null_count() == 0 {
+            RowAddrTreeMap::from_iter(keys.values().iter().copied())
+        } else {
+            RowAddrTreeMap::from_iter(keys.iter().flatten())
+        };
+        let evaluated_index = Arc::new(EvaluatedIndex {
+            index_result: IndexExprResult::exact(RowAddrMask::from_allowed(row_ids)),
+            applicable_fragments: self.dataset.fragment_bitmap.as_ref().clone(),
+        });
+        drop(compute_timer);
+
+        let fragments = self.load_fragments().await?;
+        let internal_plan =
+            FilteredReadStream::plan_scan(fragments, &Some(evaluated_index), &self.read_options);
+        let mut scoped_fragments = FilteredReadStream::plan_to_scoped_fragments(
+            &internal_plan,
+            fragments,
+            &self.dataset,
+            &self.read_options,
+            self.scan_scheduler.clone(),
+        );
+        for scoped in &mut scoped_fragments {
+            // One take round per input batch: read each fragment's rows as a
+            // single batch, and prioritize earlier input batches so consuming
+            // the (ordered) output is not starved by later batches
+            scoped.priority = batch_index;
+            scoped.batch_size = u32::MAX;
+        }
+
+        // Opens all the fragments concurrently, then runs the read tasks
+        let fragment_streams =
+            futures::future::try_join_all(scoped_fragments.into_iter().map(|scoped| {
+                FilteredReadStream::read_fragment(scoped, self.global_metrics.clone(), None)
+            }))
+            .await?;
+        let mut read_tasks = Vec::new();
+        for mut stream in fragment_streams {
+            while let Some(task) = stream.try_next().await? {
+                read_tasks.push(task);
+            }
+        }
+        let read_batches = futures::stream::iter(read_tasks)
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
+        let read_schema = Arc::new(self.read_options.projection.to_arrow_schema());
+        let read_data = arrow::compute::concat_batches(&read_schema, read_batches.iter())?;
+
+        // Align the read rows (dataset order, deduplicated) back to the
+        // input's row order via the key column
+        let read_keys = read_data
+            .column_by_name(self.key_column)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "the take read did not produce the '{}' column",
+                    self.key_column
+                ))
+            })?
+            .as_primitive::<UInt64Type>();
+        let key_to_index: HashMap<u64, u32> = read_keys
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (*key, index as u32))
+            .collect();
+
+        let mut indices = Vec::with_capacity(batch.num_rows());
+        let mut valid = Vec::with_capacity(batch.num_rows());
+        for i in 0..keys.len() {
+            let index = if keys.is_valid(i) {
+                key_to_index.get(&keys.value(i)).copied()
+            } else {
+                None
+            };
+            match index {
+                Some(index) => {
+                    indices.push(index);
+                    valid.push(true);
+                }
+                None => valid.push(false),
+            }
+        }
+
+        // Drop input rows whose key no longer exists in the dataset (e.g.
+        // stale index results pointing at deleted rows)
+        let batch = if indices.len() < batch.num_rows() {
+            arrow::compute::filter_record_batch(&batch, &BooleanArray::from(valid))?
+        } else {
+            batch
+        };
+        if batch.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+        }
+
+        let new_data =
+            arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
+        // Drop the key column if it was only read for alignment
+        let new_data = new_data.project_by_schema(self.new_fields_schema.as_ref())?;
+        Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+    }
+
+    fn apply(
+        self: Arc<Self>,
+        input: SendableRecordBatchStream,
+    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        let result_scheduler = self.scan_scheduler.clone();
+        let final_scheduler = self.scan_scheduler.clone();
+        let result_metrics = self.global_metrics.clone();
+        let final_metrics = self.global_metrics.clone();
+        let result_baseline = self.baseline_metrics.clone();
+        let final_baseline = self.baseline_metrics.clone();
+        input
+            .enumerate()
+            .map(move |(batch_index, batch)| {
+                let batch = batch?;
+                let this = self.clone();
+                DataFusionResult::Ok(
+                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
+                        .map(|res| res.unwrap()),
+                )
+            })
+            .boxed()
+            .try_buffered(get_num_compute_intensive_cpus())
+            .map(move |result| {
+                result_metrics.io_metrics.record(&result_scheduler);
+                match result_baseline.record_poll(Poll::Ready(Some(result))) {
+                    Poll::Ready(Some(result)) => result,
+                    _ => unreachable!("record_poll returned a different poll state"),
+                }
+            })
+            .finally(move || {
+                final_baseline.done();
+                final_metrics.io_metrics.record(&final_scheduler);
+            })
+    }
 }
 
 impl DisplayAs for FilteredReadExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if let FilteredReadInput::TakeRows(take) = &self.input {
+            let columns = take
+                .fields_to_take
+                .to_bare_schema()
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return match t {
+                DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                    write!(
+                        f,
+                        "LanceRead: uri={}, projection=[{}], mode=take({})",
+                        self.dataset.data_dir(),
+                        columns,
+                        take.key_column,
+                    )
+                }
+                DisplayFormatType::TreeRender => {
+                    write!(
+                        f,
+                        "LanceRead\nuri={}\nprojection=[{}]\nmode=take({})",
+                        self.dataset.data_dir(),
+                        columns,
+                        take.key_column,
+                    )
+                }
+            };
+        }
         let columns = self
             .options
             .projection
@@ -1901,11 +2458,18 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        if let Some(index_input) = &self.index_input {
-            vec![index_input]
+        if let Some(child) = self.input.child() {
+            vec![child]
         } else {
             vec![]
         }
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        // Take mode is I/O bound and partitioning it would create multiple
+        // I/O schedulers, which could use a lot of RAM (same reasoning as
+        // TakeExec).  Scan mode has no row-carrying input.
+        vec![false; self.children().len()]
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1916,6 +2480,13 @@ impl ExecutionPlan for FilteredReadExec {
         &self,
         partition: Option<usize>,
     ) -> datafusion::error::Result<Statistics> {
+        if let FilteredReadInput::TakeRows(take) = &self.input {
+            // A take emits (at most) one output row per input row
+            return Ok(Statistics {
+                num_rows: take.input.partition_statistics(partition)?.num_rows,
+                ..Statistics::new_unknown(self.schema().as_ref())
+            });
+        }
         let fragments = self
             .options
             .fragments
@@ -2038,18 +2609,14 @@ impl ExecutionPlan for FilteredReadExec {
                 Error::internal("A FilteredReadExec cannot have two children".to_string()).into(),
             ))
         } else {
-            let index_input = children.into_iter().next();
-            Ok(Arc::new(Self {
-                dataset: self.dataset.clone(),
-                options: self.options.clone(),
-                properties: self.properties.clone(),
-                metrics: self.metrics.clone(),
-                // Seems unlikely this would already be initialized but clear it
-                // out just in case
-                running_stream: Arc::new(AsyncMutex::new(None)),
-                index_input,
-                plan: Arc::new(OnceCell::new()),
-            }))
+            // Rebuild through try_new so the input encoding (index query vs
+            // take) is re-derived from the new child's schema and any derived
+            // state (output schema, properties) is recomputed.  This also
+            // clears the precomputed plan / running stream, as before.
+            let child = children.into_iter().next();
+            let rebuilt = Self::try_new(self.dataset.clone(), self.options.clone(), child)
+                .map_err(|e| DataFusionError::External(e.into()))?;
+            Ok(Arc::new(rebuilt))
         }
     }
 
@@ -2058,10 +2625,16 @@ impl ExecutionPlan for FilteredReadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        Ok(self.obtain_stream(partition, context))
+        match &self.input {
+            FilteredReadInput::TakeRows(take) => self.execute_take(take, partition, context),
+            _ => Ok(self.obtain_stream(partition, context)),
+        }
     }
 
     fn fetch(&self) -> Option<usize> {
+        if self.is_take() {
+            return None;
+        }
         if self.options.full_filter.is_none() {
             self.options
                 .scan_range_before_filter
@@ -2076,13 +2649,17 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        // This is to push the limit through the node and into an upstream node.
-        // The only upstream node is the index search and we can't push the limit
-        // to that node.
-        false
+        // In take mode the limit can be pushed through to the input plan (a
+        // take emits one output row per input row).  In scan mode the only
+        // upstream node is the index search and we can't push the limit to
+        // that node.
+        self.is_take()
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        if self.is_take() {
+            return None;
+        }
         // TODO: Support multiple partitions in the future by coordinating limits across partitions
         if matches!(
             self.options.threading_mode,
@@ -2113,7 +2690,7 @@ impl ExecutionPlan for FilteredReadExec {
         match Self::try_new(
             self.dataset.clone(),
             updated_options,
-            self.index_input.clone(),
+            self.input.index_query().cloned(),
         ) {
             Ok(exec) => Some(Arc::new(exec)),
             Err(e) => {
@@ -3051,7 +3628,7 @@ mod tests {
         let options = base_options.with_filter_plan(filter_plan);
         let plan = fixture.make_plan(options).await;
 
-        assert!(plan.index_input.is_some());
+        assert!(plan.index_input().is_some());
         assert!(plan.options().refine_filter.is_some());
 
         let limited_plan = plan.with_fetch(Some(10)).unwrap();
@@ -3892,5 +4469,395 @@ mod tests {
         let capped_result = concat_batches(&schema2, &batches2).unwrap();
 
         assert_eq!(default_result.num_rows(), capped_result.num_rows());
+    }
+
+    // ------------------------------------------------------------------------
+    // Take mode (a row-stream input instead of a serialized index result)
+    // ------------------------------------------------------------------------
+
+    mod take_rows {
+        use super::*;
+        use arrow_array::{Float32Array, StringArray, UInt64Array};
+        use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_datafusion::exec::OneShotExec;
+        use rstest::rstest;
+
+        use crate::dataset::{Dataset, WriteParams};
+        use crate::utils::test::NoContextTestFixture;
+
+        struct TakeFixture {
+            dataset: Arc<Dataset>,
+            _tmp_dir: TempStrDir,
+        }
+
+        /// 30 rows across 3 fragments (10 rows each) with columns
+        /// i (Int32), s (Utf8), and struct{x, y} (Int32s), mirroring the
+        /// TakeExec test fixture
+        async fn take_fixture(stable_row_ids: bool) -> TakeFixture {
+            let struct_fields = Fields::from(vec![
+                Arc::new(ArrowField::new("x", DataType::Int32, false)),
+                Arc::new(ArrowField::new("y", DataType::Int32, false)),
+            ]);
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, false),
+                ArrowField::new("s", DataType::Utf8, false),
+                ArrowField::new("struct", DataType::Struct(struct_fields.clone()), false),
+            ]));
+            let batches: Vec<RecordBatch> = (0..3)
+                .map(|batch_id| {
+                    let value_range = batch_id * 10..batch_id * 10 + 10;
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(value_range.clone())),
+                            Arc::new(StringArray::from_iter_values(
+                                value_range.clone().map(|v| format!("s-{v}")),
+                            )),
+                            Arc::new(arrow_array::StructArray::new(
+                                struct_fields.clone(),
+                                vec![
+                                    Arc::new(Int32Array::from_iter(value_range.clone())),
+                                    Arc::new(Int32Array::from_iter(value_range)),
+                                ],
+                                None,
+                            )),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect();
+
+            let tmp_dir = TempStrDir::default();
+            let uri = tmp_dir.as_str();
+            let params = WriteParams {
+                max_rows_per_file: 10,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+            Dataset::write(reader, uri, Some(params)).await.unwrap();
+            TakeFixture {
+                dataset: Arc::new(Dataset::open(uri).await.unwrap()),
+                _tmp_dir: tmp_dir,
+            }
+        }
+
+        /// Wrap batches of (payload, key) rows into an input plan
+        fn rows_input(batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
+            let schema = batches[0].schema();
+            let stream = futures::stream::iter(batches.into_iter().map(Ok));
+            let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+            Arc::new(OneShotExec::new(stream))
+        }
+
+        fn take_plan(
+            dataset: &Arc<Dataset>,
+            input: Arc<dyn ExecutionPlan>,
+            columns: &[&str],
+        ) -> Result<FilteredReadExec> {
+            let projection = dataset
+                .empty_projection()
+                .union_columns(columns, OnMissing::Error)
+                .unwrap();
+            FilteredReadExec::try_new(
+                dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(input),
+            )
+        }
+
+        async fn run(plan: &FilteredReadExec) -> Vec<RecordBatch> {
+            plan.execute(0, Arc::new(TaskContext::default()))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        }
+
+        /// Take with shuffled, duplicated row addresses and a payload column:
+        /// the output must preserve the input's row order, duplicates, batch
+        /// boundaries, and the payload
+        #[rstest]
+        #[case::by_row_addr(ROW_ADDR)]
+        #[case::by_row_id(ROW_ID)]
+        #[tokio::test]
+        async fn take_preserves_order_dups_and_payload(#[case] key: &str) {
+            let fixture = take_fixture(false).await;
+
+            // Rows span all 3 fragments; 21 appears twice; order is shuffled.
+            // (Without stable row ids, ids and addresses are the same values.)
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            let keys: Vec<u64> = vec![
+                addr(2, 1), // i = 21
+                addr(0, 3), // i = 3
+                addr(1, 5), // i = 15
+                addr(2, 1), // i = 21 (duplicate)
+                addr(0, 0), // i = 0
+            ];
+            let expected_i: Vec<i32> = vec![21, 3, 15, 21, 0];
+
+            let input_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("payload", DataType::Float32, false),
+                ArrowField::new(key, DataType::UInt64, true),
+            ]));
+            let payload: Vec<f32> = (0..keys.len()).map(|v| v as f32 * 0.5).collect();
+            let batch = RecordBatch::try_new(
+                input_schema.clone(),
+                vec![
+                    Arc::new(Float32Array::from(payload.clone())),
+                    Arc::new(UInt64Array::from(keys.clone())),
+                ],
+            )
+            .unwrap();
+            // Two batches to verify batch boundaries survive
+            let batches = vec![batch.slice(0, 3), batch.slice(3, 2)];
+
+            let plan = take_plan(&fixture.dataset, rows_input(batches), &["s", "i"]).unwrap();
+            assert!(plan.is_take());
+            // Output schema: input columns then new fields in dataset order
+            assert_eq!(
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>(),
+                vec!["payload", key, "i", "s"]
+            );
+
+            let result = run(&plan).await;
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0].num_rows(), 3);
+            assert_eq!(result[1].num_rows(), 2);
+            let result = concat_batches(&plan.schema(), &result).unwrap();
+
+            let i_col = result.column_by_name("i").unwrap();
+            assert_eq!(
+                i_col.as_primitive::<arrow::datatypes::Int32Type>().values(),
+                &expected_i[..]
+            );
+            let s_col = result.column_by_name("s").unwrap().as_string::<i32>();
+            for (row, i) in expected_i.iter().enumerate() {
+                assert_eq!(s_col.value(row), format!("s-{i}"));
+            }
+            let payload_col = result
+                .column_by_name("payload")
+                .unwrap()
+                .as_primitive::<Float32Type>();
+            assert_eq!(payload_col.values(), &payload[..]);
+        }
+
+        /// Take of new sub-fields into an existing struct column: the fields
+        /// merge into the struct in dataset-schema order
+        #[tokio::test]
+        async fn take_merges_nested_struct() {
+            let fixture = take_fixture(false).await;
+
+            let data = fixture
+                .dataset
+                .scan()
+                .project(&["struct"])
+                .unwrap()
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap();
+            // Rebuild the input with only struct.y so struct.x must be taken
+            let full_struct = data.column_by_name("struct").unwrap().as_struct();
+            let y_only = arrow_array::StructArray::new(
+                Fields::from(vec![Arc::new(ArrowField::new("y", DataType::Int32, false))]),
+                vec![full_struct.column_by_name("y").unwrap().clone()],
+                None,
+            );
+            let input_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("struct", y_only.data_type().clone(), false),
+                ArrowField::new(ROW_ID, DataType::UInt64, true),
+            ]));
+            let data = RecordBatch::try_new(
+                input_schema,
+                vec![
+                    Arc::new(y_only),
+                    data.column_by_name(ROW_ID).unwrap().clone(),
+                ],
+            )
+            .unwrap();
+
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .union_column("struct.x", OnMissing::Error)
+                .unwrap();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(rows_input(vec![data])),
+            )
+            .unwrap();
+
+            let expected_struct_type = DataType::Struct(Fields::from(vec![
+                Arc::new(ArrowField::new("x", DataType::Int32, false)),
+                Arc::new(ArrowField::new("y", DataType::Int32, false)),
+            ]));
+            assert_eq!(
+                plan.schema().field_with_name("struct").unwrap().data_type(),
+                &expected_struct_type
+            );
+
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(result.num_rows(), 30);
+            let struct_col = result.column_by_name("struct").unwrap().as_struct();
+            assert_eq!(
+                struct_col.column_by_name("x").unwrap(),
+                struct_col.column_by_name("y").unwrap()
+            );
+        }
+
+        /// Input rows whose key no longer exists (deleted rows) are dropped
+        #[rstest]
+        #[case::unstable(false)]
+        #[case::stable(true)]
+        #[tokio::test]
+        async fn take_drops_stale_keys(#[case] stable_row_ids: bool) {
+            let fixture = take_fixture(stable_row_ids).await;
+            let mut dataset = fixture.dataset.as_ref().clone();
+            dataset.delete("i = 15").await.unwrap();
+            let dataset = Arc::new(dataset);
+
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            // Row ids are assigned sequentially on write, so with stable row
+            // ids the id of row `i` is just `i`; without them it is the
+            // address.  Either way these are the pre-delete ids of rows 15
+            // (now deleted) and 16.
+            let keys: Vec<u64> = if stable_row_ids {
+                vec![15, 16]
+            } else {
+                vec![addr(1, 5), addr(1, 6)]
+            };
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
+                .unwrap();
+
+            let plan = take_plan(&dataset, rows_input(vec![batch]), &["i"]).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(result.num_rows(), 1);
+            let i_col = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            assert_eq!(i_col.value(0), 16);
+        }
+
+        /// Construction errors: no key column, taking by address on a
+        /// stable-row-id dataset, nothing to read
+        #[tokio::test]
+        async fn take_construction_errors() {
+            let fixture = take_fixture(false).await;
+            let no_key_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "payload",
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(
+                no_key_schema,
+                vec![Arc::new(UInt64Array::from(vec![0_u64]))],
+            )
+            .unwrap();
+            assert!(
+                take_plan(&fixture.dataset, rows_input(vec![batch.clone()]), &["s"])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must have a column")
+            );
+
+            let addr_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ADDR,
+                DataType::UInt64,
+                true,
+            )]));
+            let addr_batch =
+                RecordBatch::try_new(addr_schema, vec![Arc::new(UInt64Array::from(vec![0_u64]))])
+                    .unwrap();
+
+            // Taking fields the input already has: nothing to read
+            let with_s_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(ROW_ADDR, DataType::UInt64, true),
+                ArrowField::new("s", DataType::Utf8, false),
+            ]));
+            let with_s_batch = RecordBatch::try_new(
+                with_s_schema,
+                vec![
+                    Arc::new(UInt64Array::from(vec![0_u64])),
+                    Arc::new(StringArray::from(vec!["x"])),
+                ],
+            )
+            .unwrap();
+            assert!(
+                take_plan(&fixture.dataset, rows_input(vec![with_s_batch]), &["s"])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("nothing to read")
+            );
+
+            // Taking by address on a stable-row-id dataset is rejected
+            let stable_fixture = take_fixture(true).await;
+            assert!(
+                take_plan(
+                    &stable_fixture.dataset,
+                    rows_input(vec![addr_batch]),
+                    &["s"]
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("stable row ids")
+            );
+        }
+
+        /// with_new_children re-derives take mode and preserves the schema
+        #[tokio::test]
+        async fn take_with_new_children() {
+            let fixture = take_fixture(false).await;
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(
+                input_schema,
+                vec![Arc::new(UInt64Array::from(vec![0_u64, 1]))],
+            )
+            .unwrap();
+            let input = rows_input(vec![batch]);
+            let plan: Arc<dyn ExecutionPlan> =
+                Arc::new(take_plan(&fixture.dataset, input.clone(), &["s"]).unwrap());
+            let rebuilt = plan.clone().with_new_children(vec![input]).unwrap();
+            assert_eq!(plan.schema(), rebuilt.schema());
+            assert!(
+                rebuilt
+                    .as_any()
+                    .downcast_ref::<FilteredReadExec>()
+                    .unwrap()
+                    .is_take()
+            );
+        }
+
+        /// Take-mode nodes can be created and executed without an active
+        /// tokio runtime (required for DataFusion foreign table providers)
+        #[test]
+        fn no_context_take_rows() {
+            use lance_datafusion::datagen::DatafusionDatagenExt;
+            use lance_datagen::{BatchCount, RowCount};
+
+            let fixture = NoContextTestFixture::new();
+            let dataset = Arc::new(fixture.dataset);
+            let input = lance_datagen::gen_batch()
+                .col(ROW_ID, lance_datagen::array::step::<UInt64Type>())
+                .into_df_exec(RowCount::from(50), BatchCount::from(2));
+            let plan = take_plan(&dataset, input, &["text"]).unwrap();
+            plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        }
     }
 }

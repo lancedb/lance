@@ -147,6 +147,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     };
 
     let options = filtered_read.options();
+    // A take-mode read emits one row per input row; its count is driven by
+    // the input plan, not by fragment metadata.
+    if filtered_read.is_take() {
+        return Ok(None);
+    }
     // A refine filter is a residual the index couldn't fully evaluate — it
     // needs column data to apply, which we can't.
     if options.refine_filter.is_some() {

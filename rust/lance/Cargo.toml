@@ -192,6 +192,10 @@ name = "merge_insert"
 harness = false
 
 [[bench]]
+name = "take_exec_compare"
+harness = false
+
+[[bench]]
 name = "scan"
 harness = false
 

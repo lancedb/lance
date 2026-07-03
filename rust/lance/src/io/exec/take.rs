@@ -521,7 +521,10 @@ impl TakeExec {
     ///
     /// If this happens the order of the new nested fields will match the order defined in
     /// the dataset schema.
-    fn calculate_output_schema(
+    ///
+    /// This is also used by `FilteredReadExec`'s take mode, which shares the same
+    /// output-schema contract.
+    pub(crate) fn calculate_output_schema(
         dataset_schema: &Schema,
         input_schema: &ArrowSchema,
         projection: &Projection,

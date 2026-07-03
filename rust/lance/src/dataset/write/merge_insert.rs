@@ -58,7 +58,9 @@ use crate::{
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        AddRowAddrExec, Planner, TakeExec, project,
+        AddRowAddrExec, Planner, TakeExec,
+        filtered_read::{FilteredReadExec, FilteredReadOptions},
+        project,
         scalar_index::{IndexLookup, MapIndexExec},
         utils::ReplayExec,
     },
@@ -734,14 +736,25 @@ impl MergeInsertJob {
             )?);
         }
 
-        // 4 - Take the mapped row ids
+        // 4 - Take the mapped row ids.  On the v2 storage format the take is
+        //     planned as a FilteredReadExec fed by the index-mapper stream:
+        //     the row ids become a row-id mask read through the planned
+        //     range-read path, which is considerably faster than TakeExec's
+        //     point-lookup path.  Both nodes have the same output contract
+        //     (input columns first, then the fetched columns).
         let projection = self
             .dataset
             .empty_projection()
             .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
-        let mut target =
+        let mut target: Arc<dyn ExecutionPlan> = if self.dataset.is_legacy_storage() {
             Arc::new(TakeExec::try_new(self.dataset.clone(), index_mapper, projection)?.unwrap())
-                as Arc<dyn ExecutionPlan>;
+        } else {
+            Arc::new(FilteredReadExec::try_new(
+                self.dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(index_mapper),
+            )?)
+        };
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
         //     no scalar index) puts the row id and addr at the end.  We need to match these up so
