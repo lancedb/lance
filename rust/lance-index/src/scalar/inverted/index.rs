@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
@@ -3873,7 +3873,7 @@ impl PlainPostingList {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct CompressedPostingList {
     pub max_score: f32,
     pub length: u32,
@@ -3884,6 +3884,20 @@ pub struct CompressedPostingList {
     pub posting_tail_codec: PostingTailCodec,
     pub block_size: usize,
     pub positions: Option<CompressedPositionStorage>,
+    // First doc id per block, baked lazily and shared across per-query clones
+    // of the cached list. See `block_first_docs`.
+    first_docs: Arc<OnceLock<Box<[u32]>>>,
+}
+
+impl PartialEq for CompressedPostingList {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_score == other.max_score
+            && self.length == other.length
+            && self.blocks == other.blocks
+            && self.posting_tail_codec == other.posting_tail_codec
+            && self.block_size == other.block_size
+            && self.positions == other.positions
+    }
 }
 
 impl DeepSizeOf for CompressedPostingList {
@@ -3913,6 +3927,7 @@ impl CompressedPostingList {
             posting_tail_codec,
             block_size,
             positions,
+            first_docs: Arc::new(OnceLock::new()),
         }
     }
 
@@ -3960,6 +3975,7 @@ impl CompressedPostingList {
             posting_tail_codec,
             block_size,
             positions,
+            first_docs: Arc::new(OnceLock::new()),
         }
     }
 
@@ -3979,14 +3995,29 @@ impl CompressedPostingList {
     }
 
     pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
-        let block = self.blocks.value(block_idx);
-        let remainder = self.length as usize % self.block_size;
-        let is_remainder_block = remainder > 0 && block_idx + 1 == self.blocks.len();
-        if is_remainder_block {
-            super::encoding::read_posting_tail_first_doc(block, self.posting_tail_codec)
-        } else {
-            block[4..8].try_into().map(u32::from_le_bytes).unwrap()
-        }
+        self.block_first_docs()[block_idx]
+    }
+
+    /// First doc id of every block, decoded once per cached list and shared by
+    /// the per-query clones. Block boundary lookups (window bounds, block
+    /// binary searches) are hot enough that re-reading the block headers —
+    /// and re-decoding the tail block — shows up in profiles.
+    pub(crate) fn block_first_docs(&self) -> &[u32] {
+        self.first_docs.get_or_init(|| {
+            (0..self.blocks.len())
+                .map(|block_idx| {
+                    let block = self.blocks.value(block_idx);
+                    let remainder = self.length as usize % self.block_size;
+                    if block_idx + 1 == self.blocks.len() && remainder > 0 {
+                        return super::encoding::read_posting_tail_first_doc(
+                            block,
+                            self.posting_tail_codec,
+                        );
+                    }
+                    block[4..8].try_into().map(u32::from_le_bytes).unwrap()
+                })
+                .collect()
+        })
     }
 }
 
