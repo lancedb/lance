@@ -2268,8 +2268,8 @@ mod tests {
     };
     use arrow_array::RecordBatch;
     use arrow_array::{
-        Array, ArrayRef, RecordBatchIterator, StringArray, StructArray, UInt8Array, UInt32Array,
-        UInt64Array,
+        Array, ArrayRef, Int32Array, LargeBinaryArray, RecordBatchIterator, StringArray,
+        StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -2278,10 +2278,13 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, future::try_join_all};
     use lance_arrow::{
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
-        BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
+        BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
         BLOB_V2_EXT_NAME, DataTypeExt,
     };
-    use lance_core::{datatypes::BlobKind, utils::blob::blob_path};
+    use lance_core::{
+        datatypes::{BlobHandling, BlobKind},
+        utils::blob::blob_path,
+    };
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
     };
@@ -3196,6 +3199,101 @@ mod tests {
             .await
             .unwrap();
         assert!(descriptors.column(0).data_type().is_struct());
+    }
+
+    #[tokio::test]
+    async fn test_v2_0_legacy_blob_descriptor_projection_and_reads() {
+        let test_dir = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(blob_meta),
+        ]));
+        let payloads = [
+            b"abc".as_slice(),
+            b"defgh".as_slice(),
+            b"ijklmnop".as_slice(),
+        ];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef,
+                Arc::new(LargeBinaryArray::from_iter_values(payloads)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_0),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        for blob_handling in [
+            None,
+            Some(BlobHandling::BlobsDescriptions),
+            Some(BlobHandling::AllDescriptions),
+        ] {
+            let mut scanner = dataset.scan();
+            if let Some(blob_handling) = blob_handling {
+                scanner.blob_handling(blob_handling);
+            }
+            let descriptors = scanner
+                .project(&["blob"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let descriptor = descriptors.column(0).as_struct();
+            assert_eq!(descriptor.fields().len(), 2);
+            assert_eq!(descriptor.fields()[0].name(), "position");
+            assert_eq!(descriptor.fields()[1].name(), "size");
+            let sizes = descriptor
+                .column_by_name("size")
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            assert_eq!(sizes.values(), &[3, 5, 8]);
+        }
+
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let bytes = scanner
+            .project(&["blob"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let bytes = bytes.column(0).as_binary::<i64>();
+        for (idx, expected) in payloads.iter().enumerate() {
+            assert_eq!(bytes.value(idx), *expected);
+        }
+
+        let blob_files = dataset
+            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blob_files.len(), payloads.len());
+        for (blob_file, expected) in blob_files.iter().zip(payloads) {
+            assert_eq!(blob_file.read().await.unwrap().as_ref(), expected);
+        }
+
+        let read_blobs = dataset
+            .read_blobs("blob")
+            .unwrap()
+            .with_row_indices(vec![0, 1, 2])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(read_blobs.len(), payloads.len());
+        for (read_blob, expected) in read_blobs.iter().zip(payloads) {
+            assert_eq!(read_blob.data.as_ref(), expected);
+        }
     }
 
     #[test]

@@ -519,16 +519,20 @@ const FOOTER_LEN: usize = 40;
 
 // How a field maps onto physical columns, shared by the projection-building and
 // projection-validation walks so they stay in lockstep. In the 2.0 layout every
-// field (including structs and lists) has its own column; in 2.1 only leaves do,
-// and blob/packed-struct fields are opaque (a single column with no descent).
+// ordinary field (including structs and lists) has its own column; in 2.1 only
+// leaves do. Blob/packed-struct fields are opaque in all versions: they are a
+// single column with no descent, including unloaded blob descriptor schemas.
 // Returns `(contributes, recurse)`: whether the field has its own column and
 // whether to walk into its children. The DFS order is the field's own column (if
 // any) followed by its children, so a field's root (first) column is always the
 // first entry of its sub-slice.
 fn field_column_shape(field: &Field, is_structural: bool) -> (bool, bool) {
-    let contributes =
-        !is_structural || field.children.is_empty() || field.is_blob() || field.is_packed_struct();
-    let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
+    if field.is_blob() || field.is_packed_struct() {
+        return (true, false);
+    }
+
+    let contributes = !is_structural || field.children.is_empty();
+    let recurse = !field.children.is_empty();
     (contributes, recurse)
 }
 
@@ -2574,7 +2578,11 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, pin::Pin, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        pin::Pin,
+        sync::Arc,
+    };
 
     use arrow_array::{
         RecordBatch, UInt32Array,
@@ -2583,7 +2591,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
     use futures::{StreamExt, prelude::stream::TryStreamExt};
-    use lance_arrow::RecordBatchExt;
+    use lance_arrow::{BLOB_META_KEY, RecordBatchExt};
     use lance_core::{ArrowResult, datatypes::Schema};
     use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::{
@@ -3882,6 +3890,38 @@ mod tests {
             msg.contains("differing lengths") && msg.contains('b'),
             "expected a child-length error naming 'b', got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_validate_v2_0_unloaded_blob_projection_is_opaque() {
+        let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let arrow = ArrowSchema::new(vec![
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(metadata),
+        ]);
+        let mut schema = Schema::try_from(&arrow).unwrap();
+        schema.fields[0].unloaded_mut();
+        let projection = ReaderProjection {
+            schema: Arc::new(schema),
+            column_indices: vec![0],
+        };
+        let column_len = |column: usize| {
+            assert_eq!(column, 0);
+            Ok(3)
+        };
+        let mut cursor = 0usize;
+
+        let rows = validate_field_length(
+            &projection.schema.fields[0],
+            false,
+            true,
+            &projection.column_indices,
+            &mut cursor,
+            &column_len,
+        )
+        .unwrap();
+
+        assert_eq!(rows, 3);
+        assert_eq!(cursor, 1);
     }
 
     #[test]
