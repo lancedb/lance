@@ -1099,7 +1099,38 @@ impl MergeInsertJob {
         let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
-        while let Some((frag_id, batches)) = group_stream.next().await.transpose()? {
+        // Best-effort removal of uncommitted files after a mid-update failure.
+        // Aborts in-flight tasks first, then deletes the new fragments written
+        // so far (including ones routed to target bases). Column-patch files
+        // from completed tasks stay in primary storage where regular dataset
+        // cleanup can reclaim them.
+        async fn cleanup_on_failure(
+            dataset: &Dataset,
+            target_bases_info: &Option<Vec<TargetBaseInfo>>,
+            new_fragments: &Mutex<Vec<Fragment>>,
+            tasks: &mut JoinSet<Result<usize>>,
+        ) {
+            tasks.shutdown().await;
+            let written = new_fragments.lock().unwrap().clone();
+            cleanup_data_fragments(
+                &dataset.object_store,
+                &dataset.base,
+                target_bases_info.as_deref(),
+                &written,
+            )
+            .await;
+        }
+
+        loop {
+            let (frag_id, batches) = match group_stream.next().await.transpose() {
+                Ok(Some(group)) => group,
+                Ok(None) => break,
+                Err(e) => {
+                    cleanup_on_failure(&dataset, &target_bases_info, &new_fragments, &mut tasks)
+                        .await;
+                    return Err(e.into());
+                }
+            };
             async fn handle_fragment(
                 dataset: Arc<Dataset>,
                 fragment: FileFragment,
@@ -1371,15 +1402,26 @@ impl MergeInsertJob {
                 }
 
                 if let Some(res) = tasks.join_next().await {
-                    let size = res??;
-                    reservation.shrink(size);
+                    match res.map_err(Error::from).and_then(|size| size) {
+                        Ok(size) => reservation.shrink(size),
+                        Err(e) => {
+                            cleanup_on_failure(
+                                &dataset,
+                                &target_bases_info,
+                                &new_fragments,
+                                &mut tasks,
+                            )
+                            .await;
+                            return Err(e);
+                        }
+                    }
                 }
             }
 
             match frag_id.first() {
                 Some(ScalarValue::UInt64(Some(frag_id))) => {
                     let frag_id = *frag_id;
-                    let fragment = dataset.get_fragment(frag_id as usize).ok_or_else(|| {
+                    let Some(fragment) = dataset.get_fragment(frag_id as usize) else {
                         error!(
                             fragment_id = frag_id,
                             dataset_uri = %dataset.uri(),
@@ -1388,15 +1430,22 @@ impl MergeInsertJob {
                             branch = ?dataset.manifest().branch,
                             "Non-existent fragment id returned from merge result",
                         );
-                        Error::internal(format!(
+                        cleanup_on_failure(
+                            &dataset,
+                            &target_bases_info,
+                            &new_fragments,
+                            &mut tasks,
+                        )
+                        .await;
+                        return Err(Error::internal(format!(
                             "Got non-existent fragment id from merge result: {} (uri={}, version={}, manifest={}, branch={})",
                             frag_id,
                             dataset.uri(),
                             dataset.manifest().version,
                             dataset.manifest_location().path,
                             dataset.manifest().branch.as_deref().unwrap_or("main"),
-                        ))
-                    })?;
+                        )));
+                    };
                     let metadata = fragment.metadata.clone();
 
                     let fut = handle_fragment(
@@ -1421,6 +1470,8 @@ impl MergeInsertJob {
                     tasks.spawn(fut);
                 }
                 _ => {
+                    cleanup_on_failure(&dataset, &target_bases_info, &new_fragments, &mut tasks)
+                        .await;
                     return Err(Error::internal(format!(
                         "Got non-fragment id from merge result: {:?}",
                         frag_id
@@ -1430,8 +1481,14 @@ impl MergeInsertJob {
         }
 
         while let Some(res) = tasks.join_next().await {
-            let size = res??;
-            reservation.shrink(size);
+            match res.map_err(Error::from).and_then(|size| size) {
+                Ok(size) => reservation.shrink(size),
+                Err(e) => {
+                    cleanup_on_failure(&dataset, &target_bases_info, &new_fragments, &mut tasks)
+                        .await;
+                    return Err(e);
+                }
+            }
         }
         let mut updated_fragments = Arc::try_unwrap(updated_fragments)
             .unwrap()
