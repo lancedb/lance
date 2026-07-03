@@ -1805,10 +1805,26 @@ pub fn inverted_list_schema_for_version_with_block_size(
     format_version: InvertedListFormatVersion,
     block_size: usize,
 ) -> SchemaRef {
+    inverted_list_schema_for_version_with_block_size_and_impacts(
+        with_position,
+        format_version,
+        block_size,
+        true,
+    )
+}
+
+pub(crate) fn inverted_list_schema_for_version_with_block_size_and_impacts(
+    with_position: bool,
+    format_version: InvertedListFormatVersion,
+    block_size: usize,
+    with_impacts: bool,
+) -> SchemaRef {
     validate_format_version_block_size(format_version, block_size)
         .expect("invalid FTS format version for posting block size");
     match format_version {
-        InvertedListFormatVersion::V1 => inverted_list_schema_v1(with_position, block_size),
+        InvertedListFormatVersion::V1 => {
+            inverted_list_schema_v1(with_position, block_size, with_impacts)
+        }
         InvertedListFormatVersion::V2 | InvertedListFormatVersion::V3 => {
             inverted_list_schema_with_tail_codec_and_position_codec(
                 with_position,
@@ -1816,12 +1832,17 @@ pub fn inverted_list_schema_for_version_with_block_size(
                 PostingTailCodec::VarintDelta,
                 Some(PositionStreamCodec::PackedDelta),
                 block_size,
+                with_impacts,
             )
         }
     }
 }
 
-fn inverted_list_schema_v1(with_position: bool, block_size: usize) -> SchemaRef {
+fn inverted_list_schema_v1(
+    with_position: bool,
+    block_size: usize,
+    with_impacts: bool,
+) -> SchemaRef {
     let mut fields = vec![
         arrow_schema::Field::new(
             POSTING_COL,
@@ -1835,6 +1856,17 @@ fn inverted_list_schema_v1(with_position: bool, block_size: usize) -> SchemaRef 
         arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
         arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
     ];
+    if with_impacts {
+        fields.push(arrow_schema::Field::new(
+            IMPACT_COL,
+            datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                datatypes::DataType::LargeBinary,
+                true,
+            ))),
+            false,
+        ));
+    }
     if with_position {
         fields.push(arrow_schema::Field::new(
             POSITION_COL,
@@ -1877,6 +1909,7 @@ pub fn inverted_list_schema_with_tail_codec(
         posting_tail_codec,
         Some(PositionStreamCodec::PackedDelta),
         LEGACY_BLOCK_SIZE,
+        false,
     )
 }
 
@@ -1886,6 +1919,7 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
     posting_tail_codec: PostingTailCodec,
     position_codec: Option<PositionStreamCodec>,
     block_size: usize,
+    with_impacts: bool,
 ) -> SchemaRef {
     let mut fields = vec![
         // we compress the posting lists (including row ids and frequencies),
@@ -1902,6 +1936,17 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
         arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
         arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
     ];
+    if with_impacts {
+        fields.push(arrow_schema::Field::new(
+            IMPACT_COL,
+            datatypes::DataType::List(Arc::new(Field::new(
+                "item",
+                datatypes::DataType::LargeBinary,
+                true,
+            ))),
+            false,
+        ));
+    }
     if with_position {
         fields.push(arrow_schema::Field::new(
             COMPRESSED_POSITION_COL,
