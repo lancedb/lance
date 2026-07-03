@@ -56,28 +56,12 @@ impl PartialEq for ImpactSkipData {
     }
 }
 
+/// Test-only score/scan-count pair returned by [`ImpactSkipData::max_score_up_to`].
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImpactScore {
     pub score: f32,
     pub entries_scanned: usize,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct ImpactScoreCache {}
-
-impl ImpactScoreCache {
-    fn entry_score<S: Scorer + ?Sized>(
-        &mut self,
-        impacts: &ImpactSkipData,
-        entry_idx: usize,
-        query_weight: f32,
-        scorer: &S,
-    ) -> f32 {
-        if query_weight <= 0.0 {
-            return 0.0;
-        }
-        query_weight * impacts.doc_weight_bounds(scorer)[entry_idx]
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -225,19 +209,6 @@ impl ImpactSkipData {
         query_weight * self.doc_weight_bounds(scorer)[self.level0_len + group_idx]
     }
 
-    pub fn level0_score_cached<S: Scorer + ?Sized>(
-        &self,
-        block_idx: usize,
-        query_weight: f32,
-        scorer: &S,
-        cache: &mut ImpactScoreCache,
-    ) -> f32 {
-        if block_idx >= self.level0_len {
-            return 0.0;
-        }
-        cache.entry_score(self, block_idx, query_weight, scorer)
-    }
-
     #[cfg(test)]
     pub fn max_score_up_to<S, F>(
         &self,
@@ -256,22 +227,7 @@ impl ImpactSkipData {
         })
     }
 
-    pub fn max_score_up_to_cached<S>(
-        &self,
-        start_block_idx: usize,
-        up_to: u64,
-        query_weight: f32,
-        scorer: &S,
-        cache: &mut ImpactScoreCache,
-    ) -> ImpactScore
-    where
-        S: Scorer + ?Sized,
-    {
-        self.max_score_up_to_with(start_block_idx, up_to, |impacts, entry_idx| {
-            cache.entry_score(impacts, entry_idx, query_weight, scorer)
-        })
-    }
-
+    #[cfg(test)]
     fn max_score_up_to_with<E>(
         &self,
         start_block_idx: usize,
@@ -655,25 +611,6 @@ mod tests {
     }
 
     #[test]
-    fn impact_score_cache_matches_uncached_scores() {
-        let blocks = (0..40)
-            .map(|block| vec![(block as u32, 1 + block as u32 % 3, 10)])
-            .collect::<Vec<_>>();
-        let impacts = build_impact_skip_data(&blocks).unwrap();
-        let scorer = MemBM25Scorer::new(400, 40, HashMap::from([(String::from("token"), 40usize)]));
-        let mut cache = ImpactScoreCache::default();
-
-        let uncached_level0 = impacts.level0_score(3, 1.0, &scorer);
-        let cached_level0 = impacts.level0_score_cached(3, 1.0, &scorer, &mut cache);
-        assert_eq!(cached_level0, uncached_level0);
-
-        let uncached = impacts.max_score_up_to(0, 31, |idx| idx as u32, 1.0, &scorer);
-        let cached = impacts.max_score_up_to_cached(0, 31, 1.0, &scorer, &mut cache);
-        assert_eq!(cached.score, uncached.score);
-        assert_eq!(cached.entries_scanned, uncached.entries_scanned);
-    }
-
-    #[test]
     fn impact_entries_are_decoded_lazily() {
         let level0_0 = encode_impact_entry(&[(0, 1, 10)], ImpactFormat::FixedU32).unwrap();
         let malformed_level0_1 = vec![1, 2, 3];
@@ -691,11 +628,8 @@ mod tests {
         assert!(score.score.is_finite());
         assert_eq!(score.entries_scanned, 1);
 
-        let mut cache = ImpactScoreCache::default();
-        assert_eq!(
-            impacts.level0_score_cached(1, 1.0, &scorer, &mut cache),
-            f32::INFINITY
-        );
+        // The malformed level0 entry degrades to an unskippable bound.
+        assert_eq!(impacts.level0_score(1, 1.0, &scorer), f32::INFINITY);
     }
 
     #[test]
