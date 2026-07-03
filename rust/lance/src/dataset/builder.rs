@@ -833,7 +833,7 @@ impl DatasetBuilder {
                 let reader = object_store.open(&location.path).await?;
                 populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }
-            (manifest, location)
+            (Arc::new(manifest), location)
         } else {
             let manifest_location = match version_number {
                 Some(version) => {
@@ -866,7 +866,8 @@ impl DatasetBuilder {
                         _ => e,
                     })?,
             };
-            let manifest = Dataset::load_manifest(
+
+            let manifest = Dataset::get_manifest(
                 &object_store,
                 &manifest_location,
                 &table_uri,
@@ -880,7 +881,7 @@ impl DatasetBuilder {
             object_store,
             base_path,
             table_uri,
-            Arc::new(manifest),
+            manifest,
             location,
             session,
             commit_handler,

@@ -90,7 +90,7 @@ ds.create_scalar_index(
     index_type="INVERTED",
     name="text_idx",              # Optional index name (if omitted, default is "text_idx")
     with_position=False,          # Set True to enable phrase queries (stores token positions)
-    base_tokenizer="simple",      # Tokenizer: "simple" (whitespace+punct), "icu", "whitespace", or "raw" (no tokenization)
+    base_tokenizer="simple",      # Tokenizer: "simple", "icu", "icu/split", "whitespace", "raw", or "ngram"
     language="English",           # Language used for stemming + stop words (only used if `stem` or `remove_stop_words` is True)
     max_token_length=40,          # Drop tokens longer than this length
     lower_case=True,              # Lowercase text before tokenization

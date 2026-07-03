@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Sub;
@@ -2534,7 +2535,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
-            Some(mapping) => storage.remap(&mapping),
+            Some(mapping) => storage.remap(&RowAddrRemap::direct(mapping)),
             None => Ok(storage),
         }
     }
@@ -2555,7 +2556,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         Self::try_from_batch(batch, metadata, distance_type, frag_reuse_index)
     }
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let num_vectors = self.codes.len();
         let num_code_bytes = self.codes.value_length() as usize;
         let codes = self.codes.values().as_primitive::<UInt8Type>().values();
@@ -2565,10 +2566,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
 
         let row_ids = self.row_ids.values();
         for (i, row_id) in row_ids.iter().enumerate() {
-            match mapping.get(row_id) {
+            match mapping.get(*row_id) {
                 Some(Some(new_id)) => {
                     indices.push(i as u32);
-                    new_row_ids.push(*new_id);
+                    new_row_ids.push(new_id);
                     new_codes.extend(get_rq_code(codes, i, num_vectors, num_code_bytes));
                 }
                 Some(None) => {}
@@ -2743,6 +2744,7 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::collections::{BinaryHeap, HashMap};
 
     use arrow_array::{ArrayRef, Float32Array, Float64Array, UInt64Array};
@@ -2750,7 +2752,6 @@ mod tests {
     use lance_linalg::distance::DistanceType;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
-    use rstest::rstest;
 
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
@@ -4425,7 +4426,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&mapping).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::direct(mapping)).unwrap();
         assert!(remapped.metadata().packed);
 
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
@@ -4470,7 +4471,7 @@ mod tests {
         mapping.insert(3, None);
         mapping.insert(4, Some(104));
 
-        let remapped = storage.remap(&mapping).unwrap();
+        let remapped = storage.remap(&RowAddrRemap::direct(mapping)).unwrap();
         let remapped_batch = remapped.to_batches().unwrap().next().unwrap();
         let remapped_row_ids = remapped_batch[ROW_ID].as_primitive::<UInt64Type>().values();
         let expected_row_ids = UInt64Array::from_iter_values(

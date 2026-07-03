@@ -4481,6 +4481,14 @@ impl Scanner {
         } else {
             input
         };
+        let retain_vector = if self.is_batch_nearest {
+            let vector_field_id = self.dataset.schema().field_id(q.column.as_str())?;
+            self.projection_plan
+                .physical_projection
+                .contains_field_id(vector_field_id)
+        } else {
+            false
+        };
         let flat_dist = Arc::new(KNNVectorDistanceExec::try_new_batch(
             input,
             &q.column,
@@ -4492,6 +4500,7 @@ impl Scanner {
                 lower_bound: q.lower_bound,
                 upper_bound: q.upper_bound,
                 distance_type: metric_type,
+                retain_vector,
             },
         )?);
 
@@ -5942,12 +5951,128 @@ mod test {
         (queries, query_values)
     }
 
+    async fn nested_vector_test_dataset(dim: u32) -> (TempStrDir, Dataset) {
+        let path = TempStrDir::default();
+        let vec_field = ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            true,
+        );
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            payload_field.clone(),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|batch_idx| {
+                let vector_values: Float32Array = (0..dim * 80).map(|v| v as f32).collect();
+                let vectors =
+                    FixedSizeListArray::try_new_from_values(vector_values, dim as i32).unwrap();
+                let payload = StructArray::from(vec![(
+                    Arc::new(vec_field.clone()),
+                    Arc::new(vectors) as ArrayRef,
+                )]);
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(
+                            batch_idx * 80..(batch_idx + 1) * 80,
+                        )),
+                        Arc::new(payload),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let params = WriteParams {
+            max_rows_per_group: 10,
+            max_rows_per_file: 200,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, &path, Some(params)).await.unwrap();
+        (path, dataset)
+    }
+
+    async fn escaped_nested_vector_test_dataset(dim: u32) -> (TempStrDir, Dataset) {
+        let path = TempStrDir::default();
+        let vec_field = ArrowField::new(
+            "vec.with.dot",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            true,
+        );
+        let payload_field = ArrowField::new(
+            "payload",
+            DataType::Struct(vec![vec_field.clone()].into()),
+            true,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            payload_field.clone(),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..5)
+            .map(|batch_idx| {
+                let vector_values: Float32Array = (0..dim * 80).map(|v| v as f32).collect();
+                let vectors =
+                    FixedSizeListArray::try_new_from_values(vector_values, dim as i32).unwrap();
+                let payload = StructArray::from(vec![(
+                    Arc::new(vec_field.clone()),
+                    Arc::new(vectors) as ArrayRef,
+                )]);
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(
+                            batch_idx * 80..(batch_idx + 1) * 80,
+                        )),
+                        Arc::new(payload),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let params = WriteParams {
+            max_rows_per_group: 10,
+            max_rows_per_file: 200,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let dataset = Dataset::write(reader, &path, Some(params)).await.unwrap();
+        (path, dataset)
+    }
+
     fn assert_query_index_field(batch: &RecordBatch) {
         let schema = batch.schema();
         let field = schema.field(0);
         assert_eq!(field.name(), QUERY_INDEX_COL);
         assert_eq!(field.data_type(), &DataType::Int32);
         assert!(!field.is_nullable());
+    }
+
+    fn assert_batch_knn_output_has_no_vector(batch: &RecordBatch, vector_column: &str) {
+        assert!(
+            batch.schema().column_with_name(vector_column).is_none(),
+            "batch flat KNN output must not include vector column '{vector_column}' when it is not projected; columns: {:?}",
+            batch.schema().field_names()
+        );
     }
 
     async fn assert_batch_matches_single_queries(
@@ -6024,6 +6149,7 @@ mod test {
 
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
         assert_eq!(
             batch.num_rows(),
             2 * k,
@@ -6045,6 +6171,25 @@ mod test {
             );
         }
         assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
+
+        let mut scan_with_vec = dataset.scan();
+        scan_with_vec.nearest("vec", &queries, k).unwrap();
+        scan_with_vec.use_index(false);
+        scan_with_vec.project(&["i", "vec"]).unwrap();
+        let batch_with_vec = scan_with_vec.try_into_batch().await.unwrap();
+        assert!(
+            batch_with_vec.schema().column_with_name("vec").is_some(),
+            "batch flat KNN should return vector column when projected"
+        );
+        assert_batch_matches_single_queries(
+            dataset,
+            &batch_with_vec,
+            &query_values,
+            k,
+            false,
+            None,
+        )
+        .await;
 
         let query_values_one = (32..64).map(|v| v as f32).collect::<Vec<_>>();
         let queries_one = FixedSizeListArray::try_new_from_values(
@@ -6071,9 +6216,187 @@ mod test {
 
         let batch = scan.try_into_batch().await.unwrap();
         assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
         assert_eq!(
             batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
             &[0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_omits_vector_without_projection() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 2;
+        let (queries, query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
+        assert_query_index_field(&batch);
+        assert!(batch.schema().column_with_name("i").is_some());
+        assert!(batch.schema().column_with_name(DIST_COL).is_some());
+        assert_batch_matches_single_queries(dataset, &batch, &query_values, k, false, None).await;
+
+        let mut scan_rowid_only = dataset.scan();
+        scan_rowid_only.nearest("vec", &queries, k).unwrap();
+        scan_rowid_only.use_index(false);
+        scan_rowid_only.project(&[ROW_ID]).unwrap();
+        let batch_rowid_only = scan_rowid_only.try_into_batch().await.unwrap();
+        assert_batch_knn_output_has_no_vector(&batch_rowid_only, "vec");
+        assert!(batch_rowid_only.schema().column_with_name(ROW_ID).is_some());
+        assert!(batch_rowid_only.schema().column_with_name("i").is_none());
+
+        let mut scan_with_vec = dataset.scan();
+        scan_with_vec.nearest("vec", &queries, k).unwrap();
+        scan_with_vec.use_index(false);
+        scan_with_vec.project(&["vec"]).unwrap();
+        let batch_with_vec = scan_with_vec.try_into_batch().await.unwrap();
+        assert!(
+            batch_with_vec.schema().column_with_name("vec").is_some(),
+            "batch flat KNN must include vector column when vec is projected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_filter_keeps_non_vector_columns() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 2;
+        let (queries, query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.use_index(false);
+        scan.filter("i >= 0").unwrap();
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
+        assert!(batch.schema().column_with_name("i").is_some());
+
+        let query_indices = batch[QUERY_INDEX_COL].as_primitive::<Int32Type>();
+        for query_index in 0..2 {
+            let query =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let mut single = dataset.scan();
+            single.nearest("vec", &query, k).unwrap();
+            single.use_index(false);
+            single.filter("i >= 0").unwrap();
+            single.project(&["i"]).unwrap();
+            let single_batch = single.try_into_batch().await.unwrap();
+
+            let mask = BooleanArray::from_iter(
+                query_indices
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let batch_slice = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(
+                batch_slice["i"].as_primitive::<Int32Type>().values(),
+                single_batch["i"].as_primitive::<Int32Type>().values()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_nested_vector_projection() {
+        const VECTOR_COLUMN: &str = "payload.vec";
+        let (_tmp, dataset) = nested_vector_test_dataset(32).await;
+        let k = 2;
+        let (queries, _query_values) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest(VECTOR_COLUMN, &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, VECTOR_COLUMN);
+        assert_eq!(batch.num_rows(), 2 * k);
+        assert!(batch.schema().column_with_name("i").is_some());
+
+        let mut scan_with_vec = dataset.scan();
+        scan_with_vec.nearest(VECTOR_COLUMN, &queries, k).unwrap();
+        scan_with_vec.use_index(false);
+        scan_with_vec.project(&[VECTOR_COLUMN]).unwrap();
+        let batch_with_vec = scan_with_vec.try_into_batch().await.unwrap();
+        assert!(
+            batch_with_vec
+                .schema()
+                .column_with_name(VECTOR_COLUMN)
+                .is_some(),
+            "batch flat KNN must include nested vector column when projected; columns: {:?}",
+            batch_with_vec.schema().field_names()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_escaped_nested_vector_projection() {
+        const VECTOR_COLUMN: &str = "payload.`vec.with.dot`";
+        let (_tmp, dataset) = escaped_nested_vector_test_dataset(32).await;
+        let k = 2;
+        let (queries, _) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest(VECTOR_COLUMN, &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, VECTOR_COLUMN);
+        assert_eq!(batch.num_rows(), 2 * k);
+        assert!(batch.schema().column_with_name("i").is_some());
+
+        let mut scan_with_vec = dataset.scan();
+        scan_with_vec.nearest(VECTOR_COLUMN, &queries, k).unwrap();
+        scan_with_vec.use_index(false);
+        scan_with_vec.project(&[VECTOR_COLUMN]).unwrap();
+        let batch_with_vec = scan_with_vec.try_into_batch().await.unwrap();
+        assert!(
+            batch_with_vec
+                .schema()
+                .column_with_name(VECTOR_COLUMN)
+                .is_some(),
+            "batch flat KNN must include escaped nested vector column when projected; columns: {:?}",
+            batch_with_vec.schema().field_names()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_flat_projects_row_id_and_row_addr_without_vector() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let k = 2;
+        let (queries, _) = batch_knn_two_queries();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, k).unwrap();
+        scan.use_index(false);
+        scan.project(&[ROW_ID]).unwrap();
+        scan.with_row_address();
+
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        assert_batch_knn_output_has_no_vector(&batch, "vec");
+        assert_eq!(batch.num_rows(), 2 * k);
+        assert!(batch.schema().column_with_name(ROW_ID).is_some());
+        assert!(batch.schema().column_with_name(ROW_ADDR).is_some());
+        assert!(batch.schema().column_with_name(DIST_COL).is_some());
+        assert_eq!(
+            batch[ROW_ADDR].as_primitive::<UInt64Type>().null_count(),
+            0,
+            "row addresses should be materialized for all top-k rows"
         );
     }
 
@@ -9034,6 +9357,191 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             !plan_str.contains("LikePrefix"),
             "LIKE '%app%' should not use LikePrefix index, but got: {}",
             plan_str
+        );
+    }
+
+    /// Regression for over-matching on the zone-map recheck path: a literal prefix
+    /// containing LIKE metacharacters (`_`, `%`) must be matched literally, not as
+    /// wildcards. The indexed (recheck) result must equal the unindexed ground truth.
+    #[tokio::test]
+    async fn test_like_prefix_zone_map_escapes_metacharacters() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let names: Vec<&str> = vec!["a_b", "a_c", "axb", "a1c", "b%c", "bxc", "bcc", "zoo"];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..names.len() as i32)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://test_like_zonemap_escape", None)
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_zonemap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let collect_names = |batch: &RecordBatch| -> BTreeSet<String> {
+            batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect()
+        };
+
+        // Ensure the predicate actually exercises the zone-map LikePrefix recheck path.
+        let mut scanner = dataset.scan();
+        scanner.filter("starts_with(name, 'a_')").unwrap();
+        let plan_str = format!("{:?}", scanner.create_plan().await.unwrap());
+        assert!(
+            plan_str.contains("LikePrefix"),
+            "expected a zone-map LikePrefix plan, got: {plan_str}"
+        );
+
+        // `_` and `%` in the prefix are literal characters; the indexed result must match
+        // the unindexed evaluation for each predicate (no wildcard over-match).
+        for predicate in ["starts_with(name, 'a_')", "starts_with(name, 'b%')"] {
+            let with_index = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let without_index = dataset
+                .scan()
+                .use_scalar_index(false)
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_names(&with_index),
+                collect_names(&without_index),
+                "indexed result over-matched for predicate `{predicate}`"
+            );
+        }
+
+        // Explicit expectation so the intended (non-over-matching) result is obvious.
+        let result = dataset
+            .scan()
+            .filter("starts_with(name, 'a_')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from(["a_b".to_string(), "a_c".to_string()])
+        );
+    }
+
+    /// A bitmap index cannot answer prefix queries, so `LIKE 'prefix%'` / `starts_with`
+    /// must fall back to ordinary filtering (returning correct results) instead of being
+    /// planned as a `LikePrefix` index scan that bitmap search would reject.
+    #[tokio::test]
+    async fn test_like_prefix_bitmap_falls_back_to_filter() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let names: Vec<&str> = vec!["apple", "app", "application", "banana", "band", "zoo"];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..names.len() as i32)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://test_like_bitmap_fallback", None)
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_bitmap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // The predicate must not be planned as a LikePrefix index scan (bitmap rejects it).
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan_str = format!("{:?}", scanner.create_plan().await.unwrap());
+        assert!(
+            !plan_str.contains("LikePrefix"),
+            "bitmap LIKE must not use a LikePrefix index scan, got: {plan_str}"
+        );
+
+        let collect_names = |batch: &RecordBatch| -> BTreeSet<String> {
+            batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect()
+        };
+
+        // And it must execute successfully with correct results (previously errored).
+        let result = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from([
+                "apple".to_string(),
+                "app".to_string(),
+                "application".to_string(),
+            ])
+        );
+
+        let result = dataset
+            .scan()
+            .filter("starts_with(name, 'ban')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from(["banana".to_string(), "band".to_string()])
         );
     }
 

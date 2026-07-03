@@ -18,6 +18,7 @@ pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
 pub mod scheduler;
+pub mod spill;
 pub mod stream;
 #[cfg(test)]
 pub mod testing;

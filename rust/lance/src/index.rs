@@ -4,6 +4,7 @@
 //! Secondary Index
 //!
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -15,7 +16,6 @@ use itertools::Itertools;
 use lance_core::cache::CacheKey;
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
@@ -289,7 +289,14 @@ fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
         .as_ref()
-        .is_some_and(|details| details.type_url.ends_with("FMIndexIndexDetails"))
+        .is_some_and(|details| details.type_url.ends_with("FMIndexDetails"))
+}
+
+fn segment_has_label_list_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("LabelListIndexDetails"))
 }
 
 // Cache keys for different index types
@@ -458,7 +465,7 @@ fn legacy_type_name(index_uri: &str, index_type_hint: Option<&str>) -> String {
         "BloomFilter" => IndexType::BloomFilter.to_string(),
         "RTree" => IndexType::RTree.to_string(),
         "Inverted" => IndexType::Inverted.to_string(),
-        "FMIndex" => IndexType::Fm.to_string(),
+        "FMIndex" | "FM" => IndexType::Fm.to_string(),
         "Json" => IndexType::Scalar.to_string(),
         "Flat" | "Vector" => IndexType::Vector.to_string(),
         other if other.contains("Vector") => IndexType::Vector.to_string(),
@@ -477,7 +484,7 @@ pub trait IndexBuilder {
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
-    row_id_map: &HashMap<u64, Option<u64>>,
+    row_id_map: &RowAddrRemap,
 ) -> Result<RemapResult> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
@@ -492,20 +499,14 @@ pub(crate) async fn remap_index(
         ));
     }
 
-    if row_id_map.values().all(|v| v.is_none()) {
-        let deleted_bitmap = RoaringBitmap::from_iter(
-            row_id_map
-                .keys()
-                .map(|row_id| RowAddress::new_from_u64(*row_id))
-                .map(|addr| addr.fragment_id()),
-        );
-        if Some(deleted_bitmap) == matched.fragment_bitmap {
-            // If remap deleted all rows, we can just return the same index ID.
-            // This can happen if there is a bug where the index is covering empty
-            // fragment that haven't been cleaned up. They should be cleaned up
-            // outside of this function.
-            return Ok(RemapResult::Keep(*index_id));
-        }
+    if let Some(deleted_bitmap) = row_id_map.fully_deleted_fragments()
+        && Some(deleted_bitmap) == matched.fragment_bitmap
+    {
+        // If remap deleted all rows, we can just return the same index ID.
+        // This can happen if there is a bug where the index is covering empty
+        // fragment that haven't been cleaned up. They should be cleaned up
+        // outside of this function.
+        return Ok(RemapResult::Keep(*index_id));
     }
 
     let field_id = matched
@@ -1149,7 +1150,14 @@ impl DatasetIndexExt for Dataset {
         let all_btree = source_segments.iter().all(segment_has_btree_details);
         let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
         let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
-        if !all_vector && !all_inverted && !all_bitmap && !all_btree && !all_fmindex && !all_zonemap
+        let all_label_list = source_segments.iter().all(segment_has_label_list_details);
+        if !all_vector
+            && !all_inverted
+            && !all_bitmap
+            && !all_btree
+            && !all_fmindex
+            && !all_zonemap
+            && !all_label_list
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
@@ -1170,6 +1178,8 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+        } else if all_label_list {
+            crate::index::scalar::label_list::merge_segments(self, source_segments).await?
         } else if all_zonemap {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
         } else {
@@ -4071,7 +4081,9 @@ mod tests {
         assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices.len(), 1);
 
-        session.index_cache.clear().await; // Clear the cache
+        // Clear the cache
+        session.index_cache.clear().await;
+        session.file_metadata_cache().clear().await;
 
         let dataset2 = DatasetBuilder::from_uri(test_uri)
             .with_session(session.clone())
@@ -4111,7 +4123,7 @@ mod tests {
         let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
             .map(|i| (i as u64, None))
             .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
+        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));

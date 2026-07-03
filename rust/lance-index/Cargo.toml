@@ -44,6 +44,7 @@ lance-encoding.workspace = true
 lance-file.workspace = true
 lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
+lance-bitpacking.workspace = true
 libsais-rs = "0.2"
 lance-linalg.workspace = true
 lance-select.workspace = true
@@ -70,7 +71,6 @@ bytes.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 async-channel = "2.3.1"
-bitpacking = { version = "0.9.2", features = ["bitpacker4x"] }
 rand_distr.workspace = true
 lance-datagen.workspace = true
 rangemap.workspace = true

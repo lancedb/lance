@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[cfg(test)]
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::sync::Arc;
 
 use lance_core::Result;
@@ -62,7 +64,6 @@ mod test {
 
     use std::{
         any::Any,
-        collections::HashMap,
         sync::{Arc, atomic::AtomicBool},
     };
 
@@ -109,10 +110,6 @@ mod test {
 
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         async fn prewarm(&self) -> Result<()> {
@@ -186,7 +183,7 @@ mod test {
             unimplemented!()
         }
 
-        async fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 

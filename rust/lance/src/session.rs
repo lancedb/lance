@@ -9,6 +9,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::spill::{LocalSpillStore, SpillStore};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -53,6 +54,8 @@ pub struct Session {
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
     store_registry: Arc<ObjectStoreRegistry>,
+
+    spill_store: Arc<dyn SpillStore>,
 }
 
 impl DeepSizeOf for Session {
@@ -107,6 +110,7 @@ impl Session {
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
+            spill_store: Arc::new(LocalSpillStore::default()),
         }
     }
 
@@ -124,7 +128,33 @@ impl Session {
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,
+            spill_store: Arc::new(LocalSpillStore::default()),
         }
+    }
+
+    /// Replace the spill store used by this session.
+    ///
+    /// This is a builder-style method that consumes and returns `self`, making
+    /// it easy to chain during session construction:
+    ///
+    /// ```rust,no_run
+    /// # use lance::session::Session;
+    /// # use lance_io::spill::LocalSpillStore;
+    /// # use std::sync::Arc;
+    /// let session = Session::default()
+    ///     .with_spill_store(Arc::new(LocalSpillStore::with_cap(1 << 30).unwrap()));
+    /// ```
+    pub fn with_spill_store(mut self, store: Arc<dyn SpillStore>) -> Self {
+        self.spill_store = store;
+        self
+    }
+
+    /// Return a reference to the session's spill store.
+    ///
+    /// Callers use this to obtain reclaimable scratch space for intermediate
+    /// state that overflows memory (e.g. index builders).
+    pub fn spill_store(&self) -> &dyn SpillStore {
+        &*self.spill_store
     }
 
     /// Register a new index extension.
@@ -265,6 +295,7 @@ mod tests {
     use lance_core::cache::{CacheKey, UnsizedCacheKey};
     use lance_index::vector::VectorIndex;
     use std::borrow::Cow;
+    use tokio::io::AsyncWriteExt;
 
     struct TestKey(&'static str);
     impl CacheKey for TestKey {
@@ -338,5 +369,35 @@ mod tests {
         assert_eq!(metadata_keys[0].type_name(), "TestVec");
 
         assert_ne!(index_keys, metadata_keys);
+    }
+
+    #[tokio::test]
+    async fn test_default_session_has_spill_store() {
+        let session = Session::default();
+        // Should be able to allocate a spill and write to it without error.
+        let (mut writer, _spill) = session.spill_store().new_spill().await.unwrap();
+        writer.write_all(b"scratch").await.unwrap();
+        lance_io::traits::Writer::shutdown(writer.as_mut())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_custom_spill_store_injected() {
+        let capped = Arc::new(LocalSpillStore::with_cap(50).unwrap());
+        let session = Session::default().with_spill_store(capped);
+
+        let (mut writer, _spill) = session.spill_store().new_spill().await.unwrap();
+        // Writing 51 bytes exceeds the 50-byte cap; the typed error is wrapped
+        // in an io::Error by the writer and recovered on conversion.
+        let io_err = writer.write_all(&[0u8; 51]).await.unwrap_err();
+        let err: lance_core::Error = io_err.into();
+        assert!(
+            matches!(
+                err,
+                lance_core::Error::DiskCapExceeded { cap_bytes: 50, .. }
+            ),
+            "expected DiskCapExceeded, got {err}"
+        );
     }
 }

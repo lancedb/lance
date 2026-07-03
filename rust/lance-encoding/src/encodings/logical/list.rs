@@ -428,6 +428,96 @@ mod tests {
         check_basic_random(field).await;
     }
 
+    /// Regression test: a `List<List<Float32>>` column written as MULTIPLE
+    /// batches (chunks) whose flattened leaf values cross a value-page boundary
+    /// fails to decode with "Max offset N exceeds length of values M" (Arrow
+    /// error raised by `ListArray::try_new` in `StructuralListDecodeTask::decode`).
+    ///
+    /// The trigger (verified against the production file and pylance 7.0.0b12 /
+    /// 7.0.0 / 9.0.0-beta.10) requires ALL of:
+    ///   1. >= 2 list layers (`List<List<..>>`),
+    ///   2. a leaf large enough to be chunked into multiple value pages,
+    ///   3. the column written as more than one batch.
+    /// A single batch of the identical data round-trips fine — which is why the
+    /// earlier single-chunk version of this test (and the small `test_nested_list`
+    /// cases) did not catch it. Found in production on the gaming TransNet
+    /// `dino_embedding_per_frame` column (rectangular 3 x 768 float per row).
+    ///
+    /// Each element of the `vec![..]` passed to `check_round_trip_encoding_of_data`
+    /// is encoded as a separate batch (its own `RepDefBuilder`), so we split the
+    /// rows into two chunks to exercise the multi-batch repdef accumulation path.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_multipage_nested_float_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        use arrow_array::Float32Array;
+
+        // Production shape: 3 inner lists per row, 768 floats each.
+        let inner_per_row: usize = 3;
+        let inner_len: usize = 768;
+        // Two chunks (batches) -> two pages; a read batch that spans the page
+        // boundary is where the multi-page outer-offset bug triggered. A single
+        // [2731] chunk (one page) decodes fine, which is why this needs >= 2.
+        let chunk_rows: &[usize] = &[1366, 1365];
+
+        let make_chunk = |start_row: usize, num_rows: usize| -> Arc<dyn Array> {
+            let total_inner = num_rows * inner_per_row;
+            let total_values = total_inner * inner_len;
+            let values = Float32Array::from(
+                (0..total_values)
+                    .map(|i| (start_row + i) as f32)
+                    .collect::<Vec<_>>(),
+            );
+            let inner_offsets = ScalarBuffer::<i32>::from(
+                (0..=total_inner)
+                    .map(|i| (i * inner_len) as i32)
+                    .collect::<Vec<_>>(),
+            );
+            let inner_list = ListArray::new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                OffsetBuffer::new(inner_offsets),
+                Arc::new(values),
+                None,
+            );
+            let outer_offsets = ScalarBuffer::<i32>::from(
+                (0..=num_rows)
+                    .map(|i| (i * inner_per_row) as i32)
+                    .collect::<Vec<_>>(),
+            );
+            Arc::new(ListArray::new(
+                Arc::new(Field::new(
+                    "item",
+                    DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                    true,
+                )),
+                OffsetBuffer::new(outer_offsets),
+                Arc::new(inner_list),
+                None,
+            ))
+        };
+
+        let mut start = 0;
+        let chunks: Vec<Arc<dyn Array>> = chunk_rows
+            .iter()
+            .map(|&n| {
+                let c = make_chunk(start, n);
+                start += n;
+                c
+            })
+            .collect();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(chunks, &test_cases, field_metadata).await;
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_list_struct_list() {
         let struct_type = DataType::Struct(Fields::from(vec![Field::new(
