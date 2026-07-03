@@ -258,7 +258,7 @@ impl BlobPageScheduler {
             let bytes = read_fut.await?;
             let mut bytes_iter = bytes.into_iter();
             for blob in loaded_blobs.iter_mut() {
-                if blob.def == 0 {
+                if blob.has_data {
                     blob.set_bytes(bytes_iter.next().expect_ok()?);
                 }
             }
@@ -364,9 +364,9 @@ impl StructuralPageScheduler for BlobPageScheduler {
                 if size == 0 {
                     let rep = (position & 0xFFFF) as u16;
                     let def = ((position >> 16) & 0xFFFF) as u16;
-                    loaded_blobs.push(LoadedBlob::new(rep, def));
+                    loaded_blobs.push(LoadedBlob::new(rep, def, false));
                 } else {
-                    loaded_blobs.push(LoadedBlob::new(0, 0));
+                    loaded_blobs.push(LoadedBlob::new(0, 0, true));
                     ranges_to_read.push(position..(position + size));
                     bytes_so_far += size;
                 }
@@ -405,14 +405,25 @@ struct LoadedBlob {
     bytes: Option<Bytes>,
     rep: u16,
     def: u16,
+    /// Whether this blob has out-of-line data that must be assigned from the
+    /// I/O results (i.e. the descriptor had `size > 0`).
+    ///
+    /// This must NOT be inferred from `rep`/`def`: an empty (non-null,
+    /// zero-length) blob is encoded as `position == 0, size == 0`, which yields
+    /// `rep == 0, def == 0` -- identical to a real blob's rep/def. Keying byte
+    /// assignment off `def == 0` therefore made empty blobs steal a byte buffer
+    /// meant for a following real blob, corrupting every value after the first
+    /// empty one.
+    has_data: bool,
 }
 
 impl LoadedBlob {
-    fn new(rep: u16, def: u16) -> Self {
+    fn new(rep: u16, def: u16, has_data: bool) -> Self {
         Self {
             bytes: None,
             rep,
             def,
+            has_data,
         }
     }
 

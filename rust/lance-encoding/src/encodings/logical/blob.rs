@@ -535,6 +535,40 @@ mod tests {
         .await;
     }
 
+    /// Regression test: an empty (non-null, zero-length) blob is encoded as a
+    /// descriptor with `position == 0, size == 0`. On the decode side this
+    /// yields `rep == 0, def == 0`, which is indistinguishable from a real
+    /// blob's rep/def. The blob page loader must NOT decide whether to assign
+    /// fetched bytes based on `def == 0`; if it does, the empty blob steals a
+    /// byte buffer meant for a following real blob and every value after the
+    /// first empty one is read back as empty.
+    ///
+    /// Here `val2` and `val3` follow the empty value and would come back empty
+    /// under the buggy behavior.
+    #[tokio::test]
+    async fn test_blob_round_trip_with_empty_value() {
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let val1: &[u8] = &vec![1u8; 1024]; // 1KB
+        let val2: &[u8] = &vec![2u8; 10240]; // 10KB
+        let val3: &[u8] = &vec![3u8; 102400]; // 100KB
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(val1),
+            Some(b"".as_ref()), // empty (non-null, zero-length) -- triggers the bug
+            Some(val2),         // would be read back empty before the fix
+            None,               // null
+            Some(val3),         // would be read back empty before the fix
+        ]));
+
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
+            blob_metadata,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn test_blob_v2_external_round_trip() {
         let blob_metadata = HashMap::from([(

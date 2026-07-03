@@ -179,6 +179,35 @@ def test_scan_blob_as_binary(tmp_path):
     assert tbl.column("blobs").to_pylist() == values
 
 
+def test_scan_blob_as_binary_with_empty_value(tmp_path):
+    # An empty (non-null, zero-length) blob encodes as descriptor
+    # position=0, size=0, which decodes to rep=0, def=0 -- the same as a real
+    # blob. If byte assignment keys off def==0, the empty value steals the
+    # buffer meant for the next real blob and every value after the first empty
+    # one reads back empty (or the scan errors). This interleaves an empty value
+    # with real blobs and a null to guard against that regression.
+    val1 = b"\x01" * 1024
+    val2 = b"\x02" * 10240
+    val3 = b"\x03" * 102400
+    # normal / empty / normal / null / normal
+    values = [val1, b"", val2, None, val3]
+    arr = pa.array(values, pa.large_binary())
+    table = pa.table(
+        [arr],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
+    assert tbl.column("blobs").to_pylist() == values
+
+
 def test_fragment_scan_blob_as_binary(tmp_path):
     values = [b"foo", b"bar", b"baz"]
     arr = pa.array(values, pa.large_binary())
