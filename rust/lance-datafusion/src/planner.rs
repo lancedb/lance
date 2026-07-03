@@ -329,10 +329,82 @@ impl Planner {
         })
     }
 
+    fn is_logical_binary_op(op: &BinaryOperator) -> bool {
+        matches!(op, BinaryOperator::And | BinaryOperator::Or)
+    }
+
+    fn is_same_logical_binary_op(left: &BinaryOperator, right: &BinaryOperator) -> bool {
+        matches!(
+            (left, right),
+            (BinaryOperator::And, BinaryOperator::And) | (BinaryOperator::Or, BinaryOperator::Or)
+        )
+    }
+
+    fn flatten_logical_binary_exprs<'a>(
+        left: &'a SQLExpr,
+        op: &BinaryOperator,
+        right: &'a SQLExpr,
+    ) -> Vec<&'a SQLExpr> {
+        let mut leaves = Vec::new();
+        let mut stack = vec![right, left];
+
+        while let Some(expr) = stack.pop() {
+            match expr {
+                SQLExpr::BinaryOp {
+                    left,
+                    op: child_op,
+                    right,
+                } if Self::is_same_logical_binary_op(op, child_op) => {
+                    stack.push(right.as_ref());
+                    stack.push(left.as_ref());
+                }
+                _ => leaves.push(expr),
+            }
+        }
+
+        leaves
+    }
+
+    fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
+        if exprs.is_empty() {
+            return Err(Error::invalid_input("Binary expression has no operands"));
+        }
+
+        while exprs.len() > 1 {
+            let mut next = VecDeque::with_capacity(exprs.len().div_ceil(2));
+            while let Some(left) = exprs.pop_front() {
+                if let Some(right) = exprs.pop_front() {
+                    next.push_back(Expr::BinaryExpr(BinaryExpr::new(
+                        Box::new(left),
+                        op,
+                        Box::new(right),
+                    )));
+                } else {
+                    next.push_back(left);
+                }
+            }
+            exprs = next;
+        }
+
+        exprs
+            .pop_front()
+            .ok_or_else(|| Error::invalid_input("Binary expression has no operands"))
+    }
+
     fn binary_expr(&self, left: &SQLExpr, op: &BinaryOperator, right: &SQLExpr) -> Result<Expr> {
+        let df_op = self.binary_op(op)?;
+        if Self::is_logical_binary_op(op) {
+            let leaves = Self::flatten_logical_binary_exprs(left, op, right);
+            let mut exprs = VecDeque::with_capacity(leaves.len());
+            for leaf in leaves {
+                exprs.push_back(self.parse_sql_expr(leaf)?);
+            }
+            return Self::balanced_binary_expr(exprs, df_op);
+        }
+
         Ok(Expr::BinaryExpr(BinaryExpr::new(
             Box::new(self.parse_sql_expr(left)?),
-            self.binary_op(op)?,
+            df_op,
             Box::new(self.parse_sql_expr(right)?),
         )))
     }
@@ -1100,6 +1172,22 @@ mod tests {
                 false, false, false, false, true, true, false, false, false, false
             ])
         );
+    }
+
+    #[test]
+    fn test_parse_deep_logical_filter() {
+        let planner = Planner::new(Arc::new(Schema::empty()));
+
+        for op in ["AND", "OR"] {
+            let filter = std::iter::repeat_n("true", 1000)
+                .collect::<Vec<_>>()
+                .join(&format!(" {op} "));
+
+            let expr = planner.parse_filter(&filter).unwrap();
+            let optimized = planner.optimize_expr(expr).unwrap();
+
+            assert_eq!(optimized, lit(true));
+        }
     }
 
     #[derive(Debug, Eq, PartialEq, Hash)]

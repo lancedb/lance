@@ -250,9 +250,22 @@ impl<K: Ord> SkipListWriter<K> {
         height
     }
 
-    /// Insert `key`. Keys must be unique (the MemTable key carries a row
-    /// position, making every entry distinct); equal keys are not expected.
+    #[cfg(test)]
     pub fn insert(&mut self, key: K) {
+        self.insert_and_check_neighbors(key, |_, _| false);
+    }
+
+    /// Insert `key` and let the caller inspect its immediate level-0 neighbors.
+    ///
+    /// Keys must be unique (the MemTable key carries a row position, making
+    /// every entry distinct). Backends that index `(value, row_position)` use
+    /// the neighbor check to detect whether the same value already existed,
+    /// reusing the insertion traversal instead of issuing a second lookup.
+    pub fn insert_and_check_neighbors(
+        &mut self,
+        key: K,
+        check: impl FnOnce(Option<&K>, Option<&K>) -> bool,
+    ) -> bool {
         let cur_height = self.core.height.load(Ordering::Relaxed);
 
         // Find the predecessor at every level. For levels at/above the current
@@ -273,6 +286,15 @@ impl<K: Ord> SkipListWriter<K> {
             }
             preds[level] = pred;
         }
+
+        let succ = self.core.next_slot(preds[0], 0).load(Ordering::Acquire);
+        // SAFETY: `preds[0]` and `succ` are either null or point to nodes owned
+        // by this skiplist's arena. The single writer never removes nodes, so
+        // any non-null neighbor remains alive for the duration of this call.
+        let had_neighbor_match =
+            check(unsafe { preds[0].as_ref().map(|node| &node.key) }, unsafe {
+                succ.as_ref().map(|node| &node.key)
+            });
 
         let height = self.random_height();
 
@@ -309,6 +331,7 @@ impl<K: Ord> SkipListWriter<K> {
         }
 
         self.core.len.fetch_add(1, Ordering::Release);
+        had_neighbor_match
     }
 }
 

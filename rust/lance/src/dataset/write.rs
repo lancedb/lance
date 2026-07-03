@@ -1142,14 +1142,13 @@ where
         Ok(self.writer.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
-        let num_rows = self.writer.finish().await? as u32;
-        let size_bytes = self.writer.tell().await?;
+        let summary = self.writer.finish().await?;
         Ok((
-            num_rows,
+            summary.num_rows as u32,
             DataFile::new_legacy(
                 self.path.clone(),
                 self.writer.schema(),
-                NonZero::new(size_bytes as u64),
+                NonZero::new(summary.size_bytes),
                 self.base_id,
             ),
         ))

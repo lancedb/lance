@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     cmp::Reverse,
@@ -42,14 +43,13 @@ use super::{
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
-    frag_reuse::FragReuseIndex,
     progress::IndexBuildProgress,
     scalar::{
-        CreatedIndex, UpdateCriteria,
+        CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -125,7 +125,7 @@ pub struct BitmapIndex {
 
     index_cache: WeakLanceCache,
 
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 
     lazy_reader: LazyIndexReader,
 }
@@ -196,11 +196,23 @@ impl BitmapIndexState {
         })
     }
 
+    fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let bitmap = index
+            .as_any()
+            .downcast_ref::<BitmapIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "BitmapIndexState::from_scalar_index called with a non-bitmap index",
+                )
+            })?;
+        Self::from_index(bitmap)
+    }
+
     pub(crate) fn to_bitmap_index(
         &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<BitmapIndex>> {
         Ok(Arc::new(BitmapIndex::new(
             self.index_map.clone(),
@@ -335,7 +347,7 @@ impl BitmapIndex {
         value_type: DataType,
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         let lazy_reader = LazyIndexReader::new(store.clone());
         Self {
@@ -351,7 +363,7 @@ impl BitmapIndex {
 
     pub(crate) async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
@@ -549,12 +561,6 @@ impl Index for BitmapIndex {
 
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
-        Err(Error::not_supported_source(
-            "BitmapIndex is not a vector index".into(),
-        ))
     }
 
     async fn prewarm(&self) -> Result<()> {
@@ -790,7 +796,7 @@ impl ScalarIndex for BitmapIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let state = self.load_bitmap_index_state().await?;
@@ -812,13 +818,14 @@ impl ScalarIndex for BitmapIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        _old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let file = BitmapIndexPlugin::streaming_build_and_write(
             new_data,
             Some(self),
             dest_store,
             BITMAP_LOOKUP_NAME,
+            old_data_filter.as_ref(),
         )
         .await?;
 
@@ -1197,6 +1204,19 @@ async fn cleanup_bitmap_shard_files(store: &dyn IndexStore, shard_files: &[Strin
 #[derive(Debug, Default)]
 pub struct BitmapIndexPlugin;
 
+/// Drop the rows an old posting should no longer expose -- rows whose fragment
+/// was removed, or (under stable row ids) rows rewritten by an update -- keeping
+/// only those `filter` still considers valid. A no-op when `filter` is `None`.
+fn retain_valid(
+    mut bitmap: RowAddrTreeMap,
+    filter: Option<&super::OldIndexDataFilter>,
+) -> RowAddrTreeMap {
+    if let Some(filter) = filter {
+        filter.retain_old_rows(&mut bitmap);
+    }
+    bitmap
+}
+
 impl BitmapIndexPlugin {
     fn get_batch_from_arrays(
         keys: Arc<dyn Array>,
@@ -1328,7 +1348,7 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
-        Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME).await
+        Self::streaming_build_and_write(data, None, index_store, BITMAP_LOOKUP_NAME, None).await
     }
 
     async fn train_bitmap_shard(
@@ -1343,7 +1363,8 @@ impl BitmapIndexPlugin {
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
-        let file = Self::streaming_build_and_write(data, None, index_store, &file_name).await?;
+        let file =
+            Self::streaming_build_and_write(data, None, index_store, &file_name, None).await?;
         progress.stage_complete("build_bitmap_shard").await?;
         Ok(file)
     }
@@ -1360,6 +1381,7 @@ impl BitmapIndexPlugin {
         old_index: Option<&BitmapIndex>,
         index_store: &dyn IndexStore,
         output_file_name: &str,
+        old_data_filter: Option<&super::OldIndexDataFilter>,
     ) -> Result<IndexFile> {
         let value_type = data_source.schema().field(0).data_type().clone();
 
@@ -1406,6 +1428,7 @@ impl BitmapIndexPlugin {
                                 &mut old_pos,
                                 &mut emitted_null,
                                 &mut writer,
+                                old_data_filter,
                             )
                             .await?;
                         }
@@ -1428,6 +1451,7 @@ impl BitmapIndexPlugin {
                 &mut old_pos,
                 &mut emitted_null,
                 &mut writer,
+                old_data_filter,
             )
             .await?;
         }
@@ -1435,7 +1459,13 @@ impl BitmapIndexPlugin {
         // Emit any remaining old-only entries.
         if let Some(idx) = old_index {
             while old_pos < old_keys.len() {
-                let old_bitmap = idx.load_bitmap(&old_keys[old_pos], None).await?;
+                let old_bitmap = retain_valid(
+                    idx.load_bitmap(&old_keys[old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 writer
                     .emit(old_keys[old_pos].0.clone(), &old_bitmap)
                     .await?;
@@ -1450,7 +1480,8 @@ impl BitmapIndexPlugin {
         {
             let null_key = new_null_array(&value_type, 1);
             let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
-            writer.emit(null_key, &idx.null_map).await?;
+            let null_bitmap = retain_valid((*idx.null_map).clone(), old_data_filter);
+            writer.emit(null_key, &null_bitmap).await?;
         }
 
         writer.finish().await
@@ -1459,6 +1490,7 @@ impl BitmapIndexPlugin {
     /// Flush a completed value-run from the new data stream, emitting any
     /// old-only entries that sort before it and merging the old bitmap if the
     /// key exists in both old and new.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_run(
         key: ScalarValue,
         bitmap: &mut RowAddrTreeMap,
@@ -1467,13 +1499,14 @@ impl BitmapIndexPlugin {
         old_pos: &mut usize,
         emitted_null: &mut bool,
         writer: &mut BitmapBatchWriter,
+        old_data_filter: Option<&super::OldIndexDataFilter>,
     ) -> Result<()> {
         if key.is_null() {
             // Null values are stored separately in the old index's null_map.
             if let Some(idx) = old_index
                 && !idx.null_map.is_empty()
             {
-                *bitmap |= &*idx.null_map;
+                *bitmap |= &retain_valid((*idx.null_map).clone(), old_data_filter);
             }
             *emitted_null = true;
             writer.emit(key, bitmap).await?;
@@ -1482,7 +1515,13 @@ impl BitmapIndexPlugin {
 
             // Emit old-only entries that sort before this key.
             while *old_pos < old_keys.len() && old_keys[*old_pos] < orderable {
-                let old_bitmap = idx.load_bitmap(&old_keys[*old_pos], None).await?;
+                let old_bitmap = retain_valid(
+                    idx.load_bitmap(&old_keys[*old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 writer
                     .emit(old_keys[*old_pos].0.clone(), &old_bitmap)
                     .await?;
@@ -1491,8 +1530,13 @@ impl BitmapIndexPlugin {
 
             // If the old index also has this key, merge its bitmap.
             if *old_pos < old_keys.len() && old_keys[*old_pos] == orderable {
-                let old_bitmap = idx.load_bitmap(&old_keys[*old_pos], None).await?;
-                *bitmap |= &*old_bitmap;
+                *bitmap |= &retain_valid(
+                    idx.load_bitmap(&old_keys[*old_pos], None)
+                        .await?
+                        .as_ref()
+                        .clone(),
+                    old_data_filter,
+                );
                 *old_pos += 1;
             }
 
@@ -1506,7 +1550,7 @@ impl BitmapIndexPlugin {
     /// Remaps every bitmap in a materialized bitmap-index state using row-id mappings.
     pub(crate) fn remap_bitmap_state(
         state: HashMap<ScalarValue, RowAddrTreeMap>,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> HashMap<ScalarValue, RowAddrTreeMap> {
         state
             .into_iter()
@@ -1514,10 +1558,7 @@ impl BitmapIndexPlugin {
                 let remapped_bitmap =
                     RowAddrTreeMap::from_iter(bitmap.row_addrs().unwrap().filter_map(|addr| {
                         let addr_as_u64 = u64::from(addr);
-                        mapping
-                            .get(&addr_as_u64)
-                            .copied()
-                            .unwrap_or(Some(addr_as_u64))
+                        mapping.get(addr_as_u64).unwrap_or(Some(addr_as_u64))
                     }));
                 (key, remapped_bitmap)
             })
@@ -1676,11 +1717,7 @@ pub async fn merge_bitmap_indices(
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for BitmapIndexPlugin {
-    fn name(&self) -> &str {
-        "Bitmap"
-    }
-
+impl BasicTrainer for BitmapIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1697,26 +1734,6 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             serde_json::from_str::<BitmapParameters>(params)?
         };
         Ok(Box::new(BitmapTrainingRequest::new(params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        true
-    }
-
-    fn version(&self) -> u32 {
-        BITMAP_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            false,
-        )))
     }
 
     async fn train_index(
@@ -1760,13 +1777,45 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             files: vec![file],
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for BitmapIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Bitmap"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        BITMAP_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        // Bitmap indexes cannot answer `LikePrefix` queries (see `search`), so the parser
+        // is configured to skip them and let such predicates fall back to ordinary filtering.
+        Some(Box::new(
+            SargableQueryParser::new(index_name, self.name().to_string(), false)
+                .without_like_prefix(),
+        ))
+    }
 
     /// Load an index from storage
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(BitmapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
@@ -1775,7 +1824,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
@@ -1786,17 +1835,31 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let bitmap = index
-            .as_any()
-            .downcast_ref::<BitmapIndex>()
-            .ok_or_else(|| {
-                Error::internal("BitmapIndexPlugin::put_in_cache called with a non-bitmap index")
-            })?;
-        let state = BitmapIndexState::from_index(bitmap)?;
+        let state = BitmapIndexState::from_scalar_index(index.as_ref())?;
         cache
             .insert_with_key(&BitmapIndexStateKey, Arc::new(state))
             .await;
         Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            BitmapIndexStateKey,
+            load,
+            BitmapIndexState::from_scalar_index,
+            move |state| {
+                Ok(state.to_bitmap_index(index_store, cache, frag_reuse_index)?
+                    as Arc<dyn ScalarIndex>)
+            },
+        )
+        .await
     }
 
     async fn load_statistics(
@@ -1844,7 +1907,7 @@ mod tests {
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowSetOps;
-    use std::collections::HashMap;
+    use rstest::rstest;
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
         let mut buf = Vec::new();
@@ -2395,8 +2458,44 @@ mod tests {
         assert_eq!(red_rows_2, vec![0, 3, 6, 10, 11]);
     }
 
+    // frags 1 and 2 (3 rows each) are compacted into frag 3: the 6 rows are
+    // rewritten in order to frag 3 offsets 0..6.
+    fn bitmap_remap_compact() -> RowAddrRemap {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        use roaring::RoaringTreemap;
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                (0..3)
+                    .map(|o| u64::from(RowAddress::new_from_parts(1, o)))
+                    .chain((0..3).map(|o| u64::from(RowAddress::new_from_parts(2, o)))),
+            ),
+            old_frag_ids: vec![1, 2],
+            new_frags: vec![(3, 6)],
+        }])
+        .unwrap()
+    }
+
+    fn bitmap_remap_explicit() -> RowAddrRemap {
+        // The same mapping, listed out explicitly.
+        RowAddrRemap::direct(
+            (0..6u32)
+                .map(|i| {
+                    let (f, o) = if i < 3 { (1, i) } else { (2, i - 3) };
+                    (
+                        u64::from(RowAddress::new_from_parts(f, o)),
+                        Some(u64::from(RowAddress::new_from_parts(3, i))),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    // remap must behave identically whether the mapping is compact or explicit.
+    #[rstest]
+    #[case(bitmap_remap_compact())]
+    #[case(bitmap_remap_explicit())]
     #[tokio::test]
-    async fn test_remap_bitmap_with_null() {
+    async fn test_remap_bitmap_with_null(#[case] remap: RowAddrRemap) {
         use arrow_array::UInt32Array;
 
         // Create a temporary store.
@@ -2461,38 +2560,8 @@ mod tests {
         assert_eq!(index.index_map.len(), 2); // 2 non-null values (1 and 2)
         assert!(!index.null_map.is_empty()); // Should have null values
 
-        // Create a remap that simulates compaction of frags 1 and 2 into frag 3
-        let mut row_addr_map = HashMap::<u64, Option<u64>>::new();
-        row_addr_map.insert(
-            RowAddress::new_from_parts(1, 0).into(),
-            Some(RowAddress::new_from_parts(3, 0).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(1, 1).into(),
-            Some(RowAddress::new_from_parts(3, 1).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(1, 2).into(),
-            Some(RowAddress::new_from_parts(3, 2).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(2, 0).into(),
-            Some(RowAddress::new_from_parts(3, 3).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(2, 1).into(),
-            Some(RowAddress::new_from_parts(3, 4).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(2, 2).into(),
-            Some(RowAddress::new_from_parts(3, 5).into()),
-        );
-
         // Perform remap
-        index
-            .remap(&row_addr_map, test_store.as_ref())
-            .await
-            .unwrap();
+        index.remap(&remap, test_store.as_ref()).await.unwrap();
 
         // Reload and check
         let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())

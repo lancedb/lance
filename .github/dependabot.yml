@@ -6,6 +6,10 @@ updates:
     schedule:
       interval: "weekly"
       day: "wednesday"
+    groups:
+      cargo:
+        patterns:
+          - "*"
 
   - package-ecosystem: "cargo"
     directory: "/python"
@@ -13,6 +17,10 @@ updates:
     schedule:
       interval: "weekly"
       day: "wednesday"
+    groups:
+      cargo:
+        patterns:
+          - "*"
 
   - package-ecosystem: "cargo"
     directory: "/java/lance-jni"
@@ -20,6 +28,10 @@ updates:
     schedule:
       interval: "weekly"
       day: "wednesday"
+    groups:
+      cargo:
+        patterns:
+          - "*"
 
   - package-ecosystem: "uv"
     directory: "/python"
@@ -27,4 +39,7 @@ updates:
     schedule:
       interval: "weekly"
       day: "wednesday"
-
+    groups:
+      uv:
+        patterns:
+          - "*"

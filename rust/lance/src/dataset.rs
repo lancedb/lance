@@ -42,7 +42,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -100,6 +101,7 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
+use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
@@ -453,6 +455,12 @@ impl Dataset {
         self.refs.tags()
     }
 
+    /// A handle for cheap, index-derived statistics about this dataset (e.g. a
+    /// column's global value range) that never scan data.
+    pub fn statistics(&self) -> DatasetStatistics<'_> {
+        DatasetStatistics::new(self)
+    }
+
     pub fn branches(&self) -> Branches<'_> {
         self.refs.branches()
     }
@@ -654,6 +662,24 @@ impl Dataset {
                     }
                     _ => Error::io_source(err.into()),
                 })?;
+
+        // A stale cached size yields a bogus footer offset. Detect it (the block
+        // lacks the trailing magic) and retry with the true size, like
+        // read_manifest.
+        if manifest_location.size.is_some() && !last_block.ends_with(MAGIC) {
+            let manifest_location = ManifestLocation {
+                size: None,
+                ..manifest_location.clone()
+            };
+            return Box::pin(Self::load_manifest(
+                object_store,
+                &manifest_location,
+                uri,
+                session,
+            ))
+            .await;
+        }
+
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.
@@ -729,6 +755,30 @@ impl Dataset {
         }
 
         Ok(manifest)
+    }
+
+    /// Fetch the manifest for `manifest_location` from the session metadata
+    /// cache, loading and caching it on a miss.
+    pub(crate) async fn get_manifest(
+        object_store: &ObjectStore,
+        manifest_location: &ManifestLocation,
+        uri: &str,
+        session: &Session,
+    ) -> Result<Arc<Manifest>> {
+        let metadata_cache = session.metadata_cache.for_dataset(uri);
+        let manifest_key = ManifestKey {
+            version: manifest_location.version,
+            e_tag: manifest_location.e_tag.as_deref(),
+        };
+        if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+            return Ok(cached);
+        }
+        let loaded =
+            Arc::new(Self::load_manifest(object_store, manifest_location, uri, session).await?);
+        metadata_cache
+            .insert_with_key(&manifest_key, loaded.clone())
+            .await;
+        Ok(loaded)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2904,30 +2954,13 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let manifest_key = ManifestKey {
-                    version: location.version,
-                    e_tag: location.e_tag.as_deref(),
-                };
-                let manifest = if let Some(cached) =
-                    dataset.metadata_cache.get_with_key(&manifest_key).await
-                {
-                    cached
-                } else {
-                    let loaded = Arc::new(
-                        Dataset::load_manifest(
-                            dataset.object_store.as_ref(),
-                            &location,
-                            &dataset.uri,
-                            dataset.session.as_ref(),
-                        )
-                        .await?,
-                    );
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&manifest_key, loaded.clone())
-                        .await;
-                    loaded
-                };
+                let manifest = Dataset::get_manifest(
+                    dataset.object_store.as_ref(),
+                    &location,
+                    &dataset.uri,
+                    dataset.session.as_ref(),
+                )
+                .await?;
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.

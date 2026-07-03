@@ -9,7 +9,7 @@
 
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
@@ -20,16 +20,17 @@ use arrow_schema::{DataType, Field};
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;
 
 use datafusion::execution::SendableRecordBatchStream;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use crate::scalar::FragReuseIndex;
-use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::vector::VectorIndex;
+use crate::scalar::{
+    AnyQuery, IndexStore, MetricsCollector, RowIdRemapper, ScalarIndex, SearchResult,
+};
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -90,7 +91,7 @@ impl DeepSizeOf for BloomFilterIndex {
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
@@ -377,12 +378,6 @@ impl Index for BloomFilterIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "BloomFilter is not a vector index".into(),
-        ))
-    }
-
     async fn prewarm(&self) -> Result<()> {
         Ok(())
     }
@@ -431,7 +426,7 @@ impl ScalarIndex for BloomFilterIndex {
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(
@@ -995,11 +990,7 @@ impl BloomFilterIndexPlugin {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for BloomFilterIndexPlugin {
-    fn name(&self) -> &str {
-        "BloomFilter"
-    }
-
+impl BasicTrainer for BloomFilterIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1082,6 +1073,13 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
             files: vec![file],
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
 
     fn provides_exact_answer(&self) -> bool {
         false
@@ -1089,6 +1087,10 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
 
     fn version(&self) -> u32 {
         BLOOMFILTER_INDEX_VERSION
+    }
+
+    fn name(&self) -> &str {
+        "BloomFilter"
     }
 
     fn new_query_parser(
@@ -1107,7 +1109,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(

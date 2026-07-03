@@ -689,6 +689,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_weighs_key_footprint() {
+        // Weighted size charges the key's unique bytes, not just the value.
+        let cache = LanceCache::with_capacity(usize::MAX);
+        let key = "k".repeat(10_000);
+        let value = Arc::new(vec![1_i32]);
+        let expected =
+            std::mem::size_of::<InternalCacheKey>() + key.len() + cache_entry_size(&*value);
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new(&key), value)
+            .await;
+        assert_eq!(cache.size_bytes().await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_cache_shared_prefix_not_charged_per_entry() {
+        // The shared prefix contributes nothing per entry (it isn't freed on a
+        // single eviction); only struct + unique key + value are charged.
+        let cache = LanceCache::with_capacity(usize::MAX).with_key_prefix(&"p".repeat(10_000));
+        for i in 0..100 {
+            cache
+                .insert_with_key(
+                    &TestKey::<Vec<i32>>::new(&i.to_string()),
+                    Arc::new(vec![1_i32]),
+                )
+                .await;
+        }
+        let value_cost = cache_entry_size(&vec![1_i32]);
+        let key_bytes: usize = (0..100).map(|i| i.to_string().len()).sum();
+        let expected = 100 * (std::mem::size_of::<InternalCacheKey>() + value_cost) + key_bytes;
+        assert_eq!(cache.size_bytes().await, expected);
+    }
+
+    #[tokio::test]
     async fn test_cache_trait_objects() {
         #[derive(Debug, DeepSizeOf)]
         struct MyType(i32);

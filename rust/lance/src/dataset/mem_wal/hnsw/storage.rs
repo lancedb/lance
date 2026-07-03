@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use lance_core::{Error, ROW_ID, Result};
 use lance_linalg::distance::{DistanceType, cosine_distance, dot_f32, l2_f32};
@@ -205,6 +207,12 @@ impl ArrowFixedSizeListVectorStore {
     }
 
     /// Append one Arrow `FixedSizeList<Float32>` batch by reference.
+    ///
+    /// Null-vector rows (e.g. tombstones, or rows written without an embedding)
+    /// are skipped — they get no graph node — matching base-table vector index
+    /// semantics. Surviving non-null rows are compacted into a contiguous node
+    /// range, but each node's `row_ids` entry preserves its *original* offset in
+    /// the input batch so search still resolves a hit back to the correct row.
     pub fn append_batch(
         &self,
         vectors: Arc<FixedSizeListArray>,
@@ -221,13 +229,39 @@ impl ArrowFixedSizeListVectorStore {
                 vectors.value_length()
             )));
         }
-        if vectors.null_count() > 0 {
-            return Err(Error::invalid_input(format!(
-                "null vectors are not supported, got {} null row(s)",
-                vectors.null_count()
-            )));
+
+        // Compact away null-vector rows, remembering each survivor's original
+        // offset. The all-non-null case keeps the input array as-is (offsets are
+        // the identity) to avoid a copy on the hot path.
+        let (stored_array, original_offsets): (Arc<FixedSizeListArray>, Option<Vec<u32>>) =
+            if vectors.null_count() == 0 {
+                (vectors, None)
+            } else {
+                let valid = vectors
+                    .nulls()
+                    .ok_or_else(|| Error::internal("null_count > 0 but no null buffer"))?;
+                let mask = BooleanArray::new(valid.inner().clone(), None);
+                let filtered = arrow_select::filter::filter(vectors.as_ref(), &mask)?;
+                let fsl = filtered
+                    .as_fixed_size_list_opt()
+                    .ok_or_else(|| {
+                        Error::internal("filtered vector column is not a FixedSizeList")
+                    })?
+                    .clone();
+                let offsets: Vec<u32> = (0..vectors.len() as u32)
+                    .filter(|&i| valid.is_valid(i as usize))
+                    .collect();
+                (Arc::new(fsl), Some(offsets))
+            };
+
+        let num_rows = stored_array.len();
+        if num_rows == 0 {
+            // All rows were null (e.g. an all-tombstone memtable): no graph node.
+            let start = self.committed_len.load(Ordering::Relaxed) as u32;
+            return Ok(start..start);
         }
-        let values = vectors.values();
+
+        let values = stored_array.values();
         let Some(values_f32) = values.as_primitive_opt::<Float32Type>() else {
             return Err(Error::invalid_input(format!(
                 "vector values must be Float32, got {:?}",
@@ -236,11 +270,10 @@ impl ArrowFixedSizeListVectorStore {
         };
 
         let start = self.committed_len.load(Ordering::Relaxed);
-        let end = start.checked_add(vectors.len()).ok_or_else(|| {
+        let end = start.checked_add(num_rows).ok_or_else(|| {
             Error::invalid_input(format!(
                 "vector count overflow: start={}, batch_len={}",
-                start,
-                vectors.len()
+                start, num_rows
             ))
         })?;
         if end > self.capacity {
@@ -264,19 +297,25 @@ impl ArrowFixedSizeListVectorStore {
             self.batches
                 .add(batch_idx)
                 .write(MaybeUninit::new(StoredArrowBatch {
-                    _array: vectors.clone(),
+                    _array: stored_array.clone(),
                     values_ptr: values_f32.values().as_ptr(),
                 }));
-            for offset in 0..vectors.len() {
+            for offset in 0..num_rows {
                 self.row_to_batch
                     .add(start + offset)
                     .write(MaybeUninit::new(RowLookup {
                         batch_idx: batch_idx as u32,
                         offset: offset as u32,
                     }));
+                // The node maps back to the survivor's *original* row position,
+                // so a compacted node still resolves to the right row.
+                let original = match &original_offsets {
+                    Some(offsets) => offsets[offset] as u64,
+                    None => offset as u64,
+                };
                 self.row_ids
                     .add(start + offset)
-                    .write(MaybeUninit::new(row_id_start + offset as u64));
+                    .write(MaybeUninit::new(row_id_start + original));
             }
         }
 
@@ -458,5 +497,89 @@ mod tests {
             compute_f32_distance(snapshot.vector(0), snapshot.vector(1), DistanceType::L2),
             8.0
         );
+    }
+
+    /// Build a `FixedSizeList<Float32>` where `None` rows are null at the list
+    /// level (the representation a tombstone / embedding-less row produces).
+    fn fsl_opt(rows: &[Option<Vec<f32>>], dim: usize) -> Arc<FixedSizeListArray> {
+        let mut values: Vec<f32> = Vec::new();
+        let mut validity: Vec<bool> = Vec::new();
+        for r in rows {
+            match r {
+                Some(v) => {
+                    assert_eq!(v.len(), dim);
+                    values.extend_from_slice(v);
+                    validity.push(true);
+                }
+                None => {
+                    values.extend(std::iter::repeat_n(0.0f32, dim));
+                    validity.push(false);
+                }
+            }
+        }
+        let values = Arc::new(Float32Array::from(values)) as ArrayRef;
+        let nulls = arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::from(validity));
+        Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+                values,
+                Some(nulls),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_append_skips_null_vectors_preserves_mapping() {
+        // Mid-batch null: rows [(1,1), null, (3,3)] → two nodes that map back to
+        // the *original* offsets 0 and 2 (no off-by-one after the skip).
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(8, 2, 2, DistanceType::L2).unwrap());
+        let batch = fsl_opt(&[Some(vec![1.0, 1.0]), None, Some(vec![3.0, 3.0])], 2);
+        assert_eq!(
+            store.append_batch(batch, 0).unwrap(),
+            0..2,
+            "two non-null survivors → two contiguous nodes"
+        );
+        assert_eq!(store.committed_len(), 2);
+
+        // `to_record_batch` exposes each node's row id = its original offset.
+        let rb = store.to_record_batch(None).unwrap();
+        let row_ids = rb.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let got: Vec<u64> = (0..row_ids.len()).map(|i| row_ids.value(i)).collect();
+        assert_eq!(got, vec![0, 2], "node→row mapping skips the null row");
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.vector(0), &[1.0, 1.0]);
+        assert_eq!(snapshot.vector(1), &[3.0, 3.0]);
+        assert_eq!(snapshot.row_id(0), 0);
+        assert_eq!(snapshot.row_id(1), 2);
+    }
+
+    #[test]
+    fn test_append_skips_null_vectors_offsets_with_row_id_start() {
+        // The survivor's original offset is added to `row_id_start`.
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(8, 2, 2, DistanceType::L2).unwrap());
+        // rows at row_id_start=100: [null, (2,2)] → one node, row id 100+1.
+        let batch = fsl_opt(&[None, Some(vec![2.0, 2.0])], 2);
+        assert_eq!(store.append_batch(batch, 100).unwrap(), 0..1);
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.row_id(0), 101);
+        assert_eq!(snapshot.vector(0), &[2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_append_all_null_batch_is_empty_range() {
+        // All-null batch (e.g. an all-tombstone memtable) adds no node.
+        let store =
+            Arc::new(ArrowFixedSizeListVectorStore::try_new(8, 2, 2, DistanceType::L2).unwrap());
+        let batch = fsl_opt(&[None, None], 2);
+        assert!(
+            store.append_batch(batch, 0).unwrap().is_empty(),
+            "all-null batch yields an empty node range"
+        );
+        assert_eq!(store.committed_len(), 0);
     }
 }

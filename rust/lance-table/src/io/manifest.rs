@@ -115,14 +115,18 @@ pub async fn read_manifest_indexes(
     manifest: &Manifest,
 ) -> Result<Vec<IndexMetadata>> {
     if let Some(pos) = manifest.index_section.as_ref() {
-        let reader = if let Some(size) = location.size {
-            object_store
-                .open_with_size(&location.path, size as usize)
-                .await?
-        } else {
-            object_store.open(&location.path).await?
+        let result = read_index_section(object_store, &location.path, location.size, *pos).await;
+        // A stale cached size makes the index offset fall outside the sized view,
+        // so the read fails as "file size is too small". Retry once with the true
+        // size; surface any other error unchanged.
+        let section = match result {
+            Err(e)
+                if location.size.is_some() && e.to_string().contains("file size is too small") =>
+            {
+                read_index_section(object_store, &location.path, None, *pos).await?
+            }
+            other => other?,
         };
-        let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
         let indices = section
             .indices
@@ -133,6 +137,22 @@ pub async fn read_manifest_indexes(
     } else {
         Ok(vec![])
     }
+}
+
+/// Read the index section message at `pos`, opening the manifest with a known
+/// size when one is provided.
+async fn read_index_section(
+    object_store: &ObjectStore,
+    path: &Path,
+    size: Option<u64>,
+    pos: usize,
+) -> Result<pb::IndexSection> {
+    let reader = if let Some(size) = size {
+        object_store.open_with_size(path, size as usize).await?
+    } else {
+        object_store.open(path).await?
+    };
+    read_message(reader.as_ref(), pos).await
 }
 
 async fn do_write_manifest(

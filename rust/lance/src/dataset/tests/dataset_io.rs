@@ -692,12 +692,12 @@ async fn test_load_manifest_iops() {
         .await
         .unwrap();
 
-    // There should be only two IOPS:
-    // 1. List _versions directory to get the latest manifest location
-    // 2. Read the manifest file. (The manifest is small enough to be read in one go.
-    //    Larger manifests would result in more IOPS.)
+    // The write above committed on this same Session, so the manifest is already
+    // in the metadata cache. Opening therefore issues a single IOP:
+    // 1. List _versions directory to resolve the latest manifest location.
+    // The manifest body is served from the cache instead of being read from storage.
     let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
-    assert_io_eq!(io_stats, read_iops, 2);
+    assert_io_eq!(io_stats, read_iops, 1);
 }
 
 #[rstest]
