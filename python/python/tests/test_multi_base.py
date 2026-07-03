@@ -1248,3 +1248,125 @@ class TestWriteFragmentsWithTargetBases:
         dataset_root = Path(dataset_uri)
         data_files_root = list(dataset_root.glob("*.lance"))
         assert len(data_files_root) == 0, "Should not have data files in root"
+
+
+class TestDataReplacementWithBases:
+    """DataReplacement must preserve DataFile.base_id so replacement files can
+    live in (and resolve against) a storage base other than the dataset root."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.primary_uri = str(Path(self.test_dir) / "primary")
+        self.base1_uri = str(Path(self.test_dir) / "base1")
+        Path(self.base1_uri).mkdir(parents=True, exist_ok=True)
+
+    def teardown_method(self):
+        if hasattr(self, "test_dir"):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _make_two_base_dataset(self) -> "lance.LanceDataset":
+        """Fragment 0 at the dataset root, fragment 1 in base1; column a."""
+        ds = lance.write_dataset(
+            pa.table({"a": list(range(8))}),
+            self.primary_uri,
+            max_rows_per_file=8,
+        )
+        ds.add_bases([DatasetBasePath(self.base1_uri, name="b1", is_dataset_root=True)])
+        return lance.write_dataset(
+            pa.table({"a": list(range(8, 16))}),
+            self.primary_uri,
+            mode="append",
+            max_rows_per_file=8,
+            target_bases=["b1"],
+        )
+
+    def _write_bare_file(self, data_dir: str, data: pa.Table) -> str:
+        from lance.file import LanceFileWriter
+
+        name = f"{uuid.uuid4()}.lance"
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        with LanceFileWriter(f"{data_dir}/{name}") as writer:
+            writer.write_batch(data)
+        return name
+
+    def _b_data_file(self, name: str, base_id=None) -> "lance.fragment.DataFile":
+        from lance.file import stable_version
+        from lance.fragment import DataFile
+
+        return DataFile(
+            path=name,
+            fields=[1],  # field id of column "b" (a=0, b=1)
+            column_indices=[0],
+            file_major_version=int(stable_version().split(".")[0]),
+            file_minor_version=int(stable_version().split(".")[1]),
+            base_id=base_id,
+        )
+
+    def test_data_replacement_new_column_into_base(self):
+        """The all-NULL-column special case: the new column's data file for a
+        base fragment is written into that base and must keep its base_id."""
+        ds = self._make_two_base_dataset()
+        ds.add_columns(pa.field("b", pa.int32()))
+        ds = lance.dataset(self.primary_uri)
+
+        root_name = self._write_bare_file(
+            f"{self.primary_uri}/data",
+            pa.table({"b": pa.array([x * 10 for x in range(8)], pa.int32())}),
+        )
+        base_name = self._write_bare_file(
+            f"{self.base1_uri}/data",
+            pa.table({"b": pa.array([x * 10 for x in range(8, 16)], pa.int32())}),
+        )
+
+        op = lance.LanceOperation.DataReplacement(
+            [
+                lance.LanceOperation.DataReplacementGroup(
+                    0, self._b_data_file(root_name)
+                ),
+                lance.LanceOperation.DataReplacementGroup(
+                    1, self._b_data_file(base_name, base_id=1)
+                ),
+            ]
+        )
+        ds = lance.LanceDataset.commit(self.primary_uri, op, read_version=ds.version)
+
+        frags = ds.get_fragments()
+        root_files = {f.path: f.base_id for f in frags[0].data_files()}
+        base_files = {f.path: f.base_id for f in frags[1].data_files()}
+        assert root_files[root_name] is None
+        assert base_files[base_name] == 1
+
+        table = ds.to_table()
+        assert table.column("b").to_pylist() == [x * 10 for x in range(16)]
+
+    def test_data_replacement_replace_existing_file_in_base(self):
+        """The replace-existing-file branch must take the new file's base_id."""
+        ds = self._make_two_base_dataset()
+        ds.add_columns(pa.field("b", pa.int32()))
+        ds = lance.dataset(self.primary_uri)
+
+        first = self._write_bare_file(
+            f"{self.base1_uri}/data",
+            pa.table({"b": pa.array([0] * 8, pa.int32())}),
+        )
+        op = lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(1, self._b_data_file(first, 1))]
+        )
+        ds = lance.LanceDataset.commit(self.primary_uri, op, read_version=ds.version)
+
+        # Replace the same column file again, still in base1.
+        second = self._write_bare_file(
+            f"{self.base1_uri}/data",
+            pa.table({"b": pa.array([x * 10 for x in range(8, 16)], pa.int32())}),
+        )
+        op = lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(1, self._b_data_file(second, 1))]
+        )
+        ds = lance.LanceDataset.commit(self.primary_uri, op, read_version=ds.version)
+
+        base_files = {f.path: f.base_id for f in ds.get_fragments()[1].data_files()}
+        assert base_files[second] == 1
+        assert first not in base_files
+        assert ds.to_table().column("b").to_pylist()[8:] == [
+            x * 10 for x in range(8, 16)
+        ]

@@ -2093,7 +2093,7 @@ impl Dataset {
     /// Resolve the data directory for a given base_id.
     ///
     /// If `base_id` is `None`, returns the default data directory.
-    fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
+    pub(crate) fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
         match base_id {
             Some(base_id) => {
                 let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
