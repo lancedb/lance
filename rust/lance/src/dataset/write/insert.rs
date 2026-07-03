@@ -23,7 +23,9 @@ use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::dataset::write::{validate_and_resolve_target_bases, write_fragments_internal};
+use crate::dataset::write::{
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+};
 use crate::{Error, Result};
 use tracing::info;
 
@@ -202,8 +204,14 @@ impl<'a> InsertBuilder<'a> {
         self.validate_write(&mut context, &schema)?;
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
-        let target_base_info =
-            validate_and_resolve_target_bases(&mut context.params, existing_base_paths).await?;
+        let target_base_info = validate_and_resolve_target_bases_with_primary(
+            &mut context.params,
+            existing_base_paths,
+            &context.object_store,
+            &context.base_path,
+            &context.dest.uri(),
+        )
+        .await?;
 
         let (written_fragments, written_schema) = write_fragments_internal(
             context.dest.dataset(),

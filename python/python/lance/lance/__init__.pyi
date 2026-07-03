@@ -565,6 +565,8 @@ class _MergeInsertBuilder:
     def when_matched_fail(self) -> Self: ...
     def when_not_matched_insert_all(self) -> Self: ...
     def when_not_matched_by_source_delete(self, expr: Optional[str] = None) -> Self: ...
+    def target_bases(self, bases: list[str]) -> Self: ...
+    def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
 
 class _Scanner:
@@ -652,6 +654,7 @@ def _write_fragments(
     table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
     target_bases: Optional[List[str]] = None,
+    target_all_bases: Optional[bool] = None,
     initial_bases: Optional[List[Any]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
@@ -671,6 +674,7 @@ def _write_fragments_transaction(
     table_id: Optional[List[str]],
     enable_stable_row_ids: bool,
     target_bases: Optional[List[str]] = None,
+    target_all_bases: Optional[bool] = None,
     initial_bases: Optional[List[Any]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",

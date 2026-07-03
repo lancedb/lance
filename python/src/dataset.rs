@@ -396,6 +396,23 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn target_bases(
+        mut slf: PyRefMut<'_, Self>,
+        bases: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_base_names_or_paths(bases);
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (include_primary = true))]
+    pub fn target_all_bases(
+        mut slf: PyRefMut<'_, Self>,
+        include_primary: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_all_bases(include_primary);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -4519,6 +4536,11 @@ pub fn get_write_params(
             && !target_bases_list.is_empty()
         {
             p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        // Handle target_all_bases parameter (bool: include primary storage)
+        if let Some(target_all_bases) = get_dict_opt::<bool>(options, "target_all_bases")? {
+            p = p.with_target_all_bases(target_all_bases);
         }
 
         // Handle base_store_params: per-base storage options keyed by base path URI

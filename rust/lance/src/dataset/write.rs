@@ -381,12 +381,22 @@ pub struct WriteParams {
     /// The IDs must correspond to either:
     /// - IDs in initial_bases (for CREATE/OVERWRITE modes)
     /// - IDs already registered in the existing dataset manifest (for APPEND mode)
+    /// - [`PRIMARY_BASE_ID`] (0), which targets the dataset's primary storage
+    ///   and participates in the round-robin like any other entry
     pub target_bases: Option<Vec<u32>>,
 
     /// Target base names or paths as strings (unresolved).
     /// These will be resolved to IDs when the write operation executes.
     /// Resolution happens at builder execution time when dataset context is available.
+    /// An entry equal to the dataset's URI targets the dataset's primary storage.
     pub target_base_names_or_paths: Option<Vec<String>>,
+
+    /// Target every base registered in the dataset manifest, resolved when the
+    /// write executes. `Some(include_primary)`: when `include_primary` is true
+    /// the dataset's primary storage participates in the rotation as the first
+    /// slot. Cannot be combined with `target_bases` or
+    /// `target_base_names_or_paths`.
+    pub target_all_bases: Option<bool>,
 
     /// Allow writing external blob URIs that cannot be mapped to any registered
     /// non-dataset-root base path. When disabled, such rows are rejected.
@@ -425,6 +435,7 @@ impl Default for WriteParams {
             initial_bases: None,
             target_bases: None,
             target_base_names_or_paths: None,
+            target_all_bases: None,
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
             blob_pack_file_size_threshold: None,
@@ -524,6 +535,19 @@ impl WriteParams {
         }
     }
 
+    /// Target every base registered in the dataset manifest, resolved when the
+    /// write executes. When `include_primary` is true the dataset's primary
+    /// storage participates in the rotation as the first slot.
+    ///
+    /// Cannot be combined with [`Self::with_target_bases`] or
+    /// [`Self::with_target_base_names_or_paths`].
+    pub fn with_target_all_bases(self, include_primary: bool) -> Self {
+        Self {
+            target_all_bases: Some(include_primary),
+            ..self
+        }
+    }
+
     /// Configure whether external blobs outside registered bases are allowed.
     pub fn with_allow_external_blob_outside_bases(self, allow: bool) -> Self {
         Self {
@@ -608,6 +632,8 @@ pub async fn do_write_fragments(
         .unwrap_or_else(|| params.store_registry());
     let source_store_params = params.store_params.clone().unwrap_or_default();
 
+    // Keep a copy so failure paths can clean up files written to target bases.
+    let cleanup_bases = target_bases_info.clone();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
         base_dir,
@@ -688,7 +714,13 @@ pub async fn do_write_fragments(
         // Drop the writer so its in-progress file is cleaned up (LocalWriter
         // removes its temp file; ObjectWriter aborts the multipart upload).
         drop(writer.take());
-        cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+        cleanup_data_fragments(
+            &object_store,
+            base_dir,
+            cleanup_bases.as_deref(),
+            &fragments,
+        )
+        .await;
         return Err(e);
     }
 
@@ -713,7 +745,13 @@ pub async fn do_write_fragments(
             }
             Err(e) => {
                 drop(writer);
-                cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+                cleanup_data_fragments(
+                    &object_store,
+                    base_dir,
+                    cleanup_bases.as_deref(),
+                    &fragments,
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -727,53 +765,67 @@ pub async fn do_write_fragments(
 /// Contract:
 /// - Errors from individual `delete` calls are logged and swallowed, never returned —
 ///   callers should propagate the original write error.
-/// - Only files in the dataset's default storage (`base_id == None`) are deleted;
-///   files in external bases are skipped because we don't have their object stores here.
+/// - Files in the dataset's default storage (`base_id == None`) are deleted via
+///   `object_store`; files whose `base_id` matches an entry in `target_bases` are
+///   deleted via that base's object store. Files in bases not listed in
+///   `target_bases` are skipped because we don't have their object stores here.
 /// - Safe to call with an empty slice.
 /// - Must be called before the fragments are committed, otherwise live data may be deleted.
 pub(crate) async fn cleanup_data_fragments(
     object_store: &ObjectStore,
     base_dir: &Path,
+    target_bases: Option<&[TargetBaseInfo]>,
     fragments: &[Fragment],
 ) {
     let data_dir = base_dir.clone().join(DATA_DIR);
     let mut skipped_external = 0usize;
     for fragment in fragments {
         for file in &fragment.files {
-            if file.base_id.is_none() {
-                let path = data_dir.clone().join(file.path.as_str());
-                if let Err(e) = object_store.delete(&path).await {
-                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
-                }
-
-                // Clean up any blob v2 sidecars that might exist for this data file.
-                // Blob v2 sidecars are written to `data/{data_file_key}/{blob_id}.blob`.
-                // The `data_file_key` is the file stem of the .lance file.
-                if let Some(stem) = std::path::Path::new(file.path.as_str())
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                {
-                    let blob_dir = data_dir.clone().join(stem);
-                    match object_store.remove_dir_all(blob_dir.clone()).await {
-                        Err(e) if !matches!(e, Error::NotFound { .. }) => {
-                            log::warn!(
-                                "Failed to clean up orphaned blob dir '{}': {}",
-                                blob_dir,
-                                e
-                            );
-                        }
-                        _ => {}
+            let (store, file_dir) = if let Some(base_id) = file.base_id {
+                match target_bases.and_then(|bases| bases.iter().find(|b| b.base_id == base_id)) {
+                    Some(base_info) => {
+                        let dir = if base_info.is_dataset_root {
+                            base_info.base_dir.clone().join(DATA_DIR)
+                        } else {
+                            base_info.base_dir.clone()
+                        };
+                        (base_info.object_store.as_ref(), dir)
+                    }
+                    None => {
+                        skipped_external += 1;
+                        continue;
                     }
                 }
             } else {
-                skipped_external += 1;
+                (object_store, data_dir.clone())
+            };
+
+            let path = file_dir.clone().join(file.path.as_str());
+            if let Err(e) = store.delete(&path).await {
+                log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+            }
+
+            // Clean up any blob v2 sidecars that might exist for this data file.
+            // Blob v2 sidecars are written to `data/{data_file_key}/{blob_id}.blob`.
+            // The `data_file_key` is the file stem of the .lance file.
+            if let Some(stem) = std::path::Path::new(file.path.as_str())
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                let blob_dir = file_dir.clone().join(stem);
+                match store.remove_dir_all(blob_dir.clone()).await {
+                    Err(e) if !matches!(e, Error::NotFound { .. }) => {
+                        log::warn!("Failed to clean up orphaned blob dir '{}': {}", blob_dir, e);
+                    }
+                    _ => {}
+                }
             }
         }
     }
     if skipped_external > 0 {
         log::warn!(
             "Skipped cleanup of {} orphaned data file(s) in external bases: \
-             cleanup not supported for external bases",
+             their object stores are not available here",
             skipped_external
         );
     }
@@ -794,6 +846,12 @@ pub async fn validate_and_resolve_target_bases(
     if params.target_base_names_or_paths.is_some() && params.target_bases.is_some() {
         return Err(Error::invalid_input(
             "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
+        ));
+    }
+
+    if params.target_all_bases.is_some() {
+        return Err(Error::invalid_input(
+            "target_all_bases requires dataset context to resolve; use the write or merge insert APIs to apply it.",
         ));
     }
 
@@ -850,6 +908,13 @@ pub async fn validate_and_resolve_target_bases(
         .unwrap_or_default();
 
     if let Some(target_bases) = &target_base_ids {
+        // An empty list would panic in round-robin selection; reject it
+        // instead of silently writing to primary storage.
+        if target_bases.is_empty() {
+            return Err(Error::invalid_input(
+                "target_bases cannot be empty. Omit the option to write to primary storage.",
+            ));
+        }
         let mut bases_info = Vec::new();
 
         for &target_base_id in target_bases {
@@ -880,6 +945,136 @@ pub async fn validate_and_resolve_target_bases(
     } else {
         Ok(None)
     }
+}
+
+/// Like [`validate_and_resolve_target_bases`], but also resolves references to
+/// the dataset's primary storage: base id [`PRIMARY_BASE_ID`] in
+/// `target_bases`, or an entry equal to `primary_uri` in
+/// `target_base_names_or_paths`. Primary slots participate in the round-robin
+/// like any other target base; files written through them carry no base id.
+pub(crate) async fn validate_and_resolve_target_bases_with_primary(
+    params: &mut WriteParams,
+    existing_base_paths: Option<&HashMap<u32, BasePath>>,
+    primary_object_store: &Arc<ObjectStore>,
+    primary_base_dir: &Path,
+    primary_uri: &str,
+) -> Result<Option<Vec<TargetBaseInfo>>> {
+    // Expand an all-bases request into an explicit id list (primary first,
+    // then registered bases in ascending id order) and continue below.
+    if let Some(include_primary) = params.target_all_bases {
+        if params.target_bases.is_some() || params.target_base_names_or_paths.is_some() {
+            return Err(Error::invalid_input(
+                "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
+            ));
+        }
+        let mut ids: Vec<u32> = existing_base_paths
+            .map(|bases| bases.keys().copied().collect())
+            .unwrap_or_default();
+        // CREATE mode registers initial_bases in the same write; assign their
+        // ids here (the delegate keeps non-zero ids as-is) so they join the
+        // rotation.
+        if let Some(initial_bases) = &mut params.initial_bases {
+            let mut next_id = ids.iter().max().map(|id| id + 1).unwrap_or(1);
+            for base_path in initial_bases.iter_mut() {
+                if base_path.id == 0 {
+                    base_path.id = next_id;
+                    next_id += 1;
+                }
+                ids.push(base_path.id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        if include_primary {
+            ids.insert(0, PRIMARY_BASE_ID);
+        }
+        if ids.is_empty() {
+            return Err(Error::invalid_input(
+                "target_all_bases found no registered bases and include_primary is false. \
+                 Register bases or include primary storage.",
+            ));
+        }
+        params.target_bases = Some(ids);
+        params.target_all_bases = None;
+    }
+
+    let has_primary_ids = params
+        .target_bases
+        .as_ref()
+        .is_some_and(|ids| ids.contains(&PRIMARY_BASE_ID));
+    let has_primary_refs = params
+        .target_base_names_or_paths
+        .as_ref()
+        .is_some_and(|refs| refs.iter().any(|r| r == primary_uri));
+    if !has_primary_ids && !has_primary_refs {
+        return validate_and_resolve_target_bases(params, existing_base_paths).await;
+    }
+
+    // The delegate below may be skipped when only primary slots remain, so
+    // validate mutual exclusion here as well.
+    if params.target_base_names_or_paths.is_some() && params.target_bases.is_some() {
+        return Err(Error::invalid_input(
+            "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
+        ));
+    }
+
+    // Strip the primary slots, resolve the remaining references through the
+    // normal path, then splice the primary slots back into their original
+    // positions so the round-robin order matches what the caller asked for.
+    let is_primary_slot: Vec<bool> = if let Some(ids) = &params.target_bases {
+        ids.iter().map(|id| *id == PRIMARY_BASE_ID).collect()
+    } else {
+        params
+            .target_base_names_or_paths
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r == primary_uri)
+            .collect()
+    };
+
+    let mut shim = params.clone();
+    if let Some(ids) = &params.target_bases {
+        let rest: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| *id != PRIMARY_BASE_ID)
+            .collect();
+        shim.target_bases = if rest.is_empty() { None } else { Some(rest) };
+    } else {
+        let rest: Vec<String> = params
+            .target_base_names_or_paths
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|r| *r != primary_uri)
+            .cloned()
+            .collect();
+        shim.target_base_names_or_paths = if rest.is_empty() { None } else { Some(rest) };
+    }
+
+    let resolved_rest = validate_and_resolve_target_bases(&mut shim, existing_base_paths).await?;
+    // The delegate assigns ids to initial_bases in place; propagate that side
+    // effect back so CREATE-mode transactions register properly assigned ids.
+    params.initial_bases = shim.initial_bases;
+
+    let mut rest_iter = resolved_rest.unwrap_or_default().into_iter();
+    let mut bases_info = Vec::with_capacity(is_primary_slot.len());
+    for is_primary in is_primary_slot {
+        if is_primary {
+            bases_info.push(TargetBaseInfo {
+                base_id: PRIMARY_BASE_ID,
+                object_store: primary_object_store.clone(),
+                base_dir: primary_base_dir.clone(),
+                is_dataset_root: true,
+            });
+        } else {
+            bases_info.push(rest_iter.next().ok_or_else(|| {
+                Error::internal("target base resolution returned fewer bases than requested")
+            })?);
+        }
+    }
+    Ok(Some(bases_info))
 }
 
 fn append_external_base_candidate(
@@ -1412,9 +1607,18 @@ async fn open_writer_with_options(
     Ok(writer)
 }
 
+/// Reserved base id that refers to the dataset's primary storage in
+/// [`WriteParams::target_bases`]. Real base ids are assigned starting from 1,
+/// so 0 is never a registered base. Files written through a primary slot
+/// carry no base id, exactly like a write without target bases.
+pub const PRIMARY_BASE_ID: u32 = 0;
+
 /// Information about a target base for writing.
 /// Contains the base ID, object store, directory path, and whether it's a dataset root.
+#[derive(Clone)]
 pub struct TargetBaseInfo {
+    /// The registered base id, or [`PRIMARY_BASE_ID`] for the dataset's
+    /// primary storage.
     pub base_id: u32,
     pub object_store: Arc<ObjectStore>,
     /// The base directory path (without /data subdirectory)
@@ -1498,7 +1702,9 @@ impl WriterGenerator {
                 self.storage_version,
                 WriterOptions {
                     add_data_dir: base_info.is_dataset_root,
-                    base_id: Some(base_info.base_id),
+                    // Primary-storage slots stamp no base id, like a write
+                    // without target bases.
+                    base_id: (base_info.base_id != PRIMARY_BASE_ID).then_some(base_info.base_id),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
                     external_blob_mode: self.external_blob_mode,
@@ -3780,7 +3986,7 @@ mod tests {
             last_updated_at_version_meta: None,
         }];
 
-        cleanup_data_fragments(&object_store, &base_dir, &fragments).await;
+        cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
 
         // The local file should be removed; the external file is skipped without
         // erroring (its base store isn't known here).
@@ -3789,5 +3995,487 @@ mod tests {
             0,
             "Local data file should be deleted by cleanup"
         );
+    }
+
+    /// Verifies the target-base branch in `cleanup_data_fragments`: files whose
+    /// `base_id` matches a provided [`TargetBaseInfo`] are deleted via that base's
+    /// object store (respecting `is_dataset_root` layout), while files in bases
+    /// without a provided store are still skipped.
+    #[tokio::test]
+    async fn test_cleanup_data_fragments_deletes_target_base_files() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let primary_dir = TempStrDir::default();
+        let base1_dir = TempStrDir::default();
+        let base2_dir = TempStrDir::default();
+
+        let (object_store, base_dir) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            primary_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let (base1_store, base1_path) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            base1_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let (base2_store, base2_path) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            base2_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        // base2 is a plain data directory: files sit at its root, not under data/.
+        let count_plain_files = |dir: &str| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter(|e| e.as_ref().unwrap().path().is_file())
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        // base1 is a dataset root (files under data/), base2 is a plain data dir.
+        let base1_file_path = base1_path.clone().join(DATA_DIR).join("one.lance");
+        base1_store.put(&base1_file_path, b"x").await.unwrap();
+        let base2_file_path = base2_path.clone().join("two.lance");
+        base2_store.put(&base2_file_path, b"x").await.unwrap();
+        assert_eq!(count_data_files(base1_dir.as_str()), 1);
+        assert_eq!(count_plain_files(base2_dir.as_str()), 1);
+
+        let mut base1_file = DataFile::new_unstarted("one.lance", 2, 1);
+        base1_file.base_id = Some(1);
+        let mut base2_file = DataFile::new_unstarted("two.lance", 2, 1);
+        base2_file.base_id = Some(2);
+        let mut unknown_file = DataFile::new_unstarted("unknown.lance", 2, 1);
+        unknown_file.base_id = Some(42);
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![base1_file, base2_file, unknown_file],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        }];
+
+        let target_bases = vec![
+            TargetBaseInfo {
+                base_id: 1,
+                object_store: base1_store,
+                base_dir: base1_path,
+                is_dataset_root: true,
+            },
+            TargetBaseInfo {
+                base_id: 2,
+                object_store: base2_store,
+                base_dir: base2_path,
+                is_dataset_root: false,
+            },
+        ];
+
+        cleanup_data_fragments(&object_store, &base_dir, Some(&target_bases), &fragments).await;
+
+        assert_eq!(
+            count_data_files(base1_dir.as_str()),
+            0,
+            "File in dataset-root target base should be deleted"
+        );
+        assert_eq!(
+            count_plain_files(base2_dir.as_str()),
+            0,
+            "File in plain-directory target base should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_routed_data_files_on_failed_write() {
+        // Files already completed in target bases must be removed when the
+        // write later fails.
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let primary_dir = TempStrDir::default();
+        let base1_dir = TempStrDir::default();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let (object_store, base_dir) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            primary_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let (base1_store, base1_path) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            base1_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let good_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // 3 rows per file: the first batch fills and completes a file in the
+        // target base, then the stream fails.
+        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+            Ok(good_batch.clone()),
+            Ok(good_batch.clone()),
+            Err(DataFusionError::External("injected failure".into())),
+        ];
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(items),
+        ));
+
+        let target_bases = vec![TargetBaseInfo {
+            base_id: 1,
+            object_store: base1_store,
+            base_dir: base1_path,
+            is_dataset_root: true,
+        }];
+
+        let result = do_write_fragments(
+            None,
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            },
+            LanceFileVersion::V2_1,
+            Some(target_bases),
+        )
+        .await;
+
+        assert!(result.is_err(), "Expected write to fail");
+        assert_eq!(
+            count_data_files(base1_dir.as_str()),
+            0,
+            "Data files routed to the target base should be cleaned up on failure"
+        );
+        assert_eq!(count_data_files(primary_dir.as_str()), 0);
+    }
+
+    /// PRIMARY_BASE_ID (0) and the dataset URI include primary storage in the
+    /// target rotation, alongside registered bases.
+    #[tokio::test]
+    async fn test_multi_base_target_primary_and_bases() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = "memory://primary_slot_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        // CREATE mode targeting primary + a new base: also verifies the id
+        // assignment on initial_bases reaches the committed manifest.
+        let dataset = Dataset::write(
+            data_gen.batch(6),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 3,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        is_dataset_root: true,
+                        path: base1_uri.clone(),
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        is_dataset_root: false,
+                        path: base2_uri.clone(),
+                    },
+                ]),
+                target_bases: Some(vec![PRIMARY_BASE_ID, 1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1)]);
+
+        // APPEND across primary + both bases, one file per slot in order.
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen2.batch(9),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                target_bases: Some(vec![PRIMARY_BASE_ID, 1, 2]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(2)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+
+        // Names variant: the dataset's own URI selects primary storage.
+        let mut data_gen3 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen3.batch(6),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                target_base_names_or_paths: Some(vec![primary_uri.clone(), "base2".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(5)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(2)]);
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 21);
+    }
+
+    /// `target_all_bases` resolves to every registered base at execution
+    /// time, with primary storage as the first slot when included.
+    #[tokio::test]
+    async fn test_multi_base_target_all_bases() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = "memory://all_bases_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen.batch(3),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        is_dataset_root: true,
+                        path: base1_uri.clone(),
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        is_dataset_root: false,
+                        path: base2_uri.clone(),
+                    },
+                ]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // All bases including primary: slots are [primary, base1, base2].
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen2.batch(9),
+            Arc::new(dataset),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(1)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+
+        // Without primary: slots are [base1, base2].
+        let mut data_gen3 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen3.batch(6),
+            Arc::new(dataset),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                }
+                .with_target_all_bases(false),
+            ),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(4)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![Some(1), Some(2)]);
+
+        // Cannot be combined with explicit target bases.
+        let mut data_gen4 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let result = Dataset::write(
+            data_gen4.batch(3),
+            Arc::new(dataset),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    target_bases: Some(vec![1]),
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot specify target_all_bases together with")
+        );
+
+        // On a dataset with no registered bases: include_primary=true is a
+        // no-op rotation over primary, false is rejected.
+        let plain_uri = "memory://all_bases_plain";
+        let mut data_gen5 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let plain = Dataset::write(data_gen5.batch(3), plain_uri, None)
+            .await
+            .unwrap();
+        let mut data_gen6 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let plain = Dataset::write(
+            data_gen6.batch(3),
+            Arc::new(plain),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            plain.get_fragments().iter().all(|f| f
+                .metadata
+                .files
+                .iter()
+                .all(|file| file.base_id.is_none()))
+        );
+        let mut data_gen7 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let result = Dataset::write(
+            data_gen7.batch(3),
+            Arc::new(plain),
+            Some(
+                WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }
+                .with_target_all_bases(false),
+            ),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("target_all_bases found no registered bases")
+        );
+
+        // CREATE mode: initial_bases join the rotation before their ids are
+        // committed to a manifest.
+        let create_uri = "memory://all_bases_create";
+        let mut data_gen8 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen8.batch(9),
+            create_uri,
+            Some(
+                WriteParams {
+                    mode: WriteMode::Create,
+                    max_rows_per_file: 3,
+                    initial_bases: Some(vec![
+                        BasePath {
+                            id: 0,
+                            name: Some("base1".to_string()),
+                            is_dataset_root: true,
+                            path: format!("{}/base1", create_uri),
+                        },
+                        BasePath {
+                            id: 0,
+                            name: Some("base2".to_string()),
+                            is_dataset_root: false,
+                            path: format!("{}/base2", create_uri),
+                        },
+                    ]),
+                    ..Default::default()
+                }
+                .with_target_all_bases(true),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
     }
 }

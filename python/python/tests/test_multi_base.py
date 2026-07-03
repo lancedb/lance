@@ -82,6 +82,26 @@ class TestMultiBase:
             data.sort_values("id").reset_index(drop=True),
         )
 
+    def test_write_target_all_bases(self):
+        """target_all_bases=True rotates across primary and all initial bases."""
+        data = self.create_test_data(300)
+
+        dataset = lance.write_dataset(
+            data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.path1_uri, name="path1"),
+                DatasetBasePath(self.path2_uri, name="path2"),
+            ],
+            target_all_bases=True,
+            max_rows_per_file=100,
+        )
+
+        base_ids = [f.data_files()[0].base_id for f in dataset.get_fragments()]
+        assert base_ids == [None, 1, 2]
+        assert len(dataset.to_table()) == 300
+
     def test_base_scoped_storage_options(self):
         """base_<id>.<key> storage options flow through write and read."""
         data = self.create_test_data(200)
@@ -1404,3 +1424,185 @@ class TestDataReplacementWithBases:
         assert ds.to_table().column("b").to_pylist()[8:] == [
             x * 10 for x in range(8, 16)
         ]
+
+
+class TestMergeInsertMultiBase:
+    """Test merge insert on multi-base datasets."""
+
+    def setup_method(self):
+        """Set up test directories for each test."""
+        self.test_dir = tempfile.mkdtemp()
+        self.primary_uri = str(Path(self.test_dir) / "primary")
+        self.base1_uri = str(Path(self.test_dir) / "base1")
+        self.base2_uri = str(Path(self.test_dir) / "base2")
+        for uri in [self.primary_uri, self.base1_uri, self.base2_uri]:
+            Path(uri).mkdir(parents=True, exist_ok=True)
+
+    def teardown_method(self):
+        """Clean up test directories after each test."""
+        if hasattr(self, "test_dir"):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def create_dataset(self):
+        """Dataset with two registered bases and initial data in base1."""
+        initial_data = pd.DataFrame(
+            {
+                "id": range(100),
+                "value": [f"initial_{i}" for i in range(100)],
+            }
+        )
+        return lance.write_dataset(
+            initial_data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[
+                DatasetBasePath(self.base1_uri, name="base1"),
+                DatasetBasePath(self.base2_uri, name="base2"),
+            ],
+            target_bases=["base1"],
+            max_rows_per_file=50,
+        )
+
+    def base_name_of(self, dataset, data_file):
+        base_paths = dataset._ds.base_paths()
+        if data_file.base_id is None:
+            return None
+        return base_paths[data_file.base_id].name
+
+    def test_merge_insert_without_target_bases(self):
+        """Merge insert on a multi-base dataset writes to primary by default."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame(
+            {
+                "id": range(50, 150),
+                "value": [f"updated_{i}" for i in range(50, 150)],
+            }
+        )
+        stats = (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(new_data)
+        )
+        assert stats["num_updated_rows"] == 50
+        assert stats["num_inserted_rows"] == 50
+
+        result = dataset.to_table().to_pandas().sort_values("id")
+        assert len(result) == 150
+        assert list(result[result["id"] >= 50]["value"]) == [
+            f"updated_{i}" for i in range(50, 150)
+        ]
+
+        # New fragments (merge output) are in primary storage.
+        max_initial_fragment_id = 1  # 100 rows / 50 per file -> fragments 0, 1
+        for fragment in dataset.get_fragments():
+            is_initial = fragment.fragment_id <= max_initial_fragment_id
+            for data_file in fragment.data_files():
+                expected = "base1" if is_initial else None
+                assert self.base_name_of(dataset, data_file) == expected
+
+    def test_merge_insert_with_target_bases(self):
+        """Merge insert routes new fragments to the requested base."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame(
+            {
+                "id": range(50, 150),
+                "value": [f"updated_{i}" for i in range(50, 150)],
+            }
+        )
+        stats = (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .target_bases(["base2"])
+            .execute(new_data)
+        )
+        assert stats["num_updated_rows"] == 50
+        assert stats["num_inserted_rows"] == 50
+
+        result = dataset.to_table().to_pandas().sort_values("id")
+        assert len(result) == 150
+        assert list(result[result["id"] >= 50]["value"]) == [
+            f"updated_{i}" for i in range(50, 150)
+        ]
+
+        merge_files = 0
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id > 1:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) == "base2"
+                    merge_files += 1
+        assert merge_files > 0
+        assert list(Path(self.base2_uri).glob("**/*.lance"))
+
+        # The routed dataset stays readable from a fresh instance.
+        reloaded = lance.dataset(self.primary_uri)
+        assert reloaded.count_rows() == 150
+
+    def test_merge_insert_with_unknown_target_base(self):
+        """Merge insert referencing an unregistered base fails."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [1], "value": ["updated_1"]})
+        with pytest.raises(Exception, match="not found in available bases"):
+            (
+                dataset.merge_insert("id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .target_bases(["nonexistent"])
+                .execute(new_data)
+            )
+
+    def test_merge_insert_target_primary_via_uri(self):
+        """The dataset URI in target_bases selects primary storage."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [200], "value": ["inserted_200"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_bases([dataset.uri, "base2"])
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 101
+
+        # The single new file lands in the first slot: primary storage.
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id > 1:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) is None
+
+    def test_merge_insert_target_all_bases(self):
+        """target_all_bases spreads new files across all bases, primary first."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [300], "value": ["inserted_300"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_all_bases()
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 101
+        # A single new file lands in the first slot: primary storage.
+        newest = max(f.fragment_id for f in dataset.get_fragments())
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id == newest:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) is None
+
+        new_data = pd.DataFrame({"id": [301], "value": ["inserted_301"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_all_bases(include_primary=False)
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 102
+        newest = max(f.fragment_id for f in dataset.get_fragments())
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id == newest:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) == "base1"

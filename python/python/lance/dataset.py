@@ -536,6 +536,54 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).use_index(use_index)
 
+    def target_bases(self, bases: List[str]) -> "MergeInsertBuilder":
+        """
+        Write new fragments produced by this merge insert to these bases.
+
+        Each entry references a base path registered in the dataset manifest,
+        by name or by path URI, like the ``target_bases`` parameter of
+        :func:`~lance.write_dataset`. An entry equal to the dataset's URI
+        includes the dataset's primary storage in the rotation, e.g.
+        ``[ds.uri, "base1", "base2"]`` spreads new data files across primary
+        storage and both bases. New data files are distributed across the
+        target bases round-robin. Data files that patch existing fragments
+        and deletion files are always written to the dataset's primary
+        storage.
+
+        Parameters
+        ----------
+        bases : List[str]
+            Base names or path URIs to write new data files to.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).target_bases(bases)
+
+    def target_all_bases(self, include_primary: bool = True) -> "MergeInsertBuilder":
+        """
+        Write new fragments to every base registered in the dataset manifest.
+
+        The bases are resolved when the merge insert executes, so bases added
+        later are picked up automatically. When ``include_primary`` is True
+        (the default), the dataset's primary storage participates in the
+        round-robin rotation as the first slot. Cannot be combined with
+        :meth:`target_bases`.
+
+        Parameters
+        ----------
+        include_primary : bool, default True
+            Whether the dataset's primary storage is part of the rotation.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).target_all_bases(include_primary)
+
     def explain_plan(
         self, schema: Optional[pa.Schema] = None, verbose: bool = False
     ) -> str:
@@ -7189,6 +7237,7 @@ def write_dataset(
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
     target_bases: Optional[List[str]] = None,
+    target_all_bases: Optional[bool] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
     allow_external_blob_outside_bases: bool = False,
@@ -7294,6 +7343,11 @@ def write_dataset(
 
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the existing manifest
+    target_all_bases: bool, optional
+        Write new data files round-robin across every base registered in the
+        manifest. When True (include primary), the dataset's primary storage
+        participates in the rotation as the first slot; when False, only the
+        registered bases are used. Cannot be combined with ``target_bases``.
     base_store_params : dict of str to dict, optional
         Runtime-only object store parameters keyed by base path URI. Each key
         is a base path URI (e.g., "s3://bucket/path") and each value is a dict
@@ -7444,6 +7498,7 @@ def write_dataset(
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,
+        "target_all_bases": target_all_bases,
         "base_store_params": base_store_params,
         "external_blob_mode": external_blob_mode,
         "allow_external_blob_outside_bases": allow_external_blob_outside_bases,
