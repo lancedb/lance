@@ -3,6 +3,7 @@
 
 use super::InvertedPartition;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:
@@ -10,6 +11,16 @@ use std::collections::HashMap;
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
+}
+
+impl<T: Scorer + ?Sized> Scorer for Arc<T> {
+    fn query_weight(&self, token: &str) -> f32 {
+        self.as_ref().query_weight(token)
+    }
+
+    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+        self.as_ref().doc_weight(freq, doc_tokens)
+    }
 }
 
 // BM25 parameters
