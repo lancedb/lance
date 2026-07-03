@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases};
+use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases_with_primary};
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
@@ -215,17 +215,24 @@ impl<'a> FragmentCreateBuilder<'a> {
         let existing_base_paths = existing_dataset
             .as_ref()
             .map(|dataset| &dataset.manifest.base_paths);
-        let target_bases_info = if needs_existing_dataset {
-            validate_and_resolve_target_bases(&mut params, existing_base_paths).await?
-        } else {
-            None
-        };
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
+        let target_bases_info = if needs_existing_dataset {
+            validate_and_resolve_target_bases_with_primary(
+                &mut params,
+                existing_base_paths,
+                &object_store,
+                &base_path,
+                self.dataset_uri,
+            )
+            .await?
+        } else {
+            None
+        };
         do_write_fragments(
             existing_dataset.as_ref(),
             object_store,

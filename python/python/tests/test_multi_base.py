@@ -1534,3 +1534,22 @@ class TestMergeInsertMultiBase:
                 .target_bases(["nonexistent"])
                 .execute(new_data)
             )
+
+    def test_merge_insert_target_primary_via_uri(self):
+        """The dataset URI in target_bases selects primary storage."""
+        dataset = self.create_dataset()
+
+        new_data = pd.DataFrame({"id": [200], "value": ["inserted_200"]})
+        (
+            dataset.merge_insert("id")
+            .when_not_matched_insert_all()
+            .target_bases([dataset.uri, "base2"])
+            .execute(new_data)
+        )
+        assert dataset.count_rows() == 101
+
+        # The single new file lands in the first slot: primary storage.
+        for fragment in dataset.get_fragments():
+            if fragment.fragment_id > 1:
+                for data_file in fragment.data_files():
+                    assert self.base_name_of(dataset, data_file) is None

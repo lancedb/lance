@@ -542,8 +542,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         Each entry references a base path registered in the dataset manifest,
         by name or by path URI, like the ``target_bases`` parameter of
-        :func:`~lance.write_dataset`. New data files are distributed across
-        the target bases round-robin. Data files that patch existing fragments
+        :func:`~lance.write_dataset`. An entry equal to the dataset's URI
+        includes the dataset's primary storage in the rotation, e.g.
+        ``[ds.uri, "base1", "base2"]`` spreads new data files across primary
+        storage and both bases. New data files are distributed across the
+        target bases round-robin. Data files that patch existing fragments
         and deletion files are always written to the dataset's primary
         storage.
 

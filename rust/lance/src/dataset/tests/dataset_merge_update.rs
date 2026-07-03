@@ -4033,3 +4033,93 @@ async fn test_merge_insert_target_bases_validation() {
         err
     );
 }
+
+/// Base id 0 and the dataset URI include primary storage in the merge insert
+/// target rotation.
+#[tokio::test]
+async fn test_merge_insert_target_bases_include_primary() {
+    let fixture = multi_base_fixture(false).await;
+    let dataset = Arc::new(fixture.dataset);
+    let primary_uri = dataset.uri().to_string();
+
+    // Single new file: the first slot (primary) receives it.
+    let source = multi_base_batch(&[1, 10], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![0, 2])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let new_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .filter(|f| f.metadata.id >= 3)
+        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .collect();
+    assert_eq!(new_files, vec![None]);
+
+    // Flipped order: the first slot is base 2.
+    let max_id = dataset.manifest.max_fragment_id().unwrap();
+    let source = multi_base_batch(&[11], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![2, 0])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let new_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .filter(|f| f.metadata.id > max_id)
+        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .collect();
+    assert_eq!(new_files, vec![Some(2)]);
+
+    // Names variant: the dataset's URI selects primary storage.
+    let max_id = dataset.manifest.max_fragment_id().unwrap();
+    let source = multi_base_batch(&[12], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_base_names_or_paths(vec![primary_uri])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, _) = job.execute(reader_to_stream(reader)).await.unwrap();
+    let new_files: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .filter(|f| f.metadata.id > max_id)
+        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .collect();
+    assert_eq!(new_files, vec![None]);
+
+    let mut expected = vec![];
+    for id in [0, 2, 3, 4, 5, 6, 7, 8] {
+        expected.push(expected_row(id, 100, "orig"));
+    }
+    for id in [1, 10, 11, 12] {
+        expected.push(expected_row(id, 1000, "new"));
+    }
+    expected.sort_unstable();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+
+    let dataset = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+}

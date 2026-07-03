@@ -44,8 +44,8 @@ use inserted_rows::KeyExistenceFilter;
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{
-    CommitBuilder, TargetBaseInfo, WriteMode, WriteParams, validate_and_resolve_target_bases,
-    write_fragments_internal,
+    CommitBuilder, TargetBaseInfo, WriteMode, WriteParams,
+    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
@@ -583,9 +583,11 @@ impl MergeInsertBuilder {
     ///
     /// New data files are distributed across the target bases round-robin,
     /// the same way a normal write with [`WriteParams::target_bases`] routes
-    /// them. The IDs must be registered in the dataset manifest. Data files
-    /// that patch existing fragments and deletion files are always written to
-    /// the dataset's primary storage.
+    /// them. The IDs must be registered in the dataset manifest, or
+    /// [`super::PRIMARY_BASE_ID`] (0) to include the dataset's primary
+    /// storage in the rotation (e.g. `vec![0, 1, 2]` spreads across primary
+    /// plus bases 1 and 2). Data files that patch existing fragments and
+    /// deletion files are always written to the dataset's primary storage.
     ///
     /// Cannot be combined with [`Self::target_base_names_or_paths`].
     pub fn target_bases(&mut self, base_ids: Vec<u32>) -> &mut Self {
@@ -596,7 +598,8 @@ impl MergeInsertBuilder {
     /// Like [`Self::target_bases`], but referencing bases by name or path URI.
     ///
     /// References are resolved against the base paths registered in the
-    /// dataset manifest when the merge insert executes.
+    /// dataset manifest when the merge insert executes. An entry equal to the
+    /// dataset's URI includes the dataset's primary storage in the rotation.
     ///
     /// Cannot be combined with [`Self::target_bases`].
     pub fn target_base_names_or_paths(&mut self, refs: Vec<String>) -> &mut Self {
@@ -628,6 +631,8 @@ impl MergeInsertBuilder {
 
 /// Resolve the merge insert target bases against the base paths registered in
 /// the dataset manifest. Returns `None` when no target bases were requested.
+/// Base id [`super::PRIMARY_BASE_ID`] and the dataset's URI refer to the
+/// dataset's primary storage.
 ///
 /// Resolution runs once per execution attempt so retries validate against the
 /// manifest version they are writing to.
@@ -649,7 +654,14 @@ async fn resolve_target_bases(
         base_store_params: dataset.base_store_params.as_deref().cloned(),
         ..Default::default()
     };
-    validate_and_resolve_target_bases(&mut write_params, Some(&dataset.manifest.base_paths)).await
+    validate_and_resolve_target_bases_with_primary(
+        &mut write_params,
+        Some(&dataset.manifest.base_paths),
+        &dataset.object_store,
+        &dataset.base,
+        dataset.uri(),
+    )
+    .await
 }
 
 enum SchemaComparison {

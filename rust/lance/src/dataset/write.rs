@@ -383,11 +383,14 @@ pub struct WriteParams {
     /// The IDs must correspond to either:
     /// - IDs in initial_bases (for CREATE/OVERWRITE modes)
     /// - IDs already registered in the existing dataset manifest (for APPEND mode)
+    /// - [`PRIMARY_BASE_ID`] (0), which targets the dataset's primary storage
+    ///   and participates in the round-robin like any other entry
     pub target_bases: Option<Vec<u32>>,
 
     /// Target base names or paths as strings (unresolved).
     /// These will be resolved to IDs when the write operation executes.
     /// Resolution happens at builder execution time when dataset context is available.
+    /// An entry equal to the dataset's URI targets the dataset's primary storage.
     pub target_base_names_or_paths: Option<Vec<String>>,
 
     /// Allow writing external blob URIs that cannot be mapped to any registered
@@ -917,6 +920,97 @@ pub async fn validate_and_resolve_target_bases(
     } else {
         Ok(None)
     }
+}
+
+/// Like [`validate_and_resolve_target_bases`], but also resolves references to
+/// the dataset's primary storage: base id [`PRIMARY_BASE_ID`] in
+/// `target_bases`, or an entry equal to `primary_uri` in
+/// `target_base_names_or_paths`. Primary slots participate in the round-robin
+/// like any other target base; files written through them carry no base id.
+pub(crate) async fn validate_and_resolve_target_bases_with_primary(
+    params: &mut WriteParams,
+    existing_base_paths: Option<&HashMap<u32, BasePath>>,
+    primary_object_store: &Arc<ObjectStore>,
+    primary_base_dir: &Path,
+    primary_uri: &str,
+) -> Result<Option<Vec<TargetBaseInfo>>> {
+    let has_primary_ids = params
+        .target_bases
+        .as_ref()
+        .is_some_and(|ids| ids.contains(&PRIMARY_BASE_ID));
+    let has_primary_refs = params
+        .target_base_names_or_paths
+        .as_ref()
+        .is_some_and(|refs| refs.iter().any(|r| r == primary_uri));
+    if !has_primary_ids && !has_primary_refs {
+        return validate_and_resolve_target_bases(params, existing_base_paths).await;
+    }
+
+    // The delegate below may be skipped when only primary slots remain, so
+    // validate mutual exclusion here as well.
+    if params.target_base_names_or_paths.is_some() && params.target_bases.is_some() {
+        return Err(Error::invalid_input(
+            "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
+        ));
+    }
+
+    // Strip the primary slots, resolve the remaining references through the
+    // normal path, then splice the primary slots back into their original
+    // positions so the round-robin order matches what the caller asked for.
+    let is_primary_slot: Vec<bool> = if let Some(ids) = &params.target_bases {
+        ids.iter().map(|id| *id == PRIMARY_BASE_ID).collect()
+    } else {
+        params
+            .target_base_names_or_paths
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r == primary_uri)
+            .collect()
+    };
+
+    let mut shim = params.clone();
+    if let Some(ids) = &params.target_bases {
+        let rest: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| *id != PRIMARY_BASE_ID)
+            .collect();
+        shim.target_bases = if rest.is_empty() { None } else { Some(rest) };
+    } else {
+        let rest: Vec<String> = params
+            .target_base_names_or_paths
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|r| *r != primary_uri)
+            .cloned()
+            .collect();
+        shim.target_base_names_or_paths = if rest.is_empty() { None } else { Some(rest) };
+    }
+
+    let resolved_rest = validate_and_resolve_target_bases(&mut shim, existing_base_paths).await?;
+    // The delegate assigns ids to initial_bases in place; propagate that side
+    // effect back so CREATE-mode transactions register properly assigned ids.
+    params.initial_bases = shim.initial_bases;
+
+    let mut rest_iter = resolved_rest.unwrap_or_default().into_iter();
+    let mut bases_info = Vec::with_capacity(is_primary_slot.len());
+    for is_primary in is_primary_slot {
+        if is_primary {
+            bases_info.push(TargetBaseInfo {
+                base_id: PRIMARY_BASE_ID,
+                object_store: primary_object_store.clone(),
+                base_dir: primary_base_dir.clone(),
+                is_dataset_root: true,
+            });
+        } else {
+            bases_info.push(rest_iter.next().ok_or_else(|| {
+                Error::internal("target base resolution returned fewer bases than requested")
+            })?);
+        }
+    }
+    Ok(Some(bases_info))
 }
 
 fn append_external_base_candidate(
@@ -1449,10 +1543,18 @@ async fn open_writer_with_options(
     Ok(writer)
 }
 
+/// Reserved base id that refers to the dataset's primary storage in
+/// [`WriteParams::target_bases`]. Real base ids are assigned starting from 1,
+/// so 0 is never a registered base. Files written through a primary slot
+/// carry no base id, exactly like a write without target bases.
+pub const PRIMARY_BASE_ID: u32 = 0;
+
 /// Information about a target base for writing.
 /// Contains the base ID, object store, directory path, and whether it's a dataset root.
 #[derive(Clone)]
 pub struct TargetBaseInfo {
+    /// The registered base id, or [`PRIMARY_BASE_ID`] for the dataset's
+    /// primary storage.
     pub base_id: u32,
     pub object_store: Arc<ObjectStore>,
     /// The base directory path (without /data subdirectory)
@@ -1536,7 +1638,9 @@ impl WriterGenerator {
                 self.storage_version,
                 WriterOptions {
                     add_data_dir: base_info.is_dataset_root,
-                    base_id: Some(base_info.base_id),
+                    // Primary-storage slots stamp no base id, like a write
+                    // without target bases.
+                    base_id: (base_info.base_id != PRIMARY_BASE_ID).then_some(base_info.base_id),
                     external_base_resolver: self.external_base_resolver.clone(),
                     allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
                     external_blob_mode: self.external_blob_mode,
@@ -4005,5 +4109,105 @@ mod tests {
             "Data files routed to the target base should be cleaned up on failure"
         );
         assert_eq!(count_data_files(primary_dir.as_str()), 0);
+    }
+
+    /// PRIMARY_BASE_ID (0) and the dataset URI include primary storage in the
+    /// target rotation, alongside registered bases.
+    #[tokio::test]
+    async fn test_multi_base_target_primary_and_bases() {
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let test_uri = "memory://primary_slot_test";
+        let primary_uri = format!("{}/primary", test_uri);
+        let base1_uri = format!("{}/base1", test_uri);
+        let base2_uri = format!("{}/base2", test_uri);
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+
+        // CREATE mode targeting primary + a new base: also verifies the id
+        // assignment on initial_bases reaches the committed manifest.
+        let dataset = Dataset::write(
+            data_gen.batch(6),
+            &primary_uri,
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                max_rows_per_file: 3,
+                initial_bases: Some(vec![
+                    BasePath {
+                        id: 1,
+                        name: Some("base1".to_string()),
+                        is_dataset_root: true,
+                        path: base1_uri.clone(),
+                    },
+                    BasePath {
+                        id: 2,
+                        name: Some("base2".to_string()),
+                        is_dataset_root: false,
+                        path: base2_uri.clone(),
+                    },
+                ]),
+                target_bases: Some(vec![PRIMARY_BASE_ID, 1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.manifest.base_paths.len(), 2);
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1)]);
+
+        // APPEND across primary + both bases, one file per slot in order.
+        let mut data_gen2 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen2.batch(9),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                target_bases: Some(vec![PRIMARY_BASE_ID, 1, 2]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(2)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+
+        // Names variant: the dataset's own URI selects primary storage.
+        let mut data_gen3 =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen3.batch(6),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                target_base_names_or_paths: Some(vec![primary_uri.clone(), "base2".to_string()]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let file_bases: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .skip(5)
+            .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+            .collect();
+        assert_eq!(file_bases, vec![None, Some(2)]);
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 21);
     }
 }
