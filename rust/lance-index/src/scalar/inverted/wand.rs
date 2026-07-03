@@ -50,10 +50,11 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
         .unwrap_or(10)
 });
 // Bulk MAXSCORE path for top-k disjunctions (Lucene MaxScoreBulkScorer
-// style). Off by default while it bakes; LANCE_FTS_MAXSCORE=1 opts in. Its
-// results are score-identical to the classic WAND loop.
+// style). Default on: with right-sized partitions it wins by a wide margin
+// (Lucene-parity latency) and its results are score-identical to the classic
+// WAND loop. LANCE_FTS_MAXSCORE=0 opts back into the classic loop.
 static USE_MAXSCORE_SEARCH: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() == Ok("1"));
+    LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() != Ok("0"));
 
 #[inline]
 fn posting_block_idx(index: usize, block_size: usize) -> usize {
