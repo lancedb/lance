@@ -26,6 +26,7 @@ use crate::scalar::registry::{
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -58,6 +59,11 @@ const TOKENS_COL: &str = "tokens";
 const POSTING_LIST_COL: &str = "posting_list";
 const POSTINGS_FILENAME: &str = "ngram_postings.lance";
 const NGRAM_INDEX_VERSION: u32 = 0;
+
+/// An i32-offset Binary array can hold at most i32::MAX bytes of values in total,
+/// so a spill state whose serialized posting lists exceed that must be written as
+/// multiple record batches (same approach as the bitmap index).  Leave headroom.
+const MAX_POSTING_LIST_BATCH_BYTES: usize = i32::MAX as usize - 1024 * 1024;
 
 use std::sync::LazyLock;
 
@@ -332,40 +338,29 @@ impl NGramIndex {
         })
     }
 
-    fn remap_batch(&self, batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {
-        let posting_lists_array = batch
-            .column_by_name(POSTING_LIST_COL)
-            .expect_ok()?
-            .as_binary::<i32>();
-
-        let new_posting_lists = posting_lists_array
-            .iter()
+    // Remapping can grow the serialized posting lists, so the result is re-chunked
+    // into byte-bounded batches rather than mirroring the input batch.
+    fn remap_batch(&self, batch: RecordBatch, mapping: &RowAddrRemap) -> Result<Vec<RecordBatch>> {
+        let state = NGramIndexSpillState::try_from_batch(batch)?;
+        let bitmaps = state
+            .bitmaps
+            .into_iter()
             .map(|posting_list| {
-                let posting_list = posting_list.unwrap();
-                let posting_list = RoaringTreemap::deserialize_from(posting_list)?;
-                let new_posting_list =
-                    RoaringTreemap::from_iter(posting_list.into_iter().filter_map(|row_id| {
-                        match mapping.get(row_id) {
-                            Some(Some(new_row_id)) => Some(new_row_id),
-                            Some(None) => None,
-                            None => Some(row_id),
-                        }
-                    }));
-                let mut buf = Vec::with_capacity(new_posting_list.serialized_size());
-                new_posting_list.serialize_into(&mut buf)?;
-                Ok(buf)
+                RoaringTreemap::from_iter(posting_list.into_iter().filter_map(|row_id| {
+                    match mapping.get(row_id) {
+                        Some(Some(new_row_id)) => Some(new_row_id),
+                        Some(None) => None,
+                        None => Some(row_id),
+                    }
+                }))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
-        let new_posting_lists_array = BinaryArray::from_iter_values(new_posting_lists);
-
-        Ok(RecordBatch::try_new(
-            POSTINGS_SCHEMA.clone(),
-            vec![
-                batch.column_by_name(TOKENS_COL).expect_ok()?.clone(),
-                Arc::new(new_posting_lists_array),
-            ],
-        )?)
+        NGramIndexSpillState {
+            tokens: state.tokens,
+            bitmaps,
+        }
+        .try_into_batches()
     }
 
     async fn load(
@@ -533,8 +528,9 @@ impl ScalarIndex for NGramIndex {
         while offset < num_rows {
             let batch_size = BATCH_SIZE.min(num_rows - offset);
             let batch = reader.read_range(offset..offset + batch_size, None).await?;
-            let batch = self.remap_batch(batch, mapping)?;
-            writer.write_record_batch(batch).await?;
+            for batch in self.remap_batch(batch, mapping)? {
+                writer.write_record_batch(batch).await?;
+            }
             offset += BATCH_SIZE;
         }
 
@@ -649,16 +645,63 @@ impl NGramIndexSpillState {
         Ok(Self { tokens, bitmaps })
     }
 
-    fn try_into_batch(self) -> Result<RecordBatch> {
-        let bitmap_array = BinaryArray::from_iter_values(self.bitmaps.into_iter().map(|bitmap| {
-            let mut buf = Vec::with_capacity(bitmap.serialized_size());
-            bitmap.serialize_into(&mut buf).unwrap();
-            buf
-        }));
-        Ok(RecordBatch::try_new(
-            POSTINGS_SCHEMA.clone(),
-            vec![Arc::new(self.tokens), Arc::new(bitmap_array)],
-        )?)
+    fn try_into_batches(self) -> Result<Vec<RecordBatch>> {
+        self.try_into_batches_impl(MAX_POSTING_LIST_BATCH_BYTES)
+    }
+
+    // Split into multiple batches so that the cumulative serialized posting bytes
+    // of each batch stay under `max_batch_bytes`, avoiding i32 offset overflow in
+    // the Binary posting array.  Postings are serialized straight into each batch's
+    // values buffer to avoid a second contiguous copy of multi-GiB payloads.
+    fn try_into_batches_impl(self, max_batch_bytes: usize) -> Result<Vec<RecordBatch>> {
+        debug_assert_eq!(self.tokens.len(), self.bitmaps.len());
+        debug_assert!(max_batch_bytes <= i32::MAX as usize);
+        let make_batch =
+            |tokens: UInt32Array, values: Vec<u8>, offsets: Vec<i32>| -> Result<RecordBatch> {
+                let posting_array = BinaryArray::new(
+                    OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                    Buffer::from_vec(values),
+                    None,
+                );
+                Ok(RecordBatch::try_new(
+                    POSTINGS_SCHEMA.clone(),
+                    vec![Arc::new(tokens), Arc::new(posting_array)],
+                )?)
+            };
+
+        let mut batches = Vec::new();
+        let mut values: Vec<u8> = Vec::new();
+        let mut offsets: Vec<i32> = vec![0];
+        let mut batch_start = 0;
+        for (idx, bitmap) in self.bitmaps.into_iter().enumerate() {
+            let posting_size = bitmap.serialized_size();
+            if posting_size > max_batch_bytes {
+                return Err(Error::invalid_input(format!(
+                    "posting list for ngram token {} serializes to {} bytes, which exceeds the {} bytes that fit in a single binary array",
+                    self.tokens.value(idx),
+                    posting_size,
+                    max_batch_bytes,
+                )));
+            }
+            if values.len() + posting_size > max_batch_bytes {
+                batches.push(make_batch(
+                    self.tokens.slice(batch_start, idx - batch_start),
+                    std::mem::take(&mut values),
+                    std::mem::replace(&mut offsets, vec![0]),
+                )?);
+                batch_start = idx;
+            }
+            bitmap.serialize_into(&mut values)?;
+            offsets.push(values.len() as i32);
+        }
+        if offsets.len() > 1 || batches.is_empty() {
+            batches.push(make_batch(
+                self.tokens.slice(batch_start, offsets.len() - 1),
+                values,
+                offsets,
+            )?);
+        }
+        Ok(batches)
     }
 }
 
@@ -957,9 +1000,16 @@ impl NGramIndexBuilder {
         mut writer: Box<dyn IndexWriter>,
         state: NGramIndexSpillState,
     ) -> Result<()> {
-        writer.write_record_batch(state.try_into_batch()?).await?;
+        Self::write_state(writer.as_mut(), state).await?;
         writer.finish().await?;
 
+        Ok(())
+    }
+
+    async fn write_state(writer: &mut dyn IndexWriter, state: NGramIndexSpillState) -> Result<()> {
+        for batch in state.try_into_batches()? {
+            writer.write_record_batch(batch).await?;
+        }
         Ok(())
     }
 
@@ -1089,21 +1139,21 @@ impl NGramIndexBuilder {
             if left_state.is_none() {
                 // Left is done, full drain right
                 let state = right_state.take().expect_ok()?;
-                writer.write_record_batch(state.try_into_batch()?).await?;
+                Self::write_state(writer, state).await?;
                 while let Some(state) = right_stream.try_next().await? {
-                    writer.write_record_batch(state.try_into_batch()?).await?;
+                    Self::write_state(writer, state).await?;
                 }
             } else if right_state.is_none() {
                 // Right is done, full drain left
                 let state = left_state.take().expect_ok()?;
-                writer.write_record_batch(state.try_into_batch()?).await?;
+                Self::write_state(writer, state).await?;
                 while let Some(state) = left_stream.try_next().await? {
-                    writer.write_record_batch(state.try_into_batch()?).await?;
+                    Self::write_state(writer, state).await?;
                 }
             } else {
                 // There is a batch from both left and right.  Need to merge them
                 let merged = Self::merge_spill_states(&mut left_state, &mut right_state);
-                writer.write_record_batch(merged.try_into_batch()?).await?;
+                Self::write_state(writer, merged).await?;
                 if left_state.is_none() {
                     left_state = left_stream.try_next().await?;
                 }
@@ -1370,8 +1420,9 @@ mod tests {
         sync::Arc,
     };
 
-    use arrow::datatypes::UInt64Type;
-    use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+    use arrow::array::AsArray;
+    use arrow::datatypes::{UInt32Type, UInt64Type};
+    use arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
@@ -1384,6 +1435,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
     use lance_tokenizer::TextAnalyzer;
+    use roaring::RoaringTreemap;
 
     use crate::scalar::{
         ScalarIndex, SearchResult, TextQuery,
@@ -1392,7 +1444,7 @@ mod tests {
     };
     use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
 
-    use super::{NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
+    use super::{NGRAM_TOKENIZER, NGramIndexSpillState, ngram_to_token, tokenize_visitor};
 
     fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
         let mut tokens = Vec::with_capacity(text.len() * 3);
@@ -1936,5 +1988,90 @@ mod tests {
         let (index, _tmpdir) = do_train(builder, data).await;
 
         assert_eq!(index.tokens.len(), 29012);
+    }
+
+    #[test]
+    fn test_spill_state_chunks_by_byte_size() {
+        let bitmaps = (0..8u64)
+            .map(|i| RoaringTreemap::from_iter(0..(i + 1) * 100))
+            .collect::<Vec<_>>();
+        let tokens = UInt32Array::from_iter_values(0..8);
+        let state = NGramIndexSpillState {
+            tokens: tokens.clone(),
+            bitmaps: bitmaps.clone(),
+        };
+
+        // Small enough that several splits are required, large enough that some
+        // batches hold more than one posting
+        let max_batch_bytes = bitmaps.iter().map(|b| b.serialized_size()).max().unwrap() * 2;
+        let batches = state.try_into_batches_impl(max_batch_bytes).unwrap();
+        assert!(batches.len() > 1);
+
+        // Token order and posting contents survive the chunking
+        let mut row = 0;
+        for batch in &batches {
+            let batch_tokens = batch["tokens"].as_primitive::<UInt32Type>();
+            let batch_postings = batch["posting_list"].as_binary::<i32>();
+            let mut batch_bytes = 0;
+            for i in 0..batch.num_rows() {
+                assert_eq!(batch_tokens.value(i), tokens.value(row));
+                let posting = batch_postings.value(i);
+                batch_bytes += posting.len();
+                assert_eq!(
+                    RoaringTreemap::deserialize_from(posting).unwrap(),
+                    bitmaps[row]
+                );
+                row += 1;
+            }
+            assert!(batch_bytes <= max_batch_bytes || batch.num_rows() == 1);
+        }
+        assert_eq!(row, 8);
+    }
+
+    #[test]
+    fn test_spill_state_rejects_oversized_posting() {
+        let bitmap = RoaringTreemap::from_iter(0..1000u64);
+        let too_small = bitmap.serialized_size() - 1;
+        let state = NGramIndexSpillState {
+            tokens: UInt32Array::from_iter_values([42]),
+            bitmaps: vec![bitmap],
+        };
+        let err = state.try_into_batches_impl(too_small).unwrap_err();
+        assert!(err.to_string().contains("token 42"), "{}", err);
+    }
+
+    #[test]
+    fn test_empty_spill_state_yields_one_empty_batch() {
+        let state = NGramIndexSpillState {
+            tokens: UInt32Array::from_iter_values([]),
+            bitmaps: vec![],
+        };
+        let batches = state.try_into_batches().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 0);
+    }
+
+    // Reproduces https://linear.app/lancedb/issue/ENT-874: serialized posting lists
+    // totalling more than i32::MAX bytes used to panic with "byte array offset
+    // overflow" when packed into a single Binary array.
+    #[test]
+    #[ignore = "needs ~8 GiB of RAM and a couple of minutes; run manually"]
+    fn test_spill_state_over_i32_max_bytes() {
+        // Every 16th value keeps each container an array container (4096 entries,
+        // 2 bytes per value, immune to run compression), so the treemap serializes
+        // to ~450 MiB.  Six copies exceed i32::MAX total bytes.
+        let bitmap = RoaringTreemap::from_sorted_iter((0..225_000_000u64).map(|v| v * 16)).unwrap();
+        assert!(bitmap.serialized_size() > 400 * 1024 * 1024);
+        let bitmaps = vec![bitmap; 6];
+        let tokens = UInt32Array::from_iter_values(0..6);
+        let state = NGramIndexSpillState { tokens, bitmaps };
+
+        let batches = state.try_into_batches().unwrap();
+        assert!(batches.len() > 1);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 6);
+        for batch in &batches {
+            let postings = batch["posting_list"].as_binary::<i32>();
+            assert!(postings.value_data().len() <= i32::MAX as usize);
+        }
     }
 }
