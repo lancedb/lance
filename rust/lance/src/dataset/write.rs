@@ -25,12 +25,15 @@ use lance_file::previous::writer::{
 };
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{self as current_writer, FileWriterOptions};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
+};
 use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -287,8 +290,16 @@ pub struct WriteParams {
     /// Write mode
     pub mode: WriteMode,
 
+    /// Default object store params for the write.
+    ///
+    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// apply only to the registered base path with that id, overriding the
+    /// unscoped options that every base inherits.
     pub store_params: Option<ObjectStoreParams>,
 
+    /// Exact object store params per base path URI, taking precedence over
+    /// `base_<id>.<key>` storage options in [`Self::store_params`]. See
+    /// [`Self::with_base_store_params`].
     pub base_store_params: Option<HashMap<String, ObjectStoreParams>>,
 
     pub progress: Arc<dyn WriteFragmentProgress>,
@@ -445,8 +456,10 @@ impl WriteParams {
 
     /// Set exact runtime object store params for a registered base path.
     ///
-    /// These params are used as-is for that base. The write-level default
-    /// `store_params` remain the fallback for bases without an explicit binding.
+    /// These params are used as-is for that base, taking precedence over
+    /// `base_<id>.<key>` storage options in `store_params`. The write-level
+    /// default `store_params` remain the fallback for bases without an
+    /// explicit binding.
     pub fn with_base_store_params(
         mut self,
         base_path: impl AsRef<str>,
@@ -798,6 +811,7 @@ pub async fn validate_and_resolve_target_bases(
             all_bases.insert(base_path.id, base_path.clone());
         }
     }
+    log_unregistered_base_scoped_options(params.store_params.as_ref(), &all_bases);
 
     // Step 3: Resolve target_base_names_or_paths to IDs
     let target_base_ids = if let Some(ref names_or_paths) = params.target_base_names_or_paths {
@@ -843,7 +857,7 @@ pub async fn validate_and_resolve_target_bases(
                 ))
             })?;
 
-            let store_params = write_store_params_for_base(params, &base_path.path);
+            let store_params = write_store_params_for_base(params, base_path);
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
@@ -886,22 +900,49 @@ fn append_external_base_candidate(
     }
 }
 
-fn write_store_params_for_base(params: &WriteParams, base_path: &str) -> ObjectStoreParams {
-    params
-        .base_store_params
-        .as_ref()
-        .and_then(|base_store_params| base_store_params.get(base_path))
-        .cloned()
-        .unwrap_or_else(|| params.store_params.clone().unwrap_or_default())
+/// Debug-log base-scoped storage options (`base_<id>.<key>`) whose id does not
+/// match any registered base path. Unregistered entries are ignored during
+/// resolution: options may legitimately be vended for bases that are not (yet)
+/// registered, e.g. before ids are assigned at dataset creation.
+pub(crate) fn log_unregistered_base_scoped_options(
+    store_params: Option<&ObjectStoreParams>,
+    base_paths: &HashMap<u32, BasePath>,
+) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+    let Some(options) = store_params.and_then(|params| params.storage_options()) else {
+        return;
+    };
+    let unregistered = options
+        .keys()
+        .filter_map(|key| parse_base_scoped_key(key).map(|(id, _)| id))
+        .filter(|id| !base_paths.contains_key(id))
+        .collect::<BTreeSet<_>>();
+    if !unregistered.is_empty() {
+        log::debug!(
+            "Ignoring base-scoped storage options for unregistered base path ids: {:?}",
+            unregistered
+        );
+    }
 }
 
-fn dataset_store_params_for_base(dataset: &Dataset, base_path: &str) -> ObjectStoreParams {
-    dataset
+fn write_store_params_for_base(params: &WriteParams, base_path: &BasePath) -> ObjectStoreParams {
+    // Exact per-URI bindings are used as-is. Otherwise the write-level default
+    // params are resolved for the base scope: `base_<id>.<key>` storage
+    // options overlay the shared defaults for that base.
+    if let Some(store_params) = params
         .base_store_params
         .as_ref()
-        .and_then(|base_store_params| base_store_params.get(base_path))
-        .cloned()
-        .unwrap_or_else(|| dataset.store_params.as_deref().cloned().unwrap_or_default())
+        .and_then(|base_store_params| base_store_params.get(&base_path.path))
+    {
+        return store_params.clone();
+    }
+    let default_params = params.store_params.clone().unwrap_or_default();
+    match default_params.scoped_to_base(Some(base_path.id)) {
+        Cow::Owned(scoped_params) => scoped_params,
+        Cow::Borrowed(_) => default_params,
+    }
 }
 
 async fn append_external_initial_bases(
@@ -913,7 +954,7 @@ async fn append_external_initial_bases(
 ) -> Result<()> {
     if let Some(initial_bases) = initial_bases {
         for base_path in initial_bases {
-            let store_params = write_store_params_for_base(params, &base_path.path);
+            let store_params = write_store_params_for_base(params, base_path);
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
@@ -946,7 +987,7 @@ async fn build_external_base_resolver(
 
     if let Some(dataset) = dataset {
         for base_path in dataset.manifest.base_paths.values() {
-            let store_params = dataset_store_params_for_base(dataset, &base_path.path);
+            let store_params = dataset.store_params_for_base(Some(base_path));
             let (store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
                 &base_path.path,
@@ -2103,7 +2144,28 @@ mod tests {
             .with_base_store_params("az://container/path-a", azure_store_params("account-a"))
             .with_base_store_params("az://container/path-b", azure_store_params("account-b"));
 
-        let existing_base_paths = HashMap::from([
+        let existing_base_paths = azure_base_paths_a_b();
+
+        let target_bases =
+            validate_and_resolve_target_bases(&mut params, Some(&existing_base_paths))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(target_bases.len(), 2);
+        assert_eq!(
+            target_bases[0].object_store.store_prefix,
+            "az$container@account-a"
+        );
+        assert_eq!(
+            target_bases[1].object_store.store_prefix,
+            "az$container@account-b"
+        );
+    }
+
+    #[cfg(feature = "azure")]
+    fn azure_base_paths_a_b() -> HashMap<u32, BasePath> {
+        HashMap::from([
             (
                 1,
                 BasePath::new(
@@ -2122,7 +2184,32 @@ mod tests {
                     false,
                 ),
             ),
-        ]);
+        ])
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_validate_and_resolve_target_bases_uses_base_scoped_storage_options() {
+        // A single flat storage options map carries per-base credentials via
+        // the `base_<id>.<key>` convention; unscoped keys are shared defaults.
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_name".to_string(), "account-shared".to_string()),
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                    ("base_1.account_name".to_string(), "account-a".to_string()),
+                    ("base_2.account_name".to_string(), "account-b".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let mut params = WriteParams {
+            store_params: Some(store_params),
+            ..Default::default()
+        }
+        .with_target_bases(vec![1, 2]);
+
+        let existing_base_paths = azure_base_paths_a_b();
 
         let target_bases =
             validate_and_resolve_target_bases(&mut params, Some(&existing_base_paths))
@@ -2138,6 +2225,43 @@ mod tests {
         assert_eq!(
             target_bases[1].object_store.store_prefix,
             "az$container@account-b"
+        );
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_base_store_params_take_precedence_over_base_scoped_options() {
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("account_key".to_string(), "dGVzdA==".to_string()),
+                    (
+                        "base_1.account_name".to_string(),
+                        "account-scoped".to_string(),
+                    ),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let mut params = WriteParams {
+            store_params: Some(store_params),
+            ..Default::default()
+        }
+        .with_target_bases(vec![1])
+        .with_base_store_params("az://container/path-a", azure_store_params("account-exact"));
+
+        let existing_base_paths = azure_base_paths_a_b();
+
+        let target_bases =
+            validate_and_resolve_target_bases(&mut params, Some(&existing_base_paths))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(target_bases.len(), 1);
+        assert_eq!(
+            target_bases[0].object_store.store_prefix,
+            "az$container@account-exact"
         );
     }
 
@@ -2536,6 +2660,80 @@ mod tests {
                 .to_string()
                 .contains("Cannot specify both target_base_names_or_paths and target_bases")
         );
+    }
+
+    #[tokio::test]
+    async fn test_multi_base_write_read_with_base_scoped_storage_options() {
+        use crate::dataset::builder::DatasetBuilder;
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+
+        let primary_dir = TempStrDir::default();
+        let base1_dir = TempStrDir::default();
+
+        // Local stores ignore these options; this verifies base-scoped entries
+        // flow through the full write/read path without breaking anything.
+        let scoped_options = HashMap::from([
+            ("shared_option".to_string(), "shared".to_string()),
+            (
+                "base_1.scoped_option".to_string(),
+                "base1-value".to_string(),
+            ),
+        ]);
+        let store_params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                scoped_options.clone(),
+            ))),
+            ..Default::default()
+        };
+
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("id".to_owned())));
+        let dataset = Dataset::write(
+            data_gen.batch(5),
+            primary_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Create,
+                store_params: Some(store_params),
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("base1".to_string()),
+                    path: base1_dir.as_str().to_string(),
+                    is_dataset_root: true,
+                }]),
+                target_bases: Some(vec![1]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 5);
+        for fragment in dataset.get_fragments() {
+            assert!(
+                fragment
+                    .metadata
+                    .files
+                    .iter()
+                    .all(|file| file.base_id == Some(1))
+            );
+        }
+
+        // Reopen with the same flat options and scan through the base store.
+        let dataset = DatasetBuilder::from_uri(primary_dir.as_str())
+            .with_storage_options(scoped_options)
+            .load()
+            .await
+            .unwrap();
+        let batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let num_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(num_rows, 5);
     }
 
     #[tokio::test]

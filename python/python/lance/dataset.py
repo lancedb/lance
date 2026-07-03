@@ -7236,6 +7236,13 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+
+        For writes involving additional base paths, a key of the form
+        ``base_<id>.<key>`` applies ``<key>`` only to the base path with that
+        id, overriding the unscoped options that every base inherits. For
+        example ``{"account_key": "shared", "base_1.account_key": "abc"}``
+        makes base 1 use ``account_key = abc`` while all other options are
+        shared.
     data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
         efficient but require newer versions of lance to read.  The default (None)
@@ -7291,8 +7298,10 @@ def write_dataset(
         Runtime-only object store parameters keyed by base path URI. Each key
         is a base path URI (e.g., "s3://bucket/path") and each value is a dict
         of storage options (credentials, endpoint, etc.) for that base. These
-        are not persisted to the manifest. When a base has no explicit entry
-        here, the top-level ``storage_options`` is used as a fallback.
+        are not persisted to the manifest. These take precedence over
+        ``base_<id>.<key>`` entries in ``storage_options``. When a base has no
+        explicit entry here, the top-level ``storage_options`` is used as a
+        fallback.
     external_blob_mode: {"reference", "ingest"}, default "reference"
         How external blob URIs are handled on write.
 

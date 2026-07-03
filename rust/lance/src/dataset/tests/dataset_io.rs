@@ -242,6 +242,62 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
 }
 
 #[tokio::test]
+async fn test_store_params_for_base_resolves_base_scoped_options() {
+    let test_dir = TempStdDir::default();
+    create_file(&test_dir, WriteMode::Create, LanceFileVersion::Stable).await;
+    let uri = test_dir.to_str().unwrap();
+    let dataset = Arc::new(Dataset::open(uri).await.unwrap());
+
+    let base_dir = tempfile::tempdir().unwrap();
+    let base_uri = file_object_store_uri(base_dir.path());
+    let base = BasePath::new(1, base_uri, Some("base".to_string()), true);
+    dataset.add_bases(vec![base.clone()], None).await.unwrap();
+
+    // Reopen with a single flat storage options map carrying base-scoped
+    // entries (`base_<id>.<key>`) next to shared defaults.
+    let dataset = DatasetBuilder::from_uri(uri)
+        .with_storage_options(HashMap::from([
+            ("shared_option".to_string(), "shared".to_string()),
+            (
+                "base_1.scoped_option".to_string(),
+                "base1-value".to_string(),
+            ),
+        ]))
+        .load()
+        .await
+        .unwrap();
+
+    // The registered base resolves the scoped entry on top of shared defaults.
+    let base_path = dataset.manifest.base_paths.get(&1).unwrap().clone();
+    let params = dataset.store_params_for_base(Some(&base_path));
+    assert_eq!(
+        params.storage_options().unwrap(),
+        &HashMap::from([
+            ("shared_option".to_string(), "shared".to_string()),
+            ("scoped_option".to_string(), "base1-value".to_string()),
+        ])
+    );
+
+    // The default scope keeps only the shared defaults.
+    let params = dataset.store_params_for_base(None);
+    assert_eq!(
+        params.storage_options().unwrap(),
+        &HashMap::from([("shared_option".to_string(), "shared".to_string())])
+    );
+
+    // The base store resolved from scoped options is usable end to end.
+    let base_store = dataset.object_store(Some(1)).await.unwrap();
+    let probe = base
+        .extract_path(dataset.session().store_registry())
+        .unwrap()
+        .join("data")
+        .join("probe.lance");
+    base_store.put(&probe, b"hello").await.unwrap();
+    let read = base_store.inner.get_range(&probe, 0..5).await.unwrap();
+    assert_eq!(read.as_ref(), b"hello");
+}
+
+#[tokio::test]
 async fn test_with_object_store_wrappers_wraps_refs_store() {
     let test_dir = tempfile::tempdir().unwrap();
     let uri = file_object_store_uri(test_dir.path());

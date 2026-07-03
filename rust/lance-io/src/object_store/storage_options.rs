@@ -155,6 +155,99 @@ impl StorageOptionsProvider for LanceNamespaceStorageOptionsProvider {
     }
 }
 
+/// Prefix marking a storage option as scoped to a single registered base path.
+///
+/// A key of the form `base_<id>.<key>` applies `<key>` only to the base path
+/// with manifest id `<id>`, overriding the shared (unscoped) options for that
+/// base. For example `base_1.account_key = abc` gives the base with id 1 the
+/// option `account_key = abc` while it inherits every unscoped option.
+pub const BASE_SCOPED_OPTION_PREFIX: &str = "base_";
+
+/// Parse a base-scoped storage option key of the form `base_<id>.<key>`.
+///
+/// Returns `Some((base_id, key))` only for keys that match the convention
+/// exactly: the `base_` prefix, an all-digit u32 base id, a `.` separator, and
+/// a non-empty remainder. Any other key (e.g. `base_url`, `base_x.key`,
+/// `base_1.`) is not base-scoped.
+pub fn parse_base_scoped_key(key: &str) -> Option<(u32, &str)> {
+    let rest = key.strip_prefix(BASE_SCOPED_OPTION_PREFIX)?;
+    let (id_str, scoped_key) = rest.split_once('.')?;
+    if scoped_key.is_empty() || id_str.is_empty() || !id_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let id = id_str.parse::<u32>().ok()?;
+    Some((id, scoped_key))
+}
+
+/// Returns true if any key in `options` is base-scoped (`base_<id>.<key>`).
+pub fn has_base_scoped_options(options: &HashMap<String, String>) -> bool {
+    options
+        .keys()
+        .any(|key| parse_base_scoped_key(key).is_some())
+}
+
+/// Resolve the effective storage options for one base path scope.
+///
+/// All base-scoped keys are removed from the result. When `base_id` is
+/// `Some(id)`, entries scoped to that id are overlaid on the unscoped options,
+/// adding or overriding keys. `None` resolves the default scope (the primary
+/// dataset base), which simply drops every base-scoped entry.
+pub fn resolve_base_scoped_options(
+    options: &HashMap<String, String>,
+    base_id: Option<u32>,
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::with_capacity(options.len());
+    let mut overrides = Vec::new();
+    for (key, value) in options {
+        match parse_base_scoped_key(key) {
+            Some((id, scoped_key)) => {
+                if Some(id) == base_id {
+                    overrides.push((scoped_key.to_string(), value.clone()));
+                }
+            }
+            None => {
+                resolved.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    resolved.extend(overrides);
+    resolved
+}
+
+/// A [`StorageOptionsProvider`] that resolves another accessor's options for a
+/// single base path scope.
+///
+/// Fetching through this provider first refreshes the parent accessor when its
+/// options have expired, then resolves the refreshed options for the scope. As
+/// a result, dynamically vended per-base credentials (e.g. a namespace server
+/// returning `base_<id>.<key>` entries in one flat map) stay fresh per base.
+#[derive(Debug)]
+pub struct BaseScopedStorageOptionsProvider {
+    inner: Arc<StorageOptionsAccessor>,
+    base_id: Option<u32>,
+}
+
+impl BaseScopedStorageOptionsProvider {
+    pub fn new(inner: Arc<StorageOptionsAccessor>, base_id: Option<u32>) -> Self {
+        Self { inner, base_id }
+    }
+}
+
+#[async_trait]
+impl StorageOptionsProvider for BaseScopedStorageOptionsProvider {
+    async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        let options = self.inner.get_storage_options().await?;
+        Ok(Some(resolve_base_scoped_options(&options.0, self.base_id)))
+    }
+
+    fn provider_id(&self) -> String {
+        match self.base_id {
+            Some(id) => format!("base-scoped[base_id={}]({})", id, self.inner.accessor_id()),
+            None => format!("base-scoped[default]({})", self.inner.accessor_id()),
+        }
+    }
+}
+
 /// Unified access to storage options with automatic caching and refresh
 ///
 /// This struct bundles static storage options with an optional dynamic provider,
@@ -493,6 +586,38 @@ impl StorageOptionsAccessor {
         }
     }
 
+    /// Resolve this accessor for a single base path scope.
+    ///
+    /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
+    /// apply only to one registered base path. The returned accessor resolves
+    /// options for `base_id`: entries scoped to that base overlay the unscoped
+    /// defaults, and all other scoped entries are dropped. `None` resolves the
+    /// default scope used for the primary dataset base.
+    ///
+    /// When the initial options contain no base-scoped entries this returns
+    /// `self` unchanged, preserving accessor identity (and thus object store
+    /// registry cache keys). Scoping engages based on the initial options; a
+    /// provider-only accessor without initial options is returned unchanged.
+    ///
+    /// When a dynamic provider is present, the scoped accessor wraps `self`
+    /// through [`BaseScopedStorageOptionsProvider`], so refreshed options are
+    /// re-resolved for the base on every fetch.
+    pub fn scoped_to_base(self: &Arc<Self>, base_id: Option<u32>) -> Arc<Self> {
+        let Some(initial) = self.initial_storage_options() else {
+            return self.clone();
+        };
+        if !has_base_scoped_options(initial) {
+            return self.clone();
+        }
+        let resolved = resolve_base_scoped_options(initial, base_id);
+        if self.has_provider() {
+            let provider = Arc::new(BaseScopedStorageOptionsProvider::new(self.clone(), base_id));
+            Arc::new(Self::with_initial_and_provider(resolved, provider))
+        } else {
+            Arc::new(Self::with_static_options(resolved))
+        }
+    }
+
     /// Check if this accessor has a dynamic provider
     pub fn has_provider(&self) -> bool {
         self.provider.is_some()
@@ -747,5 +872,211 @@ mod tests {
         // Should still use cached options
         accessor.get_storage_options().await.unwrap();
         assert_eq!(mock_provider.get_call_count().await, 1);
+    }
+
+    #[test]
+    fn test_parse_base_scoped_key() {
+        assert_eq!(
+            parse_base_scoped_key("base_1.account_key"),
+            Some((1, "account_key"))
+        );
+        assert_eq!(
+            parse_base_scoped_key("base_12.headers.x-ms-version"),
+            Some((12, "headers.x-ms-version"))
+        );
+        assert_eq!(parse_base_scoped_key("base_0.region"), Some((0, "region")));
+
+        // Not base-scoped keys
+        assert_eq!(parse_base_scoped_key("account_key"), None);
+        assert_eq!(parse_base_scoped_key("base_url"), None);
+        assert_eq!(parse_base_scoped_key("base_hot.account_key"), None);
+        assert_eq!(parse_base_scoped_key("base_1x.account_key"), None);
+        assert_eq!(parse_base_scoped_key("base_+1.account_key"), None);
+        assert_eq!(parse_base_scoped_key("base_.account_key"), None);
+        assert_eq!(parse_base_scoped_key("base_1."), None);
+        assert_eq!(parse_base_scoped_key("base_1"), None);
+        // Overflows u32
+        assert_eq!(parse_base_scoped_key("base_4294967296.key"), None);
+    }
+
+    #[test]
+    fn test_resolve_base_scoped_options() {
+        let options = HashMap::from([
+            ("region".to_string(), "us-east-1".to_string()),
+            ("account_key".to_string(), "shared-key".to_string()),
+            ("base_1.account_key".to_string(), "base1-key".to_string()),
+            ("base_2.account_key".to_string(), "base2-key".to_string()),
+            ("base_2.endpoint".to_string(), "http://b2".to_string()),
+        ]);
+        assert!(has_base_scoped_options(&options));
+
+        let base1 = resolve_base_scoped_options(&options, Some(1));
+        assert_eq!(
+            base1,
+            HashMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("account_key".to_string(), "base1-key".to_string()),
+            ])
+        );
+
+        let base2 = resolve_base_scoped_options(&options, Some(2));
+        assert_eq!(
+            base2,
+            HashMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("account_key".to_string(), "base2-key".to_string()),
+                ("endpoint".to_string(), "http://b2".to_string()),
+            ])
+        );
+
+        // A base without scoped entries inherits only the unscoped options
+        let base3 = resolve_base_scoped_options(&options, Some(3));
+        assert_eq!(
+            base3,
+            HashMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("account_key".to_string(), "shared-key".to_string()),
+            ])
+        );
+
+        // The default scope drops every scoped entry
+        let default = resolve_base_scoped_options(&options, None);
+        assert_eq!(default, base3);
+
+        assert!(!has_base_scoped_options(&HashMap::from([(
+            "account_key".to_string(),
+            "shared-key".to_string()
+        )])));
+    }
+
+    #[tokio::test]
+    async fn test_scoped_to_base_identity_without_scoped_keys() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+            [("account_key".to_string(), "shared-key".to_string())],
+        )));
+        assert!(Arc::ptr_eq(&accessor.scoped_to_base(Some(1)), &accessor));
+        assert!(Arc::ptr_eq(&accessor.scoped_to_base(None), &accessor));
+
+        // Provider-only accessors (no initial options) are returned unchanged
+        let provider_only = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            MockStorageOptionsProvider::new(None),
+        )));
+        assert!(Arc::ptr_eq(
+            &provider_only.scoped_to_base(Some(1)),
+            &provider_only
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_scoped_to_base_static() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+            [
+                ("account_key".to_string(), "shared-key".to_string()),
+                ("base_1.account_key".to_string(), "base1-key".to_string()),
+            ],
+        )));
+
+        let base1 = accessor.scoped_to_base(Some(1));
+        let result = base1.get_storage_options().await.unwrap();
+        assert_eq!(
+            result.0,
+            HashMap::from([("account_key".to_string(), "base1-key".to_string())])
+        );
+        assert!(!base1.has_provider());
+
+        let default = accessor.scoped_to_base(None);
+        let result = default.get_storage_options().await.unwrap();
+        assert_eq!(
+            result.0,
+            HashMap::from([("account_key".to_string(), "shared-key".to_string())])
+        );
+
+        // Scoped accessor ids are stable across derivations and distinct per scope
+        assert_eq!(
+            accessor.scoped_to_base(Some(1)).accessor_id(),
+            base1.accessor_id()
+        );
+        assert_ne!(base1.accessor_id(), default.accessor_id());
+        assert_ne!(base1.accessor_id(), accessor.accessor_id());
+    }
+
+    #[derive(Debug)]
+    struct MockBaseScopedVendingProvider {
+        call_count: Arc<RwLock<usize>>,
+        expires_in_millis: u64,
+    }
+
+    #[async_trait]
+    impl StorageOptionsProvider for MockBaseScopedVendingProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            let count = {
+                let mut c = self.call_count.write().await;
+                *c += 1;
+                *c
+            };
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            Ok(Some(HashMap::from([
+                ("account_key".to_string(), format!("SHARED_{}", count)),
+                ("base_1.account_key".to_string(), format!("BASE1_{}", count)),
+                (
+                    EXPIRES_AT_MILLIS_KEY.to_string(),
+                    (now_ms + self.expires_in_millis).to_string(),
+                ),
+            ])))
+        }
+
+        fn provider_id(&self) -> String {
+            "MockBaseScopedVendingProvider".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scoped_to_base_refreshes_through_parent() {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let now_ms = MockClock::system_time().as_millis() as u64;
+
+        let provider = Arc::new(MockBaseScopedVendingProvider {
+            call_count: Arc::new(RwLock::new(0)),
+            expires_in_millis: 600_000,
+        });
+        let initial = HashMap::from([
+            ("account_key".to_string(), "SHARED_0".to_string()),
+            ("base_1.account_key".to_string(), "BASE1_0".to_string()),
+            (
+                EXPIRES_AT_MILLIS_KEY.to_string(),
+                (now_ms + 600_000).to_string(),
+            ),
+        ]);
+        let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            initial,
+            provider.clone(),
+        ));
+
+        let base1 = parent.scoped_to_base(Some(1));
+        let default = parent.scoped_to_base(None);
+        assert!(base1.has_provider());
+
+        // Initial options are resolved per scope without fetching
+        let result = base1.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_0");
+        assert!(!result.0.contains_key("base_1.account_key"));
+        let result = default.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "SHARED_0");
+        assert_eq!(*provider.call_count.read().await, 0);
+
+        // Expire the vended options; the scoped accessor refreshes through the
+        // parent and re-resolves the refreshed options for its scope.
+        MockClock::set_system_time(Duration::from_secs(100_000 + 601));
+        let result = base1.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_1");
+        assert_eq!(*provider.call_count.read().await, 1);
+
+        // The parent refresh is shared: other scopes see it without refetching
+        let result = default.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "SHARED_1");
+        assert_eq!(*provider.call_count.read().await, 1);
     }
 }

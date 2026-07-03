@@ -82,6 +82,40 @@ class TestMultiBase:
             data.sort_values("id").reset_index(drop=True),
         )
 
+    def test_base_scoped_storage_options(self):
+        """base_<id>.<key> storage options flow through write and read."""
+        data = self.create_test_data(200)
+
+        # Local stores ignore these options; this verifies base-scoped entries
+        # are resolved per base without breaking the write or read path.
+        storage_options = {
+            "shared_option": "shared",
+            "base_1.scoped_option": "base1-value",
+        }
+
+        dataset = lance.write_dataset(
+            data,
+            self.primary_uri,
+            mode="create",
+            initial_bases=[DatasetBasePath(self.path1_uri, name="path1")],
+            target_bases=["path1"],
+            max_rows_per_file=100,
+            storage_options=storage_options,
+        )
+        assert dataset.count_rows() == 200
+
+        # Data files land in the scoped base, not the primary path
+        assert list(Path(self.path1_uri).glob("**/*.lance"))
+        assert not list((Path(self.primary_uri) / "data").glob("*.lance"))
+
+        # Reopen with the same flat options and read through the base store
+        dataset = lance.dataset(self.primary_uri, storage_options=storage_options)
+        result = dataset.to_table().to_pandas()
+        pd.testing.assert_frame_equal(
+            result.sort_values("id").reset_index(drop=True),
+            data.sort_values("id").reset_index(drop=True),
+        )
+
     def test_multi_base_append_mode(self):
         """Test appending data to a multi-base dataset."""
         # Create initial dataset
