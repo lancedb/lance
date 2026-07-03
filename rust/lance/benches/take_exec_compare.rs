@@ -32,6 +32,8 @@
 //                            rating Int32, full_content ~1KiB Utf8), 100k rows
 //                            per fragment
 
+#![allow(clippy::print_stdout)]
+
 use std::sync::Arc;
 use std::time::Instant;
 

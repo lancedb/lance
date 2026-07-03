@@ -1542,7 +1542,7 @@ enum FilteredReadInput {
     /// Take: read the projected fields for the rows produced by this plan and
     /// merge them into its batches, preserving row order, duplicates, and
     /// payload columns (the same contract as [`TakeExec`](super::TakeExec))
-    TakeRows(TakeRowsInput),
+    TakeRows(Box<TakeRowsInput>),
 }
 
 impl FilteredReadInput {
@@ -1771,12 +1771,12 @@ impl FilteredReadExec {
             options,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            input: FilteredReadInput::TakeRows(TakeRowsInput {
+            input: FilteredReadInput::TakeRows(Box::new(TakeRowsInput {
                 input,
                 key_column,
                 fields_to_take,
                 read_options,
-            }),
+            })),
             plan: Arc::new(OnceCell::new()),
             running_stream: Arc::new(AsyncMutex::new(None)),
         })
