@@ -2372,6 +2372,10 @@ impl RetryExecutor for MergeInsertJobWithIterator {
         // Update stats with the current attempt count
         data.stats.num_attempts = self.attempt_count.load(Ordering::SeqCst);
 
+        // The dataset argument is the refreshed per-attempt dataset (the same
+        // manifest execute_impl resolved against); keep a handle so conflict
+        // cleanup resolves bases added between attempts.
+        let cleanup_dataset = dataset.clone();
         let mut commit_builder =
             CommitBuilder::new(dataset).with_skip_auto_cleanup(self.job.params.skip_auto_cleanup);
         if let Some(commit_retries) = self.job.params.commit_retries {
@@ -2395,13 +2399,13 @@ impl RetryExecutor for MergeInsertJobWithIterator {
                 // whether the manifest was written, so leave the files alone.
                 if matches!(e, Error::RetryableCommitConflict { .. }) && !new_fragments.is_empty() {
                     let target_bases_info =
-                        resolve_target_bases(&self.job.dataset, &self.job.params)
+                        resolve_target_bases(&cleanup_dataset, &self.job.params)
                             .await
                             .ok()
                             .flatten();
                     cleanup_data_fragments(
-                        &self.job.dataset.object_store,
-                        &self.job.dataset.base,
+                        &cleanup_dataset.object_store,
+                        &cleanup_dataset.base,
                         target_bases_info.as_deref(),
                         &new_fragments,
                     )

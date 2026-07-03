@@ -206,6 +206,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let version = params.data_storage_version.unwrap_or_default();
         let needs_existing_dataset = params.target_base_names_or_paths.is_some()
             || params.target_bases.is_some()
+            || params.target_all_bases.is_some()
             || params.initial_bases.is_some();
         let existing_dataset = if needs_existing_dataset {
             self.existing_dataset(&params).await?
@@ -611,6 +612,51 @@ mod tests {
 
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].files[0].base_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_write_fragments_with_target_all_bases() {
+        let primary = TempStrDir::default();
+        let base1 = TempStrDir::default();
+        let base2 = TempStrDir::default();
+        let create_params = WriteParams::default().with_initial_bases(vec![
+            BasePath::new(0, base1.to_string(), Some("base1".to_string()), false),
+            BasePath::new(0, base2.to_string(), Some("base2".to_string()), false),
+        ]);
+
+        let dataset = InsertBuilder::new(primary.as_str())
+            .with_params(&create_params)
+            .execute_stream(test_data())
+            .await
+            .unwrap();
+
+        // Without primary, the first slot is the lowest registered base id.
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }
+        .with_target_all_bases(false);
+        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+            .write_params(&append_params)
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].files[0].base_id, Some(1));
+
+        // With primary included, the first slot is primary storage.
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }
+        .with_target_all_bases(true);
+        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+            .write_params(&append_params)
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].files[0].base_id, None);
     }
 
     #[rstest]
