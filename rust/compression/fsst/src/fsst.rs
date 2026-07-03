@@ -819,23 +819,30 @@ fn decompress_bulk<T: OffsetSizeTrait>(
     let symbols = decoder.symbols;
     let lens = decoder.lens;
     // SAFETY invariant shared by every `unsafe` block in this closure:
-    // - `out` was sized by the caller to be at least 8x `compressed_strs` (enforced in
-    //   `FsstDecoder::init`, which only lets the decoder run this path once that holds). Each code
-    //   advances `out_curr` by at most 8 and each consumed input byte yields at most 8 output
-    //   bytes, so `out_curr + 8 <= out.len()` holds for every write, including the final one. This
-    //   is why we can `write_unaligned` a full 8-byte word per code and advance by only the symbol
-    //   length.
+    // - `out` is sized to at least 8x `compressed_strs` (checked in `FsstDecoder::init`, which the
+    //   sole public entry point always runs before reaching this function). Each code advances
+    //   `out_curr` by `lens[code]`, which is 1..=8 for a well-formed symbol table, and each
+    //   consumed input byte yields at most 8 output bytes, so `out_curr + 8 <= out.len()` at every
+    //   8-byte write, including the final one. This is why we can `write_unaligned` a full 8-byte
+    //   word per code and advance by only the length.
+    //   NOTE: `lens` is loaded verbatim from the (untrusted) symbol table and is NOT re-validated
+    //   to be <= 8 on decode, and offsets (below) are likewise trusted. A corrupted table or
+    //   offset buffer can violate these bounds; callers must supply structures produced by
+    //   `compress` (or otherwise trusted). Hardening the decoder against corrupt input is a
+    //   separate concern, not addressed here.
     // - The only unchecked read is `read_unaligned::<u32>`, gated by `in_curr + 4 <= in_end`; the
     //   scalar paths use bounds-checked indexing. `in_end` is a caller-provided offset into
-    //   `compressed_strs`, so soundness of the u32 read relies on the offsets being well-formed
-    //   (`in_end <= compressed_strs.len()`), which holds for offsets produced by the encoder.
+    //   `compressed_strs`; the read is sound only if `in_end <= compressed_strs.len()`, which is a
+    //   trusted precondition (holds for encoder-produced offsets; not validated here).
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         // Do SIMD operation here by 4 bytes
         while in_curr + 4 <= in_end {
             let next_block;
             let mut code;
             let mut len;
-            // SAFETY: `in_curr + 4 <= in_end <= compressed_strs.len()`, so 4 bytes are readable.
+            // SAFETY: the loop guard proves `in_curr + 4 <= in_end`. Per the closure-level
+            // invariant, `in_end <= compressed_strs.len()` is a trusted precondition (not checked
+            // here), so the 4-byte read is in bounds for well-formed input.
             unsafe {
                 next_block =
                     ptr::read_unaligned(compressed_strs.as_ptr().add(in_curr) as *const u32);
@@ -1214,8 +1221,15 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
         // decoded output can be up to 8x the input. `decompress_bulk` also relies on this bound: it
         // writes a full 8-byte word per code (advancing only by the symbol length), so the output
         // buffer must be large enough that even the final write stays in bounds. Require out_buf to
-        // be at least 8x in_buf.
-        if self.decoder_switch_on && in_buf.len() * 8 > out_buf.len() {
+        // be at least 8x in_buf. `checked_mul` guards against `in_buf.len() * 8` wrapping on 32-bit
+        // targets (an input >= 512 MiB would otherwise bypass the check); treat overflow as too
+        // small.
+        if self.decoder_switch_on
+            && in_buf
+                .len()
+                .checked_mul(8)
+                .is_none_or(|needed| needed > out_buf.len())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "output buffer too small for FSST decoder",
