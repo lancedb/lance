@@ -23,6 +23,7 @@ use crate::metrics::MetricsCollector;
 use super::{
     CompressedPositionStorage,
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
+    index::PositionStreamCodec,
     query::Operator,
     scorer::{K1, idf},
 };
@@ -31,7 +32,7 @@ use super::{
     builder::ScoredDoc,
     encoding::{
         MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
-        decompress_posting_block, decompress_posting_remainder,
+        decompress_posting_block, decompress_posting_remainder, seek_packed_doc_positions,
     },
     query::FtsSearchParams,
     scorer::Scorer,
@@ -55,6 +56,12 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
 // WAND loop. LANCE_FTS_MAXSCORE=0 opts back into the classic loop.
 static USE_MAXSCORE_SEARCH: LazyLock<bool> =
     LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() != Ok("0"));
+// Bulk conjunction path for top-k AND / phrase queries: block-max window
+// skipping plus a slice-level merge over decompressed blocks, replacing the
+// per-doc `next()` leapfrog. Results are identical to the classic AND loop.
+// LANCE_FTS_BULK_AND=0 opts back into the classic loop.
+static USE_BULK_AND_SEARCH: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_FTS_BULK_AND").as_deref() != Ok("0"));
 
 #[inline]
 fn conservative_bm25_upper_bound(query_weight: f32) -> f32 {
@@ -105,6 +112,17 @@ struct CompressedState {
     position_block_idx: Option<usize>,
     position_values: Vec<u32>,
     position_offsets: Vec<usize>,
+    // Seek state for PackedDelta position blocks: the lazily-built group
+    // header index, the last unpacked group (memoized), the decoded varint
+    // tail, the block's total delta count, and the scratch the current doc's
+    // positions land in. Together these let a phrase check decode just the
+    // candidate doc's positions instead of the whole 256-doc position block.
+    position_group_offsets: Vec<usize>,
+    position_unpacked_group: Box<[u32; BLOCK_SIZE]>,
+    position_unpacked_group_idx: Option<usize>,
+    position_tail: Vec<u32>,
+    position_total_deltas: usize,
+    position_doc_scratch: Vec<u32>,
     block_max_window: BlockMaxWindow,
     // Lucene-style anchored impact score caches: one slot per level, keyed by
     // the entry the block cursor currently sits in. Each holds
@@ -123,6 +141,12 @@ impl CompressedState {
             position_block_idx: None,
             position_values: Vec::new(),
             position_offsets: Vec::new(),
+            position_group_offsets: Vec::new(),
+            position_unpacked_group: Box::new([0; BLOCK_SIZE]),
+            position_unpacked_group_idx: None,
+            position_tail: Vec::new(),
+            position_total_deltas: 0,
+            position_doc_scratch: Vec::new(),
             block_max_window: BlockMaxWindow::new(),
             level0_cache: None,
             level1_cache: None,
@@ -630,32 +654,79 @@ impl PostingIterator {
                     let block_offset = self.index & list.block_mask();
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
-                    if compressed.position_block_idx != Some(block_idx) {
-                        decode_position_stream_block(
-                            stream.block(block_idx),
-                            compressed.freqs.as_slice(),
-                            stream.codec(),
-                            &mut compressed.position_values,
-                        )
-                        .expect("shared position stream decoding should succeed");
-                        compressed.position_offsets.clear();
-                        compressed
-                            .position_offsets
-                            .reserve(compressed.freqs.len() + 1);
-                        compressed.position_offsets.push(0);
-                        let mut offset = 0usize;
-                        for &freq in &compressed.freqs {
-                            offset += freq as usize;
-                            compressed.position_offsets.push(offset);
+                    match stream.codec() {
+                        PositionStreamCodec::PackedDelta => {
+                            // Seekable layout: decode only the candidate doc's
+                            // positions. Per-block seek state resets when the
+                            // block cursor moves; the group header index and
+                            // varint tail fill in lazily as candidates touch
+                            // them.
+                            if compressed.position_block_idx != Some(block_idx) {
+                                compressed.position_group_offsets.clear();
+                                compressed.position_group_offsets.push(0);
+                                compressed.position_tail.clear();
+                                compressed.position_unpacked_group_idx = None;
+                                compressed.position_offsets.clear();
+                                compressed
+                                    .position_offsets
+                                    .reserve(compressed.freqs.len() + 1);
+                                compressed.position_offsets.push(0);
+                                let mut offset = 0usize;
+                                for &freq in &compressed.freqs {
+                                    offset += freq as usize;
+                                    compressed.position_offsets.push(offset);
+                                }
+                                compressed.position_total_deltas = offset;
+                                compressed.position_block_idx = Some(block_idx);
+                            }
+                            let delta_start = compressed.position_offsets[block_offset];
+                            let delta_end = compressed.position_offsets[block_offset + 1];
+                            seek_packed_doc_positions(
+                                stream.block(block_idx),
+                                compressed.position_total_deltas,
+                                delta_start..delta_end,
+                                &mut compressed.position_group_offsets,
+                                &mut compressed.position_unpacked_group,
+                                &mut compressed.position_unpacked_group_idx,
+                                &mut compressed.position_tail,
+                                &mut compressed.position_doc_scratch,
+                            )
+                            .expect("shared position stream doc decoding should succeed");
+                            Some(PositionCursor::new(
+                                PositionValues::Borrowed(&compressed.position_doc_scratch[..]),
+                                self.position as i32,
+                            ))
                         }
-                        compressed.position_block_idx = Some(block_idx);
+                        PositionStreamCodec::VarintDocDelta => {
+                            if compressed.position_block_idx != Some(block_idx) {
+                                compressed.position_values.clear();
+                                decode_position_stream_block(
+                                    stream.block(block_idx),
+                                    compressed.freqs.as_slice(),
+                                    stream.codec(),
+                                    &mut compressed.position_values,
+                                )
+                                .expect("shared position stream decoding should succeed");
+                                compressed.position_offsets.clear();
+                                compressed
+                                    .position_offsets
+                                    .reserve(compressed.freqs.len() + 1);
+                                compressed.position_offsets.push(0);
+                                let mut offset = 0usize;
+                                for &freq in &compressed.freqs {
+                                    offset += freq as usize;
+                                    compressed.position_offsets.push(offset);
+                                }
+                                compressed.position_block_idx = Some(block_idx);
+                            }
+                            let start = compressed.position_offsets[block_offset];
+                            let end = compressed.position_offsets[block_offset + 1];
+                            Some(PositionCursor::new(
+                                PositionValues::Borrowed(&compressed.position_values[start..end]),
+                                self.position as i32,
+                            ))
+                        }
                     }
-                    let start = compressed.position_offsets[block_offset];
-                    let end = compressed.position_offsets[block_offset + 1];
-                    Some(PositionCursor::new(
-                        PositionValues::Borrowed(&compressed.position_values[start..end]),
-                        self.position as i32,
-                    ))
                 }
             },
         }
@@ -1194,6 +1265,9 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     and_window_stats: AndWindowStats,
     and_candidates_pruned_before_return: usize,
+    // Test-only escape hatch to run the classic conjunction loop even when the
+    // bulk path is enabled process-wide.
+    bulk_and_disabled: bool,
     docs: &'a DocSet,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -1258,10 +1332,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_last_doc: None,
             and_window_stats: AndWindowStats::default(),
             and_candidates_pruned_before_return: 0,
+            bulk_and_disabled: false,
             docs,
             scorer,
             shared_threshold: None,
         }
+    }
+
+    /// Test hook: force the classic doc-at-a-time AND loop so parity tests can
+    /// compare it against the bulk conjunction path within one process.
+    #[cfg(test)]
+    pub(crate) fn disable_bulk_and(mut self) -> Self {
+        self.bulk_and_disabled = true;
+        self
     }
 
     /// Share one cross-partition top-k floor across a query's partitions.
@@ -1333,6 +1416,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 .all(|posting| posting.posting.is_compressed())
         {
             return self.maxscore_search(params, mask, metrics);
+        }
+
+        // Top-k conjunctions (AND and phrase) over compressed lists use the
+        // bulk path: the same block-max window pruning, but candidates come
+        // from a slice-level merge over decompressed blocks instead of per-doc
+        // `next()` leapfrogging through boxed iterators.
+        if *USE_BULK_AND_SEARCH
+            && !self.bulk_and_disabled
+            && self.operator == Operator::And
+            && !self.lead.is_empty()
+            && self.lead.iter().all(|posting| posting.is_compressed())
+        {
+            return self.and_bulk_search(params, mask, metrics);
         }
 
         // Deferred-row_id path: when the DocSet was built without
@@ -2323,6 +2419,306 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .max(target)
     }
 
+    /// Bulk conjunction search. The window ends at the nearest next-block
+    /// boundary across the clauses, so within a window every clause
+    /// contributes exactly one decompressed block and the intersection is a
+    /// plain merge over `u32` slices — the per-candidate cost drops from a
+    /// full `PostingIterator::next` call per clause to a couple of loads.
+    /// Window skipping, per-candidate pruning, scoring, and heap semantics
+    /// mirror the classic loop exactly, so results are identical.
+    fn and_bulk_search(
+        &mut self,
+        params: &FtsSearchParams,
+        mask: Arc<RowAddrMask>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let docs_has_row_ids = self.docs.has_row_ids();
+        let num_lists = self.lead.len();
+        let phrase_slop = params.phrase_slop;
+
+        // Per-window view of one clause's current block. Raw pointers into the
+        // clause's `CompressedState`; valid for the whole window because the
+        // block cursor does not move within a window (position decoding writes
+        // to separate fields of the same state).
+        struct WindowList {
+            docs: *const u32,
+            freqs: *const u32,
+            // Cursor and exclusive end, as offsets within the block.
+            pos: usize,
+            end: usize,
+            // Absolute posting index of the block's first entry.
+            block_start: usize,
+        }
+
+        let mut candidates: TopKHeap =
+            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut num_comparisons: usize = 0;
+        let mut stats = AndSearchStats {
+            pruned_before_return_start: self.and_candidates_pruned_before_return,
+            ..Default::default()
+        };
+        let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
+
+        // The conjunction can only start at the max of the clauses' first docs.
+        let mut target: u64 = 0;
+        for posting in &self.lead {
+            match posting.doc() {
+                Some(doc) => target = target.max(doc.doc_id()),
+                None => return Ok(vec![]),
+            }
+        }
+
+        'window: loop {
+            self.raise_to_shared_floor(params.wand_factor);
+            if self.threshold > 0.0 {
+                let advanced = self.and_advance_target(target);
+                if advanced == TERMINATED_DOC_ID {
+                    break;
+                }
+                target = advanced;
+            }
+            debug_assert!(target <= u32::MAX as u64);
+            let target32 = target as u32;
+
+            // Position every clause's block cursor at the block that can hold
+            // `target`, and end the window at the nearest next-block boundary.
+            let mut win_end = TERMINATED_DOC_ID;
+            for j in 0..num_lists {
+                let (block_idx, block_up_to) = {
+                    let posting = &self.lead[j];
+                    let PostingList::Compressed(ref list) = posting.list else {
+                        unreachable!("bulk AND requires compressed postings");
+                    };
+                    let block_idx = posting.block_idx_for_doc(list, posting.block_idx, target32);
+                    let block_up_to = if block_idx + 1 < list.blocks.len() {
+                        u64::from(list.block_least_doc_id(block_idx + 1)).saturating_sub(1)
+                    } else {
+                        TERMINATED_DOC_ID
+                    };
+                    (block_idx, block_up_to.max(target))
+                };
+                self.lead[j].block_idx = block_idx;
+                win_end = win_end.min(block_up_to);
+            }
+            let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
+
+            // Decompress each clause's block and slice it to [target, win_end].
+            wins.clear();
+            let mut skip_window = false;
+            let mut exhausted = false;
+            for posting in &self.lead {
+                let PostingList::Compressed(ref list) = posting.list else {
+                    unreachable!("bulk AND requires compressed postings");
+                };
+                let block_idx = posting.block_idx;
+                let state = unsafe { &mut *posting.ensure_compressed_block_ptr(list, block_idx) };
+                let lo = state.doc_ids.partition_point(|&doc| doc < target32);
+                let hi = if win_end32 == u32::MAX {
+                    state.doc_ids.len()
+                } else {
+                    lo + state.doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+                };
+                if lo == hi {
+                    // No docs of this clause in the window: the whole window
+                    // has no conjunction match. If this was the clause's last
+                    // block and it is fully behind the target, the clause is
+                    // exhausted and the conjunction is done.
+                    if block_idx + 1 >= list.blocks.len()
+                        && state.doc_ids.last().is_none_or(|&doc| doc < target32)
+                    {
+                        exhausted = true;
+                    }
+                    skip_window = true;
+                    break;
+                }
+                wins.push(WindowList {
+                    docs: state.doc_ids.as_ptr(),
+                    freqs: state.freqs.as_ptr(),
+                    pos: lo,
+                    end: hi,
+                    block_start: block_idx << list.block_shift(),
+                });
+            }
+            if exhausted {
+                break 'window;
+            }
+            if !skip_window {
+                // Constant within the window (block-anchored); mirrors
+                // `and_candidate_cannot_beat_threshold`'s remaining-clause
+                // bound of first-clause-exact + rest-block-max.
+                let others_block_max: f32 = self.lead[1..]
+                    .iter()
+                    .map(|posting| posting.block_max_score(&self.scorer))
+                    .sum();
+
+                while wins[0].pos < wins[0].end {
+                    let doc = unsafe { *wins[0].docs.add(wins[0].pos) };
+                    let mut advance_to: Option<u32> = None;
+                    let mut window_done = false;
+                    for win in wins.iter_mut().skip(1) {
+                        while win.pos < win.end && unsafe { *win.docs.add(win.pos) } < doc {
+                            win.pos += 1;
+                        }
+                        if win.pos >= win.end {
+                            window_done = true;
+                            break;
+                        }
+                        let clause_doc = unsafe { *win.docs.add(win.pos) };
+                        if clause_doc > doc {
+                            advance_to = Some(clause_doc);
+                            break;
+                        }
+                    }
+                    if window_done {
+                        break;
+                    }
+                    if let Some(advance_to) = advance_to {
+                        let win = &mut wins[0];
+                        while win.pos < win.end && unsafe { *win.docs.add(win.pos) } < advance_to {
+                            win.pos += 1;
+                        }
+                        continue;
+                    }
+
+                    // All clauses sit on `doc`: a conjunction candidate.
+                    let doc_length = self.docs.scoring_num_tokens(doc);
+                    if self.threshold > 0.0 && num_lists >= 2 {
+                        let first_score = self.lead[0].score(
+                            &self.scorer,
+                            unsafe { *wins[0].freqs.add(wins[0].pos) },
+                            doc_length,
+                        );
+                        if first_score + others_block_max <= self.threshold {
+                            self.and_candidates_pruned_before_return += 1;
+                            wins[0].pos += 1;
+                            continue;
+                        }
+                    }
+                    stats.candidates_seen += 1;
+                    self.and_window_stats.candidates_returned += 1;
+                    num_comparisons += 1;
+
+                    let row_id = if docs_has_row_ids {
+                        self.docs.row_id(doc)
+                    } else {
+                        u64::from(doc)
+                    };
+                    if docs_has_row_ids
+                        && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id))
+                    {
+                        wins[0].pos += 1;
+                        continue;
+                    }
+
+                    if let Some(slop) = phrase_slop {
+                        // Park every clause's iterator on this doc so
+                        // `position_cursor` reads the right posting entry. The
+                        // window block is already decompressed; position blocks
+                        // decode lazily and are cached per block.
+                        for (win, posting) in wins.iter().zip(self.lead.iter_mut()) {
+                            posting.index = win.block_start + win.pos;
+                            posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: doc,
+                                frequency: unsafe { *win.freqs.add(win.pos) },
+                            }));
+                        }
+                        let matched = if slop == 0 {
+                            self.check_exact_positions_bulk()
+                        } else {
+                            self.check_positions(slop as i32)
+                        };
+                        if !matched {
+                            wins[0].pos += 1;
+                            continue;
+                        }
+                    }
+                    stats.full_scores += 1;
+
+                    let mut score = 0.0f32;
+                    for (win, posting) in wins.iter().zip(self.lead.iter()) {
+                        let freq = unsafe { *win.freqs.add(win.pos) };
+                        score += posting.score(&self.scorer, freq, doc_length);
+                    }
+
+                    let insert = if candidates.len() < limit {
+                        true
+                    } else {
+                        score > candidates.peek().unwrap().0.0.score.0
+                    };
+                    if insert {
+                        stats.freqs_collected += 1;
+                        let freqs = wins
+                            .iter()
+                            .zip(self.lead.iter())
+                            .map(|(win, posting)| {
+                                (posting.term_index(), unsafe { *win.freqs.add(win.pos) })
+                            })
+                            .collect();
+                        if candidates.len() >= limit {
+                            candidates.pop();
+                        }
+                        candidates.push(Reverse((
+                            ScoredDoc::new(row_id, score),
+                            freqs,
+                            doc_length,
+                            u64::from(doc),
+                        )));
+                        if candidates.len() == limit {
+                            let kth = candidates.peek().unwrap().0.0.score.0;
+                            self.update_threshold(kth, params.wand_factor);
+                        }
+                    }
+                    wins[0].pos += 1;
+                }
+            }
+
+            if win_end == TERMINATED_DOC_ID {
+                break;
+            }
+            target = win_end + 1;
+        }
+
+        tracing::debug!(
+            and_windows_wide = self.and_window_stats.windows_wide,
+            and_windows_narrow = self.and_window_stats.windows_narrow,
+            and_windows_skipped = self.and_window_stats.windows_skipped,
+            and_range_blocks_scanned = self.and_window_stats.range_blocks_scanned,
+            and_candidates_returned = self.and_window_stats.candidates_returned,
+            "fts conjunction block-max window stats (bulk)"
+        );
+        metrics.record_comparisons(num_comparisons);
+        let pruned_before_return = self
+            .and_candidates_pruned_before_return
+            .saturating_sub(stats.pruned_before_return_start);
+        metrics.record_and_candidates_seen(stats.candidates_seen);
+        metrics.record_and_candidates_pruned_before_return(pruned_before_return);
+        metrics.record_and_full_scores(stats.full_scores);
+        metrics.record_freqs_collected(stats.freqs_collected);
+
+        let to_addr = |row_id_slot: u64| {
+            if docs_has_row_ids {
+                CandidateAddr::RowId(row_id_slot)
+            } else {
+                CandidateAddr::Pending(row_id_slot as u32)
+            }
+        };
+        Ok(candidates
+            .into_iter()
+            .map(
+                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                    addr: to_addr(doc.row_id),
+                    posting_doc_id,
+                    freqs,
+                    doc_length,
+                },
+            )
+            .collect())
+    }
+
     fn and_move_to_next_block(&mut self, target: u64) {
         if self.threshold <= 0.0 {
             self.up_to = Some(target);
@@ -2903,6 +3299,57 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 iter.advance_to_relative(max_relative_pos.unwrap());
             });
         }
+    }
+
+    /// Allocation-free exact-phrase check for the bulk conjunction path,
+    /// where every clause is a parked `lead` iterator. Semantically identical
+    /// to [`Self::check_exact_positions`] — some base position must align all
+    /// clauses at their query offsets — without the per-candidate cursor vec
+    /// and sort.
+    fn check_exact_positions_bulk(&self) -> bool {
+        const MAX_INLINE_CLAUSES: usize = 16;
+        let num_clauses = self.lead.len();
+        if num_clauses > MAX_INLINE_CLAUSES {
+            return self.check_exact_positions();
+        }
+        // Cursors stay alive in the stack array so owned position buffers
+        // (legacy per-doc storage) remain valid while we scan.
+        let mut cursors: [Option<PositionCursor<'_>>; MAX_INLINE_CLAUSES] =
+            std::array::from_fn(|_| None);
+        let mut anchor_idx = 0usize;
+        let mut anchor_len = usize::MAX;
+        for (index, (slot, posting)) in cursors.iter_mut().zip(self.lead.iter()).enumerate() {
+            let cursor = posting.position_cursor().expect("positions must exist");
+            if cursor.len() < anchor_len {
+                anchor_len = cursor.len();
+                anchor_idx = index;
+            }
+            *slot = Some(cursor);
+        }
+
+        let anchor = cursors[anchor_idx]
+            .as_ref()
+            .expect("anchor cursor was just populated");
+        let anchor_offset = anchor.position_in_query as u32;
+        'anchor: for &anchor_position in anchor.positions.as_slice() {
+            let Some(base) = anchor_position.checked_sub(anchor_offset) else {
+                continue;
+            };
+            for (index, slot) in cursors[..num_clauses].iter().enumerate() {
+                if index == anchor_idx {
+                    continue;
+                }
+                let cursor = slot.as_ref().expect("clause cursor was just populated");
+                let Some(target) = base.checked_add(cursor.position_in_query as u32) else {
+                    return false;
+                };
+                if cursor.positions.as_slice().binary_search(&target).is_err() {
+                    continue 'anchor;
+                }
+            }
+            return true;
+        }
+        false
     }
 
     fn check_exact_positions(&self) -> bool {
@@ -4971,5 +5418,115 @@ mod tests {
         let second = wand.next().unwrap().unwrap();
         assert_eq!(second.0.doc_id(), 1);
         assert!(wand.check_positions(0));
+    }
+
+    /// The bulk conjunction path must return exactly the classic loop's
+    /// results — same docs, freqs, and doc lengths — for both plain AND and
+    /// phrase queries, across multi-block lists with heap/threshold pruning
+    /// in play.
+    #[rstest]
+    #[case::and_k10(false, 10)]
+    #[case::and_k3(false, 3)]
+    #[case::phrase_k10(true, 10)]
+    #[case::phrase_k3(true, 3)]
+    fn test_bulk_and_matches_classic(#[case] phrase: bool, #[case] limit: usize) {
+        let num_docs = (BLOCK_SIZE * 8 + 37) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 32 + doc_id % 57);
+        }
+
+        // Three clauses with different densities; membership comes from a
+        // cheap deterministic mix so docs scatter across blocks.
+        let clause_docs = |modulus: u32, salt: u32| -> Vec<u32> {
+            (0..num_docs)
+                .filter(|doc| (doc.wrapping_mul(2654435761).wrapping_add(salt)) % modulus < 2)
+                .collect()
+        };
+        let clauses = [clause_docs(3, 7), clause_docs(4, 13), clause_docs(5, 29)];
+
+        let build_postings = || {
+            clauses
+                .iter()
+                .enumerate()
+                .map(|(term_pos, doc_ids)| {
+                    let list = if phrase {
+                        // Roughly half of each clause's docs put the token at
+                        // position base+term_pos (forming the phrase); the
+                        // rest scatter so the position check has misses.
+                        let positions = doc_ids
+                            .iter()
+                            .map(|&doc| {
+                                if doc % 2 == 0 {
+                                    vec![5 + term_pos as u32, 40 + (doc % 3)]
+                                } else {
+                                    vec![20 + (term_pos as u32) * 4]
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        generate_posting_list_with_positions(doc_ids.clone(), positions, 1.0, true)
+                    } else {
+                        generate_posting_list(doc_ids.clone(), 1.0, None, true)
+                    };
+                    PostingIterator::with_query_weight(
+                        format!("t{term_pos}"),
+                        term_pos as u32,
+                        term_pos as u32,
+                        1.0 + term_pos as f32 * 0.5,
+                        list,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut params = FtsSearchParams::default().with_limit(Some(limit));
+        if phrase {
+            params.phrase_slop = Some(0);
+        }
+
+        let normalize = |result: Vec<DocCandidate>| {
+            let mut rows = result
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.posting_doc_id,
+                        candidate.doc_length,
+                        candidate.freqs,
+                        match candidate.addr {
+                            CandidateAddr::RowId(row_id) => row_id,
+                            CandidateAddr::Pending(doc_id) => u64::from(doc_id),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+
+        let run = |disable_bulk: bool| {
+            let mut wand = Wand::new(
+                Operator::And,
+                build_postings().into_iter(),
+                &docs,
+                UnitScorer,
+            );
+            if disable_bulk {
+                wand = wand.disable_bulk_and();
+            }
+            normalize(
+                wand.search(
+                    &params,
+                    Arc::new(RowAddrMask::default()),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap(),
+            )
+        };
+
+        let bulk = run(false);
+        let classic = run(true);
+        assert!(!bulk.is_empty(), "test corpus should produce matches");
+        assert_eq!(bulk, classic);
     }
 }
