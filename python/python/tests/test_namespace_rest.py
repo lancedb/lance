@@ -697,8 +697,8 @@ class TestDynamicContextProvider:
             def provide_context(self, info):
                 call_count["count"] += 1
                 return {
-                    "headers.Authorization": "Bearer test-token",
-                    "headers.X-Request-Id": f"req-{info.get('operation', 'unknown')}",
+                    "header.Authorization": "Bearer test-token",
+                    "header.X-Request-Id": f"req-{info.get('operation', 'unknown')}",
                 }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -727,7 +727,7 @@ class TestDynamicContextProvider:
         class ExplicitProvider(lance.namespace.DynamicContextProvider):
             def provide_context(self, info):
                 explicit_called["called"] = True
-                return {"headers.Authorization": "Bearer explicit"}
+                return {"header.Authorization": "Bearer explicit"}
 
         with tempfile.TemporaryDirectory() as tmpdir:
             backend_config = {"root": tmpdir}

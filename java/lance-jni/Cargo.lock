@@ -4062,6 +4062,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "datafusion",
@@ -4155,9 +4156,9 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-reqwest-client"
-version = "0.8.6"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba3f0a235e3ed5f8805205649ccc7d7d0f3df23ce1294242c9265ad488d7f19d"
+checksum = "c282440580af5cee0bed45ad58e6d74288a3855dcf88800f625b892d3106931f"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

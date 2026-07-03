@@ -21,8 +21,8 @@
 //! impl DynamicContextProvider for MyProvider {
 //!     fn provide_context(&self, info: &OperationInfo) -> HashMap<String, String> {
 //!         let mut context = HashMap::new();
-//!         context.insert("headers.Authorization".to_string(), format!("Bearer {}", get_current_token()));
-//!         context.insert("headers.X-Request-Id".to_string(), generate_request_id());
+//!         context.insert("header.Authorization".to_string(), format!("Bearer {}", get_current_token()));
+//!         context.insert("header.X-Request-Id".to_string(), generate_request_id());
 //!         context
 //!     }
 //! }
@@ -32,9 +32,9 @@
 //!     .build();
 //! ```
 //!
-//! For RestNamespace, context keys that start with `headers.` are converted to HTTP headers
-//! by stripping the prefix. For example, `{"headers.Authorization": "Bearer abc123"}`
-//! becomes the `Authorization: Bearer abc123` header. Keys without the `headers.` prefix
+//! For RestNamespace, context keys that start with `header.` are converted to HTTP headers
+//! by stripping the prefix. For example, `{"header.Authorization": "Bearer abc123"}`
+//! becomes the `Authorization: Bearer abc123` header. Keys without the `header.` prefix
 //! are ignored for HTTP headers but may be used for other purposes.
 
 use std::collections::HashMap;
@@ -68,8 +68,8 @@ impl OperationInfo {
 /// based on the operation being performed. The provider is called synchronously
 /// before each namespace operation.
 ///
-/// For RestNamespace, context keys that start with `headers.` are converted to
-/// HTTP headers by stripping the prefix. For example, `{"headers.Authorization": "Bearer token"}`
+/// For RestNamespace, context keys that start with `header.` are converted to
+/// HTTP headers by stripping the prefix. For example, `{"header.Authorization": "Bearer token"}`
 /// becomes the `Authorization: Bearer token` header.
 ///
 /// ## Thread Safety
@@ -92,7 +92,7 @@ pub trait DynamicContextProvider: Send + Sync + std::fmt::Debug {
     /// # Returns
     ///
     /// Returns a HashMap of context key-value pairs. For HTTP headers, use keys
-    /// with the `headers.` prefix (e.g., `headers.Authorization`).
+    /// with the `header.` prefix (e.g., `header.Authorization`).
     /// Returns an empty HashMap if no additional context is needed.
     fn provide_context(&self, info: &OperationInfo) -> HashMap<String, String>;
 }

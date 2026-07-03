@@ -49,8 +49,8 @@ use lance_namespace::models::{
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
     DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
     DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
-    ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
-    TableExistsRequest,
+    ListTablesResponse, NamespaceExistsRequest, NamespaceExistsResponse, RegisterTableRequest,
+    RegisterTableResponse, TableExistsRequest, TableExistsResponse,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_table::feature_flags::apply_feature_flags;
@@ -2824,7 +2824,7 @@ impl LanceNamespace for ManifestNamespace {
         }
     }
 
-    async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+    async fn table_exists(&self, request: TableExistsRequest) -> Result<TableExistsResponse> {
         let table_id = request.id.as_ref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
                 message: "Table ID is required".to_string(),
@@ -2841,7 +2841,7 @@ impl LanceNamespace for ManifestNamespace {
         let object_id = Self::str_object_id(table_id);
         let exists = self.manifest_contains_object(&object_id).await?;
         if exists {
-            Ok(())
+            Ok(TableExistsResponse::new())
         } else {
             Err(NamespaceError::TableNotFound {
                 message: Self::format_table_id(table_id),
@@ -3322,7 +3322,10 @@ impl LanceNamespace for ManifestNamespace {
         Ok(DropNamespaceResponse::default())
     }
 
-    async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+    async fn namespace_exists(
+        &self,
+        request: NamespaceExistsRequest,
+    ) -> Result<NamespaceExistsResponse> {
         let namespace_id = request.id.as_ref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
                 message: "Namespace ID is required".to_string(),
@@ -3331,12 +3334,12 @@ impl LanceNamespace for ManifestNamespace {
 
         // Root namespace always exists
         if namespace_id.is_empty() {
-            return Ok(());
+            return Ok(NamespaceExistsResponse::new());
         }
 
         let object_id = namespace_id.join(DELIMITER);
         if self.manifest_contains_object(&object_id).await? {
-            Ok(())
+            Ok(NamespaceExistsResponse::new())
         } else {
             Err(NamespaceError::NamespaceNotFound {
                 message: object_id.to_string(),

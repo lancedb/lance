@@ -26,6 +26,7 @@ import org.lance.namespace.model.AnalyzeTableQueryPlanRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsResponse;
 import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CountTableRowsResponse;
 import org.lance.namespace.model.CreateMaterializedViewRequest;
 import org.lance.namespace.model.CreateMaterializedViewResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
@@ -83,7 +84,9 @@ import org.lance.namespace.model.ListTablesResponse;
 import org.lance.namespace.model.MergeInsertIntoTableRequest;
 import org.lance.namespace.model.MergeInsertIntoTableResponse;
 import org.lance.namespace.model.NamespaceExistsRequest;
+import org.lance.namespace.model.NamespaceExistsResponse;
 import org.lance.namespace.model.QueryTableRequest;
+import org.lance.namespace.model.QueryTableResponse;
 import org.lance.namespace.model.RegisterTableRequest;
 import org.lance.namespace.model.RegisterTableResponse;
 import org.lance.namespace.model.RenameTableRequest;
@@ -91,6 +94,7 @@ import org.lance.namespace.model.RenameTableResponse;
 import org.lance.namespace.model.RestoreTableRequest;
 import org.lance.namespace.model.RestoreTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
+import org.lance.namespace.model.TableExistsResponse;
 import org.lance.namespace.model.UpdateTableRequest;
 import org.lance.namespace.model.UpdateTableResponse;
 import org.lance.namespace.model.UpdateTableSchemaMetadataRequest;
@@ -101,6 +105,7 @@ import org.lance.namespace.model.UpdateTableTagResponse;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.arrow.memory.BufferAllocator;
 
 import java.io.Closeable;
@@ -239,6 +244,7 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private static ObjectMapper createObjectMapper() {
     ObjectMapper mapper = new ObjectMapper();
+    mapper.registerModule(new JavaTimeModule());
     mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     return mapper;
   }
@@ -329,10 +335,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void namespaceExists(NamespaceExistsRequest request) {
+  public NamespaceExistsResponse namespaceExists(NamespaceExistsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    namespaceExistsNative(nativeDirectoryNamespaceHandle, requestJson);
+    String responseJson = namespaceExistsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, NamespaceExistsResponse.class);
   }
 
   @Override
@@ -360,10 +367,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void tableExists(TableExistsRequest request) {
+  public TableExistsResponse tableExists(TableExistsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    tableExistsNative(nativeDirectoryNamespaceHandle, requestJson);
+    String responseJson = tableExistsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, TableExistsResponse.class);
   }
 
   @Override
@@ -383,10 +391,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public Long countTableRows(CountTableRowsRequest request) {
+  public CountTableRowsResponse countTableRows(CountTableRowsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    return countTableRowsNative(nativeDirectoryNamespaceHandle, requestJson);
+    String responseJson = countTableRowsNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, CountTableRowsResponse.class);
   }
 
   @Override
@@ -451,10 +460,11 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public byte[] queryTable(QueryTableRequest request) {
+  public QueryTableResponse queryTable(QueryTableRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    return queryTableNative(nativeDirectoryNamespaceHandle, requestJson);
+    String responseJson = queryTableNative(nativeDirectoryNamespaceHandle, requestJson);
+    return fromJson(responseJson, QueryTableResponse.class);
   }
 
   @Override
@@ -758,7 +768,7 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private native String dropNamespaceNative(long handle, String requestJson);
 
-  private native void namespaceExistsNative(long handle, String requestJson);
+  private native String namespaceExistsNative(long handle, String requestJson);
 
   private native String listTablesNative(long handle, String requestJson);
 
@@ -766,13 +776,13 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private native String registerTableNative(long handle, String requestJson);
 
-  private native void tableExistsNative(long handle, String requestJson);
+  private native String tableExistsNative(long handle, String requestJson);
 
   private native String dropTableNative(long handle, String requestJson);
 
   private native String deregisterTableNative(long handle, String requestJson);
 
-  private native long countTableRowsNative(long handle, String requestJson);
+  private native String countTableRowsNative(long handle, String requestJson);
 
   private native String createTableNative(long handle, String requestJson, byte[] requestData);
 
@@ -789,7 +799,7 @@ public class DirectoryNamespace implements LanceNamespace, Closeable {
 
   private native String deleteFromTableNative(long handle, String requestJson);
 
-  private native byte[] queryTableNative(long handle, String requestJson);
+  private native String queryTableNative(long handle, String requestJson);
 
   private native String createTableIndexNative(long handle, String requestJson);
 

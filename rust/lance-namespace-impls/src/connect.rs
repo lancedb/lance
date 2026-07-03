@@ -63,7 +63,7 @@ use crate::context::DynamicContextProvider;
 /// impl DynamicContextProvider for MyProvider {
 ///     fn provide_context(&self, info: &OperationInfo) -> HashMap<String, String> {
 ///         let mut ctx = HashMap::new();
-///         ctx.insert("headers.Authorization".to_string(), "Bearer token".to_string());
+///         ctx.insert("header.Authorization".to_string(), "Bearer token".to_string());
 ///         ctx
 ///     }
 /// }
@@ -152,7 +152,7 @@ impl ConnectBuilder {
     ///
     /// The provider will be called before each operation to generate
     /// additional context. For RestNamespace, context keys that start with
-    /// `headers.` are converted to HTTP headers by stripping the prefix.
+    /// `header.` are converted to HTTP headers by stripping the prefix.
     ///
     /// # Arguments
     ///

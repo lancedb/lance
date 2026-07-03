@@ -21,9 +21,9 @@ import java.util.Map;
  * <p>Implementations can generate per-request context (e.g., authentication headers) based on the
  * operation being performed. The provider is called synchronously before each namespace operation.
  *
- * <p>For RestNamespace, context keys that start with {@code headers.} are converted to HTTP headers
- * by stripping the prefix. For example, {@code {"headers.Authorization": "Bearer abc123"}} becomes
- * the {@code Authorization: Bearer abc123} header. Keys without the {@code headers.} prefix are
+ * <p>For RestNamespace, context keys that start with {@code header.} are converted to HTTP headers
+ * by stripping the prefix. For example, {@code {"header.Authorization": "Bearer abc123"}} becomes
+ * the {@code Authorization: Bearer abc123} header. Keys without the {@code header.} prefix are
  * ignored for HTTP headers but may be used for other purposes.
  *
  * <p>Example implementation:
@@ -33,8 +33,8 @@ import java.util.Map;
  *   &#64;Override
  *   public Map&lt;String, String&gt; provideContext(String operation, String objectId) {
  *     Map&lt;String, String&gt; context = new HashMap&lt;&gt;();
- *     context.put("headers.Authorization", "Bearer " + getAuthToken());
- *     context.put("headers.X-Request-Id", UUID.randomUUID().toString());
+ *     context.put("header.Authorization", "Bearer " + getAuthToken());
+ *     context.put("header.X-Request-Id", UUID.randomUUID().toString());
  *     return context;
  *   }
  * }
@@ -69,8 +69,8 @@ public interface DynamicContextProvider {
    * @param operation The operation name (e.g., "list_tables", "describe_table", "create_namespace")
    * @param objectId The object identifier (namespace or table ID in delimited form, e.g.,
    *     "workspace$table_name")
-   * @return Map of context key-value pairs. For HTTP headers, use keys with the "headers." prefix
-   *     (e.g., "headers.Authorization"). Return an empty map if no additional context is needed.
+   * @return Map of context key-value pairs. For HTTP headers, use keys with the "header." prefix
+   *     (e.g., "header.Authorization"). Return an empty map if no additional context is needed.
    *     Must not return null.
    */
   Map<String, String> provideContext(String operation, String objectId);

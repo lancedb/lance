@@ -50,12 +50,12 @@ use lance_namespace::models::{
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse,
-    BranchContents as ModelBranchContents, CountTableRowsRequest, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
-    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    BranchContents as ModelBranchContents, CountTableRowsRequest, CountTableRowsResponse,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableBranchRequest,
+    CreateTableBranchResponse, CreateTableIndexRequest, CreateTableIndexResponse,
+    CreateTableRequest, CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
     DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
     DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
@@ -70,10 +70,11 @@ use lance_namespace::models::{
     ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
-    RestoreTableResponse, TableExistsRequest, TableVersion, TagContents as ModelTagContents,
-    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
-    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
+    NamespaceExistsResponse, QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector,
+    QueryTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    TableExistsResponse, TableVersion, TagContents as ModelTagContents, UpdateTableRequest,
+    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
+    UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 use lance_core::{Error, Result, box_error};
@@ -2171,6 +2172,7 @@ impl DirectoryNamespace {
         }
 
         DescribeTransactionResponse {
+            context: None,
             status: effective_status,
             properties: Some(properties),
         }
@@ -2188,6 +2190,7 @@ impl DirectoryNamespace {
         };
 
         DescribeTableIndexStatsResponse {
+            context: None,
             distance_type: stats
                 .get("distance_type")
                 .and_then(|value| value.as_str())
@@ -2865,14 +2868,17 @@ impl LanceNamespace for DirectoryNamespace {
         .into())
     }
 
-    async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+    async fn namespace_exists(
+        &self,
+        request: NamespaceExistsRequest,
+    ) -> Result<NamespaceExistsResponse> {
         self.record_op("namespace_exists");
         if let Some(ref manifest_ns) = self.manifest_ns {
             return manifest_ns.namespace_exists(request).await;
         }
 
         if request.id.is_none() || request.id.as_ref().unwrap().is_empty() {
-            return Ok(());
+            return Ok(NamespaceExistsResponse::new());
         }
 
         Err(NamespaceError::NamespaceNotFound {
@@ -2972,7 +2978,7 @@ impl LanceNamespace for DirectoryNamespace {
         self.describe_table_impl(request).await
     }
 
-    async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+    async fn table_exists(&self, request: TableExistsRequest) -> Result<TableExistsResponse> {
         self.record_op("table_exists");
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let skip_manifest_for_root = self.dir_listing_enabled
@@ -2982,7 +2988,7 @@ impl LanceNamespace for DirectoryNamespace {
             && !skip_manifest_for_root
         {
             match manifest_ns.table_exists(request.clone()).await {
-                Ok(()) => return Ok(()),
+                Ok(response) => return Ok(response),
                 Err(e) if manifest_feature_flags::is_incompatible_manifest_error(&e) => {
                     // An incompatible manifest must surface "please upgrade"
                     // rather than degrading to a directory-listing view.
@@ -3015,7 +3021,7 @@ impl LanceNamespace for DirectoryNamespace {
             .into());
         }
 
-        Ok(())
+        Ok(TableExistsResponse::new())
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
@@ -3433,6 +3439,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await?;
 
         Ok(ListTableVersionsResponse {
+            context: None,
             versions: table_versions,
             page_token: None,
         })
@@ -3570,6 +3577,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         Ok(CreateTableVersionResponse {
+            context: None,
             transaction_id: None,
             version: Some(Box::new(TableVersion {
                 version: version as i64,
@@ -3621,6 +3629,7 @@ impl LanceNamespace for DirectoryNamespace {
         };
 
         Ok(DescribeTableVersionResponse {
+            context: None,
             version: Box::new(table_version),
         })
     }
@@ -3673,6 +3682,7 @@ impl LanceNamespace for DirectoryNamespace {
             .await?;
 
         Ok(BatchDeleteTableVersionsResponse {
+            context: None,
             deleted_count: Some(total_deleted_count),
             transaction_id: None,
         })
@@ -3744,7 +3754,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .map(|transaction| transaction.uuid);
 
-        Ok(CreateTableIndexResponse { transaction_id })
+        Ok(CreateTableIndexResponse {
+            context: None,
+            transaction_id,
+        })
     }
 
     async fn list_table_indices(
@@ -3837,6 +3850,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let page_token = Self::paginate_indices(&mut indices, request.page_token, request.limit);
         Ok(ListTableIndicesResponse {
+            context: None,
             indexes: indices,
             page_token,
         })
@@ -4128,6 +4142,7 @@ impl LanceNamespace for DirectoryNamespace {
             .unwrap_or_else(|| "SUCCEEDED".to_string());
         let response = Self::transaction_response(version, &transaction, Some(sidecar));
         Ok(AlterTransactionResponse {
+            context: None,
             status: final_status,
             properties: response.properties,
         })
@@ -4151,6 +4166,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let response = self.create_table_index(request).await?;
         Ok(CreateTableScalarIndexResponse {
+            context: None,
             transaction_id: response.transaction_id,
         })
     }
@@ -4212,7 +4228,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .map(|transaction| transaction.uuid);
 
-        Ok(DropTableIndexResponse { transaction_id })
+        Ok(DropTableIndexResponse {
+            context: None,
+            transaction_id,
+        })
     }
 
     async fn list_all_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -4282,7 +4301,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .map(|t| t.uuid);
 
-        Ok(RestoreTableResponse { transaction_id })
+        Ok(RestoreTableResponse {
+            context: None,
+            transaction_id,
+        })
     }
 
     async fn update_table_schema_metadata(
@@ -4323,6 +4345,7 @@ impl LanceNamespace for DirectoryNamespace {
             .map(|t| t.uuid);
 
         Ok(UpdateTableSchemaMetadataResponse {
+            context: None,
             metadata: Some(updated_metadata),
             transaction_id,
         })
@@ -4497,7 +4520,10 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
-    async fn count_table_rows(&self, request: CountTableRowsRequest) -> Result<i64> {
+    async fn count_table_rows(
+        &self,
+        request: CountTableRowsRequest,
+    ) -> Result<CountTableRowsResponse> {
         self.record_op("count_table_rows");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let dataset = self
@@ -4512,7 +4538,10 @@ impl LanceNamespace for DirectoryNamespace {
                     message: format!("Failed to count rows for table at '{}': {:?}", table_uri, e),
                 })?;
 
-        Ok(count as i64)
+        Ok(CountTableRowsResponse {
+            context: None,
+            count: Some(count as i64),
+        })
     }
 
     async fn insert_into_table(
@@ -4549,6 +4578,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         Ok(InsertIntoTableResponse {
+            context: None,
             transaction_id: None,
         })
     }
@@ -4576,6 +4606,7 @@ impl LanceNamespace for DirectoryNamespace {
                 .await?;
             let version = dataset.version().version as i64;
             return Ok(MergeInsertIntoTableResponse {
+                context: None,
                 transaction_id: None,
                 num_updated_rows: Some(0),
                 num_inserted_rows: Some(num_rows as i64),
@@ -4646,6 +4677,7 @@ impl LanceNamespace for DirectoryNamespace {
             .map_err(|e| Self::map_mutation_error(e, "merge_insert_into_table", &table_uri))?;
 
         Ok(MergeInsertIntoTableResponse {
+            context: None,
             transaction_id: None,
             num_updated_rows: Some(stats.num_updated_rows as i64),
             num_inserted_rows: Some(stats.num_inserted_rows as i64),
@@ -4731,6 +4763,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let version = result.new_dataset.version().version as i64;
         Ok(UpdateTableResponse {
+            context: None,
             transaction_id: None,
             updated_rows: result.rows_updated as i64,
             version,
@@ -4762,12 +4795,13 @@ impl LanceNamespace for DirectoryNamespace {
             .map_err(|e| Self::map_mutation_error(e, "delete_from_table", &table_uri))?;
 
         Ok(DeleteFromTableResponse {
+            context: None,
             transaction_id: None,
             version: Some(result.new_dataset.version().version as i64),
         })
     }
 
-    async fn query_table(&self, request: QueryTableRequest) -> Result<Bytes> {
+    async fn query_table(&self, request: QueryTableRequest) -> Result<QueryTableResponse> {
         use arrow::ipc::writer::FileWriter;
 
         self.record_op("query_table");
@@ -4998,7 +5032,10 @@ impl LanceNamespace for DirectoryNamespace {
             })?;
         }
 
-        Ok(Bytes::from(buffer))
+        Ok(QueryTableResponse {
+            context: None,
+            data: Some(buffer),
+        })
     }
 
     async fn list_table_tags(
@@ -5028,6 +5065,7 @@ impl LanceNamespace for DirectoryNamespace {
             .collect();
 
         Ok(ListTableTagsResponse {
+            context: None,
             tags,
             page_token: None,
         })
@@ -5057,6 +5095,7 @@ impl LanceNamespace for DirectoryNamespace {
             .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
 
         Ok(GetTableTagVersionResponse {
+            context: None,
             version: contents.version as i64,
             branch: contents.branch,
         })
@@ -5095,6 +5134,7 @@ impl LanceNamespace for DirectoryNamespace {
             .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
 
         Ok(CreateTableTagResponse {
+            context: None,
             transaction_id: None,
         })
     }
@@ -5123,6 +5163,7 @@ impl LanceNamespace for DirectoryNamespace {
             .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
 
         Ok(DeleteTableTagResponse {
+            context: None,
             transaction_id: None,
         })
     }
@@ -5160,6 +5201,7 @@ impl LanceNamespace for DirectoryNamespace {
             .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
 
         Ok(UpdateTableTagResponse {
+            context: None,
             transaction_id: None,
         })
     }
@@ -5229,6 +5271,7 @@ impl LanceNamespace for DirectoryNamespace {
             })?;
 
         Ok(CreateTableBranchResponse {
+            context: None,
             transaction_id: None,
         })
     }
@@ -5273,6 +5316,7 @@ impl LanceNamespace for DirectoryNamespace {
             .collect();
 
         Ok(ListTableBranchesResponse {
+            context: None,
             branches,
             page_token: None,
         })
@@ -5310,6 +5354,7 @@ impl LanceNamespace for DirectoryNamespace {
             })?;
 
         Ok(DeleteTableBranchResponse {
+            context: None,
             transaction_id: None,
         })
     }
@@ -10676,7 +10721,10 @@ mod tests {
                 self.inner.describe_namespace(request).await
             }
 
-            async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+            async fn namespace_exists(
+                &self,
+                request: NamespaceExistsRequest,
+            ) -> Result<NamespaceExistsResponse> {
                 self.inner.namespace_exists(request).await
             }
 
@@ -10705,7 +10753,10 @@ mod tests {
                 self.inner.describe_table(request).await
             }
 
-            async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+            async fn table_exists(
+                &self,
+                request: TableExistsRequest,
+            ) -> Result<TableExistsResponse> {
                 self.inner.table_exists(request).await
             }
 
@@ -11072,6 +11123,16 @@ mod tests {
             (namespace, temp_dir, table_id)
         }
 
+        fn count_value(response: CountTableRowsResponse) -> i64 {
+            response.count.expect("count response should contain count")
+        }
+
+        fn query_data(response: QueryTableResponse) -> Vec<u8> {
+            response
+                .data
+                .expect("query response should contain IPC bytes")
+        }
+
         #[tokio::test]
         async fn test_count_table_rows_basic() {
             let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
@@ -11083,7 +11144,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let count = namespace.count_table_rows(request).await.unwrap();
+            let count = count_value(namespace.count_table_rows(request).await.unwrap());
             assert_eq!(count, 3);
         }
 
@@ -11098,7 +11159,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let count = namespace.count_table_rows(request).await.unwrap();
+            let count = count_value(namespace.count_table_rows(request).await.unwrap());
             assert_eq!(count, 2);
         }
 
@@ -11179,7 +11240,7 @@ mod tests {
                 predicate: None,
                 ..Default::default()
             };
-            let count = namespace.count_table_rows(count_req).await.unwrap();
+            let count = count_value(namespace.count_table_rows(count_req).await.unwrap());
             assert_eq!(count, 5);
         }
 
@@ -11227,7 +11288,7 @@ mod tests {
                 predicate: None,
                 ..Default::default()
             };
-            let count = namespace.count_table_rows(count_req).await.unwrap();
+            let count = count_value(namespace.count_table_rows(count_req).await.unwrap());
             assert_eq!(count, 2);
         }
 
@@ -11314,7 +11375,7 @@ mod tests {
                 predicate: None,
                 ..Default::default()
             };
-            let count = namespace.count_table_rows(count_req).await.unwrap();
+            let count = count_value(namespace.count_table_rows(count_req).await.unwrap());
             assert_eq!(count, 2);
         }
 
@@ -11331,7 +11392,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             // Decode IPC and verify
             let cursor = Cursor::new(bytes.to_vec());
@@ -11354,7 +11415,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11376,7 +11437,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11399,7 +11460,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11427,7 +11488,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11483,7 +11544,7 @@ mod tests {
                 predicate: None,
                 ..Default::default()
             };
-            let count = namespace.count_table_rows(count_req).await.unwrap();
+            let count = count_value(namespace.count_table_rows(count_req).await.unwrap());
             assert_eq!(count, 3);
 
             // Latest version should have 5 rows
@@ -11493,7 +11554,7 @@ mod tests {
                 predicate: None,
                 ..Default::default()
             };
-            let count = namespace.count_table_rows(count_req).await.unwrap();
+            let count = count_value(namespace.count_table_rows(count_req).await.unwrap());
             assert_eq!(count, 5);
         }
 
@@ -11544,7 +11605,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
@@ -11561,7 +11622,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
             let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
@@ -11657,7 +11718,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11686,7 +11747,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11714,7 +11775,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11745,7 +11806,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11787,7 +11848,7 @@ mod tests {
                 vector,
                 ..Default::default()
             };
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11812,7 +11873,7 @@ mod tests {
                 filter: Some("id > 1".to_string()),
                 ..Default::default()
             };
-            let bytes = namespace.query_table(request).await.unwrap();
+            let bytes = query_data(namespace.query_table(request).await.unwrap());
 
             let cursor = Cursor::new(bytes.to_vec());
             let reader = FileReader::try_new(cursor, None).unwrap();
@@ -11852,7 +11913,10 @@ mod tests {
                 predicate: Some("name = 'updated'".to_string()),
                 ..Default::default()
             };
-            assert_eq!(namespace.count_table_rows(count_req).await.unwrap(), 3);
+            assert_eq!(
+                count_value(namespace.count_table_rows(count_req).await.unwrap()),
+                3
+            );
         }
 
         #[tokio::test]
@@ -11876,7 +11940,10 @@ mod tests {
                 predicate: Some("name = 'Alice'".to_string()),
                 ..Default::default()
             };
-            assert_eq!(namespace.count_table_rows(untouched).await.unwrap(), 1);
+            assert_eq!(
+                count_value(namespace.count_table_rows(untouched).await.unwrap()),
+                1
+            );
 
             let touched = CountTableRowsRequest {
                 id: Some(table_id),
@@ -11884,7 +11951,10 @@ mod tests {
                 predicate: Some("name = 'matched'".to_string()),
                 ..Default::default()
             };
-            assert_eq!(namespace.count_table_rows(touched).await.unwrap(), 2);
+            assert_eq!(
+                count_value(namespace.count_table_rows(touched).await.unwrap()),
+                2
+            );
         }
 
         #[tokio::test]
@@ -11951,7 +12021,10 @@ mod tests {
                 ..Default::default()
             };
             // Original rows = 3; after deleting `id > 1` only row id=1 remains.
-            assert_eq!(namespace.count_table_rows(count_req).await.unwrap(), 1);
+            assert_eq!(
+                count_value(namespace.count_table_rows(count_req).await.unwrap()),
+                1
+            );
         }
 
         #[tokio::test]

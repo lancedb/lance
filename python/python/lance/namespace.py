@@ -28,6 +28,7 @@ from lance_namespace import (
     AlterTransactionResponse,
     AnalyzeTableQueryPlanRequest,
     CountTableRowsRequest,
+    CountTableRowsResponse,
     CreateMaterializedViewRequest,
     CreateMaterializedViewResponse,
     CreateNamespaceRequest,
@@ -87,6 +88,9 @@ from lance_namespace import (
     MergeInsertIntoTableRequest,
     MergeInsertIntoTableResponse,
     NamespaceExistsRequest,
+    NamespaceExistsResponse,
+    QueryTableRequest,
+    QueryTableResponse,
     RefreshMaterializedViewRequest,
     RefreshMaterializedViewResponse,
     RegisterTableRequest,
@@ -96,6 +100,7 @@ from lance_namespace import (
     RestoreTableRequest,
     RestoreTableResponse,
     TableExistsRequest,
+    TableExistsResponse,
     UpdateTableRequest,
     UpdateTableResponse,
     UpdateTableSchemaMetadataRequest,
@@ -136,8 +141,8 @@ class DynamicContextProvider(ABC):
     based on the operation being performed. The provider is called synchronously
     before each namespace operation.
 
-    For RestNamespace, context keys that start with `headers.` are converted to
-    HTTP headers by stripping the prefix. For example, `{"headers.Authorization":
+    For RestNamespace, context keys that start with `header.` are converted to
+    HTTP headers by stripping the prefix. For example, `{"header.Authorization":
     "Bearer token"}` becomes the `Authorization: Bearer token` header.
 
     Example
@@ -149,13 +154,13 @@ class DynamicContextProvider(ABC):
     ...
     ...     def provide_context(self, info: dict) -> dict:
     ...         return {
-    ...             "headers.Authorization": f"Bearer {self.api_key}",
+    ...             "header.Authorization": f"Bearer {self.api_key}",
     ...         }
     ...
     >>> # Create provider instance and use directly
     >>> provider = MyProvider(api_key="secret")
     >>> provider.provide_context({"operation": "list_tables", "object_id": "ns"})
-    {'headers.Authorization': 'Bearer secret'}
+    {'header.Authorization': 'Bearer secret'}
     """
 
     @abstractmethod
@@ -173,7 +178,7 @@ class DynamicContextProvider(ABC):
         -------
         dict
             Context key-value pairs. For HTTP headers, use keys with the
-            "headers." prefix (e.g., "headers.Authorization").
+            "header." prefix (e.g., "header.Authorization").
         """
         pass
 
@@ -356,7 +361,7 @@ class DirectoryNamespace(LanceNamespace):
     ...     def __init__(self, token: str):
     ...         self.token = token
     ...     def provide_context(self, info: dict) -> dict:
-    ...         return {"headers.Authorization": f"Bearer {self.token}"}
+    ...         return {"header.Authorization": f"Bearer {self.token}"}
     ...
     >>> provider = MyProvider(token="secret-token")
     >>> with tempfile.TemporaryDirectory() as tmpdir:
@@ -412,8 +417,11 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.drop_namespace(request.model_dump())
         return DropNamespaceResponse.from_dict(response_dict)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
-        self._inner.namespace_exists(request.model_dump())
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
+        response_dict = self._inner.namespace_exists(request.model_dump())
+        return NamespaceExistsResponse.from_dict(response_dict)
 
     # Table operations
 
@@ -429,8 +437,9 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.register_table(request.model_dump())
         return RegisterTableResponse.from_dict(response_dict)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
-        self._inner.table_exists(request.model_dump())
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
+        response_dict = self._inner.table_exists(request.model_dump())
+        return TableExistsResponse.from_dict(response_dict)
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:
         response_dict = self._inner.drop_table(request.model_dump())
@@ -522,7 +531,9 @@ class DirectoryNamespace(LanceNamespace):
 
     # Data manipulation operations
 
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+    def count_table_rows(
+        self, request: CountTableRowsRequest
+    ) -> CountTableRowsResponse:
         """Count the number of rows in a table, optionally filtered by a predicate.
 
         Parameters
@@ -532,10 +543,11 @@ class DirectoryNamespace(LanceNamespace):
 
         Returns
         -------
-        int
-            The number of rows matching the criteria
+        CountTableRowsResponse
+            The response containing the row count
         """
-        return self._inner.count_table_rows(request.model_dump())
+        response_dict = self._inner.count_table_rows(request.model_dump())
+        return CountTableRowsResponse.from_dict(response_dict)
 
     def insert_into_table(
         self, request: InsertIntoTableRequest, request_data: bytes
@@ -615,7 +627,7 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.delete_from_table(request.model_dump())
         return DeleteFromTableResponse.from_dict(response_dict)
 
-    def query_table(self, request) -> bytes:
+    def query_table(self, request: QueryTableRequest | dict) -> QueryTableResponse:
         """Query a table and return results as Arrow IPC.
 
         Parameters
@@ -626,12 +638,13 @@ class DirectoryNamespace(LanceNamespace):
 
         Returns
         -------
-        bytes
-            Arrow IPC file format containing the query results
+        QueryTableResponse
+            Response containing Arrow IPC file format query results
         """
-        if hasattr(request, "model_dump"):
+        if not isinstance(request, dict):
             request = request.model_dump()
-        return self._inner.query_table(request)
+        response_dict = self._inner.query_table(request)
+        return QueryTableResponse.from_dict(response_dict)
 
     # Index operations
 
@@ -941,7 +954,7 @@ class RestNamespace(LanceNamespace):
     ...     def __init__(self, api_key: str):
     ...         self.api_key = api_key
     ...     def provide_context(self, info: dict) -> dict:
-    ...         return {"headers.Authorization": f"Bearer {self.api_key}"}
+    ...         return {"header.Authorization": f"Bearer {self.api_key}"}
     ...
     >>> provider = AuthProvider(api_key="my-secret-key")
     >>> ns = lance.namespace.RestNamespace(
@@ -1003,8 +1016,11 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.drop_namespace(request.model_dump())
         return DropNamespaceResponse.from_dict(response_dict)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
-        self._inner.namespace_exists(request.model_dump())
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
+        response_dict = self._inner.namespace_exists(request.model_dump())
+        return NamespaceExistsResponse.from_dict(response_dict)
 
     # Table operations
 
@@ -1020,8 +1036,9 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.register_table(request.model_dump())
         return RegisterTableResponse.from_dict(response_dict)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
-        self._inner.table_exists(request.model_dump())
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
+        response_dict = self._inner.table_exists(request.model_dump())
+        return TableExistsResponse.from_dict(response_dict)
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:
         response_dict = self._inner.drop_table(request.model_dump())
@@ -1113,7 +1130,9 @@ class RestNamespace(LanceNamespace):
 
     # Data manipulation operations
 
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+    def count_table_rows(
+        self, request: CountTableRowsRequest
+    ) -> CountTableRowsResponse:
         """Count the number of rows in a table, optionally filtered by a predicate.
 
         Parameters
@@ -1123,10 +1142,11 @@ class RestNamespace(LanceNamespace):
 
         Returns
         -------
-        int
-            The number of rows matching the criteria
+        CountTableRowsResponse
+            The response containing the row count
         """
-        return self._inner.count_table_rows(request.model_dump())
+        response_dict = self._inner.count_table_rows(request.model_dump())
+        return CountTableRowsResponse.from_dict(response_dict)
 
     def insert_into_table(
         self, request: InsertIntoTableRequest, request_data: bytes
@@ -1206,7 +1226,7 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.delete_from_table(request.model_dump())
         return DeleteFromTableResponse.from_dict(response_dict)
 
-    def query_table(self, request) -> bytes:
+    def query_table(self, request: QueryTableRequest | dict) -> QueryTableResponse:
         """Query a table and return results as Arrow IPC.
 
         Parameters
@@ -1217,12 +1237,13 @@ class RestNamespace(LanceNamespace):
 
         Returns
         -------
-        bytes
-            Arrow IPC file format containing the query results
+        QueryTableResponse
+            Response containing Arrow IPC file format query results
         """
-        if hasattr(request, "model_dump"):
+        if not isinstance(request, dict):
             request = request.model_dump()
-        return self._inner.query_table(request)
+        response_dict = self._inner.query_table(request)
+        return QueryTableResponse.from_dict(response_dict)
 
     # Index operations
 

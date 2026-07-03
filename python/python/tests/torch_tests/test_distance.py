@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -133,6 +135,10 @@ def test_l2_distance_f16_bf16_cuda():
     assert dists.shape == (128, 512)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Torch CPU fp16/bfloat16 crashes Windows CI",
+)
 def test_l2_distance_f16_bf16_cpu():
     DIM = 32
     # Make sure it happens on CPU

@@ -20,9 +20,9 @@ use lance_namespace::models::{
     ExplainTableQueryPlanRequest, GetTableStatsRequest, GetTableTagVersionRequest,
     InsertIntoTableRequest, ListTableIndicesRequest, ListTableTagsRequest,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest,
-    MergeInsertIntoTableRequest, QueryTableRequest, RefreshMaterializedViewRequest,
-    RestoreTableRequest, UpdateTableRequest, UpdateTableSchemaMetadataRequest,
-    UpdateTableTagRequest,
+    MergeInsertIntoTableRequest, QueryTableRequest, QueryTableResponse,
+    RefreshMaterializedViewRequest, RestoreTableRequest, UpdateTableRequest,
+    UpdateTableSchemaMetadataRequest, UpdateTableTagRequest,
 };
 use lance_namespace_impls::RestNamespaceBuilder;
 use lance_namespace_impls::{ConnectBuilder, RestAdapter, RestAdapterConfig, RestAdapterHandle};
@@ -40,7 +40,7 @@ use crate::session::Session;
 /// Python-implemented dynamic context provider.
 ///
 /// Wraps a Python object that has a `provide_context(info: dict) -> dict` method.
-/// For RestNamespace, context keys that start with `headers.` are converted to
+/// For RestNamespace, context keys that start with `header.` are converted to
 /// HTTP headers by stripping the prefix.
 pub struct PyDynamicContextProvider {
     provider: Py<PyAny>,
@@ -113,6 +113,20 @@ fn dict_to_hashmap(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, String>
         map.insert(key_str, value_str);
     }
     Ok(map)
+}
+
+fn pythonize_query_table_response<'py>(
+    py: Python<'py>,
+    response: &QueryTableResponse,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dict = PyDict::new(py);
+    if let Some(context) = &response.context {
+        dict.set_item("context", pythonize(py, context)?)?;
+    }
+    if let Some(data) = &response.data {
+        dict.set_item("data", PyBytes::new(py, data))?;
+    }
+    Ok(dict.into_any())
 }
 
 /// Python wrapper for DirectoryNamespace
@@ -226,12 +240,16 @@ impl PyDirectoryNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn namespace_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn namespace_exists<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
-        crate::rt()
+        let response = crate::rt()
             .block_on(Some(py), self.inner.namespace_exists(request))?
             .infer_error()?;
-        Ok(())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     // Table operations
@@ -272,12 +290,16 @@ impl PyDirectoryNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn table_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn table_exists<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
-        crate::rt()
+        let response = crate::rt()
             .block_on(Some(py), self.inner.table_exists(request))?
             .infer_error()?;
-        Ok(())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn drop_table<'py>(
@@ -432,12 +454,16 @@ impl PyDirectoryNamespace {
 
     // Data manipulation operations
 
-    fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
+    fn count_table_rows<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request: CountTableRowsRequest = depythonize(request)?;
-        let count = crate::rt()
+        let response = crate::rt()
             .block_on(Some(py), self.inner.count_table_rows(request))?
             .infer_error()?;
-        Ok(count)
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn insert_into_table<'py>(
@@ -496,12 +522,12 @@ impl PyDirectoryNamespace {
         &self,
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyBytes>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request: QueryTableRequest = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.query_table(request))?
             .infer_error()?;
-        Ok(PyBytes::new(py, &response))
+        pythonize_query_table_response(py, &response)
     }
 
     // Index operations
@@ -831,9 +857,9 @@ impl PyRestNamespace {
     /// # Arguments
     ///
     /// * `context_provider` - Optional object with `provide_context(info: dict) -> dict` method
-    ///   for providing dynamic per-request context. Context keys that start with `headers.`
+    ///   for providing dynamic per-request context. Context keys that start with `header.`
     ///   are converted to HTTP headers by stripping the prefix. For example,
-    ///   `{"headers.Authorization": "Bearer token"}` becomes the `Authorization` header.
+    ///   `{"header.Authorization": "Bearer token"}` becomes the `Authorization` header.
     /// * `**properties` - Namespace configuration properties (uri, delimiter, header.*, etc.)
     #[new]
     #[pyo3(signature = (context_provider = None, **properties))]
@@ -926,12 +952,16 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn namespace_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn namespace_exists<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
-        crate::rt()
+        let response = crate::rt()
             .block_on(Some(py), self.inner.namespace_exists(request))?
             .infer_error()?;
-        Ok(())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     // Table operations
@@ -972,12 +1002,16 @@ impl PyRestNamespace {
         pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
-    fn table_exists(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn table_exists<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request = depythonize(request)?;
-        crate::rt()
+        let response = crate::rt()
             .block_on(Some(py), self.inner.table_exists(request))?
             .infer_error()?;
-        Ok(())
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn drop_table<'py>(
@@ -1132,12 +1166,16 @@ impl PyRestNamespace {
 
     // Data manipulation operations
 
-    fn count_table_rows(&self, py: Python, request: &Bound<'_, PyAny>) -> PyResult<i64> {
+    fn count_table_rows<'py>(
+        &self,
+        py: Python<'py>,
+        request: &Bound<'_, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request: CountTableRowsRequest = depythonize(request)?;
-        let count = crate::rt()
+        let response = crate::rt()
             .block_on(Some(py), self.inner.count_table_rows(request))?
             .infer_error()?;
-        Ok(count)
+        pythonize(py, &response).map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     fn insert_into_table<'py>(
@@ -1196,12 +1234,12 @@ impl PyRestNamespace {
         &self,
         py: Python<'py>,
         request: &Bound<'_, PyAny>,
-    ) -> PyResult<Bound<'py, PyBytes>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let request: QueryTableRequest = depythonize(request)?;
         let response = crate::rt()
             .block_on(Some(py), self.inner.query_table(request))?
             .infer_error()?;
-        Ok(PyBytes::new(py, &response))
+        pythonize_query_table_response(py, &response)
     }
 
     // Index operations
