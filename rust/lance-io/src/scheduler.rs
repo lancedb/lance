@@ -730,6 +730,28 @@ impl ScanScheduler {
         self.open_file_with_priority(path, 0, file_size_bytes).await
     }
 
+    /// Open a [`FileScheduler`] over an already-open [`Reader`].
+    ///
+    /// Unlike [`Self::open_file`], this skips the path lookup and size probe and
+    /// schedules I/O against `reader` directly. This is useful when the reader
+    /// was produced outside the scheduler's object store (e.g. a spill file
+    /// opened via [`crate::spill::Spill::reader`]), since a bare `Reader`
+    /// cannot otherwise drive a v2 `FileReader` (which needs a scheduler).
+    ///
+    /// Uses a base priority of 0; chain [`FileScheduler::with_priority`] to set
+    /// a different one.
+    pub fn open_reader(self: &Arc<Self>, reader: Arc<dyn Reader>) -> FileScheduler {
+        FileScheduler {
+            reader,
+            block_size: self.object_store.block_size() as u64,
+            root: self.clone(),
+            base_priority: 0,
+            max_iop_size: self.object_store.max_iop_size(),
+            bypass_backpressure: false,
+            extra_stats: None,
+        }
+    }
+
     fn do_submit_request(
         &self,
         reader: Arc<dyn Reader>,
@@ -1191,6 +1213,31 @@ mod tests {
             assert_eq!(expected, actual);
             offset += READ_SIZE;
         }
+    }
+
+    #[tokio::test]
+    async fn test_open_reader_bridge() {
+        let tmp_file = TempObjFile::default();
+
+        let obj_store = Arc::new(ObjectStore::local());
+
+        const DATA_SIZE: u64 = 64 * 1024;
+        let mut some_data = vec![0; DATA_SIZE as usize];
+        rand::rng().fill_bytes(&mut some_data);
+        obj_store.put(&tmp_file, &some_data).await.unwrap();
+
+        let config = SchedulerConfig::default_for_testing();
+        let scheduler = ScanScheduler::new(obj_store.clone(), config);
+
+        // Open a bare Reader ourselves, then bridge it into a FileScheduler.
+        let reader: Arc<dyn Reader> = obj_store.open(&tmp_file).await.unwrap().into();
+        let file_scheduler = scheduler.open_reader(reader);
+
+        let bytes = file_scheduler
+            .submit_request(vec![0..DATA_SIZE], 0)
+            .await
+            .unwrap();
+        assert_eq!(bytes[0], some_data);
     }
 
     #[tokio::test]

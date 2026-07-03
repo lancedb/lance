@@ -1074,12 +1074,12 @@ impl FilteredReadStream {
     }
 
     // Reads a single fragment into a stream of batch tasks
-    #[instrument(name = "read_fragment", skip_all)]
+    #[instrument(name = "read_fragment", level = "debug", skip_all)]
     async fn read_fragment(
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
-    ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
+    ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
         let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
         if let Some(filter) = &fragment_read_task.filter {

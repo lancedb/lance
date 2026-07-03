@@ -45,13 +45,18 @@ pub struct LanceIndexStore {
     /// When set, used to avoid HEAD calls when opening files
     file_sizes: HashMap<String, u64>,
     format_version: LanceFileVersion,
+    /// Base I/O priority for all requests this store submits to `scheduler`.
+    io_priority: u64,
 }
 
 impl DeepSizeOf for LanceIndexStore {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // Exclude the shared, session-scoped `metadata_cache` (accounted once by
+        // `Session::deep_size_of_children`): it is not this store's own footprint, and
+        // sizing it here makes every opened index that holds a store report the whole
+        // cache as its own bytes — inflating and N-times double-counting it.
         self.object_store.deep_size_of_children(context)
             + self.index_dir.as_ref().deep_size_of_children(context)
-            + self.metadata_cache.deep_size_of_children(context)
     }
 }
 
@@ -88,6 +93,7 @@ impl LanceIndexStore {
             scheduler,
             file_sizes: HashMap::new(),
             format_version,
+            io_priority: 0,
         }
     }
 
@@ -98,6 +104,11 @@ impl LanceIndexStore {
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
         self.file_sizes = file_sizes;
         self
+    }
+
+    /// The base I/O priority all this store's requests are submitted at.
+    pub fn io_priority(&self) -> u64 {
+        self.io_priority
     }
 
     fn index_file_path(&self, name: &str) -> Result<Path> {
@@ -128,10 +139,10 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
     }
 
     async fn finish(&mut self) -> Result<IndexFile> {
-        Self::finish(self).await?;
+        let summary = Self::finish(self).await?;
         Ok(IndexFile {
             path: String::new(),
-            size_bytes: self.tell().await? as u64,
+            size_bytes: summary.size_bytes,
         })
     }
 
@@ -139,10 +150,10 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
         &mut self,
         metadata: HashMap<String, String>,
     ) -> Result<IndexFile> {
-        Self::finish_with_metadata(self, &metadata).await?;
+        let summary = Self::finish_with_metadata(self, &metadata).await?;
         Ok(IndexFile {
             path: String::new(),
-            size_bytes: self.tell().await? as u64,
+            size_bytes: summary.size_bytes,
         })
     }
 }
@@ -432,6 +443,15 @@ impl IndexStore for LanceIndexStore {
         }))
     }
 
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        // The `scheduler` is shared (`Arc`), so this clone is cheap and the new
+        // priority only affects requests this clone submits.
+        Arc::new(Self {
+            io_priority,
+            ..self.clone()
+        })
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
@@ -440,7 +460,10 @@ impl IndexStore for LanceIndexStore {
             .get(name)
             .map(|&size| CachedFileSize::new(size))
             .unwrap_or_else(CachedFileSize::unknown);
-        let file_scheduler = self.scheduler.open_file(&path, &cached_size).await?;
+        let file_scheduler = self
+            .scheduler
+            .open_file_with_priority(&path, self.io_priority, &cached_size)
+            .await?;
         match current_reader::FileReader::try_open(
             file_scheduler,
             None,
@@ -549,7 +572,7 @@ mod tests {
     use crate::scalar::bitmap::BitmapIndexPlugin;
     use crate::scalar::btree::{BTreeIndexPlugin, BTreeParameters};
     use crate::scalar::label_list::LabelListIndexPlugin;
-    use crate::scalar::registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME};
+    use crate::scalar::registry::{BasicTrainer, ScalarIndexPlugin, VALUE_COLUMN_NAME};
     use crate::scalar::{
         LabelListQuery, SargableQuery, ScalarIndex, SearchResult,
         bitmap::BitmapIndex,
@@ -570,6 +593,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -584,6 +608,46 @@ mod tests {
             128 * 1024 * 1024,
         ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+    }
+
+    #[tokio::test]
+    async fn test_store_deep_size_excludes_metadata_cache() {
+        // The metadata cache is session-scoped and shared; a store must not count
+        // it as its own footprint, so growing the cache must not change store size.
+        struct BlobKey;
+        impl lance_core::cache::CacheKey for BlobKey {
+            type ValueType = Vec<u8>;
+            fn key(&self) -> std::borrow::Cow<'_, str> {
+                std::borrow::Cow::Borrowed("blob")
+            }
+            fn type_name() -> &'static str {
+                "Vec<u8>"
+            }
+        }
+
+        let index_dir = TempDir::default();
+        let test_path = index_dir.obj_path();
+        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
+        let store = LanceIndexStore::new(object_store, test_path, cache.clone());
+
+        let before = store.deep_size_of();
+        cache
+            .insert_with_key(&BlobKey, Arc::new(vec![0u8; 4 * 1024 * 1024]))
+            .await;
+        // Force moka to commit the write so a cache-inclusive size would grow.
+        let _ = cache.size_bytes().await;
+        let after = store.deep_size_of();
+
+        assert_eq!(
+            before, after,
+            "store deep size must exclude the shared metadata cache"
+        );
     }
 
     async fn train_index(
@@ -1646,7 +1710,7 @@ mod tests {
         let remapped_dir = TempDir::default();
         let remapped_store = test_store(&remapped_dir);
         index
-            .remap(&mapping, remapped_store.as_ref())
+            .remap(&RowAddrRemap::direct(mapping), remapped_store.as_ref())
             .await
             .unwrap();
         let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())

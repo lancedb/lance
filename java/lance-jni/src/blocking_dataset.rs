@@ -29,7 +29,10 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{JNIEnv, objects::JObject};
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
+use lance::dataset::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
+    CleanupReferencedBranch, RemovalStats,
+};
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
@@ -412,6 +415,18 @@ impl BlockingDataset {
 
     pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
         Ok(RT.block_on(self.inner.cleanup_with_policy(policy))?)
+    }
+
+    pub fn explain_cleanup_with_policy(
+        &self,
+        policy: CleanupPolicy,
+        max_candidate_files: Option<usize>,
+    ) -> Result<CleanupExplanation> {
+        let mut op = self.inner.cleanup(policy);
+        if let Some(limit) = max_candidate_files {
+            op = op.with_max_candidate_files(limit);
+        }
+        Ok(RT.block_on(op.explain())?)
     }
 
     pub fn close(&self) {}
@@ -3063,43 +3078,7 @@ fn inner_cleanup_with_policy<'local>(
     jdataset: JObject,
     jpolicy: JObject,
 ) -> Result<JObject<'local>> {
-    let before_ts_millis =
-        env.get_optional_u64_from_method(&jpolicy, "getBeforeTimestampMillis")?;
-    let before_timestamp = before_ts_millis.map(|millis| {
-        let st = UNIX_EPOCH + Duration::from_millis(millis);
-        DateTime::<Utc>::from(st)
-    });
-
-    let before_version = env.get_optional_u64_from_method(&jpolicy, "getBeforeVersion")?;
-
-    let delete_unverified = env
-        .get_optional_from_method(&jpolicy, "getDeleteUnverified", |env, obj| {
-            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
-        })?
-        .unwrap_or(false);
-
-    let error_if_tagged_old_versions = env
-        .get_optional_from_method(&jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
-            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
-        })?
-        .unwrap_or(true);
-
-    let clean_referenced_branches = env
-        .get_optional_from_method(&jpolicy, "getCleanReferencedBranches", |env, obj| {
-            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
-        })?
-        .unwrap_or(false);
-
-    let delete_rate_limit = env.get_optional_u64_from_method(&jpolicy, "getDeleteRateLimit")?;
-
-    let policy = CleanupPolicy {
-        before_timestamp,
-        before_version,
-        delete_unverified,
-        error_if_tagged_old_versions,
-        clean_referenced_branches,
-        delete_rate_limit,
-    };
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
 
     let stats = {
         let mut dataset =
@@ -3107,7 +3086,96 @@ fn inner_cleanup_with_policy<'local>(
         dataset.cleanup_with_policy(policy)
     }?;
 
-    let jstats = env.new_object(
+    cleanup_stats_to_java(env, stats)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+    jmax_candidate_files: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
+    )
+}
+
+fn inner_explain_cleanup_with_policy<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    jpolicy: JObject,
+    jmax_candidate_files: JObject,
+) -> Result<JObject<'local>> {
+    let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let max_candidate_files = env
+        .get_optional(&jmax_candidate_files, |env, inner| {
+            Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
+        })?
+        .map(|v| {
+            usize::try_from(v).map_err(|e| {
+                Error::input_error(format!(
+                    "maxCandidateFiles must be a non-negative usize value, got {}: {:?}",
+                    v, e
+                ))
+            })
+        })
+        .transpose()?;
+
+    let explanation = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.explain_cleanup_with_policy(policy, max_candidate_files)
+    }?;
+
+    cleanup_explanation_to_java(env, explanation)
+}
+
+fn extract_cleanup_policy(env: &mut JNIEnv<'_>, jpolicy: &JObject) -> Result<CleanupPolicy> {
+    let before_ts_millis = env.get_optional_u64_from_method(jpolicy, "getBeforeTimestampMillis")?;
+    let before_timestamp = before_ts_millis.map(|millis| {
+        let st = UNIX_EPOCH + Duration::from_millis(millis);
+        DateTime::<Utc>::from(st)
+    });
+
+    let before_version = env.get_optional_u64_from_method(jpolicy, "getBeforeVersion")?;
+
+    let delete_unverified = env
+        .get_optional_from_method(jpolicy, "getDeleteUnverified", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(false);
+
+    let error_if_tagged_old_versions = env
+        .get_optional_from_method(jpolicy, "getErrorIfTaggedOldVersions", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(true);
+
+    let clean_referenced_branches = env
+        .get_optional_from_method(jpolicy, "getCleanReferencedBranches", |env, obj| {
+            Ok(env.call_method(obj, "booleanValue", "()Z", &[])?.z()?)
+        })?
+        .unwrap_or(false);
+
+    let delete_rate_limit = env.get_optional_u64_from_method(jpolicy, "getDeleteRateLimit")?;
+
+    Ok(CleanupPolicy {
+        before_timestamp,
+        before_version,
+        delete_unverified,
+        error_if_tagged_old_versions,
+        clean_referenced_branches,
+        delete_rate_limit,
+    })
+}
+
+fn cleanup_stats_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    stats: RemovalStats,
+) -> Result<JObject<'local>> {
+    Ok(env.new_object(
         "org/lance/cleanup/RemovalStats",
         "(JJJJJJ)V",
         &[
@@ -3118,9 +3186,126 @@ fn inner_cleanup_with_policy<'local>(
             JValue::Long(stats.index_files_removed as i64),
             JValue::Long(stats.deletion_files_removed as i64),
         ],
-    )?;
+    )?)
+}
 
-    Ok(jstats)
+fn cleanup_file_kind_to_java(kind: CleanupFileKind) -> &'static str {
+    match kind {
+        CleanupFileKind::Manifest => "manifest",
+        CleanupFileKind::Data => "data",
+        CleanupFileKind::Transaction => "transaction",
+        CleanupFileKind::Index => "index",
+        CleanupFileKind::Deletion => "deletion",
+        CleanupFileKind::TemporaryManifest => "temporary_manifest",
+    }
+}
+
+fn cleanup_candidate_files_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    files: Vec<CleanupCandidateFile>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    // Wrap each iteration in a local frame so the temporary path/kind/candidate
+    // references do not accumulate on the JNI local reference table for large
+    // explanations (default limit is 1000 candidate files, but users can raise it).
+    for file in files {
+        env.with_local_frame(8, |env| {
+            let path = env.new_string(file.path)?;
+            let kind = env.new_string(cleanup_file_kind_to_java(file.kind))?;
+            let candidate = env.new_object(
+                "org/lance/cleanup/CleanupCandidateFile",
+                "(Ljava/lang/String;Ljava/lang/String;ZJ)V",
+                &[
+                    JValue::Object(&path),
+                    JValue::Object(&kind),
+                    JValue::Bool(file.unverified as jboolean),
+                    JValue::Long(file.size_bytes as i64),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&candidate)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_referenced_branches_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    branches: Vec<CleanupReferencedBranch>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for branch in branches {
+        env.with_local_frame(8, |env| {
+            let name = env.new_string(branch.name)?;
+            let referenced_branch = env.new_object(
+                "org/lance/cleanup/CleanupReferencedBranch",
+                "(Ljava/lang/String;JZ)V",
+                &[
+                    JValue::Object(&name),
+                    JValue::Long(branch.referenced_version as i64),
+                    JValue::Bool(branch.cleanup_candidate as jboolean),
+                ],
+            )?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&referenced_branch)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_warnings_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    warnings: Vec<String>,
+) -> Result<JObject<'local>> {
+    let list = env.new_object("java/util/ArrayList", "()V", &[])?;
+    for warning in warnings {
+        env.with_local_frame(4, |env| {
+            let warning = env.new_string(warning)?;
+            env.call_method(
+                &list,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[JValue::Object(&warning)],
+            )?;
+            Ok::<(), Error>(())
+        })?;
+    }
+    Ok(list)
+}
+
+fn cleanup_explanation_to_java<'local>(
+    env: &mut JNIEnv<'local>,
+    explanation: CleanupExplanation,
+) -> Result<JObject<'local>> {
+    let stats = cleanup_stats_to_java(env, explanation.stats)?;
+    let candidate_files = cleanup_candidate_files_to_java(env, explanation.candidate_files)?;
+    let referenced_branches =
+        cleanup_referenced_branches_to_java(env, explanation.referenced_branches)?;
+    let warnings = cleanup_warnings_to_java(env, explanation.warnings)?;
+
+    Ok(env.new_object(
+        "org/lance/cleanup/CleanupExplanation",
+        "(JLorg/lance/cleanup/RemovalStats;Ljava/util/List;ZJLjava/util/List;Ljava/util/List;)V",
+        &[
+            JValue::Long(explanation.read_version as i64),
+            JValue::Object(&stats),
+            JValue::Object(&candidate_files),
+            JValue::Bool(explanation.candidate_files_truncated as jboolean),
+            JValue::Long(explanation.candidate_file_limit as i64),
+            JValue::Object(&referenced_branches),
+            JValue::Object(&warnings),
+        ],
+    )?)
 }
 
 //////////////////////////////

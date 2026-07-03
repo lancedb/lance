@@ -443,9 +443,18 @@ impl MemTableFlusher {
                 if let MemIndexConfig::Hnsw(hnsw_config) = config
                     && let Some(mem_index) = registry.get_hnsw(&hnsw_config.name)
                 {
-                    let mut index_meta = self
+                    // `None` → the generation has no indexable vectors (e.g. all
+                    // tombstones); flush the data without an HNSW index for it.
+                    let Some(mut index_meta) = self
                         .create_hnsw_index(&gen_path, hnsw_config, mem_index)
-                        .await?;
+                        .await?
+                    else {
+                        info!(
+                            "Skipped empty HNSW index '{}' on flushed generation {} (no vectors)",
+                            hnsw_config.name, generation
+                        );
+                        continue;
+                    };
 
                     let schema = dataset.schema();
                     let field_idx = schema
@@ -641,7 +650,6 @@ impl MemTableFlusher {
         total_rows: usize,
     ) -> Result<Vec<IndexMetadata>> {
         use lance_index::pbold;
-        use lance_index::scalar::inverted::current_fts_format_version;
         use lance_index::scalar::lance_format::LanceIndexStore;
 
         let fts_configs: Vec<_> = index_configs
@@ -704,6 +712,7 @@ impl MemTableFlusher {
             })?;
 
             let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
+            let format_version = fts_cfg.params.resolved_format_version();
 
             let index_meta = IndexMetadata {
                 uuid: index_uuid,
@@ -712,7 +721,7 @@ impl MemTableFlusher {
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
-                index_version: current_fts_format_version().index_version() as i32,
+                index_version: format_version.index_version() as i32,
                 created_at: None,
                 base_id: None,
                 files: None,
@@ -739,22 +748,41 @@ impl MemTableFlusher {
         use arrow_schema::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        use lance_index::scalar::inverted::TokenSetFormat;
+        use lance_index::scalar::inverted::{
+            POSITIONS_CODEC_KEY, POSITIONS_CODEC_PACKED_DELTA_V1, POSITIONS_LAYOUT_KEY,
+            POSITIONS_LAYOUT_SHARED_STREAM_V2, POSTING_TAIL_CODEC_KEY, TokenSetFormat,
+        };
 
         // Create metadata with params and partitions in schema metadata (this is what InvertedIndex expects)
         let params_json = serde_json::to_string(&config.params)?;
         let partitions_json = serde_json::to_string(&[partition_id])?;
         let token_set_format = TokenSetFormat::default().to_string();
+        let format_version = config.params.resolved_format_version();
+        let mut metadata = [
+            ("params".to_string(), params_json),
+            ("partitions".to_string(), partitions_json),
+            ("token_set_format".to_string(), token_set_format),
+            (
+                POSTING_TAIL_CODEC_KEY.to_string(),
+                format_version.posting_tail_codec().as_str().to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        if config.params.has_positions() && format_version.uses_shared_position_stream() {
+            metadata.insert(
+                POSITIONS_LAYOUT_KEY.to_string(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_string(),
+            );
+            metadata.insert(
+                POSITIONS_CODEC_KEY.to_string(),
+                POSITIONS_CODEC_PACKED_DELTA_V1.to_string(),
+            );
+        }
 
         let schema = Arc::new(
-            Schema::new(vec![Field::new("_placeholder", DataType::Utf8, true)]).with_metadata(
-                [
-                    ("params".to_string(), params_json),
-                    ("partitions".to_string(), partitions_json),
-                    ("token_set_format".to_string(), token_set_format),
-                ]
-                .into(),
-            ),
+            Schema::new(vec![Field::new("_placeholder", DataType::Utf8, true)])
+                .with_metadata(metadata),
         );
 
         // Create a minimal batch (schema metadata is what matters)
@@ -782,12 +810,21 @@ impl MemTableFlusher {
     /// * `gen_path` - Path to the flushed generation folder
     /// * `config` - HNSW index configuration
     /// * `mem_index` - In-memory HNSW index (snapshotted, not consumed)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(None)` when the memtable holds no indexable vectors — e.g. a
+    /// generation of only tombstones (delete nulls the vector column and the
+    /// HNSW skips nulls), or an all-null vector column. The generation still
+    /// flushes its data; it simply carries no HNSW index, and an index-only
+    /// (`fast_search`) query over it returns empty — no brute-force scan.
+    /// Erroring here would fail the whole flush drain.
     async fn create_hnsw_index(
         &self,
         gen_path: &Path,
         config: &super::super::index::HnswIndexConfig,
         mem_index: &super::super::index::HnswMemIndex,
-    ) -> Result<IndexMetadata> {
+    ) -> Result<Option<IndexMetadata>> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::Float32Type;
         use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch as ArrowRecordBatch};
@@ -824,16 +861,16 @@ impl MemTableFlusher {
         let distance_type = mem_index.distance_type();
         let dim = mem_index.dim();
         if dim == 0 {
-            return Err(Error::invalid_input(
-                "HnswMemIndex has no inserted vectors; nothing to flush",
-            ));
+            // No vector was ever inserted (e.g. an all-tombstone generation):
+            // skip the index, keep the data flush.
+            return Ok(None);
         }
         // Forward-written data: HNSW row ids line up 1:1 with the data file, so
         // no position reversal (pass `None`).
         let Some((hnsw, flat_storage_batch)) = mem_index.to_lance_hnsw(None)? else {
-            return Err(Error::invalid_input(
-                "HnswMemIndex is empty; nothing to flush",
-            ));
+            // Every vector in the generation is null → empty graph; skip the
+            // index rather than failing the flush.
+            return Ok(None);
         };
 
         // Train SQ8 on the full memtable in one pass: learn global min/max
@@ -1014,7 +1051,7 @@ impl MemTableFlusher {
             files: None,
         };
 
-        Ok(index_meta)
+        Ok(Some(index_meta))
     }
 
     /// Update the shard manifest with the new flushed generation.

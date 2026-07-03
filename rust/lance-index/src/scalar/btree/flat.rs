@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeSet, HashMap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BTreeSet;
 use std::{ops::Bound, sync::Arc};
 
 use arrow_array::Array;
@@ -133,10 +134,7 @@ impl FlatIndex {
         NullableRowAddrSet::new(self.all_addrs_map.clone(), Default::default())
     }
 
-    pub fn remap_batch(
-        batch: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<RecordBatch> {
+    pub fn remap_batch(batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {
         let row_ids = batch.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
         let val_idx_and_new_id = row_ids
             .values()
@@ -144,8 +142,7 @@ impl FlatIndex {
             .enumerate()
             .filter_map(|(idx, old_id)| {
                 mapping
-                    .get(old_id)
-                    .copied()
+                    .get(*old_id)
                     .unwrap_or(Some(*old_id))
                     .map(|new_id| (idx, new_id))
             })
@@ -346,7 +343,11 @@ mod tests {
     use super::*;
     use arrow_array::{record_batch, types::Int32Type};
     use datafusion_common::ScalarValue;
+    use lance_core::utils::row_addr_remap::GroupInput;
     use lance_datagen::{RowCount, array, gen_batch};
+    use roaring::RoaringTreemap;
+    use rstest::rstest;
+    use std::collections::HashMap;
 
     fn example_index() -> FlatIndex {
         let batch = gen_batch()
@@ -490,9 +491,10 @@ mod tests {
         // 3 -> delete
         // Keep remaining as is
         let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![(0, Some(2000)), (3, None)]);
-        let remapped =
-            FlatIndex::try_new(FlatIndex::remap_batch((*index.data).clone(), &mapping).unwrap())
-                .unwrap();
+        let remapped = FlatIndex::try_new(
+            FlatIndex::remap_batch((*index.data).clone(), &RowAddrRemap::direct(mapping)).unwrap(),
+        )
+        .unwrap();
 
         let expected = FlatIndex::try_new(
             gen_batch()
@@ -505,18 +507,22 @@ mod tests {
         assert_eq!(remapped.data, expected.data);
     }
 
-    // It's possible, during compaction, that an entire page of values is deleted.  We just serialize
-    // it as an empty record batch.
-    #[tokio::test]
-    async fn test_remap_to_nothing() {
+    // An entire page (frag 0) is deleted during compaction. remap_batch must
+    // drop every row regardless of which RowAddrRemap mode expresses it.
+    // example_index holds row ids 5, 0, 3, 100, all in frag 0.
+    #[rstest]
+    #[case::compact(RowAddrRemap::compact([GroupInput {
+        rewritten_old_row_addrs: RoaringTreemap::new(),
+        old_frag_ids: vec![0],
+        new_frags: vec![],
+    }])
+    .unwrap())]
+    #[case::explicit(RowAddrRemap::direct(
+        [5u64, 0, 3, 100].into_iter().map(|id| (id, None)).collect(),
+    ))]
+    fn test_remap_to_nothing(#[case] remap: RowAddrRemap) {
         let index = example_index();
-        let mapping = HashMap::<u64, Option<u64>>::from_iter(vec![
-            (5, None),
-            (0, None),
-            (3, None),
-            (100, None),
-        ]);
-        let remapped = FlatIndex::remap_batch((*index.data).clone(), &mapping).unwrap();
+        let remapped = FlatIndex::remap_batch((*index.data).clone(), &remap).unwrap();
         assert_eq!(remapped.num_rows(), 0);
     }
 

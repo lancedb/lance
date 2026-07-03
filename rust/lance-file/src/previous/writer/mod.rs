@@ -29,6 +29,7 @@ use tokio::io::AsyncWriteExt;
 use crate::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::previous::format::metadata::{Metadata, StatisticsMetadata};
 use crate::previous::page_table::{PageInfo, PageTable};
+use crate::writer::FileWriteSummary;
 
 /// The file format currently includes a "manifest" where it stores the schema for
 /// self-describing files.  Historically this has been a table format manifest that
@@ -243,23 +244,29 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
     pub async fn finish_with_metadata(
         &mut self,
         metadata: &HashMap<String, String>,
-    ) -> Result<usize> {
+    ) -> Result<FileWriteSummary> {
         self.schema
             .metadata
             .extend(metadata.iter().map(|(k, y)| (k.clone(), y.clone())));
         self.finish().await
     }
 
-    pub async fn finish(&mut self) -> Result<usize> {
+    pub async fn finish(&mut self) -> Result<FileWriteSummary> {
         self.write_footer().await?;
-        Writer::shutdown(self.object_writer.as_mut()).await?;
+        // `shutdown` flushes the footer and reports the authoritative on-disk
+        // byte count, so the size is sourced here instead of via a later
+        // `tell()` that would rely on the cursor surviving shutdown.
+        let write_result = Writer::shutdown(self.object_writer.as_mut()).await?;
         let num_rows = self
             .metadata
             .batch_offsets
             .last()
             .cloned()
             .unwrap_or_default();
-        Ok(num_rows as usize)
+        Ok(FileWriteSummary {
+            num_rows: num_rows as u64,
+            size_bytes: write_result.size as u64,
+        })
     }
 
     /// Total records written in this file.

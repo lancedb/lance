@@ -38,6 +38,7 @@ use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
 use crate::Dataset;
+use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::blob::{
     BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
@@ -1010,12 +1011,13 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
     validate_external_blob_write_params(&params)?;
+    let normalized_converted_schema = normalize_prepared_blob_schema(&converted_schema)?;
 
     let (schema, storage_version) = if let Some(dataset) = dataset {
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
-                converted_schema.check_compatible(
+                normalized_converted_schema.check_compatible(
                     dataset.schema(),
                     &SchemaCompareOptions {
                         // We don't care if the user claims their data is nullable / non-nullable.  We will
@@ -1027,9 +1029,12 @@ pub async fn write_fragments_internal(
                         ..Default::default()
                     },
                 )?;
-                validate_blob_threshold_metadata_for_append(&converted_schema, dataset.schema())?;
+                validate_blob_threshold_metadata_for_append(
+                    &normalized_converted_schema,
+                    dataset.schema(),
+                )?;
                 let write_schema = dataset.schema().project_by_schema(
-                    &converted_schema,
+                    &normalized_converted_schema,
                     OnMissing::Error,
                     OnTypeMismatch::Error,
                 )?;
@@ -1050,13 +1055,16 @@ pub async fn write_fragments_internal(
                         .data_storage_format
                         .lance_file_version()?,
                 );
-                (converted_schema, data_storage_version)
+                (normalized_converted_schema, data_storage_version)
             }
         }
     } else {
         // Brand new dataset, use the schema from the data and the storage version
         // from the user or the default.
-        (converted_schema, params.storage_version_or_default())
+        (
+            normalized_converted_schema,
+            params.storage_version_or_default(),
+        )
     };
 
     if storage_version < LanceFileVersion::V2_2 && schema.fields_pre_order().any(|f| f.is_blob_v2())
@@ -1140,14 +1148,13 @@ where
         Ok(self.writer.tell().await? as u64)
     }
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
-        let num_rows = self.writer.finish().await? as u32;
-        let size_bytes = self.writer.tell().await?;
+        let summary = self.writer.finish().await?;
         Ok((
-            num_rows,
+            summary.num_rows as u32,
             DataFile::new_legacy(
                 self.path.clone(),
                 self.writer.schema(),
-                NonZero::new(size_bytes as u64),
+                NonZero::new(summary.size_bytes),
                 self.base_id,
             ),
         ))

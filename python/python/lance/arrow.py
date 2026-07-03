@@ -4,10 +4,12 @@
 """Extensions to PyArrows."""
 
 import json
+import typing
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from ._arrow.bf16 import (  # noqa: F401
     BFloat16,
@@ -19,8 +21,10 @@ from .dependencies import numpy as np
 from .lance import bfloat16_array
 
 __all__ = [
+    "BFloat16",
     "BFloat16Array",
     "BFloat16Type",
+    "PandasBFloat16Array",
     "bfloat16_array",
     "cast",
     "EncodedImageType",
@@ -220,14 +224,15 @@ class ImageURIArray(ImageArray):
         <lance.arrow.ImageURIArray object at 0x...>
         ['file::///tmp/1.png']
         """
+        storage: pa.Array
         if isinstance(uris, (pa.StringArray, pa.LargeStringArray)):
-            pass
+            storage = uris
         elif isinstance(uris, Iterable):
-            uris = pa.array((str(uri) for uri in uris), type=pa.string())
+            storage = pa.array((str(uri) for uri in uris), type=pa.string())
         else:
             raise TypeError("Cannot build a ImageURIArray from {}".format(type(uris)))
 
-        return cls.from_storage(ImageURIType(uris.type), uris)
+        return cls.from_storage(ImageURIType(storage.type), storage)
 
     def read_uris(self, storage_type=pa.binary()) -> "EncodedImageArray":
         """
@@ -268,7 +273,8 @@ class ImageURIArray(ImageArray):
                     print("Failed to reach the server: ", e.reason)
                 elif hasattr(e, "code"):
                     print(
-                        "The server could not fulfill the request. Error code: ", e.code
+                        "The server could not fulfill the request. Error code: ",
+                        getattr(e, "code"),
                     )
 
         images = []
@@ -277,7 +283,9 @@ class ImageURIArray(ImageArray):
             if parsed_uri.scheme in ("http", "https"):
                 images.append(download(uri))
             else:
-                filesystem, path = fs.FileSystem.from_uri(uri.as_py())
+                filesystem, path = fs.FileSystem.from_uri(  # pyright: ignore[reportPrivateImportUsage]
+                    uri.as_py()
+                )
                 with filesystem.open_input_stream(path) as f:
                     images.append(f.read())
 
@@ -297,7 +305,7 @@ class EncodedImageArray(ImageArray):
         def pillow_metadata_decoder(images):
             import io
 
-            from PIL import Image
+            from PIL import Image  # pyright: ignore[reportMissingImports]
 
             img = Image.open(io.BytesIO(images[0].as_py()))
             return img
@@ -365,22 +373,27 @@ class EncodedImageArray(ImageArray):
 
         if not decoder:
 
-            def pillow_decoder(images):
+            def pillow_decoder(images) -> "np.ndarray":
                 import io
 
-                from PIL import Image
+                from PIL import Image  # pyright: ignore[reportMissingImports]
 
                 return np.stack(
-                    [Image.open(io.BytesIO(img)) for img in images.to_pylist()]
+                    [
+                        np.asarray(Image.open(io.BytesIO(img)))
+                        for img in images.to_pylist()
+                    ]
                 )
 
-            def tensorflow_decoder(images):
+            def tensorflow_decoder(images) -> "np.ndarray":
                 import tensorflow as tf
 
                 decoded_to_tensor = tuple(
                     tf.io.decode_image(img) for img in images.to_pylist()
                 )
-                return tf.stack(decoded_to_tensor, axis=0).numpy()
+                return tf.stack(  # pyright: ignore[reportOptionalCall]
+                    decoded_to_tensor, axis=0
+                ).numpy()
 
             decoders = [
                 ("tensorflow", tensorflow_decoder),
@@ -401,9 +414,10 @@ class EncodedImageArray(ImageArray):
 
         image_array = decoder(self.storage)
         if isinstance(image_array, pa.FixedShapeTensorType):
-            shape = image_array.shape
-            arrow_type = image_array.storage_type
-            tensor_array = image_array
+            tensor = typing.cast("pa.Array", image_array)
+            shape = tensor.shape
+            arrow_type = tensor.storage_type
+            tensor_array = tensor
         else:
             shape = image_array.shape[1:]
             arrow_type = pa.from_numpy_dtype(image_array.dtype)
@@ -476,7 +490,7 @@ class FixedShapeImageTensorArray(ImageArray):
         def pillow_encoder(x):
             import io
 
-            from PIL import Image
+            from PIL import Image  # pyright: ignore[reportMissingImports]
 
             encoded_images = []
             for y in x:
@@ -571,7 +585,8 @@ def cast(
                 + f"got: {target_type}"
             )
         np_arr = arr.to_numpy()
-        float_arr = np_arr.astype(target_type.to_pandas_dtype())
+        float_type = typing.cast("pa.DataType", target_type)
+        float_arr = np_arr.astype(float_type.to_pandas_dtype())
         return pa.array(float_arr)
     elif isinstance(target_type, BFloat16Type) or target_type in ["bfloat16", "bf16"]:
         if not pa.types.is_floating(arr.type):
@@ -586,15 +601,16 @@ def cast(
         target_type
     ):
         # Casting fixed size list to fixed size list
-        if arr.type.list_size != target_type.list_size:
+        list_type = typing.cast("pa.DataType", target_type)
+        if arr.type.list_size != list_type.list_size:
             raise ValueError(
                 "Only support casting fixed size list to fixed size list "
                 f"with the same size, got: {arr.type} to {target_type}"
             )
-        values = cast(arr.values, target_type.value_type)
+        values = cast(arr.values, list_type.value_type)
         return pa.FixedSizeListArray.from_arrays(
-            values=values, list_size=target_type.list_size
+            values=values, list_size=list_type.list_size
         )
 
     # Fallback to normal cast.
-    return pa.compute.cast(arr, target_type, *args, **kwargs)
+    return pc.cast(arr, target_type, *args, **kwargs)

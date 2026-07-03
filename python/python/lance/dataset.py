@@ -51,6 +51,7 @@ from .dependencies import pandas as pd
 from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
+    CleanupExplanation,
     CleanupStats,
     Compaction,
     CompactionMetrics,
@@ -993,6 +994,16 @@ class LanceDataset(pa.dataset.Dataset):
     def describe_indices(self) -> List[IndexDescription]:
         """Returns index information for all indices in the dataset."""
         return self._ds.describe_indices()
+
+    def remap_row_addrs(self, addrs: "pa.Array") -> "Optional[pa.Array]":
+        """Remap row addresses across compactions still recorded in the
+        fragment-reuse index. Rows a compaction dropped become null. The index
+        retains only recent rounds (older ones are pruned as index remap catches
+        up), so remap promptly: an address whose round was pruned is returned
+        unchanged, not remapped. Returns ``None`` when there is no fragment-reuse
+        index.
+        """
+        return self._ds.remap_row_addrs(addrs)
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -2111,6 +2122,10 @@ class LanceDataset(pa.dataset.Dataset):
         this API allows you to open binary blob data as a regular Python file-like
         object. For more details, see :py:class:`lance.BlobFile`.
 
+        If you plan to read each selected blob completely with ``read()`` or
+        ``readall()``, use :py:meth:`read_blobs` instead. It materializes blob
+        payloads with Lance's planned batched reader.
+
         Exactly one of ids, addresses, or indices must be specified.
 
         Parameters
@@ -2159,7 +2174,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Unlike :py:meth:`take_blobs`, which returns file-like :py:class:`lance.BlobFile`
         handles for random access, this API plans and executes batched reads and
-        returns materialized blob payloads.
+        returns materialized blob payloads. Use this API for training loaders,
+        batch preprocessing, and other workflows that need complete blob bytes.
 
         Exactly one of ids, addresses, or indices must be specified.
 
@@ -2979,6 +2995,64 @@ class LanceDataset(pa.dataset.Dataset):
             delete_rate_limit,
         )
 
+    def explain_cleanup_old_versions(
+        self,
+        older_than: Optional[timedelta] = None,
+        retain_versions: Optional[int] = None,
+        *,
+        delete_unverified: bool = False,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+        include_files: bool = False,
+        max_files: int = 1000,
+    ) -> CleanupExplanation:
+        """
+        Explain what :meth:`cleanup_old_versions` would remove without deleting files.
+
+        Parameters
+        ----------
+
+        older_than: timedelta, optional
+            Only versions older than this would be removed. If ``older_than`` and
+            ``retain_versions`` are not specified, this will default to two weeks.
+
+        retain_versions: int, optional
+            Retain the last N versions of the dataset.
+
+        delete_unverified: bool, default False
+            Include unverified files that cleanup would remove when this is set.
+
+        error_if_tagged_old_versions: bool, default True
+            If set to `True`, an exception will be raised if any tagged versions
+            match the parameters. Otherwise, tagged versions will be ignored.
+
+        delete_rate_limit: int, optional
+            Accepted for parity with :meth:`cleanup_old_versions`; no deletes are
+            issued by explain.
+
+        include_files: bool, default False
+            If `True`, include candidate files in the explanation up to
+            ``max_files`` entries. Aggregate stats always include all candidates.
+
+        max_files: int, default 1000
+            Maximum number of candidate files to include when ``include_files``
+            is `True`.
+        """
+        if older_than is None and retain_versions is None:
+            older_than = timedelta(days=14)
+        if max_files <= 0:
+            raise ValueError("max_files must be positive")
+
+        return self._ds.explain_cleanup_old_versions(
+            td_to_micros(older_than) if older_than else None,
+            retain_versions,
+            delete_unverified,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+            include_files,
+            max_files,
+        )
+
     def _prepare_scalar_index_request(
         self,
         column: Union[str, List[str]],
@@ -3035,12 +3109,13 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_floating(field_type)
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
+                    and not pa.types.is_large_string(field_type)
                     and not pa.types.is_temporal(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
-                        f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, fixed-size-binary, or temporal ",
+                        f"BTREE/BITMAP/ZONEMAP index column {column} must be int",
+                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
                 if not pa.types.is_list(field_type):
@@ -3134,6 +3209,7 @@ class LanceDataset(pa.dataset.Dataset):
         fragment_ids: Optional[List[int]] = None,
         index_uuid: Optional[str] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
+        format_version: Optional[Union[int, str]] = None,
         **kwargs,
     ):
         """Create a scalar index on a column.
@@ -3168,7 +3244,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 5 types of scalar indices available today.
+        Lance supports the following scalar index types:
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -3239,6 +3315,11 @@ class LanceDataset(pa.dataset.Dataset):
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
+        format_version: int or str, optional
+            This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
+            format version to write when creating a new index. Accepts ``1``,
+            ``2``, ``"v1"``, or ``"v2"``. If unset, Lance chooses the current
+            default format.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -3267,6 +3348,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "icu": ICU dictionary-based Unicode word segmentation.
+            * "icu/split": ICU segmentation with simple-style delimiter splitting.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
@@ -3344,6 +3427,8 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["index_uuid"] = index_uuid
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
+        if format_version is not None:
+            kwargs["format_version"] = format_version
 
         self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
 
