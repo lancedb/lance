@@ -2028,6 +2028,38 @@ impl Dataset {
             field.is_blob() || field.children.iter().any(field_contains_blob)
         }
 
+        fn field_names_match(
+            fields: &[lance_core::datatypes::Field],
+            start: usize,
+            names: &[&str],
+        ) -> bool {
+            fields
+                .get(start..start + names.len())
+                .is_some_and(|candidate| {
+                    candidate
+                        .iter()
+                        .zip(names)
+                        .all(|(field, name)| field.name == *name)
+                })
+        }
+
+        fn blob_descriptor_orphan_len(
+            fields: &[lance_core::datatypes::Field],
+            start: usize,
+        ) -> usize {
+            const BLOB_V2_DESCRIPTOR_FIELDS: &[&str] =
+                &["kind", "position", "size", "blob_id", "blob_uri"];
+            const BLOB_V1_DESCRIPTOR_FIELDS: &[&str] = &["position", "size"];
+
+            if field_names_match(fields, start, BLOB_V2_DESCRIPTOR_FIELDS) {
+                BLOB_V2_DESCRIPTOR_FIELDS.len()
+            } else if field_names_match(fields, start, BLOB_V1_DESCRIPTOR_FIELDS) {
+                BLOB_V1_DESCRIPTOR_FIELDS.len()
+            } else {
+                0
+            }
+        }
+
         fn collect_columns(
             field: &lance_core::datatypes::Field,
             is_structural: bool,
@@ -2119,12 +2151,13 @@ impl Dataset {
             idx += 1;
 
             if has_footer_orphans && field_contains_blob(field) {
-                while let Some(orphan_child) = file_schema_fields.get(idx) {
-                    if dataset_schema.field(&orphan_child.name).is_some() {
+                loop {
+                    let skipped = blob_descriptor_orphan_len(file_schema_fields, idx);
+                    if skipped == 0 {
                         break;
                     }
-                    consumed_top_level_fields = idx + 1;
-                    idx += 1;
+                    consumed_top_level_fields = idx + skipped;
+                    idx += skipped;
                 }
             }
         }

@@ -2179,7 +2179,8 @@ mod tests {
     };
     use arrow_array::RecordBatch;
     use arrow_array::{
-        Array, ArrayRef, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+        Array, ArrayRef, RecordBatchIterator, StringArray, StructArray, UInt8Array, UInt32Array,
+        UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
@@ -3496,6 +3497,95 @@ mod tests {
             b"nested-replacement"
         );
         assert_eq!(blobs[0].kind(), BlobKind::Packed);
+    }
+
+    #[tokio::test]
+    async fn test_create_data_file_skips_blob_orphans_with_top_level_name_collision() {
+        let test_dir = TempStrDir::default();
+        let mut initial_builder = BlobArrayBuilder::new(1);
+        initial_builder.push_bytes(b"initial").unwrap();
+        let (_, initial_info_batch) = nested_blob_v2_batch(initial_builder.finish().unwrap());
+        let info_field = initial_info_batch.schema().field(0).as_ref().clone();
+        let logical_schema = Arc::new(Schema::new(vec![
+            info_field,
+            Field::new("kind", DataType::UInt8, false),
+        ]));
+        let initial_batch = RecordBatch::try_new(
+            logical_schema.clone(),
+            vec![
+                initial_info_batch.column(0).clone(),
+                Arc::new(UInt8Array::from(vec![7])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(initial_batch)], logical_schema.clone()),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let file_id = Uuid::new_v4().to_string();
+        let data_file_name = format!("{file_id}.lance");
+        let data_file_path = dataset.data_dir().join(data_file_name.as_str());
+        let blob_session = LanceBlobSession::try_new(
+            dataset.object_store.as_ref().clone(),
+            data_file_path.clone(),
+        )
+        .unwrap();
+        let mut blob_writer = blob_session.open_writer("blob");
+        blob_writer
+            .push_inline(Bytes::from_static(b"replacement"))
+            .unwrap();
+        let prepared_column = blob_writer.finish().unwrap();
+        let (prepared_field, prepared_array) = prepared_column.into_parts();
+
+        let info_fields = vec![Field::new("name", DataType::Utf8, false), prepared_field];
+        let info_array = Arc::new(
+            StructArray::try_new(
+                info_fields.clone().into(),
+                vec![
+                    Arc::new(StringArray::from(vec!["replacement"])) as ArrayRef,
+                    prepared_array,
+                ],
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let replacement_schema = Arc::new(Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(info_fields.into()),
+            true,
+        )]));
+        let replacement_batch =
+            RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
+
+        let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+        let mut file_writer = FileWriter::try_new(
+            object_writer,
+            crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        file_writer.write_batch(&replacement_batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let data_file = dataset
+            .create_data_file(&data_file_name, None)
+            .await
+            .unwrap();
+
+        assert_eq!(data_file.fields.len(), 2);
+        assert_eq!(data_file.column_indices.as_ref(), &[0, 1]);
     }
 
     #[tokio::test]
