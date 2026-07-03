@@ -43,7 +43,10 @@ use inserted_rows::KeyExistenceFilter;
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
-use super::{CommitBuilder, WriteParams, write_fragments_internal};
+use super::{
+    CommitBuilder, TargetBaseInfo, WriteMode, WriteParams, validate_and_resolve_target_bases,
+    write_fragments_internal,
+};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::utils::CapturedRowIds;
@@ -351,6 +354,11 @@ struct MergeInsertParams {
     source_dedupe_behavior: SourceDedupeBehavior,
     // Number of inner commit retries for manifest version conflicts. Default is 20.
     commit_retries: Option<u32>,
+    // Target base IDs for routing new fragments, mirroring WriteParams::target_bases.
+    target_bases: Option<Vec<u32>>,
+    // Target base names or path URIs (unresolved), mirroring
+    // WriteParams::target_base_names_or_paths. Resolved at execution time.
+    target_base_names_or_paths: Option<Vec<String>>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -471,6 +479,8 @@ impl MergeInsertBuilder {
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
                 commit_retries: None,
+                target_bases: None,
+                target_base_names_or_paths: None,
             },
         })
     }
@@ -569,6 +579,31 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Write new fragments produced by this merge insert to these base IDs.
+    ///
+    /// New data files are distributed across the target bases round-robin,
+    /// the same way a normal write with [`WriteParams::target_bases`] routes
+    /// them. The IDs must be registered in the dataset manifest. Data files
+    /// that patch existing fragments and deletion files are always written to
+    /// the dataset's primary storage.
+    ///
+    /// Cannot be combined with [`Self::target_base_names_or_paths`].
+    pub fn target_bases(&mut self, base_ids: Vec<u32>) -> &mut Self {
+        self.params.target_bases = Some(base_ids);
+        self
+    }
+
+    /// Like [`Self::target_bases`], but referencing bases by name or path URI.
+    ///
+    /// References are resolved against the base paths registered in the
+    /// dataset manifest when the merge insert executes.
+    ///
+    /// Cannot be combined with [`Self::target_bases`].
+    pub fn target_base_names_or_paths(&mut self, refs: Vec<String>) -> &mut Self {
+        self.params.target_base_names_or_paths = Some(refs);
+        self
+    }
+
     /// Crate a merge insert job
     pub fn try_build(&mut self) -> Result<MergeInsertJob> {
         if !self.params.insert_not_matched
@@ -579,11 +614,42 @@ impl MergeInsertBuilder {
                 "The merge insert job is not configured to change the data in any way",
             ));
         }
+        if self.params.target_bases.is_some() && self.params.target_base_names_or_paths.is_some() {
+            return Err(Error::invalid_input(
+                "Cannot specify both target_base_names_or_paths and target_bases. Use one or the other.",
+            ));
+        }
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
         })
     }
+}
+
+/// Resolve the merge insert target bases against the base paths registered in
+/// the dataset manifest. Returns `None` when no target bases were requested.
+///
+/// Resolution runs once per execution attempt so retries validate against the
+/// manifest version they are writing to.
+async fn resolve_target_bases(
+    dataset: &Dataset,
+    params: &MergeInsertParams,
+) -> Result<Option<Vec<TargetBaseInfo>>> {
+    if params.target_bases.is_none() && params.target_base_names_or_paths.is_none() {
+        return Ok(None);
+    }
+    // Reuse the normal write path resolution (validation, name/path lookup,
+    // and per-base credential handling) through a parameter shim.
+    let mut write_params = WriteParams {
+        mode: WriteMode::Append,
+        target_bases: params.target_bases.clone(),
+        target_base_names_or_paths: params.target_base_names_or_paths.clone(),
+        session: Some(dataset.session.clone()),
+        store_params: dataset.store_params.as_deref().cloned(),
+        base_store_params: dataset.base_store_params.as_deref().cloned(),
+        ..Default::default()
+    };
+    validate_and_resolve_target_bases(&mut write_params, Some(&dataset.manifest.base_paths)).await
 }
 
 enum SchemaComparison {
@@ -981,7 +1047,11 @@ impl MergeInsertJob {
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
         current_version: u64,
+        target_bases_info: Option<Vec<TargetBaseInfo>>,
     ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
+        // Shared across the per-group tasks spawned below; only new fragments
+        // are routed to target bases, column patches stay in primary storage.
+        let target_bases_info = Arc::new(target_bases_info);
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(&LanceExecutionOptions {
@@ -1241,6 +1311,7 @@ impl MergeInsertJob {
                 batches: Vec<RecordBatch>,
                 new_fragments: Arc<Mutex<Vec<Fragment>>>,
                 reservation_size: usize,
+                target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -1272,7 +1343,7 @@ impl MergeInsertJob {
                     write_schema,
                     stream,
                     Default::default(), // TODO: support write params.
-                    None,               // Merge insert doesn't use target_bases
+                    (*target_bases_info).clone(),
                 )
                 .await?;
 
@@ -1345,6 +1416,7 @@ impl MergeInsertJob {
                         batches,
                         new_fragments.clone(),
                         memory_size,
+                        target_bases_info.clone(),
                     );
                     tasks.spawn(fut);
                 }
@@ -1767,6 +1839,8 @@ impl MergeInsertJob {
             });
         }
 
+        let target_bases_info = resolve_target_bases(&self.dataset, &self.params).await?;
+
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
@@ -1868,6 +1942,7 @@ impl MergeInsertJob {
                 self.dataset.clone(),
                 Box::pin(stream),
                 self.dataset.manifest.version + 1,
+                target_bases_info,
             )
             .await?;
 
@@ -1893,7 +1968,7 @@ impl MergeInsertJob {
                 self.dataset.schema().clone(),
                 Box::pin(stream),
                 WriteParams::default(),
-                None, // Merge insert doesn't use target_bases
+                target_bases_info,
             )
             .await?;
 

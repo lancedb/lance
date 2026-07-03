@@ -36,7 +36,7 @@ use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, Fragment};
+use lance_table::format::{BasePath, DataFile, Fragment};
 
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use futures::TryStreamExt;
@@ -3404,4 +3404,632 @@ async fn test_fts_unfiltered_after_compaction_returns_remapped_row_ids() {
     for id in &returned {
         assert!(live.contains(id), "stale row_id {id}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-base tests: merge insert on datasets whose data lives across multiple
+// registered base paths, with and without routing new fragments to bases.
+// ---------------------------------------------------------------------------
+
+/// Fixture: primary storage plus two external bases. base1 is a dataset-root
+/// style base (files under `{base1}/data/`), base2 is a plain data directory
+/// (files directly under `{base2}/`). Initial data: ids 0..6 in two fragments
+/// in base1, ids 6..9 in one fragment in primary storage.
+struct MultiBaseFixture {
+    _tmp: TempDir,
+    dataset: Dataset,
+    base1_dir: std::path::PathBuf,
+    base2_dir: std::path::PathBuf,
+}
+
+fn multi_base_schema() -> Arc<ArrowSchema> {
+    Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("a", DataType::Int32, false),
+        ArrowField::new("b", DataType::Utf8, true),
+    ]))
+}
+
+fn multi_base_batch(ids: &[i32], a_offset: i32, b_prefix: &str) -> RecordBatch {
+    RecordBatch::try_new(
+        multi_base_schema(),
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(Int32Array::from(
+                ids.iter().map(|id| id + a_offset).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter()
+                    .map(|id| format!("{}{}", b_prefix, id))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+async fn multi_base_fixture(indexed: bool) -> MultiBaseFixture {
+    let tmp = TempDir::default();
+    let primary_dir = tmp.std_path().join("primary");
+    let base1_dir = tmp.std_path().join("base1");
+    let base2_dir = tmp.std_path().join("base2");
+    std::fs::create_dir_all(&base1_dir).unwrap();
+    std::fs::create_dir_all(&base2_dir).unwrap();
+    let primary_uri = format!("file://{}", primary_dir.display());
+
+    let reader = RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[0, 1, 2, 3, 4, 5], 100, "orig"))],
+        multi_base_schema(),
+    );
+    let dataset = Dataset::write(
+        reader,
+        &primary_uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            max_rows_per_file: 3,
+            initial_bases: Some(vec![
+                BasePath {
+                    id: 1,
+                    name: Some("base1".to_string()),
+                    is_dataset_root: true,
+                    path: format!("file://{}", base1_dir.display()),
+                },
+                BasePath {
+                    id: 2,
+                    name: Some("base2".to_string()),
+                    is_dataset_root: false,
+                    path: format!("file://{}", base2_dir.display()),
+                },
+            ]),
+            target_bases: Some(vec![1]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[6, 7, 8], 100, "orig"))],
+        multi_base_schema(),
+    );
+    let mut dataset = Dataset::write(
+        reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    if indexed {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let fragments = dataset.get_fragments();
+    assert_eq!(fragments.len(), 3);
+    for fragment in &fragments[..2] {
+        for file in &fragment.metadata.files {
+            assert_eq!(file.base_id, Some(1));
+        }
+    }
+    for file in &fragments[2].metadata.files {
+        assert_eq!(file.base_id, None);
+    }
+
+    MultiBaseFixture {
+        _tmp: tmp,
+        dataset,
+        base1_dir,
+        base2_dir,
+    }
+}
+
+/// Collect (id, a, b) rows sorted by id.
+async fn collect_multi_base_rows(dataset: &Dataset) -> Vec<(i32, i32, Option<String>)> {
+    let mut scan = dataset.scan();
+    scan.project(&["id", "a", "b"]).unwrap();
+    let batches = scan
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let mut rows = vec![];
+    for batch in batches {
+        let ids = batch.column(0).as_primitive::<Int32Type>();
+        let a = batch.column(1).as_primitive::<Int32Type>();
+        let b = batch.column(2).as_string::<i32>();
+        for i in 0..batch.num_rows() {
+            let b_val = if b.is_null(i) {
+                None
+            } else {
+                Some(b.value(i).to_string())
+            };
+            rows.push((ids.value(i), a.value(i), b_val));
+        }
+    }
+    rows.sort_unstable();
+    rows
+}
+
+fn expected_row(id: i32, a_offset: i32, b_prefix: &str) -> (i32, i32, Option<String>) {
+    (id, id + a_offset, Some(format!("{}{}", b_prefix, id)))
+}
+
+/// Merge insert against a multi-base table without routing: every path must
+/// read fragments from external bases correctly and write all new files to
+/// primary storage with no base id. `indexed` toggles the v2 plan path
+/// (false) vs the legacy indexed-scan path (true).
+#[rstest]
+#[tokio::test]
+async fn test_merge_insert_on_multi_base_table(#[values(false, true)] indexed: bool) {
+    let fixture = multi_base_fixture(indexed).await;
+    let dataset = Arc::new(fixture.dataset);
+
+    // Update one row in each existing fragment (two in base1, one in
+    // primary), insert two new rows.
+    let source = multi_base_batch(&[1, 4, 7, 10, 11], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, stats) = job.execute(reader_to_stream(reader)).await.unwrap();
+
+    assert_eq!(stats.num_updated_rows, 3);
+    assert_eq!(stats.num_inserted_rows, 2);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 11);
+
+    for fragment in dataset.get_fragments() {
+        let metadata = &fragment.metadata;
+        if metadata.id >= 3 {
+            // Fragments written by the merge live in primary storage.
+            for file in &metadata.files {
+                assert_eq!(file.base_id, None);
+            }
+        } else {
+            // Pre-existing fragments keep their base and get local deletion
+            // files for the rewritten rows.
+            let expected_base = if metadata.id < 2 { Some(1) } else { None };
+            for file in &metadata.files {
+                assert_eq!(file.base_id, expected_base);
+            }
+            let deletion = metadata.deletion_file.as_ref().unwrap();
+            assert_eq!(deletion.base_id, None);
+        }
+    }
+
+    let mut expected = vec![];
+    for id in [0, 2, 3, 5, 6, 8] {
+        expected.push(expected_row(id, 100, "orig"));
+    }
+    for id in [1, 4, 7, 10, 11] {
+        expected.push(expected_row(id, 1000, "new"));
+    }
+    expected.sort_unstable();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+
+    // Re-open from scratch to make sure the result is readable without any
+    // cached state.
+    let dataset = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+}
+
+/// Merge insert routing new fragments to target bases, by id and by name,
+/// covering both base layouts (dataset-root and plain data directory).
+#[rstest]
+#[tokio::test]
+async fn test_merge_insert_route_to_target_bases(#[values(false, true)] indexed: bool) {
+    let fixture = multi_base_fixture(indexed).await;
+    let dataset = Arc::new(fixture.dataset);
+
+    let source = multi_base_batch(&[1, 4, 10, 11], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![2])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, stats) = job.execute(reader_to_stream(reader)).await.unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    assert_eq!(stats.num_inserted_rows, 2);
+
+    // New fragments land in base2, which is a plain data directory, so the
+    // files sit directly under it.
+    let mut merge_files = 0;
+    for fragment in dataset.get_fragments() {
+        let metadata = &fragment.metadata;
+        if metadata.id >= 3 {
+            for file in &metadata.files {
+                assert_eq!(file.base_id, Some(2));
+                let on_disk = fixture.base2_dir.join(file.path.as_str());
+                assert!(on_disk.exists(), "missing data file {:?}", on_disk);
+                merge_files += 1;
+            }
+        }
+    }
+    assert!(merge_files > 0);
+
+    let max_fragment_id = dataset.manifest.max_fragment_id().unwrap();
+
+    // A second merge referencing a base by name: base1 is a dataset-root
+    // base, so files go under `{base1}/data/`.
+    let source = multi_base_batch(&[12, 13], 1000, "new");
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_base_names_or_paths(vec!["base1".to_string()])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(source)],
+        multi_base_schema(),
+    ));
+    let (dataset, stats) = job.execute(reader_to_stream(reader)).await.unwrap();
+    assert_eq!(stats.num_inserted_rows, 2);
+
+    let mut merge_files = 0;
+    for fragment in dataset.get_fragments() {
+        let metadata = &fragment.metadata;
+        if metadata.id > max_fragment_id {
+            for file in &metadata.files {
+                assert_eq!(file.base_id, Some(1));
+                let on_disk = fixture.base1_dir.join("data").join(file.path.as_str());
+                assert!(on_disk.exists(), "missing data file {:?}", on_disk);
+                merge_files += 1;
+            }
+        }
+    }
+    assert!(merge_files > 0);
+
+    let mut expected = vec![];
+    for id in [0, 2, 3, 5, 6, 7, 8] {
+        expected.push(expected_row(id, 100, "orig"));
+    }
+    for id in [1, 4, 10, 11, 12, 13] {
+        expected.push(expected_row(id, 1000, "new"));
+    }
+    expected.sort_unstable();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+
+    let dataset = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+}
+
+/// Partial-schema merge insert on a multi-base table: column patches for
+/// existing fragments stay in primary storage (mixing with data files in
+/// external bases within the same fragment) while inserted rows route to the
+/// requested base. Requires an index on the join key to reach the in-place
+/// update path.
+#[tokio::test]
+async fn test_merge_insert_partial_schema_multi_base() {
+    let fixture = multi_base_fixture(true).await;
+    let dataset = Arc::new(fixture.dataset);
+
+    // Update column `a` for all rows of fragment 0 (full column rewrite) and
+    // one row of fragment 1 (incremental update), insert ids 10 and 11.
+    let partial_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("a", DataType::Int32, false),
+    ]));
+    let ids = vec![0, 1, 2, 3, 10, 11];
+    let source = RecordBatch::try_new(
+        partial_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids.clone())),
+            Arc::new(Int32Array::from(
+                ids.iter().map(|id| id + 1000).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![2])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(vec![Ok(source)], partial_schema));
+    let (dataset, stats) = job.execute(reader_to_stream(reader)).await.unwrap();
+    assert_eq!(stats.num_updated_rows, 4);
+    assert_eq!(stats.num_inserted_rows, 2);
+
+    for fragment in dataset.get_fragments() {
+        let metadata = &fragment.metadata;
+        match metadata.id {
+            0 | 1 => {
+                // Patched fragments: the original file in base1 plus a column
+                // patch written to primary storage.
+                assert_eq!(metadata.files.len(), 2);
+                assert_eq!(metadata.files[0].base_id, Some(1));
+                assert_eq!(metadata.files[1].base_id, None);
+            }
+            2 => {
+                assert_eq!(metadata.files.len(), 1);
+                assert_eq!(metadata.files[0].base_id, None);
+            }
+            _ => {
+                // Inserted rows route to base2.
+                for file in &metadata.files {
+                    assert_eq!(file.base_id, Some(2));
+                    let on_disk = fixture.base2_dir.join(file.path.as_str());
+                    assert!(on_disk.exists(), "missing data file {:?}", on_disk);
+                }
+            }
+        }
+    }
+
+    // Updated rows keep their `b` values, inserted rows have no `b`.
+    let mut expected = vec![];
+    for id in [4, 5, 6, 7, 8] {
+        expected.push(expected_row(id, 100, "orig"));
+    }
+    for id in [0, 1, 2, 3] {
+        expected.push((id, id + 1000, Some(format!("orig{}", id))));
+    }
+    for id in [10, 11] {
+        expected.push((id, id + 1000, None));
+    }
+    expected.sort_unstable();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+
+    let dataset = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(collect_multi_base_rows(&dataset).await, expected);
+}
+
+/// Round-robin distribution across multiple target bases within a single
+/// merge insert. New data files are cut at `max_rows_per_file` (the write
+/// default of 1Mi rows), so inserting more rows than that produces multiple
+/// files, which must alternate between the target bases.
+#[tokio::test]
+async fn test_merge_insert_round_robin_target_bases() {
+    let tmp = TempDir::default();
+    let primary_dir = tmp.std_path().join("primary");
+    let base1_dir = tmp.std_path().join("base1");
+    let base2_dir = tmp.std_path().join("base2");
+    std::fs::create_dir_all(&base1_dir).unwrap();
+    std::fs::create_dir_all(&base2_dir).unwrap();
+    let primary_uri = format!("file://{}", primary_dir.display());
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let reader = RecordBatchIterator::new(
+        vec![Ok(RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap())],
+        schema.clone(),
+    );
+    let dataset = Dataset::write(
+        reader,
+        &primary_uri,
+        Some(WriteParams {
+            mode: WriteMode::Create,
+            initial_bases: Some(vec![
+                BasePath {
+                    id: 1,
+                    name: Some("base1".to_string()),
+                    is_dataset_root: true,
+                    path: format!("file://{}", base1_dir.display()),
+                },
+                BasePath {
+                    id: 2,
+                    name: Some("base2".to_string()),
+                    is_dataset_root: false,
+                    path: format!("file://{}", base2_dir.display()),
+                },
+            ]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // 1.2Mi new rows -> two data files -> one per base.
+    const BATCH_ROWS: i32 = 100_000;
+    let batches: Vec<_> = (0..12)
+        .map(|i| {
+            let start = 1000 + i * BATCH_ROWS;
+            Ok(RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    start..start + BATCH_ROWS,
+                ))],
+            )
+            .unwrap())
+        })
+        .collect();
+    let job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .target_bases(vec![1, 2])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(batches, schema.clone()));
+    let (dataset, stats) = job.execute(reader_to_stream(reader)).await.unwrap();
+    assert_eq!(stats.num_inserted_rows, 1_200_000);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 1_200_010);
+
+    let merge_file_bases: Vec<_> = dataset
+        .get_fragments()
+        .iter()
+        .filter(|fragment| fragment.metadata.id >= 1)
+        .flat_map(|fragment| fragment.metadata.files.iter().map(|file| file.base_id))
+        .collect();
+    assert_eq!(merge_file_bases, vec![Some(1), Some(2)]);
+}
+
+/// Target base validation across build and execution paths.
+#[tokio::test]
+async fn test_merge_insert_target_bases_validation() {
+    let fixture = multi_base_fixture(false).await;
+    let dataset = Arc::new(fixture.dataset);
+
+    // Both selectors set fails at build time.
+    let err = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![1])
+        .target_base_names_or_paths(vec!["base2".to_string()])
+        .try_build()
+        .err()
+        .unwrap();
+    assert!(
+        err.to_string()
+            .contains("Cannot specify both target_base_names_or_paths and target_bases"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Unknown base id fails at execution.
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![99])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[1], 1000, "new"))],
+        multi_base_schema(),
+    ));
+    let err = job.execute(reader_to_stream(reader)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Target base ID 99 not found in available bases"),
+        "unexpected error: {}",
+        err
+    );
+
+    // An empty target base list is rejected rather than silently ignored.
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[1], 1000, "new"))],
+        multi_base_schema(),
+    ));
+    let err = job.execute(reader_to_stream(reader)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("target_bases cannot be empty"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Unknown base name fails at execution.
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_base_names_or_paths(vec!["nonexistent".to_string()])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[1], 1000, "new"))],
+        multi_base_schema(),
+    ));
+    let err = job.execute(reader_to_stream(reader)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Base reference 'nonexistent' not found in available bases"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Delete-only merges write no data files but still validate target bases.
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::Delete)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .target_bases(vec![99])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[1], 1000, "new"))],
+        multi_base_schema(),
+    ));
+    let err = job.execute(reader_to_stream(reader)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Target base ID 99 not found in available bases"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Valid target bases on a delete-only merge are a no-op.
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::Delete)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .target_bases(vec![2])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[5], 1000, "new"))],
+        multi_base_schema(),
+    ));
+    let (dataset, stats) = job.execute(reader_to_stream(reader)).await.unwrap();
+    assert_eq!(stats.num_deleted_rows, 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
+
+    // Datasets with no registered bases reject target bases.
+    let plain_dir = TempStrDir::default();
+    let reader = RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[0, 1], 100, "orig"))],
+        multi_base_schema(),
+    );
+    let plain_dataset = Dataset::write(reader, plain_dir.as_str(), None)
+        .await
+        .unwrap();
+    let job = MergeInsertBuilder::try_new(Arc::new(plain_dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .target_bases(vec![1])
+        .try_build()
+        .unwrap();
+    let reader = Box::new(RecordBatchIterator::new(
+        vec![Ok(multi_base_batch(&[1], 1000, "new"))],
+        multi_base_schema(),
+    ));
+    let err = job.execute(reader_to_stream(reader)).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Target base ID 1 not found in available bases"),
+        "unexpected error: {}",
+        err
+    );
 }

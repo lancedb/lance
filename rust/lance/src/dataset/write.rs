@@ -852,6 +852,13 @@ pub async fn validate_and_resolve_target_bases(
         .unwrap_or_default();
 
     if let Some(target_bases) = &target_base_ids {
+        // An empty list would panic in round-robin selection; reject it
+        // instead of silently writing to primary storage.
+        if target_bases.is_empty() {
+            return Err(Error::invalid_input(
+                "target_bases cannot be empty. Omit the option to write to primary storage.",
+            ));
+        }
         let mut bases_info = Vec::new();
 
         for &target_base_id in target_bases {
@@ -1416,6 +1423,7 @@ async fn open_writer_with_options(
 
 /// Information about a target base for writing.
 /// Contains the base ID, object store, directory path, and whether it's a dataset root.
+#[derive(Clone)]
 pub struct TargetBaseInfo {
     pub base_id: u32,
     pub object_store: Arc<ObjectStore>,

@@ -30,7 +30,7 @@ use crate::dataset::write::merge_insert::inserted_rows::{
 };
 use crate::dataset::write::merge_insert::{
     MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
-    format_key_values_on_columns,
+    format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
     Dataset,
@@ -889,6 +889,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         // Use flat_map to handle the async write operation
         let dataset = self.dataset.clone();
+        let params = self.params.clone();
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
@@ -902,6 +903,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
+            let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             let (mut new_fragments, _) = write_fragments_internal(
                 Some(&dataset),
                 dataset.object_store.clone(),
@@ -909,7 +911,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 dataset.schema().clone(),
                 write_data_stream,
                 WriteParams::default(),
-                None, // Merge insert doesn't use target_bases
+                target_bases_info,
             )
             .await?;
 

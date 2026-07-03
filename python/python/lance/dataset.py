@@ -536,6 +536,29 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).use_index(use_index)
 
+    def target_bases(self, bases: List[str]) -> "MergeInsertBuilder":
+        """
+        Write new fragments produced by this merge insert to these bases.
+
+        Each entry references a base path registered in the dataset manifest,
+        by name or by path URI, like the ``target_bases`` parameter of
+        :func:`~lance.write_dataset`. New data files are distributed across
+        the target bases round-robin. Data files that patch existing fragments
+        and deletion files are always written to the dataset's primary
+        storage.
+
+        Parameters
+        ----------
+        bases : List[str]
+            Base names or path URIs to write new data files to.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).target_bases(bases)
+
     def explain_plan(
         self, schema: Optional[pa.Schema] = None, verbose: bool = False
     ) -> str:

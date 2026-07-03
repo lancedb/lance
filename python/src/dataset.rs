@@ -396,6 +396,14 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn target_bases(
+        mut slf: PyRefMut<'_, Self>,
+        bases: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_base_names_or_paths(bases);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
