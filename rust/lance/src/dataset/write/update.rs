@@ -25,6 +25,7 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
@@ -280,6 +281,7 @@ impl UpdateJob {
     async fn execute_impl(self) -> Result<UpdateData> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -1700,5 +1702,75 @@ mod tests {
             baseline_files,
             "Rewritten data files should be cleaned up on apply_deletions failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_with_blob() {
+        use arrow_array::LargeBinaryArray;
+        use arrow_schema::Field;
+        use lance_arrow::BLOB_META_KEY;
+
+        let test_dir = TempStrDir::default();
+        let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("blobs", DataType::LargeBinary, true).with_metadata(blob_meta),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"foo".as_slice()),
+                    Some(b"bar".as_slice()),
+                    Some(b"baz".as_slice()),
+                ])),
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Perform an update: update the "blobs" column where id = 1
+        let dataset = Arc::new(dataset);
+        let updated_dataset = UpdateBuilder::new(dataset)
+            .update_where("id = 1")
+            .unwrap()
+            .set("blobs", "arrow_cast('updated_bar', 'LargeBinary')")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        // Verify the updated value
+        let mut scanner = updated_dataset.scan();
+        // Read as binary to assert actual value
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batches = scanner.try_into_batch().await.unwrap();
+        let blobs = batches.column_by_name("blobs").unwrap().as_binary::<i64>();
+        let ids = batches
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+
+        // Find the index of id = 1
+        let idx = ids.values().iter().position(|&x| x == 1).unwrap();
+        assert_eq!(blobs.value(idx), b"updated_bar");
+
+        let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
+        assert_eq!(blobs.value(idx_foo), b"foo");
     }
 }

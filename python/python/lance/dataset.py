@@ -3109,12 +3109,13 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_floating(field_type)
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
+                    and not pa.types.is_large_string(field_type)
                     and not pa.types.is_temporal(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
-                        f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, fixed-size-binary, or temporal ",
+                        f"BTREE/BITMAP/ZONEMAP index column {column} must be int",
+                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
                 if not pa.types.is_list(field_type):

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::once;
@@ -331,11 +332,7 @@ impl NGramIndex {
         })
     }
 
-    fn remap_batch(
-        &self,
-        batch: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
-    ) -> Result<RecordBatch> {
+    fn remap_batch(&self, batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {
         let posting_lists_array = batch
             .column_by_name(POSTING_LIST_COL)
             .expect_ok()?
@@ -348,8 +345,8 @@ impl NGramIndex {
                 let posting_list = RoaringTreemap::deserialize_from(posting_list)?;
                 let new_posting_list =
                     RoaringTreemap::from_iter(posting_list.into_iter().filter_map(|row_id| {
-                        match mapping.get(&row_id) {
-                            Some(Some(new_row_id)) => Some(*new_row_id),
+                        match mapping.get(row_id) {
+                            Some(Some(new_row_id)) => Some(new_row_id),
                             Some(None) => None,
                             None => Some(row_id),
                         }
@@ -522,7 +519,7 @@ impl ScalarIndex for NGramIndex {
 
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let reader = self.store.open_index_file(POSTINGS_FILENAME).await?;
@@ -1366,6 +1363,8 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use rstest::rstest;
     use std::{
         collections::{HashMap, HashSet},
         sync::Arc,
@@ -1797,7 +1796,10 @@ mod tests {
         ));
 
         let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
-        index.remap(&remapping, test_store.as_ref()).await.unwrap();
+        index
+            .remap(&RowAddrRemap::direct(remapping), test_store.as_ref())
+            .await
+            .unwrap();
 
         let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
             .await
@@ -1807,6 +1809,61 @@ mod tests {
 
         let null_posting_list = get_null_posting_list(&index).await;
         assert_eq!(null_posting_list, vec![100]);
+    }
+
+    // Like `test_ngram_index_remap` but covering both RowAddrRemap modes: rows
+    // 0..4 of frag 0 are rewritten into frag 10; row 4 is deleted.
+    fn ngram_remap_compact() -> RowAddrRemap {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        use roaring::RoaringTreemap;
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(0u64..4),
+            old_frag_ids: vec![0],
+            new_frags: vec![(10, 4)],
+        }])
+        .unwrap()
+    }
+
+    fn ngram_remap_explicit() -> RowAddrRemap {
+        RowAddrRemap::direct(
+            (0u64..4)
+                .map(|i| (i, Some((10u64 << 32) | i)))
+                .chain(std::iter::once((4u64, None)))
+                .collect(),
+        )
+    }
+
+    #[rstest]
+    #[case(ngram_remap_compact())]
+    #[case(ngram_remap_explicit())]
+    #[tokio::test]
+    async fn test_ngram_index_remap_compact(#[case] remap: RowAddrRemap) {
+        let data = simple_data_with_nulls();
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        let row_ids = row_ids_in_index(&index).await;
+        assert_eq!(row_ids, vec![0, 1, 2, 3, 4]);
+
+        let new_tmpdir = Arc::new(TempDir::default());
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            new_tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        index.remap(&remap, test_store.as_ref()).await.unwrap();
+
+        let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let addr = |offset: u64| (10u64 << 32) | offset;
+        let row_ids = row_ids_in_index(&index).await;
+        assert_eq!(row_ids, vec![addr(0), addr(1), addr(2), addr(3)]);
+
+        // rows 2 and 3 are the null docs; both are rewritten into frag 10.
+        let null_posting_list = get_null_posting_list(&index).await;
+        assert_eq!(null_posting_list, vec![addr(2), addr(3)]);
     }
 
     #[test_log::test(tokio::test)]

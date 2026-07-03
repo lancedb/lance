@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, pin::Pin};
@@ -332,7 +333,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<Vec<IndexFile>> {
+    pub async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<Vec<IndexFile>> {
         if self.existing_indices.is_empty() {
             return Err(Error::invalid_input(
                 "No existing indices available for remapping",

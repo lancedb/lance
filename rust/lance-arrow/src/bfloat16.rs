@@ -144,6 +144,11 @@ impl FromIterator<Option<bf16>> for BFloat16Array {
             .len(len)
             .add_buffer(buffer.into())
             .null_bit_buffer(null_buffer);
+        // SAFETY: the value buffer contains exactly `2 * len` bytes (two bytes
+        // pushed per iteration of the loop above, including the zero-fill for
+        // null slots), which matches the `FixedSizeBinary(2)` storage layout.
+        // The null bit buffer, when present, has `len` bits appended above, so
+        // its length covers the array's logical range.
         let array_data = unsafe { array_data.build_unchecked() };
         Self {
             inner: FixedSizeBinaryArray::from(array_data),
@@ -170,6 +175,10 @@ impl From<Vec<bf16>> for BFloat16Array {
         let array_data = ArrayData::builder(DataType::FixedSizeBinary(2))
             .len(data.len())
             .add_buffer(buffer.into());
+        // SAFETY: the buffer contains exactly `2 * data.len()` bytes — each
+        // `bf16` writes its two little-endian bytes once — matching the
+        // `FixedSizeBinary(2)` storage layout. No null buffer is attached, so
+        // every element is logically valid.
         let array_data = unsafe { array_data.build_unchecked() };
         Self {
             inner: FixedSizeBinaryArray::from(array_data),
@@ -268,12 +277,63 @@ mod from_arrow {
 impl FloatArray<BFloat16Type> for FixedSizeBinaryArray {
     type FloatType = BFloat16Type;
 
+    /// Returns the underlying `bf16` values as a borrowed slice.
+    ///
+    /// # Preconditions
+    ///
+    /// - `value_length()` must be 2 (the `FixedSizeBinary(2)` storage shape
+    ///   used by [`BFloat16Array`]). Asserted at entry.
+    /// - The value buffer must be at least 2-byte aligned. Lance's in-tree
+    ///   constructors always satisfy this (every value buffer goes through
+    ///   `MutableBuffer`, which is aligned to arrow-buffer's `ALIGNMENT`
+    ///   constant — ≥32 bytes on every supported target). Externally-built
+    ///   `FixedSizeBinaryArray`s arriving via FFI, IPC, or
+    ///   `Buffer::from_custom_allocation` are not required by arrow-rs to be
+    ///   aligned beyond a single byte; passing one to this method violates the
+    ///   precondition. A `debug_assert` below catches such inputs in debug and
+    ///   test builds.
+    ///
+    /// # Endianness
+    ///
+    /// `lance-arrow` is gated on `target_endian = "little"` at the crate root,
+    /// so this method always returns values in the same byte order Lance writes
+    /// (see [`BFloat16Array::value`] and the [`FromIterator`] impls).
     fn as_slice(&self) -> &[bf16] {
         assert_eq!(
             self.value_length(),
             2,
             "BFloat16 arrays must use FixedSizeBinary(2) storage"
         );
+        debug_assert_eq!(
+            (self.value_data().as_ptr() as usize) % std::mem::align_of::<bf16>(),
+            0,
+            "BFloat16 value buffer must be at least 2-byte aligned"
+        );
+        // SAFETY:
+        // - The assert above pins `value_size == 2`, so `value_data().len() / 2`
+        //   equals the array's logical element count.
+        //   `FixedSizeBinaryArray::From<ArrayData>` constructs its value buffer
+        //   as `buffers[0].slice_with_length(offset * 2, len * 2)` (arrow-array
+        //   `fixed_size_binary_array.rs`), so `value_data()` already returns
+        //   the offset-adjusted slice. Do not replace `value_data()` with an
+        //   accessor that returns the un-sliced backing buffer.
+        // - `bf16` is `#[repr(transparent)]` over `u16` (size 2, alignment 2);
+        //   every `u16` bit pattern is a valid `bf16`, so any byte content
+        //   yields a defined value — never UB.
+        // - Alignment is the caller's responsibility per the precondition
+        //   documented above. The `debug_assert_eq!` immediately preceding this
+        //   block catches violations in debug and test builds only — release
+        //   builds rely on callers honoring the precondition. arrow-rs
+        //   declares `FixedSizeBinary(n)`'s
+        //   `BufferSpec::FixedWidth { alignment: align_of::<u8>() == 1 }`
+        //   (arrow-data `data.rs`), so arrow-rs alone does not guarantee
+        //   2-byte alignment. Lance's in-tree construction paths build value
+        //   buffers via `MutableBuffer` (arrow-buffer `ALIGNMENT` constant,
+        //   ≥32 bytes on every supported target), which trivially satisfies
+        //   `bf16`'s 2-byte requirement.
+        // - The returned slice borrows from `self`; the underlying ref-counted,
+        //   immutable Arrow buffer cannot be mutated or freed for the slice's
+        //   lifetime.
         unsafe {
             slice::from_raw_parts(
                 self.value_data().as_ptr() as *const bf16,

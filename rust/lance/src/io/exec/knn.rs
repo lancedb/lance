@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#[cfg(test)]
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -2492,7 +2494,7 @@ mod tests {
             Box::new(self.row_ids.iter())
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -2710,7 +2712,7 @@ mod tests {
             Box::new(self.row_ids.iter())
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
