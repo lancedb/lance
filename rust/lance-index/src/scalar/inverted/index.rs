@@ -1377,7 +1377,20 @@ fn group_range_for_start_index(starts: &[u32], token_count: usize, group_idx: us
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         let with_position = options.with_position;
-        let chunk_concurrency = self.store.io_parallelism().max(1);
+        // Position streams are dominated by a few huge hot-token rows, so
+        // position-bearing prewarm chunks routinely reach hundreds of MBs to
+        // GBs even though chunk sizing targets 128MB on the average token.
+        // The store shares one ScanScheduler across all partition files, and
+        // concurrent large `read_range`s can exhaust its backpressure window
+        // while every request still has undelivered pages (a request's later
+        // pages never pass the `min_in_flight` priority bypass); the prewarm
+        // then deadlocks. A single request in flight always delivers in
+        // order and recycles the window, so serialize position prewarm.
+        let chunk_concurrency = if with_position {
+            1
+        } else {
+            self.store.io_parallelism().max(1)
+        };
         for part in &self.partitions {
             part.inverted_list
                 .prewarm_posting_lists(with_position, chunk_concurrency)
