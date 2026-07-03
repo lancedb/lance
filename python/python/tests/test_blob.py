@@ -13,6 +13,7 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+from lance.blob import BlobType
 from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
@@ -37,6 +38,13 @@ def _commit_blob_fragments(dataset_uri, schema, fragments, initial_bases=None):
         initial_bases=initial_bases,
     )
     return lance.LanceDataset.commit(dataset_uri, operation)
+
+
+def _field_child_names(field):
+    data_type = field.type
+    if isinstance(data_type, pa.ExtensionType):
+        data_type = data_type.storage_type
+    return [child.name for child in data_type]
 
 
 def _external_blob_table(blob_path, payload=b"hello"):
@@ -764,11 +772,85 @@ def test_blob_extension_write_external(tmp_path):
     ],
 )
 def test_blob_from_uri_accepts_optional_slice_metadata(position, size):
-    blob = Blob.from_uri("file:///tmp/blob.bin", position=position, size=size)
+    blob = Blob.from_uri(
+        "file:///tmp/blob.bin",
+        position=position,
+        size=size,
+        source_id="image:1",
+    )
 
     assert blob.uri == "file:///tmp/blob.bin"
     assert blob.position == position
     assert blob.size == size
+    assert blob.source_id == "image:1"
+
+
+def test_blob_rejects_invalid_source_id():
+    with pytest.raises(ValueError, match="source_id cannot be empty"):
+        Blob.from_bytes(b"hello", source_id="")
+
+    with pytest.raises(ValueError, match="source_id cannot be set without data or uri"):
+        Blob(source_id="image:1")
+
+
+def test_blob_type_ipc_round_trip_accepts_new_and_old_storage():
+    new_table = pa.table(
+        {"blob": lance.blob_array([Blob.from_bytes(b"hi", source_id="s1")])}
+    )
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, new_table.schema) as writer:
+        writer.write_table(new_table)
+    restored = pa.ipc.open_stream(sink.getvalue()).read_all()
+    assert len(restored.schema.field("blob").type.storage_type) == 5
+
+    old_storage_type = pa.struct(
+        [
+            pa.field("data", pa.large_binary(), nullable=True),
+            pa.field("uri", pa.utf8(), nullable=True),
+            pa.field("position", pa.uint64(), nullable=True),
+            pa.field("size", pa.uint64(), nullable=True),
+        ]
+    )
+    old_storage = pa.StructArray.from_arrays(
+        [
+            pa.array([b"hi"], type=pa.large_binary()),
+            pa.array([None], type=pa.utf8()),
+            pa.array([None], type=pa.uint64()),
+            pa.array([None], type=pa.uint64()),
+        ],
+        names=["data", "uri", "position", "size"],
+    )
+    old_ext = pa.ExtensionArray.from_storage(BlobType(old_storage_type), old_storage)
+    old_table = pa.table({"blob": old_ext})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, old_table.schema) as writer:
+        writer.write_table(old_table)
+    restored = pa.ipc.open_stream(sink.getvalue()).read_all()
+    assert len(restored.schema.field("blob").type.storage_type) == 4
+
+
+def test_blob_extension_write_rejects_source_id_without_payload(tmp_path):
+    storage = pa.StructArray.from_arrays(
+        [
+            pa.array([None], type=pa.large_binary()),
+            pa.array([None], type=pa.utf8()),
+            pa.array([None], type=pa.uint64()),
+            pa.array([None], type=pa.uint64()),
+            pa.array(["image:1"], type=pa.utf8()),
+        ],
+        names=["data", "uri", "position", "size", "source_id"],
+    )
+    blob_array = pa.ExtensionArray.from_storage(BlobType(), storage)
+    table = pa.table({"blob": blob_array})
+
+    with pytest.raises(
+        OSError, match="source_id cannot be set on a row without data or uri"
+    ):
+        lance.write_dataset(
+            table,
+            tmp_path / "test_ds_v2_source_id_without_payload",
+            data_storage_version="2.2",
+        )
 
 
 def test_blob_extension_write_external_ingest(tmp_path):
@@ -790,6 +872,109 @@ def test_blob_extension_write_external_ingest(tmp_path):
     assert blob.size() == 5
     with blob as f:
         assert f.read() == b"hello"
+
+
+def test_blob_extension_write_source_id_shares_packed_descriptor(tmp_path):
+    payload = b"x" * (64 * 1024 + 1)
+    table = pa.table(
+        {
+            "blob": lance.blob_array(
+                [
+                    Blob.from_bytes(payload, source_id="image:1"),
+                    Blob.from_bytes(payload, source_id="image:1"),
+                    Blob.from_bytes(payload),
+                ]
+            )
+        }
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_source_id",
+        data_storage_version="2.2",
+    )
+
+    assert "source_id" not in _field_child_names(ds.schema.field("blob"))
+
+    desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
+    assert "source_id" not in _field_child_names(
+        ds.to_table(columns=["blob"]).schema.field("blob")
+    )
+    assert desc.field("kind")[0].as_py() == desc.field("kind")[1].as_py()
+    assert desc.field("blob_id")[0].as_py() == desc.field("blob_id")[1].as_py()
+    assert desc.field("position")[0].as_py() == desc.field("position")[1].as_py()
+    assert desc.field("size")[0].as_py() == desc.field("size")[1].as_py()
+    assert desc.field("position")[1].as_py() != desc.field("position")[2].as_py()
+
+    blobs = ds.take_blobs("blob", indices=[0, 1, 2])
+    assert [blob.read() for blob in blobs] == [payload, payload, payload]
+
+
+def test_blob_extension_write_source_id_size_mismatch_rejected(tmp_path):
+    table = pa.table(
+        {
+            "blob": lance.blob_array(
+                [
+                    Blob.from_bytes(b"x" * (64 * 1024 + 1), source_id="image:1"),
+                    Blob.from_bytes(b"x" * (64 * 1024 + 2), source_id="image:1"),
+                ]
+            )
+        }
+    )
+
+    with pytest.raises(OSError, match="source_id 'image:1'.*first size=65537"):
+        lance.write_dataset(
+            table,
+            tmp_path / "test_ds_v2_source_id_mismatch",
+            data_storage_version="2.2",
+        )
+
+
+def test_blob_extension_write_source_id_inline_noop(tmp_path):
+    table = pa.table(
+        {
+            "blob": lance.blob_array(
+                [
+                    Blob.from_bytes(b"a", source_id="image:1"),
+                    Blob.from_bytes(b"bb", source_id="image:1"),
+                ]
+            )
+        }
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_source_id_inline",
+        data_storage_version="2.2",
+    )
+
+    blobs = ds.take_blobs("blob", indices=[0, 1])
+    assert [blob.read() for blob in blobs] == [b"a", b"bb"]
+
+
+def test_blob_extension_write_external_ingest_implicit_source_id_shares(
+    tmp_path,
+):
+    payload = b"u" * (64 * 1024 + 1)
+    blob_path = tmp_path / "external_blob.bin"
+    blob_path.write_bytes(payload)
+    uri = blob_path.as_uri()
+
+    table = pa.table(
+        {"blob": lance.blob_array([Blob.from_uri(uri), Blob.from_uri(uri)])}
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "test_ds_v2_external_ingest_source_id",
+        data_storage_version="2.2",
+        external_blob_mode="ingest",
+    )
+
+    desc = ds.to_table(columns=["blob"]).column("blob").chunk(0)
+    assert desc.field("blob_id")[0].as_py() == desc.field("blob_id")[1].as_py()
+    assert desc.field("position")[0].as_py() == desc.field("position")[1].as_py()
+
+    blob_path.unlink()
+    blobs = ds.take_blobs("blob", indices=[0, 1])
+    assert [blob.read() for blob in blobs] == [payload, payload]
 
 
 def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp_path):

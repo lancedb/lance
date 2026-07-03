@@ -66,6 +66,10 @@ fn has_blob_v2_extension(field: &ArrowField) -> bool {
         .unwrap_or(false)
 }
 
+fn is_known_blob_v2_write_field(field: &ArrowField) -> bool {
+    matches!(field.name().as_str(), "data" | "uri" | "position" | "size")
+}
+
 #[derive(Debug, Default)]
 pub enum NullabilityComparison {
     // If the nullabilities don't match then the fields don't match
@@ -1101,9 +1105,12 @@ impl TryFrom<&ArrowField> for Field {
             None => -1,
         };
 
+        let is_blob_v2 = has_blob_v2_extension(field);
+
         let children = match field.data_type() {
             DataType::Struct(children) => children
                 .iter()
+                .filter(|f| !is_blob_v2 || is_known_blob_v2_write_field(f.as_ref()))
                 .map(|f| Self::try_from(f.as_ref()))
                 .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
@@ -1155,8 +1162,6 @@ impl TryFrom<&ArrowField> for Field {
         let unenforced_clustering_key_position = metadata
             .get(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
             .and_then(|s| s.parse::<u32>().ok());
-        let is_blob_v2 = has_blob_v2_extension(field);
-
         if is_blob_v2 {
             metadata
                 .entry(ARROW_EXT_NAME_KEY.to_string())
@@ -1922,6 +1927,39 @@ mod tests {
         let blob_v2 = field.children.iter().find(|f| f.name == "blob_v2").unwrap();
         assert_eq!(blob_v2.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
         assert_eq!(blob_v2.children.len(), 5);
+    }
+
+    #[test]
+    fn blob_v2_schema_conversion_filters_write_only_children() {
+        let metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+        let field: Field = ArrowField::new(
+            "blob",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                    ArrowField::new("uri", DataType::Utf8, true),
+                    ArrowField::new("position", DataType::UInt64, true),
+                    ArrowField::new("size", DataType::UInt64, true),
+                    ArrowField::new("source_id", DataType::Utf8, true),
+                    ArrowField::new("unknown", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(metadata)
+        .try_into()
+        .unwrap();
+
+        assert_eq!(
+            field
+                .children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["data", "uri", "position", "size"]
+        );
     }
 
     #[test]
