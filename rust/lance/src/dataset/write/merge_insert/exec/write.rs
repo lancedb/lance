@@ -37,7 +37,7 @@ use crate::{
     dataset::{
         transaction::{Operation, Transaction},
         write::{
-            WriteParams,
+            WriteParams, cleanup_data_fragments,
             merge_insert::{
                 MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
                 exec::MergeInsertMetrics,
@@ -904,6 +904,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
+            // Keep a copy so failures after the write can clean up routed files.
+            let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
                 Some(&dataset),
                 dataset.object_store.clone(),
@@ -915,27 +917,40 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             )
             .await?;
 
-            if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
-                let fragment_sizes = new_fragments
-                    .iter()
-                    .map(|f| f.physical_rows.unwrap() as u64);
+            let row_id_result: lance_core::Result<()> = (|| {
+                if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
+                    let fragment_sizes = new_fragments
+                        .iter()
+                        .map(|f| f.physical_rows.unwrap() as u64);
 
-                let sequences = lance_table::rowids::rechunk_sequences(
-                    [row_id_sequence.clone()],
-                    fragment_sizes,
-                    true,
-                )
-                .map_err(|e| {
-                    Error::internal(format!(
-                        "Captured row ids not equal to number of rows written: {}",
-                        e
-                    ))
-                })?;
+                    let sequences = lance_table::rowids::rechunk_sequences(
+                        [row_id_sequence.clone()],
+                        fragment_sizes,
+                        true,
+                    )
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "Captured row ids not equal to number of rows written: {}",
+                            e
+                        ))
+                    })?;
 
-                for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                    let serialized = lance_table::rowids::write_row_ids(&sequence);
-                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                        let serialized = lance_table::rowids::write_row_ids(&sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(e) = row_id_result {
+                cleanup_data_fragments(
+                    &dataset.object_store,
+                    &dataset.base,
+                    cleanup_bases.as_deref(),
+                    &new_fragments,
+                )
+                .await;
+                return Err(e.into());
             }
 
             // Step 2.5: Calculate write metrics from new fragments
@@ -957,7 +972,21 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             };
 
             let (updated_fragments, removed_fragment_ids) =
-                apply_deletions(&dataset, &delete_row_addrs_clone).await?;
+                match apply_deletions(&dataset, &delete_row_addrs_clone).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // The new data files are not committed; remove them (including
+                        // ones routed to target bases) before surfacing the error.
+                        cleanup_data_fragments(
+                            &dataset.object_store,
+                            &dataset.base,
+                            cleanup_bases.as_deref(),
+                            &new_fragments,
+                        )
+                        .await;
+                        return Err(e.into());
+                    }
+                };
 
             // Step 4: Create the transaction operation
             let operation = Operation::Update {

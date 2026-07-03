@@ -1765,7 +1765,8 @@ async fn rewrite_files(
     let row_addrs = match row_addrs_result {
         Ok(v) => v,
         Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, &new_fragments).await;
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
+                .await;
             return Err(e);
         }
     };
@@ -2150,7 +2151,13 @@ pub async fn commit_compaction(
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
     {
-        cleanup_data_fragments(&dataset.object_store, &dataset.base, &all_new_fragments).await;
+        cleanup_data_fragments(
+            &dataset.object_store,
+            &dataset.base,
+            None,
+            &all_new_fragments,
+        )
+        .await;
         return Err(e);
     }
 

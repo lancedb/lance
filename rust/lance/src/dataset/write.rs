@@ -610,6 +610,8 @@ pub async fn do_write_fragments(
         .unwrap_or_else(|| params.store_registry());
     let source_store_params = params.store_params.clone().unwrap_or_default();
 
+    // Keep a copy so failure paths can clean up files written to target bases.
+    let cleanup_bases = target_bases_info.clone();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
         base_dir,
@@ -690,7 +692,13 @@ pub async fn do_write_fragments(
         // Drop the writer so its in-progress file is cleaned up (LocalWriter
         // removes its temp file; ObjectWriter aborts the multipart upload).
         drop(writer.take());
-        cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+        cleanup_data_fragments(
+            &object_store,
+            base_dir,
+            cleanup_bases.as_deref(),
+            &fragments,
+        )
+        .await;
         return Err(e);
     }
 
@@ -715,7 +723,13 @@ pub async fn do_write_fragments(
             }
             Err(e) => {
                 drop(writer);
-                cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+                cleanup_data_fragments(
+                    &object_store,
+                    base_dir,
+                    cleanup_bases.as_deref(),
+                    &fragments,
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -729,53 +743,67 @@ pub async fn do_write_fragments(
 /// Contract:
 /// - Errors from individual `delete` calls are logged and swallowed, never returned —
 ///   callers should propagate the original write error.
-/// - Only files in the dataset's default storage (`base_id == None`) are deleted;
-///   files in external bases are skipped because we don't have their object stores here.
+/// - Files in the dataset's default storage (`base_id == None`) are deleted via
+///   `object_store`; files whose `base_id` matches an entry in `target_bases` are
+///   deleted via that base's object store. Files in bases not listed in
+///   `target_bases` are skipped because we don't have their object stores here.
 /// - Safe to call with an empty slice.
 /// - Must be called before the fragments are committed, otherwise live data may be deleted.
 pub(crate) async fn cleanup_data_fragments(
     object_store: &ObjectStore,
     base_dir: &Path,
+    target_bases: Option<&[TargetBaseInfo]>,
     fragments: &[Fragment],
 ) {
     let data_dir = base_dir.clone().join(DATA_DIR);
     let mut skipped_external = 0usize;
     for fragment in fragments {
         for file in &fragment.files {
-            if file.base_id.is_none() {
-                let path = data_dir.clone().join(file.path.as_str());
-                if let Err(e) = object_store.delete(&path).await {
-                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
-                }
-
-                // Clean up any blob v2 sidecars that might exist for this data file.
-                // Blob v2 sidecars are written to `data/{data_file_key}/{blob_id}.blob`.
-                // The `data_file_key` is the file stem of the .lance file.
-                if let Some(stem) = std::path::Path::new(file.path.as_str())
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                {
-                    let blob_dir = data_dir.clone().join(stem);
-                    match object_store.remove_dir_all(blob_dir.clone()).await {
-                        Err(e) if !matches!(e, Error::NotFound { .. }) => {
-                            log::warn!(
-                                "Failed to clean up orphaned blob dir '{}': {}",
-                                blob_dir,
-                                e
-                            );
-                        }
-                        _ => {}
+            let (store, file_dir) = if let Some(base_id) = file.base_id {
+                match target_bases.and_then(|bases| bases.iter().find(|b| b.base_id == base_id)) {
+                    Some(base_info) => {
+                        let dir = if base_info.is_dataset_root {
+                            base_info.base_dir.clone().join(DATA_DIR)
+                        } else {
+                            base_info.base_dir.clone()
+                        };
+                        (base_info.object_store.as_ref(), dir)
+                    }
+                    None => {
+                        skipped_external += 1;
+                        continue;
                     }
                 }
             } else {
-                skipped_external += 1;
+                (object_store, data_dir.clone())
+            };
+
+            let path = file_dir.clone().join(file.path.as_str());
+            if let Err(e) = store.delete(&path).await {
+                log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+            }
+
+            // Clean up any blob v2 sidecars that might exist for this data file.
+            // Blob v2 sidecars are written to `data/{data_file_key}/{blob_id}.blob`.
+            // The `data_file_key` is the file stem of the .lance file.
+            if let Some(stem) = std::path::Path::new(file.path.as_str())
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                let blob_dir = file_dir.clone().join(stem);
+                match store.remove_dir_all(blob_dir.clone()).await {
+                    Err(e) if !matches!(e, Error::NotFound { .. }) => {
+                        log::warn!("Failed to clean up orphaned blob dir '{}': {}", blob_dir, e);
+                    }
+                    _ => {}
+                }
             }
         }
     }
     if skipped_external > 0 {
         log::warn!(
             "Skipped cleanup of {} orphaned data file(s) in external bases: \
-             cleanup not supported for external bases",
+             their object stores are not available here",
             skipped_external
         );
     }
@@ -3790,7 +3818,7 @@ mod tests {
             last_updated_at_version_meta: None,
         }];
 
-        cleanup_data_fragments(&object_store, &base_dir, &fragments).await;
+        cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
 
         // The local file should be removed; the external file is skipped without
         // erroring (its base store isn't known here).
@@ -3799,5 +3827,183 @@ mod tests {
             0,
             "Local data file should be deleted by cleanup"
         );
+    }
+
+    /// Verifies the target-base branch in `cleanup_data_fragments`: files whose
+    /// `base_id` matches a provided [`TargetBaseInfo`] are deleted via that base's
+    /// object store (respecting `is_dataset_root` layout), while files in bases
+    /// without a provided store are still skipped.
+    #[tokio::test]
+    async fn test_cleanup_data_fragments_deletes_target_base_files() {
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let primary_dir = TempStrDir::default();
+        let base1_dir = TempStrDir::default();
+        let base2_dir = TempStrDir::default();
+
+        let (object_store, base_dir) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            primary_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let (base1_store, base1_path) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            base1_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let (base2_store, base2_path) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            base2_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        // base2 is a plain data directory: files sit at its root, not under data/.
+        let count_plain_files = |dir: &str| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter(|e| e.as_ref().unwrap().path().is_file())
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        // base1 is a dataset root (files under data/), base2 is a plain data dir.
+        let base1_file_path = base1_path.clone().join(DATA_DIR).join("one.lance");
+        base1_store.put(&base1_file_path, b"x").await.unwrap();
+        let base2_file_path = base2_path.clone().join("two.lance");
+        base2_store.put(&base2_file_path, b"x").await.unwrap();
+        assert_eq!(count_data_files(base1_dir.as_str()), 1);
+        assert_eq!(count_plain_files(base2_dir.as_str()), 1);
+
+        let mut base1_file = DataFile::new_unstarted("one.lance", 2, 1);
+        base1_file.base_id = Some(1);
+        let mut base2_file = DataFile::new_unstarted("two.lance", 2, 1);
+        base2_file.base_id = Some(2);
+        let mut unknown_file = DataFile::new_unstarted("unknown.lance", 2, 1);
+        unknown_file.base_id = Some(42);
+        let fragments = vec![Fragment {
+            id: 0,
+            files: vec![base1_file, base2_file, unknown_file],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(0),
+            created_at_version_meta: None,
+            last_updated_at_version_meta: None,
+        }];
+
+        let target_bases = vec![
+            TargetBaseInfo {
+                base_id: 1,
+                object_store: base1_store,
+                base_dir: base1_path,
+                is_dataset_root: true,
+            },
+            TargetBaseInfo {
+                base_id: 2,
+                object_store: base2_store,
+                base_dir: base2_path,
+                is_dataset_root: false,
+            },
+        ];
+
+        cleanup_data_fragments(&object_store, &base_dir, Some(&target_bases), &fragments).await;
+
+        assert_eq!(
+            count_data_files(base1_dir.as_str()),
+            0,
+            "File in dataset-root target base should be deleted"
+        );
+        assert_eq!(
+            count_plain_files(base2_dir.as_str()),
+            0,
+            "File in plain-directory target base should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_routed_data_files_on_failed_write() {
+        // Files already completed in target bases must be removed when the
+        // write later fails.
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let primary_dir = TempStrDir::default();
+        let base1_dir = TempStrDir::default();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let (object_store, base_dir) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            primary_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let (base1_store, base1_path) = ObjectStore::from_uri_and_params(
+            Default::default(),
+            base1_dir.as_str(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let good_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // 3 rows per file: the first batch fills and completes a file in the
+        // target base, then the stream fails.
+        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+            Ok(good_batch.clone()),
+            Ok(good_batch.clone()),
+            Err(DataFusionError::External("injected failure".into())),
+        ];
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema.clone(),
+            futures::stream::iter(items),
+        ));
+
+        let target_bases = vec![TargetBaseInfo {
+            base_id: 1,
+            object_store: base1_store,
+            base_dir: base1_path,
+            is_dataset_root: true,
+        }];
+
+        let result = do_write_fragments(
+            None,
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            stream,
+            WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            },
+            LanceFileVersion::V2_1,
+            Some(target_bases),
+        )
+        .await;
+
+        assert!(result.is_err(), "Expected write to fail");
+        assert_eq!(
+            count_data_files(base1_dir.as_str()),
+            0,
+            "Data files routed to the target base should be cleaned up on failure"
+        );
+        assert_eq!(count_data_files(primary_dir.as_str()), 0);
     }
 }

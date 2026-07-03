@@ -1961,6 +1961,7 @@ impl MergeInsertJob {
             // we can't use affected rows here.
             (operation, None)
         } else {
+            let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
@@ -1972,44 +1973,62 @@ impl MergeInsertJob {
             )
             .await?;
 
-            if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
-                let fragment_sizes = new_fragments
-                    .iter()
-                    .map(|f| f.physical_rows.unwrap() as u64);
-
-                let sequences = lance_table::rowids::rechunk_sequences(
-                    [row_id_sequence.clone()],
-                    fragment_sizes,
-                    true,
-                )
-                .map_err(|e| {
-                    Error::internal(format!(
-                        "Captured row ids not equal to number of rows written: {}",
-                        e
-                    ))
-                })?;
-
-                for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                    let serialized = lance_table::rowids::write_row_ids(&sequence);
-                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
-                }
-            }
-
-            // Apply deletions
-            let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
-
-            let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                    let addresses: Vec<u64> = removed_row_ids
+            // The new data files exist but are not committed yet; clean them up
+            // (including files routed to target bases) if any later step fails.
+            let post_write_result: Result<RoaringTreemap> = async {
+                if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
+                    let fragment_sizes = new_fragments
                         .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>();
-                    addresses
-                } else {
-                    removed_row_ids
-                };
+                        .map(|f| f.physical_rows.unwrap() as u64);
 
-            let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec.into_iter());
+                    let sequences = lance_table::rowids::rechunk_sequences(
+                        [row_id_sequence.clone()],
+                        fragment_sizes,
+                        true,
+                    )
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "Captured row ids not equal to number of rows written: {}",
+                            e
+                        ))
+                    })?;
+
+                    for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                        let serialized = lance_table::rowids::write_row_ids(&sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    }
+                }
+
+                // Apply deletions
+                let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
+
+                let removed_row_addr_vec =
+                    if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+                        let addresses: Vec<u64> = removed_row_ids
+                            .iter()
+                            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                            .collect::<Vec<_>>();
+                        addresses
+                    } else {
+                        removed_row_ids
+                    };
+
+                Ok(RoaringTreemap::from_iter(removed_row_addr_vec.into_iter()))
+            }
+            .await;
+            let removed_row_addrs = match post_write_result {
+                Ok(removed_row_addrs) => removed_row_addrs,
+                Err(e) => {
+                    cleanup_data_fragments(
+                        &self.dataset.object_store,
+                        &self.dataset.base,
+                        cleanup_bases.as_deref(),
+                        &new_fragments,
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
 
             let deletions_result = Self::apply_deletions(&self.dataset, &removed_row_addrs).await;
             let (old_fragments, removed_fragment_ids) = match deletions_result {
@@ -2018,6 +2037,7 @@ impl MergeInsertJob {
                     cleanup_data_fragments(
                         &self.dataset.object_store,
                         &self.dataset.base,
+                        cleanup_bases.as_deref(),
                         &new_fragments,
                     )
                     .await;
