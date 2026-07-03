@@ -441,17 +441,9 @@ pub(crate) fn validate_prepared_blob_array(field: &Field, array: &ArrayRef) -> R
     validate_prepared_blob_value_array(field, array)
 }
 
-/// Return the sidecar blob path for a data file and blob id.
-///
-/// File-level blob descriptors store `blob_id`, not an arbitrary object path. Readers derive the
-/// sidecar object path from the data file path and this id.
-pub fn blob_path_for_file(data_file_path: &Path, blob_id: u32) -> Result<Path> {
+fn sidecar_path_for_data_file(data_file_path: &Path, blob_id: u32) -> Result<Path> {
     validate_blob_id(blob_id)?;
-    let mut parts = data_file_path
-        .parts()
-        .map(|part| part.as_ref().to_string())
-        .collect::<Vec<_>>();
-    let file_name = parts.pop().ok_or_else(|| {
+    let file_name = data_file_path.filename().ok_or_else(|| {
         Error::invalid_input("Data file path must include a file name".to_string())
     })?;
     let data_file_key = file_name.strip_suffix(".lance").ok_or_else(|| {
@@ -460,7 +452,7 @@ pub fn blob_path_for_file(data_file_path: &Path, blob_id: u32) -> Result<Path> {
             data_file_path
         ))
     })?;
-    let data_dir = Path::from_iter(parts);
+    let data_dir = data_file_path.parent().unwrap_or_default();
     Ok(blob_path(&data_dir, data_file_key, blob_id))
 }
 
@@ -761,7 +753,7 @@ impl PackedBlobWriter {
         data_file_path: Path,
         blob_id: u32,
     ) -> Result<Self> {
-        let path = blob_path_for_file(&data_file_path, blob_id)?;
+        let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -848,7 +840,7 @@ impl DedicatedBlobWriter {
         data_file_path: Path,
         blob_id: u32,
     ) -> Result<Self> {
-        let path = blob_path_for_file(&data_file_path, blob_id)?;
+        let path = sidecar_path_for_data_file(&data_file_path, blob_id)?;
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -1098,16 +1090,6 @@ mod tests {
         let mut b = BlobArrayBuilder::new(1);
         let err = b.push_uri("").unwrap_err();
         assert!(err.to_string().contains("URI cannot be empty"));
-    }
-
-    #[test]
-    fn test_blob_path_for_file() {
-        let data_file_path = Path::from("data/deadbeef.lance");
-        let path = blob_path_for_file(&data_file_path, 2).unwrap();
-        assert_eq!(
-            path.to_string(),
-            "data/deadbeef/01000000000000000000000000000000.blob"
-        );
     }
 
     #[test]

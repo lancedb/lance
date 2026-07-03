@@ -10,7 +10,7 @@ use lance::{
 use pyo3::{
     Bound, PyResult,
     exceptions::PyValueError,
-    pyclass, pyfunction, pymethods,
+    pyclass, pymethods,
     types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule},
 };
 use std::sync::Arc;
@@ -32,13 +32,6 @@ impl PyBlobDescriptor {
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }
-}
-
-#[pyfunction(name = "blob_path_for_file")]
-pub fn py_blob_path_for_file(data_file_path: String, blob_id: u32) -> PyResult<String> {
-    lance::blob_path_for_file(&object_store::path::Path::from(data_file_path), blob_id)
-        .map(|path| path.to_string())
-        .infer_error()
 }
 
 #[pyclass(name = "BlobDescriptorArrayBuilder", skip_from_py_object)]

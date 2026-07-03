@@ -8,7 +8,6 @@ import sys
 import tarfile
 import textwrap
 import uuid
-from pathlib import Path
 
 import lance
 import pandas as pd
@@ -974,13 +973,11 @@ def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_repl
     data_file_name = f"{file_id}.lance"
     blob_id = 1
     blob_path = _blob_sidecar_path(dataset_uri / "data", file_id, blob_id)
-    relative_blob_path = _blob_sidecar_path(Path("."), file_id, blob_id)
-    assert lance.blob_path_for_file(data_file_name, blob_id) == str(relative_blob_path)
 
     files = LanceFileSession(dataset_uri / "data")
     blob_writer = lance.BlobDescriptorArrayBuilder("blob")
     packed = files.open_packed_blob_writer(data_file_name, blob_id)
-    assert packed.path.endswith(str(blob_path.relative_to(dataset_uri)))
+    assert packed.path.endswith(blob_path.relative_to(dataset_uri).as_posix())
     packed.write_blob(b"replacement")
     blob_writer.extend(packed.finish())
 

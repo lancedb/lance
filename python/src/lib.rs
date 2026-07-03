@@ -307,7 +307,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_evaluate_sharding_spec))?;
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
-    m.add_wrapped(wrap_pyfunction!(blob::py_blob_path_for_file))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;

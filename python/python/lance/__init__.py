@@ -20,7 +20,6 @@ from .blob import (
     PackedBlobWriter,
     blob_array,
     blob_field,
-    blob_path_for_file,
 )
 from .dataset import (
     DataStatistics,
@@ -90,7 +89,6 @@ __all__ = [
     "BlobDescriptor",
     "blob_array",
     "blob_field",
-    "blob_path_for_file",
     "CleanupCandidateFile",
     "CleanupExplanation",
     "CleanupReferencedBranch",

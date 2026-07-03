@@ -23,9 +23,6 @@ from .lance import (
 from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
-from .lance import (
-    blob_path_for_file as blob_path_for_file,
-)
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
