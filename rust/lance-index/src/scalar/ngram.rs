@@ -64,6 +64,7 @@ const NGRAM_INDEX_VERSION: u32 = 0;
 /// so a spill state whose serialized posting lists exceed that must be written as
 /// multiple record batches (same approach as the bitmap index).  Leave headroom.
 const MAX_POSTING_LIST_BATCH_BYTES: usize = i32::MAX as usize - 1024 * 1024;
+const POSTING_LIST_STREAM_BATCH_ROWS: usize = 64;
 
 use std::sync::LazyLock;
 
@@ -338,10 +339,11 @@ impl NGramIndex {
         })
     }
 
-    // Remapping can grow the serialized posting lists, so the result is re-chunked
-    // into byte-bounded batches rather than mirroring the input batch.
-    fn remap_batch(&self, batch: RecordBatch, mapping: &RowAddrRemap) -> Result<Vec<RecordBatch>> {
-        let state = NGramIndexSpillState::try_from_batch(batch)?;
+    fn remap_state(
+        &self,
+        state: NGramIndexSpillState,
+        mapping: &RowAddrRemap,
+    ) -> Result<Vec<RecordBatch>> {
         let bitmaps = state
             .bitmaps
             .into_iter()
@@ -522,16 +524,12 @@ impl ScalarIndex for NGramIndex {
             .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
             .await?;
 
-        let mut offset = 0;
-        let num_rows = reader.num_rows();
-        const BATCH_SIZE: usize = 64;
-        while offset < num_rows {
-            let batch_size = BATCH_SIZE.min(num_rows - offset);
-            let batch = reader.read_range(offset..offset + batch_size, None).await?;
-            for batch in self.remap_batch(batch, mapping)? {
+        let mut spill_stream =
+            NGramIndexBuilder::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?;
+        while let Some(state) = spill_stream.try_next().await? {
+            for batch in self.remap_state(state, mapping)? {
                 writer.write_record_batch(batch).await?;
             }
-            offset += BATCH_SIZE;
         }
 
         let file = writer.finish().await?;
@@ -620,6 +618,85 @@ impl Default for NGramIndexBuilderOptions {
 struct NGramIndexSpillState {
     tokens: UInt32Array,
     bitmaps: Vec<RoaringTreemap>,
+}
+
+struct NGramIndexSpillStateBuilder {
+    tokens: UInt32Builder,
+    bitmaps: Vec<RoaringTreemap>,
+    serialized_bytes: usize,
+}
+
+impl NGramIndexSpillStateBuilder {
+    fn new() -> Self {
+        Self {
+            tokens: UInt32Builder::with_capacity(0),
+            bitmaps: Vec::new(),
+            serialized_bytes: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bitmaps.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.bitmaps.len()
+    }
+
+    fn push(
+        &mut self,
+        token: u32,
+        bitmap: RoaringTreemap,
+        max_batch_bytes: usize,
+    ) -> Result<Option<NGramIndexSpillState>> {
+        let posting_size = bitmap.serialized_size();
+        if posting_size > max_batch_bytes {
+            return Err(Error::invalid_input(format!(
+                "posting list for ngram token {} serializes to {} bytes, which exceeds the {} bytes that fit in a single binary array",
+                token, posting_size, max_batch_bytes,
+            )));
+        }
+
+        let new_size = self
+            .serialized_bytes
+            .checked_add(posting_size)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "posting list byte size overflowed while adding ngram token {}",
+                    token
+                ))
+            })?;
+        let full_state = if !self.is_empty() && new_size > max_batch_bytes {
+            Some(self.finish())
+        } else {
+            None
+        };
+
+        self.tokens.append_value(token);
+        self.bitmaps.push(bitmap);
+        self.serialized_bytes = posting_size
+            .checked_add(if full_state.is_some() {
+                0
+            } else {
+                self.serialized_bytes
+            })
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "posting list byte size overflowed while adding ngram token {}",
+                    token
+                ))
+            })?;
+
+        Ok(full_state)
+    }
+
+    fn finish(&mut self) -> NGramIndexSpillState {
+        self.serialized_bytes = 0;
+        NGramIndexSpillState {
+            tokens: std::mem::replace(&mut self.tokens, UInt32Builder::with_capacity(0)).finish(),
+            bitmaps: std::mem::take(&mut self.bitmaps),
+        }
+    }
 }
 
 impl NGramIndexSpillState {
@@ -1015,25 +1092,52 @@ impl NGramIndexBuilder {
 
     fn stream_spill_reader(
         reader: Arc<dyn IndexReader>,
+        max_batch_bytes: usize,
     ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
         let num_rows = reader.num_rows();
 
-        Ok(stream::try_unfold(0, move |offset| {
-            let reader = reader.clone();
-            async move {
-                // These are small batches but, in the worst case scenario, each row could
-                // be massive (up to 128MB per row at 1B rows) and we end up breaking memory
-                let batch_size = std::cmp::min(num_rows - offset, 64);
-                if batch_size == 0 {
-                    return Ok(None);
+        Ok(stream::try_unfold(
+            (0, NGramIndexSpillStateBuilder::new()),
+            move |(mut offset, mut builder)| {
+                let reader = reader.clone();
+                async move {
+                    while offset < num_rows {
+                        // A single posting list is already bounded by
+                        // MAX_POSTING_LIST_BATCH_BYTES. Reading one row at a time avoids
+                        // materializing several large postings into the same BinaryArray
+                        // before the byte-bounded writer can split them again.
+                        let batch = reader.read_range(offset..offset + 1, None).await?;
+                        offset += 1;
+
+                        let state = NGramIndexSpillState::try_from_batch(batch)?;
+                        if state.tokens.len() != 1 || state.bitmaps.len() != 1 {
+                            return Err(Error::internal(format!(
+                                "expected one ngram posting row at offset {}, got {} tokens and {} posting lists",
+                                offset - 1,
+                                state.tokens.len(),
+                                state.bitmaps.len(),
+                            )));
+                        }
+                        let token = state.tokens.value(0);
+                        let mut bitmaps = state.bitmaps.into_iter();
+                        let bitmap = bitmaps.next().expect_ok()?;
+                        if let Some(state) = builder.push(token, bitmap, max_batch_bytes)? {
+                            return Ok(Some((state, (offset, builder))));
+                        }
+                        if builder.len() >= POSTING_LIST_STREAM_BATCH_ROWS {
+                            return Ok(Some((builder.finish(), (offset, builder))));
+                        }
+                    }
+
+                    if builder.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some((builder.finish(), (offset, builder))))
+                    }
                 }
-                let batch = reader.read_range(offset..offset + batch_size, None).await?;
-                let state = NGramIndexSpillState::try_from_batch(batch)?;
-                let new_offset = offset + batch_size;
-                Ok(Some((state, new_offset)))
-            }
-            .boxed()
-        }))
+                .boxed()
+            },
+        ))
     }
 
     async fn stream_spill(
@@ -1043,7 +1147,7 @@ impl NGramIndexBuilder {
         let reader = spill_store
             .open_index_file(&Self::spill_filename(id))
             .await?;
-        Self::stream_spill_reader(reader)
+        Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)
     }
 
     fn merge_spill_states(
@@ -1249,7 +1353,7 @@ impl NGramIndexBuilder {
 
         let left_stream = Self::stream_spill(self.spill_store.clone(), new_data_num).await?;
         let old_reader = old_index.open_index_file(POSTINGS_FILENAME).await?;
-        let right_stream = Self::stream_spill_reader(old_reader)?;
+        let right_stream = Self::stream_spill_reader(old_reader, MAX_POSTING_LIST_BATCH_BYTES)?;
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 
@@ -1294,14 +1398,9 @@ impl NGramIndexBuilder {
             .open_index_file(&Self::spill_filename(index_to_copy))
             .await?;
 
-        let num_rows = reader.num_rows();
-        let mut offset = 0;
-
-        while offset < num_rows {
-            let batch_size = std::cmp::min(num_rows - offset, 64);
-            let batch = reader.read_range(offset..offset + batch_size, None).await?;
-            writer.write_record_batch(batch).await?;
-            offset += batch_size;
+        let mut spill_stream = Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?;
+        while let Some(state) = spill_stream.try_next().await? {
+            Self::write_state(writer.as_mut(), state).await?;
         }
 
         writer.finish().await
@@ -1424,13 +1523,14 @@ mod tests {
     use arrow::datatypes::{UInt32Type, UInt64Type};
     use arrow_array::{Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use datafusion::{
         execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
     };
     use datafusion_common::DataFusionError;
     use futures::{TryStreamExt, stream};
     use itertools::Itertools;
-    use lance_core::{ROW_ID, cache::LanceCache, utils::tempfile::TempDir};
+    use lance_core::{Error, ROW_ID, Result, cache::LanceCache, utils::tempfile::TempDir};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
@@ -1438,13 +1538,59 @@ mod tests {
     use roaring::RoaringTreemap;
 
     use crate::scalar::{
-        ScalarIndex, SearchResult, TextQuery,
+        IndexReader, IndexStore, ScalarIndex, SearchResult, TextQuery,
         lance_format::LanceIndexStore,
         ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions},
     };
     use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
 
-    use super::{NGRAM_TOKENIZER, NGramIndexSpillState, ngram_to_token, tokenize_visitor};
+    use super::{
+        NGRAM_TOKENIZER, NGramIndexSpillState, POSTINGS_FILENAME, POSTINGS_SCHEMA, ngram_to_token,
+        tokenize_visitor,
+    };
+
+    struct MaxReadRangeReader {
+        inner: Arc<dyn IndexReader>,
+        max_rows: usize,
+    }
+
+    #[async_trait]
+    impl IndexReader for MaxReadRangeReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            self.inner.read_record_batch(n, batch_size).await
+        }
+
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            let rows = range.end - range.start;
+            if rows > self.max_rows {
+                return Err(Error::invalid_input(format!(
+                    "read_range requested {} rows, max is {}",
+                    rows, self.max_rows,
+                )));
+            }
+            self.inner.read_range(range, projection).await
+        }
+
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.inner.schema()
+        }
+
+        fn file_size_bytes(&self) -> Option<u64> {
+            self.inner.file_size_bytes()
+        }
+    }
 
     fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
         let mut tokens = Vec::with_capacity(text.len() * 3);
@@ -2024,6 +2170,62 @@ mod tests {
                 row += 1;
             }
             assert!(batch_bytes <= max_batch_bytes || batch.num_rows() == 1);
+        }
+        assert_eq!(row, 8);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_spill_reader_does_not_materialize_multirow_posting_batches() {
+        let bitmaps = (0..8u64)
+            .map(|i| RoaringTreemap::from_iter(0..(i + 1) * 100))
+            .collect::<Vec<_>>();
+        let tokens = UInt32Array::from_iter_values(0..8);
+        let state = NGramIndexSpillState {
+            tokens: tokens.clone(),
+            bitmaps: bitmaps.clone(),
+        };
+        let max_batch_bytes = bitmaps.iter().map(|b| b.serialized_size()).max().unwrap() * 2;
+
+        let tmpdir = Arc::new(TempDir::default());
+        let store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let mut writer = store
+            .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
+            .await
+            .unwrap();
+        for batch in state.try_into_batches().unwrap() {
+            writer.write_record_batch(batch).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let reader = store.open_index_file(POSTINGS_FILENAME).await.unwrap();
+        let reader = Arc::new(MaxReadRangeReader {
+            inner: reader,
+            max_rows: 1,
+        });
+        let states = NGramIndexBuilder::stream_spill_reader(reader, max_batch_bytes)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(states.len() > 1);
+
+        let mut row = 0;
+        for state in states {
+            let batch_bytes = state
+                .bitmaps
+                .iter()
+                .map(RoaringTreemap::serialized_size)
+                .sum::<usize>();
+            assert!(batch_bytes <= max_batch_bytes || state.bitmaps.len() == 1);
+            for (token, bitmap) in state.tokens.values().iter().zip(state.bitmaps) {
+                assert_eq!(*token, tokens.value(row));
+                assert_eq!(bitmap, bitmaps[row]);
+                row += 1;
+            }
         }
         assert_eq!(row, 8);
     }
