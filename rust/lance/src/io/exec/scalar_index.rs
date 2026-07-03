@@ -130,16 +130,17 @@ async fn translate_addr_treemap_to_row_ids(
         match selection {
             RowAddrSelection::Full => {
                 // The whole fragment is selected: every live row's id qualifies.
-                for id in sequence.iter() {
-                    row_ids.insert(id);
-                }
+                row_ids |= RowAddrTreeMap::from(sequence.as_ref());
             }
             RowAddrSelection::Partial(offsets) => {
                 let Some(max_offset) = offsets.max() else {
                     continue;
                 };
-                let deletion_vector = file_fragment.get_deletion_vector().await?;
-                let num_physical_rows = file_fragment.physical_rows().await? as u32;
+                let (deletion_vector, num_physical_rows) = futures::try_join!(
+                    file_fragment.get_deletion_vector(),
+                    file_fragment.physical_rows()
+                )?;
+                let num_physical_rows = num_physical_rows as u32;
                 let mut ids = sequence.iter();
                 for physical_offset in 0..num_physical_rows {
                     if physical_offset > max_offset {
@@ -955,13 +956,15 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
+    use arrow::record_batch::RecordBatchIterator;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::Schema;
     use datafusion::{
         execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::gen_batch;
     use lance_index::{
         IndexType,
@@ -970,10 +973,11 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrTreeMap, result::IndexExprResultWireFormat};
 
     use crate::{
         Dataset,
+        dataset::WriteParams,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
@@ -1034,7 +1038,6 @@ mod tests {
             needs_recheck: false,
             fragment_bitmap: None,
         });
-
         let fragments = dataset.fragments().clone();
 
         let plan = MaterializeIndexExec::new(dataset, query, fragments);
@@ -1053,6 +1056,51 @@ mod tests {
 
         assert_eq!(batches.len(), 10);
         assert_eq!(batches[0].num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_translate_addr_treemap_to_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+        let fragment_id = dataset.get_fragments()[1].id() as u32;
+
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(fragment_id);
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &full_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![5, 6, 7, 8, 9]);
+
+        let mut partial_fragment = RowAddrTreeMap::new();
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 1).into());
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 3).into());
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &partial_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![6, 8]);
     }
 
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
