@@ -60,6 +60,8 @@ const NGRAM_INDEX_VERSION: u32 = 0;
 
 use std::sync::LazyLock;
 
+type NGramSpillStream = futures::stream::BoxStream<'static, Result<NGramIndexSpillState>>;
+
 pub static TOKENS_FIELD: LazyLock<Field> =
     LazyLock::new(|| Field::new(TOKENS_COL, DataType::UInt32, true));
 pub static POSTINGS_FIELD: LazyLock<Field> =
@@ -966,12 +968,10 @@ impl NGramIndexBuilder {
         Ok(())
     }
 
-    fn stream_spill_reader(
-        reader: Arc<dyn IndexReader>,
-    ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
+    fn stream_spill_reader(reader: Arc<dyn IndexReader>) -> NGramSpillStream {
         let num_rows = reader.num_rows();
 
-        Ok(stream::try_unfold(0, move |offset| {
+        stream::try_unfold(0, move |offset| {
             let reader = reader.clone();
             async move {
                 // These are small batches but, in the worst case scenario, each row could
@@ -986,17 +986,15 @@ impl NGramIndexBuilder {
                 Ok(Some((state, new_offset)))
             }
             .boxed()
-        }))
+        })
+        .boxed()
     }
 
-    async fn stream_spill(
-        spill_store: Arc<dyn IndexStore>,
-        id: usize,
-    ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
+    async fn stream_spill(spill_store: Arc<dyn IndexStore>, id: usize) -> Result<NGramSpillStream> {
         let reader = spill_store
             .open_index_file(&Self::spill_filename(id))
             .await?;
-        Self::stream_spill_reader(reader)
+        Ok(Self::stream_spill_reader(reader))
     }
 
     fn merge_spill_states(
@@ -1202,7 +1200,7 @@ impl NGramIndexBuilder {
 
         let left_stream = Self::stream_spill(self.spill_store.clone(), new_data_num).await?;
         let old_reader = old_index.open_index_file(POSTINGS_FILENAME).await?;
-        let right_stream = Self::stream_spill_reader(old_reader)?;
+        let right_stream = Self::stream_spill_reader(old_reader);
 
         Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
 

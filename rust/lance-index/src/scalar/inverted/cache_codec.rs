@@ -39,10 +39,12 @@ use crate::cache_pb::{
     PostingTailCodec as PbPostingTailCodec,
 };
 
+use super::impact::ImpactSkipData;
 use super::index::{
     CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
     Positions, PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
 };
+use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 
 // ---------------------------------------------------------------------------
 // Tags
@@ -95,6 +97,7 @@ const BLOCK_OFFSETS_COLUMN: &str = "block_offsets";
 const ROW_IDS_COLUMN: &str = "row_ids";
 const FREQUENCIES_COLUMN: &str = "frequencies";
 const BLOCKS_COLUMN: &str = "blocks";
+const IMPACTS_COLUMN: &str = "impacts";
 
 fn legacy_positions_batch(list: &ListArray) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -178,7 +181,7 @@ fn read_position_sections(
 
 impl CacheCodecImpl for PostingList {
     const TYPE_ID: &'static str = "lance.fts.PostingList";
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         match self {
@@ -291,6 +294,8 @@ fn serialize_compressed(
         posting_tail_codec: posting_tail_codec_to_proto(posting.posting_tail_codec) as i32,
         position_storage: position_storage as i32,
         position_stream_codec: position_stream_codec as i32,
+        block_size: posting.block_size as u32,
+        has_impacts: posting.impacts.is_some(),
     };
     w.write_header(&header)?;
 
@@ -304,6 +309,15 @@ fn serialize_compressed(
 
     if let Some(storage) = &posting.positions {
         write_position_sections(w, storage)?;
+    }
+    if let Some(impacts) = &posting.impacts {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            IMPACTS_COLUMN,
+            DataType::LargeBinary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(impacts.entries().clone())])?;
+        w.write_ipc(&batch)?;
     }
     Ok(())
 }
@@ -322,13 +336,36 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
 
     let stream_codec = proto_to_position_stream_codec(header.position_stream_codec());
     let positions = read_position_sections(r, header.position_storage(), stream_codec)?;
+    let block_size = if header.block_size == 0 {
+        LEGACY_BLOCK_SIZE
+    } else {
+        validate_block_size(header.block_size as usize)?
+    };
+    let impacts = if r.version() >= 2 && header.has_impacts {
+        let batch = r.read_ipc()?;
+        let entries = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| Error::io("impacts column is not a LargeBinaryArray".to_string()))?
+            .clone();
+        Some(ImpactSkipData::new(
+            entries,
+            blocks.len(),
+            super::impact::ImpactFormat::for_block_size(block_size),
+        )?)
+    } else {
+        None
+    };
 
     Ok(CompressedPostingList::new(
         blocks,
         header.max_score,
         header.length,
         posting_tail_codec,
+        block_size,
         positions,
+        impacts,
     ))
 }
 
@@ -344,7 +381,7 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
 /// length prefixes to separate them. See issue #7040.
 impl CacheCodecImpl for PostingListGroup {
     const TYPE_ID: &'static str = "lance.fts.PostingListGroup";
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let count = u32::try_from(self.posting_lists.len())
@@ -410,12 +447,13 @@ impl CacheCodecImpl for Positions {
 #[cfg(test)]
 mod tests {
     use arrow::buffer::ScalarBuffer;
-    use arrow_array::LargeBinaryArray;
-    use arrow_array::builder::{Int32Builder, ListBuilder};
+    use arrow_array::builder::{Int32Builder, LargeBinaryBuilder, ListBuilder};
+    use arrow_array::{Array, LargeBinaryArray};
     use bytes::Bytes;
     use lance_core::Result;
     use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 
+    use super::super::impact::ImpactSkipData;
     use super::super::index::{
         CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
         Positions, PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
@@ -461,6 +499,44 @@ mod tests {
         }
     }
 
+    fn impact_entry(doc_up_to: u32, pairs: &[(u32, u32)]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + pairs.len() * 8);
+        bytes.extend_from_slice(&doc_up_to.to_le_bytes());
+        bytes.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+        for (freq, doc_len) in pairs {
+            bytes.extend_from_slice(&freq.to_le_bytes());
+            bytes.extend_from_slice(&doc_len.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn impact_skip_data(level0_len: usize) -> ImpactSkipData {
+        let mut entries = Vec::with_capacity(level0_len + level0_len.div_ceil(32));
+        for block_idx in 0..level0_len {
+            entries.push(impact_entry(
+                (block_idx as u32 + 1) * 10 - 1,
+                &[(block_idx as u32 + 1, 10)],
+            ));
+        }
+        let num_level1 = level0_len.div_ceil(32);
+        for group_idx in 0..num_level1 {
+            let group_end = ((group_idx + 1) * 32).min(level0_len);
+            let doc_up_to = group_end as u32 * 10 - 1;
+            entries.push(impact_entry(doc_up_to, &[(1, 10), (2, 8)]));
+        }
+        let mut builder = LargeBinaryBuilder::with_capacity(entries.len(), 0);
+        for entry in entries {
+            builder.append_value(entry);
+        }
+        let array = builder.finish();
+        ImpactSkipData::new(
+            array,
+            level0_len,
+            super::super::impact::ImpactFormat::FixedU32,
+        )
+        .unwrap()
+    }
+
     /// Serialize a codec body (no envelope) into a standalone buffer.
     fn body_bytes<T: CacheCodecImpl>(entry: &T) -> Bytes {
         let mut buf = Vec::new();
@@ -472,6 +548,11 @@ mod tests {
     /// Deserialize a codec body (no envelope) at the current build's version.
     fn from_body<T: CacheCodecImpl>(data: &Bytes) -> Result<T> {
         let mut r = CacheEntryReader::new(data, 0, T::CURRENT_VERSION);
+        T::deserialize(&mut r)
+    }
+
+    fn from_body_version<T: CacheCodecImpl>(data: &Bytes, version: u32) -> Result<T> {
+        let mut r = CacheEntryReader::new(data, 0, version);
         T::deserialize(&mut r)
     }
 
@@ -532,19 +613,74 @@ mod tests {
             Some(&[1u8, 2, 3, 4, 5][..]),
             Some(&[6, 7, 8, 9, 10][..]),
         ]);
-        let posting =
-            CompressedPostingList::new(blocks, 3.5, 42, PostingTailCodec::VarintDelta, None);
+        let posting = CompressedPostingList::new(
+            blocks,
+            3.5,
+            42,
+            PostingTailCodec::VarintDelta,
+            256,
+            None,
+            None,
+        );
         let entry = PostingList::Compressed(posting.clone());
         match roundtrip_posting_list(&entry) {
             PostingList::Compressed(restored) => {
                 assert_eq!(restored.max_score, posting.max_score);
                 assert_eq!(restored.length, posting.length);
                 assert_eq!(restored.posting_tail_codec, posting.posting_tail_codec);
+                assert_eq!(restored.block_size, posting.block_size);
                 assert_eq!(restored.blocks, posting.blocks);
                 assert!(restored.positions.is_none());
             }
             PostingList::Plain(_) => panic!("expected Compressed variant"),
         }
+    }
+
+    #[test]
+    fn compressed_posting_list_impacts_roundtrip() {
+        let blocks = LargeBinaryArray::from_opt_vec(vec![
+            Some(&[1u8, 2, 3, 4, 5][..]),
+            Some(&[6, 7, 8, 9, 10][..]),
+        ]);
+        let impacts = impact_skip_data(blocks.len());
+        let posting = CompressedPostingList::new(
+            blocks,
+            3.5,
+            42,
+            PostingTailCodec::VarintDelta,
+            256,
+            None,
+            Some(impacts.clone()),
+        );
+        let entry = PostingList::Compressed(posting);
+        match roundtrip_posting_list(&entry) {
+            PostingList::Compressed(restored) => {
+                let restored = restored.impacts.expect("impacts should roundtrip");
+                assert_eq!(restored.level0_len(), impacts.level0_len());
+                assert_eq!(restored.level1_len(), impacts.level1_len());
+                assert_eq!(restored.entries(), impacts.entries());
+            }
+            PostingList::Plain(_) => panic!("expected Compressed variant"),
+        }
+    }
+
+    #[test]
+    fn compressed_posting_list_v1_cache_without_impacts_decodes() {
+        let posting = CompressedPostingList::new(
+            LargeBinaryArray::from_opt_vec(vec![Some(&[1u8, 2, 3][..])]),
+            1.25,
+            5,
+            PostingTailCodec::Fixed32,
+            crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            None,
+            None,
+        );
+        let data = body_bytes(&PostingList::Compressed(posting));
+        let restored = from_body_version::<PostingList>(&data, 1).unwrap();
+        let PostingList::Compressed(restored) = restored else {
+            panic!("expected Compressed variant");
+        };
+        assert!(restored.impacts.is_none());
     }
 
     #[test]
@@ -555,9 +691,11 @@ mod tests {
             1.25,
             5,
             PostingTailCodec::Fixed32,
+            crate::scalar::inverted::LEGACY_BLOCK_SIZE,
             Some(CompressedPositionStorage::LegacyPerDoc(legacy_positions(
                 &[&[0, 4, 8]],
             ))),
+            None,
         );
         let entry = PostingList::Compressed(posting.clone());
         match roundtrip_posting_list(&entry) {
@@ -589,7 +727,9 @@ mod tests {
                 7.0,
                 3,
                 PostingTailCodec::VarintDelta,
+                256,
                 Some(CompressedPositionStorage::SharedStream(stream)),
+                None,
             );
             let entry = PostingList::Compressed(posting.clone());
             match roundtrip_posting_list(&entry) {
@@ -617,9 +757,11 @@ mod tests {
             7.0,
             3,
             PostingTailCodec::VarintDelta,
+            256,
             Some(CompressedPositionStorage::SharedStream(
                 expected_stream.clone(),
             )),
+            None,
         );
         let serialized = body_bytes(&PostingList::Compressed(posting));
 
@@ -651,6 +793,8 @@ mod tests {
             2.5,
             7,
             PostingTailCodec::VarintDelta,
+            256,
+            None,
             None,
         ));
 
@@ -672,6 +816,64 @@ mod tests {
                     }
                     _ => panic!("variant mismatch in group roundtrip"),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn posting_list_group_impacted_compressed_members_roundtrip() {
+        let first = CompressedPostingList::new(
+            LargeBinaryArray::from_opt_vec(vec![Some(&[1u8, 2, 3][..]), Some(&[4u8, 5, 6][..])]),
+            3.0,
+            256,
+            PostingTailCodec::VarintDelta,
+            crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            None,
+            Some(impact_skip_data(2)),
+        );
+        let second = CompressedPostingList::new(
+            LargeBinaryArray::from_opt_vec(vec![Some(&[7u8, 8, 9][..])]),
+            5.0,
+            128,
+            PostingTailCodec::Fixed32,
+            256,
+            Some(CompressedPositionStorage::SharedStream(
+                SharedPositionStream::new(
+                    PositionStreamCodec::PackedDelta,
+                    vec![0u32, 12],
+                    Bytes::from(vec![0xABu8; 32]),
+                ),
+            )),
+            Some(impact_skip_data(1)),
+        );
+        let members = vec![
+            PostingList::Compressed(first.clone()),
+            PostingList::Compressed(second.clone()),
+        ];
+        let group = PostingListGroup::new(members);
+        let restored = from_body::<PostingListGroup>(&body_bytes(&group)).unwrap();
+        assert_eq!(restored.posting_lists.len(), 2);
+
+        let expected = [&first, &second];
+        for (expected, restored) in expected.iter().zip(restored.posting_lists.iter()) {
+            let PostingList::Compressed(restored) = restored else {
+                panic!("expected compressed member");
+            };
+            assert_eq!(restored.blocks, expected.blocks);
+            assert_eq!(restored.length, expected.length);
+            assert_eq!(restored.max_score, expected.max_score);
+            assert_eq!(restored.posting_tail_codec, expected.posting_tail_codec);
+            assert_eq!(restored.block_size, expected.block_size);
+            assert_eq!(
+                restored.impacts.as_ref().unwrap().entries(),
+                expected.impacts.as_ref().unwrap().entries()
+            );
+            match (&expected.positions, &restored.positions) {
+                (Some(expected), Some(restored)) => {
+                    assert_position_storage_eq(expected, restored);
+                }
+                (None, None) => {}
+                _ => panic!("position storage mismatch"),
             }
         }
     }
@@ -760,7 +962,9 @@ mod tests {
                 7.0,
                 3,
                 PostingTailCodec::VarintDelta,
+                256,
                 Some(CompressedPositionStorage::SharedStream(stream)),
+                None,
             ))
         }
 
@@ -810,6 +1014,8 @@ mod tests {
                     7.0,
                     3,
                     PostingTailCodec::VarintDelta,
+                    256,
+                    None,
                     None,
                 ))
             };

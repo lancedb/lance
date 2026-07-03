@@ -22,6 +22,7 @@ use crate::metrics::MetricsCollector;
 
 use super::{
     CompressedPositionStorage,
+    impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData},
     query::Operator,
     scorer::{K1, idf},
 };
@@ -29,8 +30,8 @@ use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
     builder::ScoredDoc,
     encoding::{
-        decode_position_stream_block, decompress_positions, decompress_posting_block,
-        decompress_posting_remainder,
+        MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
+        decompress_posting_block, decompress_posting_remainder,
     },
     query::FtsSearchParams,
     scorer::Scorer,
@@ -38,12 +39,49 @@ use super::{
 use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
+
+/// Top-k heap entry: (scored doc, (term, freq) pairs, doc length, posting doc id).
+type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, Vec<(u32, u32)>, u32, u64)>>;
+const LINEAR_BLOCK_SKIP_LIMIT: usize = 8;
 pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
         .unwrap_or_else(|_| "10".to_string())
         .parse::<u64>()
         .unwrap_or(10)
 });
+// Bulk MAXSCORE path for top-k disjunctions (Lucene MaxScoreBulkScorer
+// style). Default on: with right-sized partitions it wins by a wide margin
+// (Lucene-parity latency) and its results are score-identical to the classic
+// WAND loop. LANCE_FTS_MAXSCORE=0 opts back into the classic loop.
+static USE_MAXSCORE_SEARCH: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() != Ok("0"));
+
+#[inline]
+fn posting_block_idx(index: usize, block_size: usize) -> usize {
+    match block_size {
+        128 => index >> 7,
+        256 => index >> 8,
+        _ => index / block_size,
+    }
+}
+
+#[inline]
+fn posting_block_offset(index: usize, block_size: usize) -> usize {
+    match block_size {
+        128 => index & 127,
+        256 => index & 255,
+        _ => index % block_size,
+    }
+}
+
+#[inline]
+fn posting_block_start(block_idx: usize, block_size: usize) -> usize {
+    match block_size {
+        128 => block_idx << 7,
+        256 => block_idx << 8,
+        _ => block_idx * block_size,
+    }
+}
 
 pub struct PostingIterator {
     token: String,
@@ -55,6 +93,7 @@ pub struct PostingIterator {
     index: usize,
     // the index of current block, this can be changed by `next() and shallow_next()`
     block_idx: usize,
+    current_doc: Option<DocInfo>,
     approximate_upper_bound: f32,
 
     // for compressed posting list
@@ -66,24 +105,31 @@ struct CompressedState {
     block_idx: usize,
     doc_ids: Vec<u32>,
     freqs: Vec<u32>,
-    buffer: Box<[u32; BLOCK_SIZE]>,
+    buffer: Box<[u32; MAX_POSTING_BLOCK_SIZE]>,
     position_block_idx: Option<usize>,
     position_values: Vec<u32>,
     position_offsets: Vec<usize>,
     block_max_window: BlockMaxWindow,
+    // Lucene-style anchored impact score caches: one slot per level, keyed by
+    // the entry the block cursor currently sits in. Each holds
+    // (entry_idx, doc_up_to, max_score). See `impact_level0`/`impact_level1`.
+    level0_cache: Option<(usize, u32, f32)>,
+    level1_cache: Option<(usize, u32, f32)>,
 }
 
 impl CompressedState {
-    fn new() -> Self {
+    fn new(block_size: usize) -> Self {
         Self {
             block_idx: 0,
-            doc_ids: Vec::with_capacity(BLOCK_SIZE),
-            freqs: Vec::with_capacity(BLOCK_SIZE),
-            buffer: Box::new([0; BLOCK_SIZE]),
+            doc_ids: Vec::with_capacity(block_size),
+            freqs: Vec::with_capacity(block_size),
+            buffer: Box::new([0; MAX_POSTING_BLOCK_SIZE]),
             position_block_idx: None,
             position_values: Vec::new(),
             position_offsets: Vec::new(),
             block_max_window: BlockMaxWindow::new(),
+            level0_cache: None,
+            level1_cache: None,
         }
     }
 
@@ -95,11 +141,12 @@ impl CompressedState {
         num_blocks: usize,
         length: u32,
         tail_codec: super::PostingTailCodec,
+        block_size: usize,
     ) {
         self.doc_ids.clear();
         self.freqs.clear();
 
-        let remainder = length as usize % BLOCK_SIZE;
+        let remainder = posting_block_offset(length as usize, block_size);
         if block_idx + 1 == num_blocks && remainder != 0 {
             decompress_posting_remainder(
                 block,
@@ -109,7 +156,13 @@ impl CompressedState {
                 &mut self.freqs,
             );
         } else {
-            decompress_posting_block(block, &mut self.buffer, &mut self.doc_ids, &mut self.freqs);
+            decompress_posting_block(
+                block,
+                &mut self.buffer[..],
+                &mut self.doc_ids,
+                &mut self.freqs,
+                block_size,
+            );
         }
         self.block_idx = block_idx;
         self.position_block_idx = None;
@@ -122,6 +175,8 @@ impl CompressedState {
 struct BlockMaxWindow {
     // Sliding block range used for Lucene-style getMaxScore(upTo). The deque is
     // monotonic by score and covers blocks in [start_block_idx, next_block_idx).
+    // Only used for compressed lists without impact skip data; impact lists
+    // answer window max scores from the anchored level caches instead.
     start_block_idx: usize,
     next_block_idx: usize,
     max_scores: VecDeque<(usize, f32)>,
@@ -147,11 +202,13 @@ impl BlockMaxWindow {
         self.max_scores.clear();
     }
 
-    fn max_score_up_to(
+    fn max_score_up_to<S: Scorer + ?Sized>(
         &mut self,
         list: &CompressedPostingList,
         start_block_idx: usize,
         up_to: u64,
+        query_weight: f32,
+        scorer: &S,
     ) -> BlockMaxScore {
         if start_block_idx >= list.blocks.len() {
             self.reset(start_block_idx);
@@ -182,7 +239,10 @@ impl BlockMaxWindow {
         while self.next_block_idx < list.blocks.len()
             && list.block_least_doc_id(self.next_block_idx) as u64 <= up_to
         {
-            let score = list.block_max_score(self.next_block_idx);
+            let score = match list.impacts.as_ref() {
+                Some(impacts) => impacts.level0_score(self.next_block_idx, query_weight, scorer),
+                None => list.block_max_score(self.next_block_idx),
+            };
             while matches!(self.max_scores.back(), Some((_, old_score)) if *old_score <= score) {
                 self.max_scores.pop_back();
             }
@@ -257,6 +317,109 @@ impl Ord for PostingIterator {
 
 impl PostingIterator {
     #[inline]
+    fn block_least_doc_id(&self, list: &CompressedPostingList, block_idx: usize) -> u32 {
+        list.block_least_doc_id(block_idx)
+    }
+
+    fn block_idx_for_doc(
+        &self,
+        list: &CompressedPostingList,
+        mut block_idx: usize,
+        least_id: u32,
+    ) -> usize {
+        let mut linear_skips = 0;
+        while block_idx + 1 < list.blocks.len() && linear_skips < LINEAR_BLOCK_SKIP_LIMIT {
+            if self.block_least_doc_id(list, block_idx + 1) > least_id {
+                return block_idx;
+            }
+            block_idx += 1;
+            linear_skips += 1;
+        }
+
+        if block_idx + 1 >= list.blocks.len() {
+            return block_idx;
+        }
+
+        if let Some(impacts) = list.impacts.as_ref()
+            && let Some(block_idx) =
+                self.block_idx_for_doc_with_impacts(list, impacts, block_idx, least_id)
+        {
+            return block_idx;
+        }
+
+        self.block_idx_for_doc_by_least_doc_id(list, block_idx, least_id, list.blocks.len())
+    }
+
+    fn block_idx_for_doc_with_impacts(
+        &self,
+        list: &CompressedPostingList,
+        impacts: &ImpactSkipData,
+        mut block_idx: usize,
+        least_id: u32,
+    ) -> Option<usize> {
+        while block_idx + 1 < list.blocks.len() {
+            let group_idx = (block_idx + 1) / IMPACT_LEVEL1_BLOCKS;
+            let group_end = ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(list.blocks.len());
+            let group_doc_up_to = impacts.level1_doc_up_to(group_idx)?;
+            if group_doc_up_to < least_id {
+                block_idx = group_end - 1;
+                continue;
+            }
+            if group_doc_up_to == least_id {
+                return Some(group_end - 1);
+            }
+            return Some(
+                self.block_idx_for_doc_by_least_doc_id(list, block_idx, least_id, group_end),
+            );
+        }
+        Some(block_idx)
+    }
+
+    fn block_idx_for_doc_by_least_doc_id(
+        &self,
+        list: &CompressedPostingList,
+        block_idx: usize,
+        least_id: u32,
+        right: usize,
+    ) -> usize {
+        let mut left = block_idx + 1;
+        let mut right = right;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.block_least_doc_id(list, mid) <= least_id {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left - 1
+    }
+
+    #[inline]
+    fn block_end_doc(&self) -> u64 {
+        self.next_block_first_doc()
+            .map(|doc| doc.saturating_sub(1))
+            .unwrap_or(TERMINATED_DOC_ID)
+    }
+
+    /// Level1 bound of the group holding the current block, for group-wide
+    /// skipping: (group doc_up_to, group max score). `None` when the list has
+    /// no impact skip data or the group entry is missing/malformed.
+    fn impact_group_bound<S: Scorer + ?Sized>(&self, scorer: &S) -> Option<(u64, f32)> {
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                let impacts = list.impacts.as_ref()?;
+                let (doc_up_to, score) = self.impact_level1(impacts, scorer);
+                if doc_up_to == u32::MAX {
+                    return None;
+                }
+                Some((u64::from(doc_up_to), score))
+            }
+            PostingList::Plain(_) => None,
+        }
+    }
+
+    #[inline]
     fn compressed_state_ptr(&self) -> *mut CompressedState {
         debug_assert!(self.compressed.is_some());
         // this method is called very frequently, so we prefer to use `UnsafeCell` instead of
@@ -279,6 +442,7 @@ impl PostingIterator {
                 list.blocks.len(),
                 list.length,
                 list.posting_tail_codec,
+                list.block_size,
             );
         }
         compressed as *mut CompressedState
@@ -303,14 +467,28 @@ impl PostingIterator {
         list: PostingList,
         num_doc: usize,
     ) -> Self {
-        let approximate_upper_bound = match list.max_score() {
-            Some(max_score) => max_score,
-            None => idf(list.len(), num_doc) * (K1 + 1.0),
+        // BM25's doc weight is bounded by K1 + 1 for any freq and doc length,
+        // so query_weight * (K1 + 1) is a valid global bound even when index
+        // stats drift after appends. Keeping it finite matters: an INFINITY
+        // bound can never park the iterator in the WAND tail, forcing a deep
+        // advance on every candidate.
+        let approximate_upper_bound = match &list {
+            PostingList::Compressed(posting) if posting.impacts.is_some() => {
+                query_weight * (K1 + 1.0)
+            }
+            _ => match list.max_score() {
+                Some(max_score) => max_score,
+                None => idf(list.len(), num_doc) * (K1 + 1.0),
+            },
+        };
+        let compressed = match &list {
+            PostingList::Compressed(list) => {
+                Some(UnsafeCell::new(CompressedState::new(list.block_size)))
+            }
+            PostingList::Plain(_) => None,
         };
 
-        let is_compressed = matches!(list, PostingList::Compressed(_));
-
-        Self {
+        let mut posting = Self {
             token,
             token_id,
             position,
@@ -318,9 +496,12 @@ impl PostingIterator {
             list,
             index: 0,
             block_idx: 0,
+            current_doc: None,
             approximate_upper_bound,
-            compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
-        }
+            compressed,
+        };
+        posting.refresh_current_doc();
+        posting
     }
 
     #[inline]
@@ -338,8 +519,23 @@ impl PostingIterator {
         self.approximate_upper_bound
     }
 
+    /// Tightest known list-wide score bound. Impact lists answer from the
+    /// baked doc-weight slab (the data-driven equivalent of the max_score the
+    /// non-impact format bakes at build time); everything else falls back to
+    /// `approximate_upper_bound`. A finite, tight global bound lets lagging
+    /// iterators park in the WAND tail instead of being force-advanced.
     #[inline]
-    fn score<S: Scorer>(&self, scorer: &S, freq: u32, doc_length: u32) -> f32 {
+    fn global_upper_bound<S: Scorer + ?Sized>(&self, scorer: &S) -> f32 {
+        if let PostingList::Compressed(ref list) = self.list
+            && let Some(impacts) = list.impacts.as_ref()
+        {
+            return self.query_weight * impacts.global_max_doc_weight(scorer);
+        }
+        self.approximate_upper_bound
+    }
+
+    #[inline]
+    fn score<S: Scorer + ?Sized>(&self, scorer: &S, freq: u32, doc_length: u32) -> f32 {
         self.query_weight * scorer.doc_weight(freq, doc_length)
     }
 
@@ -355,14 +551,19 @@ impl PostingIterator {
 
     #[inline]
     fn doc(&self) -> Option<DocInfo> {
+        self.current_doc
+    }
+
+    fn refresh_current_doc(&mut self) {
         if self.empty() {
-            return None;
+            self.current_doc = None;
+            return;
         }
 
-        match self.list {
+        let current_doc = match self.list {
             PostingList::Compressed(ref list) => {
-                let block_idx = self.index / BLOCK_SIZE;
-                let block_offset = self.index % BLOCK_SIZE;
+                let block_idx = posting_block_idx(self.index, list.block_size);
+                let block_offset = posting_block_offset(self.index, list.block_size);
                 let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
 
                 // Read from the decompressed block
@@ -372,7 +573,8 @@ impl PostingIterator {
                 Some(doc)
             }
             PostingList::Plain(ref list) => Some(DocInfo::Located(list.doc(self.index))),
-        }
+        };
+        self.current_doc = current_doc;
     }
 
     fn position_cursor(&self) -> Option<PositionCursor<'_>> {
@@ -400,8 +602,8 @@ impl PostingIterator {
                     ))
                 }
                 CompressedPositionStorage::SharedStream(stream) => {
-                    let block_idx = self.index / BLOCK_SIZE;
-                    let block_offset = self.index % BLOCK_SIZE;
+                    let block_idx = posting_block_idx(self.index, list.block_size);
+                    let block_offset = posting_block_offset(self.index, list.block_size);
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     if compressed.position_block_idx != Some(block_idx) {
@@ -441,36 +643,46 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
-                let mut block_idx = self.index / BLOCK_SIZE;
-                while block_idx + 1 < list.blocks.len()
-                    && list.block_least_doc_id(block_idx + 1) <= least_id
-                {
-                    block_idx += 1;
-                }
-                self.index = self.index.max(block_idx * BLOCK_SIZE);
+                let block_idx = self.block_idx_for_doc(
+                    list,
+                    posting_block_idx(self.index, list.block_size),
+                    least_id,
+                );
+                self.index = self
+                    .index
+                    .max(posting_block_start(block_idx, list.block_size));
                 let length = list.length as usize;
                 while self.index < length {
-                    let block_idx = self.index / BLOCK_SIZE;
-                    let block_offset = self.index % BLOCK_SIZE;
+                    let block_idx = posting_block_idx(self.index, list.block_size);
+                    let block_offset = posting_block_offset(self.index, list.block_size);
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     let in_block = &compressed.doc_ids[block_offset..];
                     let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
                     let new_offset = block_offset + offset_in_block;
                     if new_offset < compressed.doc_ids.len() {
-                        self.index = block_idx * BLOCK_SIZE + new_offset;
-                        break;
+                        self.index = posting_block_start(block_idx, list.block_size) + new_offset;
+                        self.block_idx = block_idx;
+                        self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                            doc_id: compressed.doc_ids[new_offset],
+                            frequency: compressed.freqs[new_offset],
+                        }));
+                        return;
                     }
                     if block_idx + 1 >= list.blocks.len() {
                         self.index = length;
+                        self.block_idx = posting_block_idx(self.index, list.block_size);
+                        self.current_doc = None;
                         break;
                     }
-                    self.index = (block_idx + 1) * BLOCK_SIZE;
+                    self.index = posting_block_start(block_idx + 1, list.block_size);
                 }
-                self.block_idx = self.index / BLOCK_SIZE;
+                self.block_idx = posting_block_idx(self.index, list.block_size);
+                self.current_doc = None;
             }
             PostingList::Plain(ref list) => {
                 self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
+                self.current_doc = (!self.empty()).then(|| DocInfo::Located(list.doc(self.index)));
             }
         }
     }
@@ -480,11 +692,7 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
-                while self.block_idx + 1 < list.blocks.len()
-                    && list.block_least_doc_id(self.block_idx + 1) <= least_id
-                {
-                    self.block_idx += 1;
-                }
+                self.block_idx = self.block_idx_for_doc(list, self.block_idx, least_id);
             }
             PostingList::Plain(_) => {
                 // we don't have block max score for legacy index,
@@ -493,28 +701,107 @@ impl PostingIterator {
         }
     }
 
+    /// Anchored level0 impact bound of the current block: (doc_up_to, max_score),
+    /// memoized until the block cursor moves. Malformed entries degrade to
+    /// (u32::MAX, INFINITY), which keeps pruning safe by making the block look
+    /// unskippable.
     #[inline]
-    fn block_max_score(&self) -> f32 {
+    fn impact_level0<S: Scorer + ?Sized>(
+        &self,
+        impacts: &ImpactSkipData,
+        scorer: &S,
+    ) -> (u32, f32) {
+        let compressed = unsafe { &mut *self.compressed_state_ptr() };
+        if let Some((block_idx, doc_up_to, score)) = compressed.level0_cache
+            && block_idx == self.block_idx
+        {
+            return (doc_up_to, score);
+        }
+        let doc_up_to = impacts.level0_doc_up_to(self.block_idx).unwrap_or(u32::MAX);
+        let score = impacts.level0_score(self.block_idx, self.query_weight, scorer);
+        compressed.level0_cache = Some((self.block_idx, doc_up_to, score));
+        (doc_up_to, score)
+    }
+
+    /// Anchored level1 impact bound of the group holding the current block,
+    /// memoized until the cursor crosses a group boundary.
+    #[inline]
+    fn impact_level1<S: Scorer + ?Sized>(
+        &self,
+        impacts: &ImpactSkipData,
+        scorer: &S,
+    ) -> (u32, f32) {
+        let group_idx = self.block_idx / IMPACT_LEVEL1_BLOCKS;
+        let compressed = unsafe { &mut *self.compressed_state_ptr() };
+        if let Some((cached_group_idx, doc_up_to, score)) = compressed.level1_cache
+            && cached_group_idx == group_idx
+        {
+            return (doc_up_to, score);
+        }
+        let doc_up_to = impacts.level1_doc_up_to(group_idx).unwrap_or(u32::MAX);
+        let score = impacts.level1_score(group_idx, self.query_weight, scorer);
+        compressed.level1_cache = Some((group_idx, doc_up_to, score));
+        (doc_up_to, score)
+    }
+
+    #[inline]
+    fn block_max_score<S: Scorer + ?Sized>(&self, scorer: &S) -> f32 {
         match self.list {
-            PostingList::Compressed(ref list) => list.block_max_score(self.block_idx),
+            PostingList::Compressed(ref list) => {
+                if let Some(impacts) = list.impacts.as_ref() {
+                    return self.impact_level0(impacts, scorer).1;
+                }
+                list.block_max_score(self.block_idx)
+            }
             PostingList::Plain(_) => self.approximate_upper_bound,
         }
     }
 
+    /// Tight max-score bound over `[current block, up_to]`. The common case —
+    /// a window ending inside the current block — answers from the anchored
+    /// level0 memo; wider windows fall back to the sliding block-max deque,
+    /// which scores each block once as it slides forward.
     #[inline]
-    fn block_max_score_up_to_with_stats(&mut self, up_to: u64) -> BlockMaxScore {
+    fn block_max_score_up_to_with_stats<S: Scorer + ?Sized>(
+        &self,
+        up_to: u64,
+        scorer: &S,
+    ) -> BlockMaxScore {
         match self.list {
             PostingList::Compressed(ref list) => {
+                if let Some(impacts) = list.impacts.as_ref() {
+                    let (level0_up_to, level0_score) = self.impact_level0(impacts, scorer);
+                    if up_to <= u64::from(level0_up_to) {
+                        return BlockMaxScore {
+                            score: level0_score,
+                            blocks_scanned: 0,
+                        };
+                    }
+                }
                 let compressed = unsafe { &mut *self.compressed_state_ptr() };
-                compressed
-                    .block_max_window
-                    .max_score_up_to(list, self.block_idx, up_to)
+                compressed.block_max_window.max_score_up_to(
+                    list,
+                    self.block_idx,
+                    up_to,
+                    self.query_weight,
+                    scorer,
+                )
             }
             PostingList::Plain(_) => BlockMaxScore {
                 score: self.approximate_upper_bound,
                 blocks_scanned: 0,
             },
         }
+    }
+
+    fn window_max_score<S: Scorer + ?Sized>(&self, up_to: Option<u64>, scorer: &S) -> f32 {
+        if let Some(up_to) = up_to
+            && let PostingList::Compressed(ref list) = self.list
+            && list.impacts.is_some()
+        {
+            return self.block_max_score_up_to_with_stats(up_to, scorer).score;
+        }
+        self.block_max_score(scorer)
     }
 
     #[inline]
@@ -533,9 +820,90 @@ impl PostingIterator {
     fn block_first_doc(&self) -> Option<u64> {
         match self.list {
             PostingList::Compressed(ref list) => {
-                Some(list.block_least_doc_id(self.block_idx) as u64)
+                Some(self.block_least_doc_id(list, self.block_idx) as u64)
             }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index).cloned(),
+        }
+    }
+
+    /// Bulk-score every posting in `[current doc, up_to]` into the window
+    /// accumulator (slot = doc - window_min) and leave the iterator on the
+    /// first doc beyond `up_to`. This is the Lucene `nextDocsAndScores`
+    /// equivalent: it walks the decompressed block arrays directly, with no
+    /// per-doc heap traffic.
+    fn collect_window_scores<S: Scorer + ?Sized>(
+        &mut self,
+        window_min: u64,
+        up_to: u64,
+        clause_idx: usize,
+        docs: &DocSet,
+        scorer: &S,
+        acc: &mut WindowAccumulator,
+    ) {
+        if self.doc().is_some_and(|doc| doc.doc_id() < window_min) {
+            self.next(window_min);
+        }
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                'blocks: while let Some(doc) = self.current_doc {
+                    if doc.doc_id() > up_to {
+                        break;
+                    }
+                    let block_idx = posting_block_idx(self.index, list.block_size);
+                    let block_offset = posting_block_offset(self.index, list.block_size);
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                    for offset in block_offset..compressed.doc_ids.len() {
+                        let doc_id = compressed.doc_ids[offset];
+                        if u64::from(doc_id) > up_to {
+                            self.index = posting_block_start(block_idx, list.block_size) + offset;
+                            self.block_idx = block_idx;
+                            self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id,
+                                frequency: compressed.freqs[offset],
+                            }));
+                            break 'blocks;
+                        }
+                        let freq = compressed.freqs[offset];
+                        let doc_length = docs.num_tokens(doc_id);
+                        let score = self.query_weight * scorer.doc_weight(freq, doc_length);
+                        let slot = (u64::from(doc_id) - window_min) as usize;
+                        acc.add(clause_idx, slot, score, freq);
+                    }
+                    // Block exhausted: step into the next block (or finish).
+                    let next_start = posting_block_start(block_idx + 1, list.block_size);
+                    if next_start >= list.length as usize {
+                        self.index = list.length as usize;
+                        self.block_idx = posting_block_idx(self.index, list.block_size);
+                        self.current_doc = None;
+                        break;
+                    }
+                    self.index = next_start;
+                    self.block_idx = block_idx + 1;
+                    let compressed =
+                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx + 1) };
+                    self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                        doc_id: compressed.doc_ids[0],
+                        frequency: compressed.freqs[0],
+                    }));
+                }
+            }
+            PostingList::Plain(_) => {
+                while let Some(doc) = self.doc() {
+                    let doc_id = doc.doc_id();
+                    if doc_id > up_to {
+                        break;
+                    }
+                    let doc_length = match &doc {
+                        DocInfo::Raw(raw) => docs.num_tokens(raw.doc_id),
+                        DocInfo::Located(located) => docs.num_tokens_by_row_id(located.row_id),
+                    };
+                    let score = self.score(scorer, doc.frequency(), doc_length);
+                    let slot = (doc_id - window_min) as usize;
+                    acc.add(clause_idx, slot, score, doc.frequency());
+                    self.next(doc_id + 1);
+                }
+            }
         }
     }
 
@@ -546,10 +914,54 @@ impl PostingIterator {
                 if self.block_idx + 1 >= list.blocks.len() {
                     return None;
                 }
-                Some(list.block_least_doc_id(self.block_idx + 1) as u64)
+                Some(self.block_least_doc_id(list, self.block_idx + 1) as u64)
             }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index + 1).cloned(),
         }
+    }
+}
+
+/// Inner window span (in doc ids) of the bulk MAXSCORE path. Same as Lucene's
+/// `MaxScoreBulkScorer.INNER_WINDOW_SIZE`.
+const MAXSCORE_INNER_WINDOW: usize = 1 << 12;
+
+/// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
+/// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
+/// paths can recover (term, freq) pairs of the essential clauses.
+struct WindowAccumulator {
+    scores: Vec<f32>,
+    freqs: Vec<u32>,
+    words: Vec<u64>,
+    num_clauses: usize,
+}
+
+impl WindowAccumulator {
+    fn new(num_clauses: usize) -> Self {
+        Self {
+            scores: vec![0.0; MAXSCORE_INNER_WINDOW],
+            freqs: vec![0; num_clauses * MAXSCORE_INNER_WINDOW],
+            words: vec![0; MAXSCORE_INNER_WINDOW / 64],
+            num_clauses,
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, clause_idx: usize, slot: usize, score: f32, freq: u32) {
+        self.scores[slot] += score;
+        // Doc-major layout: one slot's clause frequencies share a cache line.
+        self.freqs[slot * self.num_clauses + clause_idx] = freq;
+        self.words[slot >> 6] |= 1u64 << (slot & 63);
+    }
+
+    #[inline]
+    fn clause_freq(&self, clause_idx: usize, slot: usize) -> u32 {
+        self.freqs[slot * self.num_clauses + clause_idx]
+    }
+
+    #[inline]
+    fn clear_slot(&mut self, slot: usize) {
+        self.scores[slot] = 0.0;
+        self.freqs[slot * self.num_clauses..(slot + 1) * self.num_clauses].fill(0);
     }
 }
 
@@ -850,6 +1262,22 @@ impl<'a, S: Scorer> Wand<'a, S> {
             _ => {}
         }
 
+        // Top-k disjunctions over compressed lists can opt into the bulk
+        // MAXSCORE path (Lucene MaxScoreBulkScorer style): it streams whole
+        // blocks of the essential clauses into a window accumulator instead of
+        // advancing doc-at-a-time through a heap.
+        if *USE_MAXSCORE_SEARCH
+            && self.operator == Operator::Or
+            && params.phrase_slop.is_none()
+            && !self.head.is_empty()
+            && self
+                .head
+                .iter()
+                .all(|posting| posting.posting.is_compressed())
+        {
+            return self.maxscore_search(params, mask, metrics);
+        }
+
         // Deferred-row_id path: when the DocSet was built without
         // row_ids, wand emits candidates carrying just the
         // partition-local doc_id; the outer caller resolves them to
@@ -1136,6 +1564,484 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .collect())
     }
 
+    /// Bulk MAXSCORE top-k disjunction, mirroring Lucene's MaxScoreBulkScorer.
+    ///
+    /// Per outer window (bounded by the essential clauses' block boundaries):
+    /// clauses are partitioned into a non-essential prefix — sorted by window
+    /// max score, as many as fit under the threshold — and the essential rest.
+    /// Essential clauses stream their postings into a window accumulator in
+    /// bulk; only accumulated candidates that could still beat the threshold
+    /// probe the non-essential clauses. No per-doc heap maintenance happens
+    /// anywhere on this path.
+    fn maxscore_search(
+        &mut self,
+        params: &FtsSearchParams,
+        mask: Arc<RowAddrMask>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        struct MaxScoreClause {
+            posting: Box<PostingIterator>,
+            bound: f32,
+            prefix_bound: f32,
+        }
+
+        #[inline]
+        fn float_sum_upper(sum: f32, num_terms: usize) -> f32 {
+            // Mirror of Lucene MathUtil.sumUpperBound: widen the float sum so
+            // it stays a true upper bound of the exact sum.
+            sum + sum.abs() * (num_terms as f32) * f32::EPSILON
+        }
+
+        let limit = params.limit.unwrap_or(usize::MAX);
+        let docs_has_row_ids = self.docs.has_row_ids();
+        let mut clauses = std::mem::take(&mut self.head)
+            .into_vec()
+            .into_iter()
+            .map(|head| MaxScoreClause {
+                posting: head.posting,
+                bound: 0.0,
+                prefix_bound: 0.0,
+            })
+            .collect::<Vec<_>>();
+
+        let mut acc = WindowAccumulator::new(clauses.len());
+        let mut candidates: TopKHeap =
+            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut num_comparisons = 0usize;
+        // Adaptive minimum window size (Lucene): grow windows when they yield
+        // too few candidates to amortize the per-window bound computations.
+        let mut min_window_size = 1u64;
+        let mut num_windows = 0u64;
+        let mut prev_first_essential = 0usize;
+
+        let mut window_min = clauses
+            .iter()
+            .filter_map(|clause| clause.posting.doc().map(|doc| doc.doc_id()))
+            .min()
+            .unwrap_or(TERMINATED_DOC_ID);
+
+        while window_min < TERMINATED_DOC_ID {
+            clauses.retain(|clause| clause.posting.doc().is_some());
+            if clauses.is_empty() {
+                break;
+            }
+            self.raise_to_shared_floor(params.wand_factor);
+
+            // Window boundary from the previous window's essential clauses
+            // only: dense non-essential clauses must not fragment the window.
+            let first_window_lead = prev_first_essential.min(clauses.len() - 1);
+            let mut window_max = TERMINATED_DOC_ID;
+            for clause in &mut clauses {
+                let doc = clause
+                    .posting
+                    .doc()
+                    .map(|doc| doc.doc_id())
+                    .expect("exhausted clauses were retained out");
+                clause.posting.shallow_next(doc.max(window_min));
+            }
+            for clause in &clauses[first_window_lead..] {
+                window_max = window_max.min(clause.posting.block_end_doc());
+            }
+            if clauses.len() > 1 {
+                // Target at least 32 candidates per clause per window on
+                // average before shrinking windows back to block granularity.
+                if (num_comparisons as u64) < num_windows * 32 * clauses.len() as u64 {
+                    min_window_size = (min_window_size * 2).min(MAXSCORE_INNER_WINDOW as u64);
+                } else {
+                    min_window_size = 1;
+                }
+                window_max = window_max.max(window_min.saturating_add(min_window_size - 1));
+            }
+
+            for clause in &mut clauses {
+                let doc = clause
+                    .posting
+                    .doc()
+                    .map(|doc| doc.doc_id())
+                    .expect("exhausted clauses were retained out");
+                clause.bound = if doc > window_max {
+                    0.0
+                } else {
+                    clause
+                        .posting
+                        .block_max_score_up_to_with_stats(window_max, &self.scorer)
+                        .score
+                };
+            }
+            clauses.sort_unstable_by(|a, b| a.bound.total_cmp(&b.bound));
+            let mut first_essential = 0;
+            let mut prefix = 0.0_f32;
+            if self.threshold > 0.0 {
+                for (i, clause) in clauses.iter_mut().enumerate() {
+                    let widened = float_sum_upper(prefix + clause.bound, i + 1);
+                    if widened > self.threshold {
+                        break;
+                    }
+                    prefix += clause.bound;
+                    clause.prefix_bound = prefix;
+                    first_essential = i + 1;
+                }
+            }
+            prev_first_essential = first_essential;
+            num_windows += 1;
+
+            if first_essential == clauses.len() {
+                // No clause combination inside this window can beat the
+                // threshold: skip it wholesale.
+                window_min = match window_max {
+                    TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                    max => max + 1,
+                };
+                // Single live clause: instead of re-running the window
+                // machinery once per block, scan the baked per-block bounds
+                // for the next block that can beat the threshold. This is the
+                // slab form of Lucene's getSkipUpTo and turns dead stretches
+                // of a dominant term into a tight load-mul-compare loop.
+                if clauses.len() == 1 && window_min != TERMINATED_DOC_ID && self.threshold > 0.0 {
+                    let posting = &clauses[0].posting;
+                    if let PostingList::Compressed(ref list) = posting.list
+                        && let Some(impacts) = list.impacts.as_ref()
+                    {
+                        let bounds = impacts.level0_doc_weight_bounds(&self.scorer);
+                        let query_weight = posting.query_weight;
+                        // Position by binary search on the first-doc slab: the
+                        // deep cursor lags arbitrarily far behind during long
+                        // skip runs, and walking from it re-scans the same
+                        // blocks on every dead window.
+                        let first_docs = list.block_first_docs();
+                        let mut block_idx = first_docs
+                            .partition_point(|&first| u64::from(first) <= window_min)
+                            .saturating_sub(1);
+                        while block_idx < bounds.len()
+                            && query_weight * bounds[block_idx] <= self.threshold
+                        {
+                            block_idx += 1;
+                        }
+                        window_min = if block_idx < bounds.len() {
+                            window_min.max(u64::from(list.block_least_doc_id(block_idx)))
+                        } else {
+                            TERMINATED_DOC_ID
+                        };
+                    }
+                }
+                continue;
+            }
+
+            let total_non_essential_bound = if first_essential > 0 {
+                clauses[first_essential - 1].prefix_bound
+            } else {
+                0.0
+            };
+
+            // Single essential clause (the common case once the threshold is
+            // competitive): stream it directly against the non-essential
+            // prefix, skipping the accumulator entirely.
+            if first_essential + 1 == clauses.len() {
+                let (non_essential, essential) = clauses.split_at_mut(first_essential);
+                let posting = &mut essential[0].posting;
+                if posting.doc().is_some_and(|doc| doc.doc_id() < window_min) {
+                    posting.next(window_min);
+                }
+                let essential_term = posting.term_index();
+                let essential_weight = posting.query_weight;
+
+                macro_rules! consider_candidate {
+                    ($doc:expr, $freq:expr) => {{
+                        let doc = $doc;
+                        let freq = $freq;
+                        num_comparisons += 1;
+                        let doc_length = self.docs.num_tokens(doc as u32);
+                        let score = essential_weight * self.scorer.doc_weight(freq, doc_length);
+                        if !(self.threshold > 0.0
+                            && score + total_non_essential_bound <= self.threshold)
+                        {
+                            let row_id = if docs_has_row_ids {
+                                self.docs.row_id(doc as u32)
+                            } else {
+                                doc
+                            };
+                            let masked_out = docs_has_row_ids
+                                && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id));
+                            if !masked_out {
+                                let mut total = score;
+                                let mut rejected = false;
+                                for i in (0..non_essential.len()).rev() {
+                                    if self.threshold > 0.0
+                                        && total + non_essential[i].prefix_bound <= self.threshold
+                                    {
+                                        rejected = true;
+                                        break;
+                                    }
+                                    let probe = &mut non_essential[i].posting;
+                                    if probe.doc().is_some_and(|d| d.doc_id() < doc) {
+                                        probe.next(doc);
+                                    }
+                                    if let Some(d) = probe.doc()
+                                        && d.doc_id() == doc
+                                    {
+                                        total +=
+                                            probe.score(&self.scorer, d.frequency(), doc_length);
+                                    }
+                                }
+
+                                // Match the classic path's emission rule: a
+                                // candidate must beat the running threshold,
+                                // which drops zero-score matches (e.g. terms
+                                // with idf 0) exactly like Wand::next does.
+                                if !rejected && total > self.threshold {
+                                    let full = candidates.len() >= limit;
+                                    let beats_kth =
+                                        !full || total > candidates.peek().unwrap().0.0.score.0;
+                                    if beats_kth {
+                                        let mut freqs = Vec::with_capacity(non_essential.len() + 1);
+                                        freqs.push((essential_term, freq));
+                                        for clause in non_essential.iter() {
+                                            if let Some(d) = clause.posting.doc()
+                                                && d.doc_id() == doc
+                                            {
+                                                freqs.push((
+                                                    clause.posting.term_index(),
+                                                    d.frequency(),
+                                                ));
+                                            }
+                                        }
+                                        if full {
+                                            candidates.pop();
+                                        }
+                                        candidates.push(Reverse((
+                                            ScoredDoc::new(row_id, total),
+                                            freqs,
+                                            doc_length,
+                                            doc,
+                                        )));
+                                        if candidates.len() == limit {
+                                            let kth = candidates.peek().unwrap().0.0.score.0;
+                                            self.update_threshold(kth, params.wand_factor);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }};
+                }
+
+                match posting.list {
+                    PostingList::Compressed(ref list) => {
+                        'stream: while let Some(cur) = posting.current_doc {
+                            if cur.doc_id() > window_max {
+                                break;
+                            }
+                            let block_idx = posting_block_idx(posting.index, list.block_size);
+                            let block_offset = posting_block_offset(posting.index, list.block_size);
+                            let compressed = unsafe {
+                                &mut *posting.ensure_compressed_block_ptr(list, block_idx)
+                            };
+                            for offset in block_offset..compressed.doc_ids.len() {
+                                let doc_id = compressed.doc_ids[offset];
+                                if u64::from(doc_id) > window_max {
+                                    posting.index =
+                                        posting_block_start(block_idx, list.block_size) + offset;
+                                    posting.block_idx = block_idx;
+                                    posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                        doc_id,
+                                        frequency: compressed.freqs[offset],
+                                    }));
+                                    break 'stream;
+                                }
+                                consider_candidate!(u64::from(doc_id), compressed.freqs[offset]);
+                            }
+                            let next_start = posting_block_start(block_idx + 1, list.block_size);
+                            if next_start >= list.length as usize {
+                                posting.index = list.length as usize;
+                                posting.block_idx =
+                                    posting_block_idx(posting.index, list.block_size);
+                                posting.current_doc = None;
+                                break;
+                            }
+                            posting.index = next_start;
+                            posting.block_idx = block_idx + 1;
+                            let compressed = unsafe {
+                                &mut *posting.ensure_compressed_block_ptr(list, block_idx + 1)
+                            };
+                            posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: compressed.doc_ids[0],
+                                frequency: compressed.freqs[0],
+                            }));
+                        }
+                    }
+                    PostingList::Plain(_) => {
+                        while let Some(cur) = posting.doc() {
+                            let doc = cur.doc_id();
+                            if doc > window_max {
+                                break;
+                            }
+                            consider_candidate!(doc, cur.frequency());
+                            posting.next(doc + 1);
+                        }
+                    }
+                }
+
+                window_min = match window_max {
+                    TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                    max => max + 1,
+                };
+                continue;
+            }
+
+            // Stream the essential clauses through inner windows.
+            let mut inner_min = window_min;
+            loop {
+                let mut next_essential_doc = TERMINATED_DOC_ID;
+                for clause in &clauses[first_essential..] {
+                    if let Some(doc) = clause.posting.doc() {
+                        next_essential_doc = next_essential_doc.min(doc.doc_id());
+                    }
+                }
+                inner_min = inner_min.max(next_essential_doc);
+                if inner_min == TERMINATED_DOC_ID || inner_min > window_max {
+                    break;
+                }
+                let inner_max =
+                    window_max.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
+
+                for (clause_idx, clause) in clauses.iter_mut().enumerate().skip(first_essential) {
+                    clause.posting.collect_window_scores(
+                        inner_min,
+                        inner_max,
+                        clause_idx,
+                        self.docs,
+                        &self.scorer,
+                        &mut acc,
+                    );
+                }
+
+                // Drain candidates in doc order, completing them with the
+                // non-essential clauses ordered by descending bound.
+                for word_idx in 0..acc.words.len() {
+                    let mut word = acc.words[word_idx];
+                    if word == 0 {
+                        continue;
+                    }
+                    acc.words[word_idx] = 0;
+                    while word != 0 {
+                        let bit = word.trailing_zeros() as usize;
+                        word &= word - 1;
+                        let slot = (word_idx << 6) | bit;
+                        let doc = inner_min + slot as u64;
+                        let mut score = acc.scores[slot];
+                        num_comparisons += 1;
+
+                        if self.threshold > 0.0
+                            && score + total_non_essential_bound <= self.threshold
+                        {
+                            acc.clear_slot(slot);
+                            continue;
+                        }
+
+                        let row_id = if docs_has_row_ids {
+                            self.docs.row_id(doc as u32)
+                        } else {
+                            doc
+                        };
+                        if docs_has_row_ids
+                            && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id))
+                        {
+                            acc.clear_slot(slot);
+                            continue;
+                        }
+
+                        let doc_length = self.docs.num_tokens(doc as u32);
+                        let mut rejected = false;
+                        for i in (0..first_essential).rev() {
+                            if self.threshold > 0.0
+                                && score + clauses[i].prefix_bound <= self.threshold
+                            {
+                                rejected = true;
+                                break;
+                            }
+                            let posting = &mut clauses[i].posting;
+                            if posting.doc().is_some_and(|d| d.doc_id() < doc) {
+                                posting.next(doc);
+                            }
+                            if let Some(d) = posting.doc()
+                                && d.doc_id() == doc
+                            {
+                                score += posting.score(&self.scorer, d.frequency(), doc_length);
+                            }
+                        }
+
+                        if !rejected && score > self.threshold {
+                            let full = candidates.len() >= limit;
+                            let beats_kth = !full || score > candidates.peek().unwrap().0.0.score.0;
+                            if beats_kth {
+                                let freqs = clauses
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, clause)| {
+                                        if i >= first_essential {
+                                            let freq = acc.clause_freq(i, slot);
+                                            (freq > 0).then(|| (clause.posting.term_index(), freq))
+                                        } else {
+                                            clause.posting.doc().and_then(|d| {
+                                                (d.doc_id() == doc).then(|| {
+                                                    (clause.posting.term_index(), d.frequency())
+                                                })
+                                            })
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                if full {
+                                    candidates.pop();
+                                }
+                                candidates.push(Reverse((
+                                    ScoredDoc::new(row_id, score),
+                                    freqs,
+                                    doc_length,
+                                    doc,
+                                )));
+                                if candidates.len() == limit {
+                                    let kth = candidates.peek().unwrap().0.0.score.0;
+                                    self.update_threshold(kth, params.wand_factor);
+                                }
+                            }
+                        }
+                        acc.clear_slot(slot);
+                    }
+                }
+                if inner_max >= window_max {
+                    break;
+                }
+                inner_min = inner_max + 1;
+            }
+
+            window_min = match window_max {
+                TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                max => max + 1,
+            };
+        }
+
+        metrics.record_comparisons(num_comparisons);
+
+        let to_addr = |row_id_slot: u64| {
+            if docs_has_row_ids {
+                CandidateAddr::RowId(row_id_slot)
+            } else {
+                CandidateAddr::Pending(row_id_slot as u32)
+            }
+        };
+        Ok(candidates
+            .into_iter()
+            .map(
+                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                    addr: to_addr(doc.row_id),
+                    posting_doc_id,
+                    freqs,
+                    doc_length,
+                },
+            )
+            .collect())
+    }
+
     // calculate the score of the current document
     fn score(&self, doc_length: u32) -> f32 {
         let mut score = 0.0;
@@ -1174,7 +2080,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         let remaining_upper_bound = remaining
             .iter()
-            .map(|posting| posting.block_max_score())
+            .map(|posting| posting.block_max_score(&self.scorer))
             .sum::<f32>();
         first.score(&self.scorer, doc.frequency(), doc_length) + remaining_upper_bound
             <= self.threshold
@@ -1214,10 +2120,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
             if self.threshold > 0.0 && self.or_block_window_max() <= self.threshold {
                 // On the final block `up_to` is the `u64::MAX` sentinel; step once
                 // there to avoid seeking past the valid doc id range.
-                let skip_to = match self.up_to {
+                let mut skip_to = match self.up_to {
                     Some(up_to) if up_to < u32::MAX as u64 => up_to + 1,
                     _ => target + 1,
                 };
+                // The narrow window is dead; if the whole level1 group is dead
+                // too, hop over it in one advance.
+                let group_skip = self.or_group_skip_to();
+                if let Some(group_skip_to) = group_skip {
+                    skip_to = skip_to.max(group_skip_to);
+                }
                 self.push_back_leads(skip_to);
                 continue;
             }
@@ -1361,7 +2273,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let narrow_max_score = self
             .lead
             .iter()
-            .map(|posting| posting.block_max_score())
+            .map(|posting| posting.block_max_score(&self.scorer))
             .sum::<f32>();
 
         if narrow_max_score >= self.threshold {
@@ -1384,7 +2296,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             let mut wide_max_score = 0.0;
             let mut range_blocks_scanned = 0;
             for posting in &mut self.lead {
-                let block_max = posting.block_max_score_up_to_with_stats(lead_up_to);
+                let block_max = posting.block_max_score_up_to_with_stats(lead_up_to, &self.scorer);
                 wide_max_score += block_max.score;
                 range_blocks_scanned += block_max.blocks_scanned;
             }
@@ -1448,7 +2360,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn move_head_before_target_to_tail(&mut self, target: u64) {
         while matches!(self.head_doc(), Some(doc_id) if doc_id < target) {
             if let Some(posting) = self.head.pop() {
-                let upper_bound = posting.posting.approximate_upper_bound();
+                let upper_bound = posting.posting.global_upper_bound(&self.scorer);
                 if let Some(mut evicted) =
                     self.insert_tail_with_overflow(posting.posting, upper_bound)
                 {
@@ -1467,12 +2379,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let lead: f32 = self
             .lead
             .iter()
-            .map(|posting| posting.block_max_score())
+            .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
             .sum();
         let head: f32 = self
             .head
             .iter()
-            .map(|posting| posting.posting.block_max_score())
+            .map(|posting| posting.posting.window_max_score(self.up_to, &self.scorer))
             .sum();
         lead + head + self.tail_max_score
     }
@@ -1485,12 +2397,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut sum = self
             .lead
             .iter()
-            .map(|posting| posting.block_max_score())
+            .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
             .sum::<f32>();
         let mut possible_matches = self.lead.len();
         for posting in &self.tail {
             if matches!(posting.posting.block_first_doc(), Some(block_doc) if block_doc <= target) {
-                sum += posting.posting.block_max_score();
+                sum += posting.posting.window_max_score(self.up_to, &self.scorer);
                 possible_matches += 1;
             }
         }
@@ -1504,70 +2416,119 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn update_max_scores(&mut self, target: u64) {
         // Refresh the block-max window for the current target. The resulting
         // `up_to` is the furthest doc id for which this block-max view remains
-        // valid.
+        // valid. Like Lucene's WANDScorer, the boundary comes from the cheap
+        // clauses only, and the refresh avoids allocating: heaps are recycled
+        // through their backing vectors (shallow_next never changes the doc a
+        // head entry is ordered by, so heapify restores the same shape).
         let lead_cost = self
             .lead
             .iter()
             .map(|posting| posting.cost())
             .min()
             .unwrap_or(usize::MAX);
-        let mut up_to = TERMINATED_DOC_ID;
+        let mut narrow_up_to = TERMINATED_DOC_ID;
         for posting in &mut self.lead {
             posting.shallow_next(target);
-            let block_end = posting
-                .next_block_first_doc()
-                .map(|doc| doc.saturating_sub(1))
-                .unwrap_or(TERMINATED_DOC_ID);
-            up_to = up_to.min(block_end);
+            narrow_up_to = narrow_up_to.min(posting.block_end_doc());
         }
-        let head = std::mem::take(&mut self.head);
-        let mut rebuilt_head = BinaryHeap::with_capacity(head.len());
-        for mut posting in head.into_vec() {
-            if posting.posting.cost() <= lead_cost {
-                posting.posting.shallow_next(posting.doc_id());
-                let block_end = posting
-                    .posting
-                    .next_block_first_doc()
-                    .map(|doc| doc.saturating_sub(1))
-                    .unwrap_or(TERMINATED_DOC_ID);
-                up_to = up_to.min(block_end);
-            }
-            rebuilt_head.push(posting);
-        }
-        self.head = rebuilt_head;
-        if up_to == TERMINATED_DOC_ID
-            && let Some(top) = self.tail.peek()
-            && top.cost <= lead_cost
-        {
-            let block_end = top
-                .posting
-                .next_block_first_doc()
-                .map(|doc| doc.saturating_sub(1))
-                .unwrap_or(TERMINATED_DOC_ID);
-            up_to = up_to.min(block_end.max(target));
-        }
-        self.up_to = Some(up_to);
 
-        let tail = std::mem::take(&mut self.tail);
-        self.tail_max_score = 0.0;
-        for mut tail_posting in tail.into_vec() {
+        let mut head_postings = std::mem::take(&mut self.head).into_vec();
+        for posting in &mut head_postings {
+            // Unlike Lucene, every head clause participates in the boundary:
+            // the refresh is allocation-free and answers from the anchored
+            // level caches, so frequent refreshes are cheap, while keeping the
+            // window inside every clause's current block keeps all the bounds
+            // at tight level0 values.
+            let doc_id = posting.doc_id();
+            posting.posting.shallow_next(doc_id);
+            narrow_up_to = narrow_up_to.min(posting.posting.block_end_doc());
+        }
+
+        let mut tail_postings = std::mem::take(&mut self.tail).into_vec();
+        for tail_posting in &mut tail_postings {
             tail_posting.posting.shallow_next(target);
-            let upper_bound = match tail_posting.posting.block_first_doc() {
+        }
+
+        if narrow_up_to == TERMINATED_DOC_ID
+            && let Some(top) = tail_postings
+                .iter()
+                .min_by_key(|posting| posting.posting.cost())
+            && top.posting.cost() <= lead_cost
+        {
+            narrow_up_to = narrow_up_to.min(top.posting.block_end_doc().max(target));
+        }
+
+        self.up_to = Some(narrow_up_to);
+        self.head = BinaryHeap::from(head_postings);
+
+        self.tail_max_score = 0.0;
+        for tail_posting in tail_postings {
+            let posting = tail_posting.posting;
+            let upper_bound = match posting.block_first_doc() {
                 Some(block_doc) if block_doc <= target => {
-                    tail_posting
-                        .posting
-                        .block_max_score_up_to_with_stats(up_to)
-                        .score
+                    posting.window_max_score(self.up_to, &self.scorer)
                 }
                 _ => 0.0,
             };
-            if let Some(mut evicted) =
-                self.insert_tail_with_overflow(tail_posting.posting, upper_bound)
-            {
+            if let Some(mut evicted) = self.insert_tail_with_overflow(posting, upper_bound) {
                 evicted.next(target);
                 self.push_head(evicted);
             }
         }
+    }
+
+    /// After the narrow window proved skippable, try widening the skip to the
+    /// level1 group boundary, in the spirit of Lucene's `getSkipUpTo`. All
+    /// bounds come from the anchored level caches, so a failed attempt costs a
+    /// few loads and float adds — unlike an eager wide-window probe.
+    ///
+    /// The group boundary is the minimum current-group end over every live
+    /// iterator, so each iterator's level1 score is a valid bound over
+    /// `[target, group_up_to]`.
+    fn or_group_skip_to(&self) -> Option<u64> {
+        let mut group_up_to = TERMINATED_DOC_ID;
+        for posting in &self.lead {
+            let (doc_up_to, _) = posting.impact_group_bound(&self.scorer)?;
+            group_up_to = group_up_to.min(doc_up_to);
+        }
+        for posting in self.head.iter() {
+            let (doc_up_to, _) = posting.posting.impact_group_bound(&self.scorer)?;
+            group_up_to = group_up_to.min(doc_up_to);
+        }
+        for tail_posting in self.tail.iter() {
+            let (doc_up_to, _) = tail_posting.posting.impact_group_bound(&self.scorer)?;
+            group_up_to = group_up_to.min(doc_up_to);
+        }
+        if self.up_to.is_some_and(|up_to| group_up_to <= up_to) {
+            // No gain over the narrow window skip.
+            return None;
+        }
+
+        // Second pass over the memoized bounds: sum only the iterators that
+        // can produce a doc inside the skipped range.
+        let mut bounds_sum = 0.0_f32;
+        for posting in &self.lead {
+            let (_, score) = posting.impact_group_bound(&self.scorer)?;
+            bounds_sum += score;
+        }
+        for posting in self.head.iter() {
+            if posting.doc_id() > group_up_to {
+                continue;
+            }
+            let (_, score) = posting.posting.impact_group_bound(&self.scorer)?;
+            bounds_sum += score;
+        }
+        for tail_posting in self.tail.iter() {
+            if !matches!(
+                tail_posting.posting.block_first_doc(),
+                Some(block_doc) if block_doc <= group_up_to
+            ) {
+                continue;
+            }
+            let (_, score) = tail_posting.posting.impact_group_bound(&self.scorer)?;
+            bounds_sum += score;
+        }
+        (bounds_sum <= self.threshold).then_some(group_up_to.saturating_add(1))
     }
 
     fn refine_or_candidate(&mut self, target: u64, doc_length: u32) -> bool {
@@ -1693,9 +2654,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
             && posting.is_compressed()
             && self.up_to.is_some_and(|up_to| target <= up_to)
         {
-            posting.block_max_score()
+            posting.window_max_score(self.up_to, &self.scorer)
         } else {
-            posting.approximate_upper_bound()
+            posting.global_upper_bound(&self.scorer)
         }
     }
 
@@ -1977,13 +2938,17 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::impact::build_impact_skip_data;
     use super::*;
     use crate::scalar::inverted::scorer::IndexBM25Scorer;
     use crate::{
         metrics::{MetricsCollector, NoOpMetricsCollector},
         scalar::inverted::{
-            CompressedPostingList, PlainPostingList, PostingListBuilder, builder::PositionRecorder,
-            encoding::compress_posting_list,
+            CompressedPostingList, PlainPostingList, PostingListBuilder,
+            builder::PositionRecorder,
+            encoding::{
+                compress_posting_list, compress_posting_list_with_tail_codec_and_block_size,
+            },
         },
     };
 
@@ -2146,6 +3111,8 @@ mod tests {
                 max_score,
                 doc_ids.len() as u32,
                 crate::scalar::inverted::PostingTailCodec::VarintDelta,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+                None,
                 None,
             ))
         } else {
@@ -2156,6 +3123,75 @@ mod tests {
                 None,
             ))
         }
+    }
+
+    fn generate_impact_posting_list_with_freqs(
+        doc_ids: Vec<u32>,
+        freqs: Vec<u32>,
+        doc_lengths: Vec<u32>,
+    ) -> PostingList {
+        generate_impact_posting_list_with_freqs_and_block_size(
+            doc_ids,
+            freqs,
+            doc_lengths,
+            crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+        )
+    }
+
+    fn generate_impact_posting_list_with_freqs_and_block_size(
+        doc_ids: Vec<u32>,
+        freqs: Vec<u32>,
+        doc_lengths: Vec<u32>,
+        block_size: usize,
+    ) -> PostingList {
+        assert_eq!(doc_ids.len(), freqs.len());
+        assert_eq!(doc_ids.len(), doc_lengths.len());
+        let block_max_scores = vec![0.0; doc_ids.len().div_ceil(block_size)];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            block_max_scores.into_iter(),
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            block_size,
+        )
+        .unwrap();
+        let impact_blocks = doc_ids
+            .chunks(block_size)
+            .zip(freqs.chunks(block_size))
+            .zip(doc_lengths.chunks(block_size))
+            .map(|((doc_ids, freqs), doc_lengths)| {
+                doc_ids
+                    .iter()
+                    .copied()
+                    .zip(freqs.iter().copied())
+                    .zip(doc_lengths.iter().copied())
+                    .map(|((doc_id, freq), doc_length)| (doc_id, freq, doc_length))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let impacts = build_impact_skip_data(impact_blocks.as_slice()).unwrap();
+        PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            0.0,
+            doc_ids.len() as u32,
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            block_size,
+            None,
+            Some(impacts),
+        ))
+    }
+
+    fn generate_contiguous_impact_posting_list_with_block_size(
+        total: usize,
+        block_size: usize,
+    ) -> PostingList {
+        generate_impact_posting_list_with_freqs_and_block_size(
+            (0..total as u32).collect(),
+            vec![1; total],
+            vec![1; total],
+            block_size,
+        )
     }
 
     fn generate_posting_list_with_positions(
@@ -2982,7 +4018,7 @@ mod tests {
         posting.shallow_next(0);
         assert_eq!(
             posting
-                .block_max_score_up_to_with_stats((3 * BLOCK_SIZE - 1) as u64)
+                .block_max_score_up_to_with_stats((3 * BLOCK_SIZE - 1) as u64, &UnitScorer)
                 .score,
             4.0
         );
@@ -2990,7 +4026,7 @@ mod tests {
         posting.shallow_next((2 * BLOCK_SIZE) as u64);
         assert_eq!(
             posting
-                .block_max_score_up_to_with_stats((4 * BLOCK_SIZE - 1) as u64)
+                .block_max_score_up_to_with_stats((4 * BLOCK_SIZE - 1) as u64, &UnitScorer)
                 .score,
             5.0
         );
@@ -2998,9 +4034,195 @@ mod tests {
         posting.shallow_next((4 * BLOCK_SIZE) as u64);
         assert_eq!(
             posting
-                .block_max_score_up_to_with_stats((5 * BLOCK_SIZE - 1) as u64)
+                .block_max_score_up_to_with_stats((5 * BLOCK_SIZE - 1) as u64, &UnitScorer)
                 .score,
             3.0
+        );
+    }
+
+    #[test]
+    fn test_impact_level1_skip_keeps_boundary_equality_in_group() {
+        for block_size in [crate::scalar::inverted::LEGACY_BLOCK_SIZE, 256] {
+            let total = (IMPACT_LEVEL1_BLOCKS + 1) * block_size;
+            let mut posting = PostingIterator::new(
+                String::from("term"),
+                0,
+                0,
+                generate_contiguous_impact_posting_list_with_block_size(total, block_size),
+                total,
+            );
+            let target = (IMPACT_LEVEL1_BLOCKS * block_size - 1) as u64;
+
+            posting.shallow_next(target);
+            assert_eq!(posting.block_idx, IMPACT_LEVEL1_BLOCKS - 1);
+
+            posting.next(target);
+            assert_eq!(posting.block_idx, IMPACT_LEVEL1_BLOCKS - 1);
+            assert_eq!(posting.doc().map(|doc| doc.doc_id()), Some(target));
+        }
+    }
+
+    #[test]
+    fn test_impact_level1_skip_handles_partial_final_group() {
+        for block_size in [crate::scalar::inverted::LEGACY_BLOCK_SIZE, 256] {
+            let total = (IMPACT_LEVEL1_BLOCKS + 3) * block_size + 17;
+            let mut posting = PostingIterator::new(
+                String::from("term"),
+                0,
+                0,
+                generate_contiguous_impact_posting_list_with_block_size(total, block_size),
+                total,
+            );
+            let target = (total - 1) as u64;
+            let expected_block = total.div_ceil(block_size) - 1;
+
+            posting.shallow_next(target);
+            assert_eq!(posting.block_idx, expected_block);
+
+            posting.next(target);
+            assert_eq!(posting.block_idx, expected_block);
+            assert_eq!(posting.doc().map(|doc| doc.doc_id()), Some(target));
+        }
+    }
+
+    #[test]
+    fn test_impact_level1_skip_reaches_far_target_doc() {
+        for block_size in [crate::scalar::inverted::LEGACY_BLOCK_SIZE, 256] {
+            let total = (IMPACT_LEVEL1_BLOCKS * 3 + 5) * block_size;
+            let target_block = IMPACT_LEVEL1_BLOCKS * 2 + 2;
+            let target = (target_block * block_size + 17) as u64;
+            let mut posting = PostingIterator::new(
+                String::from("term"),
+                0,
+                0,
+                generate_contiguous_impact_posting_list_with_block_size(total, block_size),
+                total,
+            );
+
+            posting.shallow_next(target);
+            assert_eq!(posting.block_idx, target_block);
+
+            posting.next(target);
+            assert_eq!(posting.block_idx, target_block);
+            assert_eq!(posting.doc().map(|doc| doc.doc_id()), Some(target));
+        }
+    }
+
+    #[test]
+    fn test_or_impact_level1_window_skips_low_group_with_single_score() {
+        let total = (IMPACT_LEVEL1_BLOCKS + 1) * BLOCK_SIZE;
+        let target = (IMPACT_LEVEL1_BLOCKS * BLOCK_SIZE) as u64;
+        let mut docs = DocSet::default();
+        for doc_id in 0..total as u64 {
+            docs.append(doc_id, 1);
+        }
+
+        let doc_ids = (0..total as u32).collect::<Vec<_>>();
+        let freqs = doc_ids
+            .iter()
+            .map(|doc_id| if u64::from(*doc_id) < target { 1 } else { 10 })
+            .collect::<Vec<_>>();
+        let posting_list = generate_impact_posting_list_with_freqs(doc_ids, freqs, vec![1; total]);
+        let mut probe = PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            posting_list.clone(),
+            docs.len(),
+        );
+        probe.shallow_next(0);
+        let counting_scorer = CountingScorer {
+            scored: Arc::new(AtomicUsize::new(0)),
+        };
+        let (group_up_to, group_score) = probe.impact_group_bound(&counting_scorer).unwrap();
+        assert_eq!(group_up_to, target - 1);
+        assert_eq!(group_score, 1.0);
+        // A window ending past the current block must answer from level1.
+        assert_eq!(
+            probe.window_max_score(Some(target - 1), &counting_scorer),
+            1.0
+        );
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            posting_list,
+            docs.len(),
+        );
+        let scored = Arc::new(AtomicUsize::new(0));
+        let mut wand = Wand::new(
+            Operator::Or,
+            std::iter::once(posting),
+            &docs,
+            CountingScorer {
+                scored: scored.clone(),
+            },
+        );
+        wand.threshold = 2.0;
+
+        let (candidate, score) = wand.next().unwrap().unwrap();
+        assert_eq!(candidate.doc_id(), target);
+        assert_eq!(score, 10.0);
+        // The doc-weight bounds bake exactly once (one doc_weight call per
+        // frontier pair across all entries); beyond that only the returned
+        // candidate is scored.
+        let total_entries = (IMPACT_LEVEL1_BLOCKS + 1) + 2;
+        assert!(
+            scored.load(Ordering::Relaxed) <= total_entries + 8,
+            "bounds should be baked once instead of recomputed per window; scored={}",
+            scored.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn test_compressed_impact_block_max_score_memoizes_current_block() {
+        let total = 2 * BLOCK_SIZE as u32;
+        let doc_ids = (0..total).collect::<Vec<_>>();
+        let freqs = doc_ids
+            .iter()
+            .map(|doc_id| if *doc_id < BLOCK_SIZE as u32 { 1 } else { 2 })
+            .collect::<Vec<_>>();
+        let doc_lengths = vec![1; total as usize];
+        let posting_list = generate_impact_posting_list_with_freqs(doc_ids, freqs, doc_lengths);
+        let mut posting =
+            PostingIterator::new(String::from("term"), 0, 0, posting_list, total as usize);
+        let scored = Arc::new(AtomicUsize::new(0));
+        let scorer = CountingScorer {
+            scored: scored.clone(),
+        };
+
+        let first_score = posting.block_max_score(&scorer);
+        assert_eq!(first_score, 1.0);
+        // Baking the doc-weight bounds visits every frontier pair once: two
+        // level0 entries plus one level1 entry for this list.
+        let baked = scored.load(Ordering::Relaxed);
+        assert!(baked >= 2);
+        {
+            let compressed = unsafe { &mut *posting.compressed_state_ptr() };
+            assert_eq!(
+                compressed.level0_cache,
+                Some((0, BLOCK_SIZE as u32 - 1, first_score))
+            );
+        }
+
+        let second_score = posting.block_max_score(&scorer);
+        assert_eq!(second_score, first_score);
+        assert_eq!(
+            scored.load(Ordering::Relaxed),
+            baked,
+            "repeated block max scores must not recompute doc weights"
+        );
+
+        posting.shallow_next(BLOCK_SIZE as u64);
+        let next_block_score = posting.block_max_score(&scorer);
+        assert_eq!(next_block_score, 2.0);
+        assert_eq!(
+            scored.load(Ordering::Relaxed),
+            baked,
+            "other blocks answer from the baked bounds without rescoring"
         );
     }
 
@@ -3340,7 +4562,7 @@ mod tests {
 
         let posting = PostingIterator::new(String::from("test"), 0, 0, posting_list, 1);
 
-        let actual = posting.block_max_score();
+        let actual = posting.block_max_score(&UnitScorer);
         assert!(
             (actual - expected).abs() < 1e-6,
             "block max score should match stored value"
