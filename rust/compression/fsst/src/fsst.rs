@@ -58,8 +58,8 @@ use std::ptr;
 #[inline]
 fn fsst_unaligned_load_unchecked(v: *const u8) -> u64 {
     // SAFETY: the caller must guarantee that `v` points to at least 8 readable bytes. All callers
-    // uphold this: `compress_bulk` reads from a `[u8; 520]` buffer padded with a sentinel byte,
-    // `build_symbol_table` guards the load with `word.len() > 7 && curr < word.len() - 7`,
+    // uphold this: `compress_bulk` loads from a 520-byte stack buffer at an offset < 511 (leaving
+    // >= 8 bytes), `build_symbol_table` guards the load with `word.len() > 7 && curr < word.len() - 7`,
     // `find_longest_symbol_from_char_slice` copies into a stack `[u8; 8]` before loading, and
     // `FsstDecoder::init` reads symbols from a `symbol_table` buffer already validated to be
     // exactly `FSST_SYMBOL_TABLE_SIZE` bytes.
@@ -820,12 +820,15 @@ fn decompress_bulk<T: OffsetSizeTrait>(
     let lens = decoder.lens;
     // SAFETY invariant shared by every `unsafe` block in this closure:
     // - `out` was sized by the caller to be at least 8x `compressed_strs` (enforced in
-    //   `FsstDecoder::init`). Each code advances `out_curr` by at most 8 and each consumed input
-    //   byte yields at most 8 output bytes, so `out_curr + 8 <= out.len()` holds for every write,
-    //   including the final one. This is why we can `write_unaligned` a full 8-byte word per code
-    //   and advance by only the symbol length.
-    // - Every `read_unaligned::<u32>` reads 4 bytes gated by `in_curr + 4 <= in_end`; the trailing
-    //   scalar paths read within `in_end`, which is bounded by `compressed_strs.len()`.
+    //   `FsstDecoder::init`, which only lets the decoder run this path once that holds). Each code
+    //   advances `out_curr` by at most 8 and each consumed input byte yields at most 8 output
+    //   bytes, so `out_curr + 8 <= out.len()` holds for every write, including the final one. This
+    //   is why we can `write_unaligned` a full 8-byte word per code and advance by only the symbol
+    //   length.
+    // - The only unchecked read is `read_unaligned::<u32>`, gated by `in_curr + 4 <= in_end`; the
+    //   scalar paths use bounds-checked indexing. `in_end` is a caller-provided offset into
+    //   `compressed_strs`, so soundness of the u32 read relies on the offsets being well-formed
+    //   (`in_end <= compressed_strs.len()`), which holds for offsets produced by the encoder.
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         // Do SIMD operation here by 4 bytes
         while in_curr + 4 <= in_end {
