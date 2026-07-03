@@ -87,7 +87,7 @@ async fn build_queries(dataset: &Dataset, n: usize, rows_per: usize, seed: u64) 
     for _ in 0..n {
         let mut q = Vec::with_capacity(rows_per);
         for _ in 0..rows_per {
-            let mut target = rng.gen_range(0..total);
+            let mut target = rng.random_range(0..total);
             for (fid, fsz) in &frag_sizes {
                 if target < *fsz {
                     q.push((fid << 32) | target);
