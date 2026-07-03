@@ -147,6 +147,12 @@ impl ImpactSkipData {
         &self.baked_bounds(scorer).0
     }
 
+    /// Baked per-block max doc weights (level0 entries only), for bulk skip
+    /// scans over dead ranges without per-block window bookkeeping.
+    pub(crate) fn level0_doc_weight_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> &[f32] {
+        &self.baked_bounds(scorer).0[..self.level0_len]
+    }
+
     /// List-wide max doc weight, from the baked bounds. The tightest valid
     /// global score bound for this list is `query_weight * this`, matching
     /// what the non-impact format stores as `max_score` at build time — but
@@ -179,6 +185,18 @@ impl ImpactSkipData {
         }
     }
 
+    /// Last doc id covered by the level0 entry of `block_idx`, or `None` when
+    /// the entry is missing or malformed.
+    pub(crate) fn level0_doc_up_to(&self, block_idx: usize) -> Option<u32> {
+        if block_idx >= self.level0_len {
+            return None;
+        }
+        match self.entry_doc_up_tos[block_idx] {
+            u32::MAX => None,
+            doc_up_to => Some(doc_up_to),
+        }
+    }
+
     /// Max score of the docs covered by the level0 entry of `block_idx`,
     /// answered from the baked bounds slab.
     pub fn level0_score<S: Scorer + ?Sized>(
@@ -191,6 +209,20 @@ impl ImpactSkipData {
             return 0.0;
         }
         query_weight * self.doc_weight_bounds(scorer)[block_idx]
+    }
+
+    /// Max score of the docs covered by the level1 entry of `group_idx`,
+    /// answered from the baked bounds slab.
+    pub fn level1_score<S: Scorer + ?Sized>(
+        &self,
+        group_idx: usize,
+        query_weight: f32,
+        scorer: &S,
+    ) -> f32 {
+        if group_idx >= level1_len(self.level0_len) || query_weight <= 0.0 {
+            return 0.0;
+        }
+        query_weight * self.doc_weight_bounds(scorer)[self.level0_len + group_idx]
     }
 
     pub fn level0_score_cached<S: Scorer + ?Sized>(
