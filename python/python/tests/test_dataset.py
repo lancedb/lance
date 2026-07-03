@@ -34,7 +34,8 @@ from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
-from pydantic import BaseModel
+
+BaseModel = pytest.importorskip("pydantic").BaseModel
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
