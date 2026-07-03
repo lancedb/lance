@@ -2234,22 +2234,39 @@ impl FilteredReadTakeStream {
             scoped.batch_size = u32::MAX;
         }
 
-        // Opens all the fragments concurrently, then runs the read tasks
-        let fragment_streams =
-            futures::future::try_join_all(scoped_fragments.into_iter().map(|scoped| {
-                FilteredReadStream::read_fragment(scoped, self.global_metrics.clone(), None)
-            }))
-            .await?;
+        // Open all the fragments in parallel.  A random take touches many
+        // fragments (often one row per fragment) and the CPU-bound part of a
+        // fragment open serializes under plain future concurrency, so spawn
+        // one task per fragment like the scan path does (see
+        // FilteredReadStream::try_new).  Collecting into Vecs avoids
+        // "implementation of FnOnce is not general enough" false positives.
+        let open_tasks = scoped_fragments
+            .into_iter()
+            .map(|scoped| {
+                let global_metrics = self.global_metrics.clone();
+                SpawnedTask::spawn(
+                    async move {
+                        FilteredReadStream::read_fragment(scoped, global_metrics, None).await
+                    }
+                    .in_current_span(),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut read_tasks = Vec::new();
-        for mut stream in fragment_streams {
+        for open_task in open_tasks {
+            let mut stream = open_task.await.unwrap()?;
             while let Some(task) = stream.try_next().await? {
                 read_tasks.push(task);
             }
         }
-        let read_batches = futures::stream::iter(read_tasks)
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let decode_tasks = read_tasks
+            .into_iter()
+            .map(|task| SpawnedTask::spawn(task.in_current_span()))
+            .collect::<Vec<_>>();
+        let mut read_batches = Vec::with_capacity(decode_tasks.len());
+        for decode_task in decode_tasks {
+            read_batches.push(decode_task.await.unwrap()?);
+        }
 
         let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
         let read_schema = Arc::new(self.read_options.projection.to_arrow_schema());
