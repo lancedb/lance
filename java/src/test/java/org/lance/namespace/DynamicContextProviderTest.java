@@ -59,8 +59,8 @@ public class DynamicContextProviderTest {
         (operation, objectId) -> {
           callCount.incrementAndGet();
           Map<String, String> context = new HashMap<>();
-          context.put("headers.Authorization", "Bearer test-token-123");
-          context.put("headers.X-Request-Id", "req-" + operation);
+          context.put("header.Authorization", "Bearer test-token-123");
+          context.put("header.X-Request-Id", "req-" + operation);
           return context;
         };
 
@@ -130,8 +130,8 @@ public class DynamicContextProviderTest {
         (operation, objectId) -> {
           callCount.incrementAndGet();
           Map<String, String> context = new HashMap<>();
-          context.put("headers.Authorization", "Bearer xyz-token");
-          context.put("headers.X-Trace-Id", "trace-" + System.currentTimeMillis());
+          context.put("header.Authorization", "Bearer xyz-token");
+          context.put("header.X-Trace-Id", "trace-" + System.currentTimeMillis());
           return context;
         };
 
@@ -284,7 +284,7 @@ public class DynamicContextProviderTest {
         (operation, objectId) -> {
           explicitCallCount.incrementAndGet();
           Map<String, String> ctx = new HashMap<>();
-          ctx.put("headers.Authorization", "Bearer explicit");
+          ctx.put("header.Authorization", "Bearer explicit");
           return ctx;
         };
 

@@ -22,12 +22,12 @@ use lance_namespace::models::{
     AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
-    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    CountTableRowsResponse, CreateMaterializedViewRequest, CreateMaterializedViewResponse,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableBranchRequest,
+    CreateTableBranchResponse, CreateTableIndexRequest, CreateTableIndexResponse,
+    CreateTableRequest, CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
     DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
@@ -42,11 +42,12 @@ use lance_namespace::models::{
     ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
-    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
-    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
-    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
-    UpdateTableTagRequest, UpdateTableTagResponse,
+    NamespaceExistsResponse, QueryTableRequest, QueryTableResponse, RefreshMaterializedViewRequest,
+    RefreshMaterializedViewResponse, RegisterTableRequest, RegisterTableResponse,
+    RenameTableRequest, RenameTableResponse, RestoreTableRequest, RestoreTableResponse,
+    TableExistsRequest, TableExistsResponse, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -54,6 +55,9 @@ use lance_core::{Error, Result};
 
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
+
+const HEADER_CONTEXT_PREFIX: &str = "header.";
+const LEGACY_HEADERS_CONTEXT_PREFIX: &str = "headers.";
 
 /// HTTP client wrapper that supports per-request header injection.
 ///
@@ -89,7 +93,13 @@ impl RestClient {
     ///
     /// This method mutates the request's headers directly, which is more efficient
     /// than creating a new client with default_headers for each request.
-    fn apply_headers(&self, request: &mut reqwest::Request, operation: &str, object_id: &str) {
+    fn apply_headers(
+        &self,
+        request: &mut reqwest::Request,
+        operation: &str,
+        object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
+    ) {
         let request_headers = request.headers_mut();
 
         // First apply base headers
@@ -105,17 +115,28 @@ impl RestClient {
         if let Some(provider) = &self.context_provider {
             let info = OperationInfo::new(operation, object_id);
             let context = provider.provide_context(&info);
+            Self::apply_context_headers(request_headers, &context);
+        }
 
-            const HEADERS_PREFIX: &str = "headers.";
-            for (key, value) in context {
-                if let Some(header_name) = key.strip_prefix(HEADERS_PREFIX)
-                    && let (Ok(header_name), Ok(header_value)) = (
-                        HeaderName::from_str(header_name),
-                        HeaderValue::from_str(&value),
-                    )
-                {
-                    request_headers.insert(header_name, header_value);
-                }
+        if let Some(context) = request_context {
+            Self::apply_context_headers(request_headers, context);
+        }
+    }
+
+    fn apply_context_headers(
+        request_headers: &mut reqwest::header::HeaderMap,
+        context: &HashMap<String, String>,
+    ) {
+        for (key, value) in context {
+            if let Some(header_name) = key
+                .strip_prefix(HEADER_CONTEXT_PREFIX)
+                .or_else(|| key.strip_prefix(LEGACY_HEADERS_CONTEXT_PREFIX))
+                && let (Ok(header_name), Ok(header_value)) = (
+                    HeaderName::from_str(header_name),
+                    HeaderValue::from_str(value),
+                )
+            {
+                request_headers.insert(header_name, header_value);
             }
         }
     }
@@ -128,9 +149,10 @@ impl RestClient {
         req_builder: reqwest::RequestBuilder,
         operation: &str,
         object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
     ) -> std::result::Result<reqwest::Response, reqwest::Error> {
         let mut request = req_builder.build()?;
-        self.apply_headers(&mut request, operation, object_id);
+        self.apply_headers(&mut request, operation, object_id, request_context);
         self.client.execute(request).await
     }
 
@@ -225,7 +247,7 @@ impl RestNamespaceBuilder {
     /// It expects:
     /// - `uri`: The base URI for the REST API (required)
     /// - `delimiter`: Delimiter for object identifiers (optional, defaults to ".")
-    /// - `header.*` / `headers.*`: Additional headers (optional, prefix will be stripped)
+    /// - `header.*`: Additional headers (optional, prefix will be stripped)
     /// - `tls.cert_file`: Path to client certificate file (optional)
     /// - `tls.key_file`: Path to client private key file (optional)
     /// - `tls.ssl_ca_cert`: Path to CA certificate file (optional)
@@ -273,7 +295,7 @@ impl RestNamespaceBuilder {
             .cloned()
             .unwrap_or_else(|| Self::DEFAULT_DELIMITER.to_string());
 
-        // Extract headers (properties prefixed with "header." or "headers.")
+        // Extract headers (properties prefixed with "header." or legacy "headers.")
         let mut headers = HashMap::new();
         for (key, value) in &properties {
             if let Some(header_name) = key
@@ -386,9 +408,9 @@ impl RestNamespaceBuilder {
     /// Set a dynamic context provider for per-request context.
     ///
     /// The provider will be called before each HTTP request to generate
-    /// additional context. Context keys that start with `headers.` are converted
-    /// to HTTP headers by stripping the prefix. For example, `headers.Authorization`
-    /// becomes the `Authorization` header. Keys without the `headers.` prefix are ignored.
+    /// additional context. Context keys that start with `header.` are converted
+    /// to HTTP headers by stripping the prefix. For example, `header.Authorization`
+    /// becomes the `Authorization` header. Keys without the `header.` prefix are ignored.
     ///
     /// # Arguments
     ///
@@ -574,6 +596,74 @@ impl RestNamespace {
         }
     }
 
+    fn response_headers_to_context(
+        headers: &reqwest::header::HeaderMap,
+    ) -> Option<HashMap<String, String>> {
+        let context: HashMap<String, String> = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| {
+                    (
+                        format!("{}{}", HEADER_CONTEXT_PREFIX, name.as_str()),
+                        value.to_string(),
+                    )
+                })
+            })
+            .collect();
+
+        if context.is_empty() {
+            None
+        } else {
+            Some(context)
+        }
+    }
+
+    fn request_context_from_body<T: Serialize>(body: &T) -> Option<HashMap<String, String>> {
+        let value = serde_json::to_value(body).ok()?;
+        let context = value.get("context")?.as_object()?;
+        let context: HashMap<String, String> = context
+            .iter()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+            .collect();
+
+        if context.is_empty() {
+            None
+        } else {
+            Some(context)
+        }
+    }
+
+    fn parse_json_response<T: DeserializeOwned>(
+        content: &str,
+        header_context: Option<HashMap<String, String>>,
+    ) -> Result<T> {
+        let mut value = serde_json::from_str::<serde_json::Value>(content).map_err(|e| {
+            NamespaceError::Internal {
+                message: format!("Failed to parse response: {:?}", e),
+            }
+        })?;
+
+        if let (serde_json::Value::Object(object), Some(header_context)) =
+            (&mut value, header_context)
+        {
+            let context_value = object
+                .entry("context")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let serde_json::Value::Object(context_object) = context_value {
+                for (key, value) in header_context {
+                    context_object.insert(key, serde_json::Value::String(value));
+                }
+            }
+        }
+
+        serde_json::from_value(value).map_err(|e| {
+            NamespaceError::Internal {
+                message: format!("Failed to parse response: {:?}", e),
+            }
+            .into()
+        })
+    }
+
     /// Execute a GET request and parse JSON response.
     async fn get_json<T: DeserializeOwned>(
         &self,
@@ -581,17 +671,19 @@ impl RestNamespace {
         query: &[(&str, &str)],
         operation: &str,
         object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
     ) -> Result<T> {
         let url = format!("{}{}", self.rest_client.base_path(), path);
         let req_builder = self.rest_client.client().get(&url).query(query);
 
         let resp = self
             .rest_client
-            .execute(req_builder, operation, object_id)
+            .execute(req_builder, operation, object_id, request_context)
             .await
             .map_err(Self::request_error)?;
 
         let status = resp.status();
+        let header_context = Self::response_headers_to_context(resp.headers());
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
                 message: format!("Failed to read response body: {:?}", e),
@@ -599,15 +691,63 @@ impl RestNamespace {
         })?;
 
         if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| {
-                NamespaceError::Internal {
-                    message: format!("Failed to parse response: {:?}", e),
-                }
-                .into()
-            })
+            Self::parse_json_response(&content, header_context)
         } else {
             Err(Self::parse_error_response(status, &content))
         }
+    }
+
+    async fn get_count_table_rows_response(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        operation: &str,
+        object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
+    ) -> Result<CountTableRowsResponse> {
+        let url = format!("{}{}", self.rest_client.base_path(), path);
+        let req_builder = self.rest_client.client().get(&url).query(query);
+
+        let resp = self
+            .rest_client
+            .execute(req_builder, operation, object_id, request_context)
+            .await
+            .map_err(Self::request_error)?;
+
+        let status = resp.status();
+        let header_context = Self::response_headers_to_context(resp.headers());
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {:?}", e),
+            })
+        })?;
+
+        if !status.is_success() {
+            return Err(Self::parse_error_response(status, &content));
+        }
+
+        let trimmed = content.trim();
+        if trimmed.starts_with('{') {
+            let response: CountTableRowsResponse =
+                Self::parse_json_response(trimmed, header_context)?;
+            if response.count.is_none() {
+                return Err(NamespaceError::Internal {
+                    message: "count_table_rows response did not contain count".to_string(),
+                }
+                .into());
+            }
+            return Ok(response);
+        }
+
+        let count = trimmed
+            .parse::<i64>()
+            .map_err(|e| NamespaceError::Internal {
+                message: format!("Failed to parse count_table_rows response: {:?}", e),
+            })?;
+        Ok(CountTableRowsResponse {
+            context: header_context,
+            count: Some(count),
+        })
     }
 
     /// Execute a POST request with JSON body and parse JSON response.
@@ -619,16 +759,38 @@ impl RestNamespace {
         operation: &str,
         object_id: &str,
     ) -> Result<R> {
+        let request_context = Self::request_context_from_body(body);
+        self.post_json_with_context(
+            path,
+            query,
+            body,
+            operation,
+            object_id,
+            request_context.as_ref(),
+        )
+        .await
+    }
+
+    async fn post_json_with_context<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &T,
+        operation: &str,
+        object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
+    ) -> Result<R> {
         let url = format!("{}{}", self.rest_client.base_path(), path);
         let req_builder = self.rest_client.client().post(&url).query(query).json(body);
 
         let resp = self
             .rest_client
-            .execute(req_builder, operation, object_id)
+            .execute(req_builder, operation, object_id, request_context)
             .await
             .map_err(Self::request_error)?;
 
         let status = resp.status();
+        let header_context = Self::response_headers_to_context(resp.headers());
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
                 message: format!("Failed to read response body: {:?}", e),
@@ -636,12 +798,44 @@ impl RestNamespace {
         })?;
 
         if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| {
-                NamespaceError::Internal {
-                    message: format!("Failed to parse response: {:?}", e),
-                }
-                .into()
+            Self::parse_json_response(&content, header_context)
+        } else {
+            Err(Self::parse_error_response(status, &content))
+        }
+    }
+
+    async fn post_json_plain_response<T: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &T,
+        operation: &str,
+        object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
+    ) -> Result<(R, Option<HashMap<String, String>>)> {
+        let url = format!("{}{}", self.rest_client.base_path(), path);
+        let req_builder = self.rest_client.client().post(&url).query(query).json(body);
+
+        let resp = self
+            .rest_client
+            .execute(req_builder, operation, object_id, request_context)
+            .await
+            .map_err(Self::request_error)?;
+
+        let status = resp.status();
+        let header_context = Self::response_headers_to_context(resp.headers());
+        let content = resp.text().await.map_err(|e| {
+            Error::from(NamespaceError::Internal {
+                message: format!("Failed to read response body: {:?}", e),
             })
+        })?;
+
+        if status.is_success() {
+            let response =
+                serde_json::from_str(&content).map_err(|e| NamespaceError::Internal {
+                    message: format!("Failed to parse response: {:?}", e),
+                })?;
+            Ok((response, header_context))
         } else {
             Err(Self::parse_error_response(status, &content))
         }
@@ -655,19 +849,20 @@ impl RestNamespace {
         body: &T,
         operation: &str,
         object_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<HashMap<String, String>>> {
         let url = format!("{}{}", self.rest_client.base_path(), path);
         let req_builder = self.rest_client.client().post(&url).query(query).json(body);
+        let request_context = Self::request_context_from_body(body);
 
         let resp = self
             .rest_client
-            .execute(req_builder, operation, object_id)
+            .execute(req_builder, operation, object_id, request_context.as_ref())
             .await
             .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
-            Ok(())
+            Ok(Self::response_headers_to_context(resp.headers()))
         } else {
             let content = resp.text().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
@@ -686,17 +881,19 @@ impl RestNamespace {
         body: Vec<u8>,
         operation: &str,
         object_id: &str,
+        request_context: Option<&HashMap<String, String>>,
     ) -> Result<R> {
         let url = format!("{}{}", self.rest_client.base_path(), path);
         let req_builder = self.rest_client.client().post(&url).query(query).body(body);
 
         let resp = self
             .rest_client
-            .execute(req_builder, operation, object_id)
+            .execute(req_builder, operation, object_id, request_context)
             .await
             .map_err(Self::request_error)?;
 
         let status = resp.status();
+        let header_context = Self::response_headers_to_context(resp.headers());
         let content = resp.text().await.map_err(|e| {
             Error::from(NamespaceError::Internal {
                 message: format!("Failed to read response body: {:?}", e),
@@ -704,12 +901,7 @@ impl RestNamespace {
         })?;
 
         if status.is_success() {
-            serde_json::from_str(&content).map_err(|e| {
-                NamespaceError::Internal {
-                    message: format!("Failed to parse response: {:?}", e),
-                }
-                .into()
-            })
+            Self::parse_json_response(&content, header_context)
         } else {
             Err(Self::parse_error_response(status, &content))
         }
@@ -771,7 +963,14 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
-        self.get_json(&path, &query, "list_namespaces", &id).await
+        self.get_json(
+            &path,
+            &query,
+            "list_namespaces",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn describe_namespace(
@@ -810,14 +1009,19 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
-    async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
+    async fn namespace_exists(
+        &self,
+        request: NamespaceExistsRequest,
+    ) -> Result<NamespaceExistsResponse> {
         self.record_op("namespace_exists");
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
         let path = format!("/v1/namespace/{}/exists", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json_no_content(&path, &query, &request, "namespace_exists", &id)
-            .await
+        let context = self
+            .post_json_no_content(&path, &query, &request, "namespace_exists", &id)
+            .await?;
+        Ok(NamespaceExistsResponse { context })
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -841,7 +1045,8 @@ impl LanceNamespace for RestNamespace {
             include_declared_str = include_declared.to_string();
             query.push(("include_declared", include_declared_str.as_str()));
         }
-        self.get_json(&path, &query, "list_tables", &id).await
+        self.get_json(&path, &query, "list_tables", &id, request.context.as_ref())
+            .await
     }
 
     async fn describe_table(&self, request: DescribeTableRequest) -> Result<DescribeTableResponse> {
@@ -879,14 +1084,16 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
-    async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
+    async fn table_exists(&self, request: TableExistsRequest) -> Result<TableExistsResponse> {
         self.record_op("table_exists");
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/exists", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.post_json_no_content(&path, &query, &request, "table_exists", &id)
-            .await
+        let context = self
+            .post_json_no_content(&path, &query, &request, "table_exists", &id)
+            .await?;
+        Ok(TableExistsResponse { context })
     }
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
@@ -912,13 +1119,23 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
-    async fn count_table_rows(&self, request: CountTableRowsRequest) -> Result<i64> {
+    async fn count_table_rows(
+        &self,
+        request: CountTableRowsRequest,
+    ) -> Result<CountTableRowsResponse> {
         self.record_op("count_table_rows");
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/count_rows", encoded_id);
         let query = [("delimiter", self.delimiter.as_str())];
-        self.get_json(&path, &query, "count_table_rows", &id).await
+        self.get_count_table_rows_response(
+            &path,
+            &query,
+            "count_table_rows",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn create_table(
@@ -962,8 +1179,15 @@ impl LanceNamespace for RestNamespace {
             })?;
             query.push(("storage_options", storage_options_str.as_str()));
         }
-        self.post_binary_json(&path, &query, request_data.to_vec(), "create_table", &id)
-            .await
+        self.post_binary_json(
+            &path,
+            &query,
+            request_data.to_vec(),
+            "create_table",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
@@ -997,6 +1221,7 @@ impl LanceNamespace for RestNamespace {
             request_data.to_vec(),
             "insert_into_table",
             &id,
+            request.context.as_ref(),
         )
         .await
     }
@@ -1064,6 +1289,7 @@ impl LanceNamespace for RestNamespace {
             request_data.to_vec(),
             "merge_insert_into_table",
             &id,
+            request.context.as_ref(),
         )
         .await
     }
@@ -1091,7 +1317,7 @@ impl LanceNamespace for RestNamespace {
             .await
     }
 
-    async fn query_table(&self, request: QueryTableRequest) -> Result<Bytes> {
+    async fn query_table(&self, request: QueryTableRequest) -> Result<QueryTableResponse> {
         self.record_op("query_table");
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
@@ -1109,16 +1335,21 @@ impl LanceNamespace for RestNamespace {
 
         let resp = self
             .rest_client
-            .execute(req_builder, operation, &id)
+            .execute(req_builder, operation, &id, request.context.as_ref())
             .await
             .map_err(Self::request_error)?;
 
         let status = resp.status();
         if status.is_success() {
-            resp.bytes().await.map_err(|e| {
+            let context = Self::response_headers_to_context(resp.headers());
+            let bytes = resp.bytes().await.map_err(|e| {
                 Error::from(NamespaceError::Internal {
                     message: format!("Failed to read response bytes: {:?}", e),
                 })
+            })?;
+            Ok(QueryTableResponse {
+                context,
+                data: Some(bytes.to_vec()),
             })
         } else {
             let content = resp.text().await.map_err(|e| {
@@ -1250,7 +1481,14 @@ impl LanceNamespace for RestNamespace {
             include_declared_str = include_declared.to_string();
             query.push(("include_declared", include_declared_str.as_str()));
         }
-        self.get_json(path, &query, "list_all_tables", "").await
+        self.get_json(
+            path,
+            &query,
+            "list_all_tables",
+            "",
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn restore_table(&self, request: RestoreTableRequest) -> Result<RestoreTableResponse> {
@@ -1304,8 +1542,15 @@ impl LanceNamespace for RestNamespace {
             branch_str = branch.clone();
             query.push(("branch", branch_str.as_str()));
         }
-        self.post_json(&path, &query, &(), "list_table_versions", &id)
-            .await
+        self.post_json_with_context(
+            &path,
+            &query,
+            &(),
+            "list_table_versions",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn create_table_version(
@@ -1355,18 +1600,26 @@ impl LanceNamespace for RestNamespace {
         let id = object_id_str(&request.id, &self.delimiter)?;
         let encoded_id = urlencode(&id);
         let path = format!("/v1/table/{}/schema_metadata/update", encoded_id);
-        let query = [("delimiter", self.delimiter.as_str())];
+        let mut query = vec![("delimiter", self.delimiter.as_str())];
+        let branch_str;
+        if let Some(ref branch) = request.branch {
+            branch_str = branch.clone();
+            query.push(("branch", branch_str.as_str()));
+        }
+        let request_context = request.context.clone();
         let metadata = request.metadata.unwrap_or_default();
-        let result: HashMap<String, String> = self
-            .post_json(
+        let (result, context): (HashMap<String, String>, _) = self
+            .post_json_plain_response(
                 &path,
                 &query,
                 &metadata,
                 "update_table_schema_metadata",
                 &id,
+                request_context.as_ref(),
             )
             .await?;
         Ok(UpdateTableSchemaMetadataResponse {
+            context,
             metadata: Some(result),
             ..Default::default()
         })
@@ -1508,7 +1761,14 @@ impl LanceNamespace for RestNamespace {
             limit_str = limit.to_string();
             query.push(("limit", limit_str.as_str()));
         }
-        self.get_json(&path, &query, "list_table_tags", &id).await
+        self.get_json(
+            &path,
+            &query,
+            "list_table_tags",
+            &id,
+            request.context.as_ref(),
+        )
+        .await
     }
 
     async fn get_table_tag_version(
@@ -2076,7 +2336,7 @@ mod tests {
         // Create context provider
         let mut context_headers = HashMap::new();
         context_headers.insert(
-            "headers.X-Context-Token".to_string(),
+            "header.X-Context-Token".to_string(),
             "dynamic-token".to_string(),
         );
         let provider = Arc::new(TestContextProvider {
@@ -2120,7 +2380,7 @@ mod tests {
         // Create context provider
         let mut context_headers = HashMap::new();
         context_headers.insert(
-            "headers.X-Context-Token".to_string(),
+            "header.X-Context-Token".to_string(),
             "dynamic-token".to_string(),
         );
         let provider = Arc::new(TestContextProvider {
@@ -2162,7 +2422,7 @@ mod tests {
         // Context provider that overrides Authorization header
         let mut context_headers = HashMap::new();
         context_headers.insert(
-            "headers.Authorization".to_string(),
+            "header.Authorization".to_string(),
             "Bearer context-override-token".to_string(),
         );
         let provider = Arc::new(TestContextProvider {

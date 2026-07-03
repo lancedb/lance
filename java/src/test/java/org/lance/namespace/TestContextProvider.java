@@ -29,8 +29,8 @@ public class TestContextProvider implements DynamicContextProvider {
   @Override
   public Map<String, String> provideContext(String operation, String objectId) {
     Map<String, String> context = new HashMap<>();
-    context.put("headers.Authorization", prefix + " " + token);
-    context.put("headers.X-Operation", operation);
+    context.put("header.Authorization", prefix + " " + token);
+    context.put("header.X-Operation", operation);
     return context;
   }
 }

@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use jni::JNIEnv;
 use jni::objects::{GlobalRef, JByteArray, JMap, JObject, JString, JValue};
-use jni::sys::{jbyteArray, jlong, jobject, jstring};
+use jni::sys::{jlong, jobject, jstring};
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
 use lance_namespace::models::*;
 use lance_namespace_impls::{
@@ -337,6 +338,48 @@ impl JavaLanceNamespace {
         Ok(response_str)
     }
 
+    fn deserialize_response<Resp>(response_str: &str) -> lance_core::Result<Resp>
+    where
+        Resp: serde::de::DeserializeOwned,
+    {
+        serde_json::from_str(response_str).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to deserialize response: {}",
+                e
+            ))))
+        })
+    }
+
+    fn deserialize_query_table_response(
+        response_str: &str,
+    ) -> lance_core::Result<QueryTableResponse> {
+        let mut value: serde_json::Value = serde_json::from_str(response_str).map_err(|e| {
+            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                "Failed to deserialize queryTable response JSON: {}",
+                e
+            ))))
+        })?;
+
+        if let Some(data) = value.get_mut("data")
+            && let Some(data_base64) = data.as_str()
+        {
+            let bytes = BASE64_STANDARD.decode(data_base64).map_err(|e| {
+                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                    "Failed to decode queryTable response data: {}",
+                    e
+                ))))
+            })?;
+            *data = serde_json::Value::Array(
+                bytes
+                    .into_iter()
+                    .map(|byte| serde_json::Value::Number(byte.into()))
+                    .collect(),
+            );
+        }
+
+        Self::deserialize_response(&value.to_string())
+    }
+
     /// Helper to call a Java method that takes a request object and returns a response object.
     /// JSON conversion is done via Jackson ObjectMapper.
     async fn call_json_method<Req, Resp>(
@@ -406,71 +449,23 @@ impl JavaLanceNamespace {
             // Serialize Java response to JSON via ObjectMapper
             let response_str = Self::serialize_response(&mut env, &response_obj)?;
 
-            serde_json::from_str(&response_str).map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to deserialize response: {}",
-                    e
-                ))))
-            })
-        })
-        .await
-        .map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to spawn blocking task: {}",
-                e
-            ))))
-        })?
-    }
-
-    /// Helper for void methods (return ()).
-    async fn call_void_method<Req>(
-        &self,
-        method_name: &'static str,
-        request_class: &str,
-        request: Req,
-    ) -> lance_core::Result<()>
-    where
-        Req: serde::Serialize + Send + 'static,
-    {
-        let java_namespace = self.java_namespace.clone();
-        let jvm = self.jvm.clone();
-        let request_class = request_class.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let mut env = jvm.attach_current_thread().map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to attach to JVM: {}",
-                    e
-                ))))
-            })?;
-
-            // Serialize request to JSON
-            let request_json = serde_json::to_string(&request).map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to serialize request: {}",
-                    e
-                ))))
-            })?;
-
-            // Deserialize JSON to Java request object via ObjectMapper
-            let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
-
-            // Call the interface method with request object
-            let method_sig = format!("(L{};)V", request_class);
-            env.call_method(
-                &java_namespace,
-                method_name,
-                &method_sig,
-                &[JValue::Object(&request_obj)],
-            )
-            .map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to call {}: {}",
-                    method_name, e
-                ))))
-            })?;
-
-            Ok(())
+            if response_class.ends_with("/QueryTableResponse") {
+                let response = Self::deserialize_query_table_response(&response_str)?;
+                let response = serde_json::to_value(response).map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                        "Failed to normalize queryTable response: {}",
+                        e
+                    ))))
+                })?;
+                serde_json::from_value(response).map_err(|e| {
+                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
+                        "Failed to deserialize queryTable response: {}",
+                        e
+                    ))))
+                })
+            } else {
+                Self::deserialize_response(&response_str)
+            }
         })
         .await
         .map_err(|e| {
@@ -564,96 +559,6 @@ impl JavaLanceNamespace {
         })?
     }
 
-    /// Helper for methods returning Long (boxed).
-    async fn call_long_method<Req>(
-        &self,
-        method_name: &'static str,
-        request_class: &str,
-        request: Req,
-    ) -> lance_core::Result<i64>
-    where
-        Req: serde::Serialize + Send + 'static,
-    {
-        let java_namespace = self.java_namespace.clone();
-        let jvm = self.jvm.clone();
-        let request_class = request_class.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let mut env = jvm.attach_current_thread().map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to attach to JVM: {}",
-                    e
-                ))))
-            })?;
-
-            // Serialize request to JSON
-            let request_json = serde_json::to_string(&request).map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to serialize request: {}",
-                    e
-                ))))
-            })?;
-
-            // Deserialize JSON to Java request object via ObjectMapper
-            let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
-
-            // Call the interface method with request object - returns Long (boxed)
-            let method_sig = format!("(L{};)Ljava/lang/Long;", request_class);
-            let result = env
-                .call_method(
-                    &java_namespace,
-                    method_name,
-                    &method_sig,
-                    &[JValue::Object(&request_obj)],
-                )
-                .map_err(|e| {
-                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                        "Failed to call {}: {}",
-                        method_name, e
-                    ))))
-                })?;
-
-            let long_obj = result.l().map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "{} did not return an object: {}",
-                    method_name, e
-                ))))
-            })?;
-
-            if long_obj.is_null() {
-                return Err(lance_core::Error::io_source(Box::new(
-                    std::io::Error::other(format!("{} returned null", method_name)),
-                )));
-            }
-
-            // Unbox Long to long
-            let long_value = env
-                .call_method(&long_obj, "longValue", "()J", &[])
-                .map_err(|e| {
-                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                        "Failed to call longValue: {}",
-                        e
-                    ))))
-                })?
-                .j()
-                .map_err(|e| {
-                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                        "longValue did not return a long: {}",
-                        e
-                    ))))
-                })?;
-
-            Ok(long_value)
-        })
-        .await
-        .map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to spawn blocking task: {}",
-                e
-            ))))
-        })?
-    }
-
     /// Helper for methods with Bytes parameter (request + byte[] data).
     async fn call_with_bytes_method<Req, Resp>(
         &self,
@@ -736,87 +641,6 @@ impl JavaLanceNamespace {
                     e
                 ))))
             })
-        })
-        .await
-        .map_err(|e| {
-            lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to spawn blocking task: {}",
-                e
-            ))))
-        })?
-    }
-
-    /// Helper for methods returning Bytes (byte[]).
-    async fn call_bytes_method<Req>(
-        &self,
-        method_name: &'static str,
-        request_class: &str,
-        request: Req,
-    ) -> lance_core::Result<Bytes>
-    where
-        Req: serde::Serialize + Send + 'static,
-    {
-        let java_namespace = self.java_namespace.clone();
-        let jvm = self.jvm.clone();
-        let request_class = request_class.to_string();
-
-        tokio::task::spawn_blocking(move || {
-            let mut env = jvm.attach_current_thread().map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to attach to JVM: {}",
-                    e
-                ))))
-            })?;
-
-            // Serialize request to JSON
-            let request_json = serde_json::to_string(&request).map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to serialize request: {}",
-                    e
-                ))))
-            })?;
-
-            // Deserialize JSON to Java request object via ObjectMapper
-            let request_obj = Self::deserialize_request(&mut env, &request_json, &request_class)?;
-
-            // Call the interface method with request object - returns byte[]
-            let method_sig = format!("(L{};)[B", request_class);
-            let result = env
-                .call_method(
-                    &java_namespace,
-                    method_name,
-                    &method_sig,
-                    &[JValue::Object(&request_obj)],
-                )
-                .map_err(|e| {
-                    lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                        "Failed to call {}: {}",
-                        method_name, e
-                    ))))
-                })?;
-
-            let response_obj = result.l().map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "{} did not return an object: {}",
-                    method_name, e
-                ))))
-            })?;
-
-            if response_obj.is_null() {
-                return Err(lance_core::Error::io_source(Box::new(
-                    std::io::Error::other(format!("{} returned null", method_name)),
-                )));
-            }
-
-            let byte_array = JByteArray::from(response_obj);
-            let bytes = env.convert_byte_array(byte_array).map_err(|e| {
-                lance_core::Error::io_source(Box::new(std::io::Error::other(format!(
-                    "Failed to convert byte array: {}",
-                    e
-                ))))
-            })?;
-
-            Ok(Bytes::from(bytes))
         })
         .await
         .map_err(|e| {
@@ -997,10 +821,14 @@ impl LanceNamespaceTrait for JavaLanceNamespace {
         .await
     }
 
-    async fn namespace_exists(&self, request: NamespaceExistsRequest) -> lance_core::Result<()> {
-        self.call_void_method(
+    async fn namespace_exists(
+        &self,
+        request: NamespaceExistsRequest,
+    ) -> lance_core::Result<NamespaceExistsResponse> {
+        self.call_json_method(
             "namespaceExists",
             &format!("{}/NamespaceExistsRequest", MODEL_PKG),
+            &format!("{}/NamespaceExistsResponse", MODEL_PKG),
             request,
         )
         .await
@@ -1045,10 +873,14 @@ impl LanceNamespaceTrait for JavaLanceNamespace {
         .await
     }
 
-    async fn table_exists(&self, request: TableExistsRequest) -> lance_core::Result<()> {
-        self.call_void_method(
+    async fn table_exists(
+        &self,
+        request: TableExistsRequest,
+    ) -> lance_core::Result<TableExistsResponse> {
+        self.call_json_method(
             "tableExists",
             &format!("{}/TableExistsRequest", MODEL_PKG),
+            &format!("{}/TableExistsResponse", MODEL_PKG),
             request,
         )
         .await
@@ -1077,10 +909,14 @@ impl LanceNamespaceTrait for JavaLanceNamespace {
         .await
     }
 
-    async fn count_table_rows(&self, request: CountTableRowsRequest) -> lance_core::Result<i64> {
-        self.call_long_method(
+    async fn count_table_rows(
+        &self,
+        request: CountTableRowsRequest,
+    ) -> lance_core::Result<CountTableRowsResponse> {
+        self.call_json_method(
             "countTableRows",
             &format!("{}/CountTableRowsRequest", MODEL_PKG),
+            &format!("{}/CountTableRowsResponse", MODEL_PKG),
             request,
         )
         .await
@@ -1170,10 +1006,14 @@ impl LanceNamespaceTrait for JavaLanceNamespace {
         .await
     }
 
-    async fn query_table(&self, request: QueryTableRequest) -> lance_core::Result<Bytes> {
-        self.call_bytes_method(
+    async fn query_table(
+        &self,
+        request: QueryTableRequest,
+    ) -> lance_core::Result<QueryTableResponse> {
+        self.call_json_method(
             "queryTable",
             &format!("{}/QueryTableRequest", MODEL_PKG),
+            &format!("{}/QueryTableResponse", MODEL_PKG),
             request,
         )
         .await
@@ -1695,13 +1535,15 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_namespaceExis
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) {
-    ok_or_throw_without_return!(
+) -> jstring {
+    ok_or_throw_with_return!(
         env,
-        call_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
             RT.block_on(namespace_client.inner.namespace_exists(req))
-        })
+        }),
+        std::ptr::null_mut()
     )
+    .into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -1761,13 +1603,15 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_tableExistsNa
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) {
-    ok_or_throw_without_return!(
+) -> jstring {
+    ok_or_throw_with_return!(
         env,
-        call_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
             RT.block_on(namespace_client.inner.table_exists(req))
-        })
+        }),
+        std::ptr::null_mut()
     )
+    .into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -1810,12 +1654,15 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_countTableRow
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) -> jlong {
+) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_count_method(&mut env, handle, request_json),
-        0
+        call_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.count_table_rows(req))
+        }),
+        std::ptr::null_mut()
     )
+    .into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -1964,10 +1811,15 @@ pub extern "system" fn Java_org_lance_namespace_DirectoryNamespace_queryTableNat
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) -> jbyteArray {
+) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_namespace_query_method(&mut env, handle, request_json),
+        call_namespace_query_table_method(
+            &mut env,
+            handle,
+            request_json,
+            |namespace_client, req| { RT.block_on(namespace_client.inner.query_table(req)) }
+        ),
         std::ptr::null_mut()
     )
     .into_raw()
@@ -2645,13 +2497,15 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_namespaceExistsNat
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) {
-    ok_or_throw_without_return!(
+) -> jstring {
+    ok_or_throw_with_return!(
         env,
-        call_rest_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
             RT.block_on(namespace_client.inner.namespace_exists(req))
-        })
+        }),
+        std::ptr::null_mut()
     )
+    .into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -2711,13 +2565,15 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_tableExistsNative(
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) {
-    ok_or_throw_without_return!(
+) -> jstring {
+    ok_or_throw_with_return!(
         env,
-        call_rest_namespace_void_method(&mut env, handle, request_json, |namespace_client, req| {
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
             RT.block_on(namespace_client.inner.table_exists(req))
-        })
+        }),
+        std::ptr::null_mut()
     )
+    .into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -2760,12 +2616,15 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_countTableRowsNati
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) -> jlong {
+) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_count_method(&mut env, handle, request_json),
-        0
+        call_rest_namespace_method(&mut env, handle, request_json, |namespace_client, req| {
+            RT.block_on(namespace_client.inner.count_table_rows(req))
+        }),
+        std::ptr::null_mut()
     )
+    .into_raw()
 }
 
 #[unsafe(no_mangle)]
@@ -2914,10 +2773,15 @@ pub extern "system" fn Java_org_lance_namespace_RestNamespace_queryTableNative(
     _obj: JObject,
     handle: jlong,
     request_json: JString,
-) -> jbyteArray {
+) -> jstring {
     ok_or_throw_with_return!(
         env,
-        call_rest_namespace_query_method(&mut env, handle, request_json),
+        call_rest_namespace_query_table_method(
+            &mut env,
+            handle,
+            request_json,
+            |namespace_client, req| { RT.block_on(namespace_client.inner.query_table(req)) }
+        ),
         std::ptr::null_mut()
     )
     .into_raw()
@@ -3469,27 +3333,6 @@ where
     env.new_string(response_json).map_err(Into::into)
 }
 
-/// Helper function for void methods (DirectoryNamespace)
-fn call_namespace_void_method<Req, F>(
-    env: &mut JNIEnv,
-    handle: jlong,
-    request_json: JString,
-    f: F,
-) -> Result<()>
-where
-    Req: for<'de> Deserialize<'de>,
-    F: FnOnce(&BlockingDirectoryNamespace, Req) -> lance_core::Result<()>,
-{
-    let namespace = unsafe { &*(handle as *const BlockingDirectoryNamespace) };
-    let request_str: String = env.get_string(&request_json)?.into();
-    let request: Req = serde_json::from_str(&request_str)
-        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
-
-    f(namespace, request).map_err(Error::from)?;
-
-    Ok(())
-}
-
 /// Helper function for methods that return String directly (not JSON-serialized) (DirectoryNamespace)
 fn call_namespace_string_method<'local, Req, F>(
     env: &mut JNIEnv<'local>,
@@ -3509,24 +3352,6 @@ where
     let response = f(namespace, request).map_err(Error::from)?;
 
     env.new_string(response).map_err(Into::into)
-}
-
-/// Helper function for count methods (DirectoryNamespace)
-fn call_namespace_count_method(
-    env: &mut JNIEnv,
-    handle: jlong,
-    request_json: JString,
-) -> Result<jlong> {
-    let namespace = unsafe { &*(handle as *const BlockingDirectoryNamespace) };
-    let request_str: String = env.get_string(&request_json)?.into();
-    let request: CountTableRowsRequest = serde_json::from_str(&request_str)
-        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
-
-    let count = RT
-        .block_on(namespace.inner.count_table_rows(request))
-        .map_err(Error::from)?;
-
-    Ok(count)
 }
 
 /// Helper function for methods with data parameter (DirectoryNamespace)
@@ -3558,23 +3383,47 @@ where
     env.new_string(response_json).map_err(Into::into)
 }
 
-/// Helper function for query methods that return byte arrays (DirectoryNamespace)
-fn call_namespace_query_method<'local>(
+fn query_table_response_to_java_json(response: &QueryTableResponse) -> Result<String> {
+    let mut object = serde_json::Map::new();
+    if let Some(context) = &response.context {
+        object.insert(
+            "context".to_string(),
+            serde_json::to_value(context)
+                .map_err(|e| Error::runtime_error(format!("Failed to serialize context: {}", e)))?,
+        );
+    }
+    if let Some(data) = &response.data {
+        object.insert(
+            "data".to_string(),
+            serde_json::Value::String(BASE64_STANDARD.encode(data)),
+        );
+    }
+
+    serde_json::to_string(&object)
+        .map_err(|e| Error::runtime_error(format!("Failed to serialize response: {}", e)))
+}
+
+fn call_namespace_query_table_method<'local, F>(
     env: &mut JNIEnv<'local>,
     handle: jlong,
     request_json: JString,
-) -> Result<JByteArray<'local>> {
+    f: F,
+) -> Result<JString<'local>>
+where
+    F: FnOnce(
+        &BlockingDirectoryNamespace,
+        QueryTableRequest,
+    ) -> lance_core::Result<QueryTableResponse>,
+{
     let namespace = unsafe { &*(handle as *const BlockingDirectoryNamespace) };
     let request_str: String = env.get_string(&request_json)?.into();
     let request: QueryTableRequest = serde_json::from_str(&request_str)
         .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
 
-    let result_bytes = RT
-        .block_on(namespace.inner.query_table(request))
-        .map_err(Error::from)?;
+    let response = f(namespace, request).map_err(Error::from)?;
+    let response_json = query_table_response_to_java_json(&response)?;
 
-    let byte_array = env.byte_array_from_slice(&result_bytes)?;
-    Ok(byte_array)
+    env.new_string(response_json).map_err(Into::into)
 }
 
 /// Helper function to call namespace methods that return a response object (RestNamespace)
@@ -3602,27 +3451,6 @@ where
     env.new_string(response_json).map_err(Into::into)
 }
 
-/// Helper function for void methods (RestNamespace)
-fn call_rest_namespace_void_method<Req, F>(
-    env: &mut JNIEnv,
-    handle: jlong,
-    request_json: JString,
-    f: F,
-) -> Result<()>
-where
-    Req: for<'de> Deserialize<'de>,
-    F: FnOnce(&BlockingRestNamespace, Req) -> lance_core::Result<()>,
-{
-    let namespace = unsafe { &*(handle as *const BlockingRestNamespace) };
-    let request_str: String = env.get_string(&request_json)?.into();
-    let request: Req = serde_json::from_str(&request_str)
-        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
-
-    f(namespace, request).map_err(Error::from)?;
-
-    Ok(())
-}
-
 /// Helper function for methods that return String directly (not JSON-serialized) (RestNamespace)
 fn call_rest_namespace_string_method<'local, Req, F>(
     env: &mut JNIEnv<'local>,
@@ -3644,22 +3472,24 @@ where
     env.new_string(response).map_err(Into::into)
 }
 
-/// Helper function for count methods (RestNamespace)
-fn call_rest_namespace_count_method(
-    env: &mut JNIEnv,
+fn call_rest_namespace_query_table_method<'local, F>(
+    env: &mut JNIEnv<'local>,
     handle: jlong,
     request_json: JString,
-) -> Result<jlong> {
+    f: F,
+) -> Result<JString<'local>>
+where
+    F: FnOnce(&BlockingRestNamespace, QueryTableRequest) -> lance_core::Result<QueryTableResponse>,
+{
     let namespace = unsafe { &*(handle as *const BlockingRestNamespace) };
     let request_str: String = env.get_string(&request_json)?.into();
-    let request: CountTableRowsRequest = serde_json::from_str(&request_str)
+    let request: QueryTableRequest = serde_json::from_str(&request_str)
         .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
 
-    let count = RT
-        .block_on(namespace.inner.count_table_rows(request))
-        .map_err(Error::from)?;
+    let response = f(namespace, request).map_err(Error::from)?;
+    let response_json = query_table_response_to_java_json(&response)?;
 
-    Ok(count)
+    env.new_string(response_json).map_err(Into::into)
 }
 
 /// Helper function for methods with data parameter (RestNamespace)
@@ -3691,24 +3521,6 @@ where
     env.new_string(response_json).map_err(Into::into)
 }
 
-/// Helper function for query methods that return byte arrays (RestNamespace)
-fn call_rest_namespace_query_method<'local>(
-    env: &mut JNIEnv<'local>,
-    handle: jlong,
-    request_json: JString,
-) -> Result<JByteArray<'local>> {
-    let namespace = unsafe { &*(handle as *const BlockingRestNamespace) };
-    let request_str: String = env.get_string(&request_json)?.into();
-    let request: QueryTableRequest = serde_json::from_str(&request_str)
-        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
-
-    let result_bytes = RT
-        .block_on(namespace.inner.query_table(request))
-        .map_err(Error::from)?;
-
-    let byte_array = env.byte_array_from_slice(&result_bytes)?;
-    Ok(byte_array)
-}
 // ============================================================================
 // RestAdapter - Server for testing
 // ============================================================================
@@ -3844,5 +3656,29 @@ pub extern "system" fn Java_org_lance_namespace_RestAdapter_releaseNative(
                 server_handle.shutdown();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_table_response_decodes_java_base64_data() {
+        let response =
+            JavaLanceNamespace::deserialize_query_table_response(r#"{"data":"AQIDBA=="}"#).unwrap();
+        assert_eq!(response.data, Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn query_table_response_serializes_data_for_java_model() {
+        let response = QueryTableResponse {
+            context: None,
+            data: Some(vec![1, 2, 3, 4]),
+        };
+
+        let response_json = query_table_response_to_java_json(&response).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response_json).unwrap();
+        assert_eq!(value["data"], "AQIDBA==");
     }
 }

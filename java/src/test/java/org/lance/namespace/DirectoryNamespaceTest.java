@@ -23,6 +23,7 @@ import org.lance.WriteParams;
 import org.lance.namespace.errors.ErrorCode;
 import org.lance.namespace.errors.LanceNamespaceException;
 import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CountTableRowsResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
 import org.lance.namespace.model.CreateNamespaceResponse;
 import org.lance.namespace.model.CreateTableIndexRequest;
@@ -56,6 +57,7 @@ import org.lance.namespace.model.ListTablesResponse;
 import org.lance.namespace.model.NamespaceExistsRequest;
 import org.lance.namespace.model.QueryTableRequest;
 import org.lance.namespace.model.QueryTableRequestVector;
+import org.lance.namespace.model.QueryTableResponse;
 import org.lance.namespace.model.RegisterTableRequest;
 import org.lance.namespace.model.RegisterTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
@@ -1161,7 +1163,8 @@ public class DirectoryNamespaceTest {
     // Count rows
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    CountTableRowsResponse response = namespaceClient.countTableRows(countReq);
+    long count = response.getCount();
     assertEquals(3, count);
   }
 
@@ -1183,7 +1186,8 @@ public class DirectoryNamespaceTest {
         new CountTableRowsRequest()
             .id(Arrays.asList("workspace", "test_table"))
             .predicate("age > 28");
-    long count = namespaceClient.countTableRows(countReq);
+    CountTableRowsResponse response = namespaceClient.countTableRows(countReq);
+    long count = response.getCount();
     assertEquals(2, count); // Alice (30) and Charlie (35)
   }
 
@@ -1210,7 +1214,8 @@ public class DirectoryNamespaceTest {
     // Verify row count increased
     CountTableRowsRequest countReq =
         new CountTableRowsRequest().id(Arrays.asList("workspace", "test_table"));
-    long count = namespaceClient.countTableRows(countReq);
+    CountTableRowsResponse response = namespaceClient.countTableRows(countReq);
+    long count = response.getCount();
     assertEquals(6, count);
   }
 
@@ -1233,7 +1238,8 @@ public class DirectoryNamespaceTest {
             .id(Arrays.asList("workspace", "test_table"))
             .k(10)
             .vector(new QueryTableRequestVector());
-    byte[] resultBytes = namespaceClient.queryTable(queryReq);
+    QueryTableResponse response = namespaceClient.queryTable(queryReq);
+    byte[] resultBytes = response.getData();
     assertNotNull(resultBytes);
     assertTrue(resultBytes.length > 0);
   }

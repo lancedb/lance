@@ -7,17 +7,18 @@
 //! allowing it to be accessed via HTTP. The server implements the Lance REST Namespace
 //! specification.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
     Json, Router, ServiceExt,
     body::Bytes,
     extract::{FromRequest, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::watch;
 use tower::Layer;
 use tower_http::normalize_path::NormalizePathLayer;
@@ -27,6 +28,9 @@ use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::*;
+
+const HEADER_CONTEXT_PREFIX: &str = "header.";
+const LEGACY_HEADERS_CONTEXT_PREFIX: &str = "headers.";
 
 /// Configuration for the REST server
 #[derive(Debug, Clone)]
@@ -381,6 +385,83 @@ fn error_to_response(err: Error) -> Response {
     }
 }
 
+fn http_headers_to_context(headers: &HeaderMap) -> Option<HashMap<String, String>> {
+    let context: HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| {
+                (
+                    format!("{}{}", HEADER_CONTEXT_PREFIX, name.as_str()),
+                    value.to_string(),
+                )
+            })
+        })
+        .collect();
+
+    if context.is_empty() {
+        None
+    } else {
+        Some(context)
+    }
+}
+
+fn merge_headers_into_context(context: &mut Option<HashMap<String, String>>, headers: &HeaderMap) {
+    let Some(header_context) = http_headers_to_context(headers) else {
+        return;
+    };
+
+    context
+        .get_or_insert_with(HashMap::new)
+        .extend(header_context);
+}
+
+fn add_context_headers(headers: &mut HeaderMap, context: Option<&HashMap<String, String>>) {
+    let Some(context) = context else {
+        return;
+    };
+
+    for (key, value) in context {
+        if let Some(header_name) = key
+            .strip_prefix(HEADER_CONTEXT_PREFIX)
+            .or_else(|| key.strip_prefix(LEGACY_HEADERS_CONTEXT_PREFIX))
+            && let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(header_name.as_bytes()),
+                HeaderValue::from_str(value),
+            )
+        {
+            headers.insert(header_name, header_value);
+        }
+    }
+}
+
+fn model_context<T: Serialize>(model: &T) -> Option<HashMap<String, String>> {
+    let value = serde_json::to_value(model).ok()?;
+    let context = value.get("context")?.as_object()?;
+    let context: HashMap<String, String> = context
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+        .collect();
+
+    if context.is_empty() {
+        None
+    } else {
+        Some(context)
+    }
+}
+
+fn response_with_context(
+    mut response: Response,
+    context: Option<&HashMap<String, String>>,
+) -> Response {
+    add_context_headers(response.headers_mut(), context);
+    response
+}
+
+fn json_response_with_model_context<T: Serialize>(status: StatusCode, model: T) -> Response {
+    let context = model_context(&model);
+    response_with_context((status, Json(model)).into_response(), context.as_ref())
+}
+
 // ============================================================================
 // Namespace Operation Handlers
 // ============================================================================
@@ -394,9 +475,10 @@ async fn create_namespace(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.create_namespace(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -412,11 +494,11 @@ async fn list_namespaces(
         page_token: params.page_token,
         limit: params.limit,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.list_namespaces(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -430,9 +512,10 @@ async fn describe_namespace(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.describe_namespace(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -446,9 +529,10 @@ async fn drop_namespace(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.drop_namespace(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -462,9 +546,13 @@ async fn namespace_exists(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.namespace_exists(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(response) => response_with_context(
+            StatusCode::NO_CONTENT.into_response(),
+            response.context.as_ref(),
+        ),
         Err(e) => error_to_response(e),
     }
 }
@@ -485,11 +573,11 @@ async fn list_tables(
         limit: params.limit,
         include_declared: params.include_declared,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.list_tables(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -503,9 +591,10 @@ async fn register_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.register_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -519,6 +608,7 @@ async fn describe_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
     if params.with_table_uri.is_some() {
         request.with_table_uri = params.with_table_uri;
     }
@@ -530,7 +620,7 @@ async fn describe_table(
     }
 
     match backend.describe_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -544,9 +634,13 @@ async fn table_exists(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.table_exists(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(response) => response_with_context(
+            StatusCode::NO_CONTENT.into_response(),
+            response.context.as_ref(),
+        ),
         Err(e) => error_to_response(e),
     }
 }
@@ -560,11 +654,11 @@ async fn drop_table(
     let request = DropTableRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.drop_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -578,9 +672,10 @@ async fn deregister_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.deregister_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -648,11 +743,11 @@ async fn create_table(
         properties,
         storage_options,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.create_table(request, body).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -666,9 +761,10 @@ async fn declare_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.declare_table(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -690,11 +786,12 @@ async fn insert_into_table(
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         mode: params.mode.clone(),
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         ..Default::default()
     };
 
     match backend.insert_into_table(request, body).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -730,11 +827,12 @@ async fn merge_insert_into_table(
         timeout: params.timeout,
         use_index: params.use_index,
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         ..Default::default()
     };
 
     match backend.merge_insert_into_table(request, body).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -748,9 +846,10 @@ async fn update_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.update_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -764,9 +863,10 @@ async fn delete_from_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.delete_from_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -780,9 +880,16 @@ async fn query_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.query_table(request).await {
-        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+        Ok(response) => {
+            let data = response.data.unwrap_or_default();
+            response_with_context(
+                (StatusCode::OK, Bytes::from(data)).into_response(),
+                response.context.as_ref(),
+            )
+        }
         Err(e) => error_to_response(e),
     }
 }
@@ -798,11 +905,25 @@ async fn count_table_rows(
         version: None,
         predicate: None,
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         ..Default::default()
     };
 
     match backend.count_table_rows(request).await {
-        Ok(count) => (StatusCode::OK, Json(serde_json::json!({ "count": count }))).into_response(),
+        Ok(response) => {
+            let Some(count) = response.count else {
+                return error_to_response(
+                    NamespaceError::Internal {
+                        message: "count_table_rows response did not contain count".to_string(),
+                    }
+                    .into(),
+                );
+            };
+            response_with_context(
+                (StatusCode::OK, Json(count)).into_response(),
+                response.context.as_ref(),
+            )
+        }
         Err(e) => error_to_response(e),
     }
 }
@@ -820,9 +941,10 @@ async fn rename_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.rename_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -836,9 +958,10 @@ async fn restore_table(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.restore_table(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -856,11 +979,11 @@ async fn list_table_versions(
         descending: params.descending,
         branch: params.branch,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.list_table_versions(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -875,6 +998,7 @@ async fn create_table_version(
     let request = CreateTableVersionRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         version: body.version,
         manifest_path: body.manifest_path,
         manifest_size: body.manifest_size,
@@ -885,7 +1009,7 @@ async fn create_table_version(
     };
 
     match backend.create_table_version(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -902,11 +1026,11 @@ async fn describe_table_version(
         version: body.version,
         branch: body.branch,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.describe_table_version(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -921,13 +1045,13 @@ async fn batch_delete_table_versions(
     let request = BatchDeleteTableVersionsRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         ranges: body.ranges,
         branch: body.branch,
-        ..Default::default()
     };
 
     match backend.batch_delete_table_versions(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -941,11 +1065,12 @@ async fn get_table_stats(
     let request = GetTableStatsRequest {
         id: Some(parse_id(&id, params.delimiter.as_deref())),
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         ..Default::default()
     };
 
     match backend.get_table_stats(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -961,11 +1086,11 @@ async fn list_all_tables(
         limit: params.limit,
         include_declared: params.include_declared,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.list_all_tables(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -983,9 +1108,10 @@ async fn create_table_index(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.create_table_index(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -999,9 +1125,10 @@ async fn create_table_scalar_index(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.create_table_scalar_index(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1016,9 +1143,10 @@ async fn list_table_indices(
     let mut request = body.unwrap_or_default();
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.list_table_indices(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1040,11 +1168,12 @@ async fn describe_table_index_stats(
         version: None,
         index_name: Some(params.index_name),
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         ..Default::default()
     };
 
     match backend.describe_table_index_stats(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1059,11 +1188,12 @@ async fn drop_table_index(
         id: Some(parse_id(&params.id, query.delimiter.as_deref())),
         index_name: Some(params.index_name),
         identity: extract_identity(&headers),
+        context: http_headers_to_context(&headers),
         ..Default::default()
     };
 
     match backend.drop_table_index(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1081,9 +1211,10 @@ async fn alter_table_add_columns(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.alter_table_add_columns(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1097,9 +1228,10 @@ async fn alter_table_alter_columns(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.alter_table_alter_columns(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1113,9 +1245,10 @@ async fn alter_table_backfill_columns(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.alter_table_backfill_columns(request).await {
-        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::ACCEPTED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1129,9 +1262,10 @@ async fn refresh_materialized_view(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.refresh_materialized_view(request).await {
-        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::ACCEPTED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1145,9 +1279,10 @@ async fn create_materialized_view(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.create_materialized_view(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1161,9 +1296,10 @@ async fn alter_table_drop_columns(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.alter_table_drop_columns(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1177,9 +1313,10 @@ async fn update_table_schema_metadata(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.update_table_schema_metadata(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1199,11 +1336,11 @@ async fn list_table_tags(
         page_token: params.page_token,
         limit: params.limit,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.list_table_tags(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1217,9 +1354,10 @@ async fn get_table_tag_version(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.get_table_tag_version(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1233,9 +1371,10 @@ async fn create_table_tag(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.create_table_tag(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1249,9 +1388,10 @@ async fn delete_table_tag(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.delete_table_tag(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1265,9 +1405,10 @@ async fn update_table_tag(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.update_table_tag(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1285,9 +1426,10 @@ async fn create_table_branch(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.create_table_branch(request).await {
-        Ok(response) => (StatusCode::CREATED, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::CREATED, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1303,11 +1445,11 @@ async fn list_table_branches(
         page_token: params.page_token,
         limit: params.limit,
         identity: extract_identity(&headers),
-        ..Default::default()
+        context: http_headers_to_context(&headers),
     };
 
     match backend.list_table_branches(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1321,9 +1463,10 @@ async fn delete_table_branch(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.delete_table_branch(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1341,6 +1484,7 @@ async fn explain_table_query_plan(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.explain_table_query_plan(request).await {
         Ok(plan) => (StatusCode::OK, plan).into_response(),
@@ -1357,6 +1501,7 @@ async fn analyze_table_query_plan(
 ) -> Response {
     request.id = Some(parse_id(&id, params.delimiter.as_deref()));
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.analyze_table_query_plan(request).await {
         Ok(plan) => (StatusCode::OK, plan).into_response(),
@@ -1385,9 +1530,10 @@ async fn describe_transaction(
         request.id = Some(vec![id]);
     }
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.describe_transaction(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -1407,9 +1553,10 @@ async fn alter_transaction(
         request.id = Some(vec![id]);
     }
     request.identity = extract_identity(&headers);
+    merge_headers_into_context(&mut request.context, &headers);
 
     match backend.alter_transaction(request).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => json_response_with_model_context(StatusCode::OK, response),
         Err(e) => error_to_response(e),
     }
 }
@@ -3106,11 +3253,11 @@ mod tests {
             // Create context provider that adds custom headers
             let mut context_headers = HashMap::new();
             context_headers.insert(
-                "headers.X-Custom-Auth".to_string(),
+                "header.X-Custom-Auth".to_string(),
                 "test-auth-token".to_string(),
             );
             context_headers.insert(
-                "headers.X-Request-Source".to_string(),
+                "header.X-Request-Source".to_string(),
                 "integration-test".to_string(),
             );
 

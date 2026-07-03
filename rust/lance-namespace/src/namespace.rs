@@ -13,12 +13,12 @@ use lance_namespace_reqwest_client::models::{
     AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
-    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
-    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
-    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
-    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    CountTableRowsResponse, CreateMaterializedViewRequest, CreateMaterializedViewResponse,
+    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableBranchRequest,
+    CreateTableBranchResponse, CreateTableIndexRequest, CreateTableIndexResponse,
+    CreateTableRequest, CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
+    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
+    DeclareTableRequest, DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
     DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
     DeleteTableTagResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableIndexStatsRequest,
@@ -33,11 +33,12 @@ use lance_namespace_reqwest_client::models::{
     ListTableIndicesResponse, ListTableTagsRequest, ListTableTagsResponse,
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
-    QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
-    RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
-    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
-    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
-    UpdateTableTagRequest, UpdateTableTagResponse,
+    NamespaceExistsResponse, QueryTableRequest, QueryTableResponse, RefreshMaterializedViewRequest,
+    RefreshMaterializedViewResponse, RegisterTableRequest, RegisterTableResponse,
+    RenameTableRequest, RenameTableResponse, RestoreTableRequest, RestoreTableResponse,
+    TableExistsRequest, TableExistsResponse, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 
 /// Base trait for Lance Namespace implementations.
@@ -114,7 +115,10 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     /// # Errors
     ///
     /// Returns [`crate::ErrorCode::NamespaceNotFound`] if the namespace does not exist.
-    async fn namespace_exists(&self, _request: NamespaceExistsRequest) -> Result<()> {
+    async fn namespace_exists(
+        &self,
+        _request: NamespaceExistsRequest,
+    ) -> Result<NamespaceExistsResponse> {
         Err(Error::not_supported("namespace_exists not implemented"))
     }
 
@@ -140,7 +144,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     }
 
     /// Check if a table exists.
-    async fn table_exists(&self, _request: TableExistsRequest) -> Result<()> {
+    async fn table_exists(&self, _request: TableExistsRequest) -> Result<TableExistsResponse> {
         Err(Error::not_supported("table_exists not implemented"))
     }
 
@@ -158,7 +162,10 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     }
 
     /// Count rows in a table.
-    async fn count_table_rows(&self, _request: CountTableRowsRequest) -> Result<i64> {
+    async fn count_table_rows(
+        &self,
+        _request: CountTableRowsRequest,
+    ) -> Result<CountTableRowsResponse> {
         Err(Error::not_supported("count_table_rows not implemented"))
     }
 
@@ -210,7 +217,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     }
 
     /// Query a table.
-    async fn query_table(&self, _request: QueryTableRequest) -> Result<Bytes> {
+    async fn query_table(&self, _request: QueryTableRequest) -> Result<QueryTableResponse> {
         Err(Error::not_supported("query_table not implemented"))
     }
 
