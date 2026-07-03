@@ -26,6 +26,7 @@ from .lance import (
 )
 
 if TYPE_CHECKING:
+    from .blob import DedicatedBlobWriter, PackedBlobWriter
     from .namespace import LanceNamespace
 
 
@@ -331,6 +332,24 @@ class LanceFileSession:
             None,  # pyright: ignore[reportArgumentType]
             _inner_writer=inner,
         )
+
+    def open_packed_blob_writer(self, path: str, blob_id: int) -> "PackedBlobWriter":
+        """
+        Opens a packed blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_packed_blob_writer(path, blob_id)
+
+    def open_dedicated_blob_writer(
+        self, path: str, blob_id: int
+    ) -> "DedicatedBlobWriter":
+        """
+        Opens a dedicated blob writer for the given data file path.
+
+        The path will be appended to the base path of the session.
+        """
+        return self._session.open_dedicated_blob_writer(path, blob_id)
 
     def contains(self, path: str) -> bool:
         """

@@ -9,22 +9,22 @@ from typing import IO, Any, Iterator, Optional, Union
 import pyarrow as pa
 
 from .lance import (
+    BlobDescriptor as BlobDescriptor,
+)
+from .lance import (
+    BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
+)
+from .lance import (
     DedicatedBlobWriter as DedicatedBlobWriter,
 )
 from .lance import (
     LanceBlobFile,
 )
 from .lance import (
-    LanceBlobSession as LanceBlobSession,
-)
-from .lance import (
-    LanceBlobWriter as LanceBlobWriter,
-)
-from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
 from .lance import (
-    PreparedBlobValue as PreparedBlobValue,
+    blob_path_for_file as blob_path_for_file,
 )
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"

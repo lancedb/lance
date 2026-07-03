@@ -98,8 +98,7 @@ pub use reader::LanceReader;
 pub use scanner::Scanner;
 
 use crate::blob::{
-    PyDedicatedBlobWriter, PyLanceBlobSession, PyLanceBlobWriter, PyPackedBlobWriter,
-    PyPreparedBlobValue,
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
 };
 use crate::executor::BackgroundExecutor;
 
@@ -262,9 +261,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
-    m.add_class::<PyPreparedBlobValue>()?;
-    m.add_class::<PyLanceBlobSession>()?;
-    m.add_class::<PyLanceBlobWriter>()?;
+    m.add_class::<PyBlobDescriptor>()?;
+    m.add_class::<PyBlobDescriptorArrayBuilder>()?;
     m.add_class::<PyPackedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
@@ -309,6 +307,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mem_wal::PyLsmVectorSearchPlanner>()?;
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_evaluate_sharding_spec))?;
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
+    m.add_wrapped(wrap_pyfunction!(blob::py_blob_path_for_file))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;

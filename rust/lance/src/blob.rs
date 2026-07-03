@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Convenience builders for Lance blob v2 input columns.
+//! Builders and file-level writer helpers for Lance blob v2 columns.
 //!
-//! Blob v2 expects a column shaped as `Struct<data: LargeBinary?, uri: Utf8?>` and
-//! tagged with `ARROW:extension:name = "lance.blob.v2"`. This module offers a
-//! type-safe builder to construct that struct without manually wiring metadata
+//! Logical blob input uses `Struct<data: LargeBinary?, uri: Utf8?>`. File-level blob
+//! descriptors use a physical writer-side struct with `kind`, `blob_id`, and range fields.
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -308,24 +307,6 @@ impl BlobIdAllocator {
             }
         }
     }
-
-    pub(crate) fn reserve(&self, id: u32) -> Result<()> {
-        validate_blob_id(id)?;
-        let mut used = self
-            .inner
-            .used
-            .lock()
-            .map_err(|_| Error::internal("Blob id allocator mutex was poisoned".to_string()))?;
-        if !used.insert(id) {
-            return Err(Error::invalid_input(format!(
-                "Blob id {id} is already reserved for this data file"
-            )));
-        }
-        if id != u32::MAX {
-            self.inner.next.fetch_max(id + 1, Ordering::Relaxed);
-        }
-        Ok(())
-    }
 }
 
 fn validate_blob_id(blob_id: u32) -> Result<()> {
@@ -347,96 +328,6 @@ fn validate_range(offset: u64, size: u64, object_size: u64, label: &str) -> Resu
         )));
     }
     Ok(())
-}
-
-fn data_file_parts(data_file_path: &Path) -> Result<(Path, String)> {
-    let filename = data_file_path.filename().ok_or_else(|| {
-        Error::invalid_input("LanceBlobSession data_file_path must include a file name")
-    })?;
-    let data_file_key = filename.strip_suffix(".lance").ok_or_else(|| {
-        Error::invalid_input(format!(
-            "LanceBlobSession data_file_path must point to a .lance file, got '{filename}'"
-        ))
-    })?;
-    if data_file_key.is_empty() {
-        return Err(Error::invalid_input(
-            "LanceBlobSession data_file_path has an empty data file key",
-        ));
-    }
-    let data_dir = data_file_path.parent().ok_or_else(|| {
-        Error::invalid_input("LanceBlobSession data_file_path must include a parent directory")
-    })?;
-    Ok((data_dir, data_file_key.to_string()))
-}
-
-/// A blob sidecar namespace bound to one Lance data file path.
-///
-/// This does not write the `.lance` data file or commit anything. It derives the sidecar
-/// directory from the data file path and shares one blob id allocator across all column-scoped
-/// [`LanceBlobWriter`] values opened from the session.
-#[derive(Clone, Debug)]
-pub struct LanceBlobSession {
-    object_store: ObjectStore,
-    data_dir: Path,
-    data_file_key: String,
-    blob_id_allocator: BlobIdAllocator,
-}
-
-impl LanceBlobSession {
-    /// Create a blob session for a `.lance` data file path in the given object store.
-    pub fn try_new(object_store: ObjectStore, data_file_path: Path) -> Result<Self> {
-        let (data_dir, data_file_key) = data_file_parts(&data_file_path)?;
-        Ok(Self {
-            object_store,
-            data_dir,
-            data_file_key,
-            blob_id_allocator: BlobIdAllocator::new(1),
-        })
-    }
-
-    /// Open a prepared blob writer for one column in this data file.
-    pub fn open_writer(&self, column: impl Into<String>) -> LanceBlobWriter {
-        LanceBlobWriter::new(
-            column,
-            self.object_store.clone(),
-            self.data_dir.clone(),
-            self.data_file_key.clone(),
-            self.blob_id_allocator.clone(),
-        )
-    }
-
-    pub(crate) fn open_writer_with_metadata(
-        &self,
-        column: impl Into<String>,
-        nullable: bool,
-        metadata: HashMap<String, String>,
-    ) -> LanceBlobWriter {
-        LanceBlobWriter::new_with_metadata(
-            column,
-            nullable,
-            metadata,
-            self.object_store.clone(),
-            self.data_dir.clone(),
-            self.data_file_key.clone(),
-            self.blob_id_allocator.clone(),
-        )
-    }
-
-    /// Return the sidecar path for a blob id in this data file namespace.
-    pub fn blob_path(&self, blob_id: u32) -> Result<Path> {
-        validate_blob_id(blob_id)?;
-        Ok(blob_path(&self.data_dir, &self.data_file_key, blob_id))
-    }
-
-    /// Return the data directory that owns this session's data file.
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
-    /// Return the data file key derived from the data file path.
-    pub fn data_file_key(&self) -> &str {
-        &self.data_file_key
-    }
 }
 
 fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result<()> {
@@ -550,6 +441,29 @@ pub(crate) fn validate_prepared_blob_array(field: &Field, array: &ArrayRef) -> R
     validate_prepared_blob_value_array(field, array)
 }
 
+/// Return the sidecar blob path for a data file and blob id.
+///
+/// File-level blob descriptors store `blob_id`, not an arbitrary object path. Readers derive the
+/// sidecar object path from the data file path and this id.
+pub fn blob_path_for_file(data_file_path: &Path, blob_id: u32) -> Result<Path> {
+    validate_blob_id(blob_id)?;
+    let mut parts = data_file_path
+        .parts()
+        .map(|part| part.as_ref().to_string())
+        .collect::<Vec<_>>();
+    let file_name = parts.pop().ok_or_else(|| {
+        Error::invalid_input("Data file path must include a file name".to_string())
+    })?;
+    let data_file_key = file_name.strip_suffix(".lance").ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Data file path '{}' must end with '.lance'",
+            data_file_path
+        ))
+    })?;
+    let data_dir = Path::from_iter(parts);
+    Ok(blob_path(&data_dir, data_file_key, blob_id))
+}
+
 /// Byte range inside a packed or external blob object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlobRange {
@@ -559,9 +473,9 @@ pub struct BlobRange {
     pub size: u64,
 }
 
-/// A single writer-side blob value.
+/// A physical blob descriptor row.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PreparedBlobValue {
+pub enum BlobDescriptor {
     /// A null blob row.
     Null,
     /// Payload bytes embedded into the data file by the blob encoder.
@@ -583,19 +497,19 @@ pub enum PreparedBlobValue {
     },
 }
 
-/// A prepared blob column ready to be included in a [`RecordBatch`](arrow_array::RecordBatch).
-pub struct PreparedBlobColumn {
+/// A physical blob descriptor column ready to be included in a [`RecordBatch`](arrow_array::RecordBatch).
+pub struct BlobDescriptorColumn {
     field: Field,
     array: ArrayRef,
 }
 
-impl PreparedBlobColumn {
-    /// Return the Arrow field for the prepared column.
+impl BlobDescriptorColumn {
+    /// Return the Arrow field for the descriptor column.
     pub fn field(&self) -> &Field {
         &self.field
     }
 
-    /// Return the Arrow array for the prepared column.
+    /// Return the Arrow array for the descriptor column.
     pub fn array(&self) -> &ArrayRef {
         &self.array
     }
@@ -606,128 +520,69 @@ impl PreparedBlobColumn {
     }
 }
 
-/// Builds prepared blob values for one blob v2 column.
+/// Builds physical blob descriptors for one blob v2 column.
 ///
-/// A `LanceBlobWriter` is scoped to one column and one data file. It does not commit rows by
-/// itself; callers include the [`PreparedBlobColumn`] returned by [`Self::finish`] in the
-/// `RecordBatch` written to the matching data file.
-pub struct LanceBlobWriter {
+/// This builder only produces the writer-side descriptor struct array. It does not allocate blob ids,
+/// choose sidecar paths, write blob objects, or commit data files.
+pub struct BlobDescriptorArrayBuilder {
     field: Field,
-    object_store: ObjectStore,
-    data_dir: Path,
-    data_file_key: String,
-    blob_id_allocator: BlobIdAllocator,
-    values: Vec<PreparedBlobValue>,
+    values: Vec<BlobDescriptor>,
 }
 
-impl LanceBlobWriter {
-    pub(crate) fn new(
-        column: impl Into<String>,
-        object_store: ObjectStore,
-        data_dir: Path,
-        data_file_key: String,
-        blob_id_allocator: BlobIdAllocator,
-    ) -> Self {
+impl BlobDescriptorArrayBuilder {
+    /// Create a descriptor array builder for one blob column.
+    pub fn new(column: impl Into<String>) -> Self {
         let mut metadata = HashMap::with_capacity(1);
         metadata.insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
-        Self::new_with_metadata(
-            column,
-            true,
-            metadata,
-            object_store,
-            data_dir,
-            data_file_key,
-            blob_id_allocator,
-        )
+        Self::new_with_metadata(column, true, metadata)
     }
 
     pub(crate) fn new_with_metadata(
         column: impl Into<String>,
         nullable: bool,
         metadata: HashMap<String, String>,
-        object_store: ObjectStore,
-        data_dir: Path,
-        data_file_key: String,
-        blob_id_allocator: BlobIdAllocator,
     ) -> Self {
         Self {
             field: prepared_blob_field_with_metadata(&column.into(), nullable, metadata),
-            object_store,
-            data_dir,
-            data_file_key,
-            blob_id_allocator,
             values: Vec::new(),
         }
     }
 
-    fn reserve_blob_id(&self) -> Result<u32> {
-        self.blob_id_allocator.next()
-    }
-
-    /// Open a new packed sidecar writer owned by this data file.
-    pub async fn new_packed(&self) -> Result<PackedBlobWriter> {
-        let blob_id = self.reserve_blob_id()?;
-        PackedBlobWriter::create(
-            self.object_store.clone(),
-            blob_path(&self.data_dir, &self.data_file_key, blob_id),
+    /// Append one packed blob descriptor.
+    pub fn push_packed(&mut self, blob_id: u32, range: BlobRange) -> Result<()> {
+        self.push(BlobDescriptor::Packed {
             blob_id,
-        )
-        .await
+            offset: range.offset,
+            size: range.size,
+        })
     }
 
-    /// Open a new dedicated sidecar writer owned by this data file.
-    pub async fn new_dedicated(&self) -> Result<DedicatedBlobWriter> {
-        let blob_id = self.reserve_blob_id()?;
-        DedicatedBlobWriter::create(
-            self.object_store.clone(),
-            blob_path(&self.data_dir, &self.data_file_key, blob_id),
-            blob_id,
-        )
-        .await
-    }
-
-    /// Register ranges from an existing packed sidecar blob.
-    pub async fn load_packed(
-        &self,
+    /// Append multiple packed blob descriptors for the same blob object.
+    pub fn extend_packed(
+        &mut self,
         blob_id: u32,
         ranges: impl IntoIterator<Item = BlobRange>,
-    ) -> Result<Vec<PreparedBlobValue>> {
-        validate_blob_id(blob_id)?;
-        let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
-        let object_size = self.object_store.size(&path).await?;
-        let values = ranges
-            .into_iter()
-            .map(|range| {
-                validate_range(range.offset, range.size, object_size, "Packed blob")?;
-                Ok(PreparedBlobValue::Packed {
-                    blob_id,
-                    offset: range.offset,
-                    size: range.size,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.blob_id_allocator.reserve(blob_id)?;
-        Ok(values)
+    ) -> Result<()> {
+        for range in ranges {
+            self.push_packed(blob_id, range)?;
+        }
+        Ok(())
     }
 
-    /// Register an existing dedicated sidecar blob.
-    pub async fn load_dedicated(&self, blob_id: u32) -> Result<PreparedBlobValue> {
-        validate_blob_id(blob_id)?;
-        let path = blob_path(&self.data_dir, &self.data_file_key, blob_id);
-        let size = self.object_store.size(&path).await?;
-        self.blob_id_allocator.reserve(blob_id)?;
-        Ok(PreparedBlobValue::Dedicated { blob_id, size })
+    /// Append one dedicated blob descriptor.
+    pub fn push_dedicated(&mut self, blob_id: u32, size: u64) -> Result<()> {
+        self.push(BlobDescriptor::Dedicated { blob_id, size })
     }
 
-    /// Append one prepared value to this column.
-    pub fn push(&mut self, value: PreparedBlobValue) -> Result<()> {
-        validate_prepared_value(&value)?;
+    /// Append one blob descriptor to this column.
+    pub fn push(&mut self, value: BlobDescriptor) -> Result<()> {
+        validate_blob_descriptor(&value)?;
         self.values.push(value);
         Ok(())
     }
 
-    /// Append multiple prepared values to this column.
-    pub fn extend(&mut self, values: impl IntoIterator<Item = PreparedBlobValue>) -> Result<()> {
+    /// Append multiple blob descriptors to this column.
+    pub fn extend(&mut self, values: impl IntoIterator<Item = BlobDescriptor>) -> Result<()> {
         for value in values {
             self.push(value)?;
         }
@@ -736,7 +591,7 @@ impl LanceBlobWriter {
 
     /// Append an inline blob value.
     pub fn push_inline(&mut self, data: impl Into<Bytes>) -> Result<()> {
-        self.push(PreparedBlobValue::Inline { data: data.into() })
+        self.push(BlobDescriptor::Inline { data: data.into() })
     }
 
     /// Append an external blob reference.
@@ -746,7 +601,7 @@ impl LanceBlobWriter {
         range: Option<BlobRange>,
     ) -> Result<()> {
         let range = range.unwrap_or(BlobRange { offset: 0, size: 0 });
-        self.push(PreparedBlobValue::External {
+        self.push(BlobDescriptor::External {
             base_id: 0,
             uri: uri.into(),
             offset: range.offset,
@@ -756,16 +611,16 @@ impl LanceBlobWriter {
 
     /// Append a null blob row.
     pub fn push_null(&mut self) -> Result<()> {
-        self.push(PreparedBlobValue::Null)
+        self.push(BlobDescriptor::Null)
     }
 
-    /// Return the prepared Arrow field for this blob column.
+    /// Return the descriptor Arrow field for this blob column.
     pub fn field(&self) -> &Field {
         &self.field
     }
 
-    /// Finish this column and return the writer-side Arrow struct array.
-    pub fn finish(self) -> Result<PreparedBlobColumn> {
+    /// Finish this column and return the writer-side descriptor struct array.
+    pub fn finish(self) -> Result<BlobDescriptorColumn> {
         let mut kind_builder = PrimitiveBuilder::<UInt8Type>::with_capacity(self.values.len());
         let mut data_builder = LargeBinaryBuilder::with_capacity(self.values.len(), 0);
         let mut uri_builder = StringBuilder::with_capacity(self.values.len(), 0);
@@ -777,7 +632,7 @@ impl LanceBlobWriter {
 
         for value in self.values {
             match value {
-                PreparedBlobValue::Null => {
+                BlobDescriptor::Null => {
                     validity.append_null();
                     kind_builder.append_null();
                     data_builder.append_null();
@@ -786,7 +641,7 @@ impl LanceBlobWriter {
                     blob_size_builder.append_null();
                     position_builder.append_null();
                 }
-                PreparedBlobValue::Inline { data } => {
+                BlobDescriptor::Inline { data } => {
                     validity.append_non_null();
                     kind_builder.append_value(BlobKind::Inline as u8);
                     data_builder.append_value(data.as_ref());
@@ -795,7 +650,7 @@ impl LanceBlobWriter {
                     blob_size_builder.append_null();
                     position_builder.append_null();
                 }
-                PreparedBlobValue::Packed {
+                BlobDescriptor::Packed {
                     blob_id,
                     offset,
                     size,
@@ -808,7 +663,7 @@ impl LanceBlobWriter {
                     blob_size_builder.append_value(size);
                     position_builder.append_value(offset);
                 }
-                PreparedBlobValue::Dedicated { blob_id, size } => {
+                BlobDescriptor::Dedicated { blob_id, size } => {
                     validity.append_non_null();
                     kind_builder.append_value(BlobKind::Dedicated as u8);
                     data_builder.append_null();
@@ -817,7 +672,7 @@ impl LanceBlobWriter {
                     blob_size_builder.append_value(size);
                     position_builder.append_null();
                 }
-                PreparedBlobValue::External {
+                BlobDescriptor::External {
                     base_id,
                     uri,
                     offset,
@@ -848,18 +703,18 @@ impl LanceBlobWriter {
         )?) as ArrayRef;
         validate_prepared_blob_array(&self.field, &array)?;
 
-        Ok(PreparedBlobColumn {
+        Ok(BlobDescriptorColumn {
             field: self.field,
             array,
         })
     }
 }
 
-fn validate_prepared_value(value: &PreparedBlobValue) -> Result<()> {
+fn validate_blob_descriptor(value: &BlobDescriptor) -> Result<()> {
     match value {
-        PreparedBlobValue::Null => Ok(()),
-        PreparedBlobValue::Inline { .. } => Ok(()),
-        PreparedBlobValue::Packed {
+        BlobDescriptor::Null => Ok(()),
+        BlobDescriptor::Inline { .. } => Ok(()),
+        BlobDescriptor::Packed {
             blob_id,
             offset,
             size,
@@ -872,8 +727,8 @@ fn validate_prepared_value(value: &PreparedBlobValue) -> Result<()> {
             })?;
             Ok(())
         }
-        PreparedBlobValue::Dedicated { blob_id, .. } => validate_blob_id(*blob_id),
-        PreparedBlobValue::External {
+        BlobDescriptor::Dedicated { blob_id, .. } => validate_blob_id(*blob_id),
+        BlobDescriptor::External {
             uri, offset, size, ..
         } => {
             if uri.is_empty() {
@@ -889,18 +744,24 @@ fn validate_prepared_value(value: &PreparedBlobValue) -> Result<()> {
     }
 }
 
-/// Writes a Lance-owned packed sidecar blob and returns prepared row descriptors.
+/// Writes a Lance-owned packed sidecar blob for one data file and returns descriptors.
 pub struct PackedBlobWriter {
     object_store: ObjectStore,
     path: Path,
     blob_id: u32,
     writer: Box<dyn Writer>,
     offset: u64,
-    values: Vec<PreparedBlobValue>,
+    values: Vec<BlobDescriptor>,
 }
 
 impl PackedBlobWriter {
-    async fn create(object_store: ObjectStore, path: Path, blob_id: u32) -> Result<Self> {
+    /// Create a packed blob writer for `data_file_path` and `blob_id`.
+    pub async fn try_new(
+        object_store: ObjectStore,
+        data_file_path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
+        let path = blob_path_for_file(&data_file_path, blob_id)?;
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -912,12 +773,12 @@ impl PackedBlobWriter {
         })
     }
 
-    /// Return the blob id reserved for this packed sidecar.
+    /// Return the blob id for this packed sidecar.
     pub fn blob_id(&self) -> u32 {
         self.blob_id
     }
 
-    /// Return the sidecar path for this packed blob.
+    /// Return the derived sidecar path for this packed blob.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -929,7 +790,7 @@ impl PackedBlobWriter {
         Ok(())
     }
 
-    pub(crate) async fn write_blob_bytes(&mut self, bytes: &[u8]) -> Result<PreparedBlobValue> {
+    pub(crate) async fn write_blob_bytes(&mut self, bytes: &[u8]) -> Result<BlobDescriptor> {
         let size = bytes.len() as u64;
         let offset = self.offset;
         self.writer.write_all(bytes).await?;
@@ -940,20 +801,20 @@ impl PackedBlobWriter {
         &mut self,
         reader: &dyn Reader,
         range: Range<usize>,
-    ) -> Result<PreparedBlobValue> {
+    ) -> Result<BlobDescriptor> {
         let size = range.len() as u64;
         let offset = self.offset;
         self.writer.copy_range_from_reader(reader, range).await?;
         self.record_written_blob(offset, size)
     }
 
-    fn record_written_blob(&mut self, offset: u64, size: u64) -> Result<PreparedBlobValue> {
+    fn record_written_blob(&mut self, offset: u64, size: u64) -> Result<BlobDescriptor> {
         self.offset = self.offset.checked_add(size).ok_or_else(|| {
             Error::invalid_input(format!(
                 "Packed blob writer offset overflowed: offset={offset}, size={size}"
             ))
         })?;
-        let value = PreparedBlobValue::Packed {
+        let value = BlobDescriptor::Packed {
             blob_id: self.blob_id,
             offset,
             size,
@@ -963,7 +824,7 @@ impl PackedBlobWriter {
     }
 
     /// Finish the packed sidecar and return descriptors in write order.
-    pub async fn finish(mut self) -> Result<Vec<PreparedBlobValue>> {
+    pub async fn finish(mut self) -> Result<Vec<BlobDescriptor>> {
         Writer::shutdown(self.writer.as_mut()).await?;
         let object_size = self.object_store.size(&self.path).await?;
         validate_range(0, self.offset, object_size, "Packed blob")?;
@@ -971,7 +832,7 @@ impl PackedBlobWriter {
     }
 }
 
-/// Writes a Lance-owned dedicated sidecar blob and returns its prepared descriptor.
+/// Writes a Lance-owned dedicated sidecar blob for one data file and returns its descriptor.
 pub struct DedicatedBlobWriter {
     object_store: ObjectStore,
     path: Path,
@@ -981,7 +842,13 @@ pub struct DedicatedBlobWriter {
 }
 
 impl DedicatedBlobWriter {
-    async fn create(object_store: ObjectStore, path: Path, blob_id: u32) -> Result<Self> {
+    /// Create a dedicated blob writer for `data_file_path` and `blob_id`.
+    pub async fn try_new(
+        object_store: ObjectStore,
+        data_file_path: Path,
+        blob_id: u32,
+    ) -> Result<Self> {
+        let path = blob_path_for_file(&data_file_path, blob_id)?;
         let writer = object_store.create(&path).await?;
         Ok(Self {
             object_store,
@@ -992,12 +859,12 @@ impl DedicatedBlobWriter {
         })
     }
 
-    /// Return the blob id reserved for this dedicated sidecar.
+    /// Return the blob id for this dedicated sidecar.
     pub fn blob_id(&self) -> u32 {
         self.blob_id
     }
 
-    /// Return the sidecar path for this dedicated blob.
+    /// Return the derived sidecar path for this dedicated blob.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1031,7 +898,7 @@ impl DedicatedBlobWriter {
     }
 
     /// Finish the dedicated sidecar and return its descriptor.
-    pub async fn finish(mut self) -> Result<PreparedBlobValue> {
+    pub async fn finish(mut self) -> Result<BlobDescriptor> {
         Writer::shutdown(self.writer.as_mut()).await?;
         let object_size = self.object_store.size(&self.path).await?;
         if object_size != self.size {
@@ -1040,7 +907,7 @@ impl DedicatedBlobWriter {
                 self.path, object_size, self.size
             )));
         }
-        Ok(PreparedBlobValue::Dedicated {
+        Ok(BlobDescriptor::Dedicated {
             blob_id: self.blob_id,
             size: self.size,
         })
@@ -1234,30 +1101,23 @@ mod tests {
     }
 
     #[test]
-    fn test_prepared_blob_column_finish() {
-        let temp_dir = TempDir::default();
-        let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
-        let mut writer = LanceBlobWriter::new(
-            "blob",
-            ObjectStore::local(),
-            data_dir,
-            "data-file".to_string(),
-            BlobIdAllocator::new(1),
+    fn test_blob_path_for_file() {
+        let data_file_path = Path::from("data/deadbeef.lance");
+        let path = blob_path_for_file(&data_file_path, 2).unwrap();
+        assert_eq!(
+            path.to_string(),
+            "data/deadbeef/01000000000000000000000000000000.blob"
         );
+    }
+
+    #[test]
+    fn test_prepared_blob_column_finish() {
+        let mut writer = BlobDescriptorArrayBuilder::new("blob");
         writer.push_inline(Bytes::from_static(b"hello")).unwrap();
         writer
-            .push(PreparedBlobValue::Packed {
-                blob_id: 7,
-                offset: 3,
-                size: 5,
-            })
+            .push_packed(7, BlobRange { offset: 3, size: 5 })
             .unwrap();
-        writer
-            .push(PreparedBlobValue::Dedicated {
-                blob_id: 8,
-                size: 9,
-            })
-            .unwrap();
+        writer.push_dedicated(8, 9).unwrap();
         writer.push_null().unwrap();
 
         let column = writer.finish().unwrap();
@@ -1364,29 +1224,28 @@ mod tests {
         let temp_dir = TempDir::default();
         let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
         let data_file_key = "data-file".to_string();
+        let data_file_path = data_dir.clone().join(format!("{data_file_key}.lance"));
         let object_store = ObjectStore::local();
-        let writer = LanceBlobWriter::new(
-            "blob",
-            object_store.clone(),
-            data_dir.clone(),
-            data_file_key.clone(),
-            BlobIdAllocator::new(1),
-        );
 
-        let mut packed = writer.new_packed().await.unwrap();
-        let packed_id = packed.blob_id();
+        let packed_id = 7;
+        let packed_path = blob_path(&data_dir, &data_file_key, packed_id);
+        let mut packed =
+            PackedBlobWriter::try_new(object_store.clone(), data_file_path.clone(), packed_id)
+                .await
+                .unwrap();
+        assert_eq!(packed.path(), &packed_path);
         packed.write_blob(b"abc").await.unwrap();
         packed.write_blob(b"de").await.unwrap();
         let packed_values = packed.finish().await.unwrap();
         assert_eq!(
             packed_values,
             vec![
-                PreparedBlobValue::Packed {
+                BlobDescriptor::Packed {
                     blob_id: packed_id,
                     offset: 0,
                     size: 3,
                 },
-                PreparedBlobValue::Packed {
+                BlobDescriptor::Packed {
                     blob_id: packed_id,
                     offset: 3,
                     size: 2,
@@ -1394,80 +1253,34 @@ mod tests {
             ]
         );
 
-        let mut dedicated = writer.new_dedicated().await.unwrap();
-        let dedicated_id = dedicated.blob_id();
+        let dedicated_id = 8;
+        let dedicated_path = blob_path(&data_dir, &data_file_key, dedicated_id);
+        let mut dedicated =
+            DedicatedBlobWriter::try_new(object_store.clone(), data_file_path, dedicated_id)
+                .await
+                .unwrap();
+        assert_eq!(dedicated.path(), &dedicated_path);
         dedicated.write(b"abcdef").await.unwrap();
         assert_eq!(
             dedicated.finish().await.unwrap(),
-            PreparedBlobValue::Dedicated {
+            BlobDescriptor::Dedicated {
                 blob_id: dedicated_id,
                 size: 6,
             }
         );
 
-        let existing_packed_id = 42;
-        let existing_packed_path = blob_path(&data_dir, &data_file_key, existing_packed_id);
-        let mut existing_packed_writer = object_store.create(&existing_packed_path).await.unwrap();
-        existing_packed_writer.write_all(b"abcde").await.unwrap();
-        Writer::shutdown(existing_packed_writer.as_mut())
-            .await
-            .unwrap();
-        let loaded = writer
-            .load_packed(
-                existing_packed_id,
+        let mut builder = BlobDescriptorArrayBuilder::new("blob");
+        builder
+            .extend_packed(
+                42,
                 vec![
                     BlobRange { offset: 1, size: 2 },
                     BlobRange { offset: 4, size: 1 },
                 ],
             )
-            .await
             .unwrap();
-        assert_eq!(
-            loaded,
-            vec![
-                PreparedBlobValue::Packed {
-                    blob_id: existing_packed_id,
-                    offset: 1,
-                    size: 2,
-                },
-                PreparedBlobValue::Packed {
-                    blob_id: existing_packed_id,
-                    offset: 4,
-                    size: 1,
-                },
-            ]
-        );
-        assert!(
-            writer
-                .load_packed(
-                    existing_packed_id + 1,
-                    vec![BlobRange { offset: 4, size: 2 }]
-                )
-                .await
-                .is_err()
-        );
-        assert!(
-            writer
-                .load_packed(existing_packed_id, vec![BlobRange { offset: 0, size: 1 }])
-                .await
-                .is_err()
-        );
-
-        let existing_dedicated_id = 43;
-        let existing_dedicated_path = blob_path(&data_dir, &data_file_key, existing_dedicated_id);
-        let mut existing_dedicated_writer =
-            object_store.create(&existing_dedicated_path).await.unwrap();
-        existing_dedicated_writer.write_all(b"xyz").await.unwrap();
-        Writer::shutdown(existing_dedicated_writer.as_mut())
-            .await
-            .unwrap();
-        assert_eq!(
-            writer.load_dedicated(existing_dedicated_id).await.unwrap(),
-            PreparedBlobValue::Dedicated {
-                blob_id: existing_dedicated_id,
-                size: 3,
-            }
-        );
-        assert!(writer.load_dedicated(dedicated_id).await.is_err());
+        builder.push_dedicated(43, 3).unwrap();
+        let column = builder.finish().unwrap();
+        assert_eq!(column.array().len(), 3);
     }
 }

@@ -8,13 +8,14 @@ import sys
 import tarfile
 import textwrap
 import uuid
+from pathlib import Path
 
 import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
-from lance.file import LanceFileWriter
+from lance.file import LanceFileSession
 from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
@@ -45,6 +46,11 @@ def _external_blob_table(blob_path, payload=b"hello"):
     blob_path.parent.mkdir(parents=True, exist_ok=True)
     blob_path.write_bytes(payload)
     return pa.table({"blob": lance.blob_array([blob_path.as_uri()])})
+
+
+def _blob_sidecar_path(data_dir, data_file_key, blob_id):
+    sidecar_name = f"{int(f'{blob_id:032b}'[::-1], 2):032b}.blob"
+    return data_dir / data_file_key / sidecar_name
 
 
 def _add_columns_blob_v2_values(tmp_path):
@@ -945,8 +951,10 @@ def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
     assert ds.take_blobs("blob", indices=range(4)) == []
 
 
-def test_blob_session_writes_prepared_packed_blob_for_data_replacement(tmp_path):
-    dataset_uri = tmp_path / "test_blob_session_data_replacement"
+def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement(
+    tmp_path,
+):
+    dataset_uri = tmp_path / "test_blob_descriptor_array_builder_data_replacement"
     logical_schema = pa.schema(
         [
             pa.field("id", pa.uint32(), nullable=False),
@@ -963,13 +971,16 @@ def test_blob_session_writes_prepared_packed_blob_for_data_replacement(tmp_path)
     ds = lance.write_dataset(initial, dataset_uri, data_storage_version="2.2")
 
     file_id = str(uuid.uuid4())
-    data_file_path = dataset_uri / "data" / f"{file_id}.lance"
     data_file_name = f"{file_id}.lance"
+    blob_id = 1
+    blob_path = _blob_sidecar_path(dataset_uri / "data", file_id, blob_id)
+    relative_blob_path = _blob_sidecar_path(Path("."), file_id, blob_id)
+    assert lance.blob_path_for_file(data_file_name, blob_id) == str(relative_blob_path)
 
-    blob_session = lance.LanceBlobSession(str(data_file_path))
-    blob_writer = blob_session.open_writer("blob")
-    packed = blob_writer.new_packed()
-    assert packed.path == blob_session.blob_path(packed.blob_id)
+    files = LanceFileSession(dataset_uri / "data")
+    blob_writer = lance.BlobDescriptorArrayBuilder("blob")
+    packed = files.open_packed_blob_writer(data_file_name, blob_id)
+    assert packed.path.endswith(str(blob_path.relative_to(dataset_uri)))
     packed.write_blob(b"replacement")
     blob_writer.extend(packed.finish())
 
@@ -987,8 +998,8 @@ def test_blob_session_writes_prepared_packed_blob_for_data_replacement(tmp_path)
         schema=physical_schema,
     )
 
-    with LanceFileWriter(
-        str(data_file_path), schema=physical_schema, version="2.2"
+    with files.open_writer(
+        data_file_name, schema=physical_schema, version="2.2"
     ) as file_writer:
         file_writer.write_batch(replacement)
 

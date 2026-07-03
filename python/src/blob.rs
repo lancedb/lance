@@ -1,118 +1,71 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::file::object_store_from_uri_or_path_with_provider;
-use crate::namespace::extract_namespace_arc;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::ToPyArrow;
 use bytes::Bytes;
 use lance::{
-    BlobRange, DedicatedBlobWriter, LanceBlobSession, LanceBlobWriter, PackedBlobWriter,
-    PreparedBlobValue,
+    BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
 };
-use lance_io::object_store::LanceNamespaceStorageOptionsProvider;
 use pyo3::{
     Bound, PyResult,
     exceptions::PyValueError,
-    pyclass, pymethods,
+    pyclass, pyfunction, pymethods,
     types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule},
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
-#[pyclass(name = "PreparedBlobValue", skip_from_py_object)]
+#[pyclass(name = "BlobDescriptor", skip_from_py_object)]
 #[derive(Clone)]
-pub struct PyPreparedBlobValue {
-    inner: PreparedBlobValue,
+pub struct PyBlobDescriptor {
+    inner: BlobDescriptor,
 }
 
-impl From<PreparedBlobValue> for PyPreparedBlobValue {
-    fn from(inner: PreparedBlobValue) -> Self {
+impl From<BlobDescriptor> for PyBlobDescriptor {
+    fn from(inner: BlobDescriptor) -> Self {
         Self { inner }
     }
 }
 
 #[pymethods]
-impl PyPreparedBlobValue {
+impl PyBlobDescriptor {
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }
 }
 
-#[pyclass(name = "LanceBlobSession", skip_from_py_object)]
-pub struct PyLanceBlobSession {
-    inner: LanceBlobSession,
+#[pyfunction(name = "blob_path_for_file")]
+pub fn py_blob_path_for_file(data_file_path: String, blob_id: u32) -> PyResult<String> {
+    lance::blob_path_for_file(&object_store::path::Path::from(data_file_path), blob_id)
+        .map(|path| path.to_string())
+        .infer_error()
+}
+
+#[pyclass(name = "BlobDescriptorArrayBuilder", skip_from_py_object)]
+pub struct PyBlobDescriptorArrayBuilder {
+    field: arrow_schema::Field,
+    inner: Option<BlobDescriptorArrayBuilder>,
+}
+
+impl PyBlobDescriptorArrayBuilder {
+    fn inner_mut(&mut self) -> PyResult<&mut BlobDescriptorArrayBuilder> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("BlobDescriptorArrayBuilder is already finished"))
+    }
 }
 
 #[pymethods]
-impl PyLanceBlobSession {
+impl PyBlobDescriptorArrayBuilder {
     #[new]
-    #[pyo3(signature = (data_file_path, storage_options=None, namespace_client=None, table_id=None))]
-    pub fn new(
-        data_file_path: String,
-        storage_options: Option<HashMap<String, String>>,
-        namespace_client: Option<&Bound<'_, PyAny>>,
-        table_id: Option<Vec<String>>,
-    ) -> PyResult<Self> {
-        let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
-            let ns_client = extract_namespace_arc(ns_client.py(), ns_client)?;
-            Some(Arc::new(LanceNamespaceStorageOptionsProvider::new(
-                ns_client,
-                tid.clone(),
-            ))
-                as Arc<dyn lance_io::object_store::StorageOptionsProvider>)
-        } else {
-            None
-        };
-
-        let (object_store, path) = rt().block_on(
-            None,
-            object_store_from_uri_or_path_with_provider(data_file_path, storage_options, provider),
-        )??;
-        let inner = LanceBlobSession::try_new(object_store.as_ref().clone(), path).infer_error()?;
-        Ok(Self { inner })
-    }
-
-    pub fn open_writer(&self, column: String) -> PyLanceBlobWriter {
-        let inner = self.inner.open_writer(column);
-        PyLanceBlobWriter {
+    pub fn new(column: String) -> Self {
+        let inner = BlobDescriptorArrayBuilder::new(column);
+        Self {
             field: inner.field().clone(),
             inner: Some(inner),
         }
     }
 
-    pub fn blob_path(&self, blob_id: u32) -> PyResult<String> {
-        Ok(self.inner.blob_path(blob_id).infer_error()?.to_string())
-    }
-
-    #[getter]
-    pub fn data_file_key(&self) -> String {
-        self.inner.data_file_key().to_string()
-    }
-}
-
-#[pyclass(name = "LanceBlobWriter", skip_from_py_object)]
-pub struct PyLanceBlobWriter {
-    field: arrow_schema::Field,
-    inner: Option<LanceBlobWriter>,
-}
-
-impl PyLanceBlobWriter {
-    fn inner(&self) -> PyResult<&LanceBlobWriter> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("LanceBlobWriter is already finished"))
-    }
-
-    fn inner_mut(&mut self) -> PyResult<&mut LanceBlobWriter> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("LanceBlobWriter is already finished"))
-    }
-}
-
-#[pymethods]
-impl PyLanceBlobWriter {
     #[getter]
     pub fn field<'py>(&self, py: pyo3::Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pyarrow = PyModule::import(py, "pyarrow")?;
@@ -142,30 +95,12 @@ impl PyLanceBlobWriter {
         )
     }
 
-    pub fn new_packed(&self) -> PyResult<PyPackedBlobWriter> {
-        let packed = rt()
-            .block_on(None, self.inner()?.new_packed())?
-            .infer_error()?;
-        Ok(PyPackedBlobWriter {
-            inner: Some(packed),
-        })
-    }
-
-    pub fn new_dedicated(&self) -> PyResult<PyDedicatedBlobWriter> {
-        let dedicated = rt()
-            .block_on(None, self.inner()?.new_dedicated())?
-            .infer_error()?;
-        Ok(PyDedicatedBlobWriter {
-            inner: Some(dedicated),
-        })
-    }
-
-    pub fn load_packed(
-        &self,
+    pub fn extend_packed(
+        &mut self,
         blob_id: u32,
         offsets: Vec<u64>,
         sizes: Vec<u64>,
-    ) -> PyResult<Vec<PyPreparedBlobValue>> {
+    ) -> PyResult<()> {
         if offsets.len() != sizes.len() {
             return Err(PyValueError::new_err(format!(
                 "offsets and sizes must have the same length, got {} and {}",
@@ -178,48 +113,45 @@ impl PyLanceBlobWriter {
             .zip(sizes)
             .map(|(offset, size)| BlobRange { offset, size })
             .collect::<Vec<_>>();
-        let values = rt()
-            .block_on(None, self.inner()?.load_packed(blob_id, ranges))?
-            .infer_error()?;
-        Ok(values.into_iter().map(Into::into).collect())
+        self.inner_mut()?
+            .extend_packed(blob_id, ranges)
+            .infer_error()
     }
 
-    pub fn load_dedicated(&self, blob_id: u32) -> PyResult<PyPreparedBlobValue> {
-        let value = rt()
-            .block_on(None, self.inner()?.load_dedicated(blob_id))?
-            .infer_error()?;
-        Ok(value.into())
+    pub fn append_dedicated(&mut self, blob_id: u32, size: u64) -> PyResult<()> {
+        self.inner_mut()?
+            .push_dedicated(blob_id, size)
+            .infer_error()
     }
 
-    pub fn push(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let value = value.extract::<pyo3::PyRef<'_, PyPreparedBlobValue>>()?;
+    pub fn append(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let value = value.extract::<pyo3::PyRef<'_, PyBlobDescriptor>>()?;
         self.inner_mut()?.push(value.inner.clone()).infer_error()
     }
 
     pub fn extend(&mut self, values: &Bound<'_, PyAny>) -> PyResult<()> {
         let iter = values.try_iter()?;
         for value in iter {
-            let value = value?.extract::<pyo3::PyRef<'_, PyPreparedBlobValue>>()?;
+            let value = value?.extract::<pyo3::PyRef<'_, PyBlobDescriptor>>()?;
             self.inner_mut()?.push(value.inner.clone()).infer_error()?;
         }
         Ok(())
     }
 
-    pub fn push_inline(&mut self, data: Vec<u8>) -> PyResult<()> {
+    pub fn append_inline(&mut self, data: Vec<u8>) -> PyResult<()> {
         self.inner_mut()?
             .push_inline(Bytes::from(data))
             .infer_error()
     }
 
-    pub fn push_null(&mut self) -> PyResult<()> {
+    pub fn append_null(&mut self) -> PyResult<()> {
         self.inner_mut()?.push_null().infer_error()
     }
 
     pub fn finish<'py>(&mut self, py: pyo3::Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("LanceBlobWriter is already finished"))?;
+        let inner = self.inner.take().ok_or_else(|| {
+            PyValueError::new_err("BlobDescriptorArrayBuilder is already finished")
+        })?;
         let column = inner.finish().infer_error()?;
         column.array().to_data().to_pyarrow(py)
     }
@@ -231,6 +163,18 @@ pub struct PyPackedBlobWriter {
 }
 
 impl PyPackedBlobWriter {
+    pub(crate) async fn try_new(
+        object_store: Arc<lance_io::object_store::ObjectStore>,
+        data_file_path: object_store::path::Path,
+        blob_id: u32,
+    ) -> PyResult<Self> {
+        let inner =
+            PackedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
+                .await
+                .infer_error()?;
+        Ok(Self { inner: Some(inner) })
+    }
+
     fn inner(&self) -> PyResult<&PackedBlobWriter> {
         self.inner
             .as_ref()
@@ -261,7 +205,7 @@ impl PyPackedBlobWriter {
             .infer_error()
     }
 
-    pub fn finish(&mut self) -> PyResult<Vec<PyPreparedBlobValue>> {
+    pub fn finish(&mut self) -> PyResult<Vec<PyBlobDescriptor>> {
         let inner = self
             .inner
             .take()
@@ -277,6 +221,18 @@ pub struct PyDedicatedBlobWriter {
 }
 
 impl PyDedicatedBlobWriter {
+    pub(crate) async fn try_new(
+        object_store: Arc<lance_io::object_store::ObjectStore>,
+        data_file_path: object_store::path::Path,
+        blob_id: u32,
+    ) -> PyResult<Self> {
+        let inner =
+            DedicatedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
+                .await
+                .infer_error()?;
+        Ok(Self { inner: Some(inner) })
+    }
+
     fn inner(&self) -> PyResult<&DedicatedBlobWriter> {
         self.inner
             .as_ref()
@@ -307,7 +263,7 @@ impl PyDedicatedBlobWriter {
             .infer_error()
     }
 
-    pub fn finish(&mut self) -> PyResult<PyPreparedBlobValue> {
+    pub fn finish(&mut self) -> PyResult<PyBlobDescriptor> {
         let inner = self
             .inner
             .take()
