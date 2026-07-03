@@ -1668,3 +1668,34 @@ def test_to_pandas_returns_blob_files_when_nested_field_is_aliased(
     assert images[0].readall() == b"foo"
     assert images[1] is None
     assert images[2].readall() == b"baz"
+
+
+@pytest.mark.parametrize("data_storage_version", ["2.0", "2.1"])
+def test_blob_scan_across_file_versions(tmp_path, data_storage_version):
+    """Blob descriptor structs are one opaque column in every file version.
+
+    Regression test for 9.0.0b14: the projection length validator descended
+    into the descriptor's position/size children on 2.0 files, making any
+    blob-bearing 2.0 dataset unreadable ("ran out at field 'position'").
+    """
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.large_binary(), metadata={"lance-encoding:blob": "true"}),
+        ]
+    )
+    values = [b"x", b"yy", b"zzz"]
+    table = pa.table({"a": [1, 2, 3], "b": values}).cast(schema)
+    ds = lance.write_dataset(
+        table,
+        tmp_path / "blob_scan_versions",
+        data_storage_version=data_storage_version,
+    )
+
+    full = ds.to_table()
+    assert full.num_rows == 3
+    projected = ds.to_table(columns=["b"])
+    assert projected.num_rows == 3
+
+    blobs = ds.take_blobs("b", indices=[0, 1, 2])
+    assert [blob.read() for blob in blobs] == values

@@ -518,18 +518,21 @@ struct Footer {
 const FOOTER_LEN: usize = 40;
 
 // How a field maps onto physical columns, shared by the projection-building and
-// projection-validation walks so they stay in lockstep. In the 2.0 layout every
-// field (including structs and lists) has its own column; in 2.1 only leaves do,
-// and blob/packed-struct fields are opaque (a single column with no descent).
+// projection-validation walks so they stay in lockstep. Blob and packed-struct
+// fields are opaque in every file version: one column, no descent — their
+// descriptor/packed children never get columns of their own. Otherwise, in the
+// 2.0 layout every field (including structs and lists) has its own column; in
+// 2.1 only leaves do.
 // Returns `(contributes, recurse)`: whether the field has its own column and
 // whether to walk into its children. The DFS order is the field's own column (if
 // any) followed by its children, so a field's root (first) column is always the
 // first entry of its sub-slice.
 fn field_column_shape(field: &Field, is_structural: bool) -> (bool, bool) {
-    let contributes =
-        !is_structural || field.children.is_empty() || field.is_blob() || field.is_packed_struct();
-    let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
-    (contributes, recurse)
+    if field.is_blob() || field.is_packed_struct() {
+        return (true, false);
+    }
+    let contributes = !is_structural || field.children.is_empty();
+    (contributes, true)
 }
 
 // Whether a field's children each cover the same rows as the field itself. Struct
@@ -3882,6 +3885,35 @@ mod tests {
             msg.contains("differing lengths") && msg.contains('b'),
             "expected a child-length error naming 'b', got: {msg}"
         );
+    }
+
+    // A blob column's descriptor struct is one opaque physical column in every
+    // file version. The validator must not descend into `position`/`size`
+    // expecting columns of their own — with the 2.0 layout that made every
+    // blob-bearing dataset unreadable ("ran out at field 'position'").
+    #[rstest]
+    fn test_validate_length_blob_descriptor(#[values(false, true)] is_structural: bool) {
+        let descriptor = DataType::Struct(Fields::from(vec![
+            Field::new("position", DataType::UInt64, true),
+            Field::new("size", DataType::UInt64, true),
+        ]));
+        let blob_field = Field::new("b", descriptor, true)
+            .with_metadata([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())].into());
+        let arrow = ArrowSchema::new(vec![blob_field]);
+        let schema = Schema::try_from(&arrow).unwrap();
+        let column_len = |_c: usize| Ok(7u64);
+        let mut cursor = 0usize;
+        let rows = validate_field_length(
+            &schema.fields[0],
+            is_structural,
+            true,
+            &[0],
+            &mut cursor,
+            &column_len,
+        )
+        .unwrap();
+        assert_eq!(rows, 7);
+        assert_eq!(cursor, 1, "blob must consume exactly its one opaque column");
     }
 
     #[test]
