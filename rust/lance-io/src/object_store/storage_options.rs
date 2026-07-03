@@ -79,6 +79,15 @@ pub trait StorageOptionsProvider: Send + Sync + fmt::Debug {
     /// If [`EXPIRES_AT_MILLIS_KEY`] is not provided, the options are considered to never expire.
     async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>>;
 
+    /// Fetch fresh storage options, bypassing caches along the chain.
+    ///
+    /// Providers that serve from an upstream cache (e.g. base-scoped wrappers
+    /// reading through a parent accessor) override this to force the upstream
+    /// to re-fetch. Defaults to [`Self::fetch_storage_options`].
+    async fn force_fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        self.fetch_storage_options().await
+    }
+
     /// Return a human-readable unique identifier for this provider instance
     ///
     /// This is used for equality comparison and hashing in the object store registry.
@@ -240,6 +249,11 @@ impl StorageOptionsProvider for BaseScopedStorageOptionsProvider {
         Ok(Some(resolve_base_scoped_options(&options.0, self.base_id)))
     }
 
+    async fn force_fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        let options = self.inner.refresh_storage_options().await?;
+        Ok(Some(resolve_base_scoped_options(&options.0, self.base_id)))
+    }
+
     fn provider_id(&self) -> String {
         match self.base_id {
             Some(id) => format!("base-scoped[base_id={}]({})", id, self.inner.accessor_id()),
@@ -277,6 +291,11 @@ pub struct StorageOptionsAccessor {
 
     /// Duration before expiry to trigger refresh
     refresh_offset: Duration,
+
+    /// True when this accessor was produced by [`Self::scoped_to_base`]; its
+    /// options are already resolved for one base path scope, so scoping again
+    /// is a no-op.
+    scope_resolved: bool,
 }
 
 impl fmt::Debug for StorageOptionsAccessor {
@@ -305,14 +324,33 @@ impl StorageOptionsAccessor {
             .unwrap_or(Duration::from_millis(DEFAULT_REFRESH_OFFSET_MILLIS))
     }
 
+    /// Effective expiration of a raw options map: the minimum of the unscoped
+    /// `expires_at_millis` and every `base_<id>.expires_at_millis` entry.
+    ///
+    /// A flat map may vend per-base credentials that expire before the shared
+    /// ones. Refreshing when the earliest credential is due keeps base-scoped
+    /// accessors (which refresh through this accessor) from re-resolving stale
+    /// per-base credentials out of a still-"valid" cache.
+    fn effective_expires_at_millis(options: &HashMap<String, String>) -> Option<u64> {
+        options
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() == EXPIRES_AT_MILLIS_KEY
+                    || matches!(
+                        parse_base_scoped_key(key),
+                        Some((_, scoped_key)) if scoped_key == EXPIRES_AT_MILLIS_KEY
+                    )
+            })
+            .filter_map(|(_, value)| value.parse::<u64>().ok())
+            .min()
+    }
+
     /// Create an accessor with only static options (no refresh capability)
     ///
     /// The returned accessor will always return the provided options.
     /// This is useful when credentials don't expire or are managed externally.
     pub fn with_static_options(options: HashMap<String, String>) -> Self {
-        let expires_at_millis = options
-            .get(EXPIRES_AT_MILLIS_KEY)
-            .and_then(|s| s.parse::<u64>().ok());
+        let expires_at_millis = Self::effective_expires_at_millis(&options);
         let refresh_offset = Self::extract_refresh_offset(&options);
 
         Self {
@@ -323,6 +361,7 @@ impl StorageOptionsAccessor {
                 expires_at_millis,
             }))),
             refresh_offset,
+            scope_resolved: false,
         }
     }
 
@@ -340,6 +379,7 @@ impl StorageOptionsAccessor {
             provider: Some(provider),
             cache: Arc::new(RwLock::new(None)),
             refresh_offset: Duration::from_millis(DEFAULT_REFRESH_OFFSET_MILLIS),
+            scope_resolved: false,
         }
     }
 
@@ -356,9 +396,7 @@ impl StorageOptionsAccessor {
         initial_options: HashMap<String, String>,
         provider: Arc<dyn StorageOptionsProvider>,
     ) -> Self {
-        let expires_at_millis = initial_options
-            .get(EXPIRES_AT_MILLIS_KEY)
-            .and_then(|s| s.parse::<u64>().ok());
+        let expires_at_millis = Self::effective_expires_at_millis(&initial_options);
         let refresh_offset = Self::extract_refresh_offset(&initial_options);
 
         Self {
@@ -369,6 +407,7 @@ impl StorageOptionsAccessor {
                 expires_at_millis,
             }))),
             refresh_offset,
+            scope_resolved: false,
         }
     }
 
@@ -399,8 +438,9 @@ impl StorageOptionsAccessor {
     /// Fetch fresh options from the provider and update the cache.
     ///
     /// This bypasses the cache for callers that need to validate provider-vended
-    /// credentials even when initial metadata has no expiration.
-    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    /// credentials even when initial metadata has no expiration. The force
+    /// propagates through provider chains (e.g. base-scoped wrappers), so the
+    /// origin provider is re-queried even when intermediate caches are valid.
     pub(crate) async fn refresh_storage_options(&self) -> Result<super::StorageOptions> {
         let Some(provider) = &self.provider else {
             return self.get_storage_options().await;
@@ -411,7 +451,7 @@ impl StorageOptionsAccessor {
             provider.provider_id()
         );
 
-        let storage_options_map = provider.fetch_storage_options().await.map_err(|e| {
+        let storage_options_map = provider.force_fetch_storage_options().await.map_err(|e| {
             Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to fetch storage options: {}",
                 e
@@ -429,9 +469,7 @@ impl StorageOptionsAccessor {
             return Ok(super::StorageOptions(HashMap::new()));
         };
 
-        let expires_at_millis = options
-            .get(EXPIRES_AT_MILLIS_KEY)
-            .and_then(|s| s.parse::<u64>().ok());
+        let expires_at_millis = Self::effective_expires_at_millis(&options);
 
         let mut cache = self.cache.write().await;
         *cache = Some(CachedStorageOptions {
@@ -502,9 +540,7 @@ impl StorageOptionsAccessor {
             return Ok(Some(super::StorageOptions(HashMap::new())));
         };
 
-        let expires_at_millis = options
-            .get(EXPIRES_AT_MILLIS_KEY)
-            .and_then(|s| s.parse::<u64>().ok());
+        let expires_at_millis = Self::effective_expires_at_millis(&options);
 
         if let Some(expires_at) = expires_at_millis {
             let now_ms = SystemTime::now()
@@ -594,27 +630,39 @@ impl StorageOptionsAccessor {
     /// defaults, and all other scoped entries are dropped. `None` resolves the
     /// default scope used for the primary dataset base.
     ///
-    /// When the initial options contain no base-scoped entries this returns
-    /// `self` unchanged, preserving accessor identity (and thus object store
-    /// registry cache keys). Scoping engages based on the initial options; a
-    /// provider-only accessor without initial options is returned unchanged.
-    ///
-    /// When a dynamic provider is present, the scoped accessor wraps `self`
-    /// through [`BaseScopedStorageOptionsProvider`], so refreshed options are
-    /// re-resolved for the base on every fetch.
+    /// A static accessor whose options contain no base-scoped entries is
+    /// returned unchanged, preserving accessor identity (and thus object store
+    /// registry cache keys). A provider-backed accessor is always wrapped
+    /// through [`BaseScopedStorageOptionsProvider`] — fetched options may vend
+    /// base-scoped entries at any refresh, even when the initial options carry
+    /// none — so refreshed options are re-resolved for the scope on every
+    /// fetch. Accessors already produced by this method are returned unchanged.
     pub fn scoped_to_base(self: &Arc<Self>, base_id: Option<u32>) -> Arc<Self> {
-        let Some(initial) = self.initial_storage_options() else {
-            return self.clone();
-        };
-        if !has_base_scoped_options(initial) {
+        if self.scope_resolved {
             return self.clone();
         }
-        let resolved = resolve_base_scoped_options(initial, base_id);
         if self.has_provider() {
             let provider = Arc::new(BaseScopedStorageOptionsProvider::new(self.clone(), base_id));
-            Arc::new(Self::with_initial_and_provider(resolved, provider))
+            let mut scoped = match self.initial_storage_options() {
+                Some(initial) => Self::with_initial_and_provider(
+                    resolve_base_scoped_options(initial, base_id),
+                    provider,
+                ),
+                None => Self::with_provider(provider),
+            };
+            scoped.scope_resolved = true;
+            Arc::new(scoped)
         } else {
-            Arc::new(Self::with_static_options(resolved))
+            match self.initial_storage_options() {
+                Some(initial) if has_base_scoped_options(initial) => {
+                    let mut scoped =
+                        Self::with_static_options(resolve_base_scoped_options(initial, base_id));
+                    scoped.scope_resolved = true;
+                    Arc::new(scoped)
+                }
+                // Static options never change, so there is nothing to scope.
+                _ => self.clone(),
+            }
         }
     }
 
@@ -950,21 +998,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_to_base_identity_without_scoped_keys() {
+    async fn test_scoped_to_base_identity_and_idempotency() {
+        // Static accessors without scoped keys are returned unchanged.
         let accessor = Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
             [("account_key".to_string(), "shared-key".to_string())],
         )));
         assert!(Arc::ptr_eq(&accessor.scoped_to_base(Some(1)), &accessor));
         assert!(Arc::ptr_eq(&accessor.scoped_to_base(None), &accessor));
 
-        // Provider-only accessors (no initial options) are returned unchanged
-        let provider_only = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+        // Scoping an already-scoped accessor is a no-op (the registry choke
+        // point re-applies the default scope to every params it sees).
+        let scoped = Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+            [
+                ("account_key".to_string(), "shared-key".to_string()),
+                ("base_1.account_key".to_string(), "base1-key".to_string()),
+            ],
+        )))
+        .scoped_to_base(Some(1));
+        assert!(Arc::ptr_eq(&scoped.scoped_to_base(None), &scoped));
+
+        let provider_scoped = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
             MockStorageOptionsProvider::new(None),
-        )));
+        )))
+        .scoped_to_base(Some(1));
         assert!(Arc::ptr_eq(
-            &provider_only.scoped_to_base(Some(1)),
-            &provider_only
+            &provider_scoped.scoped_to_base(None),
+            &provider_scoped
         ));
+    }
+
+    #[tokio::test]
+    async fn test_scoped_to_base_provider_only_resolves_vended_options() {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+
+        // No initial options: scoped entries arrive only through the provider.
+        let provider = Arc::new(MockBaseScopedVendingProvider {
+            call_count: Arc::new(RwLock::new(0)),
+            expires_in_millis: 600_000,
+        });
+        let parent = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+
+        let base1 = parent.scoped_to_base(Some(1));
+        assert!(!Arc::ptr_eq(&base1, &parent));
+        let result = base1.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_1");
+        assert!(!result.0.contains_key("base_1.account_key"));
+
+        let default = parent.scoped_to_base(None);
+        let result = default.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "SHARED_1");
+        assert!(!result.0.contains_key("base_1.account_key"));
+
+        // Both scopes were served from one parent fetch.
+        assert_eq!(*provider.call_count.read().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_earlier_base_expiry_refreshes_parent() {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let now_ms = MockClock::system_time().as_millis() as u64;
+
+        // Base 1 credentials expire before the shared ones; the parent must
+        // refresh when the earliest credential is due, or the scoped accessor
+        // would keep re-resolving stale base-1 credentials from a still-
+        // "valid" parent cache.
+        let provider = Arc::new(MockBaseScopedVendingProvider {
+            call_count: Arc::new(RwLock::new(0)),
+            expires_in_millis: 600_000,
+        });
+        let initial = HashMap::from([
+            ("account_key".to_string(), "SHARED_0".to_string()),
+            ("base_1.account_key".to_string(), "BASE1_0".to_string()),
+            (
+                EXPIRES_AT_MILLIS_KEY.to_string(),
+                (now_ms + 600_000).to_string(),
+            ),
+            (
+                format!("base_1.{}", EXPIRES_AT_MILLIS_KEY),
+                (now_ms + 120_000).to_string(),
+            ),
+        ]);
+        let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            initial,
+            provider.clone(),
+        ));
+
+        let base1 = parent.scoped_to_base(Some(1));
+        let result = base1.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_0");
+        assert_eq!(*provider.call_count.read().await, 0);
+
+        // Past the base-1 expiry but before the shared expiry: the parent's
+        // effective expiry is the earlier one, so the refresh chain fetches
+        // fresh credentials instead of re-serving BASE1_0.
+        MockClock::set_system_time(Duration::from_secs(100_000 + 121));
+        let result = base1.get_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_1");
+        assert_eq!(*provider.call_count.read().await, 1);
     }
 
     #[tokio::test]
@@ -1077,6 +1207,36 @@ mod tests {
         // The parent refresh is shared: other scopes see it without refetching
         let result = default.get_storage_options().await.unwrap();
         assert_eq!(result.0.get("account_key").unwrap(), "SHARED_1");
+        assert_eq!(*provider.call_count.read().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scoped_forced_refresh_reaches_origin_provider() {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let now_ms = MockClock::system_time().as_millis() as u64;
+
+        let provider = Arc::new(MockBaseScopedVendingProvider {
+            call_count: Arc::new(RwLock::new(0)),
+            expires_in_millis: 600_000,
+        });
+        let initial = HashMap::from([
+            ("account_key".to_string(), "SHARED_0".to_string()),
+            ("base_1.account_key".to_string(), "BASE1_0".to_string()),
+            (
+                EXPIRES_AT_MILLIS_KEY.to_string(),
+                (now_ms + 600_000).to_string(),
+            ),
+        ]);
+        let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            initial,
+            provider.clone(),
+        ));
+        let base1 = parent.scoped_to_base(Some(1));
+
+        // A forced refresh must reach the origin provider even though both the
+        // scoped and the parent caches are still valid.
+        let result = base1.refresh_storage_options().await.unwrap();
+        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_1");
         assert_eq!(*provider.call_count.read().await, 1);
     }
 }

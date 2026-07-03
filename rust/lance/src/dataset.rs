@@ -806,7 +806,11 @@ impl Dataset {
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
-        write::log_unregistered_base_scoped_options(store_params.as_ref(), &manifest.base_paths);
+        write::log_unregistered_base_scoped_options(
+            store_params.as_ref(),
+            &manifest.base_paths,
+            log::Level::Debug,
+        );
         Ok(Self {
             object_store,
             base: base_path,

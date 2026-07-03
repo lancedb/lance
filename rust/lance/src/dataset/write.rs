@@ -811,7 +811,11 @@ pub async fn validate_and_resolve_target_bases(
             all_bases.insert(base_path.id, base_path.clone());
         }
     }
-    log_unregistered_base_scoped_options(params.store_params.as_ref(), &all_bases);
+    log_unregistered_base_scoped_options(
+        params.store_params.as_ref(),
+        &all_bases,
+        log::Level::Warn,
+    );
 
     // Step 3: Resolve target_base_names_or_paths to IDs
     let target_base_ids = if let Some(ref names_or_paths) = params.target_base_names_or_paths {
@@ -900,15 +904,18 @@ fn append_external_base_candidate(
     }
 }
 
-/// Debug-log base-scoped storage options (`base_<id>.<key>`) whose id does not
+/// Log base-scoped storage options (`base_<id>.<key>`) whose id does not
 /// match any registered base path. Unregistered entries are ignored during
-/// resolution: options may legitimately be vended for bases that are not (yet)
-/// registered, e.g. before ids are assigned at dataset creation.
+/// resolution. The open path logs at debug, since options may legitimately be
+/// vended for bases the loaded version does not register; the write path logs
+/// at warn, since ids are already assigned there and an unmatched id is much
+/// more likely a mistake.
 pub(crate) fn log_unregistered_base_scoped_options(
     store_params: Option<&ObjectStoreParams>,
     base_paths: &HashMap<u32, BasePath>,
+    level: log::Level,
 ) {
-    if !log::log_enabled!(log::Level::Debug) {
+    if !log::log_enabled!(level) {
         return;
     }
     let Some(options) = store_params.and_then(|params| params.storage_options()) else {
@@ -920,7 +927,8 @@ pub(crate) fn log_unregistered_base_scoped_options(
         .filter(|id| !base_paths.contains_key(id))
         .collect::<BTreeSet<_>>();
     if !unregistered.is_empty() {
-        log::debug!(
+        log::log!(
+            level,
             "Ignoring base-scoped storage options for unregistered base path ids: {:?}",
             unregistered
         );
