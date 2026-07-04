@@ -707,6 +707,7 @@ struct SparseStructuralCacheableState {
     chunk_meta: Vec<ChunkMeta>,
     chunk_value_offsets: Arc<[u64]>,
     plan: SparseStructuralPlan,
+    row_domain: u64,
 }
 
 impl DeepSizeOf for SparseStructuralCacheableState {
@@ -749,6 +750,7 @@ impl CachedPageData for SparseStructuralCacheableState {
 struct SparseStructuralScheduler {
     buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
+    row_domain: u64,
     num_items: u64,
     num_visible_items: u64,
     num_buffers: u64,
@@ -763,6 +765,7 @@ impl SparseStructuralScheduler {
     fn try_new(
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
+        row_domain: u64,
         data_type: DataType,
         layout: &pb21::SparseLayout,
         decompressors: &dyn DecompressionStrategy,
@@ -793,6 +796,7 @@ impl SparseStructuralScheduler {
         Ok(Self {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
             priority,
+            row_domain,
             num_items: layout.num_items,
             num_visible_items: layout.num_visible_items,
             num_buffers: layout.num_buffers,
@@ -1417,6 +1421,7 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
                 chunk_meta,
                 chunk_value_offsets: chunk_value_offsets.into(),
                 plan,
+                row_domain: self.row_domain,
             });
             self.page_meta = Some(page_meta.clone());
             Ok(page_meta as Arc<dyn CachedPageData>)
@@ -1442,7 +1447,7 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
         let page_meta = self.page_meta.as_ref().unwrap();
 
         let mut chunks_needed = Vec::new();
-        let selection = slice_sparse_plan(&page_meta.plan, ranges)?;
+        let selection = slice_sparse_plan(&page_meta.plan, ranges, page_meta.row_domain)?;
         for value_range in &selection.leaf_ranges {
             chunks_needed.extend(Self::value_chunk_range(
                 &page_meta.chunk_value_offsets,
@@ -1716,7 +1721,11 @@ impl DecodeSparseStructuralTask {
 
 impl DecodePageTask for DecodeSparseStructuralTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        let selection = slice_sparse_plan(&self.page_meta.plan, &self.row_ranges)?;
+        let selection = slice_sparse_plan(
+            &self.page_meta.plan,
+            &self.row_ranges,
+            self.page_meta.row_domain,
+        )?;
         let estimated_size_bytes = self
             .loaded_chunks
             .iter()
@@ -1909,11 +1918,38 @@ fn slice_list_layer(
     ))
 }
 
+fn fsl_parent_ranges_from_child_ranges(
+    ranges: &[Range<u64>],
+    dimension: u64,
+    num_child_slots: u64,
+) -> Result<Vec<Range<u64>>> {
+    if ranges.iter().any(|range| {
+        range.start > range.end
+            || range.end > num_child_slots
+            || range.start % dimension != 0
+            || range.end % dimension != 0
+    }) {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Sparse structural fixed-size-list child-domain slice is not aligned to dimension {}",
+                dimension
+            )
+            .into(),
+        ));
+    }
+    Ok(ranges
+        .iter()
+        .map(|range| range.start / dimension..range.end / dimension)
+        .collect())
+}
+
 fn slice_sparse_plan(
     plan: &SparseStructuralPlan,
     row_ranges: &[Range<u64>],
+    row_domain: u64,
 ) -> Result<SparseStructuralSelection> {
     let mut selected_ranges = row_ranges.to_vec();
+    let mut selected_domain = row_domain;
     let mut sliced_layers = Vec::with_capacity(plan.layers.len());
 
     for layer in &plan.layers {
@@ -1955,30 +1991,65 @@ fn slice_sparse_plan(
                 )?;
                 sliced_layers.push(sliced_layer);
                 selected_ranges = child_ranges;
+                selected_domain = *num_child_slots;
             }
             SparseStructuralLayerPlan::FixedSizeList {
-                num_slots: _,
+                num_slots,
                 dimension,
                 null_positions,
             } => {
-                let out_num_slots = selected_ranges
+                let num_child_slots = num_slots.checked_mul(*dimension).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Sparse structural fixed-size-list child slot count overflows: slots={}, dimension={}",
+                            num_slots, dimension
+                        )
+                        .into(),
+                    )
+                })?;
+                let already_in_child_domain =
+                    selected_domain == num_child_slots && selected_domain != *num_slots;
+                let fsl_ranges = if already_in_child_domain {
+                    fsl_parent_ranges_from_child_ranges(
+                        &selected_ranges,
+                        *dimension,
+                        num_child_slots,
+                    )?
+                } else {
+                    if selected_domain != *num_slots {
+                        return Err(Error::invalid_input_source(
+                            format!(
+                                "Sparse structural fixed-size-list slice domain {} does not match slots {} or child slots {}",
+                                selected_domain, num_slots, num_child_slots
+                            )
+                            .into(),
+                        ));
+                    }
+                    selected_ranges.clone()
+                };
+                let out_num_slots = fsl_ranges
                     .iter()
                     .map(|range| range.end - range.start)
                     .sum::<u64>();
-                let child_ranges = selected_ranges
-                    .iter()
-                    .map(|range| range.start * dimension..range.end * dimension)
-                    .collect::<Vec<_>>();
+                let child_ranges = if already_in_child_domain {
+                    selected_ranges.clone()
+                } else {
+                    selected_ranges
+                        .iter()
+                        .map(|range| range.start * dimension..range.end * dimension)
+                        .collect::<Vec<_>>()
+                };
                 sliced_layers.push(SparseStructuralLayerPlan::FixedSizeList {
                     num_slots: out_num_slots,
                     dimension: *dimension,
                     null_positions: translate_positions(
                         null_positions,
-                        &selected_ranges,
+                        &fsl_ranges,
                         "fixed-size-list null",
                     )?,
                 });
                 selected_ranges = child_ranges;
+                selected_domain = num_child_slots;
             }
         }
     }
@@ -4691,6 +4762,7 @@ impl StructuralPrimitiveFieldScheduler {
             Layout::SparseLayout(sparse) => Box::new(SparseStructuralScheduler::try_new(
                 &page_info.buffer_offsets_and_sizes,
                 page_info.priority,
+                page_info.num_rows,
                 target_field.data_type(),
                 sparse,
                 decompressors,
@@ -9584,6 +9656,252 @@ mod tests {
             .collect()
     }
 
+    fn sparse_layouts_from_pages(
+        pages: &[crate::encoder::EncodedPage],
+    ) -> Vec<&crate::format::pb21::SparseLayout> {
+        pages
+            .iter()
+            .filter_map(|page| {
+                let PageEncoding::Structural(layout) = &page.description else {
+                    return None;
+                };
+                let pb21::page_layout::Layout::SparseLayout(sparse) =
+                    layout.layout.as_ref().unwrap()
+                else {
+                    return None;
+                };
+                Some(sparse)
+            })
+            .collect()
+    }
+
+    fn sparse_nested_coverage_array() -> ArrayRef {
+        use arrow_array::{FixedSizeListArray, Int32Array, ListArray, StructArray};
+        use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_schema::Fields;
+
+        fn offsets(values: Vec<i32>) -> OffsetBuffer<i32> {
+            OffsetBuffer::new(ScalarBuffer::from(values))
+        }
+
+        fn validity(values: Vec<bool>) -> Option<NullBuffer> {
+            Some(NullBuffer::new(BooleanBuffer::from(values)))
+        }
+
+        let event_lengths = [
+            Some(2),
+            Some(0),
+            None,
+            Some(0),
+            Some(1),
+            Some(3),
+            Some(0),
+            None,
+            Some(1),
+            Some(0),
+            Some(2),
+            Some(0),
+            Some(1),
+            Some(0),
+            None,
+            Some(2),
+        ];
+        let mut event_offsets = Vec::with_capacity(event_lengths.len() + 1);
+        let mut event_validity = Vec::with_capacity(event_lengths.len());
+        let mut event_child_count = 0_i32;
+        event_offsets.push(event_child_count);
+        for length in event_lengths {
+            match length {
+                Some(length) => {
+                    event_child_count += length;
+                    event_validity.push(true);
+                }
+                None => event_validity.push(false),
+            }
+            event_offsets.push(event_child_count);
+        }
+
+        let id_values = Arc::new(Int32Array::from(vec![
+            Some(10),
+            Some(11),
+            None,
+            Some(13),
+            Some(14),
+            Some(15),
+            None,
+            Some(17),
+            Some(18),
+            Some(19),
+            Some(20),
+            Some(21),
+        ])) as ArrayRef;
+
+        let tag_values = Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(5),
+            Some(6),
+            None,
+            Some(8),
+            Some(9),
+            Some(11),
+            Some(12),
+        ])) as ArrayRef;
+        let tags = Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                offsets(vec![0, 2, 2, 2, 2, 2, 3, 6, 6, 6, 7, 7, 9]),
+                tag_values,
+                validity(vec![
+                    true, true, false, true, true, true, true, true, true, true, false, true,
+                ]),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        let pair_values = Arc::new(Int32Array::from(vec![
+            Some(0),
+            None,
+            Some(2),
+            Some(3),
+            None,
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+            Some(9),
+            Some(10),
+            None,
+            Some(12),
+            Some(13),
+            Some(14),
+            Some(15),
+            Some(16),
+            Some(17),
+            None,
+            Some(19),
+            Some(20),
+            Some(21),
+            Some(22),
+            None,
+        ])) as ArrayRef;
+        let pair = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                2,
+                pair_values,
+                validity(vec![
+                    true, true, true, false, true, true, true, true, true, true, false, true,
+                ]),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        let event_struct = Arc::new(StructArray::new(
+            Fields::from(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("tags", tags.data_type().clone(), true),
+                ArrowField::new("pair", pair.data_type().clone(), true),
+            ]),
+            vec![id_values, tags, pair],
+            validity(vec![
+                true, false, true, true, false, true, true, true, false, true, true, true,
+            ]),
+        )) as ArrayRef;
+
+        let events = Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new(
+                    "item",
+                    event_struct.data_type().clone(),
+                    true,
+                )),
+                offsets(event_offsets),
+                event_struct,
+                validity(event_validity),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        Arc::new(StructArray::new(
+            Fields::from(vec![ArrowField::new(
+                "events",
+                events.data_type().clone(),
+                true,
+            )]),
+            vec![events],
+            validity(vec![
+                true, true, true, false, true, true, true, true, true, true, true, false, true,
+                true, true, true,
+            ]),
+        ))
+    }
+
+    fn sparse_fsl_struct_coverage_array() -> ArrayRef {
+        use arrow_array::{FixedSizeListArray, Int32Array, ListArray, StructArray};
+        use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_schema::Fields;
+
+        fn offsets(values: Vec<i32>) -> OffsetBuffer<i32> {
+            OffsetBuffer::new(ScalarBuffer::from(values))
+        }
+
+        fn validity(values: Vec<bool>) -> Option<NullBuffer> {
+            Some(NullBuffer::new(BooleanBuffer::from(values)))
+        }
+
+        let values = Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            None,
+            Some(8),
+            Some(9),
+            Some(10),
+        ])) as ArrayRef;
+        let lists = Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                offsets(vec![0, 2, 2, 2, 3, 3, 4, 4, 6, 6, 7, 7, 7, 8, 8, 10, 10]),
+                values,
+                validity(vec![
+                    true, true, false, true, true, true, true, true, true, false, true, true, true,
+                    true, true, true,
+                ]),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let item_struct = Arc::new(StructArray::new(
+            Fields::from(vec![ArrowField::new(
+                "values",
+                lists.data_type().clone(),
+                true,
+            )]),
+            vec![lists],
+            validity(vec![
+                true, true, true, false, true, true, true, true, false, true, true, true, true,
+                true, true, true,
+            ]),
+        )) as ArrayRef;
+
+        Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(ArrowField::new(
+                    "item",
+                    item_struct.data_type().clone(),
+                    true,
+                )),
+                2,
+                item_struct,
+                validity(vec![true, true, false, true, true, true, false, true]),
+            )
+            .unwrap(),
+        )
+    }
+
     fn sparse_test_layout() -> crate::format::pb21::SparseLayout {
         crate::format::pb21::SparseLayout {
             value_compression: Some(ProtobufUtils21::flat(32, None)),
@@ -9612,6 +9930,7 @@ mod tests {
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
             0,
+            layout.num_items,
             DataType::Int32,
             &layout,
             &decompressors,
@@ -9629,6 +9948,7 @@ mod tests {
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0)],
             0,
+            layout.num_items,
             DataType::Int32,
             &layout,
             &decompressors,
@@ -9660,6 +9980,7 @@ mod tests {
         let err = SparseStructuralScheduler::try_new(
             &[(0, 8), (8, 8)],
             0,
+            layout.num_items,
             DataType::Int32,
             &layout,
             &decompressors,
@@ -9676,6 +9997,7 @@ mod tests {
         let mut scheduler = SparseStructuralScheduler::try_new(
             &[(0, 8), (8, 8)],
             0,
+            layout.num_items,
             DataType::Int32,
             &layout,
             &decompressors,
@@ -10007,6 +10329,103 @@ mod tests {
             .with_range(511..514)
             .with_range(4096..4112)
             .with_indices(vec![0, 1, 511, 512, 4096, 79_999]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_nested_structural_states_roundtrip() {
+        let arr = sparse_nested_coverage_array();
+        let sparse_pages =
+            encode_pages_with_structural_mode(arr.clone(), STRUCTURAL_ENCODING_SPARSE).await;
+        let sparse_layouts = sparse_layouts_from_pages(&sparse_pages);
+        assert!(
+            !sparse_layouts.is_empty(),
+            "expected forced sparse encoding to emit sparse pages"
+        );
+
+        let has_variable_list_layer = sparse_layouts.iter().any(|sparse| {
+            sparse.structural_layers.iter().any(|layer| {
+                matches!(
+                    pb21::sparse_structural_layer::Kind::try_from(layer.kind),
+                    Ok(pb21::sparse_structural_layer::Kind::SparseLayerList)
+                ) && layer.num_non_empty > 0
+                    && layer.num_nulls > 0
+                    && layer.count_compression.is_some()
+            })
+        });
+        assert!(
+            has_variable_list_layer,
+            "expected a sparse list layer with non-empty positions, counts, and null positions"
+        );
+
+        let has_validity_layer = sparse_layouts.iter().any(|sparse| {
+            sparse.structural_layers.iter().any(|layer| {
+                matches!(
+                    pb21::sparse_structural_layer::Kind::try_from(layer.kind),
+                    Ok(pb21::sparse_structural_layer::Kind::SparseLayerValidity)
+                ) && layer.num_nulls > 0
+            })
+        });
+        assert!(
+            has_validity_layer,
+            "expected a sparse validity layer for nullable struct or primitive values"
+        );
+
+        let metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        )]);
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_range(0..16)
+            .with_range(1..5)
+            .with_range(2..8)
+            .with_range(10..16)
+            .with_indices(vec![0, 1, 2, 3, 4, 5, 6, 7])
+            .with_indices(vec![2])
+            .with_indices(vec![3, 11, 15]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_fixed_size_list_struct_roundtrip() {
+        let arr = sparse_fsl_struct_coverage_array();
+        let sparse_pages =
+            encode_pages_with_structural_mode(arr.clone(), STRUCTURAL_ENCODING_SPARSE).await;
+        let sparse_layouts = sparse_layouts_from_pages(&sparse_pages);
+        assert!(
+            !sparse_layouts.is_empty(),
+            "expected forced sparse encoding to emit sparse pages"
+        );
+
+        let has_fixed_size_list_layer = sparse_layouts.iter().any(|sparse| {
+            sparse.structural_layers.iter().any(|layer| {
+                matches!(
+                    pb21::sparse_structural_layer::Kind::try_from(layer.kind),
+                    Ok(pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList)
+                ) && layer.constant_count == 2
+                    && layer.num_nulls > 0
+            })
+        });
+        assert!(
+            has_fixed_size_list_layer,
+            "expected a sparse fixed-size-list layer with dimension and null positions"
+        );
+
+        let metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        )]);
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_range(0..8)
+            .with_range(1..4)
+            .with_range(5..8)
+            .with_indices(vec![0, 1, 2, 3, 6, 7])
+            .with_indices(vec![2])
+            .with_indices(vec![6, 7]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
     }
 

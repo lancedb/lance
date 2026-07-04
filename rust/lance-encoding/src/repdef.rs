@@ -1122,7 +1122,7 @@ impl SerializerContext {
         debug_assert!(
             self.current_len == 0 || self.current_len == validity.len() + self.current_num_specials
         );
-        self.current_len = validity.len();
+        self.current_len = validity.len() + self.current_num_specials;
 
         let mut def_read_itr = self.def_levels.iter().copied();
         let mut def_write_itr = self.spare_def.iter_mut();
