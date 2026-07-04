@@ -344,6 +344,18 @@ The value buffers are still mini-block compressed. The structural layers are sto
 Valid empty list slots are not stored in the non-empty positions. They are represented by their absence from both the
 non-empty positions and null positions for that list layer.
 
+#### Selection and Compatibility
+
+Writers may emit sparse layout only for file versions 2.3 and later. Explicit sparse selection is requested with field
+metadata `lance-encoding:structural-encoding=sparse`; the request is invalid for older file versions. In 2.3 and later,
+the automatic writer path may select sparse layout when the page has native sparse structural layers and the equivalent
+mini-block repetition / definition stream would exceed the mini-block structural page budget. When sparse is not requested
+and the structural budget is satisfied, writers use the normal mini-block / full-zip selection path.
+
+Sparse layout is a page layout, not a column-level promise. Readers must identify it from `PageLayout.sparse_layout`.
+The `lance-encoding:structural-encoding` field metadata is a writer input only and must not be used by readers to infer
+the layout of existing pages.
+
 #### Buffers
 
 Sparse pages always have a metadata buffer followed by one value buffer, then zero or more structural buffers.
@@ -600,7 +612,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
-| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`               | Not set          | Force a particular structural encoding to be applied (only useful for testing purposes) |
+| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Force a structural encoding. `sparse` requires file version 2.3+.                      |
 
 ### Configuration Details
 
