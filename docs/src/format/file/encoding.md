@@ -330,9 +330,8 @@ have per offset (for variable-width data).
 ### Sparse Page Layout
 
 The sparse page layout is a 2.3+ structural layout for sparse nested data. It is selected explicitly with
-`lance-encoding:structural-encoding=sparse`, or automatically in 2.3+ when the writer would otherwise need to split a
-page because the structural information is much larger than the visible value stream. Writers must not emit this layout
-for file versions before 2.3.
+`lance-encoding:structural-encoding=sparse`, or automatically in 2.3+ when dense mini-block structural information
+would exceed the mini-block structural page budget. Writers must not emit this layout for file versions before 2.3.
 
 Sparse layout stores Arrow structure as native slot-domain mappings instead of dense repetition / definition events.
 The value buffers are still mini-block compressed. The structural layers are stored from outer-most to inner-most:

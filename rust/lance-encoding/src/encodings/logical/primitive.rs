@@ -5268,6 +5268,25 @@ impl PrimitiveStructuralEncoder {
         version.resolve() >= LanceFileVersion::V2_3
     }
 
+    fn structural_plan_needs_sparse(plan: &StructuralPagePlan) -> bool {
+        matches!(
+            plan,
+            StructuralPagePlan::Split(_) | StructuralPagePlan::UnsplittableOverBudget(_)
+        )
+    }
+
+    fn should_auto_sparse_layout(
+        version: LanceFileVersion,
+        requested_encoding: Option<&str>,
+        structural_plan: &StructuralPagePlan,
+        sparse_structural_plan: Option<&SparseStructuralPlan>,
+    ) -> bool {
+        Self::supports_sparse_layout(version)
+            && requested_encoding.is_none()
+            && Self::structural_plan_needs_sparse(structural_plan)
+            && sparse_structural_plan.is_some()
+    }
+
     pub fn try_new(
         options: &EncodingOptions,
         compression_strategy: Arc<dyn CompressionStrategy>,
@@ -7285,15 +7304,17 @@ impl PrimitiveStructuralEncoder {
         let requested_encoding = encoding_metadata
             .get(STRUCTURAL_ENCODING_META_KEY)
             .map(|requested| requested.to_lowercase());
-        let supports_sparse_layout = Self::supports_sparse_layout(version);
         let should_encode_sparse = requested_encoding.as_deref()
             == Some(STRUCTURAL_ENCODING_SPARSE)
-            || (supports_sparse_layout
-                && requested_encoding.is_none()
-                && matches!(&structural_plan, StructuralPagePlan::Split(_)));
+            || Self::should_auto_sparse_layout(
+                version,
+                requested_encoding.as_deref(),
+                &structural_plan,
+                sparse_structural_plan.as_ref(),
+            );
 
         if requested_encoding.as_deref() == Some(STRUCTURAL_ENCODING_SPARSE)
-            && !supports_sparse_layout
+            && !Self::supports_sparse_layout(version)
         {
             return Err(Error::invalid_input_source(
                 format!(
@@ -7605,11 +7626,27 @@ impl PrimitiveStructuralEncoder {
             ));
         }
 
+        if requested_encoding.is_none()
+            && Self::supports_sparse_layout(self.version)
+            && matches!(
+                structural_plan,
+                StructuralPagePlan::UnsplittableOverBudget(_)
+            )
+            && sparse_structural_plan.is_none()
+        {
+            return Err(Error::invalid_input_source(
+                "Mini-block cannot split the structural page and sparse structural encoding requires native structural layers".into(),
+            ));
+        }
+
         let should_use_sparse_plan = requested_encoding.as_deref()
             == Some(STRUCTURAL_ENCODING_SPARSE)
-            || (Self::supports_sparse_layout(self.version)
-                && requested_encoding.is_none()
-                && matches!(&structural_plan, StructuralPagePlan::Split(_)));
+            || Self::should_auto_sparse_layout(
+                self.version,
+                requested_encoding.as_deref(),
+                &structural_plan,
+                sparse_structural_plan.as_ref(),
+            );
         let pages = if should_use_sparse_plan {
             let unsplittable_miniblock_levels = match &structural_plan {
                 StructuralPagePlan::UnsplittableOverBudget(num_levels) => Some(*num_levels),
@@ -9621,6 +9658,42 @@ mod tests {
         Arc::new(builder.finish())
     }
 
+    fn unsplittable_sparse_i32_nested_list_array(num_inner_lists: usize) -> ArrayRef {
+        use arrow_array::{Int32Array, ListArray};
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
+        let mut inner_offsets = Vec::with_capacity(num_inner_lists + 1);
+        let mut value_count = 0_i32;
+        inner_offsets.push(value_count);
+        for inner_idx in 0..num_inner_lists {
+            if inner_idx + 1 == num_inner_lists {
+                value_count += 1;
+            }
+            inner_offsets.push(value_count);
+        }
+
+        let values = Arc::new(Int32Array::from(vec![42])) as ArrayRef;
+        let inner = Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
+                values,
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new("item", inner.data_type().clone(), true)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, num_inner_lists as i32])),
+                inner,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
     fn sparse_layout_from_page(
         page: &crate::encoder::EncodedPage,
     ) -> &crate::format::pb21::SparseLayout {
@@ -10092,6 +10165,36 @@ mod tests {
         let test_cases = TestCases::default()
             .with_min_file_version(LanceFileVersion::V2_3)
             .with_max_file_version(LanceFileVersion::V2_3);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_auto_for_unsplittable_overbudget_structural_page() {
+        let arr = unsplittable_sparse_i32_nested_list_array(70_000);
+        let field = arrow_schema::Field::new("c", arr.data_type().clone(), true);
+
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_3).await;
+        let sparse = sparse_layout_from_page(&page);
+        assert_eq!(sparse.num_visible_items, 1);
+        assert!(
+            sparse.num_items > u16::MAX as u64,
+            "expected unsplittable dense rep/def stream, got {} levels",
+            sparse.num_items
+        );
+        let list_layers = sparse_list_layers(sparse);
+        assert_eq!(list_layers.len(), 2);
+        assert_eq!(list_layers[0].num_slots, 1);
+        assert_eq!(list_layers[0].num_non_empty, 1);
+        assert_eq!(list_layers[0].constant_count, 70_000);
+        assert_eq!(list_layers[1].num_slots, 70_000);
+        assert_eq!(list_layers[1].num_non_empty, 1);
+        assert_eq!(list_layers[1].constant_count, 1);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_range(0..1)
+            .with_indices(vec![0]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
 
