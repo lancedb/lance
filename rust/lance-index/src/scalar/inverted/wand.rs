@@ -106,6 +106,7 @@ impl CompressedState {
                 block,
                 remainder,
                 tail_codec,
+                block_size,
                 &mut self.doc_ids,
                 &mut self.freqs,
             );
@@ -915,7 +916,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             let doc_length = match &doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
 
@@ -1089,7 +1090,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             // score the doc
             let doc_length = match is_compressed {
-                true => self.docs.num_tokens(doc_id as u32),
+                true => self.docs.scoring_num_tokens(doc_id as u32),
                 false => self.docs.num_tokens_by_row_id(row_id),
             };
             if self.operator == Operator::Or && !self.refine_or_candidate(doc_id, doc_length) {
@@ -1239,7 +1240,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             };
             let doc_length = match &first_doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             let mut lead_score = 0.0;
@@ -1321,7 +1322,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
             let doc_length = match &lead_doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             if self.and_candidate_cannot_beat_threshold(doc_length) {
