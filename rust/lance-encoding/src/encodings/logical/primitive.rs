@@ -61,8 +61,8 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, SerializedRepDefs, SparseStructuralLayerPlan, SparseStructuralPlan,
-        StructuralPagePlan, build_control_word_iterator,
+        MiniBlockRepDefBudget, RepDefSlicer, SerializedRepDefs, SparseStructuralLayerPlan,
+        SparseStructuralPlan, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -5231,10 +5231,10 @@ struct PrimitivePageData {
     row_number: u64,
     // Number of top-level rows in this page.
     num_rows: u64,
-    // Present when one top-level row is too large for one miniblock rep/def chunk.
-    unsplittable_miniblock_levels: Option<u64>,
-    // Structural split plan from the original accumulated page.
-    structural_plan: StructuralPagePlan,
+    // Present when one top-level row is too large for one mini-block rep/def page.
+    single_row_miniblock_repdef_levels: Option<u64>,
+    // Dense mini-block rep/def budget result from the original accumulated page.
+    miniblock_repdef_budget: MiniBlockRepDefBudget,
     // Native sparse structural mapping for the original accumulated page.
     sparse_structural_plan: Option<SparseStructuralPlan>,
 }
@@ -5268,22 +5268,23 @@ impl PrimitiveStructuralEncoder {
         version.resolve() >= LanceFileVersion::V2_3
     }
 
-    fn structural_plan_needs_sparse(plan: &StructuralPagePlan) -> bool {
+    fn miniblock_repdef_budget_needs_sparse(budget: &MiniBlockRepDefBudget) -> bool {
         matches!(
-            plan,
-            StructuralPagePlan::Split(_) | StructuralPagePlan::UnsplittableOverBudget(_)
+            budget,
+            MiniBlockRepDefBudget::RequiresPageSplit(_)
+                | MiniBlockRepDefBudget::SingleRowOverBudget(_)
         )
     }
 
     fn should_auto_sparse_layout(
         version: LanceFileVersion,
         requested_encoding: Option<&str>,
-        structural_plan: &StructuralPagePlan,
+        miniblock_repdef_budget: &MiniBlockRepDefBudget,
         sparse_structural_plan: Option<&SparseStructuralPlan>,
     ) -> bool {
         Self::supports_sparse_layout(version)
             && requested_encoding.is_none()
-            && Self::structural_plan_needs_sparse(structural_plan)
+            && Self::miniblock_repdef_budget_needs_sparse(miniblock_repdef_budget)
             && sparse_structural_plan.is_some()
     }
 
@@ -7164,55 +7165,50 @@ impl PrimitiveStructuralEncoder {
         Ok(sliced)
     }
 
-    fn split_structural_pages_for_miniblock_budget(
+    fn split_pages_for_miniblock_repdef_budget(
         arrays: Vec<ArrayRef>,
         repdef: SerializedRepDefs,
-        plan: StructuralPagePlan,
+        budget: MiniBlockRepDefBudget,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<PrimitivePageData>> {
-        if plan == StructuralPagePlan::Fits {
-            return Ok(vec![PrimitivePageData {
+        match budget {
+            MiniBlockRepDefBudget::WithinBudget => Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
                 row_number,
                 num_rows,
-                unsplittable_miniblock_levels: None,
-                structural_plan: StructuralPagePlan::Fits,
+                single_row_miniblock_repdef_levels: None,
+                miniblock_repdef_budget: MiniBlockRepDefBudget::WithinBudget,
                 sparse_structural_plan: None,
-            }]);
-        }
-        if let StructuralPagePlan::UnsplittableOverBudget(num_levels) = plan {
-            return Ok(vec![PrimitivePageData {
+            }]),
+            MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) => Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
                 row_number,
                 num_rows,
-                unsplittable_miniblock_levels: Some(num_levels),
-                structural_plan: StructuralPagePlan::UnsplittableOverBudget(num_levels),
+                single_row_miniblock_repdef_levels: Some(num_levels),
+                miniblock_repdef_budget: MiniBlockRepDefBudget::SingleRowOverBudget(num_levels),
                 sparse_structural_plan: None,
-            }]);
+            }]),
+            MiniBlockRepDefBudget::RequiresPageSplit(splits) => {
+                let mut pages = Vec::with_capacity(splits.len());
+                for split in splits {
+                    let arrays = Self::slice_arrays(&arrays, split.value_start, split.num_values)?;
+                    let repdef = Self::slice_repdef(&repdef, split.level_range);
+                    pages.push(PrimitivePageData {
+                        arrays,
+                        repdef,
+                        row_number: row_number + split.row_start,
+                        num_rows: split.num_rows,
+                        single_row_miniblock_repdef_levels: None,
+                        miniblock_repdef_budget: MiniBlockRepDefBudget::WithinBudget,
+                        sparse_structural_plan: None,
+                    });
+                }
+                Ok(pages)
+            }
         }
-
-        let StructuralPagePlan::Split(splits) = plan else {
-            unreachable!();
-        };
-
-        let mut pages = Vec::with_capacity(splits.len());
-        for split in splits {
-            let arrays = Self::slice_arrays(&arrays, split.value_start, split.num_values)?;
-            let repdef = Self::slice_repdef(&repdef, split.level_range);
-            pages.push(PrimitivePageData {
-                arrays,
-                repdef,
-                row_number: row_number + split.row_start,
-                num_rows: split.num_rows,
-                unsplittable_miniblock_levels: None,
-                structural_plan: StructuralPagePlan::Fits,
-                sparse_structural_plan: None,
-            });
-        }
-        Ok(pages)
     }
 
     fn encode_page(ctx: PrimitiveEncodeContext, page: PrimitivePageData) -> Result<EncodedPage> {
@@ -7231,8 +7227,8 @@ impl PrimitiveStructuralEncoder {
             repdef,
             row_number,
             num_rows,
-            unsplittable_miniblock_levels,
-            structural_plan,
+            single_row_miniblock_repdef_levels,
+            miniblock_repdef_budget,
             sparse_structural_plan,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
@@ -7309,7 +7305,7 @@ impl PrimitiveStructuralEncoder {
             || Self::should_auto_sparse_layout(
                 version,
                 requested_encoding.as_deref(),
-                &structural_plan,
+                &miniblock_repdef_budget,
                 sparse_structural_plan.as_ref(),
             );
 
@@ -7406,7 +7402,7 @@ impl PrimitiveStructuralEncoder {
             );
         }
 
-        if let Some(num_levels) = unsplittable_miniblock_levels {
+        if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let fullzip_error = match &data_block {
                 DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
                     Some(format!(
@@ -7603,12 +7599,13 @@ impl PrimitiveStructuralEncoder {
         } else {
             None
         };
-        let (repdef, structural_plan) = RepDefBuilder::serialize_with_structural_plan(
-            repdefs,
-            miniblock::max_repdef_levels_per_chunk,
-            num_rows,
-            num_values,
-        )?;
+        let (repdef, miniblock_repdef_budget) =
+            RepDefBuilder::serialize_with_miniblock_repdef_budget(
+                repdefs,
+                miniblock::max_repdef_levels_per_chunk,
+                num_rows,
+                num_values,
+            )?;
         let requested_encoding = self
             .encoding_metadata
             .get(STRUCTURAL_ENCODING_META_KEY)
@@ -7629,8 +7626,8 @@ impl PrimitiveStructuralEncoder {
         if requested_encoding.is_none()
             && Self::supports_sparse_layout(self.version)
             && matches!(
-                structural_plan,
-                StructuralPagePlan::UnsplittableOverBudget(_)
+                miniblock_repdef_budget,
+                MiniBlockRepDefBudget::SingleRowOverBudget(_)
             )
             && sparse_structural_plan.is_none()
         {
@@ -7644,12 +7641,12 @@ impl PrimitiveStructuralEncoder {
             || Self::should_auto_sparse_layout(
                 self.version,
                 requested_encoding.as_deref(),
-                &structural_plan,
+                &miniblock_repdef_budget,
                 sparse_structural_plan.as_ref(),
             );
         let pages = if should_use_sparse_plan {
-            let unsplittable_miniblock_levels = match &structural_plan {
-                StructuralPagePlan::UnsplittableOverBudget(num_levels) => Some(*num_levels),
+            let single_row_miniblock_repdef_levels = match &miniblock_repdef_budget {
+                MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) => Some(*num_levels),
                 _ => None,
             };
             vec![PrimitivePageData {
@@ -7657,15 +7654,15 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 row_number,
                 num_rows,
-                unsplittable_miniblock_levels,
-                structural_plan,
+                single_row_miniblock_repdef_levels,
+                miniblock_repdef_budget,
                 sparse_structural_plan,
             }]
         } else {
-            Self::split_structural_pages_for_miniblock_budget(
+            Self::split_pages_for_miniblock_repdef_budget(
                 arrays,
                 repdef,
-                structural_plan,
+                miniblock_repdef_budget,
                 row_number,
                 num_rows,
             )?
@@ -9658,7 +9655,7 @@ mod tests {
         Arc::new(builder.finish())
     }
 
-    fn unsplittable_sparse_i32_nested_list_array(num_inner_lists: usize) -> ArrayRef {
+    fn single_row_overbudget_sparse_i32_nested_list_array(num_inner_lists: usize) -> ArrayRef {
         use arrow_array::{Int32Array, ListArray};
         use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 
@@ -10169,8 +10166,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sparse_layout_auto_for_unsplittable_overbudget_structural_page() {
-        let arr = unsplittable_sparse_i32_nested_list_array(70_000);
+    async fn test_sparse_layout_auto_for_single_row_overbudget_repdef_page() {
+        let arr = single_row_overbudget_sparse_i32_nested_list_array(70_000);
         let field = arrow_schema::Field::new("c", arr.data_type().clone(), true);
 
         let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_3).await;
@@ -10178,7 +10175,7 @@ mod tests {
         assert_eq!(sparse.num_visible_items, 1);
         assert!(
             sparse.num_items > u16::MAX as u64,
-            "expected unsplittable dense rep/def stream, got {} levels",
+            "expected single-row over-budget dense rep/def stream, got {} levels",
             sparse.num_items
         );
         let list_layers = sparse_list_layers(sparse);
