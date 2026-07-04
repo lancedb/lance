@@ -434,8 +434,16 @@ mod tests {
                     crate::format::pb21::sparse_structural_layer::Kind::try_from(layer.kind),
                     Ok(crate::format::pb21::sparse_structural_layer::Kind::SparseLayerList)
                 ) {
-                    num_non_empty_slots += layer.num_non_empty;
-                    constant_counts.push(layer.constant_count);
+                    num_non_empty_slots += layer
+                        .non_empty_positions
+                        .as_ref()
+                        .map(|set| set.num_positions)
+                        .unwrap_or(0);
+                    if let Some(crate::format::pb21::sparse_count_set::Counts::Constant(constant)) =
+                        layer.counts.as_ref().and_then(|set| set.counts.as_ref())
+                    {
+                        constant_counts.push(constant.value);
+                    }
                 }
             }
         }

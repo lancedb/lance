@@ -134,23 +134,218 @@ pub(crate) struct SparseStructuralPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SparsePositionSet {
+    Empty,
+    All { len: u64 },
+    Range { start: u64, len: u64 },
+    Explicit(Vec<u64>),
+}
+
+impl SparsePositionSet {
+    pub(crate) fn from_positions(
+        positions: Vec<u64>,
+        domain_len: u64,
+        label: &str,
+    ) -> Result<Self> {
+        if positions.is_empty() {
+            return Ok(Self::Empty);
+        }
+        for window in positions.windows(2) {
+            if window[0] >= window[1] {
+                return Err(Error::invalid_input_source(
+                    format!("Sparse structural {label} positions must be strictly increasing")
+                        .into(),
+                ));
+            }
+        }
+        if let Some(position) = positions.iter().find(|position| **position >= domain_len) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} position {} is outside layer with {} slots",
+                    position, domain_len
+                )
+                .into(),
+            ));
+        }
+
+        let len = positions.len() as u64;
+        let first = positions[0];
+        let last = positions[positions.len() - 1];
+        if first == 0 && len == domain_len && last == domain_len - 1 {
+            return Ok(Self::All { len: domain_len });
+        }
+        if last - first + 1 == len {
+            return Ok(Self::Range { start: first, len });
+        }
+        Ok(Self::Explicit(positions))
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self::Empty
+    }
+
+    pub(crate) fn all(len: u64) -> Self {
+        if len == 0 {
+            Self::Empty
+        } else {
+            Self::All { len }
+        }
+    }
+
+    pub(crate) fn range(start: u64, len: u64) -> Self {
+        if len == 0 {
+            Self::Empty
+        } else {
+            Self::Range { start, len }
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::Empty => 0,
+            Self::All { len } | Self::Range { len, .. } => *len,
+            Self::Explicit(positions) => positions.len() as u64,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn deep_size(&self) -> usize {
+        match self {
+            Self::Explicit(positions) => positions.len() * std::mem::size_of::<u64>(),
+            Self::Empty | Self::All { .. } | Self::Range { .. } => 0,
+        }
+    }
+
+    pub(crate) fn materialize(&self) -> Result<Vec<u64>> {
+        match self {
+            Self::Empty => Ok(Vec::new()),
+            Self::All { len } => Self::materialize_range(0, *len),
+            Self::Range { start, len } => Self::materialize_range(*start, *len),
+            Self::Explicit(positions) => Ok(positions.clone()),
+        }
+    }
+
+    fn materialize_range(start: u64, len: u64) -> Result<Vec<u64>> {
+        let len_usize = usize::try_from(len).map_err(|_| {
+            Error::invalid_input_source(
+                format!(
+                    "Sparse structural position range length {} exceeds usize::MAX",
+                    len
+                )
+                .into(),
+            )
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            Error::invalid_input_source("Sparse structural position range overflows".into())
+        })?;
+        let mut positions = Vec::with_capacity(len_usize);
+        positions.extend(start..end);
+        Ok(positions)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SparseCountSet {
+    Empty,
+    Constant { value: u64, len: u64 },
+    Explicit(Vec<u64>),
+}
+
+impl SparseCountSet {
+    pub(crate) fn from_counts(counts: Vec<u64>) -> Self {
+        if counts.is_empty() {
+            return Self::Empty;
+        }
+        if let Some(first) = counts.first().copied()
+            && counts.iter().all(|count| *count == first)
+        {
+            return Self::Constant {
+                value: first,
+                len: counts.len() as u64,
+            };
+        }
+        Self::Explicit(counts)
+    }
+
+    pub(crate) fn constant(value: u64, len: u64) -> Self {
+        if len == 0 {
+            Self::Empty
+        } else {
+            Self::Constant { value, len }
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            Self::Empty => 0,
+            Self::Constant { len, .. } => *len,
+            Self::Explicit(counts) => counts.len() as u64,
+        }
+    }
+
+    pub(crate) fn deep_size(&self) -> usize {
+        match self {
+            Self::Explicit(counts) => counts.len() * std::mem::size_of::<u64>(),
+            Self::Empty | Self::Constant { .. } => 0,
+        }
+    }
+
+    pub(crate) fn materialize(&self) -> Result<Vec<u64>> {
+        match self {
+            Self::Empty => Ok(Vec::new()),
+            Self::Constant { value, len } => {
+                let len = usize::try_from(*len).map_err(|_| {
+                    Error::invalid_input_source(
+                        "Sparse structural count set length exceeds usize::MAX".into(),
+                    )
+                })?;
+                Ok(vec![*value; len])
+            }
+            Self::Explicit(counts) => Ok(counts.clone()),
+        }
+    }
+
+    pub(crate) fn sum(&self) -> Result<u64> {
+        match self {
+            Self::Empty => Ok(0),
+            Self::Constant { value, len } => value.checked_mul(*len).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "Sparse structural constant count sum overflows: value={}, len={}",
+                        value, len
+                    )
+                    .into(),
+                )
+            }),
+            Self::Explicit(counts) => counts.iter().try_fold(0_u64, |sum, count| {
+                sum.checked_add(*count).ok_or_else(|| {
+                    Error::invalid_input_source("Sparse structural list count sum overflows".into())
+                })
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SparseStructuralLayerPlan {
     Validity {
         num_slots: u64,
-        null_positions: Vec<u64>,
+        null_positions: SparsePositionSet,
     },
     List {
         num_slots: u64,
         num_child_slots: u64,
-        non_empty_positions: Vec<u64>,
-        counts: Vec<u64>,
-        constant_count: Option<u64>,
-        null_positions: Vec<u64>,
+        non_empty_positions: SparsePositionSet,
+        counts: SparseCountSet,
+        null_positions: SparsePositionSet,
     },
     FixedSizeList {
         num_slots: u64,
         dimension: u64,
-        null_positions: Vec<u64>,
+        null_positions: SparsePositionSet,
     },
 }
 
@@ -206,7 +401,11 @@ impl SparseStructuralPlan {
     }
 }
 
-fn validity_from_null_positions(num_slots: u64, null_positions: &[u64]) -> Result<BooleanBuffer> {
+fn validity_from_null_positions(
+    num_slots: u64,
+    null_positions: &SparsePositionSet,
+) -> Result<BooleanBuffer> {
+    let null_positions = null_positions.materialize()?;
     let mut validity = BooleanBufferBuilder::new(num_slots as usize);
     let mut null_iter = null_positions.iter().copied().peekable();
     for slot in 0..num_slots {
@@ -230,10 +429,13 @@ fn validity_from_null_positions(num_slots: u64, null_positions: &[u64]) -> Resul
 
 fn list_offsets_and_validity(
     num_slots: u64,
-    non_empty_positions: &[u64],
-    counts: &[u64],
-    null_positions: &[u64],
+    non_empty_positions: &SparsePositionSet,
+    counts: &SparseCountSet,
+    null_positions: &SparsePositionSet,
 ) -> Result<(OffsetBuffer<i64>, Option<NullBuffer>)> {
+    let non_empty_positions = non_empty_positions.materialize()?;
+    let counts = counts.materialize()?;
+    let null_positions = null_positions.materialize()?;
     if non_empty_positions.len() != counts.len() {
         return Err(Error::invalid_input_source(
             format!(
@@ -378,20 +580,27 @@ impl SparseStructuralUnraveler {
     fn append_validity(
         validity: &mut BooleanBufferBuilder,
         num_slots: u64,
-        null_positions: &[u64],
+        null_positions: &SparsePositionSet,
     ) {
-        if null_positions.is_empty() {
-            validity.append_n(num_slots as usize, true);
-            return;
-        }
-
-        let mut null_iter = null_positions.iter().copied().peekable();
-        for slot in 0..num_slots {
-            let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
-            if is_null {
-                null_iter.next();
+        match null_positions {
+            SparsePositionSet::Empty => validity.append_n(num_slots as usize, true),
+            SparsePositionSet::All { .. } => validity.append_n(num_slots as usize, false),
+            SparsePositionSet::Range { start, len } => {
+                validity.append_n(*start as usize, true);
+                validity.append_n(*len as usize, false);
+                let end = start + len;
+                validity.append_n((num_slots - end) as usize, true);
             }
-            validity.append(!is_null);
+            SparsePositionSet::Explicit(null_positions) => {
+                let mut null_iter = null_positions.iter().copied().peekable();
+                for slot in 0..num_slots {
+                    let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
+                    if is_null {
+                        null_iter.next();
+                    }
+                    validity.append(!is_null);
+                }
+            }
         }
     }
 
@@ -470,7 +679,7 @@ impl SparseStructuralUnraveler {
                 .into(),
             ));
         }
-        let actual_child_slots = counts.iter().sum::<u64>();
+        let actual_child_slots = counts.sum()?;
         if actual_child_slots != *num_child_slots {
             return Err(Error::invalid_input_source(
                 format!(
@@ -499,6 +708,9 @@ impl SparseStructuralUnraveler {
             return Ok(());
         }
 
+        let non_empty_positions = non_empty_positions.materialize()?;
+        let counts = counts.materialize()?;
+        let null_positions = null_positions.materialize()?;
         let mut non_empty_iter = non_empty_positions
             .iter()
             .copied()
@@ -1939,7 +2151,11 @@ impl RepDefBuilder {
                 num_values,
             }) => SparseStructuralLayerPlan::Validity {
                 num_slots: num_values as u64,
-                null_positions: Self::null_positions(validity.as_ref(), num_values),
+                null_positions: SparsePositionSet::from_positions(
+                    Self::null_positions(validity.as_ref(), num_values),
+                    num_values as u64,
+                    "validity null",
+                )?,
             },
             RawRepDef::Fsl(FslDesc {
                 validity,
@@ -1948,7 +2164,11 @@ impl RepDefBuilder {
             }) => SparseStructuralLayerPlan::FixedSizeList {
                 num_slots: num_values as u64,
                 dimension: dimension as u64,
-                null_positions: Self::null_positions(validity.as_ref(), num_values),
+                null_positions: SparsePositionSet::from_positions(
+                    Self::null_positions(validity.as_ref(), num_values),
+                    num_values as u64,
+                    "fixed-size-list null",
+                )?,
             },
             RawRepDef::Offsets(OffsetDesc {
                 offsets,
@@ -1977,17 +2197,20 @@ impl RepDefBuilder {
                         })?);
                     }
                 }
-                let constant_count = counts
-                    .first()
-                    .copied()
-                    .filter(|first| counts.iter().all(|count| count == first));
                 SparseStructuralLayerPlan::List {
                     num_slots: num_values as u64,
                     num_child_slots: *offsets.last().unwrap() as u64,
-                    non_empty_positions,
-                    counts,
-                    constant_count,
-                    null_positions,
+                    non_empty_positions: SparsePositionSet::from_positions(
+                        non_empty_positions,
+                        num_values as u64,
+                        "list non-empty",
+                    )?,
+                    counts: SparseCountSet::from_counts(counts),
+                    null_positions: SparsePositionSet::from_positions(
+                        null_positions,
+                        num_values as u64,
+                        "list null",
+                    )?,
                 }
             }
         })

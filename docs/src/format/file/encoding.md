@@ -343,6 +343,19 @@ The value buffers are still mini-block compressed. The structural layers are sto
 Valid empty list slots are not stored in the non-empty positions. They are represented by their absence from both the
 non-empty positions and null positions for that list layer.
 
+Sparse structural sets are semantic, not necessarily materialized position arrays. Position sets are encoded as one of:
+
+- empty: no slot is selected
+- all: every slot in the layer domain is selected
+- range: one contiguous slot range is selected
+- explicit: a delta-compressed `u64` position buffer
+
+List counts are encoded as one of:
+
+- empty: there are no non-empty list slots
+- constant: every non-empty list slot has the same child count
+- explicit: a compressed `u64` count buffer
+
 #### Selection and Compatibility
 
 Writers may emit sparse layout only for file versions 2.3 and later. Explicit sparse selection is requested with field
@@ -369,10 +382,14 @@ Buffer 0 stores one 8-byte entry per value chunk. The first 4 bytes store the ch
 second 4 bytes store the number of visible values in the chunk. The sum of chunk value counts must match
 `SparseLayout.num_visible_items`, and the sum of chunk byte sizes must exactly match the value buffer size.
 
-Structural position buffers store delta-encoded `u64` positions. Positions must be strictly increasing after delta
-decoding and must be within the layer's parent slot domain. List count buffers store `u64` child counts for each
-non-empty list slot. If all non-empty lists have the same length then `constant_count` is used instead of a count
-buffer.
+Structural position buffers are present only for explicit position sets. They store delta-encoded `u64` positions.
+Positions must be strictly increasing after delta decoding and must be within the layer's parent slot domain. List count
+buffers are present only for explicit count sets. They store `u64` child counts for each non-empty list slot.
+
+`SparseStructuralLayer.non_empty_positions`, `SparseStructuralLayer.counts`, and
+`SparseStructuralLayer.null_positions` are the canonical structural representation. `LIST` layers require
+`non_empty_positions`, `counts`, and `null_positions`; `VALIDITY` layers require only `null_positions`;
+`FIXED_SIZE_LIST` layers require `null_positions` and `fixed_size_list_dimension`.
 
 #### Protobuf
 
@@ -385,9 +402,9 @@ buffer.
 ```
 
 The `value_compression` field is required. The physical page buffer list must match the structural layer metadata:
-each non-zero position/count cardinality requires exactly one corresponding compressed structural buffer, and zero
-cardinality layers must not include an unused compression descriptor. Readers should reject malformed sparse pages with
-a format error.
+each explicit position/count set requires exactly one corresponding compressed structural buffer, and empty/all/range or
+constant sets must not include an unused compression descriptor. Readers should reject malformed sparse pages with a
+format error.
 
 ### Constant Page Layout
 

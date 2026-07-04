@@ -182,7 +182,7 @@ message SparseStructuralLayer {
     SPARSE_LAYER_VALIDITY = 1;
     // A list-like layer. Non-empty parent slots map to child ranges; missing valid slots are empty.
     SPARSE_LAYER_LIST = 2;
-    // A fixed-size-list layer. Child ranges are deterministic from constant_count.
+    // A fixed-size-list layer. Child ranges are deterministic from fixed_size_list_dimension.
     SPARSE_LAYER_FIXED_SIZE_LIST = 3;
   }
 
@@ -192,19 +192,59 @@ message SparseStructuralLayer {
   // Number of slots in this layer's child domain after this layer is applied. For validity
   // layers this matches num_slots because Arrow child slot numbering is unchanged.
   uint64 num_child_slots = 3;
-  // For LIST, this is the child count for every non-empty slot when count_compression is absent.
-  // For FIXED_SIZE_LIST, this is the fixed list dimension.
-  uint64 constant_count = 4;
-  // Delta-compressed u64 positions for non-empty LIST slots. Absent for non-list layers.
-  CompressiveEncoding non_empty_compression = 5;
-  // Number of non-empty LIST positions.
-  uint64 num_non_empty = 6;
-  // Optional compressed u64 child counts for non-empty LIST slots.
-  CompressiveEncoding count_compression = 7;
-  // Optional delta-compressed u64 null positions for nullable layers.
-  CompressiveEncoding null_compression = 8;
-  // Number of null positions.
-  uint64 num_nulls = 9;
+  // Semantic representation for non-empty LIST slots. Required for LIST and absent otherwise.
+  SparsePositionSet non_empty_positions = 4;
+  // Semantic representation for LIST child counts. Required for LIST and absent otherwise.
+  SparseCountSet counts = 5;
+  // Semantic representation for null slots. Required for all sparse structural layers.
+  SparsePositionSet null_positions = 6;
+  // Fixed list dimension. Required for FIXED_SIZE_LIST and zero otherwise.
+  uint64 fixed_size_list_dimension = 7;
+}
+
+message SparsePositionEmpty {}
+
+message SparsePositionAll {}
+
+message SparsePositionRange {
+  // First position in the layer slot domain.
+  uint64 start = 1;
+  // Number of positions in the contiguous range.
+  uint64 length = 2;
+}
+
+message SparsePositionSet {
+  oneof positions {
+    // Delta-compressed u64 positions. Cardinality comes from num_positions.
+    CompressiveEncoding explicit = 1;
+    // A contiguous non-empty position range.
+    SparsePositionRange range = 2;
+    // Every slot in the layer domain is present.
+    SparsePositionAll all = 3;
+    // No slots are present.
+    SparsePositionEmpty empty = 4;
+  }
+  // Number of selected positions. For explicit sets this is the number of compressed u64
+  // positions. For empty/all/range sets this must match the semantic cardinality.
+  uint64 num_positions = 5;
+}
+
+message SparseCountEmpty {}
+
+message SparseCountConstant {
+  // Child count for every selected non-empty LIST slot.
+  uint64 value = 1;
+}
+
+message SparseCountSet {
+  oneof counts {
+    // Compressed u64 child counts. Cardinality is the containing LIST layer's non-empty position count.
+    CompressiveEncoding explicit = 1;
+    // A single child count for every non-empty LIST slot.
+    SparseCountConstant constant = 2;
+    // No counts; only valid when the containing LIST layer has no non-empty positions.
+    SparseCountEmpty empty = 3;
+  }
 }
 
 // A layout used for pages where all (visible) values are the same scalar value.

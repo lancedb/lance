@@ -61,8 +61,8 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        MiniBlockRepDefBudget, RepDefSlicer, SerializedRepDefs, SparseStructuralLayerPlan,
-        SparseStructuralPlan, build_control_word_iterator,
+        MiniBlockRepDefBudget, RepDefSlicer, SerializedRepDefs, SparseCountSet, SparsePositionSet,
+        SparseStructuralLayerPlan, SparseStructuralPlan, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -677,28 +677,53 @@ impl Clone for LoadedChunk {
 }
 
 #[derive(Debug, Clone)]
+enum SparsePositionSetDecoder {
+    Empty,
+    All {
+        len: u64,
+    },
+    Range {
+        start: u64,
+        len: u64,
+    },
+    Explicit {
+        decompressor: Arc<dyn BlockDecompressor>,
+        count: u64,
+        domain_len: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum SparseCountSetDecoder {
+    Empty,
+    Constant {
+        value: u64,
+        len: u64,
+    },
+    Explicit {
+        decompressor: Arc<dyn BlockDecompressor>,
+        count: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
 enum SparseLayerDecompressors {
     Validity {
         num_slots: u64,
-        null_decompressor: Option<Arc<dyn BlockDecompressor>>,
-        num_nulls: u64,
+        null_positions: SparsePositionSetDecoder,
     },
     List {
         num_slots: u64,
         num_child_slots: u64,
-        non_empty_decompressor: Option<Arc<dyn BlockDecompressor>>,
-        num_non_empty: u64,
-        count_decompressor: Option<Arc<dyn BlockDecompressor>>,
-        constant_count: u64,
-        null_decompressor: Option<Arc<dyn BlockDecompressor>>,
-        num_nulls: u64,
+        non_empty_positions: SparsePositionSetDecoder,
+        counts: SparseCountSetDecoder,
+        null_positions: SparsePositionSetDecoder,
     },
     FixedSizeList {
         num_slots: u64,
         num_child_slots: u64,
         dimension: u64,
-        null_decompressor: Option<Arc<dyn BlockDecompressor>>,
-        num_nulls: u64,
+        null_positions: SparsePositionSetDecoder,
     },
 }
 
@@ -718,7 +743,7 @@ impl DeepSizeOf for SparseStructuralCacheableState {
             .iter()
             .map(|layer| match layer {
                 SparseStructuralLayerPlan::Validity { null_positions, .. } => {
-                    null_positions.len() * std::mem::size_of::<u64>()
+                    null_positions.deep_size()
                 }
                 SparseStructuralLayerPlan::List {
                     non_empty_positions,
@@ -726,11 +751,12 @@ impl DeepSizeOf for SparseStructuralCacheableState {
                     null_positions,
                     ..
                 } => {
-                    (non_empty_positions.len() + counts.len() + null_positions.len())
-                        * std::mem::size_of::<u64>()
+                    non_empty_positions.deep_size()
+                        + counts.deep_size()
+                        + null_positions.deep_size()
                 }
                 SparseStructuralLayerPlan::FixedSizeList { null_positions, .. } => {
-                    null_positions.len() * std::mem::size_of::<u64>()
+                    null_positions.deep_size()
                 }
             })
             .sum::<usize>();
@@ -838,40 +864,6 @@ impl SparseStructuralScheduler {
             })
     }
 
-    fn count_optional_buffer(
-        compression: &Option<CompressiveEncoding>,
-        count: u64,
-        label: &str,
-    ) -> Result<usize> {
-        if count == 0 {
-            if compression.is_some() {
-                return Err(Error::invalid_input_source(
-                    format!("Sparse structural {label} has compression but no values").into(),
-                ));
-            }
-            return Ok(0);
-        }
-        let compression = compression.as_ref().ok_or_else(|| {
-            Error::invalid_input_source(
-                format!("Sparse structural {label} has values but no compression").into(),
-            )
-        })?;
-        Self::validate_compression(compression, label)?;
-        Ok(1)
-    }
-
-    fn reject_optional_buffer(
-        compression: &Option<CompressiveEncoding>,
-        label: &str,
-    ) -> Result<()> {
-        if compression.is_some() {
-            return Err(Error::invalid_input_source(
-                format!("Sparse structural {label} is not valid for this layer").into(),
-            ));
-        }
-        Ok(())
-    }
-
     fn checked_buffer_range(position: u64, size: u64, label: &str) -> Result<Range<u64>> {
         let end = position.checked_add(size).ok_or_else(|| {
             Error::invalid_input_source(
@@ -879,6 +871,294 @@ impl SparseStructuralScheduler {
             )
         })?;
         Ok(position..end)
+    }
+
+    fn require_position_set<'a>(
+        set: &'a Option<pb21::SparsePositionSet>,
+        label: &str,
+    ) -> Result<&'a pb21::SparsePositionSet> {
+        set.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} position set is required").into(),
+            )
+        })
+    }
+
+    fn require_count_set<'a>(
+        set: &'a Option<pb21::SparseCountSet>,
+        label: &str,
+    ) -> Result<&'a pb21::SparseCountSet> {
+        set.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} count set is required").into(),
+            )
+        })
+    }
+
+    fn reject_position_set(set: &Option<pb21::SparsePositionSet>, label: &str) -> Result<()> {
+        if set.is_some() {
+            return Err(Error::invalid_input_source(
+                format!("Sparse structural {label} position set is not valid for this layer")
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_count_set(set: &Option<pb21::SparseCountSet>, label: &str) -> Result<()> {
+        if set.is_some() {
+            return Err(Error::invalid_input_source(
+                format!("Sparse structural {label} count set is not valid for this layer").into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn position_cardinality(
+        position_set: &pb21::SparsePositionSet,
+        domain_len: u64,
+        label: &str,
+    ) -> Result<u64> {
+        let positions = position_set.positions.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} position set is missing its variant").into(),
+            )
+        })?;
+        let cardinality = position_set.num_positions;
+        if cardinality > domain_len {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} cardinality {} exceeds domain {}",
+                    cardinality, domain_len
+                )
+                .into(),
+            ));
+        }
+        match positions {
+            pb21::sparse_position_set::Positions::Empty(_) => {
+                if cardinality != 0 {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} empty set has cardinality {}",
+                            cardinality
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            pb21::sparse_position_set::Positions::All(_) => {
+                if cardinality != domain_len {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} all set has cardinality {}, expected {}",
+                            cardinality, domain_len
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            pb21::sparse_position_set::Positions::Range(range) => {
+                let end = range.start.checked_add(range.length).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!("Sparse structural {label} range overflows").into(),
+                    )
+                })?;
+                if range.length != cardinality || end > domain_len {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} range {}..{} does not match cardinality {} in domain {}",
+                            range.start, end, cardinality, domain_len
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            pb21::sparse_position_set::Positions::Explicit(compression) => {
+                if cardinality == 0 {
+                    return Err(Error::invalid_input_source(
+                        format!("Sparse structural {label} has compression but no values").into(),
+                    ));
+                }
+                Self::validate_compression(compression, label)?;
+            }
+        }
+        Ok(cardinality)
+    }
+
+    fn position_buffer_count(
+        position_set: &pb21::SparsePositionSet,
+        domain_len: u64,
+        label: &str,
+    ) -> Result<usize> {
+        Self::position_cardinality(position_set, domain_len, label)?;
+        let positions = position_set.positions.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} position set is missing its variant").into(),
+            )
+        })?;
+        Ok(usize::from(matches!(
+            positions,
+            pb21::sparse_position_set::Positions::Explicit(_)
+        )))
+    }
+
+    fn count_buffer_count(
+        count_set: &pb21::SparseCountSet,
+        cardinality: u64,
+        label: &str,
+    ) -> Result<usize> {
+        let counts = count_set.counts.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} count set is missing its variant").into(),
+            )
+        })?;
+        match counts {
+            pb21::sparse_count_set::Counts::Empty(_) => {
+                if cardinality != 0 {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} empty count set has cardinality {}",
+                            cardinality
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(0)
+            }
+            pb21::sparse_count_set::Counts::Constant(constant) => {
+                if cardinality == 0 {
+                    return Err(Error::invalid_input_source(
+                        format!("Sparse structural {label} constant count has no values").into(),
+                    ));
+                }
+                if constant.value == 0 {
+                    return Err(Error::invalid_input_source(
+                        format!("Sparse structural {label} constant count is zero").into(),
+                    ));
+                }
+                Ok(0)
+            }
+            pb21::sparse_count_set::Counts::Explicit(compression) => {
+                if cardinality == 0 {
+                    return Err(Error::invalid_input_source(
+                        format!("Sparse structural {label} has compression but no values").into(),
+                    ));
+                }
+                Self::validate_compression(compression, label)?;
+                Ok(1)
+            }
+        }
+    }
+
+    fn count_set_child_slots(
+        count_set: &pb21::SparseCountSet,
+        cardinality: u64,
+        label: &str,
+    ) -> Result<Option<u64>> {
+        let counts = count_set.counts.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} count set is missing its variant").into(),
+            )
+        })?;
+        match counts {
+            pb21::sparse_count_set::Counts::Empty(_) => Ok(Some(0)),
+            pb21::sparse_count_set::Counts::Constant(constant) => constant
+                .value
+                .checked_mul(cardinality)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} constant count sum overflows: value={}, len={}",
+                            constant.value, cardinality
+                        )
+                        .into(),
+                    )
+                }),
+            pb21::sparse_count_set::Counts::Explicit(_) => Ok(None),
+        }
+    }
+
+    fn create_position_decompressor(
+        compression: &CompressiveEncoding,
+        label: &str,
+        decompressors: &dyn DecompressionStrategy,
+    ) -> Result<Arc<dyn BlockDecompressor>> {
+        let compression = Self::validate_compression(compression, label)?;
+        decompressors
+            .create_block_decompressor(compression)
+            .map(Arc::from)
+    }
+
+    fn position_set_decoder(
+        position_set: &pb21::SparsePositionSet,
+        domain_len: u64,
+        label: &str,
+        decompressors: &dyn DecompressionStrategy,
+    ) -> Result<(SparsePositionSetDecoder, u64)> {
+        let cardinality = Self::position_cardinality(position_set, domain_len, label)?;
+        let positions = position_set.positions.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} position set is missing its variant").into(),
+            )
+        })?;
+        Ok((
+            match positions {
+                pb21::sparse_position_set::Positions::Empty(_) => SparsePositionSetDecoder::Empty,
+                pb21::sparse_position_set::Positions::All(_) => {
+                    SparsePositionSetDecoder::All { len: domain_len }
+                }
+                pb21::sparse_position_set::Positions::Range(range) => {
+                    SparsePositionSetDecoder::Range {
+                        start: range.start,
+                        len: range.length,
+                    }
+                }
+                pb21::sparse_position_set::Positions::Explicit(compression) => {
+                    SparsePositionSetDecoder::Explicit {
+                        decompressor: Self::create_position_decompressor(
+                            compression,
+                            label,
+                            decompressors,
+                        )?,
+                        count: cardinality,
+                        domain_len,
+                    }
+                }
+            },
+            cardinality,
+        ))
+    }
+
+    fn count_set_decoder(
+        count_set: &pb21::SparseCountSet,
+        cardinality: u64,
+        label: &str,
+        decompressors: &dyn DecompressionStrategy,
+    ) -> Result<SparseCountSetDecoder> {
+        Self::count_buffer_count(count_set, cardinality, label)?;
+        let counts = count_set.counts.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} count set is missing its variant").into(),
+            )
+        })?;
+        Ok(match counts {
+            pb21::sparse_count_set::Counts::Empty(_) => SparseCountSetDecoder::Empty,
+            pb21::sparse_count_set::Counts::Constant(constant) => SparseCountSetDecoder::Constant {
+                value: constant.value,
+                len: cardinality,
+            },
+            pb21::sparse_count_set::Counts::Explicit(compression) => {
+                SparseCountSetDecoder::Explicit {
+                    decompressor: Self::create_position_decompressor(
+                        compression,
+                        label,
+                        decompressors,
+                    )?,
+                    count: cardinality,
+                }
+            }
+        })
     }
 
     fn structural_buffer_count(layers: &[pb21::SparseStructuralLayer]) -> Result<usize> {
@@ -895,104 +1175,78 @@ impl SparseStructuralScheduler {
                             .into(),
                         ));
                     }
-                    if layer.constant_count != 0 || layer.num_non_empty != 0 {
+                    if layer.fixed_size_list_dimension != 0 {
                         return Err(Error::invalid_input_source(
-                            "Sparse structural validity layer has list-only metadata".into(),
+                            "Sparse structural validity layer has fixed-size-list dimension".into(),
                         ));
                     }
-                    Self::reject_optional_buffer(
-                        &layer.non_empty_compression,
+                    Self::reject_position_set(
+                        &layer.non_empty_positions,
                         "validity non-empty positions",
                     )?;
-                    Self::reject_optional_buffer(&layer.count_compression, "validity counts")?;
-                    count += Self::count_optional_buffer(
-                        &layer.null_compression,
-                        layer.num_nulls,
+                    Self::reject_count_set(&layer.counts, "validity counts")?;
+                    let null_positions =
+                        Self::require_position_set(&layer.null_positions, "validity null")?;
+                    count += Self::position_buffer_count(
+                        null_positions,
+                        layer.num_slots,
                         "validity null positions",
                     )?;
                 }
                 pb21::sparse_structural_layer::Kind::SparseLayerList => {
-                    count += Self::count_optional_buffer(
-                        &layer.non_empty_compression,
-                        layer.num_non_empty,
+                    if layer.fixed_size_list_dimension != 0 {
+                        return Err(Error::invalid_input_source(
+                            "Sparse structural list layer has fixed-size-list dimension".into(),
+                        ));
+                    }
+                    let non_empty_positions =
+                        Self::require_position_set(&layer.non_empty_positions, "list non-empty")?;
+                    let num_non_empty = Self::position_cardinality(
+                        non_empty_positions,
+                        layer.num_slots,
                         "list non-empty positions",
                     )?;
-                    if layer.num_non_empty > 0
-                        && layer.count_compression.is_none()
-                        && layer.constant_count == 0
+                    count += Self::position_buffer_count(
+                        non_empty_positions,
+                        layer.num_slots,
+                        "list non-empty positions",
+                    )?;
+                    let counts = Self::require_count_set(&layer.counts, "list counts")?;
+                    count += Self::count_buffer_count(counts, num_non_empty, "list counts")?;
+                    if let Some(child_slots) =
+                        Self::count_set_child_slots(counts, num_non_empty, "list counts")?
+                        && child_slots != layer.num_child_slots
                     {
                         return Err(Error::invalid_input_source(
-                            "Sparse structural list has non-empty positions but no count compression or constant count".into(),
+                            format!(
+                                "Sparse structural list count sum {} does not match child slots {}",
+                                child_slots, layer.num_child_slots
+                            )
+                            .into(),
                         ));
                     }
-                    if layer.num_non_empty == 0 && layer.constant_count != 0 {
-                        return Err(Error::invalid_input_source(
-                            "Sparse structural list has constant count but no non-empty positions"
-                                .into(),
-                        ));
-                    }
-                    if layer.count_compression.is_some() && layer.constant_count != 0 {
-                        return Err(Error::invalid_input_source(
-                            "Sparse structural list has both count compression and constant count"
-                                .into(),
-                        ));
-                    }
-                    if layer.constant_count != 0 {
-                        let expected_child_slots = layer
-                            .num_non_empty
-                            .checked_mul(layer.constant_count)
-                            .ok_or_else(|| {
-                                Error::invalid_input_source(
-                                    format!(
-                                        "Sparse structural list child slot count overflows: non_empty={}, constant_count={}",
-                                        layer.num_non_empty, layer.constant_count
-                                    )
-                                    .into(),
-                                )
-                            })?;
-                        if expected_child_slots != layer.num_child_slots {
-                            return Err(Error::invalid_input_source(
-                                format!(
-                                    "Sparse structural list child slot count {} does not match non-empty slots {} * constant count {}",
-                                    layer.num_child_slots, layer.num_non_empty, layer.constant_count
-                                )
-                                .into(),
-                            ));
-                        }
-                    } else {
-                        count += Self::count_optional_buffer(
-                            &layer.count_compression,
-                            layer.num_non_empty,
-                            "list counts",
-                        )?;
-                    }
-                    count += Self::count_optional_buffer(
-                        &layer.null_compression,
-                        layer.num_nulls,
+                    let null_positions =
+                        Self::require_position_set(&layer.null_positions, "list null")?;
+                    count += Self::position_buffer_count(
+                        null_positions,
+                        layer.num_slots,
                         "list null positions",
                     )?;
                 }
                 pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList => {
-                    if layer.num_non_empty != 0 {
-                        return Err(Error::invalid_input_source(
-                            "Sparse structural fixed-size-list layer has list-only metadata"
-                                .into(),
-                        ));
-                    }
-                    Self::reject_optional_buffer(
-                        &layer.non_empty_compression,
+                    Self::reject_position_set(
+                        &layer.non_empty_positions,
                         "fixed-size-list non-empty positions",
                     )?;
-                    Self::reject_optional_buffer(
-                        &layer.count_compression,
-                        "fixed-size-list counts",
-                    )?;
-                    let expected_child_slots =
-                        layer.num_slots.checked_mul(layer.constant_count).ok_or_else(|| {
+                    Self::reject_count_set(&layer.counts, "fixed-size-list counts")?;
+                    let expected_child_slots = layer
+                        .num_slots
+                        .checked_mul(layer.fixed_size_list_dimension)
+                        .ok_or_else(|| {
                             Error::invalid_input_source(
                                 format!(
                                     "Sparse structural fixed-size-list child slot count overflows: slots={}, dimension={}",
-                                    layer.num_slots, layer.constant_count
+                                    layer.num_slots, layer.fixed_size_list_dimension
                                 )
                                 .into(),
                             )
@@ -1001,14 +1255,18 @@ impl SparseStructuralScheduler {
                         return Err(Error::invalid_input_source(
                             format!(
                                 "Sparse structural fixed-size-list child slot count {} does not match slots {} * dimension {}",
-                                layer.num_child_slots, layer.num_slots, layer.constant_count
+                                layer.num_child_slots, layer.num_slots, layer.fixed_size_list_dimension
                             )
                             .into(),
                         ));
                     }
-                    count += Self::count_optional_buffer(
-                        &layer.null_compression,
-                        layer.num_nulls,
+                    let null_positions = Self::require_position_set(
+                        &layer.null_positions,
+                        "fixed-size-list null",
+                    )?;
+                    count += Self::position_buffer_count(
+                        null_positions,
+                        layer.num_slots,
                         "fixed-size-list null positions",
                     )?;
                 }
@@ -1026,65 +1284,67 @@ impl SparseStructuralScheduler {
         layer: &pb21::SparseStructuralLayer,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<SparseLayerDecompressors> {
-        let null_decompressor = layer
-            .null_compression
-            .as_ref()
-            .map(|compression| {
-                let compression = Self::validate_compression(compression, "null positions")?;
-                decompressors
-                    .create_block_decompressor(compression)
-                    .map(Arc::from)
-            })
-            .transpose()?;
         let kind = pb21::sparse_structural_layer::Kind::try_from(layer.kind)?;
         Ok(match kind {
             pb21::sparse_structural_layer::Kind::SparseLayerValidity => {
+                let null_positions =
+                    Self::require_position_set(&layer.null_positions, "validity null")?;
+                let (null_positions, _) = Self::position_set_decoder(
+                    null_positions,
+                    layer.num_slots,
+                    "validity null positions",
+                    decompressors,
+                )?;
                 SparseLayerDecompressors::Validity {
                     num_slots: layer.num_slots,
-                    null_decompressor,
-                    num_nulls: layer.num_nulls,
+                    null_positions,
                 }
             }
             pb21::sparse_structural_layer::Kind::SparseLayerList => {
-                let non_empty_decompressor = layer
-                    .non_empty_compression
-                    .as_ref()
-                    .map(|compression| {
-                        let compression =
-                            Self::validate_compression(compression, "list non-empty positions")?;
-                        decompressors
-                            .create_block_decompressor(compression)
-                            .map(Arc::from)
-                    })
-                    .transpose()?;
-                let count_decompressor = layer
-                    .count_compression
-                    .as_ref()
-                    .map(|compression| {
-                        let compression = Self::validate_compression(compression, "list counts")?;
-                        decompressors
-                            .create_block_decompressor(compression)
-                            .map(Arc::from)
-                    })
-                    .transpose()?;
+                let non_empty_positions =
+                    Self::require_position_set(&layer.non_empty_positions, "list non-empty")?;
+                let (non_empty_positions, num_non_empty) = Self::position_set_decoder(
+                    non_empty_positions,
+                    layer.num_slots,
+                    "list non-empty positions",
+                    decompressors,
+                )?;
+                let counts = Self::count_set_decoder(
+                    Self::require_count_set(&layer.counts, "list counts")?,
+                    num_non_empty,
+                    "list counts",
+                    decompressors,
+                )?;
+                let null_positions =
+                    Self::require_position_set(&layer.null_positions, "list null")?;
+                let (null_positions, _) = Self::position_set_decoder(
+                    null_positions,
+                    layer.num_slots,
+                    "list null positions",
+                    decompressors,
+                )?;
                 SparseLayerDecompressors::List {
                     num_slots: layer.num_slots,
                     num_child_slots: layer.num_child_slots,
-                    non_empty_decompressor,
-                    num_non_empty: layer.num_non_empty,
-                    count_decompressor,
-                    constant_count: layer.constant_count,
-                    null_decompressor,
-                    num_nulls: layer.num_nulls,
+                    non_empty_positions,
+                    counts,
+                    null_positions,
                 }
             }
             pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList => {
+                let null_positions =
+                    Self::require_position_set(&layer.null_positions, "fixed-size-list null")?;
+                let (null_positions, _) = Self::position_set_decoder(
+                    null_positions,
+                    layer.num_slots,
+                    "fixed-size-list null positions",
+                    decompressors,
+                )?;
                 SparseLayerDecompressors::FixedSizeList {
                     num_slots: layer.num_slots,
                     num_child_slots: layer.num_child_slots,
-                    dimension: layer.constant_count,
-                    null_decompressor,
-                    num_nulls: layer.num_nulls,
+                    dimension: layer.fixed_size_list_dimension,
+                    null_positions,
                 }
             }
             pb21::sparse_structural_layer::Kind::SparseLayerUnspecified => {
@@ -1220,26 +1480,13 @@ impl SparseStructuralScheduler {
         Ok(values.to_vec())
     }
 
-    fn decode_positions(
-        decompressor: Option<&Arc<dyn BlockDecompressor>>,
-        data: Option<Bytes>,
+    fn decode_explicit_positions(
+        decompressor: &Arc<dyn BlockDecompressor>,
+        data: Bytes,
         num_positions: u64,
         num_slots: u64,
         label: &str,
-    ) -> Result<Vec<u64>> {
-        if num_positions == 0 {
-            return Ok(Vec::new());
-        }
-        let decompressor = decompressor.ok_or_else(|| {
-            Error::invalid_input_source(
-                format!("Sparse structural {label} has positions but no compression").into(),
-            )
-        })?;
-        let data = data.ok_or_else(|| {
-            Error::invalid_input_source(
-                format!("Sparse structural {label} is missing its position buffer").into(),
-            )
-        })?;
+    ) -> Result<SparsePositionSet> {
         let deltas = Self::decode_u64_values(decompressor.as_ref(), data, num_positions, label)?;
         let mut positions = Vec::with_capacity(deltas.len());
         let mut current = 0_u64;
@@ -1270,7 +1517,57 @@ impl SparseStructuralScheduler {
             }
             positions.push(current);
         }
-        Ok(positions)
+        SparsePositionSet::from_positions(positions, num_slots, label)
+    }
+
+    fn decode_position_set(
+        decoder: &SparsePositionSetDecoder,
+        buffers: &mut impl Iterator<Item = Bytes>,
+        label: &str,
+    ) -> Result<SparsePositionSet> {
+        match decoder {
+            SparsePositionSetDecoder::Empty => Ok(SparsePositionSet::empty()),
+            SparsePositionSetDecoder::All { len } => Ok(SparsePositionSet::all(*len)),
+            SparsePositionSetDecoder::Range { start, len } => {
+                Ok(SparsePositionSet::range(*start, *len))
+            }
+            SparsePositionSetDecoder::Explicit {
+                decompressor,
+                count,
+                domain_len,
+            } => Self::decode_explicit_positions(
+                decompressor,
+                Self::next_structural_buffer(buffers, label)?,
+                *count,
+                *domain_len,
+                label,
+            ),
+        }
+    }
+
+    fn decode_count_set(
+        decoder: &SparseCountSetDecoder,
+        buffers: &mut impl Iterator<Item = Bytes>,
+        label: &str,
+    ) -> Result<SparseCountSet> {
+        match decoder {
+            SparseCountSetDecoder::Empty => Ok(SparseCountSet::Empty),
+            SparseCountSetDecoder::Constant { value, len } => {
+                Ok(SparseCountSet::constant(*value, *len))
+            }
+            SparseCountSetDecoder::Explicit {
+                decompressor,
+                count,
+            } => {
+                let counts = Self::decode_u64_values(
+                    decompressor.as_ref(),
+                    Self::next_structural_buffer(buffers, label)?,
+                    *count,
+                    label,
+                )?;
+                Ok(SparseCountSet::from_counts(counts))
+            }
+        }
     }
 
     fn next_structural_buffer(
@@ -1284,18 +1581,6 @@ impl SparseStructuralScheduler {
         })
     }
 
-    fn optional_structural_buffer(
-        buffers: &mut impl Iterator<Item = Bytes>,
-        needed: bool,
-        label: &str,
-    ) -> Result<Option<Bytes>> {
-        if needed {
-            Self::next_structural_buffer(buffers, label).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
     fn decode_layer(
         layer: &SparseLayerDecompressors,
         buffers: &mut impl Iterator<Item = Bytes>,
@@ -1303,71 +1588,31 @@ impl SparseStructuralScheduler {
         Ok(match layer {
             SparseLayerDecompressors::Validity {
                 num_slots,
-                null_decompressor,
-                num_nulls,
+                null_positions,
             } => SparseStructuralLayerPlan::Validity {
                 num_slots: *num_slots,
-                null_positions: Self::decode_positions(
-                    null_decompressor.as_ref(),
-                    Self::optional_structural_buffer(
-                        buffers,
-                        *num_nulls > 0,
-                        "validity null positions",
-                    )?,
-                    *num_nulls,
-                    *num_slots,
+                null_positions: Self::decode_position_set(
+                    null_positions,
+                    buffers,
                     "validity null positions",
                 )?,
             },
             SparseLayerDecompressors::List {
                 num_slots,
                 num_child_slots,
-                non_empty_decompressor,
-                num_non_empty,
-                count_decompressor,
-                constant_count,
-                null_decompressor,
-                num_nulls,
+                non_empty_positions,
+                counts,
+                null_positions,
             } => {
-                let non_empty_positions = Self::decode_positions(
-                    non_empty_decompressor.as_ref(),
-                    Self::optional_structural_buffer(
-                        buffers,
-                        *num_non_empty > 0,
-                        "list non-empty positions",
-                    )?,
-                    *num_non_empty,
-                    *num_slots,
+                let non_empty_positions = Self::decode_position_set(
+                    non_empty_positions,
+                    buffers,
                     "list non-empty positions",
                 )?;
-                let counts = if let Some(count_decompressor) = count_decompressor {
-                    Self::decode_u64_values(
-                        count_decompressor.as_ref(),
-                        Self::next_structural_buffer(buffers, "list counts")?,
-                        *num_non_empty,
-                        "list counts",
-                    )?
-                } else {
-                    vec![*constant_count; *num_non_empty as usize]
-                };
-                let null_positions = Self::decode_positions(
-                    null_decompressor.as_ref(),
-                    Self::optional_structural_buffer(
-                        buffers,
-                        *num_nulls > 0,
-                        "list null positions",
-                    )?,
-                    *num_nulls,
-                    *num_slots,
-                    "list null positions",
-                )?;
-                let actual_child_slots = counts.iter().try_fold(0_u64, |sum, count| {
-                    sum.checked_add(*count).ok_or_else(|| {
-                        Error::invalid_input_source(
-                            "Sparse structural list count sum overflows".into(),
-                        )
-                    })
-                })?;
+                let counts = Self::decode_count_set(counts, buffers, "list counts")?;
+                let null_positions =
+                    Self::decode_position_set(null_positions, buffers, "list null positions")?;
+                let actual_child_slots = counts.sum()?;
                 if actual_child_slots != *num_child_slots {
                     return Err(Error::invalid_input_source(
                         format!(
@@ -1382,7 +1627,6 @@ impl SparseStructuralScheduler {
                     num_child_slots: *num_child_slots,
                     non_empty_positions,
                     counts,
-                    constant_count: (*constant_count > 0).then_some(*constant_count),
                     null_positions,
                 }
             }
@@ -1390,8 +1634,7 @@ impl SparseStructuralScheduler {
                 num_slots,
                 num_child_slots,
                 dimension,
-                null_decompressor,
-                num_nulls,
+                null_positions,
             } => {
                 let expected_child_slots = num_slots.checked_mul(*dimension).ok_or_else(|| {
                     Error::invalid_input_source(
@@ -1414,15 +1657,9 @@ impl SparseStructuralScheduler {
                 SparseStructuralLayerPlan::FixedSizeList {
                     num_slots: *num_slots,
                     dimension: *dimension,
-                    null_positions: Self::decode_positions(
-                        null_decompressor.as_ref(),
-                        Self::optional_structural_buffer(
-                            buffers,
-                            *num_nulls > 0,
-                            "fixed-size-list null positions",
-                        )?,
-                        *num_nulls,
-                        *num_slots,
+                    null_positions: Self::decode_position_set(
+                        null_positions,
+                        buffers,
                         "fixed-size-list null positions",
                     )?,
                 }
@@ -1901,23 +2138,175 @@ struct SparseStructuralSelection {
     leaf_ranges: Vec<Range<u64>>,
 }
 
-fn translate_positions(positions: &[u64], ranges: &[Range<u64>], label: &str) -> Result<Vec<u64>> {
-    let mut translated = Vec::new();
-    let mut output_base = 0_u64;
+struct SparsePositionSelection {
+    positions: SparsePositionSet,
+    ordinal_ranges: Vec<Range<u64>>,
+}
+
+fn validate_slice_ranges(ranges: &[Range<u64>], domain_len: u64, label: &str) -> Result<u64> {
+    let mut total = 0_u64;
     for range in ranges {
-        let mut idx = positions.partition_point(|position| *position < range.start);
-        while idx < positions.len() && positions[idx] < range.end {
-            translated.push(output_base + positions[idx] - range.start);
-            idx += 1;
+        if range.start > range.end || range.end > domain_len {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} slice {}..{} is outside domain {}",
+                    range.start, range.end, domain_len
+                )
+                .into(),
+            ));
         }
-        output_base += range.end - range.start;
+        total = total.checked_add(range.end - range.start).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} slice length overflows").into(),
+            )
+        })?;
     }
-    if translated.windows(2).any(|window| window[0] >= window[1]) {
-        return Err(Error::invalid_input_source(
-            format!("Sparse structural {label} positions are not sorted after slicing").into(),
+    Ok(total)
+}
+
+fn push_coalesced_range(ranges: &mut Vec<Range<u64>>, range: Range<u64>) {
+    if range.is_empty() {
+        return;
+    }
+    if let Some(last) = ranges.last_mut()
+        && last.end == range.start
+    {
+        last.end = range.end;
+        return;
+    }
+    ranges.push(range);
+}
+
+fn position_segments_to_set(
+    segments: Vec<Range<u64>>,
+    output_domain: u64,
+    label: &str,
+) -> Result<SparsePositionSet> {
+    let segments = coalesce_ranges(segments);
+    if segments.is_empty() {
+        return Ok(SparsePositionSet::empty());
+    }
+    if segments.len() == 1 {
+        let segment = &segments[0];
+        if segment.start == 0 && segment.end == output_domain {
+            return Ok(SparsePositionSet::all(output_domain));
+        }
+        return Ok(SparsePositionSet::range(
+            segment.start,
+            segment.end - segment.start,
         ));
     }
-    Ok(translated)
+
+    let total_len = segments
+        .iter()
+        .map(|range| range.end - range.start)
+        .try_fold(0_u64, |sum, len| {
+            sum.checked_add(len).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!("Sparse structural {label} segment length overflows").into(),
+                )
+            })
+        })?;
+    let total_len = usize::try_from(total_len).map_err(|_| {
+        Error::invalid_input_source(
+            format!("Sparse structural {label} segment length exceeds usize::MAX").into(),
+        )
+    })?;
+    let mut positions = Vec::with_capacity(total_len);
+    for segment in segments {
+        positions.extend(segment);
+    }
+    SparsePositionSet::from_positions(positions, output_domain, label)
+}
+
+fn select_position_set(
+    positions: &SparsePositionSet,
+    ranges: &[Range<u64>],
+    domain_len: u64,
+    label: &str,
+) -> Result<SparsePositionSelection> {
+    let output_domain = validate_slice_ranges(ranges, domain_len, label)?;
+    let mut segments = Vec::new();
+    let mut ordinal_ranges = Vec::new();
+    let mut output_base = 0_u64;
+
+    match positions {
+        SparsePositionSet::Empty => {}
+        SparsePositionSet::All { len } => {
+            if *len != domain_len {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Sparse structural {label} all set length {} does not match domain {}",
+                        len, domain_len
+                    )
+                    .into(),
+                ));
+            }
+            for range in ranges {
+                let range_len = range.end - range.start;
+                push_coalesced_range(&mut segments, output_base..output_base + range_len);
+                push_coalesced_range(&mut ordinal_ranges, range.clone());
+                output_base += range_len;
+            }
+        }
+        SparsePositionSet::Range { start, len } => {
+            let source_end = start.checked_add(*len).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!("Sparse structural {label} range overflows").into(),
+                )
+            })?;
+            if source_end > domain_len {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Sparse structural {label} range {}..{} is outside domain {}",
+                        start, source_end, domain_len
+                    )
+                    .into(),
+                ));
+            }
+            for range in ranges {
+                let intersect_start = range.start.max(*start);
+                let intersect_end = range.end.min(source_end);
+                if intersect_start < intersect_end {
+                    let out_start = output_base + intersect_start - range.start;
+                    let out_end = output_base + intersect_end - range.start;
+                    push_coalesced_range(&mut segments, out_start..out_end);
+                    push_coalesced_range(
+                        &mut ordinal_ranges,
+                        intersect_start - *start..intersect_end - *start,
+                    );
+                }
+                output_base += range.end - range.start;
+            }
+        }
+        SparsePositionSet::Explicit(source_positions) => {
+            let mut out_positions = Vec::new();
+            for range in ranges {
+                let idx_start =
+                    source_positions.partition_point(|position| *position < range.start);
+                let idx_end = source_positions.partition_point(|position| *position < range.end);
+                if idx_start < idx_end {
+                    out_positions.extend(
+                        source_positions[idx_start..idx_end]
+                            .iter()
+                            .map(|position| output_base + *position - range.start),
+                    );
+                    push_coalesced_range(&mut ordinal_ranges, idx_start as u64..idx_end as u64);
+                }
+                output_base += range.end - range.start;
+            }
+            let positions = SparsePositionSet::from_positions(out_positions, output_domain, label)?;
+            return Ok(SparsePositionSelection {
+                positions,
+                ordinal_ranges,
+            });
+        }
+    }
+
+    Ok(SparsePositionSelection {
+        positions: position_segments_to_set(segments, output_domain, label)?,
+        ordinal_ranges,
+    })
 }
 
 fn offsets_from_counts(counts: &[u64]) -> Result<Vec<u64>> {
@@ -1953,10 +2342,9 @@ fn coalesce_ranges(ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
 fn slice_list_layer(
     num_slots: u64,
     num_child_slots: u64,
-    non_empty_positions: &[u64],
-    counts: &[u64],
-    constant_count: Option<u64>,
-    null_positions: &[u64],
+    non_empty_positions: &SparsePositionSet,
+    counts: &SparseCountSet,
+    null_positions: &SparsePositionSet,
     ranges: &[Range<u64>],
 ) -> Result<(SparseStructuralLayerPlan, Vec<Range<u64>>)> {
     if non_empty_positions.len() != counts.len() {
@@ -1964,100 +2352,175 @@ fn slice_list_layer(
             "Sparse structural list has mismatched non-empty positions and counts".into(),
         ));
     }
-    if ranges
-        .iter()
-        .any(|range| range.start > range.end || range.end > num_slots)
-    {
+    if counts.sum()? != num_child_slots {
         return Err(Error::invalid_input_source(
             format!(
-                "Sparse structural list slice is outside layer with {} slots",
-                num_slots
+                "Sparse structural list count sum {} does not match child slots {}",
+                counts.sum()?,
+                num_child_slots
             )
             .into(),
         ));
     }
 
-    let mut out_non_empty_positions = Vec::new();
-    let mut out_counts = Vec::new();
-    let mut matched_indices = Vec::new();
-    let mut output_base = 0_u64;
-    for range in ranges {
-        let mut idx = non_empty_positions.partition_point(|position| *position < range.start);
-        while idx < non_empty_positions.len() && non_empty_positions[idx] < range.end {
-            out_non_empty_positions.push(output_base + non_empty_positions[idx] - range.start);
-            out_counts.push(counts[idx]);
-            matched_indices.push(idx);
-            idx += 1;
-        }
-        output_base += range.end - range.start;
-    }
-
-    let child_ranges = if matched_indices.is_empty() {
-        Vec::new()
-    } else if let Some(constant_count) = constant_count {
-        let expected_child_slots =
-            constant_count
-                .checked_mul(counts.len() as u64)
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        "Sparse structural list constant counts overflow child slots".into(),
-                    )
-                })?;
-        if expected_child_slots != num_child_slots {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse structural list constant count sum {} does not match child slots {}",
-                    expected_child_slots, num_child_slots
-                )
-                .into(),
-            ));
-        }
-        matched_indices
-            .iter()
-            .map(|idx| {
-                let start = *idx as u64 * constant_count;
-                start..start + constant_count
-            })
-            .collect()
-    } else {
-        let value_offsets = offsets_from_counts(counts)?;
-        let last_offset = *value_offsets.last().expect_ok()?;
-        if last_offset != num_child_slots {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse structural list count sum {} does not match child slots {}",
-                    last_offset, num_child_slots
-                )
-                .into(),
-            ));
-        }
-        matched_indices
-            .iter()
-            .map(|idx| value_offsets[*idx]..value_offsets[*idx + 1])
-            .collect()
-    };
-
-    let out_null_positions = translate_positions(null_positions, ranges, "list null")?;
+    let non_empty_selection =
+        select_position_set(non_empty_positions, ranges, num_slots, "list non-empty")?;
+    let out_counts = select_count_set(
+        counts,
+        &non_empty_selection.ordinal_ranges,
+        non_empty_selection.positions.len(),
+    )?;
+    let child_ranges =
+        child_ranges_from_counts(counts, num_child_slots, &non_empty_selection.ordinal_ranges)?;
+    let out_null_positions =
+        select_position_set(null_positions, ranges, num_slots, "list null")?.positions;
     let out_num_slots = ranges
         .iter()
         .map(|range| range.end - range.start)
         .sum::<u64>();
-    let out_num_child_slots = out_counts.iter().sum::<u64>();
-    let constant_count = out_counts
-        .first()
-        .copied()
-        .filter(|first| out_counts.iter().all(|count| count == first));
+    let out_num_child_slots = out_counts.sum()?;
     Ok((
         SparseStructuralLayerPlan::List {
             num_slots: out_num_slots,
             num_child_slots: out_num_child_slots,
-            non_empty_positions: out_non_empty_positions,
+            non_empty_positions: non_empty_selection.positions,
             counts: out_counts,
-            constant_count,
             null_positions: out_null_positions,
         },
         child_ranges,
     ))
+}
+
+fn select_count_set(
+    counts: &SparseCountSet,
+    ordinal_ranges: &[Range<u64>],
+    selected_len: u64,
+) -> Result<SparseCountSet> {
+    match counts {
+        SparseCountSet::Empty => {
+            if selected_len != 0 {
+                return Err(Error::invalid_input_source(
+                    "Sparse structural selected non-empty positions but counts are empty".into(),
+                ));
+            }
+            Ok(SparseCountSet::Empty)
+        }
+        SparseCountSet::Constant { value, len } => {
+            validate_ordinal_ranges(ordinal_ranges, *len, "constant list counts")?;
+            Ok(SparseCountSet::constant(*value, selected_len))
+        }
+        SparseCountSet::Explicit(source_counts) => {
+            validate_ordinal_ranges(
+                ordinal_ranges,
+                source_counts.len() as u64,
+                "explicit list counts",
+            )?;
+            let selected_len = usize::try_from(selected_len).map_err(|_| {
+                Error::invalid_input_source(
+                    "Sparse structural selected count length exceeds usize::MAX".into(),
+                )
+            })?;
+            let mut out_counts = Vec::with_capacity(selected_len);
+            for range in ordinal_ranges {
+                let start = usize::try_from(range.start).map_err(|_| {
+                    Error::invalid_input_source(
+                        "Sparse structural count ordinal exceeds usize::MAX".into(),
+                    )
+                })?;
+                let end = usize::try_from(range.end).map_err(|_| {
+                    Error::invalid_input_source(
+                        "Sparse structural count ordinal exceeds usize::MAX".into(),
+                    )
+                })?;
+                out_counts.extend_from_slice(&source_counts[start..end]);
+            }
+            Ok(SparseCountSet::from_counts(out_counts))
+        }
+    }
+}
+
+fn validate_ordinal_ranges(ranges: &[Range<u64>], len: u64, label: &str) -> Result<()> {
+    for range in ranges {
+        if range.start > range.end || range.end > len {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} ordinal range {}..{} is outside {} values",
+                    range.start, range.end, len
+                )
+                .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn child_ranges_from_counts(
+    counts: &SparseCountSet,
+    num_child_slots: u64,
+    ordinal_ranges: &[Range<u64>],
+) -> Result<Vec<Range<u64>>> {
+    if ordinal_ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let child_ranges = match counts {
+        SparseCountSet::Empty => {
+            return Err(Error::invalid_input_source(
+                "Sparse structural selected non-empty positions but counts are empty".into(),
+            ));
+        }
+        SparseCountSet::Constant { value, len } => {
+            let expected_child_slots = value.checked_mul(*len).ok_or_else(|| {
+                Error::invalid_input_source(
+                    "Sparse structural list constant count sum overflows child slots".into(),
+                )
+            })?;
+            if expected_child_slots != num_child_slots {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Sparse structural list constant count sum {} does not match child slots {}",
+                        expected_child_slots, num_child_slots
+                    )
+                    .into(),
+                ));
+            }
+            validate_ordinal_ranges(ordinal_ranges, *len, "constant list counts")?;
+            ordinal_ranges
+                .iter()
+                .map(|range| range.start * value..range.end * value)
+                .collect()
+        }
+        SparseCountSet::Explicit(counts) => {
+            let value_offsets = offsets_from_counts(counts)?;
+            let last_offset = *value_offsets.last().expect_ok()?;
+            if last_offset != num_child_slots {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Sparse structural list count sum {} does not match child slots {}",
+                        last_offset, num_child_slots
+                    )
+                    .into(),
+                ));
+            }
+            validate_ordinal_ranges(ordinal_ranges, counts.len() as u64, "explicit list counts")?;
+            ordinal_ranges
+                .iter()
+                .map(|range| {
+                    let start = usize::try_from(range.start).map_err(|_| {
+                        Error::invalid_input_source(
+                            "Sparse structural count ordinal exceeds usize::MAX".into(),
+                        )
+                    })?;
+                    let end = usize::try_from(range.end).map_err(|_| {
+                        Error::invalid_input_source(
+                            "Sparse structural count ordinal exceeds usize::MAX".into(),
+                        )
+                    })?;
+                    Ok(value_offsets[start]..value_offsets[end])
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    Ok(coalesce_ranges(child_ranges))
 }
 
 fn fsl_parent_ranges_from_child_ranges(
@@ -2097,7 +2560,7 @@ fn slice_sparse_plan(
     for layer in &plan.layers {
         match layer {
             SparseStructuralLayerPlan::Validity {
-                num_slots: _,
+                num_slots,
                 null_positions,
             } => {
                 let out_num_slots = selected_ranges
@@ -2106,11 +2569,13 @@ fn slice_sparse_plan(
                     .sum::<u64>();
                 sliced_layers.push(SparseStructuralLayerPlan::Validity {
                     num_slots: out_num_slots,
-                    null_positions: translate_positions(
+                    null_positions: select_position_set(
                         null_positions,
                         &selected_ranges,
+                        *num_slots,
                         "validity null",
-                    )?,
+                    )?
+                    .positions,
                 });
             }
             SparseStructuralLayerPlan::List {
@@ -2118,7 +2583,6 @@ fn slice_sparse_plan(
                 num_child_slots,
                 non_empty_positions,
                 counts,
-                constant_count,
                 null_positions,
                 ..
             } => {
@@ -2127,7 +2591,6 @@ fn slice_sparse_plan(
                     *num_child_slots,
                     non_empty_positions,
                     counts,
-                    *constant_count,
                     null_positions,
                     &selected_ranges,
                 )?;
@@ -2184,11 +2647,13 @@ fn slice_sparse_plan(
                 sliced_layers.push(SparseStructuralLayerPlan::FixedSizeList {
                     num_slots: out_num_slots,
                     dimension: *dimension,
-                    null_positions: translate_positions(
+                    null_positions: select_position_set(
                         null_positions,
                         &fsl_ranges,
+                        *num_slots,
                         "fixed-size-list null",
-                    )?,
+                    )?
+                    .positions,
                 });
                 selected_ranges = child_ranges;
                 selected_domain = num_child_slots;
@@ -6347,6 +6812,88 @@ impl PrimitiveStructuralEncoder {
         Self::encode_sparse_u64_values(deltas, compression_strategy).map(Some)
     }
 
+    fn encode_sparse_position_set(
+        positions: &SparsePositionSet,
+        compression_strategy: &dyn CompressionStrategy,
+        label: &str,
+    ) -> Result<(Option<LanceBuffer>, pb21::SparsePositionSet)> {
+        let num_positions = positions.len();
+        let (buffer, positions) = match positions {
+            SparsePositionSet::Empty => (
+                None,
+                pb21::sparse_position_set::Positions::Empty(pb21::SparsePositionEmpty {}),
+            ),
+            SparsePositionSet::All { .. } => (
+                None,
+                pb21::sparse_position_set::Positions::All(pb21::SparsePositionAll {}),
+            ),
+            SparsePositionSet::Range { start, len } => (
+                None,
+                pb21::sparse_position_set::Positions::Range(pb21::SparsePositionRange {
+                    start: *start,
+                    length: *len,
+                }),
+            ),
+            SparsePositionSet::Explicit(positions) => {
+                let (buffer, encoding) =
+                    Self::encode_sparse_positions(positions, compression_strategy, label)?
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "Sparse structural {label} explicit set is empty"
+                            ))
+                        })?;
+                (
+                    Some(buffer),
+                    pb21::sparse_position_set::Positions::Explicit(encoding),
+                )
+            }
+        };
+        Ok((
+            buffer,
+            pb21::SparsePositionSet {
+                positions: Some(positions),
+                num_positions,
+            },
+        ))
+    }
+
+    fn encode_sparse_count_set(
+        counts: &SparseCountSet,
+        compression_strategy: &dyn CompressionStrategy,
+    ) -> Result<(Option<LanceBuffer>, pb21::SparseCountSet)> {
+        let (buffer, counts) = match counts {
+            SparseCountSet::Empty => (
+                None,
+                pb21::sparse_count_set::Counts::Empty(pb21::SparseCountEmpty {}),
+            ),
+            SparseCountSet::Constant { value, .. } => (
+                None,
+                pb21::sparse_count_set::Counts::Constant(pb21::SparseCountConstant {
+                    value: *value,
+                }),
+            ),
+            SparseCountSet::Explicit(counts) => {
+                if counts.is_empty() {
+                    return Err(Error::internal(
+                        "Sparse structural explicit count set is empty".to_string(),
+                    ));
+                }
+                let (buffer, encoding) =
+                    Self::encode_sparse_u64_values(counts.clone(), compression_strategy)?;
+                (
+                    Some(buffer),
+                    pb21::sparse_count_set::Counts::Explicit(encoding),
+                )
+            }
+        };
+        Ok((
+            buffer,
+            pb21::SparseCountSet {
+                counts: Some(counts),
+            },
+        ))
+    }
+
     fn encode_sparse_structural_plan(
         plan: &SparseStructuralPlan,
         compression_strategy: &dyn CompressionStrategy,
@@ -6360,25 +6907,22 @@ impl PrimitiveStructuralEncoder {
                     num_slots,
                     null_positions,
                 } => {
-                    let null_compression = Self::encode_sparse_positions(
+                    let (null_buffer, null_positions_pb) = Self::encode_sparse_position_set(
                         null_positions,
                         compression_strategy,
                         "validity null",
-                    )?
-                    .map(|(buffer, encoding)| {
+                    )?;
+                    if let Some(buffer) = null_buffer {
                         buffers.push(buffer);
-                        encoding
-                    });
+                    }
                     layers.push(pb21::SparseStructuralLayer {
                         kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
                         num_slots: *num_slots,
                         num_child_slots: *num_slots,
-                        constant_count: 0,
-                        non_empty_compression: None,
-                        num_non_empty: 0,
-                        count_compression: None,
-                        null_compression,
-                        num_nulls: null_positions.len() as u64,
+                        non_empty_positions: None,
+                        counts: None,
+                        null_positions: Some(null_positions_pb),
+                        fixed_size_list_dimension: 0,
                     });
                 }
                 SparseStructuralLayerPlan::List {
@@ -6386,7 +6930,6 @@ impl PrimitiveStructuralEncoder {
                     num_child_slots,
                     non_empty_positions,
                     counts,
-                    constant_count,
                     null_positions,
                 } => {
                     if non_empty_positions.len() != counts.len() {
@@ -6399,42 +6942,36 @@ impl PrimitiveStructuralEncoder {
                             .into(),
                         ));
                     }
-                    let non_empty_compression = Self::encode_sparse_positions(
-                        non_empty_positions,
-                        compression_strategy,
-                        "list non-empty",
-                    )?
-                    .map(|(buffer, encoding)| {
+                    let (non_empty_buffer, non_empty_positions_pb) =
+                        Self::encode_sparse_position_set(
+                            non_empty_positions,
+                            compression_strategy,
+                            "list non-empty",
+                        )?;
+                    if let Some(buffer) = non_empty_buffer {
                         buffers.push(buffer);
-                        encoding
-                    });
-                    let count_compression = if constant_count.is_some() || counts.is_empty() {
-                        None
-                    } else {
-                        let (buffer, encoding) =
-                            Self::encode_sparse_u64_values(counts.clone(), compression_strategy)?;
+                    }
+                    let (count_buffer, counts_pb) =
+                        Self::encode_sparse_count_set(counts, compression_strategy)?;
+                    if let Some(buffer) = count_buffer {
                         buffers.push(buffer);
-                        Some(encoding)
-                    };
-                    let null_compression = Self::encode_sparse_positions(
+                    }
+                    let (null_buffer, null_positions_pb) = Self::encode_sparse_position_set(
                         null_positions,
                         compression_strategy,
                         "list null",
-                    )?
-                    .map(|(buffer, encoding)| {
+                    )?;
+                    if let Some(buffer) = null_buffer {
                         buffers.push(buffer);
-                        encoding
-                    });
+                    }
                     layers.push(pb21::SparseStructuralLayer {
                         kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
                         num_slots: *num_slots,
                         num_child_slots: *num_child_slots,
-                        constant_count: constant_count.unwrap_or(0),
-                        non_empty_compression,
-                        num_non_empty: non_empty_positions.len() as u64,
-                        count_compression,
-                        null_compression,
-                        num_nulls: null_positions.len() as u64,
+                        non_empty_positions: Some(non_empty_positions_pb),
+                        counts: Some(counts_pb),
+                        null_positions: Some(null_positions_pb),
+                        fixed_size_list_dimension: 0,
                     });
                 }
                 SparseStructuralLayerPlan::FixedSizeList {
@@ -6442,15 +6979,14 @@ impl PrimitiveStructuralEncoder {
                     dimension,
                     null_positions,
                 } => {
-                    let null_compression = Self::encode_sparse_positions(
+                    let (null_buffer, null_positions_pb) = Self::encode_sparse_position_set(
                         null_positions,
                         compression_strategy,
                         "fixed-size-list null",
-                    )?
-                    .map(|(buffer, encoding)| {
+                    )?;
+                    if let Some(buffer) = null_buffer {
                         buffers.push(buffer);
-                        encoding
-                    });
+                    }
                     let num_child_slots = num_slots.checked_mul(*dimension).ok_or_else(|| {
                         Error::invalid_input_source(
                             format!(
@@ -6464,12 +7000,10 @@ impl PrimitiveStructuralEncoder {
                         kind: pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32,
                         num_slots: *num_slots,
                         num_child_slots,
-                        constant_count: *dimension,
-                        non_empty_compression: None,
-                        num_non_empty: 0,
-                        count_compression: None,
-                        null_compression,
-                        num_nulls: null_positions.len() as u64,
+                        non_empty_positions: None,
+                        counts: None,
+                        null_positions: Some(null_positions_pb),
+                        fixed_size_list_dimension: *dimension,
                     });
                 }
             }
@@ -9743,6 +10277,27 @@ mod tests {
         Arc::new(builder.finish())
     }
 
+    fn dense_prefix_sparse_i32_list_array(
+        num_rows: i32,
+        dense_rows: i32,
+        values_per_row: i32,
+    ) -> ArrayRef {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for row in 0..num_rows {
+            if row < dense_rows {
+                for value_idx in 0..values_per_row {
+                    builder
+                        .values()
+                        .append_value(row * values_per_row + value_idx);
+                }
+            }
+            builder.append(true);
+        }
+        Arc::new(builder.finish())
+    }
+
     fn single_row_overbudget_sparse_i32_nested_list_array(num_inner_lists: usize) -> ArrayRef {
         use arrow_array::{Int32Array, ListArray};
         use arrow_buffer::{OffsetBuffer, ScalarBuffer};
@@ -9812,6 +10367,111 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn sparse_position_set(
+        positions: pb21::sparse_position_set::Positions,
+        num_positions: u64,
+    ) -> Option<pb21::SparsePositionSet> {
+        Some(pb21::SparsePositionSet {
+            positions: Some(positions),
+            num_positions,
+        })
+    }
+
+    fn sparse_position_empty() -> Option<pb21::SparsePositionSet> {
+        sparse_position_set(
+            pb21::sparse_position_set::Positions::Empty(pb21::SparsePositionEmpty {}),
+            0,
+        )
+    }
+
+    fn sparse_position_all(num_positions: u64) -> Option<pb21::SparsePositionSet> {
+        sparse_position_set(
+            pb21::sparse_position_set::Positions::All(pb21::SparsePositionAll {}),
+            num_positions,
+        )
+    }
+
+    fn sparse_position_explicit(num_positions: u64) -> Option<pb21::SparsePositionSet> {
+        sparse_position_set(
+            pb21::sparse_position_set::Positions::Explicit(ProtobufUtils21::flat(64, None)),
+            num_positions,
+        )
+    }
+
+    fn sparse_count_set(counts: pb21::sparse_count_set::Counts) -> Option<pb21::SparseCountSet> {
+        Some(pb21::SparseCountSet {
+            counts: Some(counts),
+        })
+    }
+
+    fn sparse_count_constant(value: u64) -> Option<pb21::SparseCountSet> {
+        sparse_count_set(pb21::sparse_count_set::Counts::Constant(
+            pb21::SparseCountConstant { value },
+        ))
+    }
+
+    fn sparse_count_explicit() -> Option<pb21::SparseCountSet> {
+        sparse_count_set(pb21::sparse_count_set::Counts::Explicit(
+            ProtobufUtils21::flat(64, None),
+        ))
+    }
+
+    fn sparse_position_num(position_set: &Option<pb21::SparsePositionSet>) -> u64 {
+        position_set
+            .as_ref()
+            .map(|set| set.num_positions)
+            .unwrap_or(0)
+    }
+
+    fn assert_sparse_position_explicit(position_set: &Option<pb21::SparsePositionSet>) {
+        let positions = position_set
+            .as_ref()
+            .and_then(|set| set.positions.as_ref())
+            .unwrap_or_else(|| panic!("expected sparse position set"));
+        assert!(
+            matches!(positions, pb21::sparse_position_set::Positions::Explicit(_)),
+            "expected explicit sparse position set, got {positions:?}"
+        );
+    }
+
+    fn assert_sparse_position_range(
+        position_set: &Option<pb21::SparsePositionSet>,
+        start: u64,
+        length: u64,
+    ) {
+        let positions = position_set
+            .as_ref()
+            .and_then(|set| set.positions.as_ref())
+            .unwrap_or_else(|| panic!("expected sparse position set"));
+        let pb21::sparse_position_set::Positions::Range(range) = positions else {
+            panic!("expected range sparse position set, got {positions:?}");
+        };
+        assert_eq!(range.start, start);
+        assert_eq!(range.length, length);
+    }
+
+    fn assert_sparse_position_all(position_set: &Option<pb21::SparsePositionSet>) {
+        let positions = position_set
+            .as_ref()
+            .and_then(|set| set.positions.as_ref())
+            .unwrap_or_else(|| panic!("expected sparse position set"));
+        assert!(
+            matches!(positions, pb21::sparse_position_set::Positions::All(_)),
+            "expected all sparse position set, got {positions:?}"
+        );
+    }
+
+    fn assert_sparse_count_constant(count_set: &Option<pb21::SparseCountSet>, value: u64) {
+        let counts = count_set
+            .as_ref()
+            .and_then(|set| set.counts.as_ref())
+            .unwrap_or_else(|| panic!("expected sparse count set"));
+        let pb21::sparse_count_set::Counts::Constant(constant) = counts else {
+            panic!("expected constant sparse count set, got {counts:?}");
+        };
+        assert_eq!(constant.value, value);
     }
 
     fn sparse_layouts_from_pages(
@@ -10126,12 +10786,10 @@ mod tests {
                     as i32,
                 num_slots: 1,
                 num_child_slots: 1,
-                constant_count: 0,
-                non_empty_compression: None,
-                num_non_empty: 0,
-                count_compression: None,
-                null_compression: Some(ProtobufUtils21::flat(64, None)),
-                num_nulls: 1,
+                non_empty_positions: None,
+                counts: None,
+                null_positions: sparse_position_explicit(1),
+                fixed_size_list_dimension: 0,
             });
         let decompressors = DefaultDecompressionStrategy::default();
 
@@ -10155,12 +10813,10 @@ mod tests {
             kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
             num_slots: 1,
             num_child_slots: 2,
-            constant_count: 0,
-            non_empty_compression: None,
-            num_non_empty: 0,
-            count_compression: None,
-            null_compression: None,
-            num_nulls: 0,
+            non_empty_positions: None,
+            counts: None,
+            null_positions: sparse_position_empty(),
+            fixed_size_list_dimension: 0,
         });
         let decompressors = DefaultDecompressionStrategy::default();
 
@@ -10184,12 +10840,10 @@ mod tests {
             kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
             num_slots: 1,
             num_child_slots: 1,
-            constant_count: 0,
-            non_empty_compression: Some(ProtobufUtils21::flat(64, None)),
-            num_non_empty: 0,
-            count_compression: None,
-            null_compression: None,
-            num_nulls: 0,
+            non_empty_positions: sparse_position_empty(),
+            counts: None,
+            null_positions: sparse_position_empty(),
+            fixed_size_list_dimension: 0,
         });
         let decompressors = DefaultDecompressionStrategy::default();
 
@@ -10203,22 +10857,23 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_input_contains(err, "validity non-empty positions is not valid");
+        assert_invalid_input_contains(
+            err,
+            "validity non-empty positions position set is not valid",
+        );
     }
 
     #[test]
-    fn test_sparse_layout_rejects_zero_count_list_count_compression() {
+    fn test_sparse_layout_rejects_zero_count_explicit_list_counts() {
         let mut layout = sparse_test_layout();
         layout.structural_layers.push(pb21::SparseStructuralLayer {
             kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
             num_slots: 1,
             num_child_slots: 0,
-            constant_count: 0,
-            non_empty_compression: None,
-            num_non_empty: 0,
-            count_compression: Some(ProtobufUtils21::flat(64, None)),
-            null_compression: None,
-            num_nulls: 0,
+            non_empty_positions: sparse_position_empty(),
+            counts: sparse_count_explicit(),
+            null_positions: sparse_position_empty(),
+            fixed_size_list_dimension: 0,
         });
         let decompressors = DefaultDecompressionStrategy::default();
 
@@ -10236,18 +10891,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_layout_rejects_list_constant_and_count_compression() {
+    fn test_sparse_layout_rejects_missing_list_counts() {
         let mut layout = sparse_test_layout();
         layout.structural_layers.push(pb21::SparseStructuralLayer {
             kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
             num_slots: 1,
             num_child_slots: 1,
-            constant_count: 1,
-            non_empty_compression: Some(ProtobufUtils21::flat(64, None)),
-            num_non_empty: 1,
-            count_compression: Some(ProtobufUtils21::flat(64, None)),
-            null_compression: None,
-            num_nulls: 0,
+            non_empty_positions: sparse_position_all(1),
+            counts: None,
+            null_positions: sparse_position_empty(),
+            fixed_size_list_dimension: 0,
         });
         let decompressors = DefaultDecompressionStrategy::default();
 
@@ -10261,7 +10914,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_input_contains(err, "both count compression and constant count");
+        assert_invalid_input_contains(err, "list counts count set is required");
     }
 
     #[test]
@@ -10271,12 +10924,10 @@ mod tests {
             kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
             num_slots: 2,
             num_child_slots: 3,
-            constant_count: 2,
-            non_empty_compression: Some(ProtobufUtils21::flat(64, None)),
-            num_non_empty: 2,
-            count_compression: None,
-            null_compression: None,
-            num_nulls: 0,
+            non_empty_positions: sparse_position_all(2),
+            counts: sparse_count_constant(2),
+            null_positions: sparse_position_empty(),
+            fixed_size_list_dimension: 0,
         });
         let decompressors = DefaultDecompressionStrategy::default();
 
@@ -10290,7 +10941,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_invalid_input_contains(err, "list child slot count");
+        assert_invalid_input_contains(err, "list count sum 4 does not match child slots 3");
     }
 
     #[tokio::test]
@@ -10300,12 +10951,10 @@ mod tests {
             kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
             num_slots: 1,
             num_child_slots: 1,
-            constant_count: 0,
-            non_empty_compression: None,
-            num_non_empty: 0,
-            count_compression: None,
-            null_compression: Some(ProtobufUtils21::flat(64, None)),
-            num_nulls: 1,
+            non_empty_positions: None,
+            counts: None,
+            null_positions: sparse_position_explicit(1),
+            fixed_size_list_dimension: 0,
         });
         let decompressors = DefaultDecompressionStrategy::default();
         let mut scheduler = SparseStructuralScheduler::try_new(
@@ -10401,10 +11050,9 @@ mod tests {
         let list_layers = sparse_list_layers(sparse);
         assert_eq!(list_layers.len(), 1);
         assert_eq!(list_layers[0].num_slots, 4096);
-        assert_eq!(list_layers[0].num_non_empty, 64);
-        assert_eq!(list_layers[0].constant_count, 1);
-        assert!(list_layers[0].non_empty_compression.is_some());
-        assert!(list_layers[0].count_compression.is_none());
+        assert_eq!(sparse_position_num(&list_layers[0].non_empty_positions), 64);
+        assert_sparse_position_explicit(&list_layers[0].non_empty_positions);
+        assert_sparse_count_constant(&list_layers[0].counts, 1);
         let chunk_values = sparse_metadata_visible_values(&page);
         assert_eq!(
             chunk_values.iter().map(|v| *v as u64).sum::<u64>(),
@@ -10414,6 +11062,45 @@ mod tests {
         let test_cases = TestCases::default()
             .with_min_file_version(LanceFileVersion::V2_3)
             .with_max_file_version(LanceFileVersion::V2_3);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_uses_range_position_set_for_dense_prefix() {
+        let arr = dense_prefix_sparse_i32_list_array(4096, 1024, 32);
+        let metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        )]);
+        let field = arrow_schema::Field::new("c", arr.data_type().clone(), true)
+            .with_metadata(metadata.clone());
+
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_3).await;
+        let sparse = sparse_layout_from_page(&page);
+        assert_eq!(
+            page.data.len(),
+            2,
+            "range/constant sparse structural metadata should not write structural buffers"
+        );
+        assert_eq!(sparse.num_visible_items, 1024 * 32);
+        let list_layers = sparse_list_layers(sparse);
+        assert_eq!(list_layers.len(), 1);
+        assert_eq!(list_layers[0].num_slots, 4096);
+        assert_eq!(
+            sparse_position_num(&list_layers[0].non_empty_positions),
+            1024
+        );
+        assert_eq!(sparse_position_num(&list_layers[0].null_positions), 0);
+        assert_sparse_position_range(&list_layers[0].non_empty_positions, 0, 1024);
+        assert_sparse_count_constant(&list_layers[0].counts, 32);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_range(0..16)
+            .with_range(1020..1030)
+            .with_range(3000..3010)
+            .with_indices(vec![0, 1, 1023, 1024, 4095]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
     }
 
@@ -10449,8 +11136,9 @@ mod tests {
         assert!(sparse.num_items > 65_535);
         let list_layers = sparse_list_layers(sparse);
         assert_eq!(list_layers.len(), 1);
-        assert_eq!(list_layers[0].num_non_empty, 2);
-        assert_eq!(list_layers[0].constant_count, 1);
+        assert_eq!(sparse_position_num(&list_layers[0].non_empty_positions), 2);
+        assert_sparse_position_explicit(&list_layers[0].non_empty_positions);
+        assert_sparse_count_constant(&list_layers[0].counts, 1);
 
         let test_cases = TestCases::default()
             .with_min_file_version(LanceFileVersion::V2_3)
@@ -10474,11 +11162,13 @@ mod tests {
         let list_layers = sparse_list_layers(sparse);
         assert_eq!(list_layers.len(), 2);
         assert_eq!(list_layers[0].num_slots, 1);
-        assert_eq!(list_layers[0].num_non_empty, 1);
-        assert_eq!(list_layers[0].constant_count, 70_000);
+        assert_eq!(sparse_position_num(&list_layers[0].non_empty_positions), 1);
+        assert_sparse_position_all(&list_layers[0].non_empty_positions);
+        assert_sparse_count_constant(&list_layers[0].counts, 70_000);
         assert_eq!(list_layers[1].num_slots, 70_000);
-        assert_eq!(list_layers[1].num_non_empty, 1);
-        assert_eq!(list_layers[1].constant_count, 1);
+        assert_eq!(sparse_position_num(&list_layers[1].non_empty_positions), 1);
+        assert_sparse_position_range(&list_layers[1].non_empty_positions, 69_999, 1);
+        assert_sparse_count_constant(&list_layers[1].counts, 1);
 
         let test_cases = TestCases::default()
             .with_min_file_version(LanceFileVersion::V2_3)
@@ -10741,9 +11431,14 @@ mod tests {
                 matches!(
                     pb21::sparse_structural_layer::Kind::try_from(layer.kind),
                     Ok(pb21::sparse_structural_layer::Kind::SparseLayerList)
-                ) && layer.num_non_empty > 0
-                    && layer.num_nulls > 0
-                    && layer.count_compression.is_some()
+                ) && sparse_position_num(&layer.non_empty_positions) > 0
+                    && sparse_position_num(&layer.null_positions) > 0
+                    && layer.non_empty_positions.is_some()
+                    && layer.null_positions.is_some()
+                    && matches!(
+                        layer.counts.as_ref().and_then(|set| set.counts.as_ref()),
+                        Some(pb21::sparse_count_set::Counts::Explicit(_))
+                    )
             })
         });
         assert!(
@@ -10756,7 +11451,7 @@ mod tests {
                 matches!(
                     pb21::sparse_structural_layer::Kind::try_from(layer.kind),
                     Ok(pb21::sparse_structural_layer::Kind::SparseLayerValidity)
-                ) && layer.num_nulls > 0
+                ) && sparse_position_num(&layer.null_positions) > 0
             })
         });
         assert!(
@@ -10797,8 +11492,9 @@ mod tests {
                 matches!(
                     pb21::sparse_structural_layer::Kind::try_from(layer.kind),
                     Ok(pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList)
-                ) && layer.constant_count == 2
-                    && layer.num_nulls > 0
+                ) && layer.fixed_size_list_dimension == 2
+                    && sparse_position_num(&layer.null_positions) > 0
+                    && layer.null_positions.is_some()
             })
         });
         assert!(
