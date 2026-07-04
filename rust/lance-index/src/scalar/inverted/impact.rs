@@ -100,11 +100,24 @@ impl ImpactSkipData {
 
     fn baked_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> &(Box<[f32]>, f32) {
         self.doc_weight_bounds.get_or_init(|| {
+            // V3 (Varint impacts <=> 256-doc blocks) scores with quantized doc
+            // lengths, so bake the bounds against the same quantized lengths.
+            // Quantization is monotone, so pareto dominance among the stored
+            // (freq, doc_len) frontier pairs is preserved and the frontier max
+            // still bounds every doc in the range.
+            let quantized = self.format == ImpactFormat::Varint;
             let per_entry = (0..self.entries.len())
                 .map(|entry_idx| {
                     let bytes = self.entries.value(entry_idx);
                     let mut max_doc_weight = 0.0_f32;
                     match for_each_entry_pair(bytes, self.format, |freq, doc_len| {
+                        let doc_len = if quantized {
+                            super::index::dequantize_doc_length(super::index::quantize_doc_length(
+                                doc_len,
+                            ))
+                        } else {
+                            doc_len
+                        };
                         max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
                     }) {
                         Ok(()) => max_doc_weight,

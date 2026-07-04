@@ -23,7 +23,7 @@ use crate::metrics::MetricsCollector;
 use super::{
     CompressedPositionStorage,
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData},
-    index::PositionStreamCodec,
+    index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
     scorer::{K1, idf},
 };
@@ -225,6 +225,7 @@ impl CompressedState {
                 block,
                 remainder,
                 tail_codec,
+                block_size,
                 &mut self.doc_ids,
                 &mut self.freqs,
             );
@@ -985,7 +986,7 @@ impl PostingIterator {
                             break 'blocks;
                         }
                         let freq = compressed.freqs[offset];
-                        let doc_length = docs.num_tokens(doc_id);
+                        let doc_length = docs.scoring_num_tokens(doc_id);
                         let score = self.query_weight * scorer.doc_weight(freq, doc_length);
                         let slot = (u64::from(doc_id) - window_min) as usize;
                         acc.add(clause_idx, slot, score, freq);
@@ -1015,7 +1016,7 @@ impl PostingIterator {
                         break;
                     }
                     let doc_length = match &doc {
-                        DocInfo::Raw(raw) => docs.num_tokens(raw.doc_id),
+                        DocInfo::Raw(raw) => docs.scoring_num_tokens(raw.doc_id),
                         DocInfo::Located(located) => docs.num_tokens_by_row_id(located.row_id),
                     };
                     let score = self.score(scorer, doc.frequency(), doc_length);
@@ -1476,7 +1477,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             let doc_length = match &doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
 
@@ -1650,7 +1651,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             // score the doc
             let doc_length = match is_compressed {
-                true => self.docs.num_tokens(doc_id as u32),
+                true => self.docs.scoring_num_tokens(doc_id as u32),
                 false => self.docs.num_tokens_by_row_id(row_id),
             };
             if self.operator == Operator::Or && !self.refine_or_candidate(doc_id, doc_length) {
@@ -1895,7 +1896,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         let doc = $doc;
                         let freq = $freq;
                         num_comparisons += 1;
-                        let doc_length = self.docs.num_tokens(doc as u32);
+                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
                         let score = essential_weight * self.scorer.doc_weight(freq, doc_length);
                         if !(self.threshold > 0.0
                             && score + total_non_essential_bound <= self.threshold)
@@ -2095,7 +2096,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             continue;
                         }
 
-                        let doc_length = self.docs.num_tokens(doc as u32);
+                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
                         let mut rejected = false;
                         for i in (0..first_essential).rev() {
                             if self.threshold > 0.0
@@ -2284,7 +2285,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             };
             let doc_length = match &first_doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             let mut lead_score = 0.0;
@@ -2366,7 +2367,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
             let doc_length = match &lead_doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             if self.and_candidate_cannot_beat_threshold(doc_length) {
@@ -2803,9 +2804,20 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
                 // Pass A: gather doc lengths for the whole batch up front so
                 // the loads issue back-to-back and their cache misses overlap.
+                // Quantized (V3) sets gather through the byte-norm slab: a
+                // quarter of the bytes through the cache versus the u32 vec.
                 batch_lens.clear();
-                for &doc in batch_docs.iter() {
-                    batch_lens.push(self.docs.num_tokens(doc));
+                match self.docs.scoring_norms() {
+                    Some(norms) => {
+                        for &doc in batch_docs.iter() {
+                            batch_lens.push(dequantize_doc_length(norms[doc as usize]));
+                        }
+                    }
+                    None => {
+                        for &doc in batch_docs.iter() {
+                            batch_lens.push(self.docs.scoring_num_tokens(doc));
+                        }
+                    }
                 }
 
                 // Pass B: prune / verify / score / insert, in doc order, with

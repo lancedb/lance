@@ -75,9 +75,11 @@ pub fn compress_posting_list_with_tail_codec_and_block_size<'a>(
     if length < block_size {
         // directly do remainder compression to avoid overhead of creating buffer
         let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2 + 1);
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        // write the max score of the block (128-doc blocks only)
+        if posting_block_score_prefix_len(block_size) > 0 {
+            let max_score = block_max_scores.next().unwrap();
+            let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        }
         compress_posting_remainder(
             doc_ids.copied().collect::<Vec<_>>().as_slice(),
             frequencies.copied().collect::<Vec<_>>().as_slice(),
@@ -101,9 +103,11 @@ pub fn compress_posting_list_with_tail_codec_and_block_size<'a>(
 
         assert_eq!(doc_id_buffer.len(), block_size);
 
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        // write the max score of the block (128-doc blocks only)
+        if posting_block_score_prefix_len(block_size) > 0 {
+            let max_score = block_max_scores.next().unwrap();
+            let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        }
         encode_posting_block_payload(&doc_id_buffer, &freq_buffer, &mut builder)?;
         builder.append_value("");
         doc_id_buffer.clear();
@@ -112,13 +116,28 @@ pub fn compress_posting_list_with_tail_codec_and_block_size<'a>(
 
     // we don't compress the last block if it is not full
     if !doc_id_buffer.is_empty() {
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        // write the max score of the block (128-doc blocks only)
+        if posting_block_score_prefix_len(block_size) > 0 {
+            let max_score = block_max_scores.next().unwrap();
+            let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        }
         compress_posting_remainder(&doc_id_buffer, &freq_buffer, tail_codec, &mut builder)?;
         builder.append_value("");
     }
     Ok(builder.finish())
+}
+
+/// Byte length of the block-max-score prefix on posting blocks. 128-doc
+/// blocks store a per-block max score, patched in at build time; 256-doc
+/// (V3) blocks always carry impact skip data, which supersedes it, so they
+/// store none.
+#[inline]
+pub fn posting_block_score_prefix_len(block_size: usize) -> usize {
+    if block_size == MAX_POSTING_BLOCK_SIZE {
+        0
+    } else {
+        4
+    }
 }
 
 pub fn encode_full_posting_block_into(
@@ -128,7 +147,9 @@ pub fn encode_full_posting_block_into(
 ) -> Result<()> {
     validate_block_size(doc_ids.len())?;
     debug_assert_eq!(doc_ids.len(), frequencies.len());
-    block.extend_from_slice(&0f32.to_le_bytes());
+    if posting_block_score_prefix_len(doc_ids.len()) > 0 {
+        block.extend_from_slice(&0f32.to_le_bytes());
+    }
     encode_posting_block_payload(doc_ids, frequencies, block)?;
     Ok(())
 }
@@ -252,10 +273,13 @@ pub fn encode_remainder_posting_block_into(
     doc_ids: &[u32],
     frequencies: &[u32],
     codec: PostingTailCodec,
+    block_size: usize,
     block: &mut Vec<u8>,
 ) -> Result<()> {
     debug_assert_eq!(doc_ids.len(), frequencies.len());
-    block.extend_from_slice(&0f32.to_le_bytes());
+    if posting_block_score_prefix_len(block_size) > 0 {
+        block.extend_from_slice(&0f32.to_le_bytes());
+    }
     compress_posting_remainder(doc_ids, frequencies, codec, block)?;
     Ok(())
 }
@@ -935,6 +959,7 @@ pub fn decompress_posting_list_with_tail_codec_and_block_size(
             compressed,
             remainder,
             tail_codec,
+            block_size,
             &mut doc_ids,
             &mut frequencies,
         );
@@ -976,8 +1001,8 @@ pub fn decompress_posting_block(
 ) {
     debug_assert!(validate_block_size(block_size).is_ok());
     debug_assert!(buffer.len() >= block_size);
-    // skip the first 4 bytes for the max block score
-    let mut block = &block[4..];
+    // skip the block max score prefix (128-doc blocks only)
+    let mut block = &block[posting_block_score_prefix_len(block_size)..];
     match block_size {
         BitPacker4x::BLOCK_LEN => {
             let num_bytes = decompress_sorted_block_with::<BitPacker4x>(block, buffer, doc_ids);
@@ -1004,10 +1029,11 @@ pub fn decompress_posting_remainder(
     block: &[u8],
     n: usize,
     codec: PostingTailCodec,
+    block_size: usize,
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
-    let block = &block[4..];
+    let block = &block[posting_block_score_prefix_len(block_size)..];
     match codec {
         PostingTailCodec::Fixed32 => {
             decompress_raw_remainder(block, n, doc_ids);
@@ -1098,11 +1124,18 @@ pub fn decompress_raw_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>
     }
 }
 
-pub fn read_posting_tail_first_doc(block: &[u8], codec: PostingTailCodec) -> u32 {
+pub fn read_posting_tail_first_doc(
+    block: &[u8],
+    codec: PostingTailCodec,
+    block_size: usize,
+) -> u32 {
+    let prefix = posting_block_score_prefix_len(block_size);
     match codec {
-        PostingTailCodec::Fixed32 => u32::from_le_bytes(block[4..8].try_into().unwrap()),
+        PostingTailCodec::Fixed32 => {
+            u32::from_le_bytes(block[prefix..prefix + 4].try_into().unwrap())
+        }
         PostingTailCodec::VarintDelta => {
-            let mut offset = 4usize;
+            let mut offset = prefix;
             decode_varint_u32(block, &mut offset)
                 .expect("posting tail block should contain a valid first doc id")
         }
@@ -1231,9 +1264,11 @@ mod tests {
         assert_eq!(posting_list.len(), 1);
 
         let block = posting_list.value(0);
-        let doc_num_bits = block[8];
+        // 256-doc blocks carry no block-max-score prefix (impacts supply the
+        // per-block bound): [first_doc u32][doc num_bits u8][doc payload]...
+        let doc_num_bits = block[4];
         let doc_bytes = BitPacker8x::compressed_block_size(doc_num_bits);
-        let freq_header_offset = 9 + doc_bytes;
+        let freq_header_offset = 5 + doc_bytes;
         // 256-doc blocks use patched FOR for frequencies:
         // [width u8][exception_count u8][body][exceptions...]
         let freq_num_bits = block[freq_header_offset];
