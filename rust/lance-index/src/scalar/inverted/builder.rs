@@ -557,17 +557,16 @@ impl InvertedIndexBuilder {
             // posting-list compression of nearly the whole index behind a
             // single producer thread. Compress and write them concurrently.
             let write_target = self.partition_write_target();
-            let mut tail_writes = futures::stream::iter(
-                merged_tail_partitions.into_iter().map(|mut builder| {
+            let mut tail_writes =
+                futures::stream::iter(merged_tail_partitions.into_iter().map(|mut builder| {
                     let dest_store = dest_store.clone();
                     async move {
                         let partition_id = builder.id();
                         let files = builder.write_to(dest_store.as_ref(), write_target).await?;
                         Result::Ok((partition_id, files))
                     }
-                }),
-            )
-            .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
+                }))
+                .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
             while let Some((partition_id, partition_files)) = tail_writes.try_next().await? {
                 self.new_partitions.push(partition_id);
                 files.extend(partition_files);
