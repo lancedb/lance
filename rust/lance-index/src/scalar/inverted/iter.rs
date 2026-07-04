@@ -166,6 +166,7 @@ impl Iterator for CompressedPostingListIterator {
                 compressed,
                 self.remainder,
                 self.posting_tail_codec,
+                self.block_size,
                 &mut self.doc_ids,
                 &mut self.frequencies,
             );

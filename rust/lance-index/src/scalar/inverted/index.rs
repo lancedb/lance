@@ -52,7 +52,7 @@ use std::sync::LazyLock;
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use tracing::{info, instrument};
 
-use super::encoding::{PositionBlockBuilder, decode_group_starts};
+use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder, decode_group_starts};
 use super::impact::{ImpactSkipData, ImpactSkipDataBuilder};
 use super::iter::PostingListIterator;
 use super::lazy_docset::LazyDocSet;
@@ -1588,6 +1588,8 @@ impl InvertedPartition {
             num_docs,
             false,
             frag_reuse_index,
+            // V3 (256-doc block) partitions score with quantized doc lengths.
+            inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
         ));
 
         Ok(Self {
@@ -4111,6 +4113,13 @@ impl CompressedPostingList {
     }
 
     pub fn block_max_score(&self, block_idx: usize) -> f32 {
+        // 256-doc (V3) blocks store no per-block max score: their impact
+        // skip data supplies the tight per-block bound, so callers on that
+        // path never reach here. Fall back to the list-level max, which is
+        // still a valid (looser) bound for any block.
+        if super::encoding::posting_block_score_prefix_len(self.block_size) == 0 {
+            return self.max_score;
+        }
         let block = self.blocks.value(block_idx);
         block[0..4].try_into().map(f32::from_le_bytes).unwrap()
     }
@@ -4133,9 +4142,14 @@ impl CompressedPostingList {
                         return super::encoding::read_posting_tail_first_doc(
                             block,
                             self.posting_tail_codec,
+                            self.block_size,
                         );
                     }
-                    block[4..8].try_into().map(u32::from_le_bytes).unwrap()
+                    let prefix = super::encoding::posting_block_score_prefix_len(self.block_size);
+                    block[prefix..prefix + 4]
+                        .try_into()
+                        .map(u32::from_le_bytes)
+                        .unwrap()
                 })
                 .collect()
         })
@@ -4189,12 +4203,14 @@ impl EncodedBlocks {
         doc_ids: &[u32],
         frequencies: &[u32],
         codec: PostingTailCodec,
+        block_size: usize,
     ) -> Result<()> {
         self.offsets.push(self.bytes.len() as u32);
         super::encoding::encode_remainder_posting_block_into(
             doc_ids,
             frequencies,
             codec,
+            block_size,
             &mut self.bytes,
         )
     }
@@ -5047,7 +5063,9 @@ impl PostingListBuilder {
             );
             impact_builder.append_block(impact_block.as_slice())?;
             max_score = max_score.max(block_score);
-            encoded_blocks.set_block_score(index, block_score);
+            if super::encoding::posting_block_score_prefix_len(block_size) > 0 {
+                encoded_blocks.set_block_score(index, block_score);
+            }
         }
 
         if !tail_entries.is_empty() {
@@ -5066,8 +5084,11 @@ impl PostingListBuilder {
                 doc_ids.as_slice(),
                 frequencies.as_slice(),
                 posting_tail_codec,
+                block_size,
             )?;
-            encoded_blocks.set_block_score(encoded_blocks.len() - 1, block_score);
+            if super::encoding::posting_block_score_prefix_len(block_size) > 0 {
+                encoded_blocks.set_block_score(encoded_blocks.len() - 1, block_score);
+            }
             if with_positions {
                 encoded_position_blocks.push_encoded_block(
                     tail_position_block
@@ -5086,15 +5107,18 @@ impl PostingListBuilder {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_compressed_with_block_scores_from_parts(
         with_positions: bool,
         posting_tail_codec: PostingTailCodec,
+        block_size: usize,
         mut encoded_blocks: EncodedBlocks,
         mut encoded_position_blocks: EncodedPositionBlocks,
         tail_entries: &[RawDocInfo],
         tail_position_block: Option<Vec<u8>>,
         mut block_max_scores: impl Iterator<Item = f32>,
     ) -> Result<(LargeBinaryArray, Option<SharedPositionStream>, f32)> {
+        let has_score_prefix = super::encoding::posting_block_score_prefix_len(block_size) > 0;
         let mut max_score = f32::MIN;
         let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
         let mut frequencies = Vec::with_capacity(BLOCK_SIZE);
@@ -5104,7 +5128,9 @@ impl PostingListBuilder {
                 .next()
                 .ok_or_else(|| Error::index("missing block max score".to_owned()))?;
             max_score = max_score.max(block_score);
-            encoded_blocks.set_block_score(index, block_score);
+            if has_score_prefix {
+                encoded_blocks.set_block_score(index, block_score);
+            }
         }
 
         if !tail_entries.is_empty() {
@@ -5117,8 +5143,11 @@ impl PostingListBuilder {
                 doc_ids.as_slice(),
                 frequencies.as_slice(),
                 posting_tail_codec,
+                block_size,
             )?;
-            encoded_blocks.set_block_score(encoded_blocks.len() - 1, block_score);
+            if has_score_prefix {
+                encoded_blocks.set_block_score(encoded_blocks.len() - 1, block_score);
+            }
             if with_positions {
                 encoded_position_blocks.push_encoded_block(
                     tail_position_block
@@ -5173,6 +5202,7 @@ impl PostingListBuilder {
             Self::build_compressed_with_block_scores_from_parts(
                 with_positions,
                 posting_tail_codec,
+                block_size,
                 encoded_blocks
                     .map(|encoded_blocks| *encoded_blocks)
                     .unwrap_or_default(),
@@ -5418,9 +5448,55 @@ impl Ord for RawDocInfo {
     }
 }
 
+/// Lucene SmallFloat-style doc-length quantization for V3 (256-doc block)
+/// scoring: a 4-mantissa-bit float-like byte code. Values 0-7 are exact;
+/// larger values keep their top four significand bits (relative error
+/// <= 6.25%) and decode to their bucket floor. The floor only ever shortens
+/// a doc, and a shorter doc only raises its BM25 weight, so bounds baked
+/// from quantized lengths stay valid upper bounds of quantized scores.
+pub(crate) fn quantize_doc_length(value: u32) -> u8 {
+    let num_bits = 32 - value.leading_zeros();
+    if num_bits < 4 {
+        value as u8
+    } else {
+        let shift = num_bits - 4;
+        (((value >> shift) as u8) & 0x07) | (((shift + 1) as u8) << 3)
+    }
+}
+
+#[inline]
+pub(crate) fn dequantize_doc_length(code: u8) -> u32 {
+    DEQUANTIZED_DOC_LENGTHS[code as usize]
+}
+
+pub(crate) static DEQUANTIZED_DOC_LENGTHS: [u32; 256] = build_dequantized_doc_lengths();
+
+const fn build_dequantized_doc_lengths() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut code = 0usize;
+    while code < 256 {
+        let bits = (code & 0x07) as u64;
+        let shift = (code >> 3) as i64 - 1;
+        let decoded = if shift < 0 {
+            bits
+        } else {
+            (bits | 0x08) << shift
+        };
+        // Codes past the largest u32 encoding are never produced; saturate so
+        // the table stays total.
+        table[code] = if decoded > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            decoded as u32
+        };
+        code += 1;
+    }
+    table
+}
+
 // DocSet is a mapping from row ids to the number of tokens in the document
 // It's used to sort the documents by the bm25 score
-#[derive(Debug, Clone, Default, DeepSizeOf)]
+#[derive(Debug, Clone, Default)]
 pub struct DocSet {
     row_ids: Vec<u64>,
     num_tokens: Vec<u32>,
@@ -5428,6 +5504,26 @@ pub struct DocSet {
     inv: Vec<(u64, u32)>,
 
     total_tokens: u64,
+
+    // V3 (256-doc block) partitions score with quantized doc lengths: the
+    // flag is set at partition load and the byte-norm slab bakes lazily on
+    // first scoring use (shared by clones of the loaded set). 128-block
+    // partitions never set the flag and keep exact scoring.
+    scoring_quantized: bool,
+    norms: Arc<std::sync::OnceLock<Box<[u8]>>>,
+}
+
+impl DeepSizeOf for DocSet {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.row_ids.deep_size_of_children(context)
+            + self.num_tokens.deep_size_of_children(context)
+            + self.inv.deep_size_of_children(context)
+            + self
+                .norms
+                .get()
+                .map(|slab| std::mem::size_of_val(slab.as_ref()))
+                .unwrap_or(0)
+    }
 }
 
 impl DocSet {
@@ -5576,6 +5672,8 @@ impl DocSet {
             num_tokens,
             inv: Vec::new(),
             total_tokens,
+            scoring_quantized: false,
+            norms: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -5611,6 +5709,8 @@ impl DocSet {
                 num_tokens,
                 inv: Vec::new(),
                 total_tokens,
+                scoring_quantized: false,
+                norms: Arc::new(std::sync::OnceLock::new()),
             });
         }
 
@@ -5652,6 +5752,8 @@ impl DocSet {
                 num_tokens,
                 inv,
                 total_tokens,
+                scoring_quantized: false,
+                norms: Arc::new(std::sync::OnceLock::new()),
             });
         }
 
@@ -5671,6 +5773,8 @@ impl DocSet {
             num_tokens,
             inv,
             total_tokens,
+            scoring_quantized: false,
+            norms: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -5681,6 +5785,7 @@ impl DocSet {
         let len = self.len();
         let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
         let num_tokens = std::mem::replace(&mut self.num_tokens, Vec::with_capacity(len));
+        self.invalidate_norms();
         self.total_tokens = 0;
         for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
             match mapping.get(&row_id) {
@@ -5707,6 +5812,39 @@ impl DocSet {
         self.num_tokens[doc_id as usize]
     }
 
+    /// Enable quantized doc-length scoring (V3 / 256-doc block partitions).
+    pub fn set_quantized_scoring(&mut self, quantized: bool) {
+        self.scoring_quantized = quantized;
+    }
+
+    /// The quantized doc-length slab when this set scores quantized (V3
+    /// partitions), baked on first use; `None` for exact-scoring sets.
+    pub fn scoring_norms(&self) -> Option<&[u8]> {
+        if !self.scoring_quantized {
+            return None;
+        }
+        Some(
+            self.norms
+                .get_or_init(|| {
+                    self.num_tokens
+                        .iter()
+                        .map(|&n| quantize_doc_length(n))
+                        .collect()
+                })
+                .as_ref(),
+        )
+    }
+
+    /// Doc length as scoring sees it: the quantized bucket floor for V3
+    /// partitions, the exact value otherwise.
+    #[inline]
+    pub fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+        match self.scoring_norms() {
+            Some(norms) => dequantize_doc_length(norms[doc_id as usize]),
+            None => self.num_tokens[doc_id as usize],
+        }
+    }
+
     // this can be used only if it's a legacy format,
     // which store the sorted row ids so that we can use binary search
     #[inline]
@@ -5723,7 +5861,16 @@ impl DocSet {
         self.row_ids.push(row_id);
         self.num_tokens.push(num_tokens);
         self.total_tokens += num_tokens as u64;
+        self.invalidate_norms();
         self.row_ids.len() as u32 - 1
+    }
+
+    // Drop the baked norm slab after a mutation; it re-bakes on the next
+    // scoring use.
+    fn invalidate_norms(&mut self) {
+        if self.norms.get().is_some() {
+            self.norms = Arc::new(std::sync::OnceLock::new());
+        }
     }
 
     pub(crate) fn memory_size(&self) -> usize {
