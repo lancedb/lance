@@ -13,6 +13,7 @@ use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{Column, scalar::ScalarValue};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::pin::Pin;
@@ -1108,7 +1109,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex>;
 
@@ -1131,6 +1132,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// Global `[min, max]` of the indexed column from index metadata, without a
+    /// scan, or `None` if this index type cannot supply a sound bound. When
+    /// `Some`, the range is a superset of live values (conservative under
+    /// deletes): safe to prune with, not guaranteed tight.
+    fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        None
+    }
 }
 
 /// Abstraction over any type that can remap row IDs during index loading.

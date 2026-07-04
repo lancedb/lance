@@ -4,6 +4,7 @@
 //! Secondary Index
 //!
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -15,7 +16,6 @@ use itertools::Itertools;
 use lance_core::cache::CacheKey;
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
@@ -484,7 +484,7 @@ pub trait IndexBuilder {
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
-    row_id_map: &HashMap<u64, Option<u64>>,
+    row_id_map: &RowAddrRemap,
 ) -> Result<RemapResult> {
     // Load indices from the disk.
     let indices = dataset.load_indices().await?;
@@ -499,20 +499,14 @@ pub(crate) async fn remap_index(
         ));
     }
 
-    if row_id_map.values().all(|v| v.is_none()) {
-        let deleted_bitmap = RoaringBitmap::from_iter(
-            row_id_map
-                .keys()
-                .map(|row_id| RowAddress::new_from_u64(*row_id))
-                .map(|addr| addr.fragment_id()),
-        );
-        if Some(deleted_bitmap) == matched.fragment_bitmap {
-            // If remap deleted all rows, we can just return the same index ID.
-            // This can happen if there is a bug where the index is covering empty
-            // fragment that haven't been cleaned up. They should be cleaned up
-            // outside of this function.
-            return Ok(RemapResult::Keep(*index_id));
-        }
+    if let Some(deleted_bitmap) = row_id_map.fully_deleted_fragments()
+        && Some(deleted_bitmap) == matched.fragment_bitmap
+    {
+        // If remap deleted all rows, we can just return the same index ID.
+        // This can happen if there is a bug where the index is covering empty
+        // fragment that haven't been cleaned up. They should be cleaned up
+        // outside of this function.
+        return Ok(RemapResult::Keep(*index_id));
     }
 
     let field_id = matched
@@ -4087,7 +4081,9 @@ mod tests {
         assert_io_eq!(stats, read_bytes, 0);
         assert_eq!(indices.len(), 1);
 
-        session.index_cache.clear().await; // Clear the cache
+        // Clear the cache
+        session.index_cache.clear().await;
+        session.file_metadata_cache().clear().await;
 
         let dataset2 = DatasetBuilder::from_uri(test_uri)
             .with_session(session.clone())
@@ -4127,7 +4123,7 @@ mod tests {
         let remap_to_empty = (0..dataset.count_all_rows().await.unwrap())
             .map(|i| (i as u64, None))
             .collect::<HashMap<_, _>>();
-        let new_uuid = remap_index(&dataset, &index_uuid, &remap_to_empty)
+        let new_uuid = remap_index(&dataset, &index_uuid, &RowAddrRemap::direct(remap_to_empty))
             .await
             .unwrap();
         assert_eq!(new_uuid, RemapResult::Keep(index_uuid));

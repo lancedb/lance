@@ -2128,6 +2128,10 @@ mod test {
             for value in &mut values {
                 *value = rng.next();
             }
+        } else {
+            for value in &mut values {
+                *value = rng.next() % (1 << bit_width);
+            }
         }
         let mut packed = vec![0; 1024 * bit_width / u64::T];
         unsafe {

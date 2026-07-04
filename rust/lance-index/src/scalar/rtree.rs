@@ -32,6 +32,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
@@ -543,7 +544,7 @@ impl ScalarIndex for RTreeIndex {
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(

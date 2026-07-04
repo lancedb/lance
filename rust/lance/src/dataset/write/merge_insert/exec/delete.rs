@@ -24,7 +24,7 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::write::merge_insert::assign_action::Action;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, SourceDedupeBehavior,
-    create_duplicate_row_error,
+    create_duplicate_row_error, resolve_target_bases,
 };
 
 use super::{MergeInsertMetrics, apply_deletions};
@@ -279,6 +279,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let input_stream = self.input.execute(partition, context)?;
 
         let dataset = self.dataset.clone();
+        let params = self.params.clone();
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
@@ -287,6 +288,9 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let on_columns = self.params.on.clone();
 
         let result_stream = futures::stream::once(async move {
+            // Delete-only merges write no data files, but still validate any
+            // requested target bases so unknown bases fail on every path.
+            resolve_target_bases(&dataset, &params).await?;
             // `metrics` is moved into `collect_deletions`; keep a handle on the
             // skipped-duplicate counter so it can be folded into the stats below.
             let skipped_duplicates = metrics.num_skipped_duplicates.clone();

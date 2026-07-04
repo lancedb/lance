@@ -630,10 +630,9 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 7);
         // Session should still be re-used
-        // However, the dataset needs to be loaded and the read version checked out,
-        // so an additional 4 IOPs are needed.
+        // However, the dataset needs to be loaded and the read version checked out.
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
+        assert_io_eq!(io_stats, read_iops, 4, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
         // Commit transaction with URI and new session. Re-use the store

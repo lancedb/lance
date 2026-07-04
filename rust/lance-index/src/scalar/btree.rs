@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -25,7 +26,8 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -1390,6 +1392,17 @@ impl DeepSizeOf for BTreeIndexState {
 }
 
 impl BTreeIndexState {
+    fn from_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
+            Error::internal("BTreeIndexState::from_index called with a non-BTree index")
+        })?;
+        Ok(Self {
+            lookup_batch: btree.page_lookup.batch.clone(),
+            batch_size: btree.batch_size,
+            ranges_to_files: btree.ranges_to_files.clone(),
+        })
+    }
+
     fn reconstruct(
         &self,
         store: Arc<dyn IndexStore>,
@@ -2215,7 +2228,7 @@ impl ScalarIndex for BTreeIndex {
 
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // (part_id, path)
@@ -2382,7 +2395,7 @@ pub trait BTreeSubIndex: Debug + Send + Sync + DeepSizeOf {
     async fn remap_subindex(
         &self,
         serialized: RecordBatch,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> Result<RecordBatch>;
 }
 
@@ -3316,23 +3329,34 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let btree = index.as_any().downcast_ref::<BTreeIndex>().ok_or_else(|| {
-            Error::internal("BTreeIndexPlugin::put_in_cache called with a non-BTree index")
-        })?;
-        let state = BTreeIndexState {
-            lookup_batch: btree.page_lookup.batch.clone(),
-            batch_size: btree.batch_size,
-            ranges_to_files: btree.ranges_to_files.clone(),
-        };
+        let state = BTreeIndexState::from_index(index.as_ref())?;
         cache
             .insert_with_key(&BTreeIndexStateKey, Arc::new(state))
             .await;
         Ok(())
     }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            BTreeIndexStateKey,
+            load,
+            BTreeIndexState::from_index,
+            move |state| state.reconstruct(index_store, cache, frag_reuse_index),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::sync::atomic::Ordering;
     use std::{collections::HashMap, sync::Arc};
 
@@ -3481,7 +3505,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         index
-            .remap(&HashMap::default(), remap_store.as_ref())
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -4992,7 +5016,7 @@ mod tests {
 
         // Remap with a no-op mapping.  The remapped index should be identical to the original
         ranged_index
-            .remap(&HashMap::default(), remap_store.as_ref())
+            .remap(&RowAddrRemap::empty(), remap_store.as_ref())
             .await
             .unwrap();
 
@@ -5320,7 +5344,10 @@ mod tests {
         ));
 
         // Remap the index with our deletion mapping
-        index.remap(&mapping, remap_store.as_ref()).await.unwrap();
+        index
+            .remap(&RowAddrRemap::direct(mapping), remap_store.as_ref())
+            .await
+            .unwrap();
 
         let remapped_index = BTreeIndex::load(remap_store.clone(), None, &LanceCache::no_cache())
             .await

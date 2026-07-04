@@ -9,7 +9,18 @@ import warnings
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from . import io, log
-from .blob import Blob, BlobArray, BlobColumn, BlobFile, blob_array, blob_field
+from .blob import (
+    Blob,
+    BlobArray,
+    BlobColumn,
+    BlobDescriptor,
+    BlobDescriptorArrayBuilder,
+    BlobFile,
+    DedicatedBlobWriter,
+    PackedBlobWriter,
+    blob_array,
+    blob_field,
+)
 from .dataset import (
     DataStatistics,
     FieldStatistics,
@@ -72,6 +83,10 @@ __all__ = [
     "BlobArray",
     "BlobColumn",
     "BlobFile",
+    "DedicatedBlobWriter",
+    "BlobDescriptorArrayBuilder",
+    "PackedBlobWriter",
+    "BlobDescriptor",
     "blob_array",
     "blob_field",
     "CleanupCandidateFile",
@@ -166,6 +181,13 @@ def dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+
+        For datasets with additional registered base paths, a key of the form
+        ``base_<id>.<key>`` applies ``<key>`` only to the base path with that
+        manifest id, overriding the unscoped options that every base inherits.
+        For example ``{"account_key": "shared", "base_1.account_key": "abc"}``
+        makes base 1 use ``account_key = abc`` while all other options are
+        shared.
     default_scan_options : optional, dict
         Default scan options that are used when scanning the dataset.  This accepts
         the same arguments described in :py:meth:`lance.LanceDataset.scanner`.  The
@@ -203,9 +225,10 @@ def dataset(
     base_store_params : dict of str to dict, optional
         Runtime-only object store parameters keyed by base path URI. Each key
         is a base path URI (e.g., "s3://bucket/path") and each value is a dict
-        of storage options (credentials, endpoint, etc.) for that base.  When a base
-        has no explicit entry here, the top-level ``storage_options`` is
-        used as a fallback.
+        of storage options (credentials, endpoint, etc.) for that base.  These
+        take precedence over ``base_<id>.<key>`` entries in ``storage_options``.
+        When a base has no explicit entry here, the top-level
+        ``storage_options`` is used as a fallback.
 
     Notes
     -----

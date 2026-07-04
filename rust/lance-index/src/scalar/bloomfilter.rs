@@ -20,12 +20,13 @@ use arrow_schema::{DataType, Field};
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 
 use std::sync::LazyLock;
 
 use datafusion::execution::SendableRecordBatchStream;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use crate::scalar::{
     AnyQuery, IndexStore, MetricsCollector, RowIdRemapper, ScalarIndex, SearchResult,
@@ -425,7 +426,7 @@ impl ScalarIndex for BloomFilterIndex {
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(
