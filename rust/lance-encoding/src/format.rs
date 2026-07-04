@@ -643,6 +643,31 @@ macro_rules! impl_common_protobuf_utils {
                 )
             }
 
+            #[allow(clippy::too_many_arguments)]
+            pub fn sparse_layout(
+                value_encoding: crate::format::$module::CompressiveEncoding,
+                num_buffers: u64,
+                num_items: u64,
+                num_visible_items: u64,
+                has_large_chunk: bool,
+                structural_layers: Vec<crate::format::$module::SparseStructuralLayer>,
+            ) -> crate::format::$module::PageLayout {
+                crate::format::$module::PageLayout {
+                    layout: Some(
+                        crate::format::$module::page_layout::Layout::SparseLayout(
+                            crate::format::$module::SparseLayout {
+                                value_compression: Some(value_encoding),
+                                num_buffers,
+                                num_items,
+                                num_visible_items,
+                                has_large_chunk,
+                                structural_layers,
+                            },
+                        ),
+                    ),
+                }
+            }
+
             pub fn blob_layout(
                 inner_layout: crate::format::$module::PageLayout,
                 def_meaning: &[DefinitionInterpretation],

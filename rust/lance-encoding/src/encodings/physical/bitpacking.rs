@@ -241,6 +241,14 @@ impl MiniBlockDecompressor for InlineBitpacking {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
+        if num_values == 0 {
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::empty(),
+                bits_per_value: self.uncompressed_bit_width,
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            }));
+        }
         match self.uncompressed_bit_width {
             8 => Self::unchunk::<u8>(data, num_values),
             16 => Self::unchunk::<u16>(data, num_values),

@@ -15,6 +15,7 @@ use std::{
 use crate::{
     constants::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+        STRUCTURAL_ENCODING_SPARSE,
     },
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
@@ -23,7 +24,9 @@ use crate::{
         pb21::{self, CompressiveEncoding, PageLayout, compressive_encoding::Compression},
     },
 };
-use arrow_array::{Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, types::UInt64Type};
+use arrow_array::{
+    Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_empty_array, types::UInt64Type,
+};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
@@ -58,7 +61,8 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, SerializedRepDefs, StructuralPagePlan, build_control_word_iterator,
+        RepDefSlicer, SerializedRepDefs, SparseStructuralLayerPlan, SparseStructuralPlan,
+        StructuralPagePlan, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -672,6 +676,956 @@ impl Clone for LoadedChunk {
     }
 }
 
+#[derive(Debug, Clone)]
+enum SparseLayerDecompressors {
+    Validity {
+        num_slots: u64,
+        null_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        num_nulls: u64,
+    },
+    List {
+        num_slots: u64,
+        num_child_slots: u64,
+        non_empty_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        num_non_empty: u64,
+        count_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        constant_count: u64,
+        null_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        num_nulls: u64,
+    },
+    FixedSizeList {
+        num_slots: u64,
+        dimension: u64,
+        null_decompressor: Option<Arc<dyn BlockDecompressor>>,
+        num_nulls: u64,
+    },
+}
+
+#[derive(Debug)]
+struct SparseStructuralCacheableState {
+    chunk_meta: Vec<ChunkMeta>,
+    chunk_value_offsets: Arc<[u64]>,
+    plan: SparseStructuralPlan,
+}
+
+impl DeepSizeOf for SparseStructuralCacheableState {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        let structural_size = self
+            .plan
+            .layers
+            .iter()
+            .map(|layer| match layer {
+                SparseStructuralLayerPlan::Validity { null_positions, .. } => {
+                    null_positions.len() * std::mem::size_of::<u64>()
+                }
+                SparseStructuralLayerPlan::List {
+                    non_empty_positions,
+                    counts,
+                    null_positions,
+                    ..
+                } => {
+                    (non_empty_positions.len() + counts.len() + null_positions.len())
+                        * std::mem::size_of::<u64>()
+                }
+                SparseStructuralLayerPlan::FixedSizeList { null_positions, .. } => {
+                    null_positions.len() * std::mem::size_of::<u64>()
+                }
+            })
+            .sum::<usize>();
+        self.chunk_meta.len() * std::mem::size_of::<ChunkMeta>()
+            + self.chunk_value_offsets.len() * std::mem::size_of::<u64>()
+            + structural_size
+    }
+}
+
+impl CachedPageData for SparseStructuralCacheableState {
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct SparseStructuralScheduler {
+    buffer_offsets_and_sizes: Vec<(u64, u64)>,
+    priority: u64,
+    num_items: u64,
+    num_visible_items: u64,
+    num_buffers: u64,
+    value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    layer_decompressors: Vec<SparseLayerDecompressors>,
+    data_type: DataType,
+    page_meta: Option<Arc<SparseStructuralCacheableState>>,
+    has_large_chunk: bool,
+}
+
+impl SparseStructuralScheduler {
+    fn try_new(
+        buffer_offsets_and_sizes: &[(u64, u64)],
+        priority: u64,
+        data_type: DataType,
+        layout: &pb21::SparseLayout,
+        decompressors: &dyn DecompressionStrategy,
+    ) -> Result<Self> {
+        let value_decompressor = decompressors.create_miniblock_decompressor(
+            layout.value_compression.as_ref().unwrap(),
+            decompressors,
+        )?;
+        let layer_decompressors = layout
+            .structural_layers
+            .iter()
+            .map(|layer| Self::layer_decompressors(layer, decompressors))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
+            priority,
+            num_items: layout.num_items,
+            num_visible_items: layout.num_visible_items,
+            num_buffers: layout.num_buffers,
+            value_decompressor: value_decompressor.into(),
+            layer_decompressors,
+            data_type,
+            page_meta: None,
+            has_large_chunk: layout.has_large_chunk,
+        })
+    }
+
+    fn layer_decompressors(
+        layer: &pb21::SparseStructuralLayer,
+        decompressors: &dyn DecompressionStrategy,
+    ) -> Result<SparseLayerDecompressors> {
+        let null_decompressor = layer
+            .null_compression
+            .as_ref()
+            .map(|compression| {
+                decompressors
+                    .create_block_decompressor(compression)
+                    .map(Arc::from)
+            })
+            .transpose()?;
+        let kind = pb21::sparse_structural_layer::Kind::try_from(layer.kind)?;
+        Ok(match kind {
+            pb21::sparse_structural_layer::Kind::SparseLayerValidity => {
+                SparseLayerDecompressors::Validity {
+                    num_slots: layer.num_slots,
+                    null_decompressor,
+                    num_nulls: layer.num_nulls,
+                }
+            }
+            pb21::sparse_structural_layer::Kind::SparseLayerList => {
+                let non_empty_decompressor = layer
+                    .non_empty_compression
+                    .as_ref()
+                    .map(|compression| {
+                        decompressors
+                            .create_block_decompressor(compression)
+                            .map(Arc::from)
+                    })
+                    .transpose()?;
+                let count_decompressor = layer
+                    .count_compression
+                    .as_ref()
+                    .map(|compression| {
+                        decompressors
+                            .create_block_decompressor(compression)
+                            .map(Arc::from)
+                    })
+                    .transpose()?;
+                SparseLayerDecompressors::List {
+                    num_slots: layer.num_slots,
+                    num_child_slots: layer.num_child_slots,
+                    non_empty_decompressor,
+                    num_non_empty: layer.num_non_empty,
+                    count_decompressor,
+                    constant_count: layer.constant_count,
+                    null_decompressor,
+                    num_nulls: layer.num_nulls,
+                }
+            }
+            pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList => {
+                SparseLayerDecompressors::FixedSizeList {
+                    num_slots: layer.num_slots,
+                    dimension: layer.constant_count,
+                    null_decompressor,
+                    num_nulls: layer.num_nulls,
+                }
+            }
+            pb21::sparse_structural_layer::Kind::SparseLayerUnspecified => {
+                return Err(Error::invalid_input_source(
+                    "Sparse structural layer kind is unspecified".into(),
+                ));
+            }
+        })
+    }
+
+    fn parse_chunk_meta(&self, meta_bytes: Bytes) -> Result<Vec<ChunkMeta>> {
+        if !meta_bytes.len().is_multiple_of(8) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse layout metadata length {} is not a multiple of 8",
+                    meta_bytes.len()
+                )
+                .into(),
+            ));
+        }
+
+        let value_buf_position = self.buffer_offsets_and_sizes[1].0;
+        let mut rows_counter = 0;
+        let mut offset_bytes = value_buf_position;
+        let mut chunk_meta = Vec::with_capacity(meta_bytes.len() / 8);
+        for chunk in meta_bytes.chunks_exact(8) {
+            let divided_bytes_minus_one =
+                u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let num_values = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+            let num_bytes = (divided_bytes_minus_one as usize + 1) * MINIBLOCK_ALIGNMENT;
+            rows_counter += num_values;
+            chunk_meta.push(ChunkMeta {
+                num_values,
+                chunk_size_bytes: num_bytes as u64,
+                offset_bytes,
+            });
+            offset_bytes += num_bytes as u64;
+        }
+        if rows_counter != self.num_visible_items {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse layout visible item count mismatch: metadata has {}, layout has {}",
+                    rows_counter, self.num_visible_items
+                )
+                .into(),
+            ));
+        }
+        Ok(chunk_meta)
+    }
+
+    fn decode_u64_values(
+        decompressor: &dyn BlockDecompressor,
+        data: Bytes,
+        num_values: u64,
+        label: &str,
+    ) -> Result<Vec<u64>> {
+        let decoded = decompressor.decompress(LanceBuffer::from_bytes(data, 1), num_values)?;
+        let fixed = decoded.as_fixed_width().ok_or_else(|| {
+            Error::internal(format!(
+                "Sparse structural {label} did not decode to fixed width data"
+            ))
+        })?;
+        if fixed.bits_per_value != 64 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} decoded to {} bits per value, expected 64",
+                    fixed.bits_per_value
+                )
+                .into(),
+            ));
+        }
+        Ok(fixed.data.borrow_to_typed_slice::<u64>().to_vec())
+    }
+
+    fn decode_positions(
+        decompressor: Option<&Arc<dyn BlockDecompressor>>,
+        data: Option<Bytes>,
+        num_positions: u64,
+        num_slots: u64,
+        label: &str,
+    ) -> Result<Vec<u64>> {
+        if num_positions == 0 {
+            return Ok(Vec::new());
+        }
+        let decompressor = decompressor.ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} has positions but no compression").into(),
+            )
+        })?;
+        let data = data.ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} is missing its position buffer").into(),
+            )
+        })?;
+        let deltas = Self::decode_u64_values(decompressor.as_ref(), data, num_positions, label)?;
+        let mut positions = Vec::with_capacity(deltas.len());
+        let mut current = 0_u64;
+        for (idx, delta) in deltas.into_iter().enumerate() {
+            if idx == 0 {
+                current = delta;
+            } else {
+                current = current.checked_add(delta).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!("Sparse structural {label} position overflow").into(),
+                    )
+                })?;
+            }
+            if current >= num_slots {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Sparse structural {label} position {} is outside layer with {} slots",
+                        current, num_slots
+                    )
+                    .into(),
+                ));
+            }
+            positions.push(current);
+        }
+        Ok(positions)
+    }
+
+    fn decode_layer(
+        layer: &SparseLayerDecompressors,
+        buffers: &mut impl Iterator<Item = Bytes>,
+    ) -> Result<SparseStructuralLayerPlan> {
+        Ok(match layer {
+            SparseLayerDecompressors::Validity {
+                num_slots,
+                null_decompressor,
+                num_nulls,
+            } => SparseStructuralLayerPlan::Validity {
+                num_slots: *num_slots,
+                null_positions: Self::decode_positions(
+                    null_decompressor.as_ref(),
+                    (*num_nulls > 0).then(|| buffers.next().unwrap()),
+                    *num_nulls,
+                    *num_slots,
+                    "validity null positions",
+                )?,
+            },
+            SparseLayerDecompressors::List {
+                num_slots,
+                num_child_slots,
+                non_empty_decompressor,
+                num_non_empty,
+                count_decompressor,
+                constant_count,
+                null_decompressor,
+                num_nulls,
+            } => {
+                let non_empty_positions = Self::decode_positions(
+                    non_empty_decompressor.as_ref(),
+                    (*num_non_empty > 0).then(|| buffers.next().unwrap()),
+                    *num_non_empty,
+                    *num_slots,
+                    "list non-empty positions",
+                )?;
+                let counts = if let Some(count_decompressor) = count_decompressor {
+                    Self::decode_u64_values(
+                        count_decompressor.as_ref(),
+                        buffers.next().unwrap(),
+                        *num_non_empty,
+                        "list counts",
+                    )?
+                } else {
+                    vec![*constant_count; *num_non_empty as usize]
+                };
+                let null_positions = Self::decode_positions(
+                    null_decompressor.as_ref(),
+                    (*num_nulls > 0).then(|| buffers.next().unwrap()),
+                    *num_nulls,
+                    *num_slots,
+                    "list null positions",
+                )?;
+                let actual_child_slots = counts.iter().sum::<u64>();
+                if actual_child_slots != *num_child_slots {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural list count sum {} does not match declared child slots {}",
+                            actual_child_slots, num_child_slots
+                        )
+                        .into(),
+                    ));
+                }
+                SparseStructuralLayerPlan::List {
+                    num_slots: *num_slots,
+                    num_child_slots: *num_child_slots,
+                    non_empty_positions,
+                    counts,
+                    constant_count: (*constant_count > 0).then_some(*constant_count),
+                    null_positions,
+                }
+            }
+            SparseLayerDecompressors::FixedSizeList {
+                num_slots,
+                dimension,
+                null_decompressor,
+                num_nulls,
+            } => SparseStructuralLayerPlan::FixedSizeList {
+                num_slots: *num_slots,
+                dimension: *dimension,
+                null_positions: Self::decode_positions(
+                    null_decompressor.as_ref(),
+                    (*num_nulls > 0).then(|| buffers.next().unwrap()),
+                    *num_nulls,
+                    *num_slots,
+                    "fixed-size-list null positions",
+                )?,
+            },
+        })
+    }
+
+    fn lookup_value_chunks(&self, chunk_indices: &[usize]) -> Vec<LoadedChunk> {
+        let page_meta = self.page_meta.as_ref().unwrap();
+        chunk_indices
+            .iter()
+            .map(|&chunk_idx| {
+                let chunk_meta = &page_meta.chunk_meta[chunk_idx];
+                let bytes_start = chunk_meta.offset_bytes;
+                let bytes_end = bytes_start + chunk_meta.chunk_size_bytes;
+                LoadedChunk {
+                    byte_range: bytes_start..bytes_end,
+                    items_in_chunk: chunk_meta.num_values,
+                    chunk_idx,
+                    data: LanceBuffer::empty(),
+                }
+            })
+            .collect()
+    }
+
+    fn value_chunk_range(chunk_value_offsets: &[u64], value_range: Range<u64>) -> Range<usize> {
+        let start = chunk_value_offsets.partition_point(|&offset| offset <= value_range.start) - 1;
+        let end = chunk_value_offsets
+            .partition_point(|&offset| offset < value_range.end)
+            .max(start + 1);
+        start..end
+    }
+}
+
+impl StructuralPageScheduler for SparseStructuralScheduler {
+    fn initialize<'a>(
+        &'a mut self,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
+        let mut required_ranges = Vec::new();
+        required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
+        for (position, size) in self.buffer_offsets_and_sizes.iter().skip(2) {
+            required_ranges.push(*position..*position + *size);
+        }
+        let io_req = io.submit_request(required_ranges, 0);
+
+        async move {
+            let mut buffers = io_req.await?.into_iter();
+            let meta_bytes = buffers.next().unwrap();
+
+            let chunk_meta = self.parse_chunk_meta(meta_bytes)?;
+            let mut chunk_value_offsets = Vec::with_capacity(chunk_meta.len() + 1);
+            let mut value_offset = 0;
+            chunk_value_offsets.push(value_offset);
+            for chunk in &chunk_meta {
+                value_offset += chunk.num_values;
+                chunk_value_offsets.push(value_offset);
+            }
+
+            let layers = self
+                .layer_decompressors
+                .iter()
+                .map(|layer| Self::decode_layer(layer, &mut buffers))
+                .collect::<Result<Vec<_>>>()?;
+            let plan = SparseStructuralPlan {
+                layers,
+                num_items: self.num_items,
+                num_visible_items: self.num_visible_items,
+            };
+
+            let page_meta = Arc::new(SparseStructuralCacheableState {
+                chunk_meta,
+                chunk_value_offsets: chunk_value_offsets.into(),
+                plan,
+            });
+            self.page_meta = Some(page_meta.clone());
+            Ok(page_meta as Arc<dyn CachedPageData>)
+        }
+        .boxed()
+    }
+
+    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
+        self.page_meta = Some(
+            data.clone()
+                .as_arc_any()
+                .downcast::<SparseStructuralCacheableState>()
+                .unwrap(),
+        );
+    }
+
+    fn schedule_ranges(
+        &self,
+        ranges: &[Range<u64>],
+        io: &Arc<dyn EncodingsIo>,
+    ) -> Result<Vec<PageLoadTask>> {
+        let num_rows = ranges.iter().map(|range| range.end - range.start).sum();
+        let page_meta = self.page_meta.as_ref().unwrap();
+
+        let mut chunks_needed = Vec::new();
+        let selection = slice_sparse_plan(&page_meta.plan, ranges)?;
+        for value_range in &selection.leaf_ranges {
+            chunks_needed.extend(Self::value_chunk_range(
+                &page_meta.chunk_value_offsets,
+                value_range.clone(),
+            ));
+        }
+        chunks_needed.sort_unstable();
+        chunks_needed.dedup();
+
+        let mut loaded_chunks = self.lookup_value_chunks(&chunks_needed);
+        let chunk_ranges = loaded_chunks
+            .iter()
+            .map(|chunk| chunk.byte_range.clone())
+            .collect::<Vec<_>>();
+        let loaded_chunk_data = io.submit_request(chunk_ranges, self.priority);
+        let ranges = VecDeque::from(ranges.to_vec());
+        let value_decompressor = self.value_decompressor.clone();
+        let data_type = self.data_type.clone();
+        let page_meta = page_meta.clone();
+        let num_buffers = self.num_buffers;
+        let has_large_chunk = self.has_large_chunk;
+
+        let res = async move {
+            let loaded_chunk_data = loaded_chunk_data.await?;
+            for (loaded_chunk, chunk_data) in loaded_chunks.iter_mut().zip(loaded_chunk_data) {
+                loaded_chunk.data = LanceBuffer::from_bytes(chunk_data, 1);
+            }
+
+            Ok(Box::new(SparseStructuralDecoder {
+                value_decompressor,
+                data_type,
+                page_meta,
+                loaded_chunks: Arc::new(loaded_chunks),
+                ranges,
+                offset_in_current_range: 0,
+                num_rows,
+                num_buffers,
+                has_large_chunk,
+            }) as Box<dyn StructuralPageDecoder>)
+        }
+        .boxed();
+        Ok(vec![PageLoadTask {
+            decoder_fut: res,
+            num_rows,
+        }])
+    }
+}
+
+#[derive(Debug)]
+struct SparseStructuralDecoder {
+    value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    data_type: DataType,
+    page_meta: Arc<SparseStructuralCacheableState>,
+    loaded_chunks: Arc<Vec<LoadedChunk>>,
+    ranges: VecDeque<Range<u64>>,
+    offset_in_current_range: u64,
+    num_rows: u64,
+    num_buffers: u64,
+    has_large_chunk: bool,
+}
+
+impl SparseStructuralDecoder {
+    fn drain_ranges(&mut self, mut rows_desired: u64) -> Vec<Range<u64>> {
+        let mut ranges = Vec::new();
+        while rows_desired > 0 {
+            let range = self.ranges.front().unwrap();
+            let start = range.start + self.offset_in_current_range;
+            let rows_available = range.end - start;
+            let rows_to_take = rows_available.min(rows_desired);
+            ranges.push(start..start + rows_to_take);
+            rows_desired -= rows_to_take;
+            self.offset_in_current_range += rows_to_take;
+            if self.offset_in_current_range == range.end - range.start {
+                self.offset_in_current_range = 0;
+                self.ranges.pop_front();
+            }
+        }
+        ranges
+    }
+}
+
+impl StructuralPageDecoder for SparseStructuralDecoder {
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        Ok(Box::new(DecodeSparseStructuralTask {
+            row_ranges: self.drain_ranges(num_rows),
+            value_decompressor: self.value_decompressor.clone(),
+            data_type: self.data_type.clone(),
+            page_meta: self.page_meta.clone(),
+            loaded_chunks: self.loaded_chunks.clone(),
+            num_buffers: self.num_buffers,
+            has_large_chunk: self.has_large_chunk,
+        }))
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+}
+
+#[derive(Debug)]
+struct DecodeSparseStructuralTask {
+    row_ranges: Vec<Range<u64>>,
+    value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    data_type: DataType,
+    page_meta: Arc<SparseStructuralCacheableState>,
+    loaded_chunks: Arc<Vec<LoadedChunk>>,
+    num_buffers: u64,
+    has_large_chunk: bool,
+}
+
+impl DecodeSparseStructuralTask {
+    fn loaded_chunk(&self, chunk_idx: usize) -> Result<&LoadedChunk> {
+        self.loaded_chunks
+            .binary_search_by_key(&chunk_idx, |chunk| chunk.chunk_idx)
+            .map(|idx| &self.loaded_chunks[idx])
+            .map_err(|_| {
+                Error::internal(format!(
+                    "Sparse structural decode missing loaded value chunk {}",
+                    chunk_idx
+                ))
+            })
+    }
+
+    fn decode_value_chunk(&self, chunk: &LoadedChunk) -> Result<DataBlock> {
+        let buf = &chunk.data;
+        let mut offset = 0;
+        let num_levels = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
+        offset += 2;
+        if num_levels != 0 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural value chunk unexpectedly contains {} rep/def levels",
+                    num_levels
+                )
+                .into(),
+            ));
+        }
+
+        let buffer_sizes = if self.has_large_chunk {
+            DecodeMiniBlockTask::read_buffer_sizes::<true>(buf, &mut offset, self.num_buffers)
+        } else {
+            DecodeMiniBlockTask::read_buffer_sizes::<false>(buf, &mut offset, self.num_buffers)
+        };
+
+        offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
+        let buffers = buffer_sizes
+            .into_iter()
+            .map(|buf_size| {
+                let buffer = buf.slice_with_length(offset, buf_size as usize);
+                offset += buf_size as usize;
+                offset += pad_bytes::<MINIBLOCK_ALIGNMENT>(offset);
+                buffer
+            })
+            .collect::<Vec<_>>();
+
+        self.value_decompressor
+            .decompress(buffers, chunk.items_in_chunk)
+    }
+
+    fn append_value_range(
+        &self,
+        value_range: Range<u64>,
+        data_builder: &mut DataBlockBuilder,
+        chunk_cache: &mut Option<(usize, DataBlock)>,
+    ) -> Result<()> {
+        let mut value_start = value_range.start;
+        while value_start < value_range.end {
+            let chunk_idx = self
+                .page_meta
+                .chunk_value_offsets
+                .partition_point(|&offset| offset <= value_start)
+                - 1;
+            let chunk_value_start = self.page_meta.chunk_value_offsets[chunk_idx];
+            let chunk_value_end = self.page_meta.chunk_value_offsets[chunk_idx + 1];
+            let take_end = value_range.end.min(chunk_value_end);
+
+            if !matches!(chunk_cache, Some((cached_idx, _)) if *cached_idx == chunk_idx) {
+                let chunk = self.loaded_chunk(chunk_idx)?;
+                *chunk_cache = Some((chunk_idx, self.decode_value_chunk(chunk)?));
+            }
+            let values = &chunk_cache.as_ref().unwrap().1;
+            data_builder.append(
+                values,
+                value_start - chunk_value_start..take_end - chunk_value_start,
+            );
+            value_start = take_end;
+        }
+        Ok(())
+    }
+}
+
+impl DecodePageTask for DecodeSparseStructuralTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let selection = slice_sparse_plan(&self.page_meta.plan, &self.row_ranges)?;
+        let estimated_size_bytes = self
+            .loaded_chunks
+            .iter()
+            .map(|chunk| chunk.data.len())
+            .sum::<usize>()
+            * 2;
+        let mut data_builder =
+            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
+        let mut chunk_cache: Option<(usize, DataBlock)> = None;
+        let mut appended_values = false;
+        for value_range in &selection.leaf_ranges {
+            self.append_value_range(value_range.clone(), &mut data_builder, &mut chunk_cache)?;
+            appended_values = true;
+        }
+
+        let data = if appended_values {
+            data_builder.finish()
+        } else {
+            DataBlock::from_array(new_empty_array(&self.data_type))
+        };
+        let unraveler = RepDefUnraveler::new_sparse(selection.plan);
+        Ok(DecodedPage {
+            data,
+            repdef: unraveler,
+        })
+    }
+}
+
+struct SparseStructuralSelection {
+    plan: SparseStructuralPlan,
+    leaf_ranges: Vec<Range<u64>>,
+}
+
+fn translate_positions(positions: &[u64], ranges: &[Range<u64>], label: &str) -> Result<Vec<u64>> {
+    let mut translated = Vec::new();
+    let mut output_base = 0_u64;
+    for range in ranges {
+        let mut idx = positions.partition_point(|position| *position < range.start);
+        while idx < positions.len() && positions[idx] < range.end {
+            translated.push(output_base + positions[idx] - range.start);
+            idx += 1;
+        }
+        output_base += range.end - range.start;
+    }
+    if translated.windows(2).any(|window| window[0] >= window[1]) {
+        return Err(Error::invalid_input_source(
+            format!("Sparse structural {label} positions are not sorted after slicing").into(),
+        ));
+    }
+    Ok(translated)
+}
+
+fn offsets_from_counts(counts: &[u64]) -> Vec<u64> {
+    let mut offsets = Vec::with_capacity(counts.len() + 1);
+    let mut offset = 0_u64;
+    offsets.push(offset);
+    for count in counts {
+        offset += count;
+        offsets.push(offset);
+    }
+    offsets
+}
+
+fn coalesce_ranges(ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    let mut coalesced: Vec<Range<u64>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if range.is_empty() {
+            continue;
+        }
+        if let Some(last) = coalesced.last_mut()
+            && last.end == range.start
+        {
+            last.end = range.end;
+            continue;
+        }
+        coalesced.push(range);
+    }
+    coalesced
+}
+
+fn slice_list_layer(
+    num_slots: u64,
+    num_child_slots: u64,
+    non_empty_positions: &[u64],
+    counts: &[u64],
+    constant_count: Option<u64>,
+    null_positions: &[u64],
+    ranges: &[Range<u64>],
+) -> Result<(SparseStructuralLayerPlan, Vec<Range<u64>>)> {
+    if non_empty_positions.len() != counts.len() {
+        return Err(Error::invalid_input_source(
+            "Sparse structural list has mismatched non-empty positions and counts".into(),
+        ));
+    }
+    if ranges
+        .iter()
+        .any(|range| range.start > range.end || range.end > num_slots)
+    {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Sparse structural list slice is outside layer with {} slots",
+                num_slots
+            )
+            .into(),
+        ));
+    }
+
+    let mut out_non_empty_positions = Vec::new();
+    let mut out_counts = Vec::new();
+    let mut matched_indices = Vec::new();
+    let mut output_base = 0_u64;
+    for range in ranges {
+        let mut idx = non_empty_positions.partition_point(|position| *position < range.start);
+        while idx < non_empty_positions.len() && non_empty_positions[idx] < range.end {
+            out_non_empty_positions.push(output_base + non_empty_positions[idx] - range.start);
+            out_counts.push(counts[idx]);
+            matched_indices.push(idx);
+            idx += 1;
+        }
+        output_base += range.end - range.start;
+    }
+
+    let child_ranges = if matched_indices.is_empty() {
+        Vec::new()
+    } else if let Some(constant_count) = constant_count {
+        let expected_child_slots =
+            constant_count
+                .checked_mul(counts.len() as u64)
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        "Sparse structural list constant counts overflow child slots".into(),
+                    )
+                })?;
+        if expected_child_slots != num_child_slots {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural list constant count sum {} does not match child slots {}",
+                    expected_child_slots, num_child_slots
+                )
+                .into(),
+            ));
+        }
+        matched_indices
+            .iter()
+            .map(|idx| {
+                let start = *idx as u64 * constant_count;
+                start..start + constant_count
+            })
+            .collect()
+    } else {
+        let value_offsets = offsets_from_counts(counts);
+        if *value_offsets.last().unwrap() != num_child_slots {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural list count sum {} does not match child slots {}",
+                    value_offsets.last().unwrap(),
+                    num_child_slots
+                )
+                .into(),
+            ));
+        }
+        matched_indices
+            .iter()
+            .map(|idx| value_offsets[*idx]..value_offsets[*idx + 1])
+            .collect()
+    };
+
+    let out_null_positions = translate_positions(null_positions, ranges, "list null")?;
+    let out_num_slots = ranges
+        .iter()
+        .map(|range| range.end - range.start)
+        .sum::<u64>();
+    let out_num_child_slots = out_counts.iter().sum::<u64>();
+    let constant_count = out_counts
+        .first()
+        .copied()
+        .filter(|first| out_counts.iter().all(|count| count == first));
+    Ok((
+        SparseStructuralLayerPlan::List {
+            num_slots: out_num_slots,
+            num_child_slots: out_num_child_slots,
+            non_empty_positions: out_non_empty_positions,
+            counts: out_counts,
+            constant_count,
+            null_positions: out_null_positions,
+        },
+        child_ranges,
+    ))
+}
+
+fn slice_sparse_plan(
+    plan: &SparseStructuralPlan,
+    row_ranges: &[Range<u64>],
+) -> Result<SparseStructuralSelection> {
+    let mut selected_ranges = row_ranges.to_vec();
+    let mut sliced_layers = Vec::with_capacity(plan.layers.len());
+
+    for layer in &plan.layers {
+        match layer {
+            SparseStructuralLayerPlan::Validity {
+                num_slots: _,
+                null_positions,
+            } => {
+                let out_num_slots = selected_ranges
+                    .iter()
+                    .map(|range| range.end - range.start)
+                    .sum::<u64>();
+                sliced_layers.push(SparseStructuralLayerPlan::Validity {
+                    num_slots: out_num_slots,
+                    null_positions: translate_positions(
+                        null_positions,
+                        &selected_ranges,
+                        "validity null",
+                    )?,
+                });
+            }
+            SparseStructuralLayerPlan::List {
+                num_slots,
+                num_child_slots,
+                non_empty_positions,
+                counts,
+                constant_count,
+                null_positions,
+                ..
+            } => {
+                let (sliced_layer, child_ranges) = slice_list_layer(
+                    *num_slots,
+                    *num_child_slots,
+                    non_empty_positions,
+                    counts,
+                    *constant_count,
+                    null_positions,
+                    &selected_ranges,
+                )?;
+                sliced_layers.push(sliced_layer);
+                selected_ranges = child_ranges;
+            }
+            SparseStructuralLayerPlan::FixedSizeList {
+                num_slots: _,
+                dimension,
+                null_positions,
+            } => {
+                let out_num_slots = selected_ranges
+                    .iter()
+                    .map(|range| range.end - range.start)
+                    .sum::<u64>();
+                let child_ranges = selected_ranges
+                    .iter()
+                    .map(|range| range.start * dimension..range.end * dimension)
+                    .collect::<Vec<_>>();
+                sliced_layers.push(SparseStructuralLayerPlan::FixedSizeList {
+                    num_slots: out_num_slots,
+                    dimension: *dimension,
+                    null_positions: translate_positions(
+                        null_positions,
+                        &selected_ranges,
+                        "fixed-size-list null",
+                    )?,
+                });
+                selected_ranges = child_ranges;
+            }
+        }
+    }
+
+    let num_visible_items = selected_ranges
+        .iter()
+        .map(|range| range.end - range.start)
+        .sum::<u64>();
+    Ok(SparseStructuralSelection {
+        plan: SparseStructuralPlan {
+            layers: sliced_layers,
+            num_items: num_visible_items,
+            num_visible_items,
+        },
+        leaf_ranges: coalesce_ranges(selected_ranges),
+    })
+}
+
 /// Decodes mini-block formatted data.  See [`PrimitiveStructuralEncoder`] for more
 /// details on the different layouts.
 #[derive(Debug)]
@@ -1206,6 +2160,11 @@ struct MiniBlockSchedulerDictionary {
     num_dictionary_items: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ChunkMetadataKind {
+    MiniBlock { has_large_chunk: bool },
+}
+
 /// Individual block metadata within a MiniBlock repetition index.
 #[derive(Debug)]
 struct MiniBlockRepIndexBlock {
@@ -1376,7 +2335,7 @@ pub struct MiniBlockScheduler {
     dictionary: Option<MiniBlockSchedulerDictionary>,
     // This is set after initialization
     page_meta: Option<Arc<MiniBlockCacheableState>>,
-    has_large_chunk: bool,
+    chunk_metadata_kind: ChunkMetadataKind,
 }
 
 impl MiniBlockScheduler {
@@ -1460,7 +2419,9 @@ impl MiniBlockScheduler {
             dictionary,
             def_meaning: def_meaning.into(),
             page_meta: None,
-            has_large_chunk: layout.has_large_chunk,
+            chunk_metadata_kind: ChunkMetadataKind::MiniBlock {
+                has_large_chunk: layout.has_large_chunk,
+            },
         })
     }
 
@@ -1875,35 +2836,40 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let rep_index_bytes = buffers.next();
 
             // Parse the metadata and build the chunk meta
-            let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
-            let mut chunk_meta = Vec::with_capacity(words.len());
-
             let mut rows_counter = 0;
             let mut offset_bytes = value_buf_position;
-            for (word_idx, word) in words.iter().enumerate() {
-                let log_num_values = word & 0x0F;
-                let divided_bytes = word >> 4;
-                let num_bytes = (divided_bytes as usize + 1) * MINIBLOCK_ALIGNMENT;
-                debug_assert!(num_bytes > 0);
-                let num_values = if word_idx < words.len() - 1 {
-                    debug_assert!(log_num_values > 0);
-                    1 << log_num_values
-                } else {
-                    debug_assert!(
-                        log_num_values == 0
-                            || (1 << log_num_values) == (self.items_in_page - rows_counter)
-                    );
-                    self.items_in_page - rows_counter
-                };
-                rows_counter += num_values;
+            let chunk_meta = match self.chunk_metadata_kind {
+                ChunkMetadataKind::MiniBlock { has_large_chunk } => {
+                    let words = Words::from_bytes(meta_bytes, has_large_chunk)?;
+                    let mut chunk_meta = Vec::with_capacity(words.len());
 
-                chunk_meta.push(ChunkMeta {
-                    num_values,
-                    chunk_size_bytes: num_bytes as u64,
-                    offset_bytes,
-                });
-                offset_bytes += num_bytes as u64;
-            }
+                    for (word_idx, word) in words.iter().enumerate() {
+                        let log_num_values = word & 0x0F;
+                        let divided_bytes = word >> 4;
+                        let num_bytes = (divided_bytes as usize + 1) * MINIBLOCK_ALIGNMENT;
+                        debug_assert!(num_bytes > 0);
+                        let num_values = if word_idx < words.len() - 1 {
+                            debug_assert!(log_num_values > 0);
+                            1 << log_num_values
+                        } else {
+                            debug_assert!(
+                                log_num_values == 0
+                                    || (1 << log_num_values) == (self.items_in_page - rows_counter)
+                            );
+                            self.items_in_page - rows_counter
+                        };
+                        rows_counter += num_values;
+
+                        chunk_meta.push(ChunkMeta {
+                            num_values,
+                            chunk_size_bytes: num_bytes as u64,
+                            offset_bytes,
+                        });
+                        offset_bytes += num_bytes as u64;
+                    }
+                    chunk_meta
+                }
+            };
 
             // Build the repetition index
             let rep_index = if let Some(rep_index_data) = rep_index_bytes {
@@ -1985,7 +2951,9 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
         let num_buffers = self.num_buffers;
-        let has_large_chunk = self.has_large_chunk;
+        let has_large_chunk = match self.chunk_metadata_kind {
+            ChunkMetadataKind::MiniBlock { has_large_chunk } => has_large_chunk,
+        };
         let dictionary = page_meta
             .dictionary
             .as_ref()
@@ -3349,6 +4317,13 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
+            Layout::SparseLayout(sparse) => Box::new(SparseStructuralScheduler::try_new(
+                &page_info.buffer_offsets_and_sizes,
+                page_info.priority,
+                target_field.data_type(),
+                sparse,
+                decompressors,
+            )?),
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -3775,6 +4750,22 @@ struct CompressedLevels {
     rep_index: Option<LanceBuffer>,
 }
 
+struct SparseMiniBlockChunk {
+    buffer_sizes: Vec<u32>,
+    num_values: u32,
+}
+
+struct SparseMiniBlockCompressed {
+    data: Vec<LanceBuffer>,
+    chunks: Vec<SparseMiniBlockChunk>,
+}
+
+#[derive(Debug)]
+struct SparseStructuralEncoded {
+    layers: Vec<pb21::SparseStructuralLayer>,
+    buffers: Vec<LanceBuffer>,
+}
+
 struct SerializedMiniBlockPage {
     num_buffers: u64,
     data: LanceBuffer,
@@ -3799,6 +4790,10 @@ struct PrimitivePageData {
     num_rows: u64,
     // Present when one top-level row is too large for one miniblock rep/def chunk.
     unsplittable_miniblock_levels: Option<u64>,
+    // Structural split plan from the original accumulated page.
+    structural_plan: StructuralPagePlan,
+    // Native sparse structural mapping for the original accumulated page.
+    sparse_structural_plan: Option<SparseStructuralPlan>,
 }
 
 // Immutable encoder state shared by per-page encode tasks.
@@ -3826,6 +4821,10 @@ struct PrimitiveEncodeContext {
 }
 
 impl PrimitiveStructuralEncoder {
+    fn supports_sparse_layout(version: LanceFileVersion) -> bool {
+        version.resolve() >= LanceFileVersion::V2_3
+    }
+
     pub fn try_new(
         options: &EncodingOptions,
         compression_strategy: Arc<dyn CompressionStrategy>,
@@ -4233,6 +5232,149 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    fn serialize_sparse_miniblocks(
+        miniblocks: SparseMiniBlockCompressed,
+        rep: Option<Vec<CompressedLevelsChunk>>,
+        def: Option<Vec<CompressedLevelsChunk>>,
+        support_large_chunk: bool,
+    ) -> Result<SerializedMiniBlockPage> {
+        let bytes_rep = rep
+            .as_ref()
+            .map(|rep| rep.iter().map(|r| r.data.len()).sum::<usize>())
+            .unwrap_or(0);
+        let bytes_def = def
+            .as_ref()
+            .map(|def| def.iter().map(|d| d.data.len()).sum::<usize>())
+            .unwrap_or(0);
+        let bytes_data = miniblocks.data.iter().map(|d| d.len()).sum::<usize>();
+        let mut num_buffers = miniblocks.data.len();
+        if rep.is_some() {
+            num_buffers += 1;
+        }
+        if def.is_some() {
+            num_buffers += 1;
+        }
+        let max_extra = 9 * num_buffers;
+        let mut data_buffer = Vec::with_capacity(bytes_rep + bytes_def + bytes_data + max_extra);
+        let mut meta_buffer = Vec::with_capacity(miniblocks.chunks.len() * 8);
+
+        let mut rep_iter = rep.map(|r| r.into_iter());
+        let mut def_iter = def.map(|d| d.into_iter());
+
+        let mut buffer_offsets = vec![0; miniblocks.data.len()];
+        for chunk in miniblocks.chunks {
+            if chunk.buffer_sizes.len() != miniblocks.data.len() {
+                return Err(Error::internal(format!(
+                    "Sparse chunk has {} value buffer sizes, expected {}",
+                    chunk.buffer_sizes.len(),
+                    miniblocks.data.len()
+                )));
+            }
+
+            let start_pos = data_buffer.len();
+            debug_assert_eq!(start_pos % MINIBLOCK_ALIGNMENT, 0);
+
+            let rep = rep_iter.as_mut().map(|r| r.next().unwrap());
+            let def = def_iter.as_mut().map(|d| d.next().unwrap());
+
+            let num_levels = rep
+                .as_ref()
+                .map(|r| r.num_levels)
+                .unwrap_or(def.as_ref().map(|d| d.num_levels).unwrap_or(0));
+            data_buffer.extend_from_slice(&num_levels.to_le_bytes());
+
+            if let Some(rep) = rep.as_ref() {
+                let bytes_rep = u16::try_from(rep.data.len()).map_err(|_| {
+                    Error::internal(format!(
+                        "Sparse repetition buffer size ({} bytes) too large",
+                        rep.data.len()
+                    ))
+                })?;
+                data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
+            }
+            if let Some(def) = def.as_ref() {
+                let bytes_def = u16::try_from(def.data.len()).map_err(|_| {
+                    Error::internal(format!(
+                        "Sparse definition buffer size ({} bytes) too large",
+                        def.data.len()
+                    ))
+                })?;
+                data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
+            }
+
+            if support_large_chunk {
+                for &buffer_size in &chunk.buffer_sizes {
+                    data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
+                }
+            } else {
+                for &buffer_size in &chunk.buffer_sizes {
+                    let buffer_size = u16::try_from(buffer_size).map_err(|_| {
+                        Error::internal(format!(
+                            "Sparse value buffer size ({} bytes) too large for 16-bit metadata",
+                            buffer_size
+                        ))
+                    })?;
+                    data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
+                }
+            }
+
+            let add_padding = |data_buffer: &mut Vec<u8>| {
+                let pad = pad_bytes::<MINIBLOCK_ALIGNMENT>(data_buffer.len());
+                data_buffer.extend(iter::repeat_n(FILL_BYTE, pad));
+            };
+            add_padding(&mut data_buffer);
+
+            if let Some(rep) = rep.as_ref() {
+                data_buffer.extend_from_slice(&rep.data);
+                add_padding(&mut data_buffer);
+            }
+            if let Some(def) = def.as_ref() {
+                data_buffer.extend_from_slice(&def.data);
+                add_padding(&mut data_buffer);
+            }
+            for (buffer_size, (buffer, buffer_offset)) in chunk
+                .buffer_sizes
+                .iter()
+                .zip(miniblocks.data.iter().zip(buffer_offsets.iter_mut()))
+            {
+                let start = *buffer_offset;
+                let end = start + *buffer_size as usize;
+                *buffer_offset += *buffer_size as usize;
+                data_buffer.extend_from_slice(&buffer[start..end]);
+                add_padding(&mut data_buffer);
+            }
+
+            let chunk_bytes = data_buffer.len() - start_pos;
+            if chunk_bytes == 0 || chunk_bytes > (u32::MAX as usize + 1) * MINIBLOCK_ALIGNMENT {
+                return Err(Error::internal(format!(
+                    "Sparse chunk size {} bytes exceeds the metadata limit",
+                    chunk_bytes
+                )));
+            }
+            if chunk_bytes % MINIBLOCK_ALIGNMENT != 0 {
+                return Err(Error::internal(format!(
+                    "Sparse chunk size {} bytes is not aligned to {} bytes",
+                    chunk_bytes, MINIBLOCK_ALIGNMENT
+                )));
+            }
+            let divided_bytes_minus_one = u32::try_from(chunk_bytes / MINIBLOCK_ALIGNMENT - 1)
+                .map_err(|_| {
+                    Error::internal(format!(
+                        "Sparse chunk size {} bytes exceeds the metadata limit",
+                        chunk_bytes
+                    ))
+                })?;
+            meta_buffer.extend_from_slice(&divided_bytes_minus_one.to_le_bytes());
+            meta_buffer.extend_from_slice(&chunk.num_values.to_le_bytes());
+        }
+
+        Ok(SerializedMiniBlockPage {
+            num_buffers: miniblocks.data.len() as u64,
+            data: LanceBuffer::from(data_buffer),
+            metadata: LanceBuffer::from(meta_buffer),
+        })
+    }
+
     fn encode_simple_all_null(
         column_idx: u32,
         num_rows: u64,
@@ -4563,6 +5705,274 @@ impl PrimitiveStructuralEncoder {
             env::var(DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR).ok(),
         );
         Ok(dict_values_field)
+    }
+
+    fn sparse_miniblock_compressed(
+        compressed: MiniBlockCompressed,
+    ) -> Result<SparseMiniBlockCompressed> {
+        let mut values_counter = 0_u64;
+        let mut chunks = Vec::with_capacity(compressed.chunks.len());
+        for chunk in compressed.chunks {
+            let num_values = chunk.num_values(values_counter, compressed.num_values);
+            values_counter += num_values;
+            let num_values = u32::try_from(num_values).map_err(|_| {
+                Error::invalid_input_source(
+                    format!(
+                        "Sparse value chunk has {} visible values, which exceeds the u32 metadata limit",
+                        num_values
+                    )
+                    .into(),
+                )
+            })?;
+            chunks.push(SparseMiniBlockChunk {
+                buffer_sizes: chunk.buffer_sizes,
+                num_values,
+            });
+        }
+        if values_counter != compressed.num_values {
+            return Err(Error::internal(format!(
+                "Sparse value chunks describe {} values, expected {}",
+                values_counter, compressed.num_values
+            )));
+        }
+        Ok(SparseMiniBlockCompressed {
+            data: compressed.data,
+            chunks,
+        })
+    }
+
+    fn encode_sparse_u64_values(
+        values: Vec<u64>,
+        compression_strategy: &dyn CompressionStrategy,
+    ) -> Result<(LanceBuffer, CompressiveEncoding)> {
+        let num_values = values.len() as u64;
+        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(values),
+            bits_per_value: 64,
+            num_values,
+            block_info: BlockInfo::new(),
+        });
+        block.compute_stat();
+        let field = Field::new_arrow("", DataType::UInt64, false)?;
+        let (compressor, encoding) =
+            compression_strategy.create_block_compressor(&field, &block)?;
+        Ok((compressor.compress(block)?, encoding))
+    }
+
+    fn positions_to_deltas(positions: &[u64], label: &str) -> Result<Vec<u64>> {
+        let mut previous_row = 0_u64;
+        positions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, row_id)| {
+                if idx > 0 && row_id <= previous_row {
+                    return Err(Error::invalid_input_source(
+                        format!("Sparse structural {label} positions must be strictly increasing")
+                            .into(),
+                    ));
+                }
+                let delta = if idx == 0 {
+                    row_id
+                } else {
+                    row_id - previous_row
+                };
+                previous_row = row_id;
+                Ok(delta)
+            })
+            .collect()
+    }
+
+    fn encode_sparse_positions(
+        positions: &[u64],
+        compression_strategy: &dyn CompressionStrategy,
+        label: &str,
+    ) -> Result<Option<(LanceBuffer, CompressiveEncoding)>> {
+        if positions.is_empty() {
+            return Ok(None);
+        }
+        let deltas = Self::positions_to_deltas(positions, label)?;
+        Self::encode_sparse_u64_values(deltas, compression_strategy).map(Some)
+    }
+
+    fn encode_sparse_structural_plan(
+        plan: &SparseStructuralPlan,
+        compression_strategy: &dyn CompressionStrategy,
+    ) -> Result<SparseStructuralEncoded> {
+        let mut layers = Vec::with_capacity(plan.layers.len());
+        let mut buffers = Vec::new();
+
+        for layer in &plan.layers {
+            match layer {
+                SparseStructuralLayerPlan::Validity {
+                    num_slots,
+                    null_positions,
+                } => {
+                    let null_compression = Self::encode_sparse_positions(
+                        null_positions,
+                        compression_strategy,
+                        "validity null",
+                    )?
+                    .map(|(buffer, encoding)| {
+                        buffers.push(buffer);
+                        encoding
+                    });
+                    layers.push(pb21::SparseStructuralLayer {
+                        kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
+                        num_slots: *num_slots,
+                        num_child_slots: *num_slots,
+                        constant_count: 0,
+                        non_empty_compression: None,
+                        num_non_empty: 0,
+                        count_compression: None,
+                        null_compression,
+                        num_nulls: null_positions.len() as u64,
+                    });
+                }
+                SparseStructuralLayerPlan::List {
+                    num_slots,
+                    num_child_slots,
+                    non_empty_positions,
+                    counts,
+                    constant_count,
+                    null_positions,
+                } => {
+                    if non_empty_positions.len() != counts.len() {
+                        return Err(Error::invalid_input_source(
+                            format!(
+                                "Sparse structural list has {} non-empty positions but {} counts",
+                                non_empty_positions.len(),
+                                counts.len()
+                            )
+                            .into(),
+                        ));
+                    }
+                    let non_empty_compression = Self::encode_sparse_positions(
+                        non_empty_positions,
+                        compression_strategy,
+                        "list non-empty",
+                    )?
+                    .map(|(buffer, encoding)| {
+                        buffers.push(buffer);
+                        encoding
+                    });
+                    let count_compression = if constant_count.is_some() || counts.is_empty() {
+                        None
+                    } else {
+                        let (buffer, encoding) =
+                            Self::encode_sparse_u64_values(counts.clone(), compression_strategy)?;
+                        buffers.push(buffer);
+                        Some(encoding)
+                    };
+                    let null_compression = Self::encode_sparse_positions(
+                        null_positions,
+                        compression_strategy,
+                        "list null",
+                    )?
+                    .map(|(buffer, encoding)| {
+                        buffers.push(buffer);
+                        encoding
+                    });
+                    layers.push(pb21::SparseStructuralLayer {
+                        kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
+                        num_slots: *num_slots,
+                        num_child_slots: *num_child_slots,
+                        constant_count: constant_count.unwrap_or(0),
+                        non_empty_compression,
+                        num_non_empty: non_empty_positions.len() as u64,
+                        count_compression,
+                        null_compression,
+                        num_nulls: null_positions.len() as u64,
+                    });
+                }
+                SparseStructuralLayerPlan::FixedSizeList {
+                    num_slots,
+                    dimension,
+                    null_positions,
+                } => {
+                    let null_compression = Self::encode_sparse_positions(
+                        null_positions,
+                        compression_strategy,
+                        "fixed-size-list null",
+                    )?
+                    .map(|(buffer, encoding)| {
+                        buffers.push(buffer);
+                        encoding
+                    });
+                    let num_child_slots = num_slots.checked_mul(*dimension).ok_or_else(|| {
+                        Error::invalid_input_source(
+                            format!(
+                                "Sparse structural fixed-size-list child slot count overflows: slots={}, dimension={}",
+                                num_slots, dimension
+                            )
+                            .into(),
+                        )
+                    })?;
+                    layers.push(pb21::SparseStructuralLayer {
+                        kind: pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32,
+                        num_slots: *num_slots,
+                        num_child_slots,
+                        constant_count: *dimension,
+                        non_empty_compression: None,
+                        num_non_empty: 0,
+                        count_compression: None,
+                        null_compression,
+                        num_nulls: null_positions.len() as u64,
+                    });
+                }
+            }
+        }
+
+        Ok(SparseStructuralEncoded { layers, buffers })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_sparse_structural_page(
+        column_idx: u32,
+        field: &Field,
+        compression_strategy: &dyn CompressionStrategy,
+        data: DataBlock,
+        sparse_plan: SparseStructuralPlan,
+        row_number: u64,
+        num_rows: u64,
+        support_large_chunk: bool,
+    ) -> Result<EncodedPage> {
+        if sparse_plan.num_visible_items != data.num_values() {
+            return Err(Error::internal(format!(
+                "Sparse structural plan has {} visible items but data has {} values",
+                sparse_plan.num_visible_items,
+                data.num_values()
+            )));
+        }
+
+        let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
+        let (compressed_data, value_encoding) = compressor.compress(data)?;
+        let compressed_data = Self::sparse_miniblock_compressed(compressed_data)?;
+        let serialized =
+            Self::serialize_sparse_miniblocks(compressed_data, None, None, support_large_chunk)?;
+        let structural = Self::encode_sparse_structural_plan(&sparse_plan, compression_strategy)?;
+
+        let description = ProtobufUtils21::sparse_layout(
+            value_encoding,
+            serialized.num_buffers,
+            sparse_plan.num_items,
+            sparse_plan.num_visible_items,
+            support_large_chunk,
+            structural.layers,
+        );
+
+        let mut data = Vec::with_capacity(2 + structural.buffers.len());
+        data.push(serialized.metadata);
+        data.push(serialized.data);
+        data.extend(structural.buffers);
+
+        Ok(EncodedPage {
+            num_rows,
+            column_idx,
+            data,
+            description: PageEncoding::Structural(description),
+            row_number,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5306,6 +6716,8 @@ impl PrimitiveStructuralEncoder {
                 row_number,
                 num_rows,
                 unsplittable_miniblock_levels: None,
+                structural_plan: StructuralPagePlan::Fits,
+                sparse_structural_plan: None,
             }]);
         }
         if let StructuralPagePlan::UnsplittableOverBudget(num_levels) = plan {
@@ -5315,6 +6727,8 @@ impl PrimitiveStructuralEncoder {
                 row_number,
                 num_rows,
                 unsplittable_miniblock_levels: Some(num_levels),
+                structural_plan: StructuralPagePlan::UnsplittableOverBudget(num_levels),
+                sparse_structural_plan: None,
             }]);
         }
 
@@ -5332,6 +6746,8 @@ impl PrimitiveStructuralEncoder {
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
                 unsplittable_miniblock_levels: None,
+                structural_plan: StructuralPagePlan::Fits,
+                sparse_structural_plan: None,
             });
         }
         Ok(pages)
@@ -5354,6 +6770,8 @@ impl PrimitiveStructuralEncoder {
             row_number,
             num_rows,
             unsplittable_miniblock_levels,
+            structural_plan,
+            sparse_structural_plan,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
 
@@ -5421,8 +6839,30 @@ impl PrimitiveStructuralEncoder {
         }
 
         let data_block = DataBlock::from_arrays(&arrays, num_values);
+        let requested_encoding = encoding_metadata
+            .get(STRUCTURAL_ENCODING_META_KEY)
+            .map(|requested| requested.to_lowercase());
+        let supports_sparse_layout = Self::supports_sparse_layout(version);
+        let should_encode_sparse = requested_encoding.as_deref()
+            == Some(STRUCTURAL_ENCODING_SPARSE)
+            || (supports_sparse_layout
+                && requested_encoding.is_none()
+                && matches!(&structural_plan, StructuralPagePlan::Split(_)));
+
+        if requested_encoding.as_deref() == Some(STRUCTURAL_ENCODING_SPARSE)
+            && !supports_sparse_layout
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural encoding requires Lance file format 2.3+, current version: {}",
+                    version.resolve()
+                )
+                .into(),
+            ));
+        }
 
         if version.resolve() >= LanceFileVersion::V2_2
+            && !should_encode_sparse
             && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
         {
             log::debug!(
@@ -5436,10 +6876,73 @@ impl PrimitiveStructuralEncoder {
             );
         }
 
+        let requires_full_zip_packed_struct =
+            if let DataBlock::Struct(ref struct_data_block) = data_block {
+                struct_data_block.has_variable_width_child()
+            } else {
+                false
+            };
+
+        if let DataBlock::Dictionary(dict) = data_block {
+            if should_encode_sparse {
+                return Err(Error::not_supported_source(
+                    "Sparse layout does not support dictionary data blocks".into(),
+                ));
+            }
+            log::debug!(
+                "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
+                column_idx,
+                num_values
+            );
+            let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
+            // TODO: https://github.com/lancedb/lance/issues/4809
+            // If we compute stats on dictionary_data_block => panic.
+            // If we don't compute stats on indices_data_block => panic.
+            // This is messy.  Don't make me call compute_stat ever.
+            indices_data_block.compute_stat();
+            return Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                indices_data_block,
+                repdef,
+                row_number,
+                Some(dictionary_data_block),
+                num_rows,
+                support_large_chunk,
+            );
+        }
+
+        if should_encode_sparse {
+            if requires_full_zip_packed_struct {
+                return Err(Error::not_supported_source(
+                    "Sparse layout does not support packed struct value blocks".into(),
+                ));
+            }
+            let sparse_structural_plan = sparse_structural_plan.ok_or_else(|| {
+                Error::invalid_input_source(
+                    "Sparse structural encoding requires native structural layers".into(),
+                )
+            })?;
+            log::debug!(
+                "Encoding column {} with {} visible items ({} rows) using sparse layout",
+                column_idx,
+                num_values,
+                num_rows
+            );
+            return Self::encode_sparse_structural_page(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                sparse_structural_plan,
+                row_number,
+                num_rows,
+                support_large_chunk,
+            );
+        }
+
         if let Some(num_levels) = unsplittable_miniblock_levels {
-            let requested_encoding = encoding_metadata
-                .get(STRUCTURAL_ENCODING_META_KEY)
-                .map(|requested| requested.to_lowercase());
             let fullzip_error = match &data_block {
                 DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
                     Some(format!(
@@ -5539,13 +7042,6 @@ impl PrimitiveStructuralEncoder {
             }
         }
 
-        let requires_full_zip_packed_struct =
-            if let DataBlock::Struct(ref struct_data_block) = data_block {
-                struct_data_block.has_variable_width_child()
-            } else {
-                false
-            };
-
         if requires_full_zip_packed_struct {
             log::debug!(
                 "Encoding column {} with {} items using full-zip packed struct layout",
@@ -5560,31 +7056,6 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 row_number,
                 num_rows,
-            );
-        }
-
-        if let DataBlock::Dictionary(dict) = data_block {
-            log::debug!(
-                "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
-                column_idx,
-                num_values
-            );
-            let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
-            // TODO: https://github.com/lancedb/lance/issues/4809
-            // If we compute stats on dictionary_data_block => panic.
-            // If we don't compute stats on indices_data_block => panic.
-            // This is messy.  Don't make me call compute_stat ever.
-            indices_data_block.compute_stat();
-            return Self::encode_miniblock(
-                column_idx,
-                &field,
-                compression_strategy.as_ref(),
-                indices_data_block,
-                repdef,
-                row_number,
-                Some(dictionary_data_block),
-                num_rows,
-                support_large_chunk,
             );
         }
 
@@ -5663,19 +7134,62 @@ impl PrimitiveStructuralEncoder {
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
+        let sparse_structural_plan = if Self::supports_sparse_layout(self.version) {
+            RepDefBuilder::to_sparse_structural_plan(&repdefs, num_values)?
+        } else {
+            None
+        };
         let (repdef, structural_plan) = RepDefBuilder::serialize_with_structural_plan(
             repdefs,
             miniblock::max_repdef_levels_per_chunk,
             num_rows,
             num_values,
         )?;
-        let pages = Self::split_structural_pages_for_miniblock_budget(
-            arrays,
-            repdef,
-            structural_plan,
-            row_number,
-            num_rows,
-        )?;
+        let requested_encoding = self
+            .encoding_metadata
+            .get(STRUCTURAL_ENCODING_META_KEY)
+            .map(|requested| requested.to_lowercase());
+
+        if requested_encoding.as_deref() == Some(STRUCTURAL_ENCODING_SPARSE)
+            && !Self::supports_sparse_layout(self.version)
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural encoding requires Lance file format 2.3+, current version: {}",
+                    self.version.resolve()
+                )
+                .into(),
+            ));
+        }
+
+        let should_use_sparse_plan = requested_encoding.as_deref()
+            == Some(STRUCTURAL_ENCODING_SPARSE)
+            || (Self::supports_sparse_layout(self.version)
+                && requested_encoding.is_none()
+                && matches!(&structural_plan, StructuralPagePlan::Split(_)));
+        let pages = if should_use_sparse_plan {
+            let unsplittable_miniblock_levels = match &structural_plan {
+                StructuralPagePlan::UnsplittableOverBudget(num_levels) => Some(*num_levels),
+                _ => None,
+            };
+            vec![PrimitivePageData {
+                arrays,
+                repdef,
+                row_number,
+                num_rows,
+                unsplittable_miniblock_levels,
+                structural_plan,
+                sparse_structural_plan,
+            }]
+        } else {
+            Self::split_structural_pages_for_miniblock_budget(
+                arrays,
+                repdef,
+                structural_plan,
+                row_number,
+                num_rows,
+            )?
+        };
 
         let mut tasks = Vec::with_capacity(pages.len());
         let ctx = PrimitiveEncodeContext {
@@ -5801,8 +7315,8 @@ mod tests {
     use crate::compression::DefaultDecompressionStrategy;
     use crate::constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
-        DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
-        STRUCTURAL_ENCODING_MINIBLOCK,
+        DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
+        STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
     };
     use crate::data::BlockInfo;
     use crate::decoder::{PageEncoding, StructuralFieldDecoder};
@@ -7649,11 +9163,391 @@ mod tests {
         );
     }
 
+    fn sparse_i32_list_array(num_rows: i32, visible_stride: i32) -> ArrayRef {
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        for row in 0..num_rows {
+            if row % visible_stride == 0 {
+                builder.values().append_value(row);
+            }
+            builder.append(true);
+        }
+        Arc::new(builder.finish())
+    }
+
+    fn sparse_layout_from_page(
+        page: &crate::encoder::EncodedPage,
+    ) -> &crate::format::pb21::SparseLayout {
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural page encoding");
+        };
+        let pb21::page_layout::Layout::SparseLayout(layout) = layout.layout.as_ref().unwrap()
+        else {
+            panic!("Expected sparse layout");
+        };
+        layout
+    }
+
+    fn sparse_metadata_visible_values(page: &crate::encoder::EncodedPage) -> Vec<u32> {
+        page.data[0]
+            .chunks_exact(8)
+            .map(|chunk| u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]))
+            .collect()
+    }
+
+    fn sparse_list_layers(
+        sparse: &crate::format::pb21::SparseLayout,
+    ) -> Vec<&crate::format::pb21::SparseStructuralLayer> {
+        sparse
+            .structural_layers
+            .iter()
+            .filter(|layer| {
+                matches!(
+                    crate::format::pb21::sparse_structural_layer::Kind::try_from(layer.kind),
+                    Ok(crate::format::pb21::sparse_structural_layer::Kind::SparseLayerList)
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_explicit_sparse_layout_roundtrip() {
+        let arr = sparse_i32_list_array(4096, 64);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        );
+        let field = arrow_schema::Field::new("c", arr.data_type().clone(), true)
+            .with_metadata(metadata.clone());
+
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_3).await;
+        let sparse = sparse_layout_from_page(&page);
+        assert_eq!(sparse.num_visible_items, 64);
+        assert!(sparse.num_items > sparse.num_visible_items);
+        let list_layers = sparse_list_layers(sparse);
+        assert_eq!(list_layers.len(), 1);
+        assert_eq!(list_layers[0].num_slots, 4096);
+        assert_eq!(list_layers[0].num_non_empty, 64);
+        assert_eq!(list_layers[0].constant_count, 1);
+        assert!(list_layers[0].non_empty_compression.is_some());
+        assert!(list_layers[0].count_compression.is_none());
+        let chunk_values = sparse_metadata_visible_values(&page);
+        assert_eq!(
+            chunk_values.iter().map(|v| *v as u64).sum::<u64>(),
+            sparse.num_visible_items
+        );
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_explicit_sparse_layout_requires_v2_3() {
+        let arr = sparse_i32_list_array(4096, 64);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        );
+        let field =
+            arrow_schema::Field::new("c", arr.data_type().clone(), true).with_metadata(metadata);
+
+        let err = try_encode_first_page(field, arr, LanceFileVersion::V2_2)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Sparse structural encoding requires Lance file format 2.3+"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_auto_for_overbudget_structural_page() {
+        let arr = sparse_i32_list_array(70_000, 65_535);
+        let field = arrow_schema::Field::new("c", arr.data_type().clone(), true);
+
+        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_3).await;
+        let sparse = sparse_layout_from_page(&page);
+        assert_eq!(sparse.num_visible_items, 2);
+        assert!(sparse.num_items > 65_535);
+        let list_layers = sparse_list_layers(sparse);
+        assert_eq!(list_layers.len(), 1);
+        assert_eq!(list_layers[0].num_non_empty, 2);
+        assert_eq!(list_layers[0].constant_count, 1);
+
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+    }
+
+    fn deep_sparse_struct_array(num_rows: usize, stride: usize) -> ArrayRef {
+        use arrow_array::{Int32Array, ListArray, StructArray};
+        use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_schema::Fields;
+
+        fn offsets(values: Vec<i32>) -> OffsetBuffer<i32> {
+            OffsetBuffer::new(ScalarBuffer::from(values))
+        }
+
+        fn validity(values: Vec<bool>) -> Option<NullBuffer> {
+            Some(NullBuffer::new(BooleanBuffer::from(values)))
+        }
+
+        let mut event_rows = Vec::new();
+        let mut event_offsets = Vec::with_capacity(num_rows + 1);
+        let mut event_validity = Vec::with_capacity(num_rows);
+        let mut event_child_count = 0_i32;
+        event_offsets.push(event_child_count);
+        for row in 0..num_rows {
+            let is_null = row % 4096 == 7;
+            let is_non_empty = row % stride == 0;
+            event_validity.push(!is_null);
+            if !is_null && is_non_empty {
+                event_rows.push(row as i32);
+                event_child_count += 1;
+            }
+            event_offsets.push(event_child_count);
+        }
+
+        let score_values = Arc::new(Int32Array::from(event_rows.clone())) as ArrayRef;
+        let mut sample_offsets = Vec::with_capacity(event_rows.len() + 1);
+        let mut sample_values = Vec::with_capacity(event_rows.len() * 2);
+        sample_offsets.push(0_i32);
+        for row in &event_rows {
+            sample_values.push(*row);
+            sample_values.push(*row + 1);
+            sample_offsets.push(sample_values.len() as i32);
+        }
+        let sample_values = Arc::new(Int32Array::from(sample_values)) as ArrayRef;
+        let sample_field = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let samples = Arc::new(
+            ListArray::try_new(sample_field, offsets(sample_offsets), sample_values, None).unwrap(),
+        ) as ArrayRef;
+        let event_fields = Fields::from(vec![
+            ArrowField::new("score", DataType::Int32, true),
+            ArrowField::new("samples", samples.data_type().clone(), true),
+        ]);
+        let events_struct = Arc::new(StructArray::new(
+            event_fields,
+            vec![score_values, samples],
+            None,
+        )) as ArrayRef;
+        let event_field = Arc::new(ArrowField::new(
+            "item",
+            events_struct.data_type().clone(),
+            true,
+        ));
+        let events = Arc::new(
+            ListArray::try_new(
+                event_field,
+                offsets(event_offsets),
+                events_struct,
+                validity(event_validity),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let profile_fields = Fields::from(vec![ArrowField::new(
+            "events",
+            events.data_type().clone(),
+            true,
+        )]);
+        let profile = Arc::new(StructArray::new(profile_fields, vec![events], None)) as ArrayRef;
+
+        let mut payload_rows = Vec::new();
+        let mut payload_offsets = Vec::with_capacity(num_rows + 1);
+        let mut payload_validity = Vec::with_capacity(num_rows);
+        let mut payload_child_count = 0_i32;
+        payload_offsets.push(payload_child_count);
+        for row in 0..num_rows {
+            let is_null = row % 4096 == 11;
+            let is_non_empty = row % stride == 0;
+            payload_validity.push(!is_null);
+            if !is_null && is_non_empty {
+                payload_rows.push(row as i32);
+                payload_child_count += 1;
+            }
+            payload_offsets.push(payload_child_count);
+        }
+
+        let mut payload_inner_offsets = Vec::with_capacity(payload_rows.len() + 1);
+        let mut payload_values = Vec::with_capacity(payload_rows.len() * 2);
+        payload_inner_offsets.push(0_i32);
+        for row in &payload_rows {
+            payload_values.push(*row);
+            payload_values.push(*row + 3);
+            payload_inner_offsets.push(payload_values.len() as i32);
+        }
+        let payload_values = Arc::new(Int32Array::from(payload_values)) as ArrayRef;
+        let payload_inner_field = Arc::new(ArrowField::new("item", DataType::Int32, true));
+        let payload_inner = Arc::new(
+            ListArray::try_new(
+                payload_inner_field,
+                offsets(payload_inner_offsets),
+                payload_values,
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        let payload_outer_field = Arc::new(ArrowField::new(
+            "item",
+            payload_inner.data_type().clone(),
+            true,
+        ));
+        let payload = Arc::new(
+            ListArray::try_new(
+                payload_outer_field,
+                offsets(payload_offsets),
+                payload_inner,
+                validity(payload_validity),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        Arc::new(StructArray::new(
+            Fields::from(vec![
+                ArrowField::new("profile", profile.data_type().clone(), true),
+                ArrowField::new("payload", payload.data_type().clone(), true),
+            ]),
+            vec![profile, payload],
+            None,
+        ))
+    }
+
+    fn encoded_page_bytes(pages: &[crate::encoder::EncodedPage]) -> usize {
+        pages
+            .iter()
+            .flat_map(|page| page.data.iter())
+            .map(|buffer| buffer.len())
+            .sum()
+    }
+
+    fn sparse_page_count(pages: &[crate::encoder::EncodedPage]) -> usize {
+        pages
+            .iter()
+            .filter(|page| {
+                let PageEncoding::Structural(layout) = &page.description else {
+                    return false;
+                };
+                matches!(
+                    layout.layout.as_ref().unwrap(),
+                    pb21::page_layout::Layout::SparseLayout(_)
+                )
+            })
+            .count()
+    }
+
+    async fn encode_pages_with_structural_mode(
+        array: ArrayRef,
+        mode: &str,
+    ) -> Vec<crate::encoder::EncodedPage> {
+        let metadata =
+            HashMap::from([(STRUCTURAL_ENCODING_META_KEY.to_string(), mode.to_string())]);
+        let field =
+            arrow_schema::Field::new("c", array.data_type().clone(), true).with_metadata(metadata);
+        try_encode_pages(field, array, LanceFileVersion::V2_3)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_deep_nested_struct_beats_miniblock_fullzip() {
+        let arr = deep_sparse_struct_array(80_000, 512);
+        let sparse_pages =
+            encode_pages_with_structural_mode(arr.clone(), STRUCTURAL_ENCODING_SPARSE).await;
+        let miniblock_pages =
+            encode_pages_with_structural_mode(arr.clone(), STRUCTURAL_ENCODING_MINIBLOCK).await;
+        let fullzip_pages =
+            encode_pages_with_structural_mode(arr.clone(), STRUCTURAL_ENCODING_FULLZIP).await;
+
+        let sparse_bytes = encoded_page_bytes(&sparse_pages);
+        let miniblock_bytes = encoded_page_bytes(&miniblock_pages);
+        let fullzip_bytes = encoded_page_bytes(&fullzip_pages);
+
+        assert!(sparse_page_count(&sparse_pages) > 0);
+        assert!(
+            sparse_pages.iter().any(|page| {
+                let PageEncoding::Structural(layout) = &page.description else {
+                    return false;
+                };
+                let pb21::page_layout::Layout::SparseLayout(sparse) =
+                    layout.layout.as_ref().unwrap()
+                else {
+                    return false;
+                };
+                sparse.structural_layers.len() >= 4
+            }),
+            "expected at least one sparse leaf page with deep structural layers"
+        );
+        assert!(
+            sparse_pages.len() < miniblock_pages.len(),
+            "expected sparse to emit fewer pages than miniblock: sparse={}, miniblock={}",
+            sparse_pages.len(),
+            miniblock_pages.len()
+        );
+        assert!(
+            sparse_pages.len() <= fullzip_pages.len(),
+            "expected sparse page count to be no worse than fullzip: sparse={}, fullzip={}",
+            sparse_pages.len(),
+            fullzip_pages.len()
+        );
+        assert!(
+            sparse_bytes < miniblock_bytes,
+            "expected sparse bytes < miniblock bytes: sparse={}, miniblock={}",
+            sparse_bytes,
+            miniblock_bytes
+        );
+        assert!(
+            sparse_bytes < fullzip_bytes,
+            "expected sparse bytes < fullzip bytes: sparse={}, fullzip={}",
+            sparse_bytes,
+            fullzip_bytes
+        );
+
+        let metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        )]);
+        let test_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_range(0..128)
+            .with_range(511..514)
+            .with_range(4096..4112)
+            .with_indices(vec![0, 1, 511, 512, 4096, 79_999]);
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
+    }
+
     async fn encode_first_page(
         field: arrow_schema::Field,
         array: ArrayRef,
         version: LanceFileVersion,
     ) -> crate::encoder::EncodedPage {
+        try_encode_first_page(field, array, version).await.unwrap()
+    }
+
+    async fn try_encode_first_page(
+        field: arrow_schema::Field,
+        array: ArrayRef,
+        version: LanceFileVersion,
+    ) -> lance_core::Result<crate::encoder::EncodedPage> {
+        Ok(try_encode_pages(field, array, version)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap())
+    }
+
+    async fn try_encode_pages(
+        field: arrow_schema::Field,
+        array: ArrayRef,
+        version: LanceFileVersion,
+    ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
         use crate::encoder::{
             ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
             default_encoding_strategy,
@@ -7671,29 +9565,24 @@ mod tests {
             version,
         };
 
-        let mut encoder = encoding_strategy
-            .create_field_encoder(
-                encoding_strategy.as_ref(),
-                &lance_field,
-                &mut column_index_seq,
-                &encoding_options,
-            )
-            .unwrap();
+        let mut encoder = encoding_strategy.create_field_encoder(
+            encoding_strategy.as_ref(),
+            &lance_field,
+            &mut column_index_seq,
+            &encoding_options,
+        )?;
 
         let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
         let repdef = RepDefBuilder::default();
         let num_rows = array.len() as u64;
         let mut pages = Vec::new();
-        for task in encoder
-            .maybe_encode(array, &mut external_buffers, repdef, 0, num_rows)
-            .unwrap()
-        {
-            pages.push(task.await.unwrap());
+        for task in encoder.maybe_encode(array, &mut external_buffers, repdef, 0, num_rows)? {
+            pages.push(task.await?);
         }
-        for task in encoder.flush(&mut external_buffers).unwrap() {
-            pages.push(task.await.unwrap());
+        for task in encoder.flush(&mut external_buffers)? {
+            pages.push(task.await?);
         }
-        pages.into_iter().next().unwrap()
+        Ok(pages)
     }
 
     #[tokio::test]

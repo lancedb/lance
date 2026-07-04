@@ -122,6 +122,445 @@ use crate::buffer::LanceBuffer;
 
 pub type LevelBuffer = Vec<u16>;
 
+/// Native sparse structural representation used by the 2.3 sparse layout.
+///
+/// Layers are stored from outer-most to inner-most, matching the order Arrow structural
+/// encoders record offsets and validity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SparseStructuralPlan {
+    pub(crate) layers: Vec<SparseStructuralLayerPlan>,
+    pub(crate) num_items: u64,
+    pub(crate) num_visible_items: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SparseStructuralLayerPlan {
+    Validity {
+        num_slots: u64,
+        null_positions: Vec<u64>,
+    },
+    List {
+        num_slots: u64,
+        num_child_slots: u64,
+        non_empty_positions: Vec<u64>,
+        counts: Vec<u64>,
+        constant_count: Option<u64>,
+        null_positions: Vec<u64>,
+    },
+    FixedSizeList {
+        num_slots: u64,
+        dimension: u64,
+        null_positions: Vec<u64>,
+    },
+}
+
+impl SparseStructuralPlan {
+    pub(crate) fn to_repdef(&self) -> Result<SerializedRepDefs> {
+        let mut builder = RepDefBuilder::default();
+        for layer in &self.layers {
+            match layer {
+                SparseStructuralLayerPlan::Validity {
+                    num_slots,
+                    null_positions,
+                } => {
+                    if null_positions.is_empty() {
+                        builder.add_no_null(*num_slots as usize);
+                    } else {
+                        let validity = validity_from_null_positions(*num_slots, null_positions)?;
+                        builder.add_validity_bitmap(NullBuffer::new(validity));
+                    }
+                }
+                SparseStructuralLayerPlan::List {
+                    num_slots,
+                    non_empty_positions,
+                    counts,
+                    null_positions,
+                    ..
+                } => {
+                    let (offsets, validity) = list_offsets_and_validity(
+                        *num_slots,
+                        non_empty_positions,
+                        counts,
+                        null_positions,
+                    )?;
+                    builder.add_offsets(offsets, validity);
+                }
+                SparseStructuralLayerPlan::FixedSizeList {
+                    num_slots,
+                    dimension,
+                    null_positions,
+                } => {
+                    let validity = if null_positions.is_empty() {
+                        None
+                    } else {
+                        Some(NullBuffer::new(validity_from_null_positions(
+                            *num_slots,
+                            null_positions,
+                        )?))
+                    };
+                    builder.add_fsl(validity, *dimension as usize, *num_slots as usize);
+                }
+            }
+        }
+        Ok(RepDefBuilder::serialize(vec![builder]))
+    }
+}
+
+fn validity_from_null_positions(num_slots: u64, null_positions: &[u64]) -> Result<BooleanBuffer> {
+    let mut validity = BooleanBufferBuilder::new(num_slots as usize);
+    let mut null_iter = null_positions.iter().copied().peekable();
+    for slot in 0..num_slots {
+        let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
+        if is_null {
+            null_iter.next();
+        }
+        validity.append(!is_null);
+    }
+    if let Some(extra_null) = null_iter.next() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Sparse structural null position {} is outside layer with {} slots",
+                extra_null, num_slots
+            )
+            .into(),
+        ));
+    }
+    Ok(validity.finish())
+}
+
+fn list_offsets_and_validity(
+    num_slots: u64,
+    non_empty_positions: &[u64],
+    counts: &[u64],
+    null_positions: &[u64],
+) -> Result<(OffsetBuffer<i64>, Option<NullBuffer>)> {
+    if non_empty_positions.len() != counts.len() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Sparse structural list has {} non-empty positions but {} counts",
+                non_empty_positions.len(),
+                counts.len()
+            )
+            .into(),
+        ));
+    }
+
+    let mut offsets = Vec::with_capacity(num_slots as usize + 1);
+    let mut validity =
+        (!null_positions.is_empty()).then(|| BooleanBufferBuilder::new(num_slots as usize));
+    let mut non_empty_iter = non_empty_positions
+        .iter()
+        .copied()
+        .zip(counts.iter().copied())
+        .peekable();
+    let mut null_iter = null_positions.iter().copied().peekable();
+    let mut current_offset = 0_i64;
+    offsets.push(current_offset);
+    for slot in 0..num_slots {
+        let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
+        if is_null {
+            null_iter.next();
+        }
+        if let Some(validity) = validity.as_mut() {
+            validity.append(!is_null);
+        }
+
+        if non_empty_iter
+            .peek()
+            .is_some_and(|(non_empty_pos, _)| *non_empty_pos == slot)
+        {
+            let (_, count) = non_empty_iter.next().unwrap();
+            if is_null {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Sparse structural list slot {} is both null and non-empty",
+                        slot
+                    )
+                    .into(),
+                ));
+            }
+            current_offset = current_offset
+                .checked_add(i64::try_from(count).map_err(|_| {
+                    Error::invalid_input_source(
+                        format!("Sparse structural list count {} exceeds i64::MAX", count).into(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        "Sparse structural list offsets overflow i64".into(),
+                    )
+                })?;
+        }
+        offsets.push(current_offset);
+    }
+    if let Some((extra_pos, _)) = non_empty_iter.next() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Sparse structural non-empty position {} is outside layer with {} slots",
+                extra_pos, num_slots
+            )
+            .into(),
+        ));
+    }
+    if let Some(extra_null) = null_iter.next() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Sparse structural null position {} is outside layer with {} slots",
+                extra_null, num_slots
+            )
+            .into(),
+        ));
+    }
+
+    Ok((
+        OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets)),
+        validity.map(|mut validity| NullBuffer::new(validity.finish())),
+    ))
+}
+
+#[derive(Debug)]
+struct SparseStructuralUnraveler {
+    layers: Vec<SparseStructuralLayerPlan>,
+    next_layer: usize,
+    num_items: u64,
+}
+
+impl SparseStructuralUnraveler {
+    fn new(plan: SparseStructuralPlan) -> Self {
+        let next_layer = plan.layers.len();
+        Self {
+            layers: plan.layers,
+            next_layer,
+            num_items: plan.num_visible_items,
+        }
+    }
+
+    fn current_layer(&self) -> Option<&SparseStructuralLayerPlan> {
+        self.next_layer.checked_sub(1).map(|idx| &self.layers[idx])
+    }
+
+    fn consume_current_layer(&mut self) {
+        debug_assert!(self.next_layer > 0);
+        self.next_layer -= 1;
+    }
+
+    fn is_all_valid(&self) -> bool {
+        match self.current_layer() {
+            Some(SparseStructuralLayerPlan::Validity { null_positions, .. })
+            | Some(SparseStructuralLayerPlan::FixedSizeList { null_positions, .. })
+            | Some(SparseStructuralLayerPlan::List { null_positions, .. }) => {
+                null_positions.is_empty()
+            }
+            None => true,
+        }
+    }
+
+    fn max_lists(&self) -> usize {
+        match self.current_layer() {
+            Some(SparseStructuralLayerPlan::List { num_slots, .. }) => *num_slots as usize,
+            _ => 0,
+        }
+    }
+
+    fn skip_validity(&mut self) {
+        match self.current_layer() {
+            Some(SparseStructuralLayerPlan::Validity { .. })
+            | Some(SparseStructuralLayerPlan::FixedSizeList { .. }) => {
+                self.consume_current_layer();
+            }
+            None => {}
+            Some(SparseStructuralLayerPlan::List { .. }) => {
+                unreachable!("Sparse structural list layer cannot be skipped as validity")
+            }
+        }
+    }
+
+    fn append_validity(
+        validity: &mut BooleanBufferBuilder,
+        num_slots: u64,
+        null_positions: &[u64],
+    ) {
+        if null_positions.is_empty() {
+            validity.append_n(num_slots as usize, true);
+            return;
+        }
+
+        let mut null_iter = null_positions.iter().copied().peekable();
+        for slot in 0..num_slots {
+            let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
+            if is_null {
+                null_iter.next();
+            }
+            validity.append(!is_null);
+        }
+    }
+
+    fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
+        match self.current_layer() {
+            Some(SparseStructuralLayerPlan::Validity {
+                num_slots,
+                null_positions,
+            })
+            | Some(SparseStructuralLayerPlan::FixedSizeList {
+                num_slots,
+                null_positions,
+                ..
+            }) => {
+                Self::append_validity(validity, *num_slots, null_positions);
+                self.consume_current_layer();
+            }
+            None => {
+                validity.append_n(self.num_items as usize, true);
+            }
+            Some(SparseStructuralLayerPlan::List { .. }) => {
+                unreachable!("Sparse structural list layer cannot be unraveled as validity")
+            }
+        }
+    }
+
+    fn decimate(&mut self, dimension: usize) {
+        if let Some(SparseStructuralLayerPlan::FixedSizeList {
+            dimension: actual_dimension,
+            ..
+        }) = self.current_layer()
+        {
+            debug_assert_eq!(*actual_dimension as usize, dimension);
+        }
+    }
+
+    fn to_offset<T: ArrowNativeType>(value: u64) -> Result<T> {
+        let value = usize::try_from(value).map_err(|_| {
+            Error::invalid_input_source(
+                format!("Sparse structural offset {} exceeds usize::MAX", value).into(),
+            )
+        })?;
+        T::from_usize(value).ok_or_else(|| {
+            Error::invalid_input(
+                "A single batch had more than i32::MAX values and so a large container type is required",
+            )
+        })
+    }
+
+    fn unravel_offsets<T: ArrowNativeType>(
+        &mut self,
+        offsets: &mut Vec<T>,
+        validity: Option<&mut BooleanBufferBuilder>,
+    ) -> Result<()> {
+        let Some(SparseStructuralLayerPlan::List {
+            num_slots,
+            num_child_slots,
+            non_empty_positions,
+            counts,
+            null_positions,
+            ..
+        }) = self.current_layer()
+        else {
+            return Err(Error::internal(
+                "Expected sparse structural list layer while unraveling offsets".to_string(),
+            ));
+        };
+
+        if non_empty_positions.len() != counts.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural list has {} non-empty positions but {} counts",
+                    non_empty_positions.len(),
+                    counts.len()
+                )
+                .into(),
+            ));
+        }
+        let actual_child_slots = counts.iter().sum::<u64>();
+        if actual_child_slots != *num_child_slots {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural list count sum {} does not match child slots {}",
+                    actual_child_slots, num_child_slots
+                )
+                .into(),
+            ));
+        }
+
+        let mut current_offset = offsets
+            .last()
+            .map(|offset| offset.as_usize() as u64)
+            .unwrap_or(0);
+        if offsets.is_empty() {
+            offsets.push(Self::to_offset(current_offset)?);
+        }
+
+        if non_empty_positions.is_empty() {
+            if let Some(validity) = validity {
+                Self::append_validity(validity, *num_slots, null_positions);
+            }
+            let offset = Self::to_offset(current_offset)?;
+            offsets.resize(offsets.len() + *num_slots as usize, offset);
+            self.consume_current_layer();
+            return Ok(());
+        }
+
+        let mut non_empty_iter = non_empty_positions
+            .iter()
+            .copied()
+            .zip(counts.iter().copied())
+            .peekable();
+        let mut null_iter = null_positions.iter().copied().peekable();
+        let mut validity = validity;
+        for slot in 0..*num_slots {
+            let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
+            if is_null {
+                null_iter.next();
+            }
+            if let Some(validity) = validity.as_mut() {
+                validity.append(!is_null);
+            }
+
+            if non_empty_iter
+                .peek()
+                .is_some_and(|(non_empty_pos, _)| *non_empty_pos == slot)
+            {
+                let (_, count) = non_empty_iter.next().unwrap();
+                if is_null {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural list slot {} is both null and non-empty",
+                            slot
+                        )
+                        .into(),
+                    ));
+                }
+                current_offset = current_offset.checked_add(count).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        "Sparse structural list offsets overflow u64".into(),
+                    )
+                })?;
+            }
+            offsets.push(Self::to_offset(current_offset)?);
+        }
+        if let Some((extra_pos, _)) = non_empty_iter.next() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural non-empty position {} is outside layer with {} slots",
+                    extra_pos, num_slots
+                )
+                .into(),
+            ));
+        }
+        if let Some(extra_null) = null_iter.next() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural null position {} is outside layer with {} slots",
+                    extra_null, num_slots
+                )
+                .into(),
+            ));
+        }
+
+        self.consume_current_layer();
+        Ok(())
+    }
+}
+
 /// A contiguous top-level-row range that can be encoded as one structural page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralPageSplit {
@@ -1427,6 +1866,134 @@ impl RepDefBuilder {
         )
     }
 
+    pub(crate) fn to_sparse_structural_plan(
+        builders: &[Self],
+        num_visible_items: u64,
+    ) -> Result<Option<SparseStructuralPlan>> {
+        if builders.is_empty() || builders.iter().all(|builder| builder.is_empty()) {
+            return Ok(None);
+        }
+
+        let num_layers = builders[0].num_layers();
+        if num_layers == 0 {
+            return Ok(None);
+        }
+        if builders
+            .iter()
+            .any(|builder| builder.num_layers() != num_layers)
+        {
+            return Err(Error::internal(
+                "Cannot build sparse structural plan from builders with different layer counts",
+            ));
+        }
+
+        let combined_layers = (0..num_layers)
+            .map(|layer_index| {
+                Self::concat_layers(
+                    builders.iter().map(|builder| &builder.repdefs[layer_index]),
+                    builders.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut sparse_layers = Vec::with_capacity(combined_layers.len());
+        for layer in combined_layers {
+            sparse_layers.push(Self::raw_layer_to_sparse(layer)?);
+        }
+
+        let mut plan = SparseStructuralPlan {
+            layers: sparse_layers,
+            num_items: num_visible_items,
+            num_visible_items,
+        };
+        let repdef = plan.to_repdef()?;
+        plan.num_items = repdef
+            .repetition_levels
+            .as_ref()
+            .map(|levels| levels.len() as u64)
+            .or_else(|| {
+                repdef
+                    .definition_levels
+                    .as_ref()
+                    .map(|levels| levels.len() as u64)
+            })
+            .unwrap_or(num_visible_items);
+        Ok(Some(plan))
+    }
+
+    fn null_positions(validity: Option<&BooleanBuffer>, num_values: usize) -> Vec<u64> {
+        if let Some(validity) = validity {
+            validity
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, is_valid)| (!is_valid).then_some(idx as u64))
+                .collect()
+        } else {
+            Vec::with_capacity(num_values)
+        }
+    }
+
+    fn raw_layer_to_sparse(layer: RawRepDef) -> Result<SparseStructuralLayerPlan> {
+        Ok(match layer {
+            RawRepDef::Validity(ValidityDesc {
+                validity,
+                num_values,
+            }) => SparseStructuralLayerPlan::Validity {
+                num_slots: num_values as u64,
+                null_positions: Self::null_positions(validity.as_ref(), num_values),
+            },
+            RawRepDef::Fsl(FslDesc {
+                validity,
+                num_values,
+                dimension,
+            }) => SparseStructuralLayerPlan::FixedSizeList {
+                num_slots: num_values as u64,
+                dimension: dimension as u64,
+                null_positions: Self::null_positions(validity.as_ref(), num_values),
+            },
+            RawRepDef::Offsets(OffsetDesc {
+                offsets,
+                validity,
+                num_values,
+                ..
+            }) => {
+                let mut non_empty_positions = Vec::new();
+                let mut counts = Vec::new();
+                let mut null_positions = Vec::new();
+                for slot in 0..num_values {
+                    let is_valid = validity
+                        .as_ref()
+                        .is_none_or(|validity| validity.value(slot));
+                    if !is_valid {
+                        null_positions.push(slot as u64);
+                    }
+                    let len = offsets[slot + 1] - offsets[slot];
+                    if is_valid && len > 0 {
+                        non_empty_positions.push(slot as u64);
+                        counts.push(u64::try_from(len).map_err(|_| {
+                            Error::invalid_input_source(
+                                format!("Sparse structural list has negative length {}", len)
+                                    .into(),
+                            )
+                        })?);
+                    }
+                }
+                let constant_count = counts
+                    .first()
+                    .copied()
+                    .filter(|first| counts.iter().all(|count| count == first));
+                SparseStructuralLayerPlan::List {
+                    num_slots: num_values as u64,
+                    num_child_slots: *offsets.last().unwrap() as u64,
+                    non_empty_positions,
+                    counts,
+                    constant_count,
+                    null_positions,
+                }
+            }
+        })
+    }
+
     fn serialize_builders(builders: Vec<Self>) -> (SerializerContext, Option<u64>) {
         assert!(!builders.is_empty());
         if builders.iter().all(|b| b.is_empty()) {
@@ -1514,6 +2081,7 @@ impl RepDefBuilder {
 /// This is used during decoding to create the necessary arrow structures
 #[derive(Debug)]
 pub struct RepDefUnraveler {
+    sparse: Option<SparseStructuralUnraveler>,
     rep_levels: Option<LevelBuffer>,
     def_levels: Option<LevelBuffer>,
     // Maps from definition level to the rep level at which that definition level is visible
@@ -1567,6 +2135,7 @@ impl RepDefUnraveler {
             }
         }
         Self {
+            sparse: None,
             rep_levels,
             def_levels,
             current_def_cmp: 0,
@@ -1578,7 +2147,24 @@ impl RepDefUnraveler {
         }
     }
 
+    pub(crate) fn new_sparse(plan: SparseStructuralPlan) -> Self {
+        Self {
+            sparse: Some(SparseStructuralUnraveler::new(plan)),
+            rep_levels: None,
+            def_levels: None,
+            current_def_cmp: 0,
+            current_rep_cmp: 0,
+            levels_to_rep: Vec::new(),
+            current_layer: 0,
+            def_meaning: Arc::new([]),
+            num_items: 0,
+        }
+    }
+
     pub fn is_all_valid(&self) -> bool {
+        if let Some(sparse) = &self.sparse {
+            return sparse.is_all_valid();
+        }
         self.def_levels.is_none() || self.def_meaning[self.current_layer].is_all_valid()
     }
 
@@ -1588,6 +2174,9 @@ impl RepDefUnraveler {
     /// This is not valid to call when the current level is a struct/primitive layer because
     /// in some cases there may be no rep or def information to know this.
     pub fn max_lists(&self) -> usize {
+        if let Some(sparse) = &self.sparse {
+            return sparse.max_lists();
+        }
         debug_assert!(
             self.def_meaning[self.current_layer] != DefinitionInterpretation::NullableItem
         );
@@ -1607,6 +2196,9 @@ impl RepDefUnraveler {
         offsets: &mut Vec<T>,
         validity: Option<&mut BooleanBufferBuilder>,
     ) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.unravel_offsets(offsets, validity);
+        }
         let rep_levels = self
             .rep_levels
             .as_mut()
@@ -1758,12 +2350,20 @@ impl RepDefUnraveler {
     }
 
     pub fn skip_validity(&mut self) {
+        if let Some(sparse) = self.sparse.as_mut() {
+            sparse.skip_validity();
+            return;
+        }
         debug_assert!(self.is_all_valid());
         self.current_layer += 1;
     }
 
     /// Unravels a layer of validity from the definition levels
     pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
+        if let Some(sparse) = self.sparse.as_mut() {
+            sparse.unravel_validity(validity);
+            return;
+        }
         let meaning = self.def_meaning[self.current_layer];
         if meaning == DefinitionInterpretation::AllValidItem || self.def_levels.is_none() {
             self.current_layer += 1;
@@ -1789,6 +2389,10 @@ impl RepDefUnraveler {
     }
 
     pub fn decimate(&mut self, dimension: usize) {
+        if let Some(sparse) = self.sparse.as_mut() {
+            sparse.decimate(dimension);
+            return;
+        }
         if self.rep_levels.is_some() {
             // If we need to support this then I think we need to walk through the rep def levels to find
             // the spots at which we keep.  E.g. if we have:

@@ -658,6 +658,12 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
                     actual_chain.extend(chain);
                 }
             }
+            Layout::SparseLayout(sparse) => {
+                if let Some(ref value_comp) = sparse.value_compression {
+                    let chain = extract_array_encoding_chain(value_comp);
+                    actual_chain.extend(chain);
+                }
+            }
             Layout::ConstantLayout(_) => {
                 // Constant layout does not describe a value encoding chain.
             }

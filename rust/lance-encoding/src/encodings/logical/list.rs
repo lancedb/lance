@@ -267,20 +267,34 @@ mod tests {
     async fn try_encode_v22_pages(
         array: ArrayRef,
     ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
-        try_encode_v22_pages_with_metadata(array, HashMap::new()).await
+        try_encode_pages(array, HashMap::new(), LanceFileVersion::V2_2).await
     }
 
     async fn try_encode_v22_pages_with_metadata(
         array: ArrayRef,
         field_metadata: HashMap<String, String>,
     ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
+        try_encode_pages(array, field_metadata, LanceFileVersion::V2_2).await
+    }
+
+    async fn try_encode_v23_pages(
+        array: ArrayRef,
+    ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
+        try_encode_pages(array, HashMap::new(), LanceFileVersion::V2_3).await
+    }
+
+    async fn try_encode_pages(
+        array: ArrayRef,
+        field_metadata: HashMap<String, String>,
+        version: LanceFileVersion,
+    ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
         let arrow_field =
             Field::new("", array.data_type().clone(), true).with_metadata(field_metadata);
         let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
-        let encoding_strategy = crate::encoder::default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = crate::encoder::default_encoding_strategy(version);
         let mut column_index_seq = crate::encoder::ColumnIndexSequence::default();
         let encoding_options = crate::encoder::EncodingOptions {
-            version: LanceFileVersion::V2_2,
+            version,
             ..Default::default()
         };
         let mut encoder = encoding_strategy
@@ -317,6 +331,10 @@ mod tests {
         try_encode_v22_pages(array).await.unwrap()
     }
 
+    async fn encode_v23_pages(array: ArrayRef) -> Vec<crate::encoder::EncodedPage> {
+        try_encode_v23_pages(array).await.unwrap()
+    }
+
     fn assert_split_miniblock_layout(
         pages: &[crate::encoder::EncodedPage],
         expect_structural_only_page: bool,
@@ -324,6 +342,7 @@ mod tests {
         let mut miniblock_pages = 0;
         let mut fullzip_pages = 0;
         let mut structural_only_pages = 0;
+        let mut sparse_pages = 0;
 
         for page in pages {
             let crate::decoder::PageEncoding::Structural(layout) = &page.description else {
@@ -335,6 +354,9 @@ mod tests {
                 }
                 crate::format::pb21::page_layout::Layout::FullZipLayout(_) => {
                     fullzip_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::SparseLayout(_) => {
+                    sparse_pages += 1;
                 }
                 crate::format::pb21::page_layout::Layout::ConstantLayout(layout) => {
                     if layout.inline_value.is_none()
@@ -355,12 +377,69 @@ mod tests {
             fullzip_pages, 0,
             "split list pages should not fall back to full-zip"
         );
+        assert_eq!(
+            sparse_pages, 0,
+            "forced mini-block pages should not use sparse layout"
+        );
         if expect_structural_only_page {
             assert!(
                 structural_only_pages > 0,
                 "expected at least one structural-only page"
             );
         }
+    }
+
+    fn assert_sparse_layout(pages: &[crate::encoder::EncodedPage]) {
+        let mut sparse_pages = 0;
+        let mut fullzip_pages = 0;
+
+        for page in pages {
+            let crate::decoder::PageEncoding::Structural(layout) = &page.description else {
+                continue;
+            };
+            match layout.layout.as_ref().unwrap() {
+                crate::format::pb21::page_layout::Layout::SparseLayout(_) => {
+                    sparse_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::FullZipLayout(_) => {
+                    fullzip_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::MiniBlockLayout(_)
+                | crate::format::pb21::page_layout::Layout::ConstantLayout(_)
+                | crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
+            }
+        }
+
+        assert!(sparse_pages > 0, "expected at least one sparse page");
+        assert_eq!(
+            fullzip_pages, 0,
+            "sparse list pages should not fall back to full-zip"
+        );
+    }
+
+    fn sparse_structural_list_stats(pages: &[crate::encoder::EncodedPage]) -> (u64, Vec<u64>) {
+        let mut num_non_empty_slots = 0;
+        let mut constant_counts = Vec::new();
+        for page in pages {
+            let crate::decoder::PageEncoding::Structural(layout) = &page.description else {
+                continue;
+            };
+            let crate::format::pb21::page_layout::Layout::SparseLayout(layout) =
+                layout.layout.as_ref().unwrap()
+            else {
+                continue;
+            };
+            for layer in &layout.structural_layers {
+                if matches!(
+                    crate::format::pb21::sparse_structural_layer::Kind::try_from(layer.kind),
+                    Ok(crate::format::pb21::sparse_structural_layer::Kind::SparseLayerList)
+                ) {
+                    num_non_empty_slots += layer.num_non_empty;
+                    constant_counts.push(layer.constant_count);
+                }
+            }
+        }
+        (num_non_empty_slots, constant_counts)
     }
 
     fn assert_has_fullzip_layout(pages: &[crate::encoder::EncodedPage]) {
@@ -1393,13 +1472,9 @@ mod tests {
 
     /// Reproduces the HNSW-flush shape at v2.2 on the auto path (no
     /// `STRUCTURAL_ENCODING` metadata): a dense level-0 prefix followed by a
-    /// long tail of empty lists. The global levels/values ratio looks dense,
-    /// so this used to encode as a single mini-block page whose final chunk
-    /// absorbed every trailing empty list and overflowed the per-chunk `u16`
-    /// `num_levels`, corrupting the read. The structural page planner now
-    /// splits on top-level row boundaries: the dense prefix stays on
-    /// mini-block pages and the empty tail becomes structural-only pages, so
-    /// the round-trip is lossless without falling back to full-zip.
+    /// long tail of empty lists. Since v2.2 is stable, this path must keep the
+    /// pre-sparse behavior and split into mini-block-compatible pages instead
+    /// of emitting `SparseLayout`.
     #[test_log::test(tokio::test)]
     async fn test_list_hnsw_shape_splits_to_miniblock_v2_2() {
         let list_array = make_hnsw_shaped_list_u32();
@@ -1416,6 +1491,37 @@ mod tests {
         let list_array = Arc::new(list_array) as ArrayRef;
         let pages = encode_v22_pages(list_array.clone()).await;
         assert_split_miniblock_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    /// Reproduces the HNSW-flush shape at v2.3 on the auto path (no
+    /// `STRUCTURAL_ENCODING` metadata): a dense level-0 prefix followed by a
+    /// long tail of empty lists. The global levels/values ratio looks dense,
+    /// so this used to encode as a single mini-block page whose final chunk
+    /// absorbed every trailing empty list and overflowed the per-chunk `u16`
+    /// `num_levels`, corrupting the read. The structural page planner now
+    /// uses sparse layout on the auto path, preserving mini-block-style
+    /// value compression while replacing dense rep/def structural events with
+    /// native sparse structural layers.
+    #[test_log::test(tokio::test)]
+    async fn test_list_hnsw_shape_uses_sparse_v2_3() {
+        let list_array = make_hnsw_shaped_list_u32();
+        let dense_rows: u64 = 40_000;
+        let total_rows = list_array.len() as u64;
+
+        let test_cases = TestCases::default()
+            .with_range(0..1000)
+            .with_range(dense_rows.saturating_sub(8)..(dense_rows + 8))
+            .with_range(0..total_rows)
+            .with_indices(vec![0, dense_rows - 1, dense_rows, total_rows - 1])
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v23_pages(list_array.clone()).await;
+        assert_sparse_layout(&pages);
+        let (num_non_empty_rows, constant_counts) = sparse_structural_list_stats(&pages);
+        assert_eq!(num_non_empty_rows, dense_rows);
+        assert_eq!(constant_counts, vec![32]);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
