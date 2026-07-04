@@ -327,6 +327,57 @@ The protobuf for the full zip layout describes the compression of the data buffe
 size of the control words and how many bits we have per value (for fixed-width data) or how many bits we
 have per offset (for variable-width data).
 
+### Sparse Page Layout
+
+The sparse page layout is a 2.3+ structural layout for sparse nested data. It is selected explicitly with
+`lance-encoding:structural-encoding=sparse`, or automatically in 2.3+ when the writer would otherwise need to split a
+page because the structural information is much larger than the visible value stream. Writers must not emit this layout
+for file versions before 2.3.
+
+Sparse layout stores Arrow structure as native slot-domain mappings instead of dense repetition / definition events.
+The value buffers are still mini-block compressed. The structural layers are stored from outer-most to inner-most:
+
+- validity layer: null slots in the parent slot domain
+- list layer: non-empty parent slots, child counts, and null parent slots
+- fixed-size-list layer: the fixed dimension and null parent slots
+
+Valid empty list slots are not stored in the non-empty positions. They are represented by their absence from both the
+non-empty positions and null positions for that list layer.
+
+#### Buffers
+
+Sparse pages always have a metadata buffer followed by one value buffer, then zero or more structural buffers.
+
+| Buffer | Meaning |
+| ------ | ------- |
+| 0      | Value chunk metadata |
+| 1      | Mini-block encoded value chunks |
+| 2+     | Structural position/count buffers, in `SparseStructuralLayer` order |
+
+Buffer 0 stores one 8-byte entry per value chunk. The first 4 bytes store the chunk size divided by 8 minus one. The
+second 4 bytes store the number of visible values in the chunk. The sum of chunk value counts must match
+`SparseLayout.num_visible_items`, and the sum of chunk byte sizes must exactly match the value buffer size.
+
+Structural position buffers store delta-encoded `u64` positions. Positions must be strictly increasing after delta
+decoding and must be within the layer's parent slot domain. List count buffers store `u64` child counts for each
+non-empty list slot. If all non-empty lists have the same length then `constant_count` is used instead of a count
+buffer.
+
+#### Protobuf
+
+```protobuf
+%%% proto.message.SparseLayout %%%
+```
+
+```protobuf
+%%% proto.message.SparseStructuralLayer %%%
+```
+
+The `value_compression` field is required. The physical page buffer list must match the structural layer metadata:
+each non-zero position/count cardinality requires exactly one corresponding compressed structural buffer, and zero
+cardinality layers must not include an unused compression descriptor. Readers should reject malformed sparse pages with
+a format error.
+
 ### Constant Page Layout
 
 This layout is used when all (visible) values in the page are the same scalar value.
