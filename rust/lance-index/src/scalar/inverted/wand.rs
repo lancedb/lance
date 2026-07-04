@@ -25,7 +25,7 @@ use super::{
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
-    scorer::{K1, idf},
+    scorer::{K1, bm25_doc_weight_with_norm, idf},
 };
 use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
@@ -41,8 +41,40 @@ use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
-/// Top-k heap entry: (scored doc, (term, freq) pairs, doc length, posting doc id).
-type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, Vec<(u32, u32)>, u32, u64)>>;
+/// Top-k heap entry: (scored doc, doc length, posting doc id, freq-log index).
+/// The (term, freq) pairs live in a side [`FreqLog`] so heap churn moves a
+/// small Copy tuple instead of allocating a `Vec` per insert; only the final
+/// top-k get their pairs materialized.
+type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, u32, u64, u32)>>;
+
+/// Append-only (term, freq) log for heap candidates: flat storage plus
+/// per-entry offsets (entries vary in width across paths). Discarded entries
+/// just leak into the log until the search ends — inserts are far rarer than
+/// candidates, so the log stays tiny.
+#[derive(Default)]
+struct FreqLog {
+    offsets: Vec<u32>,
+    pairs: Vec<(u32, u32)>,
+}
+
+impl FreqLog {
+    fn push(&mut self, pairs: impl Iterator<Item = (u32, u32)>) -> u32 {
+        let index = self.offsets.len() as u32;
+        self.offsets.push(self.pairs.len() as u32);
+        self.pairs.extend(pairs);
+        index
+    }
+
+    fn get(&self, index: u32) -> &[(u32, u32)] {
+        let start = self.offsets[index as usize] as usize;
+        let end = self
+            .offsets
+            .get(index as usize + 1)
+            .map(|&offset| offset as usize)
+            .unwrap_or(self.pairs.len());
+        &self.pairs[start..end]
+    }
+}
 const LINEAR_BLOCK_SKIP_LIMIT: usize = 8;
 pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
@@ -952,6 +984,9 @@ impl PostingIterator {
     /// first doc beyond `up_to`. This is the Lucene `nextDocsAndScores`
     /// equivalent: it walks the decompressed block arrays directly, with no
     /// per-doc heap traffic.
+    // The norm cache arg tips this hot-path fn over the limit; bundling the
+    // scoring inputs isn't worth the churn here.
+    #[allow(clippy::too_many_arguments)]
     fn collect_window_scores<S: Scorer + ?Sized>(
         &mut self,
         window_min: u64,
@@ -959,6 +994,7 @@ impl PostingIterator {
         clause_idx: usize,
         docs: &DocSet,
         scorer: &S,
+        norm_k: Option<(&[u8], &[f32; 256])>,
         acc: &mut WindowAccumulator,
     ) {
         if self.doc().is_some_and(|doc| doc.doc_id() < window_min) {
@@ -986,8 +1022,16 @@ impl PostingIterator {
                             break 'blocks;
                         }
                         let freq = compressed.freqs[offset];
-                        let doc_length = docs.scoring_num_tokens(doc_id);
-                        let score = self.query_weight * scorer.doc_weight(freq, doc_length);
+                        // One byte-norm load plus a cached addend replaces
+                        // recomputing the BM25 denominator per doc.
+                        let doc_weight = match norm_k {
+                            Some((norms, cache)) => bm25_doc_weight_with_norm(
+                                freq,
+                                cache[norms[doc_id as usize] as usize],
+                            ),
+                            None => scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id)),
+                        };
+                        let score = self.query_weight * doc_weight;
                         let slot = (u64::from(doc_id) - window_min) as usize;
                         acc.add(clause_idx, slot, score, freq);
                     }
@@ -1346,6 +1390,26 @@ impl<'a, S: Scorer> Wand<'a, S> {
         self
     }
 
+    /// Per-search norm→BM25-denominator cache (Lucene's norm cache): the doc
+    /// byte-norm slab plus the 256 possible denominator addends. Available
+    /// when the DocSet scores quantized (V3 partitions) and the scorer
+    /// factors `doc_weight` as `(K1+1)*freq/(freq + addend)`. Scoring through
+    /// the cache is bit-identical to `scorer.doc_weight`, because both
+    /// evaluate the same expressions on the same quantized lengths.
+    fn norm_k_cache(&self) -> Option<(&'a [u8], Box<[f32; 256]>)> {
+        let docs: &'a DocSet = self.docs;
+        let norms = docs.scoring_norms()?;
+        self.scorer.doc_norm(0)?;
+        let mut cache = Box::new([0f32; 256]);
+        for (code, slot) in cache.iter_mut().enumerate() {
+            *slot = self
+                .scorer
+                .doc_norm(dequantize_doc_length(code as u8))
+                .expect("doc_norm support was just probed");
+        }
+        Some((norms, cache))
+    }
+
     /// Set the pruning threshold from this partition's k-th best, raised to the
     /// shared cross-partition floor when one is attached.
     fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
@@ -1431,6 +1495,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let docs_has_row_ids = self.docs.has_row_ids();
 
         let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut freq_log = FreqLog::default();
         let mut num_comparisons = 0;
         let mut and_search_stats = (self.operator == Operator::And).then_some(AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -1504,31 +1569,31 @@ impl<'a, S: Scorer> Wand<'a, S> {
             };
 
             if candidates.len() < limit {
-                let freqs = self.iter_term_freqs().collect();
+                let log_idx = freq_log.push(self.iter_term_freqs());
                 if let Some(and_stats) = and_search_stats.as_mut() {
                     and_stats.freqs_collected += 1;
                 }
                 candidates.push(Reverse((
                     ScoredDoc::new(row_id, score),
-                    freqs,
                     doc_length,
                     posting_doc_id,
+                    log_idx,
                 )));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
-                let freqs = self.iter_term_freqs().collect();
+                let log_idx = freq_log.push(self.iter_term_freqs());
                 if let Some(and_stats) = and_search_stats.as_mut() {
                     and_stats.freqs_collected += 1;
                 }
                 candidates.pop();
                 candidates.push(Reverse((
                     ScoredDoc::new(row_id, score),
-                    freqs,
                     doc_length,
                     posting_doc_id,
+                    log_idx,
                 )));
                 let kth = candidates.peek().unwrap().0.0.score.0;
                 self.update_threshold(kth, params.wand_factor);
@@ -1572,10 +1637,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
                     addr: to_addr(doc.row_id),
                     posting_doc_id,
-                    freqs,
+                    freqs: freq_log.get(log_idx).to_vec(),
                     doc_length,
                 },
             )
@@ -1619,7 +1684,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .unwrap_or(false);
 
         let mut num_comparisons = 0;
-        let mut candidates = BinaryHeap::new();
+        let mut candidates: TopKHeap = BinaryHeap::new();
+        let mut freq_log = FreqLog::default();
         for (doc_id, row_id) in doc_ids {
             num_comparisons += 1;
             self.move_head_before_target_to_tail(doc_id);
@@ -1667,25 +1733,25 @@ impl<'a, S: Scorer> Wand<'a, S> {
             let score = self.score(doc_length);
 
             if candidates.len() < limit {
-                let freqs = self.iter_term_freqs().collect();
+                let log_idx = freq_log.push(self.iter_term_freqs());
                 candidates.push(Reverse((
                     ScoredDoc::new(row_id, score),
-                    freqs,
                     doc_length,
                     doc_id,
+                    log_idx,
                 )));
                 if candidates.len() == limit {
                     let kth = candidates.peek().unwrap().0.0.score.0;
                     self.update_threshold(kth, params.wand_factor);
                 }
             } else if score > candidates.peek().unwrap().0.0.score.0 {
-                let freqs = self.iter_term_freqs().collect();
+                let log_idx = freq_log.push(self.iter_term_freqs());
                 candidates.pop();
                 candidates.push(Reverse((
                     ScoredDoc::new(row_id, score),
-                    freqs,
                     doc_length,
                     doc_id,
+                    log_idx,
                 )));
                 let kth = candidates.peek().unwrap().0.0.score.0;
                 self.update_threshold(kth, params.wand_factor);
@@ -1700,10 +1766,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
                     addr: CandidateAddr::RowId(doc.row_id),
                     posting_doc_id,
-                    freqs,
+                    freqs: freq_log.get(log_idx).to_vec(),
                     doc_length,
                 },
             )
@@ -1753,6 +1819,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut acc = WindowAccumulator::new(clauses.len());
         let mut candidates: TopKHeap =
             BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut freq_log = FreqLog::default();
+        let norm_k = self.norm_k_cache();
+        let norm_k_ref = norm_k
+            .as_ref()
+            .map(|(norms, cache)| (*norms, cache.as_ref()));
         let mut num_comparisons = 0usize;
         // Adaptive minimum window size (Lucene): grow windows when they yield
         // too few candidates to amortize the per-window bound computations.
@@ -1896,8 +1967,21 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         let doc = $doc;
                         let freq = $freq;
                         num_comparisons += 1;
-                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
-                        let score = essential_weight * self.scorer.doc_weight(freq, doc_length);
+                        // One byte-norm load + cached addend when available;
+                        // the exact doc length is only needed at insert time.
+                        let norm_addend =
+                            norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
+                        let score = match norm_addend {
+                            Some(addend) => {
+                                essential_weight * bm25_doc_weight_with_norm(freq, addend)
+                            }
+                            None => {
+                                essential_weight
+                                    * self
+                                        .scorer
+                                        .doc_weight(freq, self.docs.scoring_num_tokens(doc as u32))
+                            }
+                        };
                         if !(self.threshold > 0.0
                             && score + total_non_essential_bound <= self.threshold)
                         {
@@ -1925,8 +2009,20 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                     if let Some(d) = probe.doc()
                                         && d.doc_id() == doc
                                     {
-                                        total +=
-                                            probe.score(&self.scorer, d.frequency(), doc_length);
+                                        total += match norm_addend {
+                                            Some(addend) => {
+                                                probe.query_weight
+                                                    * bm25_doc_weight_with_norm(
+                                                        d.frequency(),
+                                                        addend,
+                                                    )
+                                            }
+                                            None => probe.score(
+                                                &self.scorer,
+                                                d.frequency(),
+                                                self.docs.scoring_num_tokens(doc as u32),
+                                            ),
+                                        };
                                     }
                                 }
 
@@ -1939,26 +2035,29 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                     let beats_kth =
                                         !full || total > candidates.peek().unwrap().0.0.score.0;
                                     if beats_kth {
-                                        let mut freqs = Vec::with_capacity(non_essential.len() + 1);
-                                        freqs.push((essential_term, freq));
-                                        for clause in non_essential.iter() {
-                                            if let Some(d) = clause.posting.doc()
-                                                && d.doc_id() == doc
-                                            {
-                                                freqs.push((
-                                                    clause.posting.term_index(),
-                                                    d.frequency(),
-                                                ));
-                                            }
-                                        }
+                                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
+                                        let log_idx = freq_log.push(
+                                            std::iter::once((essential_term, freq)).chain(
+                                                non_essential.iter().filter_map(|clause| {
+                                                    clause.posting.doc().and_then(|d| {
+                                                        (d.doc_id() == doc).then(|| {
+                                                            (
+                                                                clause.posting.term_index(),
+                                                                d.frequency(),
+                                                            )
+                                                        })
+                                                    })
+                                                }),
+                                            ),
+                                        );
                                         if full {
                                             candidates.pop();
                                         }
                                         candidates.push(Reverse((
                                             ScoredDoc::new(row_id, total),
-                                            freqs,
                                             doc_length,
                                             doc,
+                                            log_idx,
                                         )));
                                         if candidates.len() == limit {
                                             let kth = candidates.peek().unwrap().0.0.score.0;
@@ -2057,6 +2156,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         clause_idx,
                         self.docs,
                         &self.scorer,
+                        norm_k_ref,
                         &mut acc,
                     );
                 }
@@ -2096,7 +2196,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             continue;
                         }
 
-                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
+                        // Doc length is only needed at heap-insert time; the
+                        // non-essential completion scores go through the norm
+                        // cache when available.
+                        let norm_addend =
+                            norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
+                        let mut doc_length_cell: Option<u32> = None;
                         let mut rejected = false;
                         for i in (0..first_essential).rev() {
                             if self.threshold > 0.0
@@ -2112,7 +2217,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             if let Some(d) = posting.doc()
                                 && d.doc_id() == doc
                             {
-                                score += posting.score(&self.scorer, d.frequency(), doc_length);
+                                score += match norm_addend {
+                                    Some(addend) => {
+                                        posting.query_weight
+                                            * bm25_doc_weight_with_norm(d.frequency(), addend)
+                                    }
+                                    None => {
+                                        let doc_length =
+                                            *doc_length_cell.get_or_insert_with(|| {
+                                                self.docs.scoring_num_tokens(doc as u32)
+                                            });
+                                        posting.score(&self.scorer, d.frequency(), doc_length)
+                                    }
+                                };
                             }
                         }
 
@@ -2120,10 +2237,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             let full = candidates.len() >= limit;
                             let beats_kth = !full || score > candidates.peek().unwrap().0.0.score.0;
                             if beats_kth {
-                                let freqs = clauses
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(i, clause)| {
+                                let doc_length = doc_length_cell
+                                    .unwrap_or_else(|| self.docs.scoring_num_tokens(doc as u32));
+                                let log_idx = freq_log.push(clauses.iter().enumerate().filter_map(
+                                    |(i, clause)| {
                                         if i >= first_essential {
                                             let freq = acc.clause_freq(i, slot);
                                             (freq > 0).then(|| (clause.posting.term_index(), freq))
@@ -2134,16 +2251,16 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                                 })
                                             })
                                         }
-                                    })
-                                    .collect::<Vec<_>>();
+                                    },
+                                ));
                                 if full {
                                     candidates.pop();
                                 }
                                 candidates.push(Reverse((
                                     ScoredDoc::new(row_id, score),
-                                    freqs,
                                     doc_length,
                                     doc,
+                                    log_idx,
                                 )));
                                 if candidates.len() == limit {
                                     let kth = candidates.peek().unwrap().0.0.score.0;
@@ -2178,10 +2295,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
                     addr: to_addr(doc.row_id),
                     posting_doc_id,
-                    freqs,
+                    freqs: freq_log.get(log_idx).to_vec(),
                     doc_length,
                 },
             )
@@ -2618,7 +2735,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut batch_docs: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut batch_offs: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE * num_lists);
         let mut batch_lens: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+        let mut batch_norms: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
+        let mut freq_log = FreqLog::default();
+        // Norm cache: one byte-norm load plus a cached addend replaces the
+        // per-clause BM25 denominator recompute in pass B.
+        let norm_k = self.norm_k_cache();
+        let norm_k_ref = norm_k
+            .as_ref()
+            .map(|(norms, cache)| (*norms, cache.as_ref()));
 
         // Per-window prune LUT for the merge kernels: an upper bound of the
         // first (rarest) clause's score by clamped frequency. Lead docs whose
@@ -2802,35 +2927,52 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     ),
                 }
 
-                // Pass A: gather doc lengths for the whole batch up front so
-                // the loads issue back-to-back and their cache misses overlap.
-                // Quantized (V3) sets gather through the byte-norm slab: a
-                // quarter of the bytes through the cache versus the u32 vec.
+                // Pass A: gather doc norms/lengths for the whole batch up
+                // front so the loads issue back-to-back and their cache
+                // misses overlap. With the norm cache, only the byte code is
+                // gathered; the exact length decodes from a tiny LUT.
                 batch_lens.clear();
-                match self.docs.scoring_norms() {
-                    Some(norms) => {
+                batch_norms.clear();
+                match norm_k_ref {
+                    Some((norms, _)) => {
                         for &doc in batch_docs.iter() {
-                            batch_lens.push(dequantize_doc_length(norms[doc as usize]));
+                            batch_norms.push(norms[doc as usize]);
                         }
                     }
-                    None => {
-                        for &doc in batch_docs.iter() {
-                            batch_lens.push(self.docs.scoring_num_tokens(doc));
+                    None => match self.docs.scoring_norms() {
+                        Some(norms) => {
+                            for &doc in batch_docs.iter() {
+                                batch_lens.push(dequantize_doc_length(norms[doc as usize]));
+                            }
                         }
-                    }
+                        None => {
+                            for &doc in batch_docs.iter() {
+                                batch_lens.push(self.docs.scoring_num_tokens(doc));
+                            }
+                        }
+                    },
                 }
 
                 // Pass B: prune / verify / score / insert, in doc order, with
                 // exactly the classic loop's semantics.
                 for (index, &doc) in batch_docs.iter().enumerate() {
-                    let doc_length = batch_lens[index];
+                    let (norm_addend, doc_length) = match norm_k_ref {
+                        Some((_, cache)) => {
+                            let code = batch_norms[index];
+                            (Some(cache[code as usize]), dequantize_doc_length(code))
+                        }
+                        None => (None, batch_lens[index]),
+                    };
                     let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
                     if self.threshold > 0.0 && num_lists >= 2 {
-                        let first_score = self.lead[0].score(
-                            &self.scorer,
-                            unsafe { *wins[0].freqs.add(offs[0] as usize) },
-                            doc_length,
-                        );
+                        let first_freq = unsafe { *wins[0].freqs.add(offs[0] as usize) };
+                        let first_score = match norm_addend {
+                            Some(addend) => {
+                                self.lead[0].query_weight
+                                    * bm25_doc_weight_with_norm(first_freq, addend)
+                            }
+                            None => self.lead[0].score(&self.scorer, first_freq, doc_length),
+                        };
                         if first_score + others_block_max <= self.threshold {
                             self.and_candidates_pruned_before_return += 1;
                             continue;
@@ -2880,7 +3022,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     for ((win, posting), &off) in wins.iter().zip(self.lead.iter()).zip(offs.iter())
                     {
                         let freq = unsafe { *win.freqs.add(off as usize) };
-                        score += posting.score(&self.scorer, freq, doc_length);
+                        score += match norm_addend {
+                            Some(addend) => {
+                                posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
+                            }
+                            None => posting.score(&self.scorer, freq, doc_length),
+                        };
                     }
 
                     let insert = if candidates.len() < limit {
@@ -2890,24 +3037,22 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     };
                     if insert {
                         stats.freqs_collected += 1;
-                        let freqs = wins
-                            .iter()
-                            .zip(self.lead.iter())
-                            .zip(offs.iter())
-                            .map(|((win, posting), &off)| {
-                                (posting.term_index(), unsafe {
-                                    *win.freqs.add(off as usize)
-                                })
-                            })
-                            .collect();
+                        let log_idx =
+                            freq_log.push(wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
+                                |((win, posting), &off)| {
+                                    (posting.term_index(), unsafe {
+                                        *win.freqs.add(off as usize)
+                                    })
+                                },
+                            ));
                         if candidates.len() >= limit {
                             candidates.pop();
                         }
                         candidates.push(Reverse((
                             ScoredDoc::new(row_id, score),
-                            freqs,
                             doc_length,
                             u64::from(doc),
+                            log_idx,
                         )));
                         if candidates.len() == limit {
                             let kth = candidates.peek().unwrap().0.0.score.0;
@@ -2950,10 +3095,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         Ok(candidates
             .into_iter()
             .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
                     addr: to_addr(doc.row_id),
                     posting_doc_id,
-                    freqs,
+                    freqs: freq_log.get(log_idx).to_vec(),
                     doc_length,
                 },
             )
