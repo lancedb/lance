@@ -668,4 +668,35 @@ mod tests {
         }
         assert_eq!(tokens, vec!["lance".to_string(), "data".to_string()]);
     }
+
+    // Common English pronouns/function words such as `you`/`my`/`your`/`we`
+    // must be removed by the ICU `all()` stop-word path. These are among the
+    // highest-frequency tokens, so leaking them builds pathologically large
+    // single-term posting lists (and previously overflowed the u32 posting-list
+    // size counter, panicking the whole index build). The leak is independent
+    // of stemming, so we assert it for both stem=false and stem=true.
+    #[rstest]
+    #[case::icu_no_stem("icu", false)]
+    #[case::icu_stem("icu", true)]
+    #[case::icu_split_no_stem("icu/split", false)]
+    #[case::icu_split_stem("icu/split", true)]
+    fn test_icu_common_english_stop_words_do_not_leak(
+        #[case] base_tokenizer: &str,
+        #[case] stem: bool,
+    ) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer(base_tokenizer.to_string())
+            .stem(stem)
+            .remove_stop_words(true)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("you my your we lance data");
+        let tokens: Vec<String> = std::iter::from_fn(|| stream.next().map(|t| t.text.clone()))
+            .filter(|t| matches!(t.as_str(), "you" | "my" | "your" | "we"))
+            .collect();
+        assert!(
+            tokens.is_empty(),
+            "common English stop words leaked through the icu pipeline (stem={stem}): {tokens:?}"
+        );
+    }
 }
