@@ -720,7 +720,10 @@ mod tests {
         let tokens: Vec<String> =
             std::iter::from_fn(|| stream.next().map(|t| t.text.clone())).collect();
         let stop = ["我", "在", "有", "了", "是", "的", "和"];
-        let leaked: Vec<&String> = tokens.iter().filter(|t| stop.contains(&t.as_str())).collect();
+        let leaked: Vec<&String> = tokens
+            .iter()
+            .filter(|t| stop.contains(&t.as_str()))
+            .collect();
         assert!(
             leaked.is_empty(),
             "common Chinese stop words leaked through the icu pipeline: {leaked:?} (all tokens: {tokens:?})"
