@@ -680,6 +680,11 @@ mod tests {
     #[case::icu_stem("icu", true)]
     #[case::icu_split_no_stem("icu/split", false)]
     #[case::icu_split_stem("icu/split", true)]
+    // `simple` is the recommended tokenizer for monolingual English corpora and
+    // uses StopWordFilter::new(English) rather than the ICU all() path, so it
+    // must be covered too.
+    #[case::simple_no_stem("simple", false)]
+    #[case::simple_stem("simple", true)]
     fn test_icu_common_english_stop_words_do_not_leak(
         #[case] base_tokenizer: &str,
         #[case] stem: bool,
