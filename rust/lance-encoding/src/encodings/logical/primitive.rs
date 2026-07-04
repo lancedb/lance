@@ -860,11 +860,51 @@ impl SparseStructuralScheduler {
         Ok(1)
     }
 
+    fn reject_optional_buffer(
+        compression: &Option<CompressiveEncoding>,
+        label: &str,
+    ) -> Result<()> {
+        if compression.is_some() {
+            return Err(Error::invalid_input_source(
+                format!("Sparse structural {label} is not valid for this layer").into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn checked_buffer_range(position: u64, size: u64, label: &str) -> Result<Range<u64>> {
+        let end = position.checked_add(size).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} buffer range overflows").into(),
+            )
+        })?;
+        Ok(position..end)
+    }
+
     fn structural_buffer_count(layers: &[pb21::SparseStructuralLayer]) -> Result<usize> {
         layers.iter().try_fold(0_usize, |mut count, layer| {
             let kind = pb21::sparse_structural_layer::Kind::try_from(layer.kind)?;
             match kind {
                 pb21::sparse_structural_layer::Kind::SparseLayerValidity => {
+                    if layer.num_child_slots != layer.num_slots {
+                        return Err(Error::invalid_input_source(
+                            format!(
+                                "Sparse structural validity child slots {} do not match slots {}",
+                                layer.num_child_slots, layer.num_slots
+                            )
+                            .into(),
+                        ));
+                    }
+                    if layer.constant_count != 0 || layer.num_non_empty != 0 {
+                        return Err(Error::invalid_input_source(
+                            "Sparse structural validity layer has list-only metadata".into(),
+                        ));
+                    }
+                    Self::reject_optional_buffer(
+                        &layer.non_empty_compression,
+                        "validity non-empty positions",
+                    )?;
+                    Self::reject_optional_buffer(&layer.count_compression, "validity counts")?;
                     count += Self::count_optional_buffer(
                         &layer.null_compression,
                         layer.num_nulls,
@@ -885,10 +925,46 @@ impl SparseStructuralScheduler {
                             "Sparse structural list has non-empty positions but no count compression or constant count".into(),
                         ));
                     }
-                    if layer.count_compression.is_some() {
-                        let compression = layer.count_compression.as_ref().expect_ok()?;
-                        Self::validate_compression(compression, "list counts")?;
-                        count += 1;
+                    if layer.num_non_empty == 0 && layer.constant_count != 0 {
+                        return Err(Error::invalid_input_source(
+                            "Sparse structural list has constant count but no non-empty positions"
+                                .into(),
+                        ));
+                    }
+                    if layer.count_compression.is_some() && layer.constant_count != 0 {
+                        return Err(Error::invalid_input_source(
+                            "Sparse structural list has both count compression and constant count"
+                                .into(),
+                        ));
+                    }
+                    if layer.constant_count != 0 {
+                        let expected_child_slots = layer
+                            .num_non_empty
+                            .checked_mul(layer.constant_count)
+                            .ok_or_else(|| {
+                                Error::invalid_input_source(
+                                    format!(
+                                        "Sparse structural list child slot count overflows: non_empty={}, constant_count={}",
+                                        layer.num_non_empty, layer.constant_count
+                                    )
+                                    .into(),
+                                )
+                            })?;
+                        if expected_child_slots != layer.num_child_slots {
+                            return Err(Error::invalid_input_source(
+                                format!(
+                                    "Sparse structural list child slot count {} does not match non-empty slots {} * constant count {}",
+                                    layer.num_child_slots, layer.num_non_empty, layer.constant_count
+                                )
+                                .into(),
+                            ));
+                        }
+                    } else {
+                        count += Self::count_optional_buffer(
+                            &layer.count_compression,
+                            layer.num_non_empty,
+                            "list counts",
+                        )?;
                     }
                     count += Self::count_optional_buffer(
                         &layer.null_compression,
@@ -897,6 +973,20 @@ impl SparseStructuralScheduler {
                     )?;
                 }
                 pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList => {
+                    if layer.num_non_empty != 0 {
+                        return Err(Error::invalid_input_source(
+                            "Sparse structural fixed-size-list layer has list-only metadata"
+                                .into(),
+                        ));
+                    }
+                    Self::reject_optional_buffer(
+                        &layer.non_empty_compression,
+                        "fixed-size-list non-empty positions",
+                    )?;
+                    Self::reject_optional_buffer(
+                        &layer.count_compression,
+                        "fixed-size-list counts",
+                    )?;
                     let expected_child_slots =
                         layer.num_slots.checked_mul(layer.constant_count).ok_or_else(|| {
                             Error::invalid_input_source(
@@ -1085,7 +1175,49 @@ impl SparseStructuralScheduler {
                 .into(),
             ));
         }
-        Ok(fixed.data.borrow_to_typed_slice::<u64>().to_vec())
+        if fixed.num_values != num_values {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} decoded {} values, expected {}",
+                    fixed.num_values, num_values
+                )
+                .into(),
+            ));
+        }
+        let num_values_usize = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} value count exceeds usize::MAX").into(),
+            )
+        })?;
+        let expected_len = num_values_usize
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!("Sparse structural {label} decoded byte length overflows").into(),
+                )
+            })?;
+        if fixed.data.len() != expected_len {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} decoded {} bytes, expected {}",
+                    fixed.data.len(),
+                    expected_len
+                )
+                .into(),
+            ));
+        }
+        let values = fixed.data.borrow_to_typed_slice::<u64>();
+        if values.len() != num_values_usize {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} decoded {} u64 values, expected {}",
+                    values.len(),
+                    num_values
+                )
+                .into(),
+            ));
+        }
+        Ok(values.to_vec())
     }
 
     fn decode_positions(
@@ -1380,11 +1512,21 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
             Ok(buffer) => buffer,
             Err(err) => return std::future::ready(Err(err)).boxed(),
         };
-        let mut required_ranges = Vec::new();
-        required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
-        for (position, size) in self.buffer_offsets_and_sizes.iter().skip(2) {
-            required_ranges.push(*position..*position + *size);
-        }
+        let required_ranges = match (|| -> Result<Vec<Range<u64>>> {
+            let mut required_ranges = Vec::new();
+            required_ranges.push(Self::checked_buffer_range(
+                meta_buf_position,
+                meta_buf_size,
+                "metadata",
+            )?);
+            for (position, size) in self.buffer_offsets_and_sizes.iter().skip(2) {
+                required_ranges.push(Self::checked_buffer_range(*position, *size, "structural")?);
+            }
+            Ok(required_ranges)
+        })() {
+            Ok(ranges) => ranges,
+            Err(err) => return std::future::ready(Err(err)).boxed(),
+        };
         let io_req = io.submit_request(required_ranges, 0);
 
         async move {
@@ -5697,32 +5839,13 @@ impl PrimitiveStructuralEncoder {
 
     fn serialize_sparse_miniblocks(
         miniblocks: SparseMiniBlockCompressed,
-        rep: Option<Vec<CompressedLevelsChunk>>,
-        def: Option<Vec<CompressedLevelsChunk>>,
         support_large_chunk: bool,
     ) -> Result<SerializedMiniBlockPage> {
-        let bytes_rep = rep
-            .as_ref()
-            .map(|rep| rep.iter().map(|r| r.data.len()).sum::<usize>())
-            .unwrap_or(0);
-        let bytes_def = def
-            .as_ref()
-            .map(|def| def.iter().map(|d| d.data.len()).sum::<usize>())
-            .unwrap_or(0);
         let bytes_data = miniblocks.data.iter().map(|d| d.len()).sum::<usize>();
-        let mut num_buffers = miniblocks.data.len();
-        if rep.is_some() {
-            num_buffers += 1;
-        }
-        if def.is_some() {
-            num_buffers += 1;
-        }
+        let num_buffers = miniblocks.data.len();
         let max_extra = 9 * num_buffers;
-        let mut data_buffer = Vec::with_capacity(bytes_rep + bytes_def + bytes_data + max_extra);
+        let mut data_buffer = Vec::with_capacity(bytes_data + max_extra);
         let mut meta_buffer = Vec::with_capacity(miniblocks.chunks.len() * 8);
-
-        let mut rep_iter = rep.map(|r| r.into_iter());
-        let mut def_iter = def.map(|d| d.into_iter());
 
         let mut buffer_offsets = vec![0; miniblocks.data.len()];
         for chunk in miniblocks.chunks {
@@ -5737,33 +5860,7 @@ impl PrimitiveStructuralEncoder {
             let start_pos = data_buffer.len();
             debug_assert_eq!(start_pos % MINIBLOCK_ALIGNMENT, 0);
 
-            let rep = rep_iter.as_mut().map(|r| r.next().unwrap());
-            let def = def_iter.as_mut().map(|d| d.next().unwrap());
-
-            let num_levels = rep
-                .as_ref()
-                .map(|r| r.num_levels)
-                .unwrap_or(def.as_ref().map(|d| d.num_levels).unwrap_or(0));
-            data_buffer.extend_from_slice(&num_levels.to_le_bytes());
-
-            if let Some(rep) = rep.as_ref() {
-                let bytes_rep = u16::try_from(rep.data.len()).map_err(|_| {
-                    Error::internal(format!(
-                        "Sparse repetition buffer size ({} bytes) too large",
-                        rep.data.len()
-                    ))
-                })?;
-                data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
-            }
-            if let Some(def) = def.as_ref() {
-                let bytes_def = u16::try_from(def.data.len()).map_err(|_| {
-                    Error::internal(format!(
-                        "Sparse definition buffer size ({} bytes) too large",
-                        def.data.len()
-                    ))
-                })?;
-                data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
-            }
+            data_buffer.extend_from_slice(&0_u16.to_le_bytes());
 
             if support_large_chunk {
                 for &buffer_size in &chunk.buffer_sizes {
@@ -5787,14 +5884,6 @@ impl PrimitiveStructuralEncoder {
             };
             add_padding(&mut data_buffer);
 
-            if let Some(rep) = rep.as_ref() {
-                data_buffer.extend_from_slice(&rep.data);
-                add_padding(&mut data_buffer);
-            }
-            if let Some(def) = def.as_ref() {
-                data_buffer.extend_from_slice(&def.data);
-                add_padding(&mut data_buffer);
-            }
             for (buffer_size, (buffer, buffer_offset)) in chunk
                 .buffer_sizes
                 .iter()
@@ -6411,8 +6500,7 @@ impl PrimitiveStructuralEncoder {
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
         let compressed_data = Self::sparse_miniblock_compressed(compressed_data)?;
-        let serialized =
-            Self::serialize_sparse_miniblocks(compressed_data, None, None, support_large_chunk)?;
+        let serialized = Self::serialize_sparse_miniblocks(compressed_data, support_large_chunk)?;
         let structural = Self::encode_sparse_structural_plan(&sparse_plan, compression_strategy)?;
 
         let description = ProtobufUtils21::sparse_layout(
@@ -10058,6 +10146,211 @@ mod tests {
         .unwrap_err();
 
         assert_invalid_input_contains(err, "Sparse layout has 2 buffers, expected 3");
+    }
+
+    #[test]
+    fn test_sparse_layout_rejects_validity_child_slot_mismatch() {
+        let mut layout = sparse_test_layout();
+        layout.structural_layers.push(pb21::SparseStructuralLayer {
+            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
+            num_slots: 1,
+            num_child_slots: 2,
+            constant_count: 0,
+            non_empty_compression: None,
+            num_non_empty: 0,
+            count_compression: None,
+            null_compression: None,
+            num_nulls: 0,
+        });
+        let decompressors = DefaultDecompressionStrategy::default();
+
+        let err = SparseStructuralScheduler::try_new(
+            &[(0, 8), (8, 8)],
+            0,
+            layout.num_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap_err();
+
+        assert_invalid_input_contains(err, "validity child slots");
+    }
+
+    #[test]
+    fn test_sparse_layout_rejects_wrong_kind_structural_compression() {
+        let mut layout = sparse_test_layout();
+        layout.structural_layers.push(pb21::SparseStructuralLayer {
+            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
+            num_slots: 1,
+            num_child_slots: 1,
+            constant_count: 0,
+            non_empty_compression: Some(ProtobufUtils21::flat(64, None)),
+            num_non_empty: 0,
+            count_compression: None,
+            null_compression: None,
+            num_nulls: 0,
+        });
+        let decompressors = DefaultDecompressionStrategy::default();
+
+        let err = SparseStructuralScheduler::try_new(
+            &[(0, 8), (8, 8)],
+            0,
+            layout.num_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap_err();
+
+        assert_invalid_input_contains(err, "validity non-empty positions is not valid");
+    }
+
+    #[test]
+    fn test_sparse_layout_rejects_zero_count_list_count_compression() {
+        let mut layout = sparse_test_layout();
+        layout.structural_layers.push(pb21::SparseStructuralLayer {
+            kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
+            num_slots: 1,
+            num_child_slots: 0,
+            constant_count: 0,
+            non_empty_compression: None,
+            num_non_empty: 0,
+            count_compression: Some(ProtobufUtils21::flat(64, None)),
+            null_compression: None,
+            num_nulls: 0,
+        });
+        let decompressors = DefaultDecompressionStrategy::default();
+
+        let err = SparseStructuralScheduler::try_new(
+            &[(0, 8), (8, 8)],
+            0,
+            layout.num_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap_err();
+
+        assert_invalid_input_contains(err, "list counts has compression but no values");
+    }
+
+    #[test]
+    fn test_sparse_layout_rejects_list_constant_and_count_compression() {
+        let mut layout = sparse_test_layout();
+        layout.structural_layers.push(pb21::SparseStructuralLayer {
+            kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
+            num_slots: 1,
+            num_child_slots: 1,
+            constant_count: 1,
+            non_empty_compression: Some(ProtobufUtils21::flat(64, None)),
+            num_non_empty: 1,
+            count_compression: Some(ProtobufUtils21::flat(64, None)),
+            null_compression: None,
+            num_nulls: 0,
+        });
+        let decompressors = DefaultDecompressionStrategy::default();
+
+        let err = SparseStructuralScheduler::try_new(
+            &[(0, 8), (8, 8)],
+            0,
+            layout.num_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap_err();
+
+        assert_invalid_input_contains(err, "both count compression and constant count");
+    }
+
+    #[test]
+    fn test_sparse_layout_rejects_list_constant_child_slot_mismatch() {
+        let mut layout = sparse_test_layout();
+        layout.structural_layers.push(pb21::SparseStructuralLayer {
+            kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
+            num_slots: 2,
+            num_child_slots: 3,
+            constant_count: 2,
+            non_empty_compression: Some(ProtobufUtils21::flat(64, None)),
+            num_non_empty: 2,
+            count_compression: None,
+            null_compression: None,
+            num_nulls: 0,
+        });
+        let decompressors = DefaultDecompressionStrategy::default();
+
+        let err = SparseStructuralScheduler::try_new(
+            &[(0, 8), (8, 8), (16, 8)],
+            0,
+            layout.num_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap_err();
+
+        assert_invalid_input_contains(err, "list child slot count");
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_rejects_short_structural_buffer() {
+        let mut layout = sparse_test_layout();
+        layout.structural_layers.push(pb21::SparseStructuralLayer {
+            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
+            num_slots: 1,
+            num_child_slots: 1,
+            constant_count: 0,
+            non_empty_compression: None,
+            num_non_empty: 0,
+            count_compression: None,
+            null_compression: Some(ProtobufUtils21::flat(64, None)),
+            num_nulls: 1,
+        });
+        let decompressors = DefaultDecompressionStrategy::default();
+        let mut scheduler = SparseStructuralScheduler::try_new(
+            &[(0, 8), (8, 8), (16, 0)],
+            0,
+            layout.num_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&[0; 8]);
+        let io: Arc<dyn crate::EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
+
+        let Err(err) = scheduler.initialize(&io).await else {
+            panic!("expected sparse layout to reject short structural buffer");
+        };
+
+        assert_invalid_input_contains(err, "decoded 0 bytes, expected 8");
+    }
+
+    #[tokio::test]
+    async fn test_sparse_layout_rejects_metadata_buffer_range_overflow() {
+        let layout = sparse_test_layout();
+        let decompressors = DefaultDecompressionStrategy::default();
+        let mut scheduler = SparseStructuralScheduler::try_new(
+            &[(u64::MAX, 1), (0, 0)],
+            0,
+            layout.num_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap();
+        let io: Arc<dyn crate::EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::new()));
+
+        let Err(err) = scheduler.initialize(&io).await else {
+            panic!("expected sparse layout to reject metadata buffer range overflow");
+        };
+
+        assert_invalid_input_contains(err, "metadata buffer range overflows");
     }
 
     #[tokio::test]
