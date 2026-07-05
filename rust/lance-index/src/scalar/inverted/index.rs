@@ -3923,6 +3923,7 @@ impl CompressedPostingList {
         block_size: usize,
         positions: Option<CompressedPositionStorage>,
     ) -> Self {
+        debug_assert!(block_size.is_power_of_two());
         Self {
             max_score,
             length,
@@ -3932,6 +3933,19 @@ impl CompressedPostingList {
             positions,
             first_docs: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Block sizes are validated powers of two, so per-doc hot loops derive
+    /// block indices with shift/mask instead of runtime division, which is
+    /// measurably slower in the iterator advance path.
+    #[inline]
+    pub(crate) fn block_shift(&self) -> u32 {
+        self.block_size.trailing_zeros()
+    }
+
+    #[inline]
+    pub(crate) fn block_mask(&self) -> usize {
+        self.block_size - 1
     }
 
     pub fn from_batch(

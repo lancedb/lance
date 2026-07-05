@@ -374,8 +374,8 @@ impl PostingIterator {
 
         match self.list {
             PostingList::Compressed(ref list) => {
-                let block_idx = self.index / list.block_size;
-                let block_offset = self.index % list.block_size;
+                let block_idx = self.index >> list.block_shift();
+                let block_offset = self.index & list.block_mask();
                 let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
 
                 // Read from the decompressed block
@@ -413,8 +413,8 @@ impl PostingIterator {
                     ))
                 }
                 CompressedPositionStorage::SharedStream(stream) => {
-                    let block_idx = self.index / list.block_size;
-                    let block_offset = self.index % list.block_size;
+                    let block_idx = self.index >> list.block_shift();
+                    let block_offset = self.index & list.block_mask();
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     if compressed.position_block_idx != Some(block_idx) {
@@ -454,33 +454,34 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
-                let mut block_idx = self.index / list.block_size;
+                let shift = list.block_shift();
+                let mut block_idx = self.index >> shift;
                 while block_idx + 1 < list.blocks.len()
                     && list.block_least_doc_id(block_idx + 1) <= least_id
                 {
                     block_idx += 1;
                 }
-                self.index = self.index.max(block_idx * list.block_size);
+                self.index = self.index.max(block_idx << shift);
                 let length = list.length as usize;
                 while self.index < length {
-                    let block_idx = self.index / list.block_size;
-                    let block_offset = self.index % list.block_size;
+                    let block_idx = self.index >> shift;
+                    let block_offset = self.index & list.block_mask();
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     let in_block = &compressed.doc_ids[block_offset..];
                     let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
                     let new_offset = block_offset + offset_in_block;
                     if new_offset < compressed.doc_ids.len() {
-                        self.index = block_idx * list.block_size + new_offset;
+                        self.index = (block_idx << shift) + new_offset;
                         break;
                     }
                     if block_idx + 1 >= list.blocks.len() {
                         self.index = length;
                         break;
                     }
-                    self.index = (block_idx + 1) * list.block_size;
+                    self.index = (block_idx + 1) << shift;
                 }
-                self.block_idx = self.index / list.block_size;
+                self.block_idx = self.index >> shift;
             }
             PostingList::Plain(ref list) => {
                 self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
