@@ -2723,11 +2723,6 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
-    use crate::writer::{
-        COLUMN_STATS_COLUMN_NAME_FIELD, COLUMN_STATS_MAX_VALUE_FIELD, COLUMN_STATS_MIN_VALUE_FIELD,
-        COLUMN_STATS_NAN_COUNT_FIELD, COLUMN_STATS_NULL_COUNT_FIELD, COLUMN_STATS_ZONE_ID_FIELD,
-        COLUMN_STATS_ZONE_LENGTH_FIELD, COLUMN_STATS_ZONE_START_FIELD,
-    };
     use std::{
         collections::{BTreeMap, HashMap},
         pin::Pin,

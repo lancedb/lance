@@ -2566,10 +2566,7 @@ mod tests {
         ));
 
         // Perform remap
-        index
-            .remap(&remap, remapped_store.as_ref())
-            .await
-            .unwrap();
+        index.remap(&remap, remapped_store.as_ref()).await.unwrap();
 
         // Reload and check
         let reloaded_idx = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())

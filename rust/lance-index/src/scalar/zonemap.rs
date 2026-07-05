@@ -176,7 +176,7 @@ impl ZoneMapIndex {
         let mut min: Option<&ScalarValue> = None;
         let mut max: Option<&ScalarValue> = None;
         for zone in segments.into_iter().flat_map(|seg| seg.zones.iter()) {
-            if Self::scalar_is_nan(&zone.max) {
+            if Self::is_nan(&zone.max) {
                 return None;
             }
             if Self::scalar_is_finite_bound(&zone.min)
@@ -195,7 +195,7 @@ impl ZoneMapIndex {
 
     /// A scalar usable as a global-range bound: non-null and, for floats, non-NaN.
     fn scalar_is_finite_bound(v: &ScalarValue) -> bool {
-        !v.is_null() && !Self::scalar_is_nan(v)
+        !v.is_null() && !Self::is_nan(v)
     }
 
     /// Evaluates whether a zone could potentially contain values matching the query.
