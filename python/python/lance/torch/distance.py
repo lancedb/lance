@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import sys
 from typing import Optional, Tuple
 
 from lance.dependencies import torch
@@ -124,8 +125,15 @@ def argmin_l2(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
     return min_dists.pow(2), idx
 
 
-@torch.compile
-def pairwise_l2(
+def _use_eager_pairwise_l2(x: torch.Tensor) -> bool:
+    return (
+        sys.platform == "win32"
+        and x.device == torch.device("cpu")
+        and x.dtype in {torch.float16, torch.bfloat16}
+    )
+
+
+def _pairwise_l2_impl(
     x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Compute pair-wise L2 distances between x and y.
@@ -168,6 +176,17 @@ def pairwise_l2(
         - 2 * xy
     )
     return dists.type(origin_dtype)
+
+
+_compiled_pairwise_l2 = torch.compile(_pairwise_l2_impl)
+
+
+def pairwise_l2(
+    x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    if _use_eager_pairwise_l2(x):
+        return _pairwise_l2_impl(x, y, y2)
+    return _compiled_pairwise_l2(x, y, y2)
 
 
 @torch.compile

@@ -9,6 +9,21 @@ torch = pytest.importorskip("torch")
 from lance.torch.distance import pairwise_l2  # noqa: E402
 
 
+def test_pairwise_l2_windows_cpu_half_uses_eager(monkeypatch):
+    import lance.torch.distance as distance
+
+    monkeypatch.setattr(distance.sys, "platform", "win32")
+
+    x = torch.rand(2, 4, dtype=torch.float16).to("cpu")
+    assert distance._use_eager_pairwise_l2(x)
+
+    x = x.type(torch.bfloat16)
+    assert distance._use_eager_pairwise_l2(x)
+
+    x = x.type(torch.float32)
+    assert not distance._use_eager_pairwise_l2(x)
+
+
 def test_cosine_distance():
     from lance.torch.distance import cosine_distance
 
