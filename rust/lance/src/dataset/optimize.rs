@@ -3667,9 +3667,14 @@ mod tests {
         };
 
         // Remap without a frag reuse index should yield unsupported
-        let Some(_scalar_index) = dataset.load_index_by_name("scalar").await.unwrap() else {
-            panic!("scalar index must be available");
-        };
+        assert!(
+            dataset
+                .load_index_by_name("scalar")
+                .await
+                .unwrap()
+                .is_some(),
+            "scalar index must be available"
+        );
 
         let result = remapping::remap_column_index(&mut dataset, &["i"], index_name.clone()).await;
         assert!(matches!(result, Err(Error::NotSupported { .. })));
@@ -6845,9 +6850,6 @@ mod tests {
         );
     }
 
-    // Note: This test is disabled because policy enforcement now prevents
-    // creating datasets with mixed stats. The "all-or-nothing" consolidation
-    // logic is still in place for backwards compatibility with older datasets.
     #[tokio::test]
     async fn test_commit_compaction_cleans_up_blob_v2_sidecars_on_commit_failure() {
         use crate::BlobArrayBuilder;
