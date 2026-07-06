@@ -243,10 +243,19 @@ fn try_rle_for_block(
     None
 }
 
-fn try_bitpack_for_mini_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
+fn try_bitpack_for_mini_block(
+    _data: &FixedWidthDataBlock,
+    _version: LanceFileVersion,
+) -> Option<Box<dyn MiniBlockCompressor>> {
     #[cfg(feature = "bitpacking")]
     {
         let bits = _data.bits_per_value;
+        // u128 inline bitpacking is a newer on-disk encoding (2.3+). Readers for earlier
+        // versions only decode 8/16/32/64-bit inline bitpacking, so restrict the 128-bit case
+        // to versions that support it; see `LanceFileVersion::support_u128_bitpacking`.
+        if bits == 128 && !_version.support_u128_bitpacking() {
+            return None;
+        }
         if estimate_inline_bitpacking_bytes(_data).is_some() {
             return Some(Box::new(InlineBitpacking::new(bits)));
         }
@@ -263,7 +272,7 @@ fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
     use arrow_array::cast::AsArray;
 
     let bits = data.bits_per_value;
-    if !matches!(bits, 8 | 16 | 32 | 64) {
+    if !matches!(bits, 8 | 16 | 32 | 64 | 128) {
         return None;
     }
     if data.num_values == 0 {
@@ -294,9 +303,15 @@ fn estimate_inline_bitpacking_bytes(data: &FixedWidthDataBlock) -> Option<u64> {
 
 fn try_bitpack_for_block(
     data: &FixedWidthDataBlock,
+    version: LanceFileVersion,
 ) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
     let bits = data.bits_per_value;
-    if !matches!(bits, 8 | 16 | 32 | 64) {
+    if !matches!(bits, 8 | 16 | 32 | 64 | 128) {
+        return None;
+    }
+    // See `try_bitpack_for_mini_block`: the 128-bit case is gated to versions that support it
+    // so readers of an older version never receive a page they cannot decode.
+    if bits == 128 && !version.support_u128_bitpacking() {
         return None;
     }
 
@@ -457,7 +472,7 @@ impl DefaultCompressionStrategy {
 
         let base = try_bss_for_mini_block(data, params)
             .or_else(|| try_rle_for_mini_block(data, params))
-            .or_else(|| try_bitpack_for_mini_block(data))
+            .or_else(|| try_bitpack_for_mini_block(data, self.version))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
 
         maybe_wrap_general_for_mini_block(base, params)
@@ -668,7 +683,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 {
                     return Ok((compressor, encoding));
                 }
-                if let Some((compressor, encoding)) = try_bitpack_for_block(fixed_width) {
+                if let Some((compressor, encoding)) =
+                    try_bitpack_for_block(fixed_width, self.version)
+                {
                     return Ok((compressor, encoding));
                 }
 
@@ -1328,6 +1345,74 @@ mod tests {
         assert!(
             !debug_str.contains("RleEncoder"),
             "expected RLE to be skipped when bitpacking is smaller, got: {debug_str}"
+        );
+    }
+
+    // u128 bitpacking is a newer on-disk encoding: readers of older file versions only decode
+    // 8/16/32/64-bit inline bitpacking, so the writer must only emit it on 2.3+ format versions.
+    // Verify the chooser gates the 128-bit case by version on both the inline (miniblock) and
+    // out-of-line (block) bitpacking paths.
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_u128_bitpacking_gated_by_file_version() {
+        use crate::statistics::ComputeStat;
+
+        // Decimal128 → 128-bit values, small magnitudes so bitpacking is clearly beneficial.
+        // 2048 values (two chunks) so the block path exercises OutOfLineBitpacking.
+        let make_u128_block = || {
+            let values: Vec<i128> = (0..2048).map(|i| (i % 16) as i128).collect();
+            let mut block = FixedWidthDataBlock {
+                bits_per_value: 128,
+                data: LanceBuffer::reinterpret_vec(values),
+                num_values: 2048,
+                block_info: BlockInfo::default(),
+            };
+            block.compute_stat();
+            block
+        };
+
+        for version in [
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+        ] {
+            assert!(
+                try_bitpack_for_mini_block(&make_u128_block(), version).is_none(),
+                "v{version}: u128 inline bitpacking must not be emitted on a stable version"
+            );
+            assert!(
+                try_bitpack_for_block(&make_u128_block(), version).is_none(),
+                "v{version}: u128 block bitpacking must not be emitted on a stable version"
+            );
+        }
+
+        // 2.3+ (reached either explicitly or via the `next` alias) opts into the new encoding.
+        // Pinning the concrete `V2_3` here guards against a gate tied to the moving `is_unstable`
+        // boundary, which would turn the encoding off once 2.3 leaves the unstable channel.
+        for version in [LanceFileVersion::V2_3, LanceFileVersion::Next] {
+            assert!(
+                try_bitpack_for_mini_block(&make_u128_block(), version).is_some(),
+                "v{version}: u128 inline bitpacking should be available on 2.3+"
+            );
+            assert!(
+                try_bitpack_for_block(&make_u128_block(), version).is_some(),
+                "v{version}: u128 block bitpacking should be available on 2.3+"
+            );
+        }
+
+        // Control: the existing 8/16/32/64-bit widths stay available on stable versions.
+        let mut narrow = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(
+                (0..2048).map(|i| (i % 16) as u32).collect::<Vec<_>>(),
+            ),
+            num_values: 2048,
+            block_info: BlockInfo::default(),
+        };
+        narrow.compute_stat();
+        assert!(
+            try_bitpack_for_mini_block(&narrow, LanceFileVersion::V2_1).is_some(),
+            "32-bit inline bitpacking must remain available on stable versions"
         );
     }
 
