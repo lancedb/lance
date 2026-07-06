@@ -28,12 +28,14 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array};
+use arrow_array::{
+    ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+};
 use arrow_schema::{DataType, Field};
-use lance_select::RowAddrTreeMap;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use std::sync::Arc;
+use lance_select::RowAddrTreeMap;
+use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::scalar::RowIdRemapper;
@@ -644,11 +646,12 @@ impl ScalarIndex for ZoneMapIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        if let SargableQuery::IsNull() = query {
-            if let Some(null_rows) = &self.null_rows {
-                return Ok(SearchResult::exact(null_rows.clone()));
-            }
+        if let SargableQuery::IsNull() = query
+            && let Some(null_rows) = &self.null_rows
+        {
+            return Ok(SearchResult::exact(null_rows.clone()));
         }
+
         search_zones(&self.zones, metrics, |zone| {
             self.evaluate_zone_against_query(zone, query)
         })
@@ -685,9 +688,15 @@ impl ScalarIndex for ZoneMapIndex {
         let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?;
         let (updated_zones, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
 
-        // Merge existing and new null rows
-        let mut merged_null_rows = self.null_rows.clone().unwrap_or_default();
-        merged_null_rows |= &new_null_rows;
+        // Merge existing and new null rows.  If the existing index had no null bitmap
+        // (legacy format — null positions unknown), preserve that None: updating cannot
+        // recover the missing information, and claiming the result has zero nulls would
+        // be a false negative.  Only a full retrain produces a fresh, complete bitmap.
+        let merged_null_rows = self.null_rows.as_ref().map(|existing| {
+            let mut merged = existing.clone();
+            merged |= &new_null_rows;
+            merged
+        });
 
         // Serialize the combined zones back into the index file
         let mut builder = ZoneMapIndexBuilder::try_new(options, self.data_type.clone())?;
@@ -736,7 +745,7 @@ pub async fn merge_zonemap_indices(
 
     let mut zones = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
-    let mut any_null_bitmap = false;
+    let mut any_missing_bitmap = false;
     for source in source_indices {
         if source.rows_per_zone != rows_per_zone {
             return Err(Error::invalid_input(format!(
@@ -760,11 +769,13 @@ pub async fn merge_zonemap_indices(
                 })
                 .cloned(),
         );
-        if let Some(null_rows) = &source.null_rows {
-            any_null_bitmap = true;
-            let mut filtered = null_rows.clone();
-            filtered.retain_fragments(fragment_filter.iter());
-            merged_null_rows |= &filtered;
+        match &source.null_rows {
+            Some(null_rows) => {
+                let mut filtered = null_rows.clone();
+                filtered.retain_fragments(fragment_filter.iter());
+                merged_null_rows |= &filtered;
+            }
+            None => any_missing_bitmap = true,
         }
     }
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));
@@ -772,8 +783,8 @@ pub async fn merge_zonemap_indices(
     let mut builder =
         ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(rows_per_zone), data_type)?;
     builder.maps = zones;
-    if any_null_bitmap {
-        builder.null_rows = merged_null_rows;
+    if !any_missing_bitmap {
+        builder.null_rows = Some(merged_null_rows);
     }
     let files = builder.write_index(dest_store).await?;
 
@@ -825,7 +836,10 @@ pub struct ZoneMapIndexBuilder {
 
     items_type: DataType,
     maps: Vec<ZoneMapStatistics>,
-    null_rows: RowAddrTreeMap,
+    // None means "legacy index — null positions unknown"; Some means a complete bitmap.
+    // write_index omits the null-bitmap global buffer when this is None, preserving the
+    // legacy format so that downstream searches remain conservative.
+    null_rows: Option<RowAddrTreeMap>,
 }
 
 impl ZoneMapIndexBuilder {
@@ -834,7 +848,7 @@ impl ZoneMapIndexBuilder {
             options,
             items_type,
             maps: Vec::new(),
-            null_rows: RowAddrTreeMap::new(),
+            null_rows: None,
         })
     }
 
@@ -846,7 +860,7 @@ impl ZoneMapIndexBuilder {
         let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?;
         let (maps, null_rows) = trainer.train(batches_source).await?;
         self.maps = maps;
-        self.null_rows = null_rows;
+        self.null_rows = Some(null_rows);
         Ok(())
     }
 
@@ -913,18 +927,21 @@ impl ZoneMapIndexBuilder {
             .await?;
         index_file.write_record_batch(record_batch).await?;
 
-        let mut null_bitmap_bytes = Vec::with_capacity(self.null_rows.serialized_size());
-        self.null_rows.serialize_into(&mut null_bitmap_bytes)?;
-        let null_bitmap_idx = index_file
-            .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
-            .await?;
-
-        let zonemap_file = index_file
-            .finish_with_metadata(HashMap::from([(
-                NULL_BITMAP_META_KEY.to_string(),
-                null_bitmap_idx.to_string(),
-            )]))
-            .await?;
+        let zonemap_file = if let Some(null_rows) = self.null_rows {
+            let mut null_bitmap_bytes = Vec::with_capacity(null_rows.serialized_size());
+            null_rows.serialize_into(&mut null_bitmap_bytes)?;
+            let null_bitmap_idx = index_file
+                .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
+                .await?;
+            index_file
+                .finish_with_metadata(HashMap::from([(
+                    NULL_BITMAP_META_KEY.to_string(),
+                    null_bitmap_idx.to_string(),
+                )]))
+                .await?
+        } else {
+            index_file.finish_with_metadata(HashMap::new()).await?
+        };
 
         Ok(vec![zonemap_file])
     }
@@ -1180,6 +1197,7 @@ mod tests {
         lance_format::LanceIndexStore,
         zonemap::{
             ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex, ZoneMapIndexBuilderParams,
+            merge_zonemap_indices,
         },
     };
 
@@ -2863,6 +2881,136 @@ mod tests {
         assert_eq!(compute_next_prefix("\u{10FFFF}\u{10FFFF}"), None);
     }
 
+    // When merging zone map segments, if ANY source segment has null_rows = None
+    // (legacy — null positions unknown), the merged result must also be None.
+    // The bug: any_null_bitmap is set to true as soon as one source has Some(...),
+    // and the None sources are silently skipped.  The merged index then has
+    // null_rows = Some(partial_bitmap), so an IsNull search returns exact results
+    // that only cover the modern segment's nulls — a false negative for the legacy
+    // segment whose null positions were never tracked.
+    #[tokio::test]
+    async fn test_merge_with_legacy_none_segment_not_treated_as_no_nulls() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        use arrow_array::{Int32Array, UInt32Array};
+
+        // Index A: fragment 0, modern — has a complete null bitmap with 2 known null rows.
+        let schema_a = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let batch_a = RecordBatch::try_new(
+            schema_a,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1i32)])) as _,
+                Arc::new(Int32Array::from(vec![Some(5i32)])) as _,
+                Arc::new(UInt32Array::from(vec![2u32])) as _,
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![10u64])) as _,
+            ],
+        )
+        .unwrap();
+        let mut modern_null_rows = RowAddrTreeMap::new();
+        modern_null_rows.insert(0u64 << 32 | 3); // frag 0 row 3
+        modern_null_rows.insert(0u64 << 32 | 7); // frag 0 row 7
+        let cache = LanceCache::no_cache();
+        let index_a = Arc::new(
+            ZoneMapIndex::try_from_serialized(
+                batch_a,
+                store.clone(),
+                None,
+                &cache,
+                10,
+                Some(modern_null_rows), // modern: complete bitmap
+            )
+            .unwrap(),
+        );
+
+        // Index B: fragment 1, legacy — null_rows = None despite null_count = 3.
+        let schema_b = Arc::new(Schema::new(vec![
+            Field::new("min", DataType::Int32, true),
+            Field::new("max", DataType::Int32, true),
+            Field::new("null_count", DataType::UInt32, false),
+            Field::new("nan_count", DataType::UInt32, false),
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+        ]));
+        let batch_b = RecordBatch::try_new(
+            schema_b,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10i32)])) as _,
+                Arc::new(Int32Array::from(vec![Some(20i32)])) as _,
+                Arc::new(UInt32Array::from(vec![3u32])) as _,
+                Arc::new(UInt32Array::from(vec![0u32])) as _,
+                Arc::new(UInt64Array::from(vec![1u64])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![10u64])) as _,
+            ],
+        )
+        .unwrap();
+        let index_b = Arc::new(
+            ZoneMapIndex::try_from_serialized(
+                batch_b,
+                store.clone(),
+                None,
+                &cache,
+                10,
+                None, // legacy: null positions unknown
+            )
+            .unwrap(),
+        );
+
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let all_frags = RoaringBitmap::from_iter([0u32, 1]);
+        merge_zonemap_indices(
+            &[index_a.as_ref(), index_b.as_ref()],
+            dest_store.as_ref(),
+            &all_frags,
+        )
+        .await
+        .unwrap();
+
+        let merged = ZoneMapIndex::load(dest_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // Index B had null_rows = None, so the merged index cannot know all null positions.
+        // IsNull must NOT return exact — that would be a false negative for fragment 1's nulls.
+        let result = merged
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // With the bug: any_null_bitmap=true (from A) → null_rows=Some(A's bitmap only)
+        //              → IsNull returns exact, missing B's unknown nulls ← FALSE NEGATIVE
+        // With the fix: any_null_bitmap=false (because B is None) → null_rows=None
+        //              → IsNull falls through to zone scan → AtMost
+        assert!(
+            !result.is_exact(),
+            "IsNull on a merged index where one source had null_rows=None must not return \
+             exact; the legacy segment had null_count=3 so its nulls exist at unknown positions"
+        );
+    }
+
     // Writes a zonemap file in the legacy format (no null bitmap global buffer),
     // simulating an index created before the null bitmap feature was added.
     async fn write_legacy_zonemap(store: &dyn IndexStore, null_count: u32) {
@@ -2917,7 +3065,10 @@ mod tests {
             .await
             .expect("failed to load legacy zonemap");
 
-        assert!(index.null_rows.is_none(), "legacy index should have no null bitmap");
+        assert!(
+            index.null_rows.is_none(),
+            "legacy index should have no null bitmap"
+        );
 
         // IS NULL should fall back to the zone-scan path and return AtMost, not Exact.
         let result = index

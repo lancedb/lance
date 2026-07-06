@@ -17,13 +17,14 @@ use crate::scalar::{
 use crate::{Any, pb};
 use arrow_array::{Array, UInt64Array};
 use arrow_schema::{DataType, Field};
-use lance_select::RowAddrTreeMap;
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use datafusion::execution::SendableRecordBatchStream;
@@ -432,11 +433,12 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-        if let BloomFilterQuery::IsNull() = query {
-            if let Some(null_rows) = &self.null_rows {
-                return Ok(SearchResult::exact(null_rows.clone()));
-            }
+        if let BloomFilterQuery::IsNull() = query
+            && let Some(null_rows) = &self.null_rows
+        {
+            return Ok(SearchResult::exact(null_rows.clone()));
         }
+
         search_zones(&self.zones, metrics, |block| {
             self.evaluate_block_against_query(block, query)
         })
@@ -472,9 +474,15 @@ impl ScalarIndex for BloomFilterIndex {
         let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
         let (updated_blocks, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
 
-        // Merge existing and new null rows
-        let mut merged_null_rows = self.null_rows.clone().unwrap_or_default();
-        merged_null_rows |= &new_null_rows;
+        // Merge existing and new null rows.  If the existing index had no null bitmap
+        // (legacy format — null positions unknown), preserve that None: updating cannot
+        // recover the missing information, and claiming the result has zero nulls would
+        // be a false negative.  Only a full retrain produces a fresh, complete bitmap.
+        let merged_null_rows = self.null_rows.as_ref().map(|existing| {
+            let mut merged = existing.clone();
+            merged |= &new_null_rows;
+            merged
+        });
 
         // Write the combined zones back to storage
         let mut builder = BloomFilterIndexBuilder::try_new(params)?;
@@ -569,7 +577,10 @@ impl BloomFilterIndexBuilderParams {
 pub struct BloomFilterIndexBuilder {
     params: BloomFilterIndexBuilderParams,
     blocks: Vec<BloomFilterStatistics>,
-    null_rows: RowAddrTreeMap,
+    // None means "legacy index — null positions unknown"; Some means a complete bitmap.
+    // write_index omits the null-bitmap global buffer when this is None, preserving the
+    // legacy format so that downstream searches remain conservative.
+    null_rows: Option<RowAddrTreeMap>,
 }
 
 impl BloomFilterIndexBuilder {
@@ -577,7 +588,7 @@ impl BloomFilterIndexBuilder {
         Ok(Self {
             params,
             blocks: Vec::new(),
-            null_rows: RowAddrTreeMap::new(),
+            null_rows: None,
         })
     }
 
@@ -589,7 +600,7 @@ impl BloomFilterIndexBuilder {
         let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
         let (blocks, null_rows) = trainer.train(batches_source).await?;
         self.blocks = blocks;
-        self.null_rows = null_rows;
+        self.null_rows = Some(null_rows);
         Ok(())
     }
 
@@ -664,18 +675,21 @@ impl BloomFilterIndexBuilder {
             .await?;
         index_file.write_record_batch(record_batch).await?;
 
-        let mut null_bitmap_bytes = Vec::with_capacity(self.null_rows.serialized_size());
-        self.null_rows.serialize_into(&mut null_bitmap_bytes)?;
-        let null_bitmap_idx = index_file
-            .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
-            .await?;
-
-        let bloomfilter_file = index_file
-            .finish_with_metadata(HashMap::from([(
-                NULL_BITMAP_META_KEY.to_string(),
-                null_bitmap_idx.to_string(),
-            )]))
-            .await?;
+        let bloomfilter_file = if let Some(null_rows) = self.null_rows {
+            let mut null_bitmap_bytes = Vec::with_capacity(null_rows.serialized_size());
+            null_rows.serialize_into(&mut null_bitmap_bytes)?;
+            let null_bitmap_idx = index_file
+                .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
+                .await?;
+            index_file
+                .finish_with_metadata(HashMap::from([(
+                    NULL_BITMAP_META_KEY.to_string(),
+                    null_bitmap_idx.to_string(),
+                )]))
+                .await?
+        } else {
+            index_file.finish_with_metadata(HashMap::new()).await?
+        };
 
         Ok(vec![bloomfilter_file])
     }
@@ -2181,10 +2195,10 @@ mod tests {
     // Writes a bloomfilter file in the legacy format (no null bitmap global buffer),
     // simulating an index created before the null bitmap feature was added.
     async fn write_legacy_bloomfilter(store: &dyn IndexStore, has_null: bool) {
-        use arrow_array::BooleanArray;
         use crate::scalar::bloomfilter::{
             BLOOMFILTER_FILENAME, BLOOMFILTER_ITEM_META_KEY, BLOOMFILTER_PROBABILITY_META_KEY,
         };
+        use arrow_array::BooleanArray;
         let schema = Arc::new(Schema::new(vec![
             Field::new("fragment_id", DataType::UInt64, false),
             Field::new("zone_start", DataType::UInt64, false),
@@ -2207,15 +2221,92 @@ mod tests {
         file_schema
             .metadata
             .insert(BLOOMFILTER_ITEM_META_KEY.to_string(), "1000".to_string());
-        file_schema
-            .metadata
-            .insert(BLOOMFILTER_PROBABILITY_META_KEY.to_string(), "0.01".to_string());
+        file_schema.metadata.insert(
+            BLOOMFILTER_PROBABILITY_META_KEY.to_string(),
+            "0.01".to_string(),
+        );
         let mut writer = store
             .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
             .await
             .unwrap();
         writer.write_record_batch(batch).await.unwrap();
         writer.finish().await.unwrap();
+    }
+
+    // Updating a legacy (null_rows = None) index must not silently treat None as
+    // "no nulls".  The bug: `self.null_rows.clone().unwrap_or_default()` collapses
+    // None into an empty RowAddrTreeMap; after the merge the updated index has
+    // `null_rows = Some(empty)`, so an IsNull search returns `exact(empty)` — a
+    // false negative even though the legacy zone recorded has_null = true.
+    #[tokio::test]
+    async fn test_update_legacy_none_null_rows_not_treated_as_no_nulls() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Write a legacy-format index (no null bitmap) with has_null=true in its zone.
+        write_legacy_bloomfilter(store.as_ref(), true).await;
+
+        let index = BloomFilterIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(
+            index.null_rows.is_none(),
+            "precondition: legacy null_rows is None"
+        );
+
+        // Update with new data from fragment 1 (no nulls).  The destination is the
+        // same store so we can reload from it afterwards.
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![
+                    Some(10i32),
+                    Some(20),
+                    Some(30),
+                ])) as _,
+                Arc::new(UInt64Array::from_iter_values(
+                    (0u64..3).map(|i| (1u64 << 32) | i),
+                )) as _,
+            ],
+        )
+        .unwrap();
+        let new_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            new_schema,
+            stream::once(std::future::ready(Ok(new_batch))),
+        ));
+
+        index
+            .update(new_stream, store.as_ref(), None)
+            .await
+            .unwrap();
+
+        let updated_index = BloomFilterIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // The legacy zone had has_null=true, so there ARE nulls at unknown positions.
+        // An IsNull search on the updated index must NOT claim "no nulls" (exact empty).
+        // It must be conservative and return AtMost, falling back to the has_null scan.
+        let result = updated_index
+            .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // With the bug: null_rows = Some(empty) → returns exact(empty) ← FALSE NEGATIVE
+        // With the fix: null_rows = None        → falls through to has_null scan → AtMost
+        assert!(
+            !result.is_exact(),
+            "IsNull on an updated legacy index must not return exact(empty); \
+             the legacy zone had has_null=true so nulls exist at unknown positions"
+        );
     }
 
     #[tokio::test]
@@ -2233,7 +2324,10 @@ mod tests {
             .await
             .expect("failed to load legacy bloomfilter");
 
-        assert!(index.null_rows.is_none(), "legacy index should have no null bitmap");
+        assert!(
+            index.null_rows.is_none(),
+            "legacy index should have no null bitmap"
+        );
 
         // IS NULL should fall back to the has_null zone scan and return AtMost, not Exact.
         let result = index
