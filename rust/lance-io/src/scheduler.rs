@@ -380,6 +380,9 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
     bypass_backpressure: bool,
+    // Queue the batch's backpressure reservation is refunded to once its response
+    // is delivered or discarded (see `Response`'s `Drop`).
+    io_queue: Arc<IoQueue>,
 }
 
 impl<F: FnOnce(Response) + Send> MutableBatch<F> {
@@ -389,6 +392,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
         priority: u128,
         num_reqs: usize,
         bypass_backpressure: bool,
+        io_queue: Arc<IoQueue>,
     ) -> Self {
         Self {
             when_done: Some(when_done),
@@ -398,6 +402,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             num_reqs,
             err: None,
             bypass_backpressure,
+            io_queue,
         }
     }
 }
@@ -419,7 +424,8 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
         // We don't really care if no one is around to receive it, just let
         // the result go out of scope and get cleaned up
         let response = Response {
-            data: result,
+            data: Some(result),
+            io_queue: self.io_queue.clone(),
             // Report 0 bytes for bypass tasks so the backpressure budget is unaffected
             num_bytes: if self.bypass_backpressure {
                 0
@@ -779,10 +785,23 @@ impl Debug for ScanScheduler {
 }
 
 struct Response {
-    data: Result<Vec<Bytes>>,
+    // `Option` so the caller can take the data out while the response (and its
+    // backpressure refund on drop) stays intact.
+    data: Option<Result<Vec<Bytes>>>,
+    io_queue: Arc<IoQueue>,
     priority: u128,
     num_reqs: usize,
     num_bytes: u64,
+}
+
+// Refund the batch's backpressure reservation when the response is dropped, be
+// that on delivery or when a cancelled request's undelivered response is
+// discarded.  This releases the budget even if the caller drops the future early.
+impl Drop for Response {
+    fn drop(&mut self) {
+        self.io_queue
+            .on_bytes_consumed(self.num_bytes, self.priority, self.num_reqs);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -966,6 +985,7 @@ impl ScanScheduler {
             priority,
             request.len(),
             bypass_backpressure,
+            io_queue.clone(),
         ))));
 
         for (task_idx, iop) in request.into_iter().enumerate() {
@@ -1004,14 +1024,11 @@ impl ScanScheduler {
 
         self.do_submit_request(reader, request, tx, priority, io_queue, bypass_backpressure);
 
-        let io_queue_clone = io_queue.clone();
-
-        rx.map(move |wrapped_rsp| {
-            // Right now, it isn't possible for I/O to be cancelled so a cancel error should
-            // not occur
-            let rsp = wrapped_rsp.unwrap();
-            io_queue_clone.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
-            rsp.data
+        rx.map(|wrapped_rsp| {
+            // A cancel error can't occur: the sender always sends before dropping.
+            // The reservation is refunded on `Response` drop, so just take the data.
+            let mut rsp = wrapped_rsp.unwrap();
+            rsp.data.take().unwrap()
         })
     }
 
