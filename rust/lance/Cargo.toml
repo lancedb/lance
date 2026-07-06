@@ -163,6 +163,9 @@ huggingface = ["lance-io/huggingface"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
+# EXPERIMENTAL: action-based (UserOperation) transactions. Unstable wire format
+# with no compatibility guarantee; not compiled into default builds.
+unstable-action-transactions = ["lance-table/unstable-action-transactions"]
 # Compile the RocksDB comparison arm of the (disabled) mem_wal_kv_point_lookup
 # bench. Commented out so it stays out of CI's all-features build.
 # bench-rocksdb = ["dep:rocksdb"]

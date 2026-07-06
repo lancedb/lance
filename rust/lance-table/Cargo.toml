@@ -60,6 +60,10 @@ protobuf-src = { version = "2.1", optional = true }
 
 [features]
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
+# EXPERIMENTAL: action-based (UserOperation) transactions. Unstable wire format
+# with no compatibility guarantee; not compiled into default builds. See
+# protos/transaction_experimental.proto.
+unstable-action-transactions = []
 protoc = ["dep:protobuf-src"]
 
 [package.metadata.docs.rs]
