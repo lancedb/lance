@@ -695,7 +695,10 @@ impl Dataset {
             read_struct(object_reader.as_ref(), offset).await
         }?;
 
-        if !can_read_dataset(manifest.reader_feature_flags) {
+        if !can_read_dataset(
+            manifest.reader_feature_flags,
+            &manifest.experimental_reader_features,
+        ) {
             let message = format!(
                 "This dataset cannot be read by this version of Lance. \
                  Please upgrade Lance to read this dataset.\n Flags: {}",

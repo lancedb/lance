@@ -101,6 +101,19 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Names of experimental features this dataset relies on for reading.
+    ///
+    /// EXPERIMENTAL: pairs with the `FLAG_EXPERIMENTAL` reader feature-flag bit.
+    /// A reader that does not understand every name here must refuse the dataset.
+    /// Empty for datasets that use no experimental features.
+    pub experimental_reader_features: Vec<String>,
+
+    /// Names of experimental features this dataset relies on for writing.
+    ///
+    /// EXPERIMENTAL: the writer-side counterpart of
+    /// `experimental_reader_features`.
+    pub experimental_writer_features: Vec<String>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -196,6 +209,8 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            experimental_reader_features: Vec::new(),
+            experimental_writer_features: Vec::new(),
         }
     }
 
@@ -227,6 +242,8 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            experimental_reader_features: previous.experimental_reader_features.clone(),
+            experimental_writer_features: previous.experimental_writer_features.clone(),
         }
     }
 
@@ -289,6 +306,8 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            experimental_reader_features: self.experimental_reader_features.clone(),
+            experimental_writer_features: self.experimental_writer_features.clone(),
         }
     }
 
@@ -931,6 +950,8 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            experimental_reader_features: p.experimental_reader_features,
+            experimental_writer_features: p.experimental_writer_features,
         })
     }
 }
@@ -994,6 +1015,8 @@ impl From<&Manifest> for pb::Manifest {
                 })
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
+            experimental_reader_features: m.experimental_reader_features.clone(),
+            experimental_writer_features: m.experimental_writer_features.clone(),
         }
     }
 }
