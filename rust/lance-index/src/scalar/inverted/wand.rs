@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{
     cell::UnsafeCell,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashMap, VecDeque},
 };
 use std::{cmp::Reverse, fmt::Debug};
 
@@ -574,6 +574,89 @@ pub struct DocCandidate {
     pub doc_length: u32,
 }
 
+type CandidateHeap = BinaryHeap<Reverse<RowHeapEntry>>;
+
+struct ElementCandidate {
+    freqs: Vec<(u32, u32)>,
+    doc_length: u32,
+    posting_doc_id: u64,
+}
+
+struct RowHeapEntry {
+    row_id: u64,
+    score: ScoredDoc,
+    elements: Vec<ElementCandidate>,
+}
+
+impl PartialEq for RowHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score
+    }
+}
+
+impl Eq for RowHeapEntry {}
+
+impl PartialOrd for RowHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RowHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score.cmp(&other.score)
+    }
+}
+
+struct RowCandidate {
+    row_id: u64,
+    score: f32,
+    elements: Vec<ElementCandidate>,
+}
+
+impl RowCandidate {
+    fn new(
+        row_id: u64,
+        score: f32,
+        freqs: Vec<(u32, u32)>,
+        doc_length: u32,
+        posting_doc_id: u64,
+    ) -> Self {
+        let mut candidate = Self {
+            row_id,
+            score,
+            elements: Vec::new(),
+        };
+        candidate.push_element(score, freqs, doc_length, posting_doc_id);
+        candidate
+    }
+
+    fn push_element(
+        &mut self,
+        score: f32,
+        freqs: Vec<(u32, u32)>,
+        doc_length: u32,
+        posting_doc_id: u64,
+    ) {
+        if score > self.score {
+            self.score = score;
+        }
+        self.elements.push(ElementCandidate {
+            freqs,
+            doc_length,
+            posting_doc_id,
+        });
+    }
+
+    fn into_heap_entry(self) -> Reverse<RowHeapEntry> {
+        Reverse(RowHeapEntry {
+            row_id: self.row_id,
+            score: ScoredDoc::new(self.row_id, self.score),
+            elements: self.elements,
+        })
+    }
+}
+
 struct HeadPosting {
     // Iterators that are already positioned on or after the next candidate doc.
     // The heap is ordered by smallest doc id so the top element determines
@@ -727,6 +810,7 @@ pub struct Wand<'a, S: Scorer> {
     and_candidates_pruned_before_return: usize,
     docs: &'a DocSet,
     scorer: S,
+    rows_may_have_duplicates: bool,
     // Shared cross-partition top-k floor. Each partition publishes its local
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
@@ -791,6 +875,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_candidates_pruned_before_return: 0,
             docs,
             scorer,
+            rows_may_have_duplicates: false,
             shared_threshold: None,
         }
     }
@@ -798,6 +883,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
     /// Share one cross-partition top-k floor across a query's partitions.
     pub(crate) fn with_shared_threshold(mut self, shared: Arc<AtomicU32>) -> Self {
         self.shared_threshold = Some(shared);
+        self
+    }
+
+    /// Override the duplicate-row-id metadata supplied by the caller.
+    pub(crate) fn with_duplicate_row_ids(mut self, has_duplicate_row_ids: bool) -> Self {
+        self.rows_may_have_duplicates = has_duplicate_row_ids;
         self
     }
 
@@ -826,6 +917,122 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
     }
 
+    fn push_row_candidate(
+        &mut self,
+        candidates: &mut CandidateHeap,
+        limit: usize,
+        candidate: RowCandidate,
+        params: &FtsSearchParams,
+    ) {
+        if candidates.len() < limit {
+            candidates.push(candidate.into_heap_entry());
+            if candidates.len() == limit {
+                let kth = candidates.peek().unwrap().0.score.score.0;
+                self.update_threshold(kth, params.wand_factor);
+            }
+        } else if candidate.score > candidates.peek().unwrap().0.score.score.0 {
+            candidates.pop();
+            candidates.push(candidate.into_heap_entry());
+            let kth = candidates.peek().unwrap().0.score.score.0;
+            self.update_threshold(kth, params.wand_factor);
+        }
+    }
+
+    fn flush_row_candidate(
+        &mut self,
+        candidates: &mut CandidateHeap,
+        limit: usize,
+        current_row: &mut Option<RowCandidate>,
+        params: &FtsSearchParams,
+    ) {
+        if let Some(candidate) = current_row.take() {
+            self.push_row_candidate(candidates, limit, candidate, params);
+        }
+    }
+
+    fn push_row_element(
+        row_candidates: &mut HashMap<u64, RowCandidate>,
+        row_id: u64,
+        score: f32,
+        freqs: Vec<(u32, u32)>,
+        doc_length: u32,
+        posting_doc_id: u64,
+    ) {
+        match row_candidates.get_mut(&row_id) {
+            Some(candidate) => candidate.push_element(score, freqs, doc_length, posting_doc_id),
+            None => {
+                row_candidates.insert(
+                    row_id,
+                    RowCandidate::new(row_id, score, freqs, doc_length, posting_doc_id),
+                );
+            }
+        }
+    }
+
+    fn top_row_candidates(
+        row_candidates: HashMap<u64, RowCandidate>,
+        limit: usize,
+    ) -> Vec<RowCandidate> {
+        let mut row_candidates = row_candidates.into_values().collect::<Vec<_>>();
+        row_candidates.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.row_id.cmp(&b.row_id))
+        });
+        if row_candidates.len() > limit {
+            row_candidates.truncate(limit);
+        }
+        row_candidates
+    }
+
+    fn publish_shared_threshold(&self, row_candidates: &[RowCandidate], limit: usize) {
+        if row_candidates.len() == limit
+            && let (Some(shared), Some(kth)) =
+                (self.shared_threshold.as_ref(), row_candidates.last())
+        {
+            atomic_store_max_f32(shared, kth.score);
+        }
+    }
+
+    fn row_candidates_into_doc_candidates(row_candidates: Vec<RowCandidate>) -> Vec<DocCandidate> {
+        row_candidates
+            .into_iter()
+            .flat_map(|row| {
+                row.elements.into_iter().map(move |element| DocCandidate {
+                    addr: CandidateAddr::RowId(row.row_id),
+                    posting_doc_id: element.posting_doc_id,
+                    freqs: element.freqs,
+                    doc_length: element.doc_length,
+                })
+            })
+            .collect()
+    }
+
+    fn heap_into_doc_candidates(
+        candidates: CandidateHeap,
+        docs_has_row_ids: bool,
+    ) -> Vec<DocCandidate> {
+        let to_addr = |row_id_slot: u64| {
+            if docs_has_row_ids {
+                CandidateAddr::RowId(row_id_slot)
+            } else {
+                CandidateAddr::Pending(row_id_slot as u32)
+            }
+        };
+        candidates
+            .into_iter()
+            .flat_map(|Reverse(row)| {
+                let addr = to_addr(row.row_id);
+                row.elements.into_iter().map(move |element| DocCandidate {
+                    addr,
+                    posting_doc_id: element.posting_doc_id,
+                    freqs: element.freqs,
+                    doc_length: element.doc_length,
+                })
+            })
+            .collect()
+    }
+
     // search the top-k documents that contain the query
     // returns the row_id, frequency and doc length
     pub(crate) fn search(
@@ -839,9 +1046,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
+        let docs_has_row_ids = self.docs.has_row_ids();
         match (mask.max_len(), mask.iter_addrs()) {
             (Some(num_rows_matched), Some(row_ids))
-                if self.operator == Operator::Or
+                if docs_has_row_ids
+                    && self.operator == Operator::Or
                     && num_rows_matched * 100
                         <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
             {
@@ -854,9 +1063,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // row_ids, wand emits candidates carrying just the
         // partition-local doc_id; the outer caller resolves them to
         // row_ids post-wand.
-        let docs_has_row_ids = self.docs.has_row_ids();
+        let aggregate_rows = docs_has_row_ids && self.rows_may_have_duplicates;
 
-        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates: CandidateHeap =
+            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut row_candidates = HashMap::new();
         let mut num_comparisons = 0;
         let mut and_search_stats = (self.operator == Operator::And).then_some(AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -901,7 +1112,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
                 continue;
             }
-
             let doc_length = match &doc {
                 DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
@@ -929,35 +1139,31 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.score(doc_length)
             };
 
-            if candidates.len() < limit {
+            if aggregate_rows {
                 let freqs = self.iter_term_freqs().collect();
                 if let Some(and_stats) = and_search_stats.as_mut() {
                     and_stats.freqs_collected += 1;
                 }
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
+                Self::push_row_element(
+                    &mut row_candidates,
+                    row_id,
+                    score,
                     freqs,
                     doc_length,
                     posting_doc_id,
-                )));
-                if candidates.len() == limit {
-                    let kth = candidates.peek().unwrap().0.0.score.0;
-                    self.update_threshold(kth, params.wand_factor);
-                }
-            } else if score > candidates.peek().unwrap().0.0.score.0 {
+                );
+            } else if candidates.len() < limit || score > candidates.peek().unwrap().0.score.score.0
+            {
                 let freqs = self.iter_term_freqs().collect();
                 if let Some(and_stats) = and_search_stats.as_mut() {
                     and_stats.freqs_collected += 1;
                 }
-                candidates.pop();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    freqs,
-                    doc_length,
-                    posting_doc_id,
-                )));
-                let kth = candidates.peek().unwrap().0.0.score.0;
-                self.update_threshold(kth, params.wand_factor);
+                self.push_row_candidate(
+                    &mut candidates,
+                    limit,
+                    RowCandidate::new(row_id, score, freqs, doc_length, posting_doc_id),
+                    params,
+                );
             }
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
@@ -984,28 +1190,17 @@ impl<'a, S: Scorer> Wand<'a, S> {
             metrics.record_freqs_collected(and_stats.freqs_collected);
         }
 
-        // The heap entry's `row_id` slot is either a real row_id
-        // (DocSet had row_ids) or the doc_id widened to u64
-        // (deferred). Tag it accordingly so the caller can match
-        // rather than guess.
-        let to_addr = |row_id_slot: u64| {
-            if docs_has_row_ids {
-                CandidateAddr::RowId(row_id_slot)
-            } else {
-                CandidateAddr::Pending(row_id_slot as u32)
-            }
-        };
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
-                    addr: to_addr(doc.row_id),
-                    posting_doc_id,
-                    freqs,
-                    doc_length,
-                },
-            )
-            .collect())
+        if aggregate_rows {
+            let row_candidates = Self::top_row_candidates(row_candidates, limit);
+            self.publish_shared_threshold(&row_candidates, limit);
+            Ok(Self::row_candidates_into_doc_candidates(row_candidates))
+        } else {
+            // The heap entry's `row_id` slot is either a real row_id
+            // (DocSet had row_ids) or the doc_id widened to u64
+            // (deferred). Tag it accordingly so the caller can match
+            // rather than guess.
+            Ok(Self::heap_into_doc_candidates(candidates, docs_has_row_ids))
+        }
     }
 
     fn flat_search(
@@ -1024,7 +1219,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // A list column maps one row id to several doc ids, so expand every
         // document the row owns — keying on a single doc id would drop matches
         // at non-last list positions (lancedb#3352).
-        let doc_ids = row_ids
+        let mut doc_ids = row_ids
             .flat_map(|row_addr| {
                 let row_id: u64 = row_addr.into();
                 self.docs
@@ -1032,7 +1227,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     .map(move |doc_id| (doc_id, row_id))
             })
             .sorted_unstable()
-            .collect::<Vec<_>>();
+            .peekable();
         let is_compressed = self
             .head
             .peek()
@@ -1045,8 +1240,17 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .unwrap_or(false);
 
         let mut num_comparisons = 0;
-        let mut candidates = BinaryHeap::new();
-        for (doc_id, row_id) in doc_ids {
+        let mut candidates: CandidateHeap = BinaryHeap::new();
+        let mut row_candidates = HashMap::new();
+        let mut current_row = None;
+        while let Some((doc_id, row_id)) = doc_ids.next() {
+            if !self.rows_may_have_duplicates
+                && current_row
+                    .as_ref()
+                    .is_some_and(|candidate: &RowCandidate| candidate.row_id != row_id)
+            {
+                self.flush_row_candidate(&mut candidates, limit, &mut current_row, params);
+            }
             num_comparisons += 1;
             self.move_head_before_target_to_tail(doc_id);
             self.move_head_doc_to_lead(doc_id);
@@ -1092,48 +1296,53 @@ impl<'a, S: Scorer> Wand<'a, S> {
             self.collect_tail_matches(doc_id);
             let score = self.score(doc_length);
 
-            if candidates.len() < limit {
+            if self.rows_may_have_duplicates {
                 let freqs = self.iter_term_freqs().collect();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
+                Self::push_row_element(
+                    &mut row_candidates,
+                    row_id,
+                    score,
                     freqs,
                     doc_length,
                     doc_id,
-                )));
-                if candidates.len() == limit {
-                    let kth = candidates.peek().unwrap().0.0.score.0;
-                    self.update_threshold(kth, params.wand_factor);
+                );
+            } else if candidates.len() < limit || score > candidates.peek().unwrap().0.score.score.0
+            {
+                let freqs = self.iter_term_freqs().collect();
+                match current_row.as_mut() {
+                    Some(candidate) => {
+                        candidate.push_element(score, freqs, doc_length, doc_id);
+                    }
+                    None => {
+                        current_row =
+                            Some(RowCandidate::new(row_id, score, freqs, doc_length, doc_id));
+                    }
                 }
-            } else if score > candidates.peek().unwrap().0.0.score.0 {
-                let freqs = self.iter_term_freqs().collect();
-                candidates.pop();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    freqs,
-                    doc_length,
-                    doc_id,
-                )));
-                let kth = candidates.peek().unwrap().0.0.score.0;
-                self.update_threshold(kth, params.wand_factor);
+                let is_row_end = match doc_ids.peek() {
+                    Some((_, next_row_id)) => *next_row_id != row_id,
+                    None => true,
+                };
+                if is_row_end {
+                    self.flush_row_candidate(&mut candidates, limit, &mut current_row, params);
+                }
             }
 
             self.advance_lead_to_head(doc_id + 1);
         }
+        if !self.rows_may_have_duplicates {
+            self.flush_row_candidate(&mut candidates, limit, &mut current_row, params);
+        }
         metrics.record_comparisons(num_comparisons);
 
-        // flat_search is driven by an explicit row_ids iterator, so
-        // every candidate already has a real row_id.
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
-                    addr: CandidateAddr::RowId(doc.row_id),
-                    posting_doc_id,
-                    freqs,
-                    doc_length,
-                },
-            )
-            .collect())
+        if self.rows_may_have_duplicates {
+            let row_candidates = Self::top_row_candidates(row_candidates, limit);
+            self.publish_shared_threshold(&row_candidates, limit);
+            Ok(Self::row_candidates_into_doc_candidates(row_candidates))
+        } else {
+            // flat_search is driven by an explicit row_ids iterator, so
+            // every candidate already has a real row_id.
+            Ok(Self::heap_into_doc_candidates(candidates, true))
+        }
     }
 
     // calculate the score of the current document
@@ -3238,7 +3447,8 @@ mod tests {
             vec![posting].into_iter(),
             &docs,
             InverseDocLengthScorer,
-        );
+        )
+        .with_duplicate_row_ids(true);
         wand.threshold = 0.5;
 
         let selected = vec![RowAddress::from(1_u64), RowAddress::from(2_u64)];
@@ -3305,7 +3515,8 @@ mod tests {
             vec![posting].into_iter(),
             &docs,
             InverseDocLengthScorer,
-        );
+        )
+        .with_duplicate_row_ids(true);
         wand.threshold = 0.5;
 
         let selected = vec![RowAddress::from(100_u64)];
@@ -3326,6 +3537,224 @@ mod tests {
             matches!(addrs.as_slice(), [CandidateAddr::RowId(100)]),
             "expected exactly row 100, got {addrs:?}"
         );
+    }
+
+    #[test]
+    fn test_search_deduplicates_list_row_candidates() {
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(vec![0, 1, 2, 3], 1.0, None, true),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, vec![posting].into_iter(), &docs, UnitScorer)
+            .with_duplicate_row_ids(true);
+
+        let result = wand
+            .search(
+                &FtsSearchParams::new().with_limit(Some(2)),
+                Arc::new(RowAddrMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut row_ids = result
+            .into_iter()
+            .map(|doc| match doc.addr {
+                CandidateAddr::RowId(row_id) => row_id,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        row_ids.dedup();
+
+        assert_eq!(row_ids, vec![100, 101]);
+    }
+
+    #[test]
+    fn test_search_deduplicates_non_contiguous_list_row_candidates() {
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 101, 100]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list_with_freqs(vec![0, 1, 2], vec![10, 8, 9], 10.0, None, true),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, vec![posting].into_iter(), &docs, UnitScorer)
+            .with_duplicate_row_ids(true);
+
+        let result = wand
+            .search(
+                &FtsSearchParams::new().with_limit(Some(2)),
+                Arc::new(RowAddrMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut row_ids = result
+            .iter()
+            .map(|doc| match doc.addr {
+                CandidateAddr::RowId(row_id) => row_id,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        row_ids.dedup();
+
+        let mut row_100_doc_ids = result
+            .into_iter()
+            .filter_map(|doc| match doc.addr {
+                CandidateAddr::RowId(100) => Some(doc.posting_doc_id),
+                CandidateAddr::RowId(_) => None,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
+        row_100_doc_ids.sort_unstable();
+
+        assert_eq!(row_ids, vec![100, 101]);
+        assert_eq!(row_100_doc_ids, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_search_returns_all_elements_for_selected_list_row() {
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list_with_freqs(vec![0, 1, 2], vec![2, 1, 1], 2.0, None, true),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, vec![posting].into_iter(), &docs, UnitScorer)
+            .with_duplicate_row_ids(true);
+
+        let result = wand
+            .search(
+                &FtsSearchParams::new().with_limit(Some(1)),
+                Arc::new(RowAddrMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut posting_doc_ids = result
+            .into_iter()
+            .map(|doc| {
+                assert!(matches!(doc.addr, CandidateAddr::RowId(100)));
+                doc.posting_doc_id
+            })
+            .collect::<Vec<_>>();
+        posting_doc_ids.sort_unstable();
+
+        assert_eq!(posting_doc_ids, vec![0, 1]);
+    }
+
+    #[rstest]
+    fn test_flat_search_deduplicates_list_row_candidates(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 100, 101]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(vec![0, 1, 2, 3], 1.0, None, is_compressed),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, vec![posting].into_iter(), &docs, UnitScorer)
+            .with_duplicate_row_ids(true);
+
+        let selected = vec![RowAddress::from(100_u64), RowAddress::from(101_u64)];
+        let result = wand
+            .flat_search(
+                &FtsSearchParams::new().with_limit(Some(2)),
+                Box::new(selected.into_iter()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut row_ids = result
+            .into_iter()
+            .map(|doc| match doc.addr {
+                CandidateAddr::RowId(row_id) => row_id,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        row_ids.dedup();
+
+        assert_eq!(row_ids, vec![100, 101]);
+    }
+
+    #[rstest]
+    fn test_flat_search_deduplicates_non_contiguous_list_row_candidates(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 101, 100]);
+        let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+
+        let posting = PostingIterator::with_query_weight(
+            String::from("needle"),
+            0,
+            0,
+            1.0,
+            generate_posting_list_with_freqs(
+                vec![0, 1, 2],
+                vec![10, 8, 9],
+                10.0,
+                None,
+                is_compressed,
+            ),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, vec![posting].into_iter(), &docs, UnitScorer)
+            .with_duplicate_row_ids(true);
+
+        let selected = vec![RowAddress::from(100_u64), RowAddress::from(101_u64)];
+        let result = wand
+            .flat_search(
+                &FtsSearchParams::new().with_limit(Some(2)),
+                Box::new(selected.into_iter()),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut row_ids = result
+            .iter()
+            .map(|doc| match doc.addr {
+                CandidateAddr::RowId(row_id) => row_id,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        row_ids.dedup();
+
+        let mut row_100_doc_ids = result
+            .into_iter()
+            .filter_map(|doc| match doc.addr {
+                CandidateAddr::RowId(100) => Some(doc.posting_doc_id),
+                CandidateAddr::RowId(_) => None,
+                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
+            })
+            .collect::<Vec<_>>();
+        row_100_doc_ids.sort_unstable();
+
+        assert_eq!(row_ids, vec![100, 101]);
+        assert_eq!(row_100_doc_ids, vec![0, 2]);
     }
 
     #[test]

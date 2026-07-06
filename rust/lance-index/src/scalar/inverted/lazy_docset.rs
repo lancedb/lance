@@ -47,6 +47,7 @@ pub struct LoadedDocSet {
     docs: Arc<DocSet>,
     num_rows: usize,
     total_tokens: u64,
+    has_duplicate_row_ids: bool,
 }
 
 /// Store-backed DocSet view that loads on demand and caches.
@@ -64,6 +65,7 @@ pub struct DeferredDocSet {
     docs_path: String,
     is_legacy: bool,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    has_duplicate_row_ids: bool,
     /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
     /// `sum(num_tokens)` cached on first compute.
@@ -83,10 +85,12 @@ impl std::fmt::Debug for LazyDocSet {
                 .debug_struct("LazyDocSet::Loaded")
                 .field("num_rows", &l.num_rows)
                 .field("total_tokens", &l.total_tokens)
+                .field("has_duplicate_row_ids", &l.has_duplicate_row_ids)
                 .finish(),
             Self::Deferred(d) => f
                 .debug_struct("LazyDocSet::Deferred")
                 .field("num_rows", &d.num_rows)
+                .field("has_duplicate_row_ids", &d.has_duplicate_row_ids)
                 .field("total_tokens_loaded", &d.total_tokens.initialized())
                 .field("full_loaded", &d.full.initialized())
                 .finish(),
@@ -123,12 +127,14 @@ impl LazyDocSet {
         num_rows: usize,
         is_legacy: bool,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        has_duplicate_row_ids: bool,
     ) -> Self {
         Self::Deferred(Box::new(DeferredDocSet {
             store,
             docs_path,
             is_legacy,
             frag_reuse_index,
+            has_duplicate_row_ids,
             num_rows,
             total_tokens: OnceCell::new(),
             num_tokens_col: OnceCell::new(),
@@ -142,10 +148,12 @@ impl LazyDocSet {
     pub fn from_loaded(docs: DocSet) -> Self {
         let num_rows = docs.len();
         let total_tokens = docs.total_tokens_num();
+        let has_duplicate_row_ids = docs.has_duplicate_row_ids();
         Self::Loaded(LoadedDocSet {
             docs: Arc::new(docs),
             num_rows,
             total_tokens,
+            has_duplicate_row_ids,
         })
     }
 
@@ -176,6 +184,13 @@ impl LazyDocSet {
         match self {
             Self::Loaded(_) => false,
             Self::Deferred(d) => d.frag_reuse_index.is_some(),
+        }
+    }
+
+    pub fn has_duplicate_row_ids(&self) -> bool {
+        match self {
+            Self::Loaded(l) => l.has_duplicate_row_ids,
+            Self::Deferred(d) => d.has_duplicate_row_ids,
         }
     }
 
@@ -213,8 +228,12 @@ impl LazyDocSet {
     /// AND no FragReuseIndex needs to filter row_ids; otherwise the
     /// full DocSet. Encapsulates the policy so callers don't have to
     /// rederive the conditions for the targeted-read fast path.
-    pub async fn docs_for_wand(&self, mask: &RowAddrMask) -> Result<Arc<DocSet>> {
-        if mask.is_select_all() && !self.has_frag_reuse_remap() {
+    pub async fn docs_for_wand(
+        &self,
+        mask: &RowAddrMask,
+        require_row_ids: bool,
+    ) -> Result<Arc<DocSet>> {
+        if !require_row_ids && mask.is_select_all() && !self.has_frag_reuse_remap() {
             self.ensure_num_tokens_loaded().await
         } else {
             self.ensure_loaded().await

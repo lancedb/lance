@@ -2,13 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::cmp::min;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::{
-    cmp::{Reverse, min},
-    collections::BinaryHeap,
-};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
@@ -109,6 +106,7 @@ pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
+pub const DOCS_HAVE_DUPLICATE_ROW_IDS_KEY: &str = "docs_have_duplicate_row_ids";
 pub const POSTING_TAIL_CODEC_KEY: &str = "posting_tail_codec";
 pub const POSITIONS_LAYOUT_KEY: &str = "positions_layout";
 pub const POSITIONS_CODEC_KEY: &str = "positions_codec";
@@ -417,6 +415,21 @@ pub(super) fn parse_format_version_from_metadata(
     } else {
         Ok(InvertedListFormatVersion::V1)
     }
+}
+
+pub(super) fn parse_docs_have_duplicate_row_ids(
+    metadata: &HashMap<String, String>,
+) -> Result<bool> {
+    metadata
+        .get(DOCS_HAVE_DUPLICATE_ROW_IDS_KEY)
+        .map(|value| {
+            value.parse::<bool>().map_err(|err| {
+                Error::index(format!(
+                    "failed to parse {DOCS_HAVE_DUPLICATE_ROW_IDS_KEY}: {err}"
+                ))
+            })
+        })
+        .unwrap_or(Ok(false))
 }
 
 #[derive(Clone)]
@@ -773,8 +786,7 @@ impl InvertedIndex {
         }
 
         fn push_scored_candidate(
-            candidates: &mut BinaryHeap<Reverse<ScoredDoc>>,
-            limit: usize,
+            candidates: &mut HashMap<u64, f32>,
             addr: CandidateAddr,
             score: f32,
         ) -> Result<()> {
@@ -789,18 +801,37 @@ impl InvertedIndex {
                 }
             };
 
-            if candidates.len() < limit {
-                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
-            } else if candidates.peek().unwrap().0.score.0 < score {
-                candidates.pop();
-                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
-            }
+            candidates
+                .entry(row_id)
+                .and_modify(|existing| {
+                    if score > *existing {
+                        *existing = score;
+                    }
+                })
+                .or_insert(score);
             Ok(())
+        }
+
+        fn sorted_top_rows(candidates: HashMap<u64, f32>, limit: usize) -> (Vec<u64>, Vec<f32>) {
+            let mut candidates = candidates
+                .into_iter()
+                .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+                .collect::<Vec<_>>();
+            candidates.sort_unstable_by(|a, b| {
+                b.score.cmp(&a.score).then_with(|| a.row_id.cmp(&b.row_id))
+            });
+            if candidates.len() > limit {
+                candidates.truncate(limit);
+            }
+            candidates
+                .into_iter()
+                .map(|doc| (doc.row_id, doc.score.0))
+                .unzip()
         }
 
         let mask = prefilter.mask();
 
-        let mut candidates = BinaryHeap::new();
+        let mut candidates = HashMap::new();
         // Shared top-k floor across this query's partitions. Seeded to -inf so
         // the first real score wins; each partition publishes its local k-th
         // and prunes against the running global k-th (a lower bound on the true
@@ -835,7 +866,14 @@ impl InvertedIndex {
                         // row_id/num_tokens download for it.
                         return Result::Ok(PartitionCandidates::empty());
                     }
-                    let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
+                    // Row-level top-k needs row_id visibility inside WAND only
+                    // when this docs file actually contains duplicate row_ids.
+                    // Unique-row partitions keep the deferred num_tokens-only
+                    // path and resolve the surviving top-k doc_ids afterwards.
+                    let docs_for_wand = part
+                        .docs
+                        .docs_for_wand(mask.as_ref(), part.docs.has_duplicate_row_ids())
+                        .await?;
                     let max_position = postings
                         .iter()
                         .map(|posting| posting.term_index() as usize)
@@ -926,7 +964,7 @@ impl InvertedIndex {
                         score += idf_by_position[term_index as usize]
                             * scorer.doc_weight(freq, doc_length);
                     }
-                    push_scored_candidate(&mut candidates, limit, addr, score)?;
+                    push_scored_candidate(&mut candidates, addr, score)?;
                 }
             } else {
                 let grouped_positions = grouped_expansions
@@ -965,16 +1003,12 @@ impl InvertedIndex {
                             score += idf_weight * scorer.doc_weight(freq, doc_length);
                         }
                     }
-                    push_scored_candidate(&mut candidates, limit, addr, score)?;
+                    push_scored_candidate(&mut candidates, addr, score)?;
                 }
             }
         }
 
-        Ok(candidates
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
-            .unzip())
+        Ok(sorted_top_rows(candidates, limit))
     }
 
     async fn load_legacy_index(
@@ -1406,7 +1440,8 @@ pub struct InvertedPartition {
     pub(crate) inverted_list: Arc<PostingListReader>,
     /// Per-doc row_id + num_tokens. Wrapped in `LazyDocSet` so partitions
     /// that don't contribute hits to a query never pay the full-array
-    /// download. Scoring paths call `ensure_loaded` before walking wand.
+    /// download. Scoring paths materialize row_ids only when row-level WAND
+    /// needs them for duplicate-row deduplication.
     pub(crate) docs: Arc<LazyDocSet>,
     token_set_format: TokenSetFormat,
 }
@@ -1456,13 +1491,17 @@ impl InvertedPartition {
         // the store + path instead of an open reader keeps a cached partition
         // from pinning a docs-file handle for its whole lifetime.
         let docs_path = doc_file_path(id);
-        let num_docs = store.open_index_file(&docs_path).await?.num_rows();
+        let docs_reader = store.open_index_file(&docs_path).await?;
+        let num_docs = docs_reader.num_rows();
+        let has_duplicate_row_ids =
+            parse_docs_have_duplicate_row_ids(&docs_reader.schema().metadata)?;
         let docs = Arc::new(LazyDocSet::new(
             store.clone(),
             docs_path,
             num_docs,
             false,
             frag_reuse_index,
+            has_duplicate_row_ids,
         ));
 
         Ok(Self {
@@ -1819,6 +1858,7 @@ impl InvertedPartition {
         // handle the num_tokens-only case.
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), docs, scorer)
+            .with_duplicate_row_ids(self.docs.has_duplicate_row_ids())
             .with_shared_threshold(shared_threshold);
         let hits = wand.search(params, mask, metrics)?;
         Ok(hits)
@@ -5042,6 +5082,17 @@ impl DocSet {
         !self.row_ids.is_empty()
     }
 
+    pub(crate) fn has_duplicate_row_ids(&self) -> bool {
+        if self.row_ids.len() < 2 {
+            return false;
+        }
+        if self.row_ids.is_sorted() {
+            return self.row_ids.windows(2).any(|window| window[0] == window[1]);
+        }
+        let mut seen = HashSet::with_capacity(self.row_ids.len());
+        self.row_ids.iter().any(|row_id| !seen.insert(*row_id))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &u32)> {
         self.row_ids.iter().zip(self.num_tokens.iter())
     }
@@ -5115,10 +5166,16 @@ impl DocSet {
         let row_id_col = UInt64Array::from_iter_values(self.row_ids.iter().cloned());
         let num_tokens_col = UInt32Array::from_iter_values(self.num_tokens.iter().cloned());
 
-        let schema = arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
-            arrow_schema::Field::new(NUM_TOKEN_COL, DataType::UInt32, false),
-        ]);
+        let schema = arrow_schema::Schema::new_with_metadata(
+            vec![
+                arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
+                arrow_schema::Field::new(NUM_TOKEN_COL, DataType::UInt32, false),
+            ],
+            HashMap::from([(
+                DOCS_HAVE_DUPLICATE_ROW_IDS_KEY.to_owned(),
+                self.has_duplicate_row_ids().to_string(),
+            )]),
+        );
 
         let batch = RecordBatch::try_new(
             Arc::new(schema),
@@ -5552,8 +5609,8 @@ fn flat_bm25_score(
     counted_input: &RecordBatch,
     scorer: &MemBM25Scorer,
 ) -> Result<RecordBatch> {
-    let mut row_ids_builder = UInt64Builder::with_capacity(counted_input.num_rows());
-    let mut scores_builder = Float32Builder::with_capacity(counted_input.num_rows());
+    let mut row_order = Vec::new();
+    let mut row_scores = HashMap::new();
 
     let mut row_ids_iter = counted_input
         .column(FLAT_ROW_ID_COL_IDX)
@@ -5592,9 +5649,22 @@ fn flat_bm25_score(
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
         if score > 0.0 {
-            row_ids_builder.append_value(row_id);
-            scores_builder.append_value(score);
+            if let Some(existing) = row_scores.get_mut(&row_id) {
+                if score > *existing {
+                    *existing = score;
+                }
+            } else {
+                row_order.push(row_id);
+                row_scores.insert(row_id, score);
+            }
         }
+    }
+
+    let mut row_ids_builder = UInt64Builder::with_capacity(row_order.len());
+    let mut scores_builder = Float32Builder::with_capacity(row_order.len());
+    for row_id in row_order {
+        row_ids_builder.append_value(row_id);
+        scores_builder.append_value(row_scores[&row_id]);
     }
 
     let row_ids = row_ids_builder.finish();
@@ -7758,6 +7828,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_bm25_search_deduplicates_row_ids_across_partitions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("needle".to_owned());
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(3));
+        builder0.posting_lists[0].add(1, PositionRecorder::Count(1));
+        builder0.docs.append(100, 1);
+        builder0.docs.append(101, 1);
+        builder0.write(store.as_ref()).await.unwrap();
+
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("needle".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(2));
+        builder1.posting_lists[0].add(1, PositionRecorder::Count(1));
+        builder1.docs.append(100, 1);
+        builder1.docs.append(102, 1);
+        builder1.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(vec!["needle".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids.len(), 2);
+        assert_eq!(row_ids[0], 100);
+        assert!(
+            matches!(row_ids[1], 101 | 102),
+            "the second row has the same score in both partitions, got {}",
+            row_ids[1]
+        );
+        assert_eq!(scores.len(), row_ids.len());
+        assert!(
+            scores[0] > scores[1],
+            "row 100 should keep the highest score across duplicate candidates"
+        );
+    }
+
     async fn write_test_metadata(
         store: &Arc<LanceIndexStore>,
         partition_ids: Vec<u64>,
@@ -7779,6 +7906,46 @@ mod tests {
             .await
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
+    }
+
+    async fn write_docset_metadata_test_index(row_ids: &[u64]) -> Arc<InvertedIndex> {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("alpha".to_owned());
+        let mut posting = PostingListBuilder::new(false);
+        for (doc_id, row_id) in row_ids.iter().copied().enumerate() {
+            posting.add(doc_id as u32, PositionRecorder::Count(1));
+            builder.docs.append(row_id, 1);
+        }
+        builder.posting_lists.push(posting);
+        builder.write(store.as_ref()).await.unwrap();
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        InvertedIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_docset_metadata_tracks_unique_row_ids() {
+        let index = write_docset_metadata_test_index(&[10, 11]).await;
+        assert!(!index.partitions[0].docs.has_duplicate_row_ids());
+    }
+
+    #[tokio::test]
+    async fn test_docset_metadata_tracks_duplicate_row_ids() {
+        let index = write_docset_metadata_test_index(&[10, 10, 11]).await;
+        assert!(index.partitions[0].docs.has_duplicate_row_ids());
+    }
+
+    #[test]
+    fn test_missing_docset_duplicate_metadata_defaults_to_fast_path() {
+        assert!(!parse_docs_have_duplicate_row_ids(&HashMap::new()).unwrap());
     }
 
     #[tokio::test]
@@ -8733,6 +8900,56 @@ mod tests {
             "same term frequency should score shorter document higher; short={}, long={}",
             scores.value(0),
             scores.value(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_search_deduplicates_row_ids_by_max_score() {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![100u64, 100, 101])),
+                Arc::new(StringArray::from(vec![
+                    "alpha filler filler filler",
+                    "alpha",
+                    "alpha",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+
+        let result_stream = flat_bm25_search_stream_with_metrics(
+            input,
+            "text".to_string(),
+            "alpha".to_string(),
+            tokenizer,
+            None,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+        let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+        let scores = scored[SCORE_COL].as_primitive::<Float32Type>();
+
+        assert_eq!(row_ids.values(), &[100, 101]);
+        assert!(
+            (scores.value(0) - scores.value(1)).abs() < 1e-6,
+            "row 100 should keep the score from its best matching element"
         );
     }
 

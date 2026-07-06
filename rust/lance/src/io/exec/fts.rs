@@ -107,7 +107,10 @@ async fn search_segments(
     base_scorer: Arc<MemBM25Scorer>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
-    let mut candidates = std::collections::BinaryHeap::new();
+    if limit == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut candidates = HashMap::new();
     let searches = indices
         .iter()
         .map(|index| {
@@ -136,19 +139,29 @@ async fn search_segments(
 
     while let Some((doc_ids, scores)) = searches.try_next().await? {
         for (row_id, score) in doc_ids.into_iter().zip(scores.into_iter()) {
-            if candidates.len() < limit {
-                candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
-            } else if candidates.peek().unwrap().0.score.0 < score {
-                candidates.pop();
-                candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
-            }
+            candidates
+                .entry(row_id)
+                .and_modify(|existing| {
+                    if score > *existing {
+                        *existing = score;
+                    }
+                })
+                .or_insert(score);
         }
     }
 
-    Ok(candidates
-        .into_sorted_vec()
+    let mut candidates = candidates
         .into_iter()
-        .map(|std::cmp::Reverse(doc)| (doc.row_id, doc.score.0))
+        .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|a, b| b.score.cmp(&a.score).then_with(|| a.row_id.cmp(&b.row_id)));
+    if candidates.len() > limit {
+        candidates.truncate(limit);
+    }
+
+    Ok(candidates
+        .into_iter()
+        .map(|doc| (doc.row_id, doc.score.0))
         .unzip())
 }
 

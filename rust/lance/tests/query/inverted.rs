@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::Float32Type;
+use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::{
     ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
@@ -12,8 +14,8 @@ use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::{InsertBuilder, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_index::IndexType;
-use lance_index::scalar::inverted::Language;
 use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+use lance_index::scalar::inverted::{Language, SCORE_COL};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_table::format::IndexMetadata;
 
@@ -148,6 +150,63 @@ async fn test_inverted_phrase_query_with_positions() {
             test_fts(&original, &ds, "text", "lance database", None, true, true).await;
         })
         .await;
+}
+
+#[tokio::test]
+async fn test_inverted_list_utf8_returns_unique_rows_with_row_limit() {
+    let test_dir = tempfile::tempdir().unwrap();
+    let test_uri = test_dir.path().to_str().unwrap();
+
+    let mut tags = ListBuilder::new(StringBuilder::new());
+    for row in [
+        ["puppy", "puppy", "puppy"].as_slice(),
+        ["puppy"].as_slice(),
+        ["kitten"].as_slice(),
+    ] {
+        for value in row {
+            tags.values().append_value(*value);
+        }
+        tags.append(true);
+    }
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef),
+        ("tags", Arc::new(tags.finish()) as ArrayRef),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+    let mut ds = Dataset::write(reader, test_uri, None).await.unwrap();
+
+    let params = base_inverted_params(false);
+    ds.create_index(&["tags"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let query = FullTextSearchQuery::new("puppy".to_string())
+        .with_column("tags".to_string())
+        .unwrap()
+        .limit(Some(2));
+    let mut scanner = ds.scan();
+    scanner.full_text_search(query).unwrap();
+    let result = scanner.try_into_batch().await.unwrap();
+
+    assert_eq!(result.num_rows(), 2);
+    let ids = result
+        .column_by_name("id")
+        .unwrap()
+        .as_primitive::<arrow::datatypes::Int32Type>();
+    let mut ids = ids.values().to_vec();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1]);
+
+    let scores = result
+        .column_by_name(SCORE_COL)
+        .unwrap()
+        .as_primitive::<Float32Type>();
+    assert!(
+        (scores.value(0) - scores.value(1)).abs() < 1e-6,
+        "row 0 should keep the score from one best matching list element"
+    );
 }
 
 #[tokio::test]
