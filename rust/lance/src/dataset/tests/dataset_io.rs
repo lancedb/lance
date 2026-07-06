@@ -15,7 +15,7 @@ use crate::session::Session;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
 
-use crate::dataset::write::{WriteMode, WriteParams};
+use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
@@ -1059,6 +1059,164 @@ async fn test_write_manifest(
     .await;
 
     assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+}
+
+#[tokio::test]
+async fn test_rle_v2_v23_write_and_append() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+    let mut dataset = Dataset::write(
+        batches,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let manifest = read_manifest(
+        dataset.object_store.as_ref(),
+        &dataset
+            .commit_handler
+            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .await
+            .unwrap()
+            .path,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        manifest.data_storage_format.lance_file_version().unwrap(),
+        LanceFileVersion::V2_3
+    );
+
+    let append_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![9; 1000]))],
+    )
+    .unwrap();
+    let append_batches =
+        RecordBatchIterator::new(vec![Ok(append_batch)].into_iter(), schema.clone());
+    dataset = Dataset::write(
+        append_batches,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        dataset
+            .manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_3
+    );
+
+    let actual = dataset.scan().try_into_batch().await.unwrap();
+    let expected = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(
+            [vec![7; 1000], vec![9; 1000]].concat(),
+        ))],
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_rle_v2_uncommitted_create_commits_v23_storage() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let transaction = InsertBuilder::new(test_uri.as_str())
+        .with_params(&WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        })
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+
+    let dataset = CommitBuilder::new(test_uri.as_str())
+        .execute(transaction)
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_3
+    );
+}
+
+#[tokio::test]
+async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
+    let test_uri = TempStrDir::default();
+    let clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![7; 1000]))],
+    )
+    .unwrap();
+
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let clone = dataset
+        .shallow_clone(clone_uri.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        clone
+            .manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_3
+    );
 }
 
 #[rstest]

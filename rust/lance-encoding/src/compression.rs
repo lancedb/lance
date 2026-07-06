@@ -51,7 +51,10 @@ use crate::{
                 PackedStructVariablePerValueEncoder, VariablePackedStructFieldDecoder,
                 VariablePackedStructFieldKind,
             },
-            rle::{RleDecompressor, RleEncoder},
+            rle::{
+                RleDecompressor, RleEncoder, RunLengthWidth, select_run_length_width,
+                select_run_length_width_and_size,
+            },
             value::{ValueDecompressor, ValueEncoder},
         },
     },
@@ -165,6 +168,7 @@ fn try_bss_for_mini_block(
 fn try_rle_for_mini_block(
     data: &FixedWidthDataBlock,
     params: &CompressionFieldParams,
+    use_rle_v2: bool,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
@@ -188,16 +192,22 @@ fn try_rle_for_mini_block(
         return None;
     }
 
-    // Estimate the encoded size.
-    //
-    // RLE stores (value, run_length) pairs. Run lengths are u8 and long runs are split into
-    // multiple entries of up to 255 values. We don't know the run length distribution here,
-    // so we conservatively account for splitting with an upper bound.
     let num_values = data.num_values;
-    let estimated_pairs = (run_count.saturating_add(num_values / 255)).min(num_values);
-
     let raw_bytes = (num_values as u128) * (type_size as u128);
-    let rle_bytes = (estimated_pairs as u128) * ((type_size + 1) as u128);
+    let (run_length_width, rle_bytes) = if use_rle_v2 {
+        select_run_length_width_and_size(&data.data, data.num_values, data.bits_per_value).ok()?
+    } else {
+        // Estimate the encoded size.
+        //
+        // Compatibility RLE stores (value, u8 run_length) pairs. Long runs are split into
+        // multiple entries of up to 255 values. We don't know the run length distribution here,
+        // so we conservatively account for splitting with an upper bound.
+        let estimated_pairs = (run_count.saturating_add(num_values / 255)).min(num_values);
+        (
+            RunLengthWidth::U8,
+            (estimated_pairs as u128) * ((type_size + 1) as u128),
+        )
+    };
 
     if rle_bytes < raw_bytes {
         #[cfg(feature = "bitpacking")]
@@ -208,7 +218,9 @@ fn try_rle_for_mini_block(
                 return None;
             }
         }
-        return Some(Box::new(RleEncoder::new()));
+        return Some(Box::new(RleEncoder::with_run_length_width(
+            run_length_width,
+        )));
     }
     None
 }
@@ -217,14 +229,15 @@ fn try_rle_for_block(
     data: &FixedWidthDataBlock,
     version: LanceFileVersion,
     params: &CompressionFieldParams,
-) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    use_rle_v2: bool,
+) -> Result<Option<(Box<dyn BlockCompressor>, CompressiveEncoding)>> {
     if version < LanceFileVersion::V2_2 {
-        return None;
+        return Ok(None);
     }
 
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
-        return None;
+        return Ok(None);
     }
 
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
@@ -233,14 +246,19 @@ fn try_rle_for_block(
         .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
     if (run_count as f64) < (data.num_values as f64) * threshold {
-        let compressor = Box::new(RleEncoder::new());
+        let run_length_width = if use_rle_v2 {
+            select_run_length_width(&data.data, data.num_values, data.bits_per_value)?
+        } else {
+            RunLengthWidth::U8
+        };
+        let compressor = Box::new(RleEncoder::with_run_length_width(run_length_width));
         let encoding = ProtobufUtils21::rle(
             ProtobufUtils21::flat(bits, None),
-            ProtobufUtils21::flat(/*bits_per_value=*/ 8, None),
+            ProtobufUtils21::flat(run_length_width.bits_per_value(), None),
         );
-        return Some((compressor, encoding));
+        return Ok(Some((compressor, encoding)));
     }
-    None
+    Ok(None)
 }
 
 fn try_bitpack_for_mini_block(_data: &FixedWidthDataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
@@ -393,6 +411,10 @@ impl DefaultCompressionStrategy {
         self
     }
 
+    fn use_rle_v2(&self) -> bool {
+        self.version.resolve() >= LanceFileVersion::V2_3
+    }
+
     /// Parse compression parameters from field metadata
     fn parse_field_metadata(field: &Field, version: &LanceFileVersion) -> CompressionFieldParams {
         let mut params = CompressionFieldParams::default();
@@ -456,7 +478,7 @@ impl DefaultCompressionStrategy {
         }
 
         let base = try_bss_for_mini_block(data, params)
-            .or_else(|| try_rle_for_mini_block(data, params))
+            .or_else(|| try_rle_for_mini_block(data, params, self.use_rle_v2()))
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
 
@@ -664,7 +686,7 @@ impl CompressionStrategy for DefaultCompressionStrategy {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
                 if let Some((compressor, encoding)) =
-                    try_rle_for_block(fixed_width, self.version, &field_params)
+                    try_rle_for_block(fixed_width, self.version, &field_params, self.use_rle_v2())?
                 {
                     return Ok((compressor, encoding));
                 }
@@ -815,8 +837,11 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
             Compression::Rle(rle) => {
-                let bits_per_value = validate_rle_compression(rle)?;
-                Ok(Box::new(RleDecompressor::new(bits_per_value)))
+                let (bits_per_value, run_length_width) = validate_rle_compression(rle)?;
+                Ok(Box::new(RleDecompressor::with_run_length_width(
+                    bits_per_value,
+                    run_length_width,
+                )))
             }
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
@@ -1005,15 +1030,18 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(general_decompressor))
             }
             Compression::Rle(rle) => {
-                let bits_per_value = validate_rle_compression(rle)?;
-                Ok(Box::new(RleDecompressor::new(bits_per_value)))
+                let (bits_per_value, run_length_width) = validate_rle_compression(rle)?;
+                Ok(Box::new(RleDecompressor::with_run_length_width(
+                    bits_per_value,
+                    run_length_width,
+                )))
             }
             _ => todo!(),
         }
     }
 }
-/// Validates RLE compression format and extracts bits_per_value
-fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
+/// Validates RLE compression format and extracts value and run length widths.
+fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<(u64, RunLengthWidth)> {
     let values = rle
         .values
         .as_ref()
@@ -1043,14 +1071,22 @@ fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
         ));
     };
 
-    if run_lengths.bits_per_value != 8 {
+    if !matches!(values.bits_per_value, 8 | 16 | 32 | 64) {
         return Err(Error::invalid_input(format!(
-            "RLE compression only supports 8-bit run lengths, got {}",
-            run_lengths.bits_per_value
+            "RLE compression only supports 8, 16, 32, or 64-bit values, got {}",
+            values.bits_per_value
         )));
     }
 
-    Ok(values.bits_per_value)
+    let run_length_width =
+        RunLengthWidth::from_bits(run_lengths.bits_per_value).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "RLE compression only supports 8, 16, or 32-bit run lengths, got {}",
+                run_lengths.bits_per_value
+            ))
+        })?;
+
+    Ok((values.bits_per_value, run_length_width))
 }
 
 #[cfg(test)]
@@ -1657,6 +1693,83 @@ mod tests {
         // Should use RLE because run_count (100) < num_values * threshold (800)
         let debug_str = format!("{:?}", compressor);
         assert!(debug_str.contains("RleEncoder"));
+    }
+
+    #[test]
+    fn test_rle_v2_miniblock_selects_u16_run_lengths() {
+        let mut metadata = HashMap::new();
+        metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "1.0".to_string());
+        metadata.insert(BSS_META_KEY.to_string(), "off".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        let values = vec![7i32; 1000];
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 1000,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
+            panic!("expected RLE encoding");
+        };
+        let Compression::Flat(run_lengths) = rle
+            .run_lengths
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("expected flat run lengths");
+        };
+        assert_eq!(run_lengths.bits_per_value, 16);
+    }
+
+    #[test]
+    fn test_rle_v2_uses_selected_width_cost_before_bitpacking() {
+        let mut metadata = HashMap::new();
+        metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "1.0".to_string());
+        metadata.insert(BSS_META_KEY.to_string(), "off".to_string());
+        let mut field = create_test_field("test_column", DataType::Int32);
+        field.metadata = metadata;
+
+        let values = vec![0i32; 4096];
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 4096,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let debug_str = format!("{compressor:?}");
+        assert!(debug_str.contains("RleEncoder"));
+
+        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
+            panic!("expected RLE encoding");
+        };
+        let Compression::Flat(run_lengths) = rle
+            .run_lengths
+            .as_ref()
+            .unwrap()
+            .compression
+            .as_ref()
+            .unwrap()
+        else {
+            panic!("expected flat run lengths");
+        };
+        assert_eq!(run_lengths.bits_per_value, 16);
     }
 
     #[test]

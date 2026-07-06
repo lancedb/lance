@@ -183,25 +183,44 @@ fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: 
         .unwrap_or(default_worker_memory_limit_bytes)
 }
 
-fn merge_all_tail_partitions(tails: Vec<TailPartition>) -> Result<Option<InnerBuilder>> {
-    if tails.is_empty() {
-        return Ok(None);
+/// Merge the workers' leftover tail builders into as few partitions as the
+/// memory budget allows. Folding unconditionally would collapse every build
+/// whose workers never hit the flush threshold into a single partition, which
+/// destroys intra-query parallelism; splitting by the same per-partition
+/// budget as the flush path makes the final partition count converge to
+/// roughly total_builder_memory / memory_limit_bytes regardless of worker
+/// layout.
+fn merge_all_tail_partitions(
+    tails: Vec<TailPartition>,
+    memory_limit_bytes: u64,
+) -> Result<Vec<InnerBuilder>> {
+    let mut merged_builders: Vec<InnerBuilder> = Vec::new();
+    let mut merged: Option<InnerBuilder> = None;
+    for tail in tails {
+        let builder = tail.builder;
+        if builder.is_empty() {
+            continue;
+        }
+        match &mut merged {
+            Some(current) => {
+                let would_exceed_memory =
+                    current.memory_size().saturating_add(builder.memory_size())
+                        >= memory_limit_bytes;
+                let would_exceed_doc_ids =
+                    current.docs.len().saturating_add(builder.docs.len()) > u32::MAX as usize;
+                if would_exceed_memory || would_exceed_doc_ids {
+                    merged_builders.push(std::mem::replace(current, builder));
+                } else {
+                    current.merge_from(builder)?;
+                }
+            }
+            None => merged = Some(builder),
+        }
     }
-    merge_tail_partition_group(tails).map(Some)
-}
-
-fn merge_tail_partition_group(group: Vec<TailPartition>) -> Result<InnerBuilder> {
-    let mut group = group.into_iter();
-    let mut merged = group
-        .next()
-        .ok_or_else(|| {
-            Error::invalid_input("cannot merge an empty tail partition group".to_owned())
-        })?
-        .builder;
-    for tail in group {
-        merged.merge_from(tail.builder)?;
+    if let Some(builder) = merged {
+        merged_builders.push(builder);
     }
-    Ok(merged)
+    Ok(merged_builders)
 }
 
 #[derive(Debug)]
@@ -537,16 +556,28 @@ impl InvertedIndexBuilder {
                     tail_partitions.push(tail_partition);
                 }
             }
-            let merged_tail_partitions =
-                spawn_cpu(move || merge_all_tail_partitions(tail_partitions)).await?;
-            if let Some(builder) = merged_tail_partitions {
-                self.new_partitions.push(builder.id());
-                let mut builder = builder;
-                files.extend(
-                    builder
-                        .write_to(dest_store.as_ref(), self.partition_write_target())
-                        .await?,
-                );
+            let merged_tail_partitions = spawn_cpu(move || {
+                merge_all_tail_partitions(tail_partitions, worker_memory_limit_bytes)
+            })
+            .await?;
+            // Tail partitions hold most of the data when workers rarely hit the
+            // flush threshold; writing them one at a time serializes the
+            // posting-list compression of nearly the whole index behind a
+            // single producer thread. Compress and write them concurrently.
+            let write_target = self.partition_write_target();
+            let mut tail_writes =
+                futures::stream::iter(merged_tail_partitions.into_iter().map(|mut builder| {
+                    let dest_store = dest_store.clone();
+                    async move {
+                        let partition_id = builder.id();
+                        let files = builder.write_to(dest_store.as_ref(), write_target).await?;
+                        Result::Ok((partition_id, files))
+                    }
+                }))
+                .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 16));
+            while let Some((partition_id, partition_files)) = tail_writes.try_next().await? {
+                self.new_partitions.push(partition_id);
+                files.extend(partition_files);
             }
             log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
             Result::Ok(files)
@@ -3966,27 +3997,208 @@ mod tests {
         assert_eq!(resolve_worker_memory_limit_bytes(&params, 16), 256 << 20);
     }
 
-    #[test]
-    fn test_merge_all_tail_partitions_combines_everything() -> Result<()> {
-        let merged = merge_all_tail_partitions(vec![
-            TailPartition {
-                builder: InnerBuilder::new(0, false, TokenSetFormat::default()),
-            },
-            TailPartition {
-                builder: InnerBuilder::new(1, false, TokenSetFormat::default()),
-            },
-            TailPartition {
-                builder: InnerBuilder::new(2, false, TokenSetFormat::default()),
-            },
-        ])?;
+    fn tail_with_docs(id: u64, num_docs: u64) -> TailPartition {
+        let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
+        let token = builder.tokens.add(format!("token{}", id));
+        builder
+            .posting_lists
+            .resize_with(builder.tokens.len(), || PostingListBuilder::new(false));
+        for row in 0..num_docs {
+            let doc = builder.docs.append(row, 1);
+            builder.posting_lists[token as usize].add(doc, PositionRecorder::Count(1));
+        }
+        TailPartition { builder }
+    }
 
-        assert_eq!(merged.expect("merged builder should exist").id(), 0);
+    #[test]
+    fn test_merge_all_tail_partitions_combines_under_budget() -> Result<()> {
+        let merged = merge_all_tail_partitions(
+            vec![
+                tail_with_docs(0, 4),
+                tail_with_docs(1, 4),
+                tail_with_docs(2, 4),
+            ],
+            u64::MAX,
+        )?;
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id(), 0);
+        assert_eq!(merged[0].docs.len(), 12);
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_all_tail_partitions_splits_on_memory_budget() -> Result<()> {
+        let tails = vec![
+            tail_with_docs(0, 64),
+            tail_with_docs(1, 64),
+            tail_with_docs(2, 64),
+            tail_with_docs(3, 64),
+        ];
+        let single = tails[0].builder.memory_size();
+        // A budget below two builders' footprint must keep them separate.
+        let merged = merge_all_tail_partitions(tails, single + 1)?;
+        assert_eq!(merged.len(), 4);
+        assert!(merged.iter().all(|builder| builder.docs.len() == 64));
         Ok(())
     }
 
     #[test]
     fn test_merge_all_tail_partitions_returns_none_for_empty_input() -> Result<()> {
-        assert!(merge_all_tail_partitions(Vec::new())?.is_none());
+        assert!(merge_all_tail_partitions(Vec::new(), u64::MAX)?.is_empty());
+        Ok(())
+    }
+
+    /// Build an inverted index over `batches` with an explicit worker/memory
+    /// layout and return it loaded, so tests can compare query behavior
+    /// across partition shapes of the same corpus.
+    async fn build_fuzzy_corpus_index(
+        batches: Vec<RecordBatch>,
+        num_workers: usize,
+        memory_limit_mb: u64,
+    ) -> Result<(TempDir, Arc<InvertedIndex>)> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = batches[0].schema();
+        let stream =
+            RecordBatchStreamAdapter::new(schema, stream::iter(batches.into_iter().map(Ok)));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(false)
+                .stem(false)
+                .max_token_length(None)
+                .num_workers(num_workers)
+                .memory_limit_mb(memory_limit_mb);
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        // The caller keeps the TempDir alive for as long as it queries the
+        // loaded index.
+        Ok((index_dir, index))
+    }
+
+    /// Regression test for tail-partition splitting vs fuzzy queries
+    /// (https://github.com/lance-format/lance/pull/7601#pullrequestreview):
+    /// splitting the leftover tails into budget-sized partitions must not
+    /// change fuzzy results while `max_expansions` is not the binding
+    /// constraint. Every doc carries one member of two dense fuzzy families
+    /// plus unique filler tokens, so a small worker memory budget forces
+    /// flushes and a tail split, while a fuzzy query matches every doc.
+    #[tokio::test]
+    async fn test_tail_partition_split_preserves_fuzzy_results() -> Result<()> {
+        use std::collections::HashMap;
+
+        use crate::prefilter::NoFilter;
+        use crate::scalar::inverted::document_tokenizer::DocType;
+        use crate::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
+
+        const NUM_DOCS: usize = 4000;
+        const DOCS_PER_BATCH: usize = 20;
+        let alpha_variants = ["alpha", "alphb", "alphc", "alphd", "alphe"];
+        let beta_variants = ["beta", "betb", "betc", "betd", "bete"];
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batches = (0..NUM_DOCS / DOCS_PER_BATCH)
+            .map(|batch_idx| {
+                let mut docs = Vec::with_capacity(DOCS_PER_BATCH);
+                let mut row_ids = Vec::with_capacity(DOCS_PER_BATCH);
+                for row in 0..DOCS_PER_BATCH {
+                    let i = batch_idx * DOCS_PER_BATCH + row;
+                    // 8 unique filler tokens per doc grow the vocabulary so
+                    // the corpus comfortably exceeds the small worker budget.
+                    docs.push(format!(
+                        "{} {} f{i}a f{i}b f{i}c f{i}d f{i}e f{i}f f{i}g f{i}h",
+                        alpha_variants[i % alpha_variants.len()],
+                        beta_variants[i % beta_variants.len()],
+                    ));
+                    row_ids.push(i as u64);
+                }
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StringArray::from(docs)),
+                        Arc::new(UInt64Array::from(row_ids)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        // Reference shape: everything in one partition.
+        let (_ref_dir, ref_index) = build_fuzzy_corpus_index(batches.clone(), 1, 1024).await?;
+        assert_eq!(
+            ref_index.partitions.len(),
+            1,
+            "reference build should stay in a single partition"
+        );
+
+        // Tail-heavy shape: a 1MB budget across 2 workers forces flushes and
+        // splits the leftover tails by the same budget.
+        let (_split_dir, split_index) = build_fuzzy_corpus_index(batches, 2, 1).await?;
+        assert!(
+            split_index.partitions.len() > 1,
+            "small worker budget should produce multiple partitions, got {}",
+            split_index.partitions.len()
+        );
+
+        async fn fuzzy_search(
+            index: &InvertedIndex,
+            tokens: &[&str],
+            operator: Operator,
+        ) -> HashMap<u64, f32> {
+            let tokens = Arc::new(Tokens::new(
+                tokens.iter().map(|t| t.to_string()).collect(),
+                DocType::Text,
+            ));
+            // max_expansions=50 is far above the 10 family variants, so the
+            // per-partition vs global cap distinction cannot bind here.
+            let params = Arc::new(
+                FtsSearchParams::new()
+                    .with_limit(Some(NUM_DOCS))
+                    .with_fuzziness(Some(1))
+                    .with_max_expansions(50),
+            );
+            let (row_ids, scores) = index
+                .bm25_search(
+                    tokens,
+                    params,
+                    operator,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            row_ids.into_iter().zip(scores).collect()
+        }
+
+        for (tokens, operator) in [
+            (vec!["alphx"], Operator::Or),
+            (vec!["alphx", "betx"], Operator::Or),
+            (vec!["alphx", "betx"], Operator::And),
+        ] {
+            let reference = fuzzy_search(&ref_index, &tokens, operator).await;
+            let split = fuzzy_search(&split_index, &tokens, operator).await;
+            assert_eq!(
+                reference.len(),
+                NUM_DOCS,
+                "every doc carries a family variant, {tokens:?} {operator:?} should match all"
+            );
+            assert_eq!(
+                reference, split,
+                "fuzzy {operator:?} results must not depend on the tail partition shape for {tokens:?}"
+            );
+        }
+
         Ok(())
     }
 
@@ -4008,10 +4220,15 @@ mod tests {
         let second_doc = second.docs.append(20, 2);
         second.posting_lists[world as usize].add(second_doc, PositionRecorder::Count(2));
 
-        let merged = merge_tail_partition_group(vec![
-            TailPartition { builder: first },
-            TailPartition { builder: second },
-        ])?;
+        let merged = merge_all_tail_partitions(
+            vec![
+                TailPartition { builder: first },
+                TailPartition { builder: second },
+            ],
+            u64::MAX,
+        )?;
+        assert_eq!(merged.len(), 1);
+        let merged = &merged[0];
 
         assert_eq!(merged.id(), 0);
         assert_eq!(merged.docs.len(), 2);

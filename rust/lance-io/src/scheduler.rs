@@ -66,6 +66,10 @@ impl PrioritiesInFlight {
         self.in_flight.first().copied().unwrap_or(u128::MAX)
     }
 
+    fn contains(&self, prio: u128) -> bool {
+        self.in_flight.binary_search(&prio).is_ok()
+    }
+
     fn push(&mut self, prio: u128) {
         let pos = match self.in_flight.binary_search(&prio) {
             Ok(pos) => pos,
@@ -141,6 +145,10 @@ impl IoQueueState {
         } else if self.no_backpressure
             || task.bypass_backpressure
             || task.priority <= self.priorities_in_flight.min_in_flight()
+            // Chunks from an admitted logical request must keep moving.  A
+            // higher-priority request may be scheduled later and remain
+            // unconsumed while the caller awaits this request.
+            || self.priorities_in_flight.contains(task.priority)
         {
             true
         } else if task.num_bytes() as i64 > self.bytes_avail {
@@ -1596,6 +1604,99 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(first_fut.await.unwrap().len(), 10);
         assert_eq!(second_fut.await.unwrap().len(), 10);
+    }
+
+    #[derive(Debug)]
+    struct BlockingReader {
+        semaphore: Arc<tokio::sync::Semaphore>,
+        path: Path,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for BlockingReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for BlockingReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            4096
+        }
+
+        fn io_parallelism(&self) -> usize {
+            1
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(1_000_000) })
+        }
+
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            let semaphore = self.semaphore.clone();
+            let num_bytes = range.end - range.start;
+            Box::pin(async move {
+                semaphore.acquire().await.unwrap().forget();
+                Ok(Bytes::from(vec![0u8; num_bytes]))
+            })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::from(vec![0u8; 1_000_000])) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_same_priority_chunks_continue_after_higher_priority_request() {
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("mem://").unwrap(),
+            Some(4096),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        let scheduler = ScanScheduler::new(
+            obj_store,
+            SchedulerConfig {
+                io_buffer_size_bytes: 10,
+                use_lite_scheduler: Some(false),
+            },
+        );
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(BlockingReader {
+            semaphore: semaphore.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        let low_priority =
+            scheduler.submit_request(reader.clone(), vec![0..6, 100..106], 10, false);
+        let high_priority = scheduler.submit_request(reader, vec![200..204], 0, false);
+
+        semaphore.add_permits(3);
+        let low_priority = timeout(Duration::from_secs(5), low_priority)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            low_priority.iter().map(|bytes| bytes.len()).sum::<usize>(),
+            12
+        );
+
+        let high_priority = timeout(Duration::from_secs(5), high_priority)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(high_priority[0].len(), 4);
     }
 
     /// A Reader that tracks how many times get_range has been called.
