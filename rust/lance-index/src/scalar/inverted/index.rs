@@ -10,7 +10,7 @@ use std::{
     collections::BinaryHeap,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Range,
     time::Instant,
 };
@@ -630,22 +630,25 @@ impl InvertedIndex {
         query_tokens: &Tokens,
         params: &FtsSearchParams,
     ) -> Result<MemBM25Scorer> {
+        if matches!(params.fuzziness, Some(n) if n != 0) {
+            let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
+            self.bm25_scorer_for_final_tokens(&expanded).await
+        } else {
+            self.bm25_scorer_for_final_tokens(query_tokens).await
+        }
+    }
+
+    /// Scorer for a token list that needs no further fuzzy expansion: dedup
+    /// the terms and pull their document frequencies. `bm25_search` calls
+    /// this with the tokens it already expanded, so the expansion runs once
+    /// per query rather than once for the scorer and once per partition.
+    async fn bm25_scorer_for_final_tokens(&self, tokens: &Tokens) -> Result<MemBM25Scorer> {
         let (total_tokens, num_docs) = self.aggregate_corpus_stats().await?;
         let mut terms: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
-        if matches!(params.fuzziness, Some(n) if n != 0) {
-            let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
-            for idx in 0..expanded.len() {
-                let token = expanded.get_token(idx);
-                if seen.insert(token.to_string()) {
-                    terms.push(token.to_string());
-                }
-            }
-        } else {
-            for token in query_tokens {
-                if seen.insert(token.to_string()) {
-                    terms.push(token.to_string());
-                }
+        for token in tokens {
+            if seen.insert(token.to_string()) {
+                terms.push(token.to_string());
             }
         }
         let mut token_docs = HashMap::with_capacity(terms.len());
@@ -717,17 +720,46 @@ impl InvertedIndex {
     }
 
     /// Expand fuzzy query tokens against all partitions in this segment.
+    ///
+    /// `params.max_expansions` caps the whole query's expansion, not any
+    /// single partition's: for each query token the per-partition candidates
+    /// (each streamed in FST key order) merge into one lexicographically
+    /// ordered set, and the remaining budget takes a prefix of it. The
+    /// selected terms are a pure function of the segment's vocabulary, so
+    /// splitting the same corpus into more partitions cannot change which
+    /// terms a fuzzy query matches.
     pub fn expand_fuzzy_tokens(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut expanded_tokens = Vec::new();
         let mut expanded_positions = Vec::new();
         let mut seen = HashSet::new();
-        for partition in &self.partitions {
-            let expanded = partition.expand_fuzzy(tokens, params)?;
-            for idx in 0..expanded.len() {
-                let token = expanded.get_token(idx);
-                let position = expanded.position(idx);
-                if seen.insert((token.to_string(), position)) {
-                    expanded_tokens.push(token.to_string());
+        for token_idx in 0..tokens.len() {
+            let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
+            if remaining == 0 {
+                break;
+            }
+            let token = tokens.get_token(token_idx);
+            let position = tokens.position(token_idx);
+            // Each partition contributes at most its `remaining`
+            // lexicographically smallest candidates, so the global
+            // lex-smallest `remaining` selection below is unaffected by the
+            // per-partition truncation.
+            let mut candidates = BTreeSet::new();
+            let base_prefix_len = tokens.token_type().prefix_len(token) as u32;
+            for partition in &self.partitions {
+                partition.collect_fuzzy_candidates(
+                    token,
+                    base_prefix_len,
+                    params,
+                    remaining,
+                    &mut candidates,
+                )?;
+            }
+            for candidate in candidates {
+                if expanded_tokens.len() >= params.max_expansions {
+                    break;
+                }
+                if seen.insert((candidate.clone(), position)) {
+                    expanded_tokens.push(candidate);
                     expanded_positions.push(position);
                 }
             }
@@ -753,6 +785,28 @@ impl InvertedIndex {
         metrics: Arc<dyn MetricsCollector>,
         base_scorer: Option<&MemBM25Scorer>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
+        // Fuzzy expansion runs once here, with the global `max_expansions`
+        // budget, instead of once per partition: partitions receive the
+        // final token list, so the matched terms cannot depend on how the
+        // corpus happens to be partitioned.
+        let tokens = if matches!(params.fuzziness, Some(n) if n != 0) {
+            let expanded = Arc::new(self.expand_fuzzy_tokens(tokens.as_ref(), params.as_ref())?);
+            if operator == Operator::And || params.phrase_slop.is_some() {
+                // AND/phrase semantics require every original token position
+                // to keep at least one expansion; a position that expands to
+                // nothing anywhere in the segment can never be matched.
+                let surviving = (0..expanded.len())
+                    .map(|idx| expanded.position(idx))
+                    .collect::<HashSet<_>>();
+                if (0..tokens.len()).any(|idx| !surviving.contains(&tokens.position(idx))) {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+            }
+            expanded
+        } else {
+            tokens
+        };
+
         // The wand only consults `scorer.doc_weight`, which is metadata-free.
         // The outer aggregation below consults `scorer.query_weight`, which
         // hits per-token `posting_len`; building a `MemBM25Scorer` with
@@ -761,9 +815,7 @@ impl InvertedIndex {
         let scorer: &dyn Scorer = if let Some(base_scorer) = base_scorer {
             base_scorer
         } else {
-            local_scorer = self
-                .bm25_base_scorer(tokens.as_ref(), params.as_ref())
-                .await?;
+            local_scorer = self.bm25_scorer_for_final_tokens(tokens.as_ref()).await?;
             &local_scorer
         };
 
@@ -1484,47 +1536,29 @@ impl InvertedPartition {
         let mut new_positions = Vec::with_capacity(new_tokens.capacity());
         let mut seen = HashSet::new();
         for token_idx in 0..tokens.len() {
-            if new_tokens.len() >= params.max_expansions {
+            let remaining = params.max_expansions.saturating_sub(new_tokens.len());
+            if remaining == 0 {
                 break;
             }
             let token = tokens.get_token(token_idx);
             let position = tokens.position(token_idx);
-            let fuzziness = match params.fuzziness {
-                Some(fuzziness) => fuzziness,
-                None => MatchQuery::auto_fuzziness(token),
-            };
-            let lev = fst::automaton::Levenshtein::new(token, fuzziness)
-                .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
-
-            let base_len = tokens.token_type().prefix_len(token) as u32;
-            if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                let mut expanded = Vec::new();
-                let remaining = params.max_expansions - new_tokens.len();
-                match base_len + params.prefix_length {
-                    0 => take_fst_keys(map.search(lev), &mut expanded, remaining),
-                    prefix_length => {
-                        let prefix = &token[..min(prefix_length as usize, token.len())];
-                        let prefix = fst::automaton::Str::new(prefix).starts_with();
-                        take_fst_keys(
-                            map.search(lev.intersection(prefix)),
-                            &mut expanded,
-                            remaining,
-                        )
-                    }
+            let base_prefix_len = tokens.token_type().prefix_len(token) as u32;
+            let mut candidates = BTreeSet::new();
+            self.collect_fuzzy_candidates(
+                token,
+                base_prefix_len,
+                params,
+                remaining,
+                &mut candidates,
+            )?;
+            for candidate in candidates {
+                if new_tokens.len() >= params.max_expansions {
+                    break;
                 }
-                for token in expanded {
-                    if seen.insert((token.clone(), position)) {
-                        new_tokens.push(token);
-                        new_positions.push(position);
-                        if new_tokens.len() >= params.max_expansions {
-                            break;
-                        }
-                    }
+                if seen.insert((candidate.clone(), position)) {
+                    new_tokens.push(candidate);
+                    new_positions.push(position);
                 }
-            } else {
-                return Err(Error::index(
-                    "tokens is not fst, which is not expected".to_owned(),
-                ));
             }
         }
         Ok(Tokens::with_positions(
@@ -1532,6 +1566,47 @@ impl InvertedPartition {
             new_positions,
             tokens.token_type().clone(),
         ))
+    }
+
+    /// Collect up to `limit` fuzzy candidates for one query token from this
+    /// partition's token FST, in key (lexicographic) order. Callers merge
+    /// candidates across partitions and apply the query-wide
+    /// `max_expansions` budget; truncating each partition at `limit` is
+    /// lossless for that selection because any term among the merged
+    /// lexicographically-smallest `limit` is also among its own partition's
+    /// smallest `limit`.
+    fn collect_fuzzy_candidates(
+        &self,
+        token: &str,
+        base_prefix_len: u32,
+        params: &FtsSearchParams,
+        limit: usize,
+        candidates: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let fuzziness = match params.fuzziness {
+            Some(fuzziness) => fuzziness,
+            None => MatchQuery::auto_fuzziness(token),
+        };
+        let lev = fst::automaton::Levenshtein::new(token, fuzziness)
+            .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
+
+        if let TokenMap::Fst(ref map) = self.tokens.tokens {
+            let mut expanded = Vec::new();
+            match base_prefix_len + params.prefix_length {
+                0 => take_fst_keys(map.search(lev), &mut expanded, limit),
+                prefix_length => {
+                    let prefix = &token[..min(prefix_length as usize, token.len())];
+                    let prefix = fst::automaton::Str::new(prefix).starts_with();
+                    take_fst_keys(map.search(lev.intersection(prefix)), &mut expanded, limit)
+                }
+            }
+            candidates.extend(expanded);
+            Ok(())
+        } else {
+            Err(Error::index(
+                "tokens is not fst, which is not expected".to_owned(),
+            ))
+        }
     }
 
     fn union_plain_posting_lists(postings: Vec<PostingList>) -> Result<PostingList> {
@@ -1642,10 +1717,11 @@ impl InvertedPartition {
                 .map(|index| tokens.position(index))
                 .collect::<HashSet<_>>()
         });
-        let tokens = match is_fuzzy {
-            true => self.expand_fuzzy(tokens, params)?,
-            false => tokens.clone(),
-        };
+        // Fuzzy expansion already ran once at the index level (see
+        // `InvertedIndex::bm25_search`) under the global `max_expansions`
+        // budget; the incoming tokens are final and `is_fuzzy` only drives
+        // the grouped dedup/scoring semantics below.
+        let tokens = tokens.clone();
         let token_positions = (0..tokens.len())
             .map(|index| tokens.position(index))
             .collect::<Vec<_>>();
@@ -8034,6 +8110,132 @@ mod tests {
                 ("beta".to_owned(), 1),
             ],
             "max_expansions should cap the whole fuzzy query, not each token"
+        );
+    }
+
+    /// Write one partition holding `variants` in order, with one
+    /// single-token doc per variant taken from `row_ids`.
+    async fn write_variant_partition(
+        store: &Arc<LanceIndexStore>,
+        partition_id: u64,
+        variants: &[&str],
+        row_ids: &[u64],
+    ) {
+        let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+        for token in variants {
+            builder.tokens.add((*token).to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+        }
+        for (local_idx, row_id) in row_ids.iter().enumerate() {
+            builder.posting_lists[local_idx].add(local_idx as u32, PositionRecorder::Count(1));
+            builder.docs.append(*row_id, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_expansion_cap_is_global_across_partitions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_variant_partition(&store, 0, &["alpha", "alphb"], &[100, 101]).await;
+        write_variant_partition(&store, 1, &["alphc", "alphd"], &[102, 103]).await;
+        write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let params = FtsSearchParams::new()
+            .with_fuzziness(Some(1))
+            .with_max_expansions(3);
+        let tokens = Tokens::new(vec!["alphx".to_owned()], DocType::Text);
+
+        let expanded = index.expand_fuzzy_tokens(&tokens, &params).unwrap();
+        let expanded_terms = (0..expanded.len())
+            .map(|idx| expanded.get_token(idx).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expanded_terms,
+            vec!["alpha".to_owned(), "alphb".to_owned(), "alphc".to_owned()],
+            "max_expansions must cap the whole query across partitions, \
+             in lexicographic order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_results_independent_of_partition_shape() {
+        // The same four single-variant docs, laid out as one partition and
+        // as two. With a binding max_expansions the two shapes must still
+        // match the same documents with the same scores.
+        let single_dir = TempObjDir::default();
+        let single_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            single_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        write_variant_partition(
+            &single_store,
+            0,
+            &["alpha", "alphb", "alphc", "alphd"],
+            &[100, 101, 102, 103],
+        )
+        .await;
+        write_test_metadata(&single_store, vec![0], InvertedIndexParams::default()).await;
+
+        let split_dir = TempObjDir::default();
+        let split_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            split_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        write_variant_partition(&split_store, 0, &["alpha", "alphb"], &[100, 101]).await;
+        write_variant_partition(&split_store, 1, &["alphc", "alphd"], &[102, 103]).await;
+        write_test_metadata(&split_store, vec![0, 1], InvertedIndexParams::default()).await;
+
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_fuzziness(Some(1))
+                .with_max_expansions(3),
+        );
+
+        let mut results = Vec::new();
+        for store in [single_store, split_store] {
+            let cache = LanceCache::with_capacity(4096);
+            let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+            let tokens = Arc::new(Tokens::new(vec!["alphx".to_owned()], DocType::Text));
+            let (row_ids, scores) = index
+                .bm25_search(
+                    tokens,
+                    params.clone(),
+                    Operator::Or,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut scored = row_ids.into_iter().zip(scores).collect::<Vec<_>>();
+            scored.sort_unstable_by_key(|(row_id, _)| *row_id);
+            results.push(scored);
+        }
+
+        assert_eq!(
+            results[0]
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>(),
+            vec![100, 101, 102],
+            "a binding cap keeps the three lexicographically smallest variants"
+        );
+        assert_eq!(
+            results[0], results[1],
+            "fuzzy results must not depend on the partition shape"
         );
     }
 
