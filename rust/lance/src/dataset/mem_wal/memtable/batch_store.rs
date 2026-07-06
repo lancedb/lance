@@ -78,14 +78,10 @@ impl StoredBatch {
 
     /// Estimate the memory size of a RecordBatch.
     ///
-    /// Uses Arrow's slice-aware [`ArrayData::get_slice_memory_size`] so a batch
-    /// that is a zero-copy slice of a larger parent reports only its own window
-    /// instead of the whole shared buffer. `get_array_memory_size` counts every
-    /// buffer's full `capacity()` regardless of the array's offset/length, so N
-    /// slices tiling one parent would each report the parent's size and inflate
-    /// the memtable estimate by ~N× — tripping the flush threshold far below the
-    /// configured size. The fallback keeps the old (over-counting but safe)
-    /// behavior for the rare types where the slice-aware call errors.
+    /// Sums each column's slice-aware buffer size (see
+    /// [`Self::estimate_array_size`]) plus the struct overhead, so a column that
+    /// is a zero-copy slice of a larger parent contributes only its own window
+    /// rather than the whole shared buffer.
     fn estimate_batch_size(batch: &RecordBatch) -> usize {
         batch
             .columns()
@@ -95,28 +91,30 @@ impl StoredBatch {
             + std::mem::size_of::<RecordBatch>()
     }
 
-    /// Slice-aware memory estimate for a single array.
+    /// Slice-aware buffer size of a single array.
     ///
-    /// [`ArrayData::get_slice_memory_size`] ignores the variadic data buffers of
-    /// `Utf8View`/`BinaryView` (values > 12 bytes) yet still returns `Ok`, so
-    /// long view batches would be undercounted as ~`16 * rows`. Add those buffers
-    /// back; they are shared across slices, so counting full capacity over-counts
-    /// for slices — the safe direction, matching the rest of this estimate.
+    /// [`ArrayData::get_slice_memory_size`] reports each buffer's own window
+    /// (not the whole shared buffer), but omits the variadic data buffers of
+    /// `Utf8View`/`BinaryView` (values > 12 bytes) while still returning `Ok`, so
+    /// [`Self::view_data_buffers_size`] adds them. Those buffers are shared across
+    /// zero-copy slices and are counted at full capacity for each slice — an
+    /// over-count in the safe direction.
     fn estimate_array_size(data: &ArrayData) -> usize {
         match data.get_slice_memory_size() {
             Ok(size) => size + Self::view_data_buffers_size(data),
-            // Errors only for rare unsupported layouts; use the over-counting sum.
+            // Fall back to the full-buffer sum for layouts the slice-aware call
+            // cannot handle.
             Err(_) => data.get_array_memory_size(),
         }
     }
 
-    /// Capacity of the variadic data buffers `get_slice_memory_size` omits for
-    /// `Utf8View`/`BinaryView`, summed recursively over children.
+    /// Capacity of the variadic `Utf8View`/`BinaryView` data buffers that
+    /// [`ArrayData::get_slice_memory_size`] omits, summed recursively over children.
     fn view_data_buffers_size(data: &ArrayData) -> usize {
         let mut size = 0;
         if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
-            // buffers()[0] is the 16-byte view array (already counted); [1..] are
-            // the data buffers get_slice_memory_size skips.
+            // buffers()[0] is the 16-byte view array that get_slice_memory_size
+            // already counts; [1..] are the data buffers it skips.
             size += data
                 .buffers()
                 .iter()
