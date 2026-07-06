@@ -1906,6 +1906,32 @@ mod tests {
     }
 
     #[test]
+    fn test_rle_v2_miniblock_keeps_u8_run_lengths_before_v2_3() {
+        for version in [LanceFileVersion::V2_1, LanceFileVersion::V2_2] {
+            let mut metadata = HashMap::new();
+            metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "1.0".to_string());
+            metadata.insert(BSS_META_KEY.to_string(), "off".to_string());
+            let mut field = create_test_field("test_column", DataType::Int32);
+            field.metadata = metadata;
+
+            let values = vec![7i32; 1000];
+            let mut data = FixedWidthDataBlock {
+                bits_per_value: 32,
+                data: LanceBuffer::reinterpret_vec(values),
+                num_values: 1000,
+                block_info: BlockInfo::default(),
+            };
+            data.compute_stat();
+            let data = DataBlock::FixedWidth(data);
+
+            let strategy = DefaultCompressionStrategy::new().with_version(version);
+            let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+            let (_compressed, encoding) = compressor.compress(data).unwrap();
+            assert_eq!(rle_run_length_bits(&encoding), 8, "version={version}");
+        }
+    }
+
+    #[test]
     fn test_rle_v2_uses_selected_width_cost_before_bitpacking() {
         let mut metadata = HashMap::new();
         metadata.insert(RLE_THRESHOLD_META_KEY.to_string(), "1.0".to_string());
@@ -2227,6 +2253,25 @@ mod tests {
             }
             _ => panic!("expected fixed-width block"),
         }
+    }
+
+    #[test]
+    fn test_rle_v2_block_keeps_u8_run_lengths_for_v2_2() {
+        let field = create_test_field("dict_indices", DataType::Int32);
+        let values = vec![42i32; 70_000];
+        let mut block = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 70_000,
+            block_info: BlockInfo::default(),
+        };
+        block.compute_stat();
+        let data = DataBlock::FixedWidth(block);
+
+        let strategy = DefaultCompressionStrategy::with_params(CompressionParams::new())
+            .with_version(LanceFileVersion::V2_2);
+        let (_compressor, encoding) = strategy.create_block_compressor(&field, &data).unwrap();
+        assert_eq!(rle_run_length_bits(&encoding), 8);
     }
 
     #[test]
