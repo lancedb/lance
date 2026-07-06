@@ -28,7 +28,7 @@ const DEFAULT_GOOSEFS_PORT: u16 = 9200;
 ///
 /// Path handling model (S3-style):
 /// - The OpenDAL `root` is fixed to `/` (or a user-supplied cluster-wide base)
-///   so that a single [`Operator`] can serve every dataset under the same
+///   so that a single `Operator` can serve every dataset under the same
 ///   master. This keeps the `ObjectStoreRegistry` cache correct: two URLs
 ///   like `goosefs://host:9200/a.lance` and `goosefs://host:9200/b.lance`
 ///   share one store and each request carries its own object key.
@@ -51,8 +51,8 @@ const DEFAULT_GOOSEFS_PORT: u16 = 9200;
 /// | `goosefs_auth_username`   | `GOOSEFS_AUTH_USERNAME` | Username for `simple` auth mode.                                                              |
 ///
 /// Note on `goosefs_root`: it is deliberately cluster-wide (not per-URL) so
-/// that many datasets under the same master share a single cached [`Operator`].
-/// A custom root also participates in the [`ObjectStoreRegistry`] cache prefix,
+/// that many datasets under the same master share a single cached `Operator`.
+/// A custom root also participates in the `ObjectStoreRegistry` cache prefix,
 /// so stores rooted at different subtrees do not collide.
 #[derive(Default, Debug)]
 pub struct GooseFsStoreProvider;
