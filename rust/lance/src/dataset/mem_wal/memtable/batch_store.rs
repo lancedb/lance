@@ -1072,37 +1072,64 @@ mod tests {
     fn test_estimated_size_counts_view_data_buffers() {
         // Long Utf8View/BinaryView values live in variadic data buffers that
         // `get_slice_memory_size` ignores (returning ~16 * rows). The estimate
-        // must include them.
-        use arrow_array::StringViewArray;
+        // must include them, both for a top-level view column and for a view
+        // array nested in a container, which is only reached via child_data
+        // recursion.
+        use arrow_array::{Array, ArrayRef, StringViewArray, StructArray};
 
         let num_rows = 1_000;
         // Each value exceeds the 12-byte inline limit, so it spills to a data buffer.
         let long_value = "x".repeat(64);
         let payload_bytes = num_rows * long_value.len();
-
-        let array = StringViewArray::from(
-            (0..num_rows)
-                .map(|_| Some(long_value.as_str()))
-                .collect::<Vec<_>>(),
-        );
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "s",
-            DataType::Utf8View,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
-
-        let estimated = StoredBatch::estimate_batch_size(&batch);
         // What the slice-aware call alone reports: just the 16-byte view entries.
         let view_entries_only = num_rows * 16;
-        assert!(
-            estimated >= payload_bytes,
-            "estimate {estimated} should cover the view data-buffer payload {payload_bytes}"
-        );
-        assert!(
-            estimated > view_entries_only * 2,
-            "estimate {estimated} must exceed the ~{view_entries_only}-byte view-entry-only undercount"
-        );
+
+        let make_views = || {
+            StringViewArray::from(
+                (0..num_rows)
+                    .map(|_| Some(long_value.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let assert_covers = |batch: &RecordBatch| {
+            let estimated = StoredBatch::estimate_batch_size(batch);
+            assert!(
+                estimated >= payload_bytes,
+                "estimate {estimated} should cover the view data-buffer payload {payload_bytes}"
+            );
+            assert!(
+                estimated > view_entries_only * 2,
+                "estimate {estimated} must exceed the ~{view_entries_only}-byte view-entry-only undercount"
+            );
+        };
+
+        // Top-level view column.
+        let flat = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "s",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(make_views())],
+        )
+        .unwrap();
+        assert_covers(&flat);
+
+        // View nested inside a struct — reachable only through child_data recursion.
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("s", DataType::Utf8View, false)),
+            Arc::new(make_views()) as ArrayRef,
+        )]);
+        let nested = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "st",
+                nested.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(nested)],
+        )
+        .unwrap();
+        assert_covers(&nested);
     }
 
     #[test]
