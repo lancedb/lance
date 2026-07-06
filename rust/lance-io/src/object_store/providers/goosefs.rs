@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store::path::Path;
 use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::GooseFs};
 use url::Url;
@@ -33,11 +32,28 @@ const DEFAULT_GOOSEFS_PORT: u16 = 9200;
 ///   master. This keeps the `ObjectStoreRegistry` cache correct: two URLs
 ///   like `goosefs://host:9200/a.lance` and `goosefs://host:9200/b.lance`
 ///   share one store and each request carries its own object key.
-/// - [`Self::extract_path`] returns the URL path (percent-decoded) as the key
+/// - Path extraction relies on the default [`ObjectStoreProvider::extract_path`]
+///   implementation, which returns the URL path (percent-decoded) as the key
 ///   passed to `ObjectStore::get`, `put`, etc. — mirroring how `s3://bucket/k`
 ///   yields key `k`.
 ///
-/// Configuration priority: storage_options > environment variables > URL authority > defaults
+/// Supported configuration keys (via `storage_options` or environment variables,
+/// resolved with priority: `storage_options` > env var > URL authority > default):
+///
+/// | storage_options key       | env var                 | purpose                                                                                       |
+/// |---------------------------|-------------------------|-----------------------------------------------------------------------------------------------|
+/// | `goosefs_master_addr`     | `GOOSEFS_MASTER_ADDR`   | Master gRPC address, e.g. `host:9200`. Supports HA: `addr1:port,addr2:port`.                  |
+/// | `goosefs_root`            | `GOOSEFS_ROOT`          | Cluster-wide OpenDAL root shared by all datasets under the same master. Defaults to `/`.      |
+/// | `goosefs_write_type`      | `GOOSEFS_WRITE_TYPE`    | GooseFS write type (e.g. `MUST_CACHE`, `CACHE_THROUGH`, `THROUGH`, `ASYNC_THROUGH`).          |
+/// | `goosefs_block_size`      | `GOOSEFS_BLOCK_SIZE`    | GooseFS block size (bytes). Distinct from Lance's own `block_size`.                           |
+/// | `goosefs_chunk_size`      | `GOOSEFS_CHUNK_SIZE`    | GooseFS chunk size (bytes) used by the client.                                                |
+/// | `goosefs_auth_type`       | `GOOSEFS_AUTH_TYPE`     | Authentication mode: `nosasl` or `simple`.                                                    |
+/// | `goosefs_auth_username`   | `GOOSEFS_AUTH_USERNAME` | Username for `simple` auth mode.                                                              |
+///
+/// Note on `goosefs_root`: it is deliberately cluster-wide (not per-URL) so
+/// that many datasets under the same master share a single cached [`Operator`].
+/// A custom root also participates in the [`ObjectStoreRegistry`] cache prefix,
+/// so stores rooted at different subtrees do not collide.
 #[derive(Default, Debug)]
 pub struct GooseFsStoreProvider;
 
@@ -90,15 +106,8 @@ impl GooseFsStoreProvider {
             .filter(|v| !v.is_empty())
     }
 
-    /// Resolve the OpenDAL `root` for this Operator.
-    ///
-    /// The root is intentionally cluster-wide (not per-URL) so that many
-    /// datasets under the same master can share a single cached Operator.
-    ///
-    /// Priority:
-    /// 1. `storage_options["goosefs_root"]`
-    /// 2. `GOOSEFS_ROOT` environment variable
-    /// 3. `"/"` (default: expose the whole filesystem)
+    /// Resolve the OpenDAL `root` for this Operator. See the file-level docs on
+    /// [`GooseFsStoreProvider`] for the semantics of `goosefs_root`.
     fn resolve_root(storage_options: &StorageOptions) -> String {
         Self::resolve_option(storage_options, "goosefs_root", "GOOSEFS_ROOT")
             .unwrap_or_else(|| "/".to_string())
@@ -186,23 +195,11 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         })
     }
 
-    /// Extract the object key relative to the OpenDAL root.
-    ///
-    /// GooseFS now behaves like S3: the URL path is the per-request key that
-    /// gets appended to a cluster-wide root by OpenDAL's
-    /// `build_rooted_abs_path`. The returned [`Path`] is the percent-decoded
-    /// URL path with the leading `/` stripped.
-    ///
-    /// `goosefs://host:port/data/file.lance` → key `data/file.lance`
-    /// `goosefs://host:port/`                → key `""`
-    fn extract_path(&self, url: &Url) -> Result<Path> {
-        // `Path::from_url_path` percent-decodes the input and normalizes
-        // separators, matching how `S3StoreProvider` (default trait impl)
-        // treats bucket-relative keys.
-        Path::from_url_path(url.path()).map_err(|e| {
-            Error::invalid_input(format!("Invalid path in URL '{}': {}", url.path(), e))
-        })
-    }
+    // `extract_path` uses the default `ObjectStoreProvider` trait implementation:
+    // it percent-decodes the URL path and returns it as the object key, exactly
+    // like S3 does for `s3://bucket/key`. Overriding it here would only
+    // duplicate that behavior. See the file-level doc comment above for the
+    // full path-handling model.
 
     /// Calculate the object store prefix used as the registry cache key.
     ///
