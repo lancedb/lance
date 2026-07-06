@@ -132,26 +132,146 @@ impl RunLengthWidth {
     }
 }
 
-/// Select the lowest-cost run length width for a fixed-width data block.
+const RUN_LENGTH_WIDTHS: [RunLengthWidth; 3] =
+    [RunLengthWidth::U8, RunLengthWidth::U16, RunLengthWidth::U32];
+
+/// Select the lowest-cost run length width from precomputed entry counts.
+pub(crate) fn select_run_length_width_from_entries(
+    entries: &[u64],
+    bits_per_value: u64,
+) -> Result<(RunLengthWidth, u128)> {
+    if entries.len() != RUN_LENGTH_WIDTHS.len() {
+        return Err(Error::invalid_input_source(
+            format!(
+                "RLE run length entry statistics must have {} values, got {}",
+                RUN_LENGTH_WIDTHS.len(),
+                entries.len()
+            )
+            .into(),
+        ));
+    }
+
+    if !matches!(bits_per_value, 8 | 16 | 32 | 64) {
+        return Err(Error::invalid_input_source(
+            format!("RLE encoding bits_per_value must be 8, 16, 32, or 64, got {bits_per_value}")
+                .into(),
+        ));
+    }
+
+    let mut best_width = RUN_LENGTH_WIDTHS[0];
+    let mut best_cost = rle_encoded_size_from_entries(entries[0], bits_per_value, best_width);
+    for (&width, &entry_count) in RUN_LENGTH_WIDTHS.iter().zip(entries.iter()).skip(1) {
+        let cost = rle_encoded_size_from_entries(entry_count, bits_per_value, width);
+        if cost < best_cost {
+            best_width = width;
+            best_cost = cost;
+        }
+    }
+
+    Ok((best_width, best_cost))
+}
+
+pub(crate) fn rle_encoded_size_from_entries(
+    entry_count: u64,
+    bits_per_value: u64,
+    run_length_width: RunLengthWidth,
+) -> u128 {
+    let bytes_per_value = (bits_per_value / 8) as u128;
+    let bytes_per_length = run_length_width.bytes_per_value() as u128;
+    (entry_count as u128) * (bytes_per_value + bytes_per_length)
+}
+
+pub(crate) fn run_length_width_index(run_length_width: RunLengthWidth) -> usize {
+    match run_length_width {
+        RunLengthWidth::U8 => 0,
+        RunLengthWidth::U16 => 1,
+        RunLengthWidth::U32 => 2,
+    }
+}
+
 pub(crate) fn select_run_length_width(
     data: &LanceBuffer,
     num_values: u64,
     bits_per_value: u64,
-) -> Result<RunLengthWidth> {
-    select_run_length_width_and_size(data, num_values, bits_per_value).map(|(width, _)| width)
+    max_segment_values: Option<u64>,
+) -> Result<(RunLengthWidth, u128)> {
+    let entries = collect_run_length_entries(data, num_values, bits_per_value, max_segment_values)?;
+    select_run_length_width_from_entries(&entries, bits_per_value)
 }
 
-/// Select the lowest-cost run length width and return the encoded size estimate.
-pub(crate) fn select_run_length_width_and_size(
+pub(crate) fn rle_encoded_size(
     data: &LanceBuffer,
     num_values: u64,
     bits_per_value: u64,
-) -> Result<(RunLengthWidth, u128)> {
+    max_segment_values: Option<u64>,
+    run_length_width: RunLengthWidth,
+) -> Result<u128> {
+    let entries = collect_run_length_entries(data, num_values, bits_per_value, max_segment_values)?;
+    let width_idx = run_length_width_index(run_length_width);
+    Ok(rle_encoded_size_from_entries(
+        entries[width_idx],
+        bits_per_value,
+        run_length_width,
+    ))
+}
+
+fn collect_run_length_entries(
+    data: &LanceBuffer,
+    num_values: u64,
+    bits_per_value: u64,
+    max_segment_values: Option<u64>,
+) -> Result<[u64; 3]> {
+    let num_values = usize::try_from(num_values).map_err(|_| {
+        Error::invalid_input_source(
+            format!("RLE num_values does not fit in usize: {num_values}").into(),
+        )
+    })?;
+
+    macro_rules! collect_entries {
+        ($ty:ty) => {{
+            let type_size = std::mem::size_of::<$ty>();
+            let expected_bytes = num_values.checked_mul(type_size).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "RLE input byte length overflow: {num_values} values of {type_size} bytes"
+                    )
+                    .into(),
+                )
+            })?;
+            if data.len() != expected_bytes {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE input data size mismatch: {} bytes for {} values of {} bytes",
+                        data.len(),
+                        num_values,
+                        type_size
+                    )
+                    .into(),
+                ));
+            }
+            let values = data.borrow_to_typed_slice::<$ty>();
+            let values = values.get(..num_values).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "RLE data has {} values but {} were expected",
+                        values.len(),
+                        num_values
+                    )
+                    .into(),
+                )
+            })?;
+            Ok(collect_run_length_entries_from_slice(
+                values,
+                max_segment_values,
+            ))
+        }};
+    }
+
     match bits_per_value {
-        8 => select_run_length_width_generic::<u8>(data, num_values),
-        16 => select_run_length_width_generic::<u16>(data, num_values),
-        32 => select_run_length_width_generic::<u32>(data, num_values),
-        64 => select_run_length_width_generic::<u64>(data, num_values),
+        8 => collect_entries!(u8),
+        16 => collect_entries!(u16),
+        32 => collect_entries!(u32),
+        64 => collect_entries!(u64),
         _ => Err(Error::invalid_input_source(
             format!("RLE encoding bits_per_value must be 8, 16, 32, or 64, got {bits_per_value}")
                 .into(),
@@ -159,80 +279,44 @@ pub(crate) fn select_run_length_width_and_size(
     }
 }
 
-fn select_run_length_width_generic<T>(
-    data: &LanceBuffer,
-    num_values: u64,
-) -> Result<(RunLengthWidth, u128)>
-where
-    T: bytemuck::Pod + PartialEq + Copy + ArrowNativeType,
-{
-    let num_values = usize::try_from(num_values).map_err(|_| {
-        Error::invalid_input_source(
-            format!("RLE num_values does not fit in usize: {num_values}").into(),
-        )
-    })?;
-    if num_values == 0 {
-        return Ok((RunLengthWidth::U8, 0));
+fn collect_run_length_entries_from_slice<T: PartialEq + Copy>(
+    values: &[T],
+    max_segment_values: Option<u64>,
+) -> [u64; 3] {
+    if values.is_empty() {
+        return [0; 3];
     }
 
-    let type_size = std::mem::size_of::<T>();
-    let expected_bytes = num_values.checked_mul(type_size).ok_or_else(|| {
-        Error::invalid_input_source(
-            format!("RLE input byte length overflow: {num_values} values of {type_size} bytes")
-                .into(),
-        )
-    })?;
-    if data.len() != expected_bytes {
-        return Err(Error::invalid_input_source(
-            format!(
-                "RLE input data size mismatch: {} bytes for {} values of {} bytes",
-                data.len(),
-                num_values,
-                type_size
-            )
-            .into(),
-        ));
-    }
+    let mut entries = [0u64; 3];
+    let mut prev = values[0];
+    let mut current_length = 1u64;
 
-    let values_ref = data.borrow_to_typed_slice::<T>();
-    let values: &[T] = values_ref.as_ref();
-    let mut costs = [0_u128; 3];
-
-    let mut current_value = values[0];
-    let mut current_length = 1_u64;
-    for &value in values.iter().skip(1) {
-        if value == current_value {
-            current_length += 1;
-        } else {
-            accumulate_width_costs(current_length, type_size, &mut costs);
-            current_value = value;
+    for &value in &values[1..] {
+        if value != prev {
+            accumulate_run_length_entries(current_length, max_segment_values, &mut entries);
+            prev = value;
             current_length = 1;
+        } else {
+            current_length += 1;
         }
     }
-    accumulate_width_costs(current_length, type_size, &mut costs);
+    accumulate_run_length_entries(current_length, max_segment_values, &mut entries);
 
-    let widths = [RunLengthWidth::U8, RunLengthWidth::U16, RunLengthWidth::U32];
-    let mut best_idx = 0usize;
-    let mut best_cost = costs[0];
-    for (idx, &cost) in costs.iter().enumerate().skip(1) {
-        if cost < best_cost {
-            best_idx = idx;
-            best_cost = cost;
-        }
-    }
-    Ok((widths[best_idx], best_cost))
+    entries
 }
 
-fn accumulate_width_costs(run_length: u64, type_size: usize, costs: &mut [u128; 3]) {
-    let widths = [RunLengthWidth::U8, RunLengthWidth::U16, RunLengthWidth::U32];
-    // The current encoder uses miniblock-sized chunks for both miniblock and block paths.
-    let max_segment_values = *MAX_MINIBLOCK_VALUES;
+pub(crate) fn accumulate_run_length_entries(
+    run_length: u64,
+    max_segment_values: Option<u64>,
+    entries: &mut [u64; 3],
+) {
+    let max_segment_values = max_segment_values.unwrap_or(run_length).max(1);
     let mut remaining = run_length;
     while remaining > 0 {
         let segment = remaining.min(max_segment_values);
-        for (idx, width) in widths.iter().enumerate() {
-            let entries = segment.div_ceil(width.max_run_length());
-            costs[idx] += (entries as u128) * ((type_size + width.bytes_per_value()) as u128);
+        for (idx, width) in RUN_LENGTH_WIDTHS.iter().enumerate() {
+            let entry_count = segment.div_ceil(width.max_run_length());
+            entries[idx] = entries[idx].saturating_add(entry_count);
         }
         remaining -= segment;
     }
@@ -368,6 +452,74 @@ impl RleEncoder {
             ],
             chunks,
         ))
+    }
+
+    fn encode_block_data(
+        &self,
+        data: &LanceBuffer,
+        num_values: u64,
+        bits_per_value: u64,
+    ) -> Result<Vec<LanceBuffer>> {
+        match bits_per_value {
+            8 => self.encode_block_data_generic::<u8>(data, num_values),
+            16 => self.encode_block_data_generic::<u16>(data, num_values),
+            32 => self.encode_block_data_generic::<u32>(data, num_values),
+            64 => self.encode_block_data_generic::<u64>(data, num_values),
+            _ => Err(Error::invalid_input_source(
+                format!(
+                    "RLE encoding bits_per_value must be 8, 16, 32, or 64, got {bits_per_value}"
+                )
+                .into(),
+            )),
+        }
+    }
+
+    fn encode_block_data_generic<T>(
+        &self,
+        data: &LanceBuffer,
+        num_values: u64,
+    ) -> Result<Vec<LanceBuffer>>
+    where
+        T: bytemuck::Pod + PartialEq + Copy + ArrowNativeType,
+    {
+        let num_values = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input_source(
+                format!("RLE num_values does not fit in usize: {num_values}").into(),
+            )
+        })?;
+        let type_size = std::mem::size_of::<T>();
+        let expected_bytes = num_values.checked_mul(type_size).ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("RLE input byte length overflow: {num_values} values of {type_size} bytes")
+                    .into(),
+            )
+        })?;
+        if data.len() != expected_bytes {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "RLE input data size mismatch: {} bytes for {} values of {} bytes",
+                    data.len(),
+                    num_values,
+                    type_size
+                )
+                .into(),
+            ));
+        }
+        if num_values == 0 {
+            return Ok(vec![LanceBuffer::empty(), LanceBuffer::empty()]);
+        }
+
+        let values_ref = data.borrow_to_typed_slice::<T>();
+        let values = values_ref.as_ref();
+        let estimated_runs = num_values / 10;
+        let mut all_values = Vec::with_capacity(estimated_runs * type_size);
+        let mut all_lengths =
+            Vec::with_capacity(estimated_runs * self.run_length_width.bytes_per_value());
+        self.encode_values(values, &mut all_values, &mut all_lengths);
+        Ok(vec![
+            LanceBuffer::from(all_values),
+            LanceBuffer::from(all_lengths),
+        ])
     }
 
     /// Encodes the largest valid mini-block prefix from `offset`.
@@ -566,8 +718,8 @@ impl BlockCompressor for RleEncoder {
                 let num_values = fixed_width.num_values;
                 let bits_per_value = fixed_width.bits_per_value;
 
-                let (all_buffers, _) =
-                    self.encode_data(&fixed_width.data, num_values, bits_per_value)?;
+                let all_buffers =
+                    self.encode_block_data(&fixed_width.data, num_values, bits_per_value)?;
 
                 let values_size = all_buffers[0].len() as u64;
 
@@ -896,13 +1048,9 @@ mod tests {
 
     #[test]
     fn test_select_run_length_width_prefers_u16_for_long_runs() {
-        let data = vec![7i32; 300];
-        let bytes = data
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let width =
-            select_run_length_width(&LanceBuffer::from(bytes), data.len() as u64, 32).unwrap();
+        let mut entries = [0u64; 3];
+        accumulate_run_length_entries(300, Some(*MAX_MINIBLOCK_VALUES), &mut entries);
+        let (width, _) = select_run_length_width_from_entries(&entries, 32).unwrap();
         assert_eq!(width, RunLengthWidth::U16);
     }
 
