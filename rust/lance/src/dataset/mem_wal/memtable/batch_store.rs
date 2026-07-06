@@ -95,33 +95,28 @@ impl StoredBatch {
             + std::mem::size_of::<RecordBatch>()
     }
 
-    /// Slice-aware memory estimate for a single array, correcting for view types.
+    /// Slice-aware memory estimate for a single array.
     ///
-    /// [`ArrayData::get_slice_memory_size`] only accounts for the fixed 16-byte
-    /// view entries of `Utf8View`/`BinaryView` and ignores the variadic data
-    /// buffers that hold values longer than 12 bytes. It still returns `Ok` for
-    /// these types, so without this correction a batch of long view values would
-    /// be undercounted as ~`16 * rows` while retaining far more memory. We add
-    /// the variadic buffers back (recursing through nested view children). The
-    /// buffers are shared across zero-copy slices, so counting their full
-    /// capacity over-counts for slices — the safe direction, matching the rest
-    /// of this estimate.
+    /// [`ArrayData::get_slice_memory_size`] ignores the variadic data buffers of
+    /// `Utf8View`/`BinaryView` (values > 12 bytes) yet still returns `Ok`, so
+    /// long view batches would be undercounted as ~`16 * rows`. Add those buffers
+    /// back; they are shared across slices, so counting full capacity over-counts
+    /// for slices — the safe direction, matching the rest of this estimate.
     fn estimate_array_size(data: &ArrayData) -> usize {
         match data.get_slice_memory_size() {
             Ok(size) => size + Self::view_data_buffers_size(data),
-            // The slice-aware call errors only for rare unsupported layouts;
-            // fall back to the over-counting (but complete) buffer sum.
+            // Errors only for rare unsupported layouts; use the over-counting sum.
             Err(_) => data.get_array_memory_size(),
         }
     }
 
-    /// Capacity of the variadic data buffers that [`ArrayData::get_slice_memory_size`]
-    /// omits for `Utf8View`/`BinaryView` arrays, summed recursively over children.
+    /// Capacity of the variadic data buffers `get_slice_memory_size` omits for
+    /// `Utf8View`/`BinaryView`, summed recursively over children.
     fn view_data_buffers_size(data: &ArrayData) -> usize {
         let mut size = 0;
         if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
-            // buffers()[0] is the 16-byte view array counted by
-            // get_slice_memory_size; buffers()[1..] are the data buffers it skips.
+            // buffers()[0] is the 16-byte view array (already counted); [1..] are
+            // the data buffers get_slice_memory_size skips.
             size += data
                 .buffers()
                 .iter()
@@ -1077,11 +1072,9 @@ mod tests {
 
     #[test]
     fn test_estimated_size_counts_view_data_buffers() {
-        // Utf8View/BinaryView keep values longer than 12 bytes in variadic data
-        // buffers that Arrow's `get_slice_memory_size` ignores (it counts only
-        // the fixed 16-byte view entries and still returns `Ok`). Without the
-        // correction, a batch of long view values would be undercounted as
-        // ~16 * rows while retaining far more memory.
+        // Long Utf8View/BinaryView values live in variadic data buffers that
+        // `get_slice_memory_size` ignores (returning ~16 * rows). The estimate
+        // must include them.
         use arrow_array::StringViewArray;
 
         let num_rows = 1_000;
