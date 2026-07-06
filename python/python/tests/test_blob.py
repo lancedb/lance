@@ -179,6 +179,40 @@ def test_scan_blob_as_binary(tmp_path):
     assert tbl.column("blobs").to_pylist() == values
 
 
+def test_v2_0_blob_descriptor_projection_and_reads(tmp_path):
+    values = [b"abc", b"defgh", b"ijklmnop"]
+    blob_field = pa.field(
+        "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+    )
+    schema = pa.schema([pa.field("id", pa.int32()), blob_field])
+    table = pa.table(
+        {"id": [0, 1, 2], "blob": values},
+        schema=schema,
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds", data_storage_version="2.0")
+
+    for blob_handling in [None, "all_descriptions", "blobs_descriptions"]:
+        kwargs = {} if blob_handling is None else {"blob_handling": blob_handling}
+        descriptions = ds.scanner(columns=["blob"], **kwargs).to_table().column("blob")
+        chunk = descriptions.chunk(0)
+        assert chunk.type == pa.struct(
+            [
+                pa.field("position", pa.uint64()),
+                pa.field("size", pa.uint64()),
+            ]
+        )
+        assert chunk.field("size").to_pylist() == [3, 5, 8]
+
+    tbl = ds.scanner(columns=["blob"], blob_handling="all_binary").to_table()
+    assert tbl.column("blob").to_pylist() == values
+    assert [blob.read() for blob in ds.take_blobs("blob", indices=[0, 1, 2])] == values
+    assert ds.read_blobs("blob", indices=[0, 1, 2]) == [
+        (0, b"abc"),
+        (1, b"defgh"),
+        (2, b"ijklmnop"),
+    ]
+
+
 def test_fragment_scan_blob_as_binary(tmp_path):
     values = [b"foo", b"bar", b"baz"]
     arr = pa.array(values, pa.large_binary())
