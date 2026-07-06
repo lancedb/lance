@@ -43,7 +43,9 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
+use arrow_schema::DataType;
 
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
@@ -88,13 +90,49 @@ impl StoredBatch {
         batch
             .columns()
             .iter()
-            .map(|col| {
-                col.to_data()
-                    .get_slice_memory_size()
-                    .unwrap_or_else(|_| col.get_array_memory_size())
-            })
+            .map(|col| Self::estimate_array_size(&col.to_data()))
             .sum::<usize>()
             + std::mem::size_of::<RecordBatch>()
+    }
+
+    /// Slice-aware memory estimate for a single array, correcting for view types.
+    ///
+    /// [`ArrayData::get_slice_memory_size`] only accounts for the fixed 16-byte
+    /// view entries of `Utf8View`/`BinaryView` and ignores the variadic data
+    /// buffers that hold values longer than 12 bytes. It still returns `Ok` for
+    /// these types, so without this correction a batch of long view values would
+    /// be undercounted as ~`16 * rows` while retaining far more memory. We add
+    /// the variadic buffers back (recursing through nested view children). The
+    /// buffers are shared across zero-copy slices, so counting their full
+    /// capacity over-counts for slices — the safe direction, matching the rest
+    /// of this estimate.
+    fn estimate_array_size(data: &ArrayData) -> usize {
+        match data.get_slice_memory_size() {
+            Ok(size) => size + Self::view_data_buffers_size(data),
+            // The slice-aware call errors only for rare unsupported layouts;
+            // fall back to the over-counting (but complete) buffer sum.
+            Err(_) => data.get_array_memory_size(),
+        }
+    }
+
+    /// Capacity of the variadic data buffers that [`ArrayData::get_slice_memory_size`]
+    /// omits for `Utf8View`/`BinaryView` arrays, summed recursively over children.
+    fn view_data_buffers_size(data: &ArrayData) -> usize {
+        let mut size = 0;
+        if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+            // buffers()[0] is the 16-byte view array counted by
+            // get_slice_memory_size; buffers()[1..] are the data buffers it skips.
+            size += data
+                .buffers()
+                .iter()
+                .skip(1)
+                .map(|b| b.capacity())
+                .sum::<usize>();
+        }
+        for child in data.child_data() {
+            size += Self::view_data_buffers_size(child);
+        }
+        size
     }
 }
 
@@ -1034,6 +1072,45 @@ mod tests {
         assert!(
             estimated * 10 < over_counting_sum,
             "estimate {estimated} should be far below the over-counting sum {over_counting_sum}"
+        );
+    }
+
+    #[test]
+    fn test_estimated_size_counts_view_data_buffers() {
+        // Utf8View/BinaryView keep values longer than 12 bytes in variadic data
+        // buffers that Arrow's `get_slice_memory_size` ignores (it counts only
+        // the fixed 16-byte view entries and still returns `Ok`). Without the
+        // correction, a batch of long view values would be undercounted as
+        // ~16 * rows while retaining far more memory.
+        use arrow_array::StringViewArray;
+
+        let num_rows = 1_000;
+        // Each value exceeds the 12-byte inline limit, so it spills to a data buffer.
+        let long_value = "x".repeat(64);
+        let payload_bytes = num_rows * long_value.len();
+
+        let array = StringViewArray::from(
+            (0..num_rows)
+                .map(|_| Some(long_value.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+
+        let estimated = StoredBatch::estimate_batch_size(&batch);
+        // What the slice-aware call alone reports: just the 16-byte view entries.
+        let view_entries_only = num_rows * 16;
+        assert!(
+            estimated >= payload_bytes,
+            "estimate {estimated} should cover the view data-buffer payload {payload_bytes}"
+        );
+        assert!(
+            estimated > view_entries_only * 2,
+            "estimate {estimated} must exceed the ~{view_entries_only}-byte view-entry-only undercount"
         );
     }
 
