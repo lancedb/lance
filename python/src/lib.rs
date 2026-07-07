@@ -329,6 +329,12 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // Whether this extension was built with the experimental action-based
+    // transaction feature. Committing a LanceOperation.UserOperation requires it.
+    m.add(
+        "_action_transactions_enabled",
+        cfg!(feature = "unstable-action-transactions"),
+    )?;
 
     register_datagen(py, m)?;
     register_indices(py, m)?;
