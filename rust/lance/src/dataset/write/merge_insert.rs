@@ -1289,26 +1289,16 @@ impl MergeInsertJob {
                     // will be the original source data, and all subsequent batches
                     // will be updates.
                     let mut source_batches = Vec::with_capacity(batches.len() + 1);
-                    source_batches.push(batches[0].clone()); // placeholder for source data
-                    // Check once whether JSON conversion is needed (all batches share the same schema)
-                    let needs_json_conversion = batches[0]
-                        .schema()
-                        .as_ref()
-                        .without_column(ROW_ADDR)
-                        .fields()
-                        .iter()
-                        .any(|f| is_arrow_json_field(f) || has_json_fields(f));
+                    // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) so every
+                    // batch is in physical format, matching what the updater reads from the
+                    // fragment. `convert_json_columns` is a no-op clone when there is nothing
+                    // to convert, so it can be applied unconditionally. The first entry is a
+                    // placeholder for the source data (overwritten each iteration below); it
+                    // must be converted too, otherwise its schema would diverge from the rest.
+                    source_batches.push(convert_json_columns(&batches[0]).map_err(Error::from)?);
                     for batch in &batches {
                         let dropped = batch.drop_column(ROW_ADDR)?;
-                        // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary)
-                        // so source_batches are in physical format, matching what the
-                        // updater reads from the fragment.
-                        if needs_json_conversion {
-                            source_batches
-                                .push(convert_json_columns(&dropped).map_err(Error::from)?);
-                        } else {
-                            source_batches.push(dropped);
-                        }
+                        source_batches.push(convert_json_columns(&dropped).map_err(Error::from)?);
                     }
 
                     // This function is here to help rustc with lifetimes.
