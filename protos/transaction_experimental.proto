@@ -60,13 +60,31 @@ message UserAction {
 // A granular change to the manifest. Traditional operations decompose into an
 // ordered list of these.
 //
-// EXPERIMENTAL: only `AddFragments` is defined so far, as a proof of shape.
-// The remaining actions (RemoveFragments, UpdateDeletionVector, AddIndex, ...)
-// land in follow-up vertical slices.
+// EXPERIMENTAL: only `AddFragments` and `AddIndex` are defined so far. The
+// remaining actions (RemoveFragments, UpdateDeletionVector, ...) land in
+// follow-up vertical slices.
 message Action {
   oneof action {
     AddFragments add_fragments = 1;
+    AddIndex add_index = 2;
   }
+}
+
+// A fragment to be appended by this operation, before its final id is assigned.
+//
+// This is deliberately distinct from `DataFragment`: a committed fragment has an
+// assigned `id`, but a fragment being added does not yet, and instead carries an
+// operation-local placeholder so later actions can reference it.
+message NewFragment {
+  // Operation-local placeholder token identifying this fragment within the
+  // enclosing UserOperation, unique among that operation's new fragments. Later
+  // actions (e.g. AddIndex.covers_local) reference this token; at apply time it
+  // is resolved to the real fragment id assigned from the manifest counter.
+  uint32 local_id = 1;
+  // The fragment payload to append. Its `id` field is IGNORED: the real id is
+  // assigned at apply time from the manifest's fragment counter (late binding),
+  // and re-assigned on every commit retry.
+  DataFragment fragment = 2;
 }
 
 // Append new fragments to the table.
@@ -74,7 +92,29 @@ message Action {
 // Covers: Append, the "add new rows" part of Overwrite, and new fragments
 // produced by compaction.
 message AddFragments {
-  // The new fragments to append. Fragment IDs are not carried here; they are
-  // assigned at apply time from the manifest's counters (late binding).
-  repeated DataFragment fragments = 1;
+  // The new fragments to append, each with an operation-local placeholder.
+  repeated NewFragment new_fragments = 1;
+}
+
+// Register a secondary index segment in the manifest.
+//
+// The index file(s) are expected to have already been written; this action only
+// records the index metadata. Coverage is the union of already-committed
+// fragment ids (`covers_existing`) and fragments added earlier in this same
+// operation (`covers_local`, resolved to their assigned ids at apply time).
+message AddIndex {
+  // Unique identifier of the index across all dataset versions.
+  string uuid = 1;
+  // Human-readable index name. Replace-by-uuid semantics apply on the manifest.
+  string name = 2;
+  // The field ids the index is built on.
+  repeated int32 fields = 3;
+  // Already-committed fragment ids this index covers.
+  repeated uint64 covers_existing = 4;
+  // Placeholders (NewFragment.local_id) of same-operation fragments this index
+  // covers, resolved to real fragment ids at apply time.
+  repeated uint32 covers_local = 5;
+  // Optional opaque, type-specific index metadata: a serialized
+  // google.protobuf.Any. Absent when the index carries no details.
+  optional bytes index_details = 6;
 }
