@@ -361,8 +361,8 @@ impl LanceExecutionOptions {
 
 pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let sort_spill_reservation_bytes = (options.mem_pool_size() / 3) as usize;
-    let mut session_config = SessionConfig::new()
-        .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
+    let mut session_config =
+        SessionConfig::new().with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
     let mut runtime_env_builder = RuntimeEnvBuilder::new();
     if let Some(target_partition) = options.target_partition {
         session_config = session_config.with_target_partitions(target_partition);
