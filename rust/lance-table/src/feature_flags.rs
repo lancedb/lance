@@ -46,8 +46,9 @@ const _: () = assert!(FLAG_EXPERIMENTAL < FLAG_UNKNOWN);
 /// its name moves out of this list and onto a dedicated feature-flag bit.
 pub fn known_experimental_features() -> &'static [&'static str] {
     &[
-        // Register experimental feature names here, gated by their Cargo feature:
-        //   #[cfg(feature = "unstable-action-transactions")] "action-transactions",
+        // Register experimental feature names here, gated by their Cargo feature.
+        #[cfg(feature = "unstable-action-transactions")]
+        crate::transaction::FEATURE_NAME,
     ]
 }
 
@@ -246,6 +247,28 @@ mod tests {
 
         assert_ne!(manifest.writer_feature_flags & FLAG_EXPERIMENTAL, 0);
         assert_eq!(manifest.reader_feature_flags & FLAG_EXPERIMENTAL, 0);
+    }
+
+    // Without the Cargo feature, the action-transactions experiment is not
+    // registered, so a dataset declaring it is rejected — this is what makes a
+    // default build refuse action-based transactions.
+    #[cfg(not(feature = "unstable-action-transactions"))]
+    #[test]
+    fn test_action_transactions_rejected_by_default() {
+        let declared = vec!["action-transactions".to_string()];
+        assert!(!can_read_dataset(FLAG_EXPERIMENTAL, &declared));
+        assert!(!can_write_dataset(FLAG_EXPERIMENTAL, &declared));
+    }
+
+    // With the Cargo feature, the experiment is registered and admitted.
+    #[cfg(feature = "unstable-action-transactions")]
+    #[test]
+    fn test_action_transactions_recognized() {
+        let name = crate::transaction::FEATURE_NAME;
+        assert!(known_experimental_features().contains(&name));
+        let declared = vec![name.to_string()];
+        assert!(can_read_dataset(FLAG_EXPERIMENTAL, &declared));
+        assert!(can_write_dataset(FLAG_EXPERIMENTAL, &declared));
     }
 
     #[test]

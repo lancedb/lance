@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+import "table.proto";
+
+package lance.table;
+
+// EXPERIMENTAL — Action-based transactions (milestone "Action-based
+// Transactions (UserOperation)"; design discussion #5960).
+//
+// This file defines the *unstable* wire format for compound, action-based
+// transactions. It is doubly gated and MUST NOT be treated as a stable format:
+//
+//   1. Rust: only compiled under the non-default `unstable-action-transactions`
+//      Cargo feature, so it is absent from released artifacts.
+//   2. On disk: any dataset that writes one of these transactions sets the
+//      FLAG_ACTION_TRANSACTIONS writer feature flag, so libraries that do not
+//      understand it refuse to commit.
+//
+// The messages here carry NO backwards- or forwards-compatibility guarantee
+// and may change or be removed in any release. Once the format is finalized
+// and ratified by PMC vote, these messages will be promoted into
+// transaction.proto and the guarantee will attach then.
+
+// A user-facing, composable transaction: an ordered list of user actions that
+// commit atomically as a single manifest change.
+//
+// When promoted, this becomes a variant of the top-level `Transaction` in
+// transaction.proto (replacing the single-`Operation` model):
+//
+//   Transaction {
+//     oneof operation {
+//       ...existing operations...
+//       UserOperation user_operation = N;  // <-- actions land here
+//     }
+//   }
+message UserOperation {
+  // Human-readable description, e.g. "INSERT INTO t VALUES (1)".
+  string description = 1;
+  // Unique identifier for this operation, matching Transaction.uuid semantics.
+  string uuid = 2;
+  // The dataset version this operation was planned against.
+  uint64 read_version = 3;
+  // The ordered list of user actions applied by this operation.
+  repeated UserAction actions = 4;
+}
+
+// A single user-recognizable step within a UserOperation (e.g. "append batch",
+// "rebuild index"), carrying a description and the granular actions it expands
+// to. Action lists are flattened when applied to the manifest.
+message UserAction {
+  // Human-readable description of this step.
+  string description = 1;
+  // The granular manifest changes this step expands to.
+  repeated Action actions = 2;
+}
+
+// A granular change to the manifest. Traditional operations decompose into an
+// ordered list of these.
+//
+// EXPERIMENTAL: only `AddFragments` is defined so far, as a proof of shape.
+// The remaining actions (RemoveFragments, UpdateDeletionVector, AddIndex, ...)
+// land in follow-up vertical slices.
+message Action {
+  oneof action {
+    AddFragments add_fragments = 1;
+  }
+}
+
+// Append new fragments to the table.
+//
+// Covers: Append, the "add new rows" part of Overwrite, and new fragments
+// produced by compaction.
+message AddFragments {
+  // The new fragments to append. Fragment IDs are not carried here; they are
+  // assigned at apply time from the manifest's counters (late binding).
+  repeated DataFragment fragments = 1;
+}
