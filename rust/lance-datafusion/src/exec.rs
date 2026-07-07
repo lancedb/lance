@@ -311,7 +311,6 @@ impl std::fmt::Debug for LanceExecutionOptions {
 }
 
 const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
-const DEFAULT_LANCE_SORT_SPILL_RESERVATION_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
@@ -361,8 +360,9 @@ impl LanceExecutionOptions {
 }
 
 pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
+    let sort_spill_reservation_bytes = (options.mem_pool_size() / 3) as usize;
     let mut session_config = SessionConfig::new()
-        .with_sort_spill_reservation_bytes(DEFAULT_LANCE_SORT_SPILL_RESERVATION_BYTES);
+        .with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
     let mut runtime_env_builder = RuntimeEnvBuilder::new();
     if let Some(target_partition) = options.target_partition {
         session_config = session_config.with_target_partitions(target_partition);
