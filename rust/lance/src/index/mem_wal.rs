@@ -493,10 +493,11 @@ mod tests {
 
     /// Regression: a committed `__mem_wal` system index (which legitimately has
     /// `fragment_bitmap: None`) must not break `describe_indices`, the path
-    /// behind lancedb's `list_indices`/`wait_for_index`. Real indices must still
-    /// be returned; the system index must be skipped.
+    /// behind lancedb's `list_indices`/`wait_for_index`. The bitmap-less system
+    /// index is described (as zero indexed rows), consistent with `__frag_reuse`,
+    /// alongside the real user index.
     #[tokio::test]
-    async fn test_describe_indices_skips_mem_wal_system_index() {
+    async fn test_describe_indices_includes_mem_wal_system_index() {
         use crate::index::DatasetIndexExt;
         use lance_index::IndexType;
         use lance_index::scalar::ScalarIndexParams;
@@ -541,16 +542,27 @@ mod tests {
             .clone();
         assert!(mem_wal.fragment_bitmap.is_none());
 
-        // describe_indices no longer errors, skips __mem_wal, keeps the real one.
+        // describe_indices no longer errors: it describes the bitmap-less
+        // __mem_wal index (zero indexed rows) alongside the real scalar index.
         let descriptions = dataset.describe_indices(None).await.unwrap();
-        assert!(
-            descriptions.iter().all(|d| d.name() != MEM_WAL_INDEX_NAME),
-            "system index must be excluded from describe_indices"
+        let mem_wal_desc = descriptions
+            .iter()
+            .find(|d| d.name() == MEM_WAL_INDEX_NAME)
+            .expect("__mem_wal must be described, not skipped");
+        assert_eq!(
+            mem_wal_desc.index_type(),
+            "MemWal",
+            "system index type must resolve via infer_system_index_type"
+        );
+        assert_eq!(
+            mem_wal_desc.rows_indexed(),
+            0,
+            "a bitmap-less system index indexes zero rows"
         );
         assert_eq!(
             descriptions.len(),
-            1,
-            "the real scalar index must still be listed"
+            2,
+            "both the real scalar index and __mem_wal must be listed"
         );
     }
 }

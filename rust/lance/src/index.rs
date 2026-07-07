@@ -781,10 +781,18 @@ impl IndexDescriptionImpl {
         let mut missing_fragment_refs = 0u64;
 
         for shard in &segments {
-            let fragment_bitmap = shard
-            .fragment_bitmap
-            .as_ref()
-            .ok_or_else(|| Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()))?;
+            let Some(fragment_bitmap) = shard.fragment_bitmap.as_ref() else {
+                // A system index (e.g. __mem_wal) is an inline state record that
+                // indexes no fragments, so a missing bitmap is expected and
+                // contributes zero indexed rows. For a data index a missing bitmap
+                // means the covered fragment set is unknown (the index predates
+                // bitmap persistence), so we reject it rather than report a
+                // fabricated row count — retraining rebuilds it with a bitmap.
+                if is_system_index(shard) {
+                    continue;
+                }
+                return Err(Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()));
+            };
 
             indexed_fragment_refs += fragment_bitmap.len();
             for fragment_id in fragment_bitmap.iter() {
@@ -1026,12 +1034,6 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices().await?;
         let mut indices = if let Some(criteria) = criteria {
             indices.iter().filter(|idx| {
-                // System indices (e.g. __mem_wal, __frag_reuse) are inline state
-                // records with no fragment_bitmap, so they have no describable
-                // index and would trip IndexDescriptionImpl::try_new.
-                if is_system_index(idx) {
-                    return false;
-                }
                 if idx.index_details.is_none() {
                     log::warn!("The method describe_indices does not support indexes without index details.  Please retrain the index {}", idx.name);
                     return false;
@@ -1050,10 +1052,7 @@ impl DatasetIndexExt for Dataset {
                 }
             }).collect::<Vec<_>>()
         } else {
-            indices
-                .iter()
-                .filter(|idx| !is_system_index(idx))
-                .collect::<Vec<_>>()
+            indices.iter().collect::<Vec<_>>()
         };
         indices.sort_by_key(|idx| &idx.name);
 
