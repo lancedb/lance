@@ -109,14 +109,23 @@ fn install_atfork() {}
 /// This can also be used to convert a big chunk of synchronous work into a future
 /// so that it can be run in parallel with something like StreamExt::buffered()
 ///
+/// # Only hand over substantial CPU work
+///
+/// Dispatching to the pool has real overhead (a `spawn_blocking` hop plus a oneshot
+/// channel round trip). As a rule of thumb the closure should be expected to do at
+/// least ~100µs of CPU work; below that the thread-pool overhead is likely to
+/// outweigh any parallelism benefit, and the work is better left inline.
+///
 /// # The task must never wait on anything
 ///
-/// The CPU pool is deliberately tiny: it is sized to
-/// [`get_num_compute_intensive_cpus`], which is `max(1, num_cpus - LANCE_IO_CORE_RESERVATION)`
-/// and collapses to a **single blocking thread** on machines with `<= 3` visible
-/// CPUs (1-vCPU VMs, CI runners, CPU-limited Kubernetes pods). A closure passed to
-/// `spawn_cpu` occupies one of these threads for its entire lifetime, including any
-/// time it spends *parked*. So the closure must only consume CPU and return; it must
+/// The CPU pool is sized to [`get_num_compute_intensive_cpus`], which is
+/// `max(1, num_cpus - LANCE_IO_CORE_RESERVATION)`. On a big host that is plenty of
+/// workers (e.g. 62 on a 64-core box), but in resource-constrained environments it can
+/// collapse to a **single blocking thread** — on machines with `<= 3` visible CPUs
+/// (1-vCPU VMs, CI runners, CPU-limited Kubernetes pods) the pool has exactly one
+/// worker. A closure passed to `spawn_cpu` occupies one of these threads for its entire
+/// lifetime, including any time it spends *parked*. So the closure must only consume
+/// CPU and return; it must
 /// **never** block, wait, or park. Concretely, the closure must not, directly or
 /// transitively:
 ///
