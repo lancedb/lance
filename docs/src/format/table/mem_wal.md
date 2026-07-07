@@ -388,56 +388,7 @@ The supported built-in transforms are:
 
 `num_buckets` must be in `[1, 1024]`.
 Null bucket values hash to 0 and therefore map to bucket 0.
-
-The hash uses 32-bit wrapping arithmetic with these mixing functions.
-Right shifts in `fmix` are logical shifts of the `u32` bit pattern.
-
-```text
-mix_k1(k) = rotl32(k * 0xcc9e2d51, 15) * 0x1b873593
-mix_h1(h, k) = rotl32(h ^ k, 13) * 5 + 0xe6546b64
-fmix(h, len) =
-    h = h ^ len
-    h = (h ^ (h >> 16)) * 0x85ebca6b
-    h = (h ^ (h >> 13)) * 0xc2b2ae35
-    h ^ (h >> 16)
-```
-
-Signed and unsigned casts use two's-complement wrapping.
-Values are normalized and hashed as follows:
-
-- `bool`: `false` as `0`, `true` as `1`, then `hash_i32`.
-- `int8`, `int16`, `int32`, `uint8`, `uint16`, `uint32`, `date32`, `time32`: cast to `i32`, then `hash_i32`.
-- `int64`, `uint64`, `timestamp`, `time64`: cast to `i64`, then `hash_i64`.
-- `float32`: `-0.0` and `+0.0` normalize to bits `0`; all NaNs normalize to `0x7fc00000`; other values use IEEE 754 bits cast to `i32`, then `hash_i32`.
-- `float64`: `-0.0` and `+0.0` normalize to bits `0`; all NaNs normalize to `0x7ff8000000000000`; other values use IEEE 754 bits cast to `i64`, then `hash_i64`.
-- `utf8` and `large_utf8`: hash the UTF-8 bytes with `hash_bytes`.
-
-The helper hashes are:
-
-```text
-hash_i32(v) = fmix(mix_h1(0, mix_k1(v)), 4)
-
-hash_i64(v) =
-    low = low 32 bits of v as i32
-    high = high 32 bits of v as i32
-    fmix(mix_h1(mix_h1(0, mix_k1(low)), mix_k1(high)), 8)
-
-hash_bytes(bytes) =
-    h = 0
-    for each complete 4-byte little-endian chunk:
-        h = mix_h1(h, mix_k1(chunk_as_i32))
-    for each remaining byte:
-        h = mix_h1(h, mix_k1(sign_extend_i8(byte)))
-    fmix(h, byte_length)
-```
-
-Test vectors for `num_buckets = 8`:
-
-- `int32` or `date32`: `1 -> 2`, `2 -> 7`, `null -> 0`, `3 -> 1`.
-- `utf8`: `"a" -> 1`, `"b" -> 5`, `null -> 0`.
-- `bool`: `true -> 2`.
-- `float32`: `1.25 -> 0`.
-- `float64`: `1.25 -> 0`.
+See [Appendix 3: Bucket Hashing](#appendix-3-bucket-hashing) for the exact hash algorithm and test vectors.
 
 The `bucket` transform supports scalar boolean, integer, floating-point, date32, time, timestamp, utf8, and large_utf8 source types.
 The `identity` transform supports scalar boolean, integer, utf8, and large_utf8 source types.
@@ -675,3 +626,55 @@ Merger A commits first and updates `merged_generations[shard]` to 6 in the same 
 Merger B then hits a commit conflict, reloads the latest MemWAL index, sees `merged_generations[shard] >= 6`, skips generation 6, and continues with generation 7.
 
 The MemWAL index is the authoritative merge-progress record because it is committed atomically with the base-table data changes.
+
+### Appendix 3: Bucket Hashing
+
+The bucket transform hash uses 32-bit wrapping arithmetic with these mixing functions.
+Right shifts in `fmix` are logical shifts of the `u32` bit pattern.
+
+```text
+mix_k1(k) = rotl32(k * 0xcc9e2d51, 15) * 0x1b873593
+mix_h1(h, k) = rotl32(h ^ k, 13) * 5 + 0xe6546b64
+fmix(h, len) =
+    h = h ^ len
+    h = (h ^ (h >> 16)) * 0x85ebca6b
+    h = (h ^ (h >> 13)) * 0xc2b2ae35
+    h ^ (h >> 16)
+```
+
+Signed and unsigned casts use two's-complement wrapping.
+Values are normalized and hashed as follows:
+
+- `bool`: `false` as `0`, `true` as `1`, then `hash_i32`.
+- `int8`, `int16`, `int32`, `uint8`, `uint16`, `uint32`, `date32`, `time32`: cast to `i32`, then `hash_i32`.
+- `int64`, `uint64`, `timestamp`, `time64`: cast to `i64`, then `hash_i64`.
+- `float32`: `-0.0` and `+0.0` normalize to bits `0`; all NaNs normalize to `0x7fc00000`; other values use IEEE 754 bits cast to `i32`, then `hash_i32`.
+- `float64`: `-0.0` and `+0.0` normalize to bits `0`; all NaNs normalize to `0x7ff8000000000000`; other values use IEEE 754 bits cast to `i64`, then `hash_i64`.
+- `utf8` and `large_utf8`: hash the UTF-8 bytes with `hash_bytes`.
+
+The helper hashes are:
+
+```text
+hash_i32(v) = fmix(mix_h1(0, mix_k1(v)), 4)
+
+hash_i64(v) =
+    low = low 32 bits of v as i32
+    high = high 32 bits of v as i32
+    fmix(mix_h1(mix_h1(0, mix_k1(low)), mix_k1(high)), 8)
+
+hash_bytes(bytes) =
+    h = 0
+    for each complete 4-byte little-endian chunk:
+        h = mix_h1(h, mix_k1(chunk_as_i32))
+    for each remaining byte:
+        h = mix_h1(h, mix_k1(sign_extend_i8(byte)))
+    fmix(h, byte_length)
+```
+
+Test vectors for `num_buckets = 8`:
+
+- `int32` or `date32`: `1 -> 2`, `2 -> 7`, `null -> 0`, `3 -> 1`.
+- `utf8`: `"a" -> 1`, `"b" -> 5`, `null -> 0`.
+- `bool`: `true -> 2`.
+- `float32`: `1.25 -> 0`.
+- `float64`: `1.25 -> 0`.
