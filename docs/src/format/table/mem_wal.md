@@ -34,7 +34,8 @@ Append-only tables without a primary key do not rely on last-write-wins conflict
 
 The MemWAL index is a system index entry on the base table.
 It has `name = "__lance_mem_wal"`, no indexed fields, and no index files.
-The current implementation sets `IndexMetadata.files` to `None` and stores all index data in the `MemWalIndexDetails` protobuf message in `IndexMetadata.index_details`.
+`IndexMetadata.files` is `None`.
+All MemWAL index data is stored in the `MemWalIndexDetails` protobuf message in `IndexMetadata.index_details`.
 
 The index stores:
 
@@ -62,7 +63,7 @@ It serves two purposes:
 1. It buffers data and per-MemTable indexes before a flushed generation is written.
 2. It lets readers access data that has not been flushed yet when strong consistency is required.
 
-The complete in-memory layout is implementation-specific.
+The storage format does not prescribe the in-memory MemTable layout.
 Conceptually, a MemTable is an append log of Arrow record batches.
 Later appends have larger in-memory row positions.
 For primary-key tables, in-memory reads use the largest visible row position as the newest row for a key.
@@ -143,7 +144,7 @@ If a flush attempt fails, a retry writes a different directory instead of reusin
 The shard manifest records the successful directory name in `flushed_generations.path`.
 
 The generation directory is a standard Lance dataset written with the base table's data storage version.
-The current implementation writes one fragment per flushed generation.
+Each flushed generation is written as one fragment.
 Additional MemWAL sidecars may be present:
 
 ```text
@@ -303,7 +304,8 @@ pa.schema([
 ])
 ```
 
-The current Lance Rust implementation keeps MemWAL index data inline and discovers the latest shard set by listing `_mem_wal/` shard directories and reading shard manifests.
+The MemWAL index data is stored inline.
+Readers discover the latest shard set by listing `_mem_wal/` shard directories and reading shard manifests.
 
 <details>
 <summary>MemWalIndexDetails protobuf message</summary>
@@ -330,7 +332,7 @@ Each `ShardingField` contains:
 - `result_type`: Arrow type name for the computed value.
 - `parameters`: transform-specific string parameters.
 
-The current implementation supports these built-in transforms:
+The supported built-in transforms are:
 
 - `unsharded`: takes no source columns, always returns `int32` value 0, and creates one shard.
 - `bucket`: takes one source column and `num_buckets`, hashes the value, and returns an `int32` bucket id in `[0, num_buckets)`.
@@ -395,14 +397,14 @@ Test vectors for `num_buckets = 8`:
 - `float32`: `1.25 -> 0`.
 - `float64`: `1.25 -> 0`.
 
-The current bucket transform supports scalar boolean, integer, floating-point, date32, time, timestamp, utf8, and large_utf8 source types.
-The current identity transform supports scalar boolean, integer, utf8, and large_utf8 source types.
+The `bucket` transform supports scalar boolean, integer, floating-point, date32, time, timestamp, utf8, and large_utf8 source types.
+The `identity` transform supports scalar boolean, integer, utf8, and large_utf8 source types.
 
-The `year`, `month`, `day`, `hour`, `multi_bucket`, and `truncate` transform names are not part of the current implemented MemWAL writer path.
+The `year`, `month`, `day`, `hour`, `multi_bucket`, and `truncate` transform names are not supported MemWAL sharding transforms and must not be used in `ShardingSpec.transform`.
 
 ## Storage Layout
 
-The current MemWAL storage layout is:
+The MemWAL storage layout is:
 
 ```text
 {table_path}/
