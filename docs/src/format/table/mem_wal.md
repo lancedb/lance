@@ -191,6 +191,41 @@ The `_pk_index/` sidecar is not a maintained user index, is not registered in th
 Its identity is its immutable generation path.
 Readers open it directly from `{generation_path}/_pk_index`.
 
+The `_pk_index/` directory is a Lance scalar BTree index store:
+
+```text
+_pk_index/
+├── page_data.lance
+└── page_lookup.lance
+```
+
+Readers load this directory as a BTree index using `BTreeIndexDetails` with default parameters.
+The logical rows indexed by the BTree are sorted pairs:
+
+```python
+pa.schema([
+    pa.field("value", <primary-key-index-type>, nullable=True),
+    pa.field("_rowid", pa.uint64(), nullable=False),
+])
+```
+
+For a single-column primary key, `value` has the Arrow type of the primary-key column and stores the primary-key scalar directly.
+For a composite primary key, `value` is `binary` and stores an order-preserving tuple encoding of all primary-key columns in primary-key column order.
+Each tuple column is encoded as:
+
+- `0x00` for null.
+- `0x01` followed by the non-null value encoding otherwise.
+
+Supported non-null value encodings are:
+
+- Signed integers and date values: sign-flipped 8-byte big-endian integer bytes.
+- Unsigned integers: 8-byte big-endian unsigned integer bytes.
+- Boolean: one byte, `0x00` for false and `0x01` for true.
+- UTF-8 and binary values: raw bytes, with each `0x00` byte escaped as `0x00 0xff`, followed by a `0x00 0x00` terminator.
+
+This encoding is injective and preserves primary-key tuple ordering under lexicographic byte comparison.
+Composite primary-key columns must use one of the supported encodings above.
+
 The sidecar row ids are in the same forward row-position space as the data files, deletion vector, and maintained user indexes.
 The sidecar is used for cross-generation membership and block-list checks.
 It is not used to choose the newest row inside the same flushed generation; the deletion vector has already hidden older same-generation duplicates.
