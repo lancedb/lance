@@ -865,3 +865,37 @@ def test_fragment_take_with_json_column(tmp_path):
     assert metas[0] == '{"val":1}'
     assert metas[1] == '{"val":4}'
     assert metas[2] == '{"val":7}'
+
+
+def test_fragment_create_with_json_column(tmp_path):
+    """Test that LanceFragment.create works with Arrow JSON extension type.
+
+    Previously the single-fragment create path skipped the Arrow JSON (Utf8) ->
+    Lance JSON (JSONB LargeBinary) conversion that write_dataset/write_fragments
+    perform, so the raw UTF-8 string bytes were written into a column whose schema
+    declared JSONB. Reads then miss-decoded the bytes and returned garbage.
+    """
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "uid": pa.array(["a", "b", "c", "d"], type=pa.utf8()),
+            "payload": pa.array(
+                ['{"x":1}', '{"x":2}', '{"y":3}', '{"y":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    frag = LanceFragment.create(tmp_path, data)
+    operation = LanceOperation.Overwrite(data.schema, [frag])
+    dataset = LanceDataset.commit(tmp_path, operation)
+
+    result = dataset.to_table()
+    assert result.column("uid").to_pylist() == ["a", "b", "c", "d"]
+    payloads = result.column("payload").to_pylist()
+    assert [json.loads(p) for p in payloads] == [
+        {"x": 1},
+        {"x": 2},
+        {"y": 3},
+        {"y": 4},
+    ]

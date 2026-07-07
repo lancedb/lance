@@ -13,12 +13,12 @@ use crate::vector::graph::OrderedFloat;
 use crate::{progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
-use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
-use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion::execution::SendableRecordBatchStream;
 use fst::Streamer;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_bitpacking::{BitPacker, BitPacker4x};
@@ -27,18 +27,16 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
+use lance_core::{Error, ROW_ID, Result};
 use lance_io::object_store::ObjectStore;
 use lance_select::RowSetOps;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::task::{Context, Poll};
 use std::{fmt::Debug, sync::atomic::AtomicU64};
 use tracing::instrument;
 
@@ -1264,6 +1262,11 @@ struct WorkerOutput {
     tail_partition: Option<TailPartition>,
 }
 
+enum DocumentSource<'a> {
+    Text(&'a str),
+    StringList(&'a dyn Array),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IndexWorkerConfig {
     with_position: bool,
@@ -1349,147 +1352,256 @@ impl IndexWorker {
 
     async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let doc_col = batch.column(0);
-        let doc_iter = iter_str_array(doc_col);
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-        let docs = doc_iter
-            .zip(row_id_col.values().iter())
-            .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
+        match doc_col.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let docs = iter_str_array(doc_col.as_ref())
+                    .zip(row_id_col.values().iter())
+                    .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
 
+                for (doc, row_id) in docs {
+                    self.process_document(row_id, DocumentSource::Text(doc), false)
+                        .await?;
+                }
+            }
+            DataType::List(_) => {
+                self.process_string_list_batch::<i32>(doc_col, row_id_col)
+                    .await?;
+            }
+            DataType::LargeList(_) => {
+                self.process_string_list_batch::<i64>(doc_col, row_id_col)
+                    .await?;
+            }
+            data_type => {
+                return Err(Error::index(format!(
+                    "expect data type String, LargeString, List(String), or LargeList(String) but got {}",
+                    data_type
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_string_list_batch<Offset: arrow::array::OffsetSizeTrait>(
+        &mut self,
+        doc_col: &Arc<dyn Array>,
+        row_id_col: &arrow_array::PrimitiveArray<datatypes::UInt64Type>,
+    ) -> Result<()> {
+        let docs = doc_col.as_list::<Offset>();
+        match docs.value_type() {
+            datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => {}
+            data_type => {
+                return Err(Error::index(format!(
+                    "expect list item data type String or LargeString but got {}",
+                    data_type
+                )));
+            }
+        }
+
+        for (doc, row_id) in docs.iter().zip(row_id_col.values().iter()) {
+            let Some(doc) = doc else {
+                continue;
+            };
+
+            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()), true)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    fn checked_token_position(row_id: u64, token_position: usize) -> Result<u32> {
+        u32::try_from(token_position).map_err(|_| {
+            Error::invalid_input(format!(
+                "token position overflow for row_id={row_id}: token_position={token_position}"
+            ))
+        })
+    }
+
+    fn materialize_string_list(elements: &dyn Array) -> String {
+        let mut doc = String::new();
+        for element in iter_str_array(elements).flatten() {
+            if !doc.is_empty() {
+                doc.push(' ');
+            }
+            doc.push_str(element);
+        }
+        doc
+    }
+
+    async fn process_document(
+        &mut self,
+        row_id: u64,
+        document: DocumentSource<'_>,
+        skip_empty_document: bool,
+    ) -> Result<()> {
         let with_position = self.has_position();
-        for (doc, row_id) in docs {
-            let builder_was_empty = self.builder.docs.is_empty();
-            let old_temporary_memory_size = self.temporary_memory_size();
-            let old_token_memory_size = self.builder.tokens.memory_size() as u64;
-            let doc_id = self.builder.docs.len() as u32;
-            let mut token_num: u32 = 0;
-            let mut posting_memory_delta = 0i64;
-            if with_position {
+        let builder_was_empty = self.builder.docs.is_empty();
+        let old_temporary_memory_size = self.temporary_memory_size();
+        let old_token_memory_size = self.builder.tokens.memory_size() as u64;
+        let doc_id = self.builder.docs.len() as u32;
+        let mut token_num: u32 = 0;
+        let mut doc_length_bytes = 0usize;
+        let mut posting_memory_delta = 0i64;
+        if with_position {
+            {
                 if self.token_ids.capacity() < self.last_token_count {
                     self.token_ids
                         .reserve(self.last_token_count - self.token_ids.capacity());
                 }
                 self.token_ids.clear();
+                let tokenizer = &mut self.tokenizer;
                 let builder = &mut self.builder;
                 let token_ids = &mut self.token_ids;
                 let memory_size = &mut self.memory_size;
                 let posting_tail_codec = builder.posting_tail_codec;
 
-                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
-                while token_stream.advance() {
-                    let token = token_stream.token();
-                    let token_id = builder.tokens.get_or_add(&token.text);
-                    if token_id as usize == builder.posting_lists.len() {
-                        let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
-                            * std::mem::size_of::<PostingListBuilder>())
-                            as u64;
-                        builder.posting_lists.push(
-                            PostingListBuilder::new_with_posting_tail_codec(
-                                true,
-                                posting_tail_codec,
-                            ),
-                        );
-                        let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
-                            * std::mem::size_of::<PostingListBuilder>())
-                            as u64;
-                        Self::adjust_tracked_value(
-                            memory_size,
-                            old_posting_lists_overhead_size,
-                            new_posting_lists_overhead_size,
-                        );
+                let mut process_text = |text: &str| -> Result<()> {
+                    doc_length_bytes += text.len();
+                    let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    while token_stream.advance() {
+                        let token = token_stream.token();
+                        let position = Self::checked_token_position(row_id, token.position)?;
+                        let token_id = builder.tokens.get_or_add(&token.text);
+                        if token_id as usize == builder.posting_lists.len() {
+                            let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
+                                * std::mem::size_of::<PostingListBuilder>())
+                                as u64;
+                            builder.posting_lists.push(
+                                PostingListBuilder::new_with_posting_tail_codec(
+                                    true,
+                                    posting_tail_codec,
+                                ),
+                            );
+                            let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
+                                * std::mem::size_of::<PostingListBuilder>())
+                                as u64;
+                            Self::adjust_tracked_value(
+                                memory_size,
+                                old_posting_lists_overhead_size,
+                                new_posting_lists_overhead_size,
+                            );
+                        }
+                        let posting_list = &mut builder.posting_lists[token_id as usize];
+                        let old_posting_memory_size = posting_list.size();
+                        if posting_list.add_occurrence(doc_id, position)? {
+                            token_ids.push(token_id);
+                        }
+                        let new_posting_memory_size = posting_list.size();
+                        posting_memory_delta +=
+                            new_posting_memory_size as i64 - old_posting_memory_size as i64;
+                        token_num += 1;
                     }
-                    let posting_list = &mut builder.posting_lists[token_id as usize];
-                    let old_posting_memory_size = posting_list.size();
-                    if posting_list.add_occurrence(doc_id, token.position as u32)? {
-                        token_ids.push(token_id);
+                    Ok(())
+                };
+
+                match document {
+                    DocumentSource::Text(doc) => {
+                        process_text(doc)?;
                     }
-                    let new_posting_memory_size = posting_list.size();
-                    posting_memory_delta +=
-                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                    token_num += 1;
+                    DocumentSource::StringList(elements) => {
+                        let doc = Self::materialize_string_list(elements);
+                        process_text(&doc)?;
+                    }
                 }
-            } else {
+            }
+        } else {
+            {
                 if self.token_ids.capacity() < self.last_token_count {
                     self.token_ids
                         .reserve(self.last_token_count - self.token_ids.capacity());
                 }
                 self.token_ids.clear();
 
-                let mut token_stream = self.tokenizer.token_stream_for_doc(doc);
-                while token_stream.advance() {
-                    let token_id = self.builder.tokens.get_or_add(&token_stream.token().text);
-                    self.token_ids.push(token_id);
-                    token_num += 1;
-                }
-            }
-            self.adjust_tracked_memory_size(
-                old_token_memory_size,
-                self.builder.tokens.memory_size() as u64,
-            );
-
-            if !with_position {
-                let old_posting_lists_overhead_size = self.posting_lists_overhead_size();
-                self.builder
-                    .posting_lists
-                    .resize_with(self.builder.tokens.len(), || {
-                        PostingListBuilder::new_with_posting_tail_codec(
-                            false,
-                            self.builder.posting_tail_codec,
-                        )
-                    });
-                let new_posting_lists_overhead_size = self.posting_lists_overhead_size();
-                Self::adjust_tracked_value(
-                    &mut self.memory_size,
-                    old_posting_lists_overhead_size,
-                    new_posting_lists_overhead_size,
-                );
-            }
-
-            let old_doc_memory_size = self.builder.docs.memory_size() as u64;
-            let appended_doc_id = self.builder.docs.append(row_id, token_num);
-            debug_assert_eq!(appended_doc_id, doc_id);
-            self.adjust_tracked_memory_size(
-                old_doc_memory_size,
-                self.builder.docs.memory_size() as u64,
-            );
-            self.total_doc_length += doc.len();
-
-            if with_position {
-                for &token_id in &self.token_ids {
-                    let (old_posting_memory_size, new_posting_memory_size) = {
-                        let posting_list = &mut self.builder.posting_lists[token_id as usize];
-                        let old_posting_memory_size = posting_list.size();
-                        posting_list.finish_open_doc(doc_id)?;
-                        let new_posting_memory_size = posting_list.size();
-                        (old_posting_memory_size, new_posting_memory_size)
-                    };
-                    posting_memory_delta +=
-                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                }
-                Self::apply_delta(&mut self.memory_size, posting_memory_delta);
-            } else if token_num > 0 {
-                self.token_ids.sort_unstable();
-                let mut iter = self.token_ids.iter();
-                let mut current = *iter.next().unwrap();
-                let mut count = 1u32;
-                for &token_id in iter {
-                    if token_id == current {
-                        count += 1;
-                        continue;
+                let tokenizer = &mut self.tokenizer;
+                let builder = &mut self.builder;
+                let token_ids = &mut self.token_ids;
+                let mut process_text = |text: &str| {
+                    doc_length_bytes += text.len();
+                    let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    while token_stream.advance() {
+                        let token_id = builder.tokens.get_or_add(&token_stream.token().text);
+                        token_ids.push(token_id);
+                        token_num += 1;
                     }
+                };
 
-                    let (old_posting_memory_size, new_posting_memory_size) = {
-                        let posting_list = &mut self.builder.posting_lists[current as usize];
-                        let old_posting_memory_size = posting_list.size();
-                        posting_list.add(doc_id, PositionRecorder::Count(count));
-                        let new_posting_memory_size = posting_list.size();
-                        (old_posting_memory_size, new_posting_memory_size)
-                    };
-                    posting_memory_delta +=
-                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
-
-                    current = token_id;
-                    count = 1;
+                match document {
+                    DocumentSource::Text(doc) => process_text(doc),
+                    DocumentSource::StringList(elements) => {
+                        let doc = Self::materialize_string_list(elements);
+                        process_text(&doc);
+                    }
                 }
+            }
+        }
+        self.adjust_tracked_memory_size(
+            old_token_memory_size,
+            self.builder.tokens.memory_size() as u64,
+        );
+
+        if skip_empty_document && token_num == 0 {
+            self.last_token_count = 0;
+            self.trim_temporary_buffers();
+            self.adjust_tracked_memory_size(
+                old_temporary_memory_size,
+                self.temporary_memory_size(),
+            );
+            return Ok(());
+        }
+
+        if !with_position {
+            let old_posting_lists_overhead_size = self.posting_lists_overhead_size();
+            self.builder
+                .posting_lists
+                .resize_with(self.builder.tokens.len(), || {
+                    PostingListBuilder::new_with_posting_tail_codec(
+                        false,
+                        self.builder.posting_tail_codec,
+                    )
+                });
+            let new_posting_lists_overhead_size = self.posting_lists_overhead_size();
+            Self::adjust_tracked_value(
+                &mut self.memory_size,
+                old_posting_lists_overhead_size,
+                new_posting_lists_overhead_size,
+            );
+        }
+
+        let old_doc_memory_size = self.builder.docs.memory_size() as u64;
+        let appended_doc_id = self.builder.docs.append(row_id, token_num);
+        debug_assert_eq!(appended_doc_id, doc_id);
+        self.adjust_tracked_memory_size(
+            old_doc_memory_size,
+            self.builder.docs.memory_size() as u64,
+        );
+        self.total_doc_length += doc_length_bytes;
+
+        if with_position {
+            for &token_id in &self.token_ids {
+                let (old_posting_memory_size, new_posting_memory_size) = {
+                    let posting_list = &mut self.builder.posting_lists[token_id as usize];
+                    let old_posting_memory_size = posting_list.size();
+                    posting_list.finish_open_doc(doc_id)?;
+                    let new_posting_memory_size = posting_list.size();
+                    (old_posting_memory_size, new_posting_memory_size)
+                };
+                posting_memory_delta +=
+                    new_posting_memory_size as i64 - old_posting_memory_size as i64;
+            }
+            Self::apply_delta(&mut self.memory_size, posting_memory_delta);
+        } else if token_num > 0 {
+            self.token_ids.sort_unstable();
+            let mut iter = self.token_ids.iter();
+            let mut current = *iter.next().unwrap();
+            let mut count = 1u32;
+            for &token_id in iter {
+                if token_id == current {
+                    count += 1;
+                    continue;
+                }
+
                 let (old_posting_memory_size, new_posting_memory_size) = {
                     let posting_list = &mut self.builder.posting_lists[current as usize];
                     let old_posting_memory_size = posting_list.size();
@@ -1499,27 +1611,35 @@ impl IndexWorker {
                 };
                 posting_memory_delta +=
                     new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                Self::apply_delta(&mut self.memory_size, posting_memory_delta);
-            }
-            self.last_token_count = self.token_ids.len();
-            self.trim_temporary_buffers();
-            self.adjust_tracked_memory_size(
-                old_temporary_memory_size,
-                self.temporary_memory_size(),
-            );
 
-            if self.builder.docs.len() == 1 && self.memory_size > self.worker_memory_limit_bytes {
-                return Err(Error::invalid_input(format!(
-                    "single document row_id={} exceeds worker memory limit: {} > {} bytes",
-                    row_id, self.memory_size, self.worker_memory_limit_bytes
-                )));
+                current = token_id;
+                count = 1;
             }
+            let (old_posting_memory_size, new_posting_memory_size) = {
+                let posting_list = &mut self.builder.posting_lists[current as usize];
+                let old_posting_memory_size = posting_list.size();
+                posting_list.add(doc_id, PositionRecorder::Count(count));
+                let new_posting_memory_size = posting_list.size();
+                (old_posting_memory_size, new_posting_memory_size)
+            };
+            posting_memory_delta += new_posting_memory_size as i64 - old_posting_memory_size as i64;
+            Self::apply_delta(&mut self.memory_size, posting_memory_delta);
+        }
+        self.last_token_count = self.token_ids.len();
+        self.trim_temporary_buffers();
+        self.adjust_tracked_memory_size(old_temporary_memory_size, self.temporary_memory_size());
 
-            if self.builder.docs.len() as u32 == u32::MAX
-                || (!builder_was_empty && self.memory_size >= self.worker_memory_limit_bytes)
-            {
-                self.flush().await?;
-            }
+        if self.builder.docs.len() == 1 && self.memory_size > self.worker_memory_limit_bytes {
+            return Err(Error::invalid_input(format!(
+                "single document row_id={} exceeds worker memory limit: {} > {} bytes",
+                row_id, self.memory_size, self.worker_memory_limit_bytes
+            )));
+        }
+
+        if self.builder.docs.len() as u32 == u32::MAX
+            || (!builder_was_empty && self.memory_size >= self.worker_memory_limit_bytes)
+        {
+            self.flush().await?;
         }
 
         Ok(())
@@ -1770,129 +1890,6 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
         );
     }
     Arc::new(arrow_schema::Schema::new_with_metadata(fields, metadata))
-}
-
-/// Flatten the string list stream into a string stream
-pub struct FlattenStream {
-    /// Inner record batch stream with 2 columns:
-    /// 1. doc_col: List(Utf8) or List(LargeUtf8)
-    /// 2. row_id_col: UInt64
-    inner: SendableRecordBatchStream,
-    field_type: DataType,
-    data_type: DataType,
-}
-
-impl FlattenStream {
-    pub fn new(input: SendableRecordBatchStream) -> Self {
-        let schema = input.schema();
-        let field = schema.field(0);
-        let data_type = match field.data_type() {
-            DataType::List(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
-            DataType::List(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
-                DataType::LargeUtf8
-            }
-            DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8) => DataType::Utf8,
-            DataType::LargeList(f) if matches!(f.data_type(), DataType::LargeUtf8) => {
-                DataType::LargeUtf8
-            }
-            _ => panic!(
-                "expect data type List(Utf8) or List(LargeUtf8) but got {:?}",
-                field.data_type()
-            ),
-        };
-        Self {
-            inner: input,
-            field_type: field.data_type().clone(),
-            data_type,
-        }
-    }
-}
-
-impl Stream for FlattenStream {
-    type Item = datafusion_common::Result<RecordBatch>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(batch))) => {
-                let doc_col = batch.column(0);
-                let batch = match self.field_type {
-                    DataType::List(_) => flatten_string_list::<i32>(&batch, doc_col).map_err(|e| {
-                        datafusion_common::error::DataFusionError::Execution(format!(
-                            "flatten string list error: {}",
-                            e
-                        ))
-                    }),
-                    DataType::LargeList(_) => {
-                        flatten_string_list::<i64>(&batch, doc_col).map_err(|e| {
-                            datafusion_common::error::DataFusionError::Execution(format!(
-                                "flatten string list error: {}",
-                                e
-                            ))
-                        })
-                    }
-                    _ => unreachable!(
-                        "expect data type List or LargeList but got {:?}",
-                        self.field_type
-                    ),
-                };
-                Poll::Ready(Some(batch))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl RecordBatchStream for FlattenStream {
-    fn schema(&self) -> SchemaRef {
-        let schema = Schema::new(vec![
-            Field::new(
-                self.inner.schema().field(0).name(),
-                self.data_type.clone(),
-                true,
-            ),
-            ROW_ID_FIELD.clone(),
-        ]);
-
-        Arc::new(schema)
-    }
-}
-
-fn flatten_string_list<Offset: arrow::array::OffsetSizeTrait>(
-    batch: &RecordBatch,
-    doc_col: &Arc<dyn Array>,
-) -> Result<RecordBatch> {
-    let docs = doc_col.as_list::<Offset>();
-    let row_ids = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-
-    let row_ids = row_ids
-        .values()
-        .iter()
-        .zip(docs.iter())
-        .flat_map(|(row_id, doc)| std::iter::repeat_n(*row_id, doc.map(|d| d.len()).unwrap_or(0)));
-
-    let row_ids = Arc::new(UInt64Array::from_iter_values(row_ids));
-    let docs = match docs.value_type() {
-        datatypes::DataType::Utf8 | datatypes::DataType::LargeUtf8 => docs.values().clone(),
-        _ => {
-            return Err(Error::index(format!(
-                "expect data type String or LargeString but got {}",
-                docs.value_type()
-            )));
-        }
-    };
-
-    let schema = Schema::new(vec![
-        Field::new(
-            batch.schema().field(0).name(),
-            docs.data_type().clone(),
-            true,
-        ),
-        ROW_ID_FIELD.clone(),
-    ]);
-    let batch = RecordBatch::try_new(Arc::new(schema), vec![docs, row_ids])?;
-    Ok(batch)
 }
 
 pub(crate) fn token_file_path(partition_id: u64) -> String {
@@ -2168,7 +2165,7 @@ pub fn document_input(
         DataType::List(field) | DataType::LargeList(field)
             if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
         {
-            Ok(Box::pin(FlattenStream::new(input)))
+            Ok(input)
         }
         DataType::LargeBinary => match field.metadata().get(ARROW_EXT_NAME_KEY) {
             Some(name) if name.as_str() == JSON_EXT_NAME => {

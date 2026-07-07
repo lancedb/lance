@@ -10,7 +10,7 @@ use std::{
     collections::BinaryHeap,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Range,
     time::Instant,
 };
@@ -630,22 +630,25 @@ impl InvertedIndex {
         query_tokens: &Tokens,
         params: &FtsSearchParams,
     ) -> Result<MemBM25Scorer> {
+        if matches!(params.fuzziness, Some(n) if n != 0) {
+            let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
+            self.bm25_scorer_for_final_tokens(&expanded).await
+        } else {
+            self.bm25_scorer_for_final_tokens(query_tokens).await
+        }
+    }
+
+    /// Scorer for a token list that needs no further fuzzy expansion: dedup
+    /// the terms and pull their document frequencies. `bm25_search` calls
+    /// this with the tokens it already expanded, so the expansion runs once
+    /// per query rather than once for the scorer and once per partition.
+    async fn bm25_scorer_for_final_tokens(&self, tokens: &Tokens) -> Result<MemBM25Scorer> {
         let (total_tokens, num_docs) = self.aggregate_corpus_stats().await?;
         let mut terms: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
-        if matches!(params.fuzziness, Some(n) if n != 0) {
-            let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
-            for idx in 0..expanded.len() {
-                let token = expanded.get_token(idx);
-                if seen.insert(token.to_string()) {
-                    terms.push(token.to_string());
-                }
-            }
-        } else {
-            for token in query_tokens {
-                if seen.insert(token.to_string()) {
-                    terms.push(token.to_string());
-                }
+        for token in tokens {
+            if seen.insert(token.to_string()) {
+                terms.push(token.to_string());
             }
         }
         let mut token_docs = HashMap::with_capacity(terms.len());
@@ -717,17 +720,46 @@ impl InvertedIndex {
     }
 
     /// Expand fuzzy query tokens against all partitions in this segment.
+    ///
+    /// `params.max_expansions` caps the whole query's expansion, not any
+    /// single partition's: for each query token the per-partition candidates
+    /// (each streamed in FST key order) merge into one lexicographically
+    /// ordered set, and the remaining budget takes a prefix of it. The
+    /// selected terms are a pure function of the segment's vocabulary, so
+    /// splitting the same corpus into more partitions cannot change which
+    /// terms a fuzzy query matches.
     pub fn expand_fuzzy_tokens(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut expanded_tokens = Vec::new();
         let mut expanded_positions = Vec::new();
         let mut seen = HashSet::new();
-        for partition in &self.partitions {
-            let expanded = partition.expand_fuzzy(tokens, params)?;
-            for idx in 0..expanded.len() {
-                let token = expanded.get_token(idx);
-                let position = expanded.position(idx);
-                if seen.insert((token.to_string(), position)) {
-                    expanded_tokens.push(token.to_string());
+        for token_idx in 0..tokens.len() {
+            let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
+            if remaining == 0 {
+                break;
+            }
+            let token = tokens.get_token(token_idx);
+            let position = tokens.position(token_idx);
+            // Each partition contributes at most its `remaining`
+            // lexicographically smallest candidates, so the global
+            // lex-smallest `remaining` selection below is unaffected by the
+            // per-partition truncation.
+            let mut candidates = BTreeSet::new();
+            let base_prefix_len = tokens.token_type().prefix_len(token) as u32;
+            for partition in &self.partitions {
+                partition.collect_fuzzy_candidates(
+                    token,
+                    base_prefix_len,
+                    params,
+                    remaining,
+                    &mut candidates,
+                )?;
+            }
+            for candidate in candidates {
+                if expanded_tokens.len() >= params.max_expansions {
+                    break;
+                }
+                if seen.insert((candidate.clone(), position)) {
+                    expanded_tokens.push(candidate);
                     expanded_positions.push(position);
                 }
             }
@@ -753,6 +785,28 @@ impl InvertedIndex {
         metrics: Arc<dyn MetricsCollector>,
         base_scorer: Option<&MemBM25Scorer>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
+        // Fuzzy expansion runs once here, with the global `max_expansions`
+        // budget, instead of once per partition: partitions receive the
+        // final token list, so the matched terms cannot depend on how the
+        // corpus happens to be partitioned.
+        let tokens = if matches!(params.fuzziness, Some(n) if n != 0) {
+            let expanded = Arc::new(self.expand_fuzzy_tokens(tokens.as_ref(), params.as_ref())?);
+            if operator == Operator::And || params.phrase_slop.is_some() {
+                // AND/phrase semantics require every original token position
+                // to keep at least one expansion; a position that expands to
+                // nothing anywhere in the segment can never be matched.
+                let surviving = (0..expanded.len())
+                    .map(|idx| expanded.position(idx))
+                    .collect::<HashSet<_>>();
+                if (0..tokens.len()).any(|idx| !surviving.contains(&tokens.position(idx))) {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+            }
+            expanded
+        } else {
+            tokens
+        };
+
         // The wand only consults `scorer.doc_weight`, which is metadata-free.
         // The outer aggregation below consults `scorer.query_weight`, which
         // hits per-token `posting_len`; building a `MemBM25Scorer` with
@@ -761,9 +815,7 @@ impl InvertedIndex {
         let scorer: &dyn Scorer = if let Some(base_scorer) = base_scorer {
             base_scorer
         } else {
-            local_scorer = self
-                .bm25_base_scorer(tokens.as_ref(), params.as_ref())
-                .await?;
+            local_scorer = self.bm25_scorer_for_final_tokens(tokens.as_ref()).await?;
             &local_scorer
         };
 
@@ -1484,47 +1536,29 @@ impl InvertedPartition {
         let mut new_positions = Vec::with_capacity(new_tokens.capacity());
         let mut seen = HashSet::new();
         for token_idx in 0..tokens.len() {
-            if new_tokens.len() >= params.max_expansions {
+            let remaining = params.max_expansions.saturating_sub(new_tokens.len());
+            if remaining == 0 {
                 break;
             }
             let token = tokens.get_token(token_idx);
             let position = tokens.position(token_idx);
-            let fuzziness = match params.fuzziness {
-                Some(fuzziness) => fuzziness,
-                None => MatchQuery::auto_fuzziness(token),
-            };
-            let lev = fst::automaton::Levenshtein::new(token, fuzziness)
-                .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
-
-            let base_len = tokens.token_type().prefix_len(token) as u32;
-            if let TokenMap::Fst(ref map) = self.tokens.tokens {
-                let mut expanded = Vec::new();
-                let remaining = params.max_expansions - new_tokens.len();
-                match base_len + params.prefix_length {
-                    0 => take_fst_keys(map.search(lev), &mut expanded, remaining),
-                    prefix_length => {
-                        let prefix = &token[..min(prefix_length as usize, token.len())];
-                        let prefix = fst::automaton::Str::new(prefix).starts_with();
-                        take_fst_keys(
-                            map.search(lev.intersection(prefix)),
-                            &mut expanded,
-                            remaining,
-                        )
-                    }
+            let base_prefix_len = tokens.token_type().prefix_len(token) as u32;
+            let mut candidates = BTreeSet::new();
+            self.collect_fuzzy_candidates(
+                token,
+                base_prefix_len,
+                params,
+                remaining,
+                &mut candidates,
+            )?;
+            for candidate in candidates {
+                if new_tokens.len() >= params.max_expansions {
+                    break;
                 }
-                for token in expanded {
-                    if seen.insert((token.clone(), position)) {
-                        new_tokens.push(token);
-                        new_positions.push(position);
-                        if new_tokens.len() >= params.max_expansions {
-                            break;
-                        }
-                    }
+                if seen.insert((candidate.clone(), position)) {
+                    new_tokens.push(candidate);
+                    new_positions.push(position);
                 }
-            } else {
-                return Err(Error::index(
-                    "tokens is not fst, which is not expected".to_owned(),
-                ));
             }
         }
         Ok(Tokens::with_positions(
@@ -1532,6 +1566,47 @@ impl InvertedPartition {
             new_positions,
             tokens.token_type().clone(),
         ))
+    }
+
+    /// Collect up to `limit` fuzzy candidates for one query token from this
+    /// partition's token FST, in key (lexicographic) order. Callers merge
+    /// candidates across partitions and apply the query-wide
+    /// `max_expansions` budget; truncating each partition at `limit` is
+    /// lossless for that selection because any term among the merged
+    /// lexicographically-smallest `limit` is also among its own partition's
+    /// smallest `limit`.
+    fn collect_fuzzy_candidates(
+        &self,
+        token: &str,
+        base_prefix_len: u32,
+        params: &FtsSearchParams,
+        limit: usize,
+        candidates: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let fuzziness = match params.fuzziness {
+            Some(fuzziness) => fuzziness,
+            None => MatchQuery::auto_fuzziness(token),
+        };
+        let lev = fst::automaton::Levenshtein::new(token, fuzziness)
+            .map_err(|e| Error::index(format!("failed to construct the fuzzy query: {}", e)))?;
+
+        if let TokenMap::Fst(ref map) = self.tokens.tokens {
+            let mut expanded = Vec::new();
+            match base_prefix_len + params.prefix_length {
+                0 => take_fst_keys(map.search(lev), &mut expanded, limit),
+                prefix_length => {
+                    let prefix = &token[..min(prefix_length as usize, token.len())];
+                    let prefix = fst::automaton::Str::new(prefix).starts_with();
+                    take_fst_keys(map.search(lev.intersection(prefix)), &mut expanded, limit)
+                }
+            }
+            candidates.extend(expanded);
+            Ok(())
+        } else {
+            Err(Error::index(
+                "tokens is not fst, which is not expected".to_owned(),
+            ))
+        }
     }
 
     fn union_plain_posting_lists(postings: Vec<PostingList>) -> Result<PostingList> {
@@ -1642,10 +1717,11 @@ impl InvertedPartition {
                 .map(|index| tokens.position(index))
                 .collect::<HashSet<_>>()
         });
-        let tokens = match is_fuzzy {
-            true => self.expand_fuzzy(tokens, params)?,
-            false => tokens.clone(),
-        };
+        // Fuzzy expansion already ran once at the index level (see
+        // `InvertedIndex::bm25_search`) under the global `max_expansions`
+        // budget; the incoming tokens are final and `is_fuzzy` only drives
+        // the grouped dedup/scoring semantics below.
+        let tokens = tokens.clone();
         let token_positions = (0..tokens.len())
             .map(|index| tokens.position(index))
             .collect::<Vec<_>>();
@@ -5052,12 +5128,11 @@ impl DocSet {
 
     /// Resolve a `row_id` to every `doc_id` it owns.
     ///
-    /// A scalar column maps each row to a single document, but a
-    /// `list<string>` column indexes every element as its own document, so a
-    /// single `row_id` can own several `doc_id`s sharing that key in `inv`.
+    /// Modern indexes map each row to a single document. Older list indexes
+    /// may have indexed each list element as its own document, so a single
+    /// `row_id` can still own several `doc_id`s sharing that key in `inv`.
     /// The prefilter path (`flat_search`) walks an allow-list of row_ids and
-    /// must evaluate *all* of a row's documents; resolving to one `doc_id`
-    /// silently drops matches at non-last list positions (lancedb#3352).
+    /// must evaluate all legacy documents for that row.
     pub fn doc_ids(&self, row_id: u64) -> impl Iterator<Item = u64> + '_ {
         if self.inv.is_empty() {
             // in legacy format, the row id is doc id (one document per row)
@@ -5330,6 +5405,12 @@ pub fn flat_full_text_search(
     match batches[0][doc_col].data_type() {
         DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
         DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
+        DataType::List(_) => {
+            do_flat_full_text_search_list::<i32>(batches, doc_col, query, tokenizer)
+        }
+        DataType::LargeList(_) => {
+            do_flat_full_text_search_list::<i64>(batches, doc_col, query, tokenizer)
+        }
         data_type => Err(Error::invalid_input(format!(
             "unsupported data type {} for inverted index",
             data_type
@@ -5358,6 +5439,46 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
                 // What is this assertion for?  Why would doc contain query?  Don't we reach
                 // here only if they share at least one token?  Why is it not debug_assert?
                 assert!(doc.contains(query));
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
+    batches: &[&RecordBatch],
+    doc_col: &str,
+    query: &str,
+    tokenizer: Option<Box<dyn LanceTokenizer>>,
+) -> Result<Vec<u64>> {
+    let mut results = Vec::new();
+    let mut tokenizer =
+        tokenizer.unwrap_or_else(|| InvertedIndexParams::default().build().unwrap());
+    let query_tokens = collect_query_tokens(query, &mut tokenizer);
+
+    for batch in batches {
+        let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let doc_array = batch[doc_col].as_list::<ListOffset>();
+        match doc_array.value_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => {}
+            data_type => {
+                return Err(Error::invalid_input(format!(
+                    "unsupported list item data type {} for inverted index",
+                    data_type
+                )));
+            }
+        }
+        for i in 0..row_id_array.len() {
+            if doc_array.is_null(i) {
+                continue;
+            }
+            let elements = doc_array.value(i);
+            if iter_str_array(elements.as_ref())
+                .flatten()
+                .any(|element| has_query_token(element, &mut tokenizer, &query_tokens))
+            {
+                results.push(row_id_array.value(i));
             }
         }
     }
@@ -5422,6 +5543,8 @@ async fn tokenize_and_count(
                 // thread is invisible to the caller's poll timer otherwise).
                 let start = std::time::Instant::now();
                 let batch = batch?;
+                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let mut row_ids = UInt64Builder::with_capacity(batch.num_rows());
                 let mut all_token_counts = UInt64Builder::with_capacity(batch.num_rows());
                 let mut query_token_counts = FixedSizeListBuilder::with_capacity(
                     UInt64Builder::with_capacity(batch.num_rows() * query_tokens.len()),
@@ -5429,20 +5552,7 @@ async fn tokenize_and_count(
                     batch.num_rows(),
                 );
                 let mut temp_query_token_counts = Vec::with_capacity(query_tokens.len());
-                let doc_iter = iter_str_array(batch.column(doc_col_idx));
-                for doc in doc_iter {
-                    let Some(doc) = doc else {
-                        all_token_counts.append_value(0);
-                        query_token_counts
-                            .values()
-                            .append_value_n(0, query_tokens.len());
-                        query_token_counts.append(true);
-                        continue;
-                    };
-
-                    temp_query_token_counts.clear();
-                    temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens.len()));
-
+                let mut count_text = |doc: &str, temp_query_token_counts: &mut Vec<u64>| -> u64 {
                     let mut stream = tokenizer.token_stream_for_doc(doc);
                     let mut all_tokens = 0;
                     while let Some(token) = stream.next() {
@@ -5451,20 +5561,67 @@ async fn tokenize_and_count(
                             temp_query_token_counts[token_index] += 1;
                         }
                     }
-                    all_token_counts.append_value(all_tokens);
-                    for count in temp_query_token_counts.iter().copied() {
-                        query_token_counts.values().append_value(count);
+                    all_tokens
+                };
+                let mut append_counts =
+                    |row_id: u64, all_tokens: u64, temp_query_token_counts: &[u64]| {
+                        row_ids.append_value(row_id);
+                        all_token_counts.append_value(all_tokens);
+                        for count in temp_query_token_counts.iter().copied() {
+                            query_token_counts.values().append_value(count);
+                        }
+                        query_token_counts.append(true);
+                    };
+                match batch.column(doc_col_idx).data_type() {
+                    DataType::Utf8 | DataType::LargeUtf8 => {
+                        let doc_iter = iter_str_array(batch.column(doc_col_idx));
+                        for (doc, row_id) in doc_iter.zip(row_id_array.values().iter()) {
+                            temp_query_token_counts.clear();
+                            temp_query_token_counts
+                                .extend(std::iter::repeat_n(0, query_tokens.len()));
+
+                            let Some(doc) = doc else {
+                                append_counts(*row_id, 0, &temp_query_token_counts);
+                                continue;
+                            };
+
+                            let all_tokens = count_text(doc, &mut temp_query_token_counts);
+                            append_counts(*row_id, all_tokens, &temp_query_token_counts);
+                        }
                     }
-                    query_token_counts.append(true);
+                    DataType::List(_) => {
+                        tokenize_and_count_list::<i32>(
+                            batch.column(doc_col_idx),
+                            row_id_array,
+                            &mut count_text,
+                            &mut append_counts,
+                            &mut temp_query_token_counts,
+                            query_tokens.len(),
+                        )?;
+                    }
+                    DataType::LargeList(_) => {
+                        tokenize_and_count_list::<i64>(
+                            batch.column(doc_col_idx),
+                            row_id_array,
+                            &mut count_text,
+                            &mut append_counts,
+                            &mut temp_query_token_counts,
+                            query_tokens.len(),
+                        )?;
+                    }
+                    data_type => {
+                        return DataFusionResult::Err(datafusion_common::DataFusionError::Execution(
+                            format!("unsupported data type {} for flat full text search", data_type),
+                        ));
+                    }
                 }
-                let row_ids = batch[ROW_ID].clone();
+                let row_ids = row_ids.finish();
                 let all_token_counts = all_token_counts.finish();
                 let query_token_counts = query_token_counts.finish();
                 let result_batch = RecordBatch::try_new(
-
                     output_schema,
                     vec![
-                        row_ids,
+                        Arc::new(row_ids) as ArrayRef,
                         Arc::new(all_token_counts) as ArrayRef,
                         Arc::new(query_token_counts) as ArrayRef,
                     ],
@@ -5488,6 +5645,47 @@ async fn tokenize_and_count(
         &output_schema_clone,
         &batches,
     )?)
+}
+
+fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
+    doc_col: &ArrayRef,
+    row_id_array: &arrow_array::PrimitiveArray<UInt64Type>,
+    count_text: &mut impl FnMut(&str, &mut Vec<u64>) -> u64,
+    append_counts: &mut impl FnMut(u64, u64, &[u64]),
+    temp_query_token_counts: &mut Vec<u64>,
+    query_tokens_len: usize,
+) -> DataFusionResult<()> {
+    let doc_array = doc_col.as_list::<ListOffset>();
+    match doc_array.value_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => {}
+        data_type => {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "unsupported list item data type {} for flat full text search",
+                data_type
+            )));
+        }
+    }
+
+    for i in 0..row_id_array.len() {
+        if doc_array.is_null(i) {
+            continue;
+        }
+
+        temp_query_token_counts.clear();
+        temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
+
+        let elements = doc_array.value(i);
+        let mut all_tokens = 0;
+        for element in iter_str_array(elements.as_ref()).flatten() {
+            all_tokens += count_text(element, temp_query_token_counts);
+        }
+
+        if all_tokens > 0 {
+            append_counts(row_id_array.value(i), all_tokens, temp_query_token_counts);
+        }
+    }
+
+    Ok(())
 }
 
 /// Initialize the BM25 scorer
@@ -5530,7 +5728,9 @@ fn initialize_scorer(
 
     for _ in 0..counted_input.num_rows() {
         for token_count in all_token_counts.iter_mut() {
-            *token_count += input_token_counters.next().unwrap_or_default();
+            if input_token_counters.next().unwrap_or_default() > 0 {
+                *token_count += 1;
+            }
         }
     }
 
@@ -5742,7 +5942,10 @@ mod tests {
     };
     use crate::scalar::inverted::query::{FtsSearchParams, Operator};
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow::array::{AsArray, Int32Builder, LargeBinaryBuilder, ListBuilder, UInt32Builder};
+    use arrow::array::{
+        AsArray, GenericListBuilder, GenericStringBuilder, Int32Builder, LargeBinaryBuilder,
+        ListBuilder, UInt32Builder,
+    };
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -8116,6 +8319,132 @@ mod tests {
         );
     }
 
+    /// Write one partition holding `variants` in order, with one
+    /// single-token doc per variant taken from `row_ids`.
+    async fn write_variant_partition(
+        store: &Arc<LanceIndexStore>,
+        partition_id: u64,
+        variants: &[&str],
+        row_ids: &[u64],
+    ) {
+        let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+        for token in variants {
+            builder.tokens.add((*token).to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+        }
+        for (local_idx, row_id) in row_ids.iter().enumerate() {
+            builder.posting_lists[local_idx].add(local_idx as u32, PositionRecorder::Count(1));
+            builder.docs.append(*row_id, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_expansion_cap_is_global_across_partitions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_variant_partition(&store, 0, &["alpha", "alphb"], &[100, 101]).await;
+        write_variant_partition(&store, 1, &["alphc", "alphd"], &[102, 103]).await;
+        write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let params = FtsSearchParams::new()
+            .with_fuzziness(Some(1))
+            .with_max_expansions(3);
+        let tokens = Tokens::new(vec!["alphx".to_owned()], DocType::Text);
+
+        let expanded = index.expand_fuzzy_tokens(&tokens, &params).unwrap();
+        let expanded_terms = (0..expanded.len())
+            .map(|idx| expanded.get_token(idx).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expanded_terms,
+            vec!["alpha".to_owned(), "alphb".to_owned(), "alphc".to_owned()],
+            "max_expansions must cap the whole query across partitions, \
+             in lexicographic order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_results_independent_of_partition_shape() {
+        // The same four single-variant docs, laid out as one partition and
+        // as two. With a binding max_expansions the two shapes must still
+        // match the same documents with the same scores.
+        let single_dir = TempObjDir::default();
+        let single_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            single_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        write_variant_partition(
+            &single_store,
+            0,
+            &["alpha", "alphb", "alphc", "alphd"],
+            &[100, 101, 102, 103],
+        )
+        .await;
+        write_test_metadata(&single_store, vec![0], InvertedIndexParams::default()).await;
+
+        let split_dir = TempObjDir::default();
+        let split_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            split_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        write_variant_partition(&split_store, 0, &["alpha", "alphb"], &[100, 101]).await;
+        write_variant_partition(&split_store, 1, &["alphc", "alphd"], &[102, 103]).await;
+        write_test_metadata(&split_store, vec![0, 1], InvertedIndexParams::default()).await;
+
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_fuzziness(Some(1))
+                .with_max_expansions(3),
+        );
+
+        let mut results = Vec::new();
+        for store in [single_store, split_store] {
+            let cache = LanceCache::with_capacity(4096);
+            let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+            let tokens = Arc::new(Tokens::new(vec!["alphx".to_owned()], DocType::Text));
+            let (row_ids, scores) = index
+                .bm25_search(
+                    tokens,
+                    params.clone(),
+                    Operator::Or,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut scored = row_ids.into_iter().zip(scores).collect::<Vec<_>>();
+            scored.sort_unstable_by_key(|(row_id, _)| *row_id);
+            results.push(scored);
+        }
+
+        assert_eq!(
+            results[0]
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>(),
+            vec![100, 101, 102],
+            "a binding cap keeps the three lexicographically smallest variants"
+        );
+        assert_eq!(
+            results[0], results[1],
+            "fuzzy results must not depend on the partition shape"
+        );
+    }
+
     #[tokio::test]
     async fn test_fuzzy_and_scores_grouped_expansions_by_matched_token() {
         let tmpdir = TempObjDir::default();
@@ -8813,6 +9142,60 @@ mod tests {
             scores.value(0),
             scores.value(1)
         );
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_search_treats_string_lists_as_row_documents() {
+        let mut docs_builder =
+            GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+        docs_builder.values().append_value("alpha");
+        docs_builder.values().append_value("alpha beta");
+        docs_builder.append(true);
+        docs_builder.values().append_value("beta");
+        docs_builder.append(true);
+        docs_builder.append(true);
+        docs_builder.values().append_null();
+        docs_builder.append(true);
+        docs_builder.append(false);
+
+        let docs = Arc::new(docs_builder.finish()) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", docs.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3, 4])) as ArrayRef,
+                docs,
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+
+        let result_stream = flat_bm25_search_stream_with_metrics(
+            input,
+            "text".to_string(),
+            "alpha".to_string(),
+            tokenizer,
+            None,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+        let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+
+        assert_eq!(row_ids.values(), &[0]);
     }
 
     /// An [`IndexReader`] wrapper that hides the posting-group-offsets schema
