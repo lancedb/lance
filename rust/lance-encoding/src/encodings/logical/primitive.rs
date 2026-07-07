@@ -1472,8 +1472,8 @@ impl ChunkInstructions {
         chunk_index: &MiniBlockChunkIndex,
         user_ranges: &[Range<u64>],
     ) -> Vec<Self> {
-        // `num_chunks` is constant for the page, so bind it once rather than
-        // re-deriving it (a width match + length read) on every loop iteration.
+        // Bind the per-page chunk count once; re-deriving it each iteration
+        // costs a width match plus a length read.
         let num_chunks = chunk_index.num_chunks();
         // This is an in-exact capacity guess but pretty good.  The actual capacity can be
         // smaller if instructions are merged.  It can be larger if there are multiple instructions
@@ -1775,13 +1775,10 @@ fn flat_value_counts_iter(logs: &[u8], items_in_page: u64) -> impl Iterator<Item
     })
 }
 
-/// Builds the compact per-chunk index from parsed metadata words and (for nested
-/// pages) the raw repetition-index bytes.
-///
-/// `byte_starts` (cumulative chunk sizes) is built for every page.  The row axis
-/// is selected per page shape: `UniformFlat` when all non-last chunks hold the
-/// same number of values (fixed-width / bitpacking), `Flat` for non-uniform flat
-/// pages (RLE / FSST), and `Nested` when a repetition index is present.
+/// Builds the compact per-chunk index from the metadata words and, for nested
+/// pages, the raw repetition-index bytes.  The row axis is picked by page shape:
+/// `UniformFlat` when all non-last chunks share a value count (fixed-width /
+/// bitpacking), `Flat` for non-uniform flat pages (RLE / FSST), else `Nested`.
 fn build_chunk_index(
     words: &Words,
     items_in_page: u64,
@@ -1801,9 +1798,8 @@ fn build_chunk_index(
         data_buf_size,
     );
 
-    // Nested pages (repetition present) track rows via the repetition index and
-    // keep leaf item counts separately; flat pages have row index == value index,
-    // so the value counts are the row axis.
+    // Nested pages track rows via the repetition index and keep leaf item counts
+    // separately; flat pages have row == value index, so value counts are rows.
     let rows = if let Some(rep_index_data) = rep_index_bytes {
         assert!(rep_index_data.len() % 8 == 0);
         let stride = repetition_index_depth as usize + 1;
@@ -1885,7 +1881,6 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let dictionary_bytes = self.dictionary.as_ref().and_then(|_| buffers.next());
             let rep_index_bytes = buffers.next();
 
-            // Parse the metadata words and build the compact per-chunk index.
             let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
             let chunk_index = build_chunk_index(
                 &words,

@@ -3,17 +3,10 @@
 
 //! Compact per-page chunk index for the mini-block structural encoding.
 //!
-//! The mini-block scheduler needs to answer two questions about a cached page:
-//!
-//!  - by chunk index: where does chunk `i` live on disk and how many leaf
-//!    values does it hold (used to fetch and decode a chunk)
-//!  - by row: which chunk contains a given row, and what is that chunk's row
-//!    structure (used to translate user row ranges into chunk reads)
-//!
-//! Historically this was served by two parallel arrays of per-chunk structs
-//! (`Vec<ChunkMeta>` and a repetition index of blocks), 48 bytes per chunk,
-//! most of it derivable from a handful of cumulative quantities.  This module
-//! stores only the non-redundant quantities and derives the rest:
+//! Replaces two parallel per-chunk arrays (`Vec<ChunkMeta>` + a repetition index
+//! of blocks, ~48 bytes/chunk) with the non-redundant cumulative quantities
+//! alone, deriving the rest.  The scheduler looks chunks up by index (byte range,
+//! leaf value count) and by row (which chunk holds a row).
 //!
 //! ```text
 //! MiniBlockChunkIndex
@@ -24,20 +17,15 @@
 //!    |- Flat { value_starts }       flat page, non-uniform leaf chunking
 //!    `- Nested { row_starts, .. }   repetition present; rows tracked as prefix sums
 //! ```
-//!
-//! Chunk byte ranges and row->chunk lookups are O(1) (uniform flat) or
-//! O(log n) (everything else), and the [`DeepSizeOf`] impl accounts for every
-//! retained buffer.
 
 use std::ops::Range;
 
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use lance_core::cache::{Context, DeepSizeOf};
 
-/// A cumulative (prefix-sum) array, stored as `u32` when the grand total fits
-/// and `u64` otherwise.  The array has length `num_chunks + 1`: entry `0` is
-/// `0`, entry `i` is the sum of the first `i` chunk deltas, and the final entry
-/// is the grand total.
+/// Cumulative (prefix-sum) array of length `num_chunks + 1` (entry `0` is `0`,
+/// the last entry is the grand total).  Stored as `u32` when the total fits,
+/// else `u64`.
 #[derive(Debug)]
 pub enum PrefixSums {
     U32(Vec<u32>),
@@ -45,9 +33,8 @@ pub enum PrefixSums {
 }
 
 impl PrefixSums {
-    /// Builds a cumulative array from per-chunk `deltas`.  `total` (the sum of
-    /// all deltas) selects the storage width, so callers must pass an accurate
-    /// total.  `num_chunks` is used only to pre-size the allocation.
+    /// Builds the cumulative array from per-chunk `deltas`.  `total` selects the
+    /// storage width (callers must pass the true sum); `num_chunks` only pre-sizes.
     pub fn from_deltas(deltas: impl Iterator<Item = u64>, num_chunks: usize, total: u64) -> Self {
         if total <= u32::MAX as u64 {
             let mut values = Vec::with_capacity(num_chunks + 1);
@@ -74,10 +61,9 @@ impl PrefixSums {
         }
     }
 
-    /// Builds a `PrefixSums` from an already-cumulative array (`[0, .., total]`,
-    /// length `num_chunks + 1`), narrowing to `u32` storage when the grand total
-    /// (the last entry) fits.  Unlike [`Self::from_deltas`], the caller has
-    /// already run the sum, so no intermediate deltas buffer is needed.
+    /// Builds a `PrefixSums` from an already-cumulative array (`[0, .., total]`),
+    /// narrowing to `u32` when the total fits.  Avoids the deltas buffer
+    /// [`Self::from_deltas`] would need.
     fn from_prefix(prefix: Vec<u64>) -> Self {
         debug_assert!(!prefix.is_empty());
         debug_assert_eq!(prefix[0], 0);
@@ -97,9 +83,8 @@ impl PrefixSums {
         }
     }
 
-    /// Cumulative values at positions `i` and `i + 1` (the start and end of
-    /// chunk `i`) read behind a single width match, halving the branching of
-    /// two separate `get` calls on the hot per-chunk path.
+    /// Start and end of chunk `i` (positions `i`, `i + 1`) behind one width
+    /// match -- halves the branching of two `get` calls on the hot per-chunk path.
     pub fn get_pair(&self, i: usize) -> (u64, u64) {
         match self {
             Self::U32(values) => (values[i] as u64, values[i + 1] as u64),
@@ -122,18 +107,12 @@ impl PrefixSums {
     }
 
     /// Index of the chunk whose half-open span `[get(i), get(i+1))` contains
-    /// `value`.  On an exact match against a chunk start, returns the first
-    /// chunk with that start (matching the previous repetition-index behavior
-    /// where several chunks can share a start row).
+    /// `value`.  On an exact hit against a chunk start, returns the *first* chunk
+    /// with that start (chunks can share a start row).
     pub fn find(&self, value: u64) -> usize {
-        // Search only the chunk starts, excluding the trailing grand total.  We
-        // match on the storage width once (instead of per probe through `get`)
-        // and let `partition_point` run a branch-light binary search over the
-        // concrete slice.  `partition_point` returns the first index whose start
-        // is `>= value`, which is already the first of any duplicated starts, so
-        // no back-walk is needed.  When no start reaches `value`, `value` lies
-        // strictly inside the preceding chunk; that index is always >= 1 because
-        // `get(0) == 0 <= value`.
+        // Match the width once, then binary-search only the starts (not the
+        // trailing total).  `partition_point` already yields the first of any
+        // duplicated starts; the `idx - 1` fallback is safe since `get(0) == 0`.
         match self {
             Self::U32(values) => {
                 let starts = &values[..values.len() - 1];
@@ -166,9 +145,8 @@ impl DeepSizeOf for PrefixSums {
     }
 }
 
-/// Number of leaf values (items) in each chunk, needed to decode a chunk.  This
-/// is only tracked separately for nested pages; flat pages read item counts off
-/// their row mapping (rows == items).
+/// Leaf value counts per chunk, needed to decode.  Tracked only for nested
+/// pages; flat pages read items off the row mapping (rows == items).
 #[derive(Debug)]
 pub enum ItemCounts {
     /// Every non-last chunk holds the same number of values.
@@ -222,11 +200,9 @@ impl DeepSizeOf for ItemCounts {
 
 /// How row ranges map onto chunks.
 ///
-/// Flat pages (no repetition) have row index == value index and never carry a
-/// preamble or trailer.  Nested pages track rows (lists) separately from leaf
-/// items and record, per chunk, whether it ends with a partial list (a
-/// trailer); the presence of a preamble is derived from the previous chunk's
-/// trailer.
+/// Flat pages have row == value index and no preamble/trailer.  Nested pages
+/// track rows separately from leaf items and store a trailer bit per chunk; a
+/// chunk's preamble is the previous chunk's trailer.
 #[derive(Debug)]
 pub enum RowMapping {
     /// Flat page whose non-last chunks all hold `values_per_chunk` values, so
@@ -425,21 +401,14 @@ impl DeepSizeOf for MiniBlockChunkIndex {
 
 /// Parses a mini-block repetition index into the compact nested row mapping.
 ///
-/// The bytes hold `u64` values in groups of `stride`; the first two of each
-/// group are the number of lists that finish in the chunk (`ends`) and the
-/// number of leftover items after the last finished list (`partial`).  This
-/// reproduces the previous decode exactly while storing only cumulative row
-/// starts and a trailer bit per chunk:
-///
-///  - `starts_including_trailer[i] = ends + has_trailer - has_preamble`, and
-///    `row_starts` is its prefix sum (Invariant 1);
-///  - `has_preamble[i] = has_trailer[i-1]`, so only `has_trailer` is stored
-///    (Invariant 2).
+/// Bytes are `u64`s in groups of `stride`; the first two are `ends` (lists
+/// finishing in the chunk) and `partial` (leftover items).  Only cumulative row
+/// starts and a trailer bit are kept: `has_preamble[i] = has_trailer[i-1]` and
+/// `starts_including_trailer = ends + has_trailer - has_preamble`.
 pub fn parse_nested_rep(rep_bytes: &[u8], stride: usize) -> (PrefixSums, BooleanBuffer) {
-    // The rep index is a little-endian `[u64]`; read the two words we need per
-    // group directly from the bytes so we don't copy the whole buffer just to
-    // reinterpret it.  `rep_bytes.len()` is a multiple of 8 (asserted by the
-    // caller), so slicing 8-byte windows is always in bounds.
+    // Read the two `u64`s per group straight from the little-endian bytes rather
+    // than copying the buffer to reinterpret it.  The caller guarantees
+    // `rep_bytes.len() % 8 == 0`, so the 8-byte windows stay in bounds.
     const WORD: usize = std::mem::size_of::<u64>();
     let read_word = |word_idx: usize| -> u64 {
         let byte = word_idx * WORD;
