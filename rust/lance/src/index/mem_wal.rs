@@ -16,7 +16,10 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails, MergedGeneration};
+use lance_index::mem_wal::{
+    IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails, MergedGeneration,
+    ShardingSpec,
+};
 use lance_table::format::{IndexMetadata, pb};
 use uuid::Uuid;
 
@@ -36,6 +39,42 @@ pub(crate) fn load_mem_wal_index_details(index: IndexMetadata) -> Result<MemWalI
     } else {
         Err(Error::index("Index details not found for the MemWAL index"))
     }
+}
+
+/// Serialize a `__mem_wal` index's details to JSON for `describe_indices`.
+///
+/// Mirrors `vector_details_as_json`: decode the stored `Any`, then emit a
+/// curated JSON view. The raw `inline_snapshots` bytes are deliberately omitted
+/// (only their size is reported) — they are serialized shard-snapshot file
+/// bytes, not human-inspectable state, and can be large.
+pub(crate) fn mem_wal_details_as_json(any: &prost_types::Any) -> Result<String> {
+    let details = MemWalIndexDetails::try_from(any.to_msg::<pb::MemWalIndexDetails>()?)?;
+
+    #[derive(serde::Serialize)]
+    struct MemWalDetailsJson<'a> {
+        snapshot_ts_millis: i64,
+        num_shards: u32,
+        inline_snapshot_bytes: Option<usize>,
+        sharding_specs: &'a [ShardingSpec],
+        maintained_indexes: &'a [String],
+        merged_generations: &'a [MergedGeneration],
+        index_catchup: &'a [IndexCatchupProgress],
+        writer_config_defaults: &'a std::collections::HashMap<String, String>,
+    }
+
+    let view = MemWalDetailsJson {
+        snapshot_ts_millis: details.snapshot_ts_millis,
+        num_shards: details.num_shards,
+        inline_snapshot_bytes: details.inline_snapshots.as_ref().map(Vec::len),
+        sharding_specs: &details.sharding_specs,
+        maintained_indexes: &details.maintained_indexes,
+        merged_generations: &details.merged_generations,
+        index_catchup: &details.index_catchup,
+        writer_config_defaults: &details.writer_config_defaults,
+    };
+
+    serde_json::to_string(&view)
+        .map_err(|e| Error::index(format!("failed to serialize MemWAL index details: {e}")))
 }
 
 /// Open the MemWAL index from its metadata.
@@ -563,6 +602,20 @@ mod tests {
             descriptions.len(),
             2,
             "both the real scalar index and __mem_wal must be listed"
+        );
+
+        // details() decodes the WAL state instead of returning "{}"; the raw
+        // inline_snapshots bytes must never be serialized into the JSON.
+        let details_json = mem_wal_desc.details().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&details_json).unwrap();
+        assert_eq!(
+            v["merged_generations"].as_array().unwrap().len(),
+            1,
+            "the committed merged generation must appear in details"
+        );
+        assert!(
+            v.get("inline_snapshots").is_none(),
+            "raw snapshot bytes must never be serialized into details"
         );
     }
 }
