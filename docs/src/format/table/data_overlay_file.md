@@ -59,9 +59,8 @@ ignored, regardless of commit order.
 An overlay's data file stores **one value column per field**, in the order of
 `data_file.fields`. It does **not** store a row-offset key column. The position of
 a covered offset's value within its column is the **rank** of that offset in the
-field's coverage bitmap — the number of set bits below it. For a Roaring bitmap
-this is an O(1) operation, so random access to any cell is a rank computation
-followed by a single value fetch, with no offset column to read and no binary
+field's coverage bitmap — the number of set bits below it. Resolving a cell is a
+rank lookup plus one value fetch, with no separate offset column to store or
 search.
 
 Because different fields may cover different offset sets, the value columns of a
