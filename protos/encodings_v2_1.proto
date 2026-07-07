@@ -178,13 +178,16 @@ message SparseLayout {
 message SparseStructuralLayer {
   enum Kind {
     SPARSE_LAYER_UNSPECIFIED = 0;
-    // A nullable item / struct layer. Null slots are recorded in the parent slot domain.
+    // A nullable item / struct layer. Validity positions are recorded in the parent slot domain.
     SPARSE_LAYER_VALIDITY = 1;
     // A list-like layer. Non-empty parent slots map to child ranges; missing valid slots are empty.
     SPARSE_LAYER_LIST = 2;
     // A fixed-size-list layer. Child ranges are deterministic from fixed_size_list_dimension.
     SPARSE_LAYER_FIXED_SIZE_LIST = 3;
   }
+
+  reserved 6;
+  reserved "null_positions";
 
   Kind kind = 1;
   // Number of slots in this layer's parent domain.
@@ -196,10 +199,23 @@ message SparseStructuralLayer {
   SparsePositionSet non_empty_positions = 4;
   // Semantic representation for LIST child counts. Required for LIST and absent otherwise.
   SparseCountSet counts = 5;
-  // Semantic representation for null slots. Required for all sparse structural layers.
-  SparsePositionSet null_positions = 6;
   // Fixed list dimension. Required for FIXED_SIZE_LIST and zero otherwise.
   uint64 fixed_size_list_dimension = 7;
+  // Semantic representation for validity. Required for all sparse structural layers.
+  SparseValiditySet validity = 8;
+}
+
+message SparseValiditySet {
+  enum Meaning {
+    SPARSE_VALIDITY_UNSPECIFIED = 0;
+    // Positions are null exceptions in an otherwise valid slot domain.
+    SPARSE_VALIDITY_NULL_POSITIONS = 1;
+    // Positions are valid exceptions in an otherwise null slot domain.
+    SPARSE_VALIDITY_VALID_POSITIONS = 2;
+  }
+
+  Meaning meaning = 1;
+  SparsePositionSet positions = 2;
 }
 
 message SparsePositionEmpty {}

@@ -247,6 +247,351 @@ impl SparsePositionSet {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SparseValidityMeaning {
+    NullPositions,
+    ValidPositions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SparseValiditySet {
+    pub(crate) meaning: SparseValidityMeaning,
+    pub(crate) positions: SparsePositionSet,
+}
+
+#[derive(Clone, Copy)]
+struct PositionSetStats {
+    count: u64,
+    first: u64,
+    last: u64,
+    is_contiguous: bool,
+}
+
+impl Default for PositionSetStats {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            first: 0,
+            last: 0,
+            is_contiguous: true,
+        }
+    }
+}
+
+impl PositionSetStats {
+    fn observe(&mut self, position: u64) {
+        if self.count == 0 {
+            self.first = position;
+        } else if self.last + 1 != position {
+            self.is_contiguous = false;
+        }
+        self.last = position;
+        self.count += 1;
+    }
+
+    fn encoded_cost(&self, domain_len: u64) -> u64 {
+        if self.count == 0 || self.count == domain_len || self.is_contiguous {
+            0
+        } else {
+            self.count
+        }
+    }
+
+    fn to_set(
+        self,
+        validity: &BooleanBuffer,
+        want_valid: bool,
+        domain_len: u64,
+        label: &str,
+    ) -> Result<SparsePositionSet> {
+        if self.count == 0 {
+            return Ok(SparsePositionSet::empty());
+        }
+        if self.count == domain_len {
+            return Ok(SparsePositionSet::all(domain_len));
+        }
+        if self.is_contiguous {
+            return Ok(SparsePositionSet::range(self.first, self.count));
+        }
+
+        let len = usize::try_from(self.count).map_err(|_| {
+            Error::invalid_input_source(
+                format!("Sparse structural {label} positions exceed usize::MAX").into(),
+            )
+        })?;
+        let mut positions = Vec::with_capacity(len);
+        for (idx, is_valid) in validity.iter().enumerate() {
+            if is_valid == want_valid {
+                positions.push(idx as u64);
+            }
+        }
+        SparsePositionSet::from_positions(positions, domain_len, label)
+    }
+}
+
+impl SparseValiditySet {
+    pub(crate) fn from_validity(
+        validity: Option<&BooleanBuffer>,
+        num_values: usize,
+        label: &str,
+    ) -> Result<Self> {
+        let Some(validity) = validity else {
+            return Ok(Self {
+                meaning: SparseValidityMeaning::NullPositions,
+                positions: SparsePositionSet::empty(),
+            });
+        };
+        if validity.len() != num_values {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural {label} validity length {} does not match {} slots",
+                    validity.len(),
+                    num_values
+                )
+                .into(),
+            ));
+        }
+
+        let domain_len = num_values as u64;
+        let mut valid_stats = PositionSetStats::default();
+        let mut null_stats = PositionSetStats::default();
+        for (idx, is_valid) in validity.iter().enumerate() {
+            if is_valid {
+                valid_stats.observe(idx as u64);
+            } else {
+                null_stats.observe(idx as u64);
+            }
+        }
+
+        if null_stats.count == 0 {
+            return Ok(Self {
+                meaning: SparseValidityMeaning::NullPositions,
+                positions: SparsePositionSet::empty(),
+            });
+        }
+        if valid_stats.count == 0 {
+            return Ok(Self {
+                meaning: SparseValidityMeaning::ValidPositions,
+                positions: SparsePositionSet::empty(),
+            });
+        }
+
+        let valid_cost = valid_stats.encoded_cost(domain_len);
+        let null_cost = null_stats.encoded_cost(domain_len);
+        if valid_cost < null_cost {
+            Ok(Self {
+                meaning: SparseValidityMeaning::ValidPositions,
+                positions: valid_stats.to_set(validity, true, domain_len, label)?,
+            })
+        } else {
+            Ok(Self {
+                meaning: SparseValidityMeaning::NullPositions,
+                positions: null_stats.to_set(validity, false, domain_len, label)?,
+            })
+        }
+    }
+
+    pub(crate) fn is_all_valid(&self, num_slots: u64, label: &str) -> Result<bool> {
+        self.positions.validate_domain(num_slots, label)?;
+        Ok(match self.meaning {
+            SparseValidityMeaning::NullPositions => self.positions.is_empty(),
+            SparseValidityMeaning::ValidPositions => self.positions.len() == num_slots,
+        })
+    }
+
+    pub(crate) fn deep_size(&self) -> usize {
+        self.positions.deep_size()
+    }
+
+    fn append_to(&self, validity: &mut BooleanBufferBuilder, num_slots: u64) -> Result<()> {
+        self.positions.validate_domain(num_slots, "validity")?;
+        match (self.meaning, &self.positions) {
+            (SparseValidityMeaning::NullPositions, SparsePositionSet::Empty) => {
+                validity.append_n(num_slots as usize, true);
+            }
+            (SparseValidityMeaning::ValidPositions, SparsePositionSet::Empty) => {
+                validity.append_n(num_slots as usize, false);
+            }
+            (SparseValidityMeaning::NullPositions, SparsePositionSet::All { .. }) => {
+                validity.append_n(num_slots as usize, false);
+            }
+            (SparseValidityMeaning::ValidPositions, SparsePositionSet::All { .. }) => {
+                validity.append_n(num_slots as usize, true);
+            }
+            (meaning, SparsePositionSet::Range { start, len }) => {
+                let range_end = start.checked_add(*len).ok_or_else(|| {
+                    Error::invalid_input_source("Sparse structural validity range overflows".into())
+                })?;
+                let default_valid = matches!(meaning, SparseValidityMeaning::NullPositions);
+                let range_valid = !default_valid;
+                validity.append_n(*start as usize, default_valid);
+                validity.append_n(*len as usize, range_valid);
+                validity.append_n((num_slots - range_end) as usize, default_valid);
+            }
+            (_, SparsePositionSet::Explicit(_)) => {
+                let mut cursor = SparseValidityCursor::new(self, num_slots, "validity")?;
+                for slot in 0..num_slots {
+                    validity.append(cursor.is_valid(slot)?);
+                }
+                cursor.finish()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn to_validity_buffer(&self, num_slots: u64) -> Result<BooleanBuffer> {
+        let mut validity = BooleanBufferBuilder::new(num_slots as usize);
+        self.append_to(&mut validity, num_slots)?;
+        Ok(validity.finish())
+    }
+}
+
+impl SparsePositionSet {
+    fn validate_domain(&self, domain_len: u64, label: &str) -> Result<()> {
+        match self {
+            Self::Empty => {}
+            Self::All { len } => {
+                if *len != domain_len {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} all set length {} does not match domain {}",
+                            len, domain_len
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            Self::Range { start, len } => {
+                let end = start.checked_add(*len).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!("Sparse structural {label} range overflows").into(),
+                    )
+                })?;
+                if end > domain_len {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} range {}..{} is outside domain {}",
+                            start, end, domain_len
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            Self::Explicit(positions) => {
+                for window in positions.windows(2) {
+                    if window[0] >= window[1] {
+                        return Err(Error::invalid_input_source(
+                            format!(
+                                "Sparse structural {label} positions must be strictly increasing"
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+                if let Some(position) = positions.last()
+                    && *position >= domain_len
+                {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} position {} is outside layer with {} slots",
+                            position, domain_len
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct SparsePositionSetCursor<'a> {
+    set: &'a SparsePositionSet,
+    explicit: Option<std::iter::Peekable<std::slice::Iter<'a, u64>>>,
+}
+
+impl<'a> SparsePositionSetCursor<'a> {
+    fn new(set: &'a SparsePositionSet, domain_len: u64, label: &str) -> Result<Self> {
+        set.validate_domain(domain_len, label)?;
+        let explicit = match set {
+            SparsePositionSet::Explicit(positions) => Some(positions.iter().peekable()),
+            _ => None,
+        };
+        Ok(Self { set, explicit })
+    }
+
+    fn contains(&mut self, slot: u64) -> Result<bool> {
+        Ok(match self.set {
+            SparsePositionSet::Empty => false,
+            SparsePositionSet::All { .. } => true,
+            SparsePositionSet::Range { start, len } => slot >= *start && slot < *start + *len,
+            SparsePositionSet::Explicit(_) => {
+                let iter = self.explicit.as_mut().ok_or_else(|| {
+                    Error::internal("Sparse structural explicit cursor is missing".to_string())
+                })?;
+                if let Some(position) = iter.peek()
+                    && **position < slot
+                {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Sparse structural explicit position {} was skipped before slot {}",
+                            **position, slot
+                        )
+                        .into(),
+                    ));
+                }
+                if iter.peek().is_some_and(|position| **position == slot) {
+                    iter.next();
+                    true
+                } else {
+                    false
+                }
+            }
+        })
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(iter) = self.explicit.as_mut()
+            && let Some(position) = iter.next()
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Sparse structural explicit position {} was not consumed",
+                    position
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct SparseValidityCursor<'a> {
+    meaning: SparseValidityMeaning,
+    positions: SparsePositionSetCursor<'a>,
+}
+
+impl<'a> SparseValidityCursor<'a> {
+    fn new(validity: &'a SparseValiditySet, domain_len: u64, label: &str) -> Result<Self> {
+        Ok(Self {
+            meaning: validity.meaning,
+            positions: SparsePositionSetCursor::new(&validity.positions, domain_len, label)?,
+        })
+    }
+
+    fn is_valid(&mut self, slot: u64) -> Result<bool> {
+        let is_stored = self.positions.contains(slot)?;
+        Ok(match self.meaning {
+            SparseValidityMeaning::NullPositions => !is_stored,
+            SparseValidityMeaning::ValidPositions => is_stored,
+        })
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.positions.finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SparseCountSet {
     Empty,
@@ -333,19 +678,19 @@ impl SparseCountSet {
 pub(crate) enum SparseStructuralLayerPlan {
     Validity {
         num_slots: u64,
-        null_positions: SparsePositionSet,
+        validity: SparseValiditySet,
     },
     List {
         num_slots: u64,
         num_child_slots: u64,
         non_empty_positions: SparsePositionSet,
         counts: SparseCountSet,
-        null_positions: SparsePositionSet,
+        validity: SparseValiditySet,
     },
     FixedSizeList {
         num_slots: u64,
         dimension: u64,
-        null_positions: SparsePositionSet,
+        validity: SparseValiditySet,
     },
 }
 
@@ -356,42 +701,40 @@ impl SparseStructuralPlan {
             match layer {
                 SparseStructuralLayerPlan::Validity {
                     num_slots,
-                    null_positions,
+                    validity,
                 } => {
-                    if null_positions.is_empty() {
+                    if validity.is_all_valid(*num_slots, "validity")? {
                         builder.add_no_null(*num_slots as usize);
                     } else {
-                        let validity = validity_from_null_positions(*num_slots, null_positions)?;
-                        builder.add_validity_bitmap(NullBuffer::new(validity));
+                        builder.add_validity_bitmap(NullBuffer::new(
+                            validity.to_validity_buffer(*num_slots)?,
+                        ));
                     }
                 }
                 SparseStructuralLayerPlan::List {
                     num_slots,
                     non_empty_positions,
                     counts,
-                    null_positions,
+                    validity,
                     ..
                 } => {
                     let (offsets, validity) = list_offsets_and_validity(
                         *num_slots,
                         non_empty_positions,
                         counts,
-                        null_positions,
+                        validity,
                     )?;
                     builder.add_offsets(offsets, validity);
                 }
                 SparseStructuralLayerPlan::FixedSizeList {
                     num_slots,
                     dimension,
-                    null_positions,
+                    validity,
                 } => {
-                    let validity = if null_positions.is_empty() {
+                    let validity = if validity.is_all_valid(*num_slots, "fixed-size-list")? {
                         None
                     } else {
-                        Some(NullBuffer::new(validity_from_null_positions(
-                            *num_slots,
-                            null_positions,
-                        )?))
+                        Some(NullBuffer::new(validity.to_validity_buffer(*num_slots)?))
                     };
                     builder.add_fsl(validity, *dimension as usize, *num_slots as usize);
                 }
@@ -401,41 +744,14 @@ impl SparseStructuralPlan {
     }
 }
 
-fn validity_from_null_positions(
-    num_slots: u64,
-    null_positions: &SparsePositionSet,
-) -> Result<BooleanBuffer> {
-    let null_positions = null_positions.materialize()?;
-    let mut validity = BooleanBufferBuilder::new(num_slots as usize);
-    let mut null_iter = null_positions.iter().copied().peekable();
-    for slot in 0..num_slots {
-        let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
-        if is_null {
-            null_iter.next();
-        }
-        validity.append(!is_null);
-    }
-    if let Some(extra_null) = null_iter.next() {
-        return Err(Error::invalid_input_source(
-            format!(
-                "Sparse structural null position {} is outside layer with {} slots",
-                extra_null, num_slots
-            )
-            .into(),
-        ));
-    }
-    Ok(validity.finish())
-}
-
 fn list_offsets_and_validity(
     num_slots: u64,
     non_empty_positions: &SparsePositionSet,
     counts: &SparseCountSet,
-    null_positions: &SparsePositionSet,
+    validity: &SparseValiditySet,
 ) -> Result<(OffsetBuffer<i64>, Option<NullBuffer>)> {
     let non_empty_positions = non_empty_positions.materialize()?;
     let counts = counts.materialize()?;
-    let null_positions = null_positions.materialize()?;
     if non_empty_positions.len() != counts.len() {
         return Err(Error::invalid_input_source(
             format!(
@@ -448,23 +764,20 @@ fn list_offsets_and_validity(
     }
 
     let mut offsets = Vec::with_capacity(num_slots as usize + 1);
-    let mut validity =
-        (!null_positions.is_empty()).then(|| BooleanBufferBuilder::new(num_slots as usize));
+    let mut validity_builder = (!validity.is_all_valid(num_slots, "list validity")?)
+        .then(|| BooleanBufferBuilder::new(num_slots as usize));
     let mut non_empty_iter = non_empty_positions
         .iter()
         .copied()
         .zip(counts.iter().copied())
         .peekable();
-    let mut null_iter = null_positions.iter().copied().peekable();
+    let mut validity_cursor = SparseValidityCursor::new(validity, num_slots, "list validity")?;
     let mut current_offset = 0_i64;
     offsets.push(current_offset);
     for slot in 0..num_slots {
-        let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
-        if is_null {
-            null_iter.next();
-        }
-        if let Some(validity) = validity.as_mut() {
-            validity.append(!is_null);
+        let is_valid = validity_cursor.is_valid(slot)?;
+        if let Some(validity_builder) = validity_builder.as_mut() {
+            validity_builder.append(is_valid);
         }
 
         if non_empty_iter
@@ -472,10 +785,10 @@ fn list_offsets_and_validity(
             .is_some_and(|(non_empty_pos, _)| *non_empty_pos == slot)
         {
             let (_, count) = non_empty_iter.next().unwrap();
-            if is_null {
+            if !is_valid {
                 return Err(Error::invalid_input_source(
                     format!(
-                        "Sparse structural list slot {} is both null and non-empty",
+                        "Sparse structural list slot {} is both invalid and non-empty",
                         slot
                     )
                     .into(),
@@ -495,6 +808,7 @@ fn list_offsets_and_validity(
         }
         offsets.push(current_offset);
     }
+    validity_cursor.finish()?;
     if let Some((extra_pos, _)) = non_empty_iter.next() {
         return Err(Error::invalid_input_source(
             format!(
@@ -504,19 +818,10 @@ fn list_offsets_and_validity(
             .into(),
         ));
     }
-    if let Some(extra_null) = null_iter.next() {
-        return Err(Error::invalid_input_source(
-            format!(
-                "Sparse structural null position {} is outside layer with {} slots",
-                extra_null, num_slots
-            )
-            .into(),
-        ));
-    }
 
     Ok((
         OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets)),
-        validity.map(|mut validity| NullBuffer::new(validity.finish())),
+        validity_builder.map(|mut validity| NullBuffer::new(validity.finish())),
     ))
 }
 
@@ -548,11 +853,22 @@ impl SparseStructuralUnraveler {
 
     fn is_all_valid(&self) -> bool {
         match self.current_layer() {
-            Some(SparseStructuralLayerPlan::Validity { null_positions, .. })
-            | Some(SparseStructuralLayerPlan::FixedSizeList { null_positions, .. })
-            | Some(SparseStructuralLayerPlan::List { null_positions, .. }) => {
-                null_positions.is_empty()
-            }
+            Some(SparseStructuralLayerPlan::Validity {
+                num_slots,
+                validity,
+            })
+            | Some(SparseStructuralLayerPlan::FixedSizeList {
+                num_slots,
+                validity,
+                ..
+            })
+            | Some(SparseStructuralLayerPlan::List {
+                num_slots,
+                validity,
+                ..
+            }) => validity
+                .is_all_valid(*num_slots, "validity")
+                .unwrap_or(false),
             None => true,
         }
     }
@@ -577,45 +893,18 @@ impl SparseStructuralUnraveler {
         }
     }
 
-    fn append_validity(
-        validity: &mut BooleanBufferBuilder,
-        num_slots: u64,
-        null_positions: &SparsePositionSet,
-    ) {
-        match null_positions {
-            SparsePositionSet::Empty => validity.append_n(num_slots as usize, true),
-            SparsePositionSet::All { .. } => validity.append_n(num_slots as usize, false),
-            SparsePositionSet::Range { start, len } => {
-                validity.append_n(*start as usize, true);
-                validity.append_n(*len as usize, false);
-                let end = start + len;
-                validity.append_n((num_slots - end) as usize, true);
-            }
-            SparsePositionSet::Explicit(null_positions) => {
-                let mut null_iter = null_positions.iter().copied().peekable();
-                for slot in 0..num_slots {
-                    let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
-                    if is_null {
-                        null_iter.next();
-                    }
-                    validity.append(!is_null);
-                }
-            }
-        }
-    }
-
-    fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
+    fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) -> Result<()> {
         match self.current_layer() {
             Some(SparseStructuralLayerPlan::Validity {
                 num_slots,
-                null_positions,
+                validity: layer_validity,
             })
             | Some(SparseStructuralLayerPlan::FixedSizeList {
                 num_slots,
-                null_positions,
+                validity: layer_validity,
                 ..
             }) => {
-                Self::append_validity(validity, *num_slots, null_positions);
+                layer_validity.append_to(validity, *num_slots)?;
                 self.consume_current_layer();
             }
             None => {
@@ -625,6 +914,7 @@ impl SparseStructuralUnraveler {
                 unreachable!("Sparse structural list layer cannot be unraveled as validity")
             }
         }
+        Ok(())
     }
 
     fn decimate(&mut self, dimension: usize) {
@@ -660,7 +950,7 @@ impl SparseStructuralUnraveler {
             num_child_slots,
             non_empty_positions,
             counts,
-            null_positions,
+            validity: layer_validity,
             ..
         }) = self.current_layer()
         else {
@@ -700,7 +990,7 @@ impl SparseStructuralUnraveler {
 
         if non_empty_positions.is_empty() {
             if let Some(validity) = validity {
-                Self::append_validity(validity, *num_slots, null_positions);
+                layer_validity.append_to(validity, *num_slots)?;
             }
             let offset = Self::to_offset(current_offset)?;
             offsets.resize(offsets.len() + *num_slots as usize, offset);
@@ -710,21 +1000,18 @@ impl SparseStructuralUnraveler {
 
         let non_empty_positions = non_empty_positions.materialize()?;
         let counts = counts.materialize()?;
-        let null_positions = null_positions.materialize()?;
         let mut non_empty_iter = non_empty_positions
             .iter()
             .copied()
             .zip(counts.iter().copied())
             .peekable();
-        let mut null_iter = null_positions.iter().copied().peekable();
+        let mut validity_cursor =
+            SparseValidityCursor::new(layer_validity, *num_slots, "list validity")?;
         let mut validity = validity;
         for slot in 0..*num_slots {
-            let is_null = null_iter.peek().is_some_and(|null_pos| *null_pos == slot);
-            if is_null {
-                null_iter.next();
-            }
+            let is_valid = validity_cursor.is_valid(slot)?;
             if let Some(validity) = validity.as_mut() {
-                validity.append(!is_null);
+                validity.append(is_valid);
             }
 
             if non_empty_iter
@@ -732,10 +1019,10 @@ impl SparseStructuralUnraveler {
                 .is_some_and(|(non_empty_pos, _)| *non_empty_pos == slot)
             {
                 let (_, count) = non_empty_iter.next().unwrap();
-                if is_null {
+                if !is_valid {
                     return Err(Error::invalid_input_source(
                         format!(
-                            "Sparse structural list slot {} is both null and non-empty",
+                            "Sparse structural list slot {} is both invalid and non-empty",
                             slot
                         )
                         .into(),
@@ -749,20 +1036,12 @@ impl SparseStructuralUnraveler {
             }
             offsets.push(Self::to_offset(current_offset)?);
         }
+        validity_cursor.finish()?;
         if let Some((extra_pos, _)) = non_empty_iter.next() {
             return Err(Error::invalid_input_source(
                 format!(
                     "Sparse structural non-empty position {} is outside layer with {} slots",
                     extra_pos, num_slots
-                )
-                .into(),
-            ));
-        }
-        if let Some(extra_null) = null_iter.next() {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse structural null position {} is outside layer with {} slots",
-                    extra_null, num_slots
                 )
                 .into(),
             ));
@@ -2132,18 +2411,6 @@ impl RepDefBuilder {
         Ok(Some(plan))
     }
 
-    fn null_positions(validity: Option<&BooleanBuffer>, num_values: usize) -> Vec<u64> {
-        if let Some(validity) = validity {
-            validity
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, is_valid)| (!is_valid).then_some(idx as u64))
-                .collect()
-        } else {
-            Vec::with_capacity(num_values)
-        }
-    }
-
     fn raw_layer_to_sparse(layer: RawRepDef) -> Result<SparseStructuralLayerPlan> {
         Ok(match layer {
             RawRepDef::Validity(ValidityDesc {
@@ -2151,10 +2418,10 @@ impl RepDefBuilder {
                 num_values,
             }) => SparseStructuralLayerPlan::Validity {
                 num_slots: num_values as u64,
-                null_positions: SparsePositionSet::from_positions(
-                    Self::null_positions(validity.as_ref(), num_values),
-                    num_values as u64,
-                    "validity null",
+                validity: SparseValiditySet::from_validity(
+                    validity.as_ref(),
+                    num_values,
+                    "validity",
                 )?,
             },
             RawRepDef::Fsl(FslDesc {
@@ -2164,10 +2431,10 @@ impl RepDefBuilder {
             }) => SparseStructuralLayerPlan::FixedSizeList {
                 num_slots: num_values as u64,
                 dimension: dimension as u64,
-                null_positions: SparsePositionSet::from_positions(
-                    Self::null_positions(validity.as_ref(), num_values),
-                    num_values as u64,
-                    "fixed-size-list null",
+                validity: SparseValiditySet::from_validity(
+                    validity.as_ref(),
+                    num_values,
+                    "fixed-size-list",
                 )?,
             },
             RawRepDef::Offsets(OffsetDesc {
@@ -2178,14 +2445,10 @@ impl RepDefBuilder {
             }) => {
                 let mut non_empty_positions = Vec::new();
                 let mut counts = Vec::new();
-                let mut null_positions = Vec::new();
                 for slot in 0..num_values {
                     let is_valid = validity
                         .as_ref()
                         .is_none_or(|validity| validity.value(slot));
-                    if !is_valid {
-                        null_positions.push(slot as u64);
-                    }
                     let len = offsets[slot + 1] - offsets[slot];
                     if is_valid && len > 0 {
                         non_empty_positions.push(slot as u64);
@@ -2206,10 +2469,10 @@ impl RepDefBuilder {
                         "list non-empty",
                     )?,
                     counts: SparseCountSet::from_counts(counts),
-                    null_positions: SparsePositionSet::from_positions(
-                        null_positions,
-                        num_values as u64,
-                        "list null",
+                    validity: SparseValiditySet::from_validity(
+                        validity.as_ref(),
+                        num_values,
+                        "list",
                     )?,
                 }
             }
@@ -2581,16 +2844,15 @@ impl RepDefUnraveler {
     }
 
     /// Unravels a layer of validity from the definition levels
-    pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
+    pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) -> Result<()> {
         if let Some(sparse) = self.sparse.as_mut() {
-            sparse.unravel_validity(validity);
-            return;
+            return sparse.unravel_validity(validity);
         }
         let meaning = self.def_meaning[self.current_layer];
         if meaning == DefinitionInterpretation::AllValidItem || self.def_levels.is_none() {
             self.current_layer += 1;
             validity.append_n(self.num_items as usize, true);
-            return;
+            return Ok(());
         }
 
         self.current_layer += 1;
@@ -2608,6 +2870,7 @@ impl RepDefUnraveler {
         }) {
             validity.append(is_valid);
         }
+        Ok(())
     }
 
     pub fn decimate(&mut self, dimension: usize) {
@@ -2671,7 +2934,7 @@ impl CompositeRepDefUnraveler {
     /// Unravels a layer of validity
     ///
     /// Returns None if there are no null items in this layer
-    pub fn unravel_validity(&mut self, num_values: usize) -> Option<NullBuffer> {
+    pub fn unravel_validity(&mut self, num_values: usize) -> Result<Option<NullBuffer>> {
         let is_all_valid = self
             .unravelers
             .iter()
@@ -2681,13 +2944,13 @@ impl CompositeRepDefUnraveler {
             for unraveler in self.unravelers.iter_mut() {
                 unraveler.skip_validity();
             }
-            None
+            Ok(None)
         } else {
             let mut validity = BooleanBufferBuilder::new(num_values);
             for unraveler in self.unravelers.iter_mut() {
-                unraveler.unravel_validity(&mut validity);
+                unraveler.unravel_validity(&mut validity)?;
             }
-            Some(NullBuffer::new(validity.finish()))
+            Ok(Some(NullBuffer::new(validity.finish())))
         }
     }
 
@@ -2695,7 +2958,7 @@ impl CompositeRepDefUnraveler {
         &mut self,
         num_values: usize,
         dimension: usize,
-    ) -> Option<NullBuffer> {
+    ) -> Result<Option<NullBuffer>> {
         for unraveler in self.unravelers.iter_mut() {
             unraveler.decimate(dimension);
         }
@@ -3492,7 +3755,7 @@ mod tests {
         // Note: validity doesn't exactly round-trip because repdef normalizes some of the
         // redundant validity values
         assert_eq!(
-            unraveler.unravel_validity(9),
+            unraveler.unravel_validity(9).unwrap(),
             Some(validity(&[
                 true, true, true, false, false, false, true, true, false
             ]))
@@ -3630,14 +3893,14 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, false, false, false, false
             ]))
         );
-        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2).unwrap(), None);
         assert_eq!(
-            unraveler.unravel_fsl_validity(2, 2),
+            unraveler.unravel_fsl_validity(2, 2).unwrap(),
             Some(validity(&[true, false]))
         );
     }
@@ -3673,10 +3936,10 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(8), None);
-        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(unraveler.unravel_validity(8).unwrap(), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2).unwrap(), None);
         assert_eq!(
-            unraveler.unravel_fsl_validity(2, 2),
+            unraveler.unravel_fsl_validity(2, 2).unwrap(),
             Some(validity(&[true, false]))
         );
     }
@@ -3754,7 +4017,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, None);
@@ -3780,7 +4043,7 @@ mod tests {
             9,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(9), None);
+        assert_eq!(unraveler.unravel_validity(9).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 1, 3, 5, 7, 9]).inner());
         assert_eq!(val, None);
@@ -3844,7 +4107,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, None);
@@ -3874,7 +4137,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, false, true])));
@@ -3904,7 +4167,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, true, true])));
@@ -3932,11 +4195,11 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[false, true, false, false]))
         );
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[false, true, false, false]))
         );
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
@@ -3965,14 +4228,14 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(5),
+            unraveler.unravel_validity(5).unwrap(),
             Some(validity(&[false, false, true, true, false]))
         );
         assert_eq!(
-            unraveler.unravel_validity(5),
+            unraveler.unravel_validity(5).unwrap(),
             Some(validity(&[false, false, true, true, true]))
         );
-        assert_eq!(unraveler.unravel_validity(5), None);
+        assert_eq!(unraveler.unravel_validity(5).unwrap(), None);
     }
 
     #[test]
@@ -4014,7 +4277,7 @@ mod tests {
 
         let mut unraveler = CompositeRepDefUnraveler::new(vec![unravel1, unravel2]);
 
-        assert!(unraveler.unravel_validity(9).is_none());
+        assert!(unraveler.unravel_validity(9).unwrap().is_none());
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(
             off.inner(),
@@ -4310,11 +4573,11 @@ mod tests {
             0,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(0), None);
+        assert_eq!(unraveler.unravel_validity(0).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 0, 0, 0]).inner());
         assert_eq!(val, Some(validity(&[false, false, false])));
-        let val = unraveler.unravel_validity(3).unwrap();
+        let val = unraveler.unravel_validity(3).unwrap().unwrap();
         assert_eq!(val.inner(), validity(&[true, false, true]).inner());
     }
 
@@ -4342,7 +4605,7 @@ mod tests {
             1,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(1), None);
+        assert_eq!(unraveler.unravel_validity(1).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 1, 1]).inner());
         assert_eq!(val, Some(validity(&[true, false])));
@@ -4373,7 +4636,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, true, true, true, true
             ]))
@@ -4410,7 +4673,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[true, false, true, true]))
         );
         assert_eq!(
@@ -4442,7 +4705,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, true, true, true, true
             ]))

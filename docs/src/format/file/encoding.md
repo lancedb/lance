@@ -336,12 +336,12 @@ would exceed the mini-block structural page budget. Writers must not emit this l
 Sparse layout stores Arrow structure as native slot-domain mappings instead of dense repetition / definition events.
 The value buffers are still mini-block compressed. The structural layers are stored from outer-most to inner-most:
 
-- validity layer: null slots in the parent slot domain
-- list layer: non-empty parent slots, child counts, and null parent slots
-- fixed-size-list layer: the fixed dimension and null parent slots
+- validity layer: parent validity in either null-position or valid-position form
+- list layer: parent validity, non-empty parent slots, and child counts
+- fixed-size-list layer: parent validity and the fixed dimension
 
-Valid empty list slots are not stored in the non-empty positions. They are represented by their absence from both the
-non-empty positions and null positions for that list layer.
+Valid empty list slots are not stored in `non_empty_positions`. They are valid slots that are absent from
+`non_empty_positions`.
 
 Sparse structural sets are semantic, not necessarily materialized position arrays. Position sets are encoded as one of:
 
@@ -386,10 +386,26 @@ Structural position buffers are present only for explicit position sets. They st
 Positions must be strictly increasing after delta decoding and must be within the layer's parent slot domain. List count
 buffers are present only for explicit count sets. They store `u64` child counts for each non-empty list slot.
 
-`SparseStructuralLayer.non_empty_positions`, `SparseStructuralLayer.counts`, and
-`SparseStructuralLayer.null_positions` are the canonical structural representation. `LIST` layers require
-`non_empty_positions`, `counts`, and `null_positions`; `VALIDITY` layers require only `null_positions`;
-`FIXED_SIZE_LIST` layers require `null_positions` and `fixed_size_list_dimension`.
+`SparseStructuralLayer.validity` is required for every sparse structural layer. It stores one position set plus an
+explicit meaning:
+
+- `SPARSE_VALIDITY_NULL_POSITIONS`: every slot is valid unless it appears in `validity.positions`
+- `SPARSE_VALIDITY_VALID_POSITIONS`: every slot is null unless it appears in `validity.positions`
+
+The writer should choose the meaning that yields the smaller canonical position set after considering empty, all, range,
+and explicit forms. The zero enum value `SPARSE_VALIDITY_UNSPECIFIED` is invalid and readers must reject it.
+
+`VALIDITY` layers require only `validity`. `FIXED_SIZE_LIST` layers require `validity` and
+`fixed_size_list_dimension`. `LIST` layers require `validity`, `non_empty_positions`, and `counts`.
+For a `LIST` layer:
+
+- valid slots are decoded from `validity`
+- non-empty valid slots are listed in `non_empty_positions`
+- valid empty slots are valid slots not listed in `non_empty_positions`
+- null slots are the complement of valid slots
+
+`non_empty_positions` must be a subset of the decoded valid slots. `counts` must have one value for each non-empty slot,
+and the sum of those counts must equal `num_child_slots`.
 
 #### Protobuf
 

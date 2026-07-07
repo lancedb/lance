@@ -387,7 +387,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         let validity = if self.is_root {
             None
         } else {
-            repdef.unravel_validity(length)
+            repdef.unravel_validity(length)?
         };
 
         let array = StructArray::try_new(self.child_fields, children, validity)
