@@ -329,6 +329,19 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  // EXPERIMENTAL: an action-based (UserOperation) transaction.
+  //
+  // The action list is carried as an opaque payload so this stable, PMC-voted
+  // schema stays free of the unstable action structure: `payload` is a
+  // serialized `lance.table.UserOperation` from the (non-default,
+  // feature-gated) transaction_experimental.proto. Builds without the
+  // `unstable-action-transactions` feature cannot interpret it and reject the
+  // transaction. Once the format is ratified, this is replaced by the real
+  // typed message.
+  message ExperimentalUserOperation {
+    bytes payload = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -346,6 +359,7 @@ message Transaction {
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
     UpdateBases update_bases = 114;
+    ExperimentalUserOperation experimental_user_operation = 115;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

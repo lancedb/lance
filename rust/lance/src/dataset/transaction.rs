@@ -3348,6 +3348,15 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::UpdateBases {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
+            Some(pb::transaction::Operation::ExperimentalUserOperation(_)) => {
+                // Wired to a real Operation variant in a later commit; until then
+                // (and in any build without the feature) it is unreadable.
+                return Err(Error::not_supported_source(
+                    "action-based (experimental) transactions require a build with the \
+                     `unstable-action-transactions` feature"
+                        .into(),
+                ));
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
