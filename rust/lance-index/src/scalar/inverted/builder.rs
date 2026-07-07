@@ -1255,7 +1255,7 @@ impl InnerBuilder {
         let posting_tail_codec = self.format_version.posting_tail_codec();
         let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
         let (tx, rx) = async_channel::bounded(*LANCE_FTS_WRITE_QUEUE_SIZE);
-        let producer = spawn_cpu(move || {
+        let producer = tokio::spawn(async move {
             let mut batch_builder = V3PostingLayoutBatchBuilder::new(
                 block_schema,
                 position_schema,
@@ -1263,26 +1263,35 @@ impl InnerBuilder {
                 posting_tail_codec,
                 batch_rows,
             );
-            for posting_list in posting_lists {
-                posting_list
-                    .append_to_v3_layout_with_docs(&docs_for_batches, &mut batch_builder)?;
-                if batch_builder.len() < batch_rows {
-                    continue;
-                }
-                let batch = batch_builder.finish()?;
-                if let Err(err) = tx.send_blocking(batch) {
-                    return Err(Error::execution(format!(
-                        "failed to send V3 posting batch to writer: {err}"
-                    )));
-                }
-            }
+            let mut posting_lists = posting_lists.into_iter();
+            loop {
+                let docs_for_batches = docs_for_batches.clone();
+                let (next_builder, next_posting_lists, batch) = spawn_cpu(move || {
+                    let mut batch_builder = batch_builder;
+                    let mut posting_lists = posting_lists;
+                    let mut batch = None;
+                    for posting_list in posting_lists.by_ref() {
+                        posting_list
+                            .append_to_v3_layout_with_docs(&docs_for_batches, &mut batch_builder)?;
+                        if batch_builder.len() >= batch_rows {
+                            batch = Some(batch_builder.finish()?);
+                            break;
+                        }
+                    }
+                    if batch.is_none() && !batch_builder.is_empty() {
+                        batch = Some(batch_builder.finish()?);
+                    }
+                    Result::Ok((batch_builder, posting_lists, batch))
+                })
+                .await?;
+                batch_builder = next_builder;
+                posting_lists = next_posting_lists;
 
-            if !batch_builder.is_empty() {
-                let batch = batch_builder.finish()?;
-                if let Err(err) = tx.send_blocking(batch) {
-                    return Err(Error::execution(format!(
-                        "failed to send V3 posting batch to writer: {err}"
-                    )));
+                let Some(batch) = batch else {
+                    break;
+                };
+                if tx.send(batch).await.is_err() {
+                    break;
                 }
             }
 
@@ -1311,7 +1320,7 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        let terms_batch = producer.await?;
+        let terms_batch = producer.await??;
 
         let mut files = Vec::new();
         files.push(block_writer.finish().await?);
