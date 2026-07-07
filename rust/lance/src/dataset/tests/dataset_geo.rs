@@ -6,12 +6,13 @@ use std::vec;
 
 use crate::Dataset;
 use crate::dataset::tests::dataset_transactions::execute_sql;
+use crate::dataset::write::WriteParams;
 
 use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::cast::AsArray;
-use arrow_array::types::Float64Type;
+use arrow_array::types::{Float64Type, UInt64Type};
 use datafusion::common::{assert_contains, assert_not_contains};
 use geo_types::{Rect, coord, line_string};
 use geoarrow_array::{
@@ -19,9 +20,11 @@ use geoarrow_array::{
     builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
 };
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
+use rstest::rstest;
 
 #[tokio::test]
 async fn test_geo_types() {
@@ -150,8 +153,11 @@ async fn test_geo_sql() {
     );
 }
 
+#[rstest]
+#[case::stable_row_ids(true)]
+#[case::unstable_row_ids(false)]
 #[tokio::test]
-async fn test_geo_rtree_index() {
+async fn test_geo_rtree_index(#[case] use_stable_row_ids: bool) {
     // 1. Creates arrow table linestring spatial data
     let line_string_type = LineStringType::new(Dimension::XY, Default::default());
 
@@ -177,15 +183,26 @@ async fn test_geo_rtree_index() {
     // 2. Write to lance
     let lance_path = TempStrDir::default();
     let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-    let mut dataset = Dataset::write(reader, &lance_path, Some(Default::default()))
+    let params = WriteParams {
+        max_rows_per_file: 1000,
+        enable_stable_row_ids: use_stable_row_ids,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &lance_path, Some(params))
         .await
         .unwrap();
+    assert!(dataset.fragments().len() > 1);
 
-    async fn assert_intersects_sql(dataset: &mut Dataset, has_index: bool) {
-        // Executes a SQL query with St_Distance function
-        let sql = "SELECT linestring from dataset where St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2 0, 0 2 )'))";
+    async fn assert_intersects_sql(
+        dataset: &mut Dataset,
+        has_index: bool,
+        use_stable_row_ids: bool,
+    ) -> Vec<(u64, u64)> {
+        let sql = "SELECT _rowid, _rowaddr from dataset where St_Intersects(linestring, ST_GeomFromText('LINESTRING ( 2002 2000, 2000 2002 )'))";
         let batches = dataset
             .sql(sql)
+            .with_row_id(true)
+            .with_row_addr(true)
             .build()
             .await
             .unwrap()
@@ -193,14 +210,35 @@ async fn test_geo_rtree_index() {
             .await
             .unwrap();
 
-        let mut num_rows = 0;
-        for b in batches {
-            num_rows += b.num_rows();
+        let mut rows = Vec::with_capacity(2);
+        for batch in &batches {
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            let row_addrs = batch
+                .column_by_name("_rowaddr")
+                .unwrap()
+                .as_primitive::<UInt64Type>();
+            for idx in 0..batch.num_rows() {
+                rows.push((row_ids.value(idx), row_addrs.value(idx)));
+            }
         }
-        assert_eq!(2, num_rows);
+        rows.sort_unstable();
+        assert_eq!(2, rows.len());
+        for (row_id, row_addr) in &rows {
+            if use_stable_row_ids {
+                assert_ne!(row_id, row_addr);
+            } else {
+                assert_eq!(row_id, row_addr);
+            }
+            assert!(RowAddress::from(*row_addr).fragment_id() > 0);
+        }
 
         let batches = dataset
             .sql(&format!("Explain {}", sql))
+            .with_row_id(true)
+            .with_row_addr(true)
             .build()
             .await
             .unwrap()
@@ -213,9 +251,10 @@ async fn test_geo_rtree_index() {
         } else {
             assert_not_contains!(&plan, "ScalarIndexQuery");
         }
+        rows
     }
 
-    assert_intersects_sql(&mut dataset, false).await;
+    let unindexed_rows = assert_intersects_sql(&mut dataset, false, use_stable_row_ids).await;
 
     dataset
         .create_index(
@@ -228,5 +267,6 @@ async fn test_geo_rtree_index() {
         .await
         .unwrap();
 
-    assert_intersects_sql(&mut dataset, true).await;
+    let indexed_rows = assert_intersects_sql(&mut dataset, true, use_stable_row_ids).await;
+    assert_eq!(indexed_rows, unindexed_rows);
 }

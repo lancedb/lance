@@ -14,8 +14,6 @@ use crate::scalar::{
 };
 use crate::{Index, IndexType, pb};
 use arrow_array::UInt32Array;
-use arrow_array::cast::AsArray;
-use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -31,7 +29,6 @@ use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
@@ -218,7 +215,7 @@ pub fn extract_bounding_boxes(
 }
 
 struct BboxStreamStats {
-    null_map: RowAddrTreeMap,
+    null_row_ids: RowAddrTreeMap,
     total_bbox: BoundingBox,
     // Number of non-null items
     num_items: usize,
@@ -314,7 +311,7 @@ impl RTreeIndex {
             return Ok(RowAddrTreeMap::default());
         }
 
-        let mut row_addrs = RowAddrTreeMap::new();
+        let mut row_ids = RowAddrTreeMap::new();
         let mut stack = vec![self.metadata.num_pages - 1];
 
         while let Some(page_idx) = stack.pop() {
@@ -332,7 +329,7 @@ impl RTreeIndex {
 
             let bbox_array =
                 extract_bounding_boxes(batch.column(0).as_ref(), batch.schema().field(0))?;
-            let rowaddr_or_pageid_array = batch
+            let rowid_or_pageid_array = batch
                 .column(1)
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -342,17 +339,17 @@ impl RTreeIndex {
                 let rect = bbox_array.value(i).unwrap();
                 if bbox.rect_intersects(&rect) {
                     if is_leaf {
-                        let row_addr = rowaddr_or_pageid_array.value(i);
-                        row_addrs.insert(row_addr);
+                        let row_id = rowid_or_pageid_array.value(i);
+                        row_ids.insert(row_id);
                     } else {
-                        let page_id = rowaddr_or_pageid_array.value(i);
+                        let page_id = rowid_or_pageid_array.value(i);
                         stack.push(page_id);
                     }
                 }
             }
         }
 
-        Ok(row_addrs)
+        Ok(row_ids)
     }
 
     async fn search_null(&self, metrics: &dyn MetricsCollector) -> Result<RowAddrTreeMap> {
@@ -481,22 +478,9 @@ impl Index for RTreeIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        let mut frag_ids = RoaringBitmap::default();
-
-        let mut reader_stream = self.clone().into_data_stream().await?;
-        while let Some(page) = reader_stream.try_next().await? {
-            let mut page_frag_ids = page
-                .column(1)
-                .as_primitive::<UInt64Type>()
-                .iter()
-                .flatten()
-                .map(|row_addr| RowAddress::from(row_addr).fragment_id())
-                .collect::<Vec<_>>();
-            page_frag_ids.sort();
-            page_frag_ids.dedup();
-            frag_ids |= RoaringBitmap::from_sorted_iter(page_frag_ids).unwrap();
-        }
-        Ok(frag_ids)
+        Err(Error::not_supported(
+            "RTree index does not support calculating included fragments from logical row ids",
+        ))
     }
 }
 
@@ -513,15 +497,15 @@ impl ScalarIndex for RTreeIndex {
                 let geo_array =
                     extract_bounding_boxes(query.value.to_array()?.as_ref(), &query.field)?;
                 let bbox = total_bounds(&geo_array)?;
-                let mut rowids = self.search_bbox(bbox, metrics).await?;
+                let mut row_ids = self.search_bbox(bbox, metrics).await?;
                 let mut null_map = self.search_null(metrics).await?;
 
                 if let Some(fri) = &self.frag_reuse_index {
-                    rowids = fri.remap_row_addrs_tree_map(&rowids);
+                    row_ids = fri.remap_row_addrs_tree_map(&row_ids);
                     null_map = fri.remap_row_addrs_tree_map(&null_map);
                 }
                 Ok(SearchResult::AtMost(NullableRowAddrSet::new(
-                    rowids, null_map,
+                    row_ids, null_map,
                 )))
             }
             GeoQuery::IsNull => {
@@ -581,7 +565,7 @@ impl ScalarIndex for RTreeIndex {
         new_bbox.add_rect(&self.metadata.bbox);
 
         let merge_stats = BboxStreamStats {
-            null_map: RowAddrTreeMap::union_all(&[&null_map, &stats.null_map]),
+            null_row_ids: RowAddrTreeMap::union_all(&[&null_map, &stats.null_row_ids]),
             total_bbox: new_bbox,
             num_items: self.metadata.num_items + stats.num_items,
         };
@@ -663,10 +647,15 @@ impl RTreeIndexPlugin {
             ));
         }
 
-        let row_id_field = schema.field_with_name(ROW_ID)?;
-        if *row_id_field.data_type() != DataType::UInt64 {
+        let row_id_field = schema.field(1);
+        if row_id_field.name() != ROW_ID || *row_id_field.data_type() != DataType::UInt64 {
             return Err(Error::invalid_input_source(
-                "Second field in RTree index schema must be of type UInt64".into(),
+                format!(
+                    "Second field in RTree index schema must be {ROW_ID} with type UInt64, found field '{}' with type {:?}",
+                    row_id_field.name(),
+                    row_id_field.data_type(),
+                )
+                .into(),
             ));
         }
         Ok(())
@@ -705,7 +694,7 @@ impl RTreeIndexPlugin {
         page_size: u32,
         spill_store: Arc<LanceIndexStore>,
     ) -> Result<(SendableRecordBatchStream, BboxStreamStats)> {
-        let mut null_rowaddrs = RowAddrTreeMap::new();
+        let mut null_row_ids = RowAddrTreeMap::new();
         let mut total_bbox = BoundingBox::new();
         let mut num_non_null_rows = 0;
 
@@ -717,7 +706,7 @@ impl RTreeIndexPlugin {
 
         while let Some(batch) = data.try_next().await? {
             let bbox_array = extract_bounding_boxes(&batch.column(0), batch.schema().field(0))?;
-            let rowaddr_array = batch
+            let row_id_array = batch
                 .column(1)
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -727,12 +716,12 @@ impl RTreeIndexPlugin {
 
             let num_rows = bbox_array.len();
 
-            let mut non_null_indexes = vec![];
+            let mut non_null_indexes = Vec::with_capacity(num_rows);
 
             for i in 0..num_rows {
                 if bbox_array.is_null(i) {
-                    let rowaddr = rowaddr_array.value(i);
-                    null_rowaddrs.insert(rowaddr);
+                    let row_id = row_id_array.value(i);
+                    null_row_ids.insert(row_id);
                 } else {
                     non_null_indexes.push(i as u32);
                 }
@@ -762,7 +751,7 @@ impl RTreeIndexPlugin {
         Ok((
             Box::pin(new_data),
             BboxStreamStats {
-                null_map: null_rowaddrs,
+                null_row_ids,
                 total_bbox,
                 num_items: num_non_null_rows,
             },
@@ -901,7 +890,7 @@ impl RTreeIndexPlugin {
         )
         .await?;
 
-        let nulls_file = Self::write_nulls(store, stats.null_map).await?;
+        let nulls_file = Self::write_nulls(store, stats.null_row_ids).await?;
 
         Ok(vec![page_file, nulls_file])
     }
@@ -1024,6 +1013,20 @@ mod tests {
 
     fn expected_num_pages(num_items: usize, page_size: u32) -> u64 {
         RTreeMetadata::calculate_page_offsets(num_items, page_size).len() as u64
+    }
+
+    #[test]
+    fn test_validate_schema_reports_invalid_row_id_field() {
+        let schema = Schema::new(vec![
+            ArrowField::new(VALUE_COLUMN_NAME, DataType::Binary, false),
+            ArrowField::new("row_addr", DataType::UInt32, false),
+        ]);
+
+        let err = RTreeIndexPlugin::validate_schema(&schema).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        let message = err.to_string();
+        assert!(message.contains("must be _rowid with type UInt64"));
+        assert!(message.contains("found field 'row_addr' with type UInt32"));
     }
 
     fn convert_bbox_rowid_batch_stream(
@@ -1150,13 +1153,13 @@ mod tests {
         let num_points = 10000;
         let null_probability = 0.001; // 0.1%
 
-        let mut expected_nulls = Vec::new();
+        let mut expected_nulls = RowAddrTreeMap::new();
         let mut point_builder = PointBuilder::new(point_type.clone());
 
         for i in 0..num_points {
             if rng.random_bool(null_probability) {
                 point_builder.push_null();
-                expected_nulls.push(RowAddress::new_from_parts(0, i as u32));
+                expected_nulls.insert(i as u64);
             } else {
                 let x = rng.random_range(-1000.0..1000.0);
                 let y = rng.random_range(-1000.0..1000.0);
@@ -1166,21 +1169,21 @@ mod tests {
         let point_arr = point_builder.finish();
 
         let (rtree_index, _store, _tmpdir) = train_index(&point_arr, None).await;
-        let row_addrs = rtree_index
+        let row_ids = rtree_index
             .search_null(&NoOpMetricsCollector)
             .await
             .unwrap();
 
-        let mut actual_nulls = row_addrs.row_addrs().unwrap().collect::<Vec<_>>();
-        actual_nulls.sort();
-        expected_nulls.sort();
-
-        assert_eq!(actual_nulls, expected_nulls);
+        assert_eq!(row_ids, expected_nulls);
     }
 
     #[tokio::test]
     async fn test_update_and_search() {
-        fn gen_data(num_items: u32, frag_id: u32, nulls_addrs: &mut RowAddrTreeMap) -> RectArray {
+        fn gen_data(
+            num_items: u32,
+            row_id_start: u64,
+            null_row_ids: &mut RowAddrTreeMap,
+        ) -> RectArray {
             let bbox_type = RectType::new(Dimension::XY, Default::default());
 
             let mut rng = rand::rng();
@@ -1190,7 +1193,7 @@ mod tests {
             for i in 0..num_items {
                 if rng.random_bool(null_probability) {
                     rect_builder.push_null();
-                    nulls_addrs.insert(RowAddress::new_from_parts(frag_id, i).into());
+                    null_row_ids.insert(row_id_start + i as u64);
                 } else {
                     let x1 = rng.random_range(-1000.0..1000.0);
                     let y1 = rng.random_range(-1000.0..1000.0);
@@ -1206,10 +1209,9 @@ mod tests {
             rect_builder.finish()
         }
 
-        let mut nulls_addrs = RowAddrTreeMap::default();
+        let mut null_row_ids = RowAddrTreeMap::default();
 
-        let frag_id = 0;
-        let rect_arr = gen_data(10000, frag_id, &mut nulls_addrs);
+        let rect_arr = gen_data(10000, 0, &mut null_row_ids);
 
         let (rtree_index, _store, _tmpdir) = train_index(&rect_arr, Some(16)).await;
 
@@ -1220,14 +1222,14 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let new_frag_id = 1;
-        let new_rect_arr = gen_data(10000, 1, &mut nulls_addrs);
-        let new_rowaddr_arr = (0..new_rect_arr.len())
-            .map(|off| RowAddress::new_from_parts(new_frag_id, off as u32).into())
+        let new_row_id_start = rect_arr.len() as u64;
+        let new_rect_arr = gen_data(10000, new_row_id_start, &mut null_row_ids);
+        let new_row_ids = (0..new_rect_arr.len())
+            .map(|off| new_row_id_start + off as u64)
             .collect::<Vec<_>>();
         let stream = convert_bbox_rowid_batch_stream(
             &new_rect_arr,
-            Arc::new(UInt64Array::from(new_rowaddr_arr.clone())),
+            Arc::new(UInt64Array::from(new_row_ids.clone())),
         );
         rtree_index
             .update(stream, new_store.as_ref(), None)
@@ -1243,17 +1245,17 @@ mod tests {
             coord! { x: 10.5, y: 1.5 },
             coord! { x: 99.5, y: 200.5 },
         ));
-        let row_addrs = new_rtree_index
+        let row_ids = new_rtree_index
             .search_bbox(search_bbox, &NoOpMetricsCollector)
             .await
             .unwrap();
 
-        let mut expected_row_addrs = RowAddrTreeMap::new();
+        let mut expected_row_ids = RowAddrTreeMap::new();
         for i in 0..rect_arr.len() {
             if !rect_arr.is_null(i) {
                 let bbox = BoundingBox::new_with_rect(&rect_arr.value(i).unwrap());
                 if search_bbox.rect_intersects(&bbox) {
-                    expected_row_addrs.insert(i as u64);
+                    expected_row_ids.insert(i as u64);
                 }
             }
         }
@@ -1261,18 +1263,18 @@ mod tests {
             if !new_rect_arr.is_null(i) {
                 let bbox = BoundingBox::new_with_rect(&new_rect_arr.value(i).unwrap());
                 if search_bbox.rect_intersects(&bbox) {
-                    expected_row_addrs.insert(new_rowaddr_arr.get(i).copied().unwrap());
+                    expected_row_ids.insert(new_row_ids.get(i).copied().unwrap());
                 }
             }
         }
 
-        assert_eq!(row_addrs, expected_row_addrs);
+        assert_eq!(row_ids, expected_row_ids);
 
         let actual_nulls = new_rtree_index
             .search_null(&NoOpMetricsCollector)
             .await
             .unwrap();
-        assert_eq!(actual_nulls, nulls_addrs);
+        assert_eq!(actual_nulls, null_row_ids);
     }
 
     #[tokio::test]
