@@ -1572,8 +1572,22 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false, false, false, false)
-            .await
+        let batch = self
+            .take_rows(&row_ids, projection, false, false, false, false)
+            .await?;
+
+        // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
+        // for user-facing output.
+        if batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| lance_arrow::json::is_json_field(f) || lance_arrow::json::has_json_fields(f))
+        {
+            Ok(lance_arrow::json::convert_lance_json_to_arrow(&batch)?)
+        } else {
+            Ok(batch)
+        }
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.

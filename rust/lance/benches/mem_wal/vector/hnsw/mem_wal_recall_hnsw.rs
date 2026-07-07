@@ -385,6 +385,8 @@ async fn run_checkpoint(
     }
     let writer_config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: true,

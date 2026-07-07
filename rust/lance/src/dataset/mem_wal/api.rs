@@ -401,6 +401,14 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
             config.max_wal_buffer_size.to_string(),
         ),
         (
+            "max_wal_persist_retries".to_string(),
+            config.max_wal_persist_retries.to_string(),
+        ),
+        (
+            "wal_persist_retry_base_delay_ms".to_string(),
+            config.wal_persist_retry_base_delay.as_millis().to_string(),
+        ),
+        (
             "max_memtable_size".to_string(),
             config.max_memtable_size.to_string(),
         ),
