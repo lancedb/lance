@@ -380,9 +380,9 @@ pub enum Operation {
         replacements: Vec<DataReplacementGroup>,
     },
     /// Attach overlay files to fragments, supplying new values for a subset of
-    /// `(row offset, field)` cells without rewriting the fragments' base data
-    /// files. See [`DataOverlayFile`] and the Data Overlay Files specification
-    /// for resolution, coverage, and versioning rules.
+    /// `(physical offset, field)` cells without rewriting the fragments' base
+    /// data files. See [`DataOverlayFile`] and the Data Overlay Files
+    /// specification for resolution, coverage, and versioning rules.
     DataOverlay { groups: Vec<DataOverlayGroup> },
     /// Merge a new column in
     /// 'fragments' is the final fragments include all data files, the new fragments must align with old ones at rows.
@@ -6337,8 +6337,6 @@ mod tests {
     fn test_data_overlay_operation_roundtrips() {
         // A DataOverlay operation survives the protobuf round-trip, preserving
         // the target fragment, the overlay's coverage, and its committed_version.
-        use lance_table::format::{DataOverlayFile, OverlayCoverage};
-
         let mut bitmap = roaring::RoaringBitmap::new();
         bitmap.insert(1);
         bitmap.insert(4);
@@ -6427,6 +6425,66 @@ mod tests {
         assert_eq!(frag.overlays[0].committed_version, 3);
         assert_eq!(frag.overlays[1].committed_version, result.version);
         assert!(result.version > manifest.version);
+    }
+
+    #[test]
+    fn test_data_overlay_build_manifest_multi_fragment() {
+        // Overlays targeting two distinct fragments are each applied and stamped,
+        // while a fragment the operation does not target is passed through with
+        // its existing overlays untouched.
+        let frag0 = Fragment::new(0);
+        let frag1 = Fragment::new(1);
+        let mut frag2 = Fragment::new(2);
+        frag2.overlays = vec![overlay_with_field(9, 3)]; // untargeted, committed at v3
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![frag0, frag1, frag2]),
+            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataOverlay {
+                groups: vec![
+                    DataOverlayGroup {
+                        fragment_id: 0,
+                        overlays: vec![overlay_with_field(1, 0)],
+                    },
+                    DataOverlayGroup {
+                        fragment_id: 1,
+                        overlays: vec![overlay_with_field(2, 0)],
+                    },
+                ],
+            },
+            None,
+        );
+
+        let (result, _) = txn
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let frag = |id: u64| {
+            result
+                .fragments
+                .iter()
+                .find(|f| f.id == id)
+                .unwrap_or_else(|| panic!("fragment {id} missing from result"))
+        };
+        // Both targeted fragments get their overlay, stamped to the new version.
+        assert_eq!(frag(0).overlays.len(), 1);
+        assert_eq!(frag(0).overlays[0].committed_version, result.version);
+        assert_eq!(frag(1).overlays.len(), 1);
+        assert_eq!(frag(1).overlays[0].committed_version, result.version);
+        // The untargeted fragment is unchanged: same overlay, original version.
+        assert_eq!(frag(2).overlays.len(), 1);
+        assert_eq!(frag(2).overlays[0].committed_version, 3);
     }
 
     #[test]

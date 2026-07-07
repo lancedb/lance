@@ -1106,12 +1106,16 @@ impl<'a> TransactionRebase<'a> {
     /// Conflict checks for our DataOverlay transaction against a concurrent one.
     ///
     /// Overlays are intentionally permissive (see the Data Overlay Files spec):
-    /// they stack with other overlays and tolerate appends, deletes, column
-    /// rewrites, and index builds, because overlay coverage is addressed by
-    /// physical offset and the version gate keeps indexes correct. The only
-    /// concurrent operations that invalidate an overlay are those that rewrite
-    /// rows or consume the overlays on one of our fragments (Rewrite / Merge),
-    /// and the whole-dataset replacements (Overwrite / Restore).
+    /// they stack with other overlays and tolerate appends, index builds, data
+    /// replacement, and in-place deletes / updates (deletion vectors, column
+    /// rewrites), because overlay coverage is addressed by physical offset and
+    /// the version gate keeps indexes correct. A concurrent operation conflicts
+    /// when it invalidates an overlay: retryably when it rewrites rows or
+    /// consumes the overlays on one of our fragments (Rewrite / Merge) or removes
+    /// an overlaid fragment outright (a Delete / Update that drops the fragment),
+    /// and incompatibly for whole-dataset replacements (Overwrite / Restore) and
+    /// MemWAL state updates (UpdateMemWalState), which do not rebase against data
+    /// operations.
     fn check_data_overlay_txn(
         &mut self,
         other_transaction: &Transaction,
@@ -3048,6 +3052,62 @@ mod tests {
                     matches!(result, Err(Error::IncompatibleTransaction { .. })),
                     "overlay should be incompatible with {other:?}, got {result:?}"
                 ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rewrite_conflicts_with_data_overlay() {
+        // Reverse direction of test_data_overlay_conflicts: our transaction is a
+        // Rewrite and a concurrent DataOverlay has already committed. A rewrite
+        // changes the physical row addresses of the fragments it touches, so an
+        // overlay on one of those fragments is invalidated (retryable); an
+        // overlay on any other fragment is unaffected.
+        use crate::dataset::transaction::DataOverlayGroup;
+        use lance_table::format::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let overlay_on = |fragment_id: u64| Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 0,
+                }],
+            }],
+        };
+        // Our transaction rewrites fragment 1.
+        let rewrite_op = Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![Fragment::new(1)],
+                new_fragments: vec![],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+
+        for (other, expect_conflict) in [(overlay_on(1), true), (overlay_on(0), false)] {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, rewrite_op.clone(), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(&rewrite_op).collect::<HashSet<_>>(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+            };
+            let other_txn = Transaction::new(0, other.clone(), None);
+            let result = rebase.check_txn(&other_txn, 1);
+            if expect_conflict {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "rewrite of fragment 1 should retryably conflict with {other:?}, got {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "rewrite of fragment 1 should not conflict with {other:?}, got {result:?}"
+                );
             }
         }
     }

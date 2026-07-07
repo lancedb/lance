@@ -150,7 +150,13 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_read_dataset(super::FLAG_BASE_PATHS));
         assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        assert!(can_read_dataset(super::FLAG_DATA_OVERLAY_FILES));
+        // Overlay support is gated on the build profile / env opt-in, so the
+        // flag is readable exactly when overlays are enabled (see
+        // test_data_overlay_flag_release_gating for the full policy).
+        assert_eq!(
+            can_read_dataset(super::FLAG_DATA_OVERLAY_FILES),
+            data_overlay_files_enabled()
+        );
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
@@ -215,14 +221,19 @@ mod tests {
         assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
         assert!(can_write_dataset(super::FLAG_BASE_PATHS));
         assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
-        assert!(can_write_dataset(super::FLAG_DATA_OVERLAY_FILES));
+        // Overlay support is gated on the build profile / env opt-in, so the
+        // flag is writable exactly when overlays are enabled (see
+        // test_data_overlay_flag_release_gating for the full policy).
+        assert_eq!(
+            can_write_dataset(super::FLAG_DATA_OVERLAY_FILES),
+            data_overlay_files_enabled()
+        );
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
                 | super::FLAG_BASE_PATHS
-                | super::FLAG_DATA_OVERLAY_FILES
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
     }

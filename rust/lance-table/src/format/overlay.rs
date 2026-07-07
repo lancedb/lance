@@ -163,7 +163,7 @@ impl DataOverlayFile {
             OverlayCoverage::PerField(bitmaps) => {
                 bitmaps.get(field_pos).cloned().ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "overlay field_coverage has {} bitmaps but field position {} was requested",
+                        "overlay per-field coverage has {} bitmaps but field position {} was requested",
                         bitmaps.len(),
                         field_pos
                     ))
