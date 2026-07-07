@@ -55,8 +55,8 @@ use crate::{
                 VariablePackedStructFieldKind,
             },
             rle::{
-                RleDecompressor, RleEncoder, RunLengthWidth, rle_encoded_size,
-                select_run_length_width,
+                RleChildDecompressor, RleDecompressor, RleEncoder, RunLengthWidth,
+                rle_encoded_size, select_run_length_width,
             },
             value::{ValueDecompressor, ValueEncoder},
         },
@@ -221,11 +221,23 @@ fn try_rle_for_mini_block(
                 return None;
             }
         }
-        return Some(Box::new(RleEncoder::with_run_length_width(
+        let child_compression = rle_child_compression_config(params);
+        return Some(Box::new(RleEncoder::with_child_compression(
             run_length_width,
+            child_compression,
+            child_compression,
         )));
     }
     None
+}
+
+fn rle_child_compression_config(params: &CompressionFieldParams) -> Option<CompressionConfig> {
+    let raw = params.compression.as_deref()?;
+    if matches!(raw, "none" | "fsst") {
+        return None;
+    }
+    let scheme = CompressionScheme::from_str(raw).ok()?;
+    Some(CompressionConfig::new(scheme, params.compression_level))
 }
 
 fn try_rle_for_block(
@@ -951,13 +963,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 // compression.
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
-            Compression::Rle(rle) => {
-                let (bits_per_value, run_length_width) = validate_rle_compression(rle)?;
-                Ok(Box::new(RleDecompressor::with_run_length_width(
-                    bits_per_value,
-                    run_length_width,
-                )))
-            }
+            Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(
+                rle,
+                decompression_strategy,
+            )?)),
             Compression::ByteStreamSplit(bss) => {
                 let Compression::Flat(values) =
                     bss.values.as_ref().unwrap().compression.as_ref().unwrap()
@@ -1144,19 +1153,15 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
 
                 Ok(Box::new(general_decompressor))
             }
-            Compression::Rle(rle) => {
-                let (bits_per_value, run_length_width) = validate_rle_compression(rle)?;
-                Ok(Box::new(RleDecompressor::with_run_length_width(
-                    bits_per_value,
-                    run_length_width,
-                )))
-            }
+            Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(rle, self)?)),
             _ => todo!(),
         }
     }
 }
-/// Validates RLE compression format and extracts value and run length widths.
-fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<(u64, RunLengthWidth)> {
+fn create_rle_decompressor(
+    rle: &crate::format::pb21::Rle,
+    decompression_strategy: &dyn DecompressionStrategy,
+) -> Result<RleDecompressor> {
     let values = rle
         .values
         .as_ref()
@@ -1166,42 +1171,162 @@ fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<(u64, RunL
         .as_ref()
         .ok_or_else(|| Error::invalid_input("RLE compression missing run lengths encoding"))?;
 
-    let values = values
-        .compression
-        .as_ref()
-        .ok_or_else(|| Error::invalid_input("RLE compression missing values compression"))?;
-    let Compression::Flat(values) = values else {
-        return Err(Error::invalid_input(
-            "RLE compression only supports flat values",
-        ));
-    };
+    let values = create_rle_child_decompressor(values, "values", decompression_strategy)?;
+    let run_lengths =
+        create_rle_child_decompressor(run_lengths, "run lengths", decompression_strategy)?;
 
-    let run_lengths = run_lengths
-        .compression
-        .as_ref()
-        .ok_or_else(|| Error::invalid_input("RLE compression missing run lengths compression"))?;
-    let Compression::Flat(run_lengths) = run_lengths else {
-        return Err(Error::invalid_input(
-            "RLE compression only supports flat run lengths",
-        ));
-    };
-
-    if !matches!(values.bits_per_value, 8 | 16 | 32 | 64) {
+    if !matches!(values.bits_per_value(), 8 | 16 | 32 | 64) {
         return Err(Error::invalid_input(format!(
             "RLE compression only supports 8, 16, 32, or 64-bit values, got {}",
-            values.bits_per_value
+            values.bits_per_value()
         )));
     }
 
     let run_length_width =
-        RunLengthWidth::from_bits(run_lengths.bits_per_value).ok_or_else(|| {
+        RunLengthWidth::from_bits(run_lengths.bits_per_value()).ok_or_else(|| {
             Error::invalid_input(format!(
                 "RLE compression only supports 8, 16, or 32-bit run lengths, got {}",
-                run_lengths.bits_per_value
+                run_lengths.bits_per_value()
             ))
         })?;
 
-    Ok((values.bits_per_value, run_length_width))
+    if values.requires_num_values() && run_lengths.requires_num_values() {
+        return Err(Error::invalid_input(
+            "RLE values and run lengths child encodings cannot both require the run count",
+        ));
+    }
+
+    if values.is_identity() && run_lengths.is_identity() {
+        return Ok(RleDecompressor::with_run_length_width(
+            values.bits_per_value(),
+            run_length_width,
+        ));
+    }
+
+    Ok(RleDecompressor::with_child_decompressors(
+        values.bits_per_value(),
+        run_length_width,
+        values,
+        run_lengths,
+    ))
+}
+
+fn create_rle_child_decompressor(
+    encoding: &CompressiveEncoding,
+    role: &str,
+    decompression_strategy: &dyn DecompressionStrategy,
+) -> Result<RleChildDecompressor> {
+    let compression = encoding
+        .compression
+        .as_ref()
+        .ok_or_else(|| Error::invalid_input(format!("RLE {role} missing child compression")))?;
+    let (bits_per_value, requires_num_values, needs_decompressor) =
+        validate_rle_child_compression(compression, role)?;
+
+    if needs_decompressor {
+        Ok(RleChildDecompressor::block(
+            bits_per_value,
+            decompression_strategy.create_block_decompressor(encoding)?,
+            requires_num_values,
+        ))
+    } else {
+        Ok(RleChildDecompressor::flat(bits_per_value))
+    }
+}
+
+fn validate_rle_child_compression(
+    compression: &Compression,
+    role: &str,
+) -> Result<(u64, bool, bool)> {
+    match compression {
+        Compression::Flat(flat) => Ok((flat.bits_per_value, false, false)),
+        Compression::General(general) => {
+            general.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} general child missing compression config"
+                ))
+            })?;
+            let values = general.values.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!("RLE {role} general child missing inner encoding"))
+            })?;
+            let inner = values.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} general child missing inner compression"
+                ))
+            })?;
+            let (bits_per_value, requires_num_values) =
+                validate_rle_block_child_inner(inner, role)?;
+            Ok((bits_per_value, requires_num_values, true))
+        }
+        Compression::OutOfLineBitpacking(out_of_line) => {
+            let values = out_of_line.values.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values encoding"
+                ))
+            })?;
+            let Compression::Flat(_) = values.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values compression"
+                ))
+            })?
+            else {
+                return Err(Error::invalid_input(format!(
+                    "RLE {role} bitpacking child only supports flat values"
+                )));
+            };
+            Ok((out_of_line.uncompressed_bits_per_value, true, true))
+        }
+        other => Err(Error::invalid_input(format!(
+            "RLE {role} only supports flat, general, or out-of-line bitpacking child encodings, got {}",
+            compression_name(other)
+        ))),
+    }
+}
+
+fn validate_rle_block_child_inner(compression: &Compression, role: &str) -> Result<(u64, bool)> {
+    match compression {
+        Compression::Flat(flat) => Ok((flat.bits_per_value, false)),
+        Compression::OutOfLineBitpacking(out_of_line) => {
+            let values = out_of_line.values.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values encoding"
+                ))
+            })?;
+            let Compression::Flat(_) = values.compression.as_ref().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "RLE {role} bitpacking child missing values compression"
+                ))
+            })?
+            else {
+                return Err(Error::invalid_input(format!(
+                    "RLE {role} bitpacking child only supports flat values"
+                )));
+            };
+            Ok((out_of_line.uncompressed_bits_per_value, true))
+        }
+        other => Err(Error::invalid_input(format!(
+            "RLE {role} general child only supports flat or out-of-line bitpacking inner encodings, got {}",
+            compression_name(other)
+        ))),
+    }
+}
+
+fn compression_name(compression: &Compression) -> &'static str {
+    match compression {
+        Compression::Flat(_) => "flat",
+        Compression::Variable(_) => "variable",
+        Compression::Fsst(_) => "fsst",
+        Compression::OutOfLineBitpacking(_) => "out-of-line bitpacking",
+        Compression::InlineBitpacking(_) => "inline bitpacking",
+        Compression::General(_) => "general",
+        Compression::Constant(_) => "constant",
+        Compression::Dictionary(_) => "dictionary",
+        Compression::ByteStreamSplit(_) => "byte stream split",
+        Compression::PackedStruct(_) => "packed struct",
+        Compression::FixedSizeList(_) => "fixed-size list",
+        Compression::VariablePackedStruct(_) => "variable packed struct",
+        Compression::Rle(_) => "rle",
+    }
 }
 
 #[cfg(test)]
