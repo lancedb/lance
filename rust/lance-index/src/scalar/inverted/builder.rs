@@ -639,26 +639,7 @@ impl InvertedIndexBuilder {
             ),
         ]);
 
-        if self.params.with_position && self.format_version.uses_shared_position_stream() {
-            metadata.insert(
-                POSITIONS_LAYOUT_KEY.to_owned(),
-                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
-            );
-            metadata.insert(
-                POSITIONS_CODEC_KEY.to_owned(),
-                self.format_version
-                    .position_codec()
-                    .expect("shared positions require a codec")
-                    .as_str()
-                    .to_owned(),
-            );
-        }
-        if self.format_version.uses_block_row_layout() {
-            metadata.insert(
-                POSTING_BLOCK_LAYOUT_KEY.to_owned(),
-                POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3.to_owned(),
-            );
-        }
+        self.add_format_metadata(&mut metadata);
 
         let metadata_file_schema = Arc::new(Schema::new(vec![Field::new(
             DELETED_FRAGMENTS_COL,
@@ -700,6 +681,16 @@ impl InvertedIndexBuilder {
                 self.posting_tail_codec.as_str().to_owned(),
             ),
         ]);
+        self.add_format_metadata(&mut metadata);
+        // Use partition ID to generate a unique temporary filename
+        let file_name = part_metadata_file_path(partition);
+        let mut writer = dest_store
+            .new_index_file(&file_name, Arc::new(Schema::empty()))
+            .await?;
+        writer.finish_with_metadata(metadata).await
+    }
+
+    fn add_format_metadata(&self, metadata: &mut HashMap<String, String>) {
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),
@@ -714,12 +705,12 @@ impl InvertedIndexBuilder {
                     .to_owned(),
             );
         }
-        // Use partition ID to generate a unique temporary filename
-        let file_name = part_metadata_file_path(partition);
-        let mut writer = dest_store
-            .new_index_file(&file_name, Arc::new(Schema::empty()))
-            .await?;
-        writer.finish_with_metadata(metadata).await
+        if self.format_version.uses_block_row_layout() {
+            metadata.insert(
+                POSTING_BLOCK_LAYOUT_KEY.to_owned(),
+                POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3.to_owned(),
+            );
+        }
     }
 
     async fn write_metadata_with_progress(
@@ -3108,10 +3099,31 @@ mod tests {
         partition_id: u64,
         target: PartitionWriteTarget,
     ) -> Result<()> {
-        write_partition_file_marker(store, &target.token_path(partition_id), partition_id).await?;
-        write_partition_file_marker(store, &target.posting_path(partition_id), partition_id)
+        write_partition_files_for_layout(
+            store,
+            partition_id,
+            target,
+            InvertedListFormatVersion::V2,
+            false,
+        )
+        .await
+    }
+
+    async fn write_partition_files_for_layout(
+        store: &dyn IndexStore,
+        partition_id: u64,
+        target: PartitionWriteTarget,
+        format_version: InvertedListFormatVersion,
+        with_position: bool,
+    ) -> Result<()> {
+        for suffix in partition_file_suffixes_for_layout(format_version, with_position) {
+            write_partition_file_marker(
+                store,
+                &target.file_path(partition_id, suffix),
+                partition_id,
+            )
             .await?;
-        write_partition_file_marker(store, &target.doc_path(partition_id), partition_id).await?;
+        }
         Ok(())
     }
 
@@ -3139,6 +3151,24 @@ mod tests {
             read_partition_file_marker(store, &doc_file_path(partition_id)).await?,
             expected_marker
         );
+        Ok(())
+    }
+
+    async fn assert_partition_file_markers_for_layout(
+        store: &dyn IndexStore,
+        partition_id: u64,
+        expected_marker: u64,
+        format_version: InvertedListFormatVersion,
+        with_position: bool,
+    ) -> Result<()> {
+        for suffix in partition_file_suffixes_for_layout(format_version, with_position) {
+            assert_eq!(
+                read_partition_file_marker(store, &partition_file_path(partition_id, suffix))
+                    .await?,
+                expected_marker,
+                "unexpected marker in partition file suffix {suffix}"
+            );
+        }
         Ok(())
     }
 
@@ -3211,6 +3241,83 @@ mod tests {
                         .await
                         .is_err(),
                     "staged partition files should be cleaned up after final metadata is written"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_files_remaps_v3_staged_extra_files() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = Arc::new(NoRenameStore::new(base_store.clone()));
+        let partitions = vec![5_u64, 1_u64];
+        let format_version = InvertedListFormatVersion::V3;
+        let with_position = true;
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default().with_position(with_position),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        )
+        .with_format_version(format_version);
+
+        for partition_id in &partitions {
+            write_partition_files_for_layout(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+                format_version,
+                with_position,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            store,
+            noop_progress(),
+        )
+        .await?;
+
+        let metadata_reader = base_store.open_index_file(METADATA_FILE).await?;
+        let metadata = &metadata_reader.schema().metadata;
+        assert_eq!(
+            metadata.get(POSTING_BLOCK_LAYOUT_KEY).map(String::as_str),
+            Some(POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3)
+        );
+
+        let mut expected_partitions = partitions.clone();
+        expected_partitions.sort_unstable();
+        for (new_id, old_id) in expected_partitions.iter().enumerate() {
+            assert_partition_file_markers_for_layout(
+                base_store.as_ref(),
+                new_id as u64,
+                *old_id,
+                format_version,
+                with_position,
+            )
+            .await?;
+            for suffix in partition_file_suffixes_for_layout(format_version, with_position) {
+                assert!(
+                    base_store
+                        .open_index_file(&staged_partition_file_path(*old_id, suffix))
+                        .await
+                        .is_err(),
+                    "staged V3 partition file suffix {suffix} should be cleaned up"
                 );
             }
         }
