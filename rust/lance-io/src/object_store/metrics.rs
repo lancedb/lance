@@ -3,10 +3,6 @@
 
 //! Publishes object store metrics via the [`metrics`] crate.
 //!
-//! The [`metrics`] facade lets downstream applications install any recorder
-//! (Prometheus, OpenTelemetry, etc.) without Lance depending on a specific
-//! backend. When no recorder is installed the calls are cheap no-ops.
-//!
 //! Two layers cooperate:
 //!
 //! * [`MeteredObjectStore`] wraps any [`object_store::ObjectStore`] and records
@@ -14,10 +10,10 @@
 //!   number of requests currently in flight. It works for every store
 //!   regardless of backend.
 //! * [`MeteringHttpConnector`] wraps the HTTP client used by the native cloud
-//!   stores (S3 / GCS / Azure) and records throttle responses (HTTP 429 / 503)
-//!   per attempt. Because `object_store`'s retry loop re-issues each request
+//!   stores (S3 / GCS / Azure) and records throttle / retryable responses per
+//!   attempt. Because `object_store`'s retry loop re-issues each request
 //!   through the [`HttpService`](object_store::client::HttpService), this sees
-//!   every retried throttle, which a store-level wrapper cannot observe.
+//!   every retried response, which a store-level wrapper cannot observe.
 //!
 //! The two layers have different coverage: every store gets the request-level
 //! metrics from [`MeteredObjectStore`], but only the native cloud stores get
@@ -25,90 +21,110 @@
 //! bypass `object_store`'s HTTP client, so there is no place to install the
 //! connector for them.
 //!
-//! All metrics carry a `scheme` label (e.g. `s3`, `gs`, `azure`).
+//! All metrics carry a `base` label identifying the store (e.g. `s3$bucket`,
+//! `az$container@account`), so multiple buckets on the same cloud can be told
+//! apart. The metric name constants ([`METRIC_REQUESTS`] etc.) and the recording
+//! helpers ([`record_request`], [`record_count`], [`record_error`],
+//! [`InFlightGuard`]) are public so custom object stores can emit the same
+//! metrics.
 
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
     UploadPart,
 };
 
-/// Total number of object store requests, labelled by `operation` and `scheme`.
-const METRIC_REQUESTS: &str = "lance_object_store_requests_total";
-/// Total bytes transferred by object store requests, labelled by `operation` and `scheme`.
-const METRIC_BYTES: &str = "lance_object_store_request_bytes_total";
-/// Object store request latency in seconds, labelled by `operation` and `scheme`.
-const METRIC_DURATION: &str = "lance_object_store_request_duration_seconds";
-/// Total number of failed object store requests, labelled by `operation` and `scheme`.
-const METRIC_ERRORS: &str = "lance_object_store_errors_total";
+/// Total number of object store requests, labelled by `operation` and `base`.
+pub const METRIC_REQUESTS: &str = "lance_object_store_requests_total";
+/// Total bytes transferred by object store requests, labelled by `operation` and `base`.
+pub const METRIC_BYTES: &str = "lance_object_store_request_bytes_total";
+/// Object store request latency in seconds, labelled by `operation` and `base`.
+pub const METRIC_DURATION: &str = "lance_object_store_request_duration_seconds";
+/// Total number of failed object store requests, labelled by `operation` and `base`.
+pub const METRIC_ERRORS: &str = "lance_object_store_errors_total";
 /// Total number of throttle responses (HTTP 429 / 503) seen at the HTTP layer,
-/// labelled by `status` and `scheme`. Counts every attempt, including retries.
-const METRIC_THROTTLE: &str = "lance_object_store_throttle_total";
+/// labelled by `status` and `base`. Counts every attempt, including retries.
+pub const METRIC_THROTTLE: &str = "lance_object_store_throttle_total";
+/// Total number of retryable responses (HTTP 5xx / 429 / 408) seen at the HTTP
+/// layer, labelled by `status` and `base`. Counts every attempt, including
+/// retries. This is a superset of [`METRIC_THROTTLE`]; 409 (conflict) is
+/// deliberately excluded so commit conflicts are not counted as retries.
+pub const METRIC_RETRYABLE: &str = "lance_object_store_retryable_responses_total";
 /// Number of object store requests currently in flight, labelled by `operation`
-/// and `scheme`.
-const METRIC_IN_FLIGHT: &str = "lance_object_store_in_flight_requests";
+/// and `base`.
+pub const METRIC_IN_FLIGHT: &str = "lance_object_store_in_flight_requests";
 
 /// Record the outcome of a unary request: count, latency, bytes (on success), and errors.
-fn record_request<T>(
-    scheme: &str,
+pub fn record_request<T>(
+    base: &str,
     operation: &'static str,
     start: Instant,
     bytes: u64,
     result: &OSResult<T>,
 ) {
+    record_outcome(base, operation, start, bytes, result.is_err());
+}
+
+/// Record count, latency, and either transferred bytes or an error for a
+/// completed request. Used both for unary requests and for streamed GETs whose
+/// bytes are only known once the body finishes.
+pub fn record_outcome(
+    base: &str,
+    operation: &'static str,
+    start: Instant,
+    bytes: u64,
+    is_error: bool,
+) {
     let elapsed = start.elapsed().as_secs_f64();
-    metrics::counter!(METRIC_REQUESTS, "operation" => operation, "scheme" => scheme.to_owned())
+    metrics::counter!(METRIC_REQUESTS, "operation" => operation, "base" => base.to_owned())
         .increment(1);
-    metrics::histogram!(METRIC_DURATION, "operation" => operation, "scheme" => scheme.to_owned())
+    metrics::histogram!(METRIC_DURATION, "operation" => operation, "base" => base.to_owned())
         .record(elapsed);
-    match result {
-        Ok(_) => {
-            if bytes > 0 {
-                metrics::counter!(METRIC_BYTES, "operation" => operation, "scheme" => scheme.to_owned())
-                    .increment(bytes);
-            }
-        }
-        Err(_) => {
-            metrics::counter!(METRIC_ERRORS, "operation" => operation, "scheme" => scheme.to_owned())
-                .increment(1);
-        }
+    if is_error {
+        record_error(base, operation);
+    } else if bytes > 0 {
+        metrics::counter!(METRIC_BYTES, "operation" => operation, "base" => base.to_owned())
+            .increment(bytes);
     }
 }
 
 /// Record a single request count without latency, used for streaming operations
 /// (list / delete) whose work happens lazily as the stream is polled.
-fn record_count(scheme: &str, operation: &'static str) {
-    metrics::counter!(METRIC_REQUESTS, "operation" => operation, "scheme" => scheme.to_owned())
+pub fn record_count(base: &str, operation: &'static str) {
+    metrics::counter!(METRIC_REQUESTS, "operation" => operation, "base" => base.to_owned())
         .increment(1);
 }
 
-fn record_error(scheme: &str, operation: &'static str) {
-    metrics::counter!(METRIC_ERRORS, "operation" => operation, "scheme" => scheme.to_owned())
+/// Record a single error for an operation.
+pub fn record_error(base: &str, operation: &'static str) {
+    metrics::counter!(METRIC_ERRORS, "operation" => operation, "base" => base.to_owned())
         .increment(1);
 }
 
 /// Raises the in-flight gauge for an operation on creation and lowers it on
 /// drop, so the count stays balanced even if the request future or stream is
 /// cancelled or dropped before completing.
-struct InFlightGuard {
-    scheme: String,
+pub struct InFlightGuard {
+    base: String,
     operation: &'static str,
 }
 
 impl InFlightGuard {
-    fn new(scheme: &str, operation: &'static str) -> Self {
-        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => operation, "scheme" => scheme.to_owned())
+    pub fn new(base: &str, operation: &'static str) -> Self {
+        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => operation, "base" => base.to_owned())
             .increment(1.0);
         Self {
-            scheme: scheme.to_owned(),
+            base: base.to_owned(),
             operation,
         }
     }
@@ -116,7 +132,7 @@ impl InFlightGuard {
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => self.operation, "scheme" => self.scheme.clone())
+        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => self.operation, "base" => self.base.clone())
             .decrement(1.0);
     }
 }
@@ -124,7 +140,7 @@ impl Drop for InFlightGuard {
 #[derive(Debug)]
 pub struct MeteredObjectStore {
     target: Arc<dyn object_store::ObjectStore>,
-    scheme: String,
+    base: String,
 }
 
 impl std::fmt::Display for MeteredObjectStore {
@@ -143,10 +159,10 @@ impl object_store::ObjectStore for MeteredObjectStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         let size = bytes.content_length() as u64;
-        let _in_flight = InFlightGuard::new(&self.scheme, "put");
+        let _in_flight = InFlightGuard::new(&self.base, "put");
         let start = Instant::now();
         let result = self.target.put_opts(location, bytes, opts).await;
-        record_request(&self.scheme, "put", start, size, &result);
+        record_request(&self.base, "put", start, size, &result);
         result
     }
 
@@ -158,7 +174,7 @@ impl object_store::ObjectStore for MeteredObjectStore {
         let upload = self.target.put_multipart_opts(location, opts).await?;
         Ok(Box::new(MeteredMultipartUpload {
             target: upload,
-            scheme: self.scheme.clone(),
+            base: self.base.clone(),
         }))
     }
 
@@ -167,27 +183,37 @@ impl object_store::ObjectStore for MeteredObjectStore {
         // distinguish it here to keep HEAD and GET as separate operations.
         let is_head = options.head;
         let operation = if is_head { "head" } else { "get" };
-        let _in_flight = InFlightGuard::new(&self.scheme, operation);
+        let in_flight = InFlightGuard::new(&self.base, operation);
         let start = Instant::now();
         let result = self.target.get_opts(location, options).await;
-        // A HEAD transfers only metadata, so it has no payload bytes.
-        let bytes = match &result {
-            Ok(res) if !is_head => res.range.end - res.range.start,
-            _ => 0,
-        };
-        record_request(&self.scheme, operation, start, bytes, &result);
-        result
+
+        // A HEAD transfers only metadata, and errors carry no payload, so both
+        // are recorded immediately. `get_opts` only resolves once the response
+        // headers arrive; the body is streamed afterwards, so for a successful
+        // GET we defer recording until the body has been drained (see below).
+        if is_head || result.is_err() {
+            record_request(&self.base, operation, start, 0, &result);
+            return result;
+        }
+
+        let result = result.expect("checked to be Ok above");
+        Ok(meter_get_result(
+            result,
+            self.base.clone(),
+            start,
+            in_flight,
+        ))
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
-        let _in_flight = InFlightGuard::new(&self.scheme, "get");
+        let _in_flight = InFlightGuard::new(&self.base, "get");
         let start = Instant::now();
         let result = self.target.get_ranges(location, ranges).await;
         let bytes = match &result {
             Ok(parts) => parts.iter().map(|b| b.len() as u64).sum(),
             Err(_) => 0,
         };
-        record_request(&self.scheme, "get", start, bytes, &result);
+        record_request(&self.base, "get", start, bytes, &result);
         result
     }
 
@@ -195,8 +221,13 @@ impl object_store::ObjectStore for MeteredObjectStore {
         &self,
         locations: BoxStream<'static, OSResult<Path>>,
     ) -> BoxStream<'static, OSResult<Path>> {
-        let scheme = self.scheme.clone();
-        let in_flight = InFlightGuard::new(&self.scheme, "delete");
+        let base = self.base.clone();
+        // Count one logical delete request per call, matching `list`: a single
+        // `delete_stream` maps to one batched request on stores that support it
+        // (e.g. S3's `DeleteObjects`), so counting per yielded path would
+        // over-count. Errors are still recorded per failing path.
+        record_count(&self.base, "delete");
+        let in_flight = InFlightGuard::new(&self.base, "delete");
         self.target
             .delete_stream(locations)
             .map(move |result| {
@@ -204,10 +235,8 @@ impl object_store::ObjectStore for MeteredObjectStore {
                 // the guard, keeping the gauge raised until the stream is
                 // dropped (a move closure only captures the variables it uses).
                 let _in_flight = &in_flight;
-                // Each yielded path is one delete; failures additionally bump the error counter.
-                record_count(&scheme, "delete");
                 if result.is_err() {
-                    record_error(&scheme, "delete");
+                    record_error(&base, "delete");
                 }
                 result
             })
@@ -215,11 +244,11 @@ impl object_store::ObjectStore for MeteredObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        record_count(&self.scheme, "list");
+        record_count(&self.base, "list");
         meter_list_stream(
             self.target.list(prefix),
-            self.scheme.clone(),
-            InFlightGuard::new(&self.scheme, "list"),
+            self.base.clone(),
+            InFlightGuard::new(&self.base, "list"),
         )
     }
 
@@ -228,35 +257,35 @@ impl object_store::ObjectStore for MeteredObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        record_count(&self.scheme, "list");
+        record_count(&self.base, "list");
         meter_list_stream(
             self.target.list_with_offset(prefix, offset),
-            self.scheme.clone(),
-            InFlightGuard::new(&self.scheme, "list"),
+            self.base.clone(),
+            InFlightGuard::new(&self.base, "list"),
         )
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
-        let _in_flight = InFlightGuard::new(&self.scheme, "list");
+        let _in_flight = InFlightGuard::new(&self.base, "list");
         let start = Instant::now();
         let result = self.target.list_with_delimiter(prefix).await;
-        record_request(&self.scheme, "list", start, 0, &result);
+        record_request(&self.base, "list", start, 0, &result);
         result
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
-        let _in_flight = InFlightGuard::new(&self.scheme, "copy");
+        let _in_flight = InFlightGuard::new(&self.base, "copy");
         let start = Instant::now();
         let result = self.target.copy_opts(from, to, opts).await;
-        record_request(&self.scheme, "copy", start, 0, &result);
+        record_request(&self.base, "copy", start, 0, &result);
         result
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
-        let _in_flight = InFlightGuard::new(&self.scheme, "rename");
+        let _in_flight = InFlightGuard::new(&self.base, "rename");
         let start = Instant::now();
         let result = self.target.rename_opts(from, to, opts).await;
-        record_request(&self.scheme, "rename", start, 0, &result);
+        record_request(&self.base, "rename", start, 0, &result);
         result
     }
 }
@@ -265,7 +294,7 @@ impl object_store::ObjectStore for MeteredObjectStore {
 /// counted once when the stream is created (a single LIST may return many items).
 fn meter_list_stream(
     stream: BoxStream<'static, OSResult<ObjectMeta>>,
-    scheme: String,
+    base: String,
     in_flight: InFlightGuard,
 ) -> BoxStream<'static, OSResult<ObjectMeta>> {
     stream
@@ -275,57 +304,152 @@ fn meter_list_stream(
             // holding it here keeps the gauge raised until the stream is dropped.
             let _in_flight = &in_flight;
             if result.is_err() {
-                record_error(&scheme, "list");
+                record_error(&base, "list");
             }
             result
         })
         .boxed()
 }
 
+/// Wrap a successful GET so the request is recorded once its body has been
+/// fully read, capturing the true transfer duration and byte count rather than
+/// the time-to-first-byte and declared range. For payloads without a body
+/// stream (e.g. a local file handle) the request is recorded immediately.
+fn meter_get_result(
+    mut result: GetResult,
+    base: String,
+    start: Instant,
+    in_flight: InFlightGuard,
+) -> GetResult {
+    match result.payload {
+        GetResultPayload::Stream(stream) => {
+            result.payload = GetResultPayload::Stream(
+                MeteredGetStream {
+                    inner: stream,
+                    base,
+                    start,
+                    bytes: 0,
+                    errored: false,
+                    recorded: false,
+                    _in_flight: in_flight,
+                }
+                .boxed(),
+            );
+            result
+        }
+        // No body stream to observe (e.g. a local file), so record now.
+        other => {
+            let bytes = result.range.end - result.range.start;
+            record_outcome(&base, "get", start, bytes, false);
+            result.payload = other;
+            result
+        }
+    }
+}
+
+/// Stream wrapper over a GET body that records the request (count, duration,
+/// bytes, errors) once the body is fully drained or the stream is dropped.
+struct MeteredGetStream {
+    inner: BoxStream<'static, OSResult<Bytes>>,
+    base: String,
+    start: Instant,
+    bytes: u64,
+    errored: bool,
+    recorded: bool,
+    _in_flight: InFlightGuard,
+}
+
+impl MeteredGetStream {
+    fn record(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        record_outcome(&self.base, "get", self.start, self.bytes, self.errored);
+    }
+}
+
+impl Stream for MeteredGetStream {
+    type Item = OSResult<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.bytes += chunk.len() as u64;
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.errored = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.record();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for MeteredGetStream {
+    fn drop(&mut self) {
+        // Records the partial transfer if the body was dropped before it drained.
+        self.record();
+    }
+}
+
 #[derive(Debug)]
 struct MeteredMultipartUpload {
     target: Box<dyn MultipartUpload>,
-    scheme: String,
+    base: String,
 }
 
 #[async_trait::async_trait]
 impl MultipartUpload for MeteredMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        // Each part upload is a distinct `put` request, so it records the same
-        // count / bytes / latency / error set as a unary put.
-        let scheme = self.scheme.clone();
+        // Each part upload is a distinct request, recorded under the `put_part`
+        // operation with the same count / bytes / latency / error set as a
+        // unary put.
+        let base = self.base.clone();
         let size = data.content_length() as u64;
         let inner = self.target.put_part(data);
         async move {
-            let _in_flight = InFlightGuard::new(&scheme, "put");
+            let _in_flight = InFlightGuard::new(&base, "put_part");
             let start = Instant::now();
             let result = inner.await;
-            record_request(&scheme, "put", start, size, &result);
+            record_request(&base, "put_part", start, size, &result);
             result
         }
         .boxed()
     }
 
     async fn complete(&mut self) -> OSResult<PutResult> {
-        self.target.complete().await
+        // Completing a multipart upload issues its own request that can throttle
+        // or fail, so it is metered like any other operation.
+        let _in_flight = InFlightGuard::new(&self.base, "complete_multipart");
+        let start = Instant::now();
+        let result = self.target.complete().await;
+        record_request(&self.base, "complete_multipart", start, 0, &result);
+        result
     }
 
     async fn abort(&mut self) -> OSResult<()> {
-        self.target.abort().await
+        let _in_flight = InFlightGuard::new(&self.base, "abort_multipart");
+        let start = Instant::now();
+        let result = self.target.abort().await;
+        record_request(&self.base, "abort_multipart", start, 0, &result);
+        result
     }
 }
 
 pub trait ObjectStoreMetricsExt {
-    /// Wrap this store so its operations publish metrics under the given `scheme` label.
-    fn metered(self, scheme: String) -> Arc<dyn object_store::ObjectStore>;
+    /// Wrap this store so its operations publish metrics under the given `base` label.
+    fn metered(self, base: String) -> Arc<dyn object_store::ObjectStore>;
 }
 
 impl ObjectStoreMetricsExt for Arc<dyn object_store::ObjectStore> {
-    fn metered(self, scheme: String) -> Arc<dyn object_store::ObjectStore> {
-        Arc::new(MeteredObjectStore {
-            target: self,
-            scheme,
-        })
+    fn metered(self, base: String) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(MeteredObjectStore { target: self, base })
     }
 }
 
@@ -339,19 +463,19 @@ mod http {
         HttpService, ReqwestConnector,
     };
 
-    /// An [`HttpConnector`] that records throttle responses observed by the
-    /// underlying HTTP client. Install it on the S3 / GCS / Azure builders via
-    /// `with_http_connector`.
+    /// An [`HttpConnector`] that records throttle and retryable responses
+    /// observed by the underlying HTTP client. Install it on the S3 / GCS /
+    /// Azure builders via `with_http_connector`.
     #[derive(Debug)]
     pub struct MeteringHttpConnector {
-        scheme: String,
+        base: String,
         inner: ReqwestConnector,
     }
 
     impl MeteringHttpConnector {
-        pub fn new(scheme: String) -> Self {
+        pub fn new(base: String) -> Self {
             Self {
-                scheme,
+                base,
                 inner: ReqwestConnector::default(),
             }
         }
@@ -361,7 +485,7 @@ mod http {
         fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
             let client = self.inner.connect(options)?;
             Ok(HttpClient::new(MeteringHttpService {
-                scheme: self.scheme.clone(),
+                base: self.base.clone(),
                 inner: client,
             }))
         }
@@ -369,7 +493,7 @@ mod http {
 
     #[derive(Debug)]
     struct MeteringHttpService {
-        scheme: String,
+        base: String,
         inner: HttpClient,
     }
 
@@ -377,16 +501,27 @@ mod http {
     impl HttpService for MeteringHttpService {
         async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
             let response = self.inner.execute(req).await?;
-            let status = response.status();
-            // 429 (throttling) and 5xx (e.g. 503 service unavailable) are the
-            // statuses that drive object_store's retry loop. Each attempt that
-            // hits one is recorded with its numeric status, so 429 and 503 can
-            // be told apart.
-            if status.as_u16() == 429 || status.is_server_error() {
+            let status = response.status().as_u16();
+            // Each attempt that object_store may retry is recorded with its
+            // numeric status. Throttles (429 / 503) are a distinct, narrower
+            // signal than the broader set of retryable responses, so they get
+            // their own counter. 409 (conflict) is intentionally excluded from
+            // the retryable set so commit conflicts are not counted as retries.
+            let is_throttle = status == 429 || status == 503;
+            let is_retryable = status == 429 || status == 408 || (500..600).contains(&status);
+            if is_throttle {
                 metrics::counter!(
                     METRIC_THROTTLE,
-                    "status" => status.as_u16().to_string(),
-                    "scheme" => self.scheme.clone(),
+                    "status" => status.to_string(),
+                    "base" => self.base.clone(),
+                )
+                .increment(1);
+            }
+            if is_retryable {
+                metrics::counter!(
+                    METRIC_RETRYABLE,
+                    "status" => status.to_string(),
+                    "base" => self.base.clone(),
                 )
                 .increment(1);
             }
@@ -424,18 +559,19 @@ mod http {
                 .unwrap()
         }
 
-        fn throttle_count(
+        fn metric_count(
             metrics: &[(metrics::Key, DebugValue)],
-            scheme: &str,
+            name: &str,
+            base: &str,
             status: &str,
         ) -> u64 {
             for (key, value) in metrics {
-                if key.name() != METRIC_THROTTLE {
+                if key.name() != name {
                     continue;
                 }
                 let labels: std::collections::HashMap<&str, &str> =
                     key.labels().map(|l| (l.key(), l.value())).collect();
-                if labels.get("scheme") == Some(&scheme)
+                if labels.get("base") == Some(&base)
                     && labels.get("status") == Some(&status)
                     && let DebugValue::Counter(v) = value
                 {
@@ -446,7 +582,7 @@ mod http {
         }
 
         #[test]
-        fn test_throttle_responses_counted_by_status() {
+        fn test_throttle_and_retryable_responses_counted_by_status() {
             let recorder = DebuggingRecorder::new();
             let snapshotter = recorder.snapshotter();
             metrics::with_local_recorder(&recorder, || {
@@ -456,18 +592,20 @@ mod http {
                 rt.block_on(async {
                     // Each attempt that object_store retries flows through `call`
                     // again; here we simulate that by issuing several responses.
-                    // The scheme is baked into the connector, so it labels the metric.
-                    for (scheme, status) in [
-                        ("s3", 429u16),
-                        ("s3", 503),
-                        ("s3", 503),
-                        ("s3", 500),
-                        ("s3", 200),
-                        ("s3", 404),
-                        ("gs", 429),
+                    // The base is baked into the connector, so it labels the metric.
+                    for (base, status) in [
+                        ("s3$bucket", 429u16),
+                        ("s3$bucket", 503),
+                        ("s3$bucket", 503),
+                        ("s3$bucket", 500),
+                        ("s3$bucket", 408),
+                        ("s3$bucket", 409),
+                        ("s3$bucket", 200),
+                        ("s3$bucket", 404),
+                        ("gs$bucket", 429),
                     ] {
                         let service = MeteringHttpService {
-                            scheme: scheme.into(),
+                            base: base.into(),
                             inner: HttpClient::new(StaticStatusService { status }),
                         };
                         service.call(request()).await.unwrap();
@@ -482,16 +620,31 @@ mod http {
                 .map(|(ck, _unit, _desc, value)| (ck.key().clone(), value))
                 .collect();
 
-            assert_eq!(throttle_count(&recorded, "s3", "429"), 1);
-            assert_eq!(throttle_count(&recorded, "s3", "503"), 2);
-            // Other server errors (5xx) are retryable and counted by their status.
-            assert_eq!(throttle_count(&recorded, "s3", "500"), 1);
-            // Success and non-retryable client errors are not throttles.
-            assert_eq!(throttle_count(&recorded, "s3", "200"), 0);
-            assert_eq!(throttle_count(&recorded, "s3", "404"), 0);
-            // The scheme label is taken from the connector, not shared across schemes.
-            assert_eq!(throttle_count(&recorded, "gs", "429"), 1);
-            assert_eq!(throttle_count(&recorded, "gs", "503"), 0);
+            let throttle = |base, status| metric_count(&recorded, METRIC_THROTTLE, base, status);
+            let retryable = |base, status| metric_count(&recorded, METRIC_RETRYABLE, base, status);
+
+            // Throttles are only 429 and 503.
+            assert_eq!(throttle("s3$bucket", "429"), 1);
+            assert_eq!(throttle("s3$bucket", "503"), 2);
+            assert_eq!(throttle("s3$bucket", "500"), 0);
+            assert_eq!(throttle("s3$bucket", "408"), 0);
+
+            // Retryable is the broader set: 5xx, 429, 408 (but not 409).
+            assert_eq!(retryable("s3$bucket", "429"), 1);
+            assert_eq!(retryable("s3$bucket", "503"), 2);
+            assert_eq!(retryable("s3$bucket", "500"), 1);
+            assert_eq!(retryable("s3$bucket", "408"), 1);
+            // 409 conflict is excluded so commit conflicts are not counted as retries.
+            assert_eq!(retryable("s3$bucket", "409"), 0);
+
+            // Success and non-retryable client errors count as neither.
+            assert_eq!(throttle("s3$bucket", "200"), 0);
+            assert_eq!(retryable("s3$bucket", "404"), 0);
+
+            // The base label is taken from the connector, not shared across stores.
+            assert_eq!(throttle("gs$bucket", "429"), 1);
+            assert_eq!(retryable("gs$bucket", "429"), 1);
+            assert_eq!(throttle("gs$bucket", "503"), 0);
         }
     }
 }
@@ -609,7 +762,7 @@ mod tests {
                 .unwrap();
         });
 
-        let labels = [("operation", "put"), ("scheme", "memory")];
+        let labels = [("operation", "put"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
         assert_eq!(
             counter_value(&recorded, METRIC_BYTES, &labels),
@@ -625,15 +778,52 @@ mod tests {
             let store = metered_store();
             let path = Path::from("a/b.bin");
             store.put(&path, payload(data)).await.unwrap();
-            store.get(&path).await.unwrap();
+            // The GET is only recorded once its body has been fully drained.
+            store.get(&path).await.unwrap().bytes().await.unwrap();
         });
 
-        let labels = [("operation", "get"), ("scheme", "memory")];
+        let labels = [("operation", "get"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
         assert_eq!(
             counter_value(&recorded, METRIC_BYTES, &labels),
             data.len() as u64
         );
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
+    }
+
+    #[test]
+    fn test_get_not_recorded_until_body_drained() {
+        let data = b"hello world";
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let labels = [("operation", "get"), ("base", "memory")];
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let store = metered_store();
+                let path = Path::from("a/b.bin");
+                store.put(&path, payload(data)).await.unwrap();
+
+                // Holding the result without reading the body records nothing yet.
+                let result = store.get(&path).await.unwrap();
+                assert_eq!(
+                    counter_value(&snapshot(&snapshotter), METRIC_REQUESTS, &labels),
+                    0
+                );
+
+                // Draining the body records the request with the true byte count.
+                let bytes = result.bytes().await.unwrap();
+                assert_eq!(bytes.len(), data.len());
+                let recorded = snapshot(&snapshotter);
+                assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+                assert_eq!(
+                    counter_value(&recorded, METRIC_BYTES, &labels),
+                    data.len() as u64
+                );
+            });
+        });
     }
 
     #[test]
@@ -649,7 +839,7 @@ mod tests {
             counter_value(
                 &recorded,
                 METRIC_REQUESTS,
-                &[("operation", "head"), ("scheme", "memory")]
+                &[("operation", "head"), ("base", "memory")]
             ),
             1
         );
@@ -658,7 +848,7 @@ mod tests {
             counter_value(
                 &recorded,
                 METRIC_REQUESTS,
-                &[("operation", "get"), ("scheme", "memory")]
+                &[("operation", "get"), ("base", "memory")]
             ),
             0
         );
@@ -667,26 +857,34 @@ mod tests {
             counter_value(
                 &recorded,
                 METRIC_BYTES,
-                &[("operation", "head"), ("scheme", "memory")]
+                &[("operation", "head"), ("base", "memory")]
             ),
             0
         );
     }
 
     #[test]
-    fn test_delete_records_count_per_path() {
+    fn test_delete_records_one_request_per_call() {
         let recorded = capture_metrics(|| async {
             let store = metered_store();
-            let path = Path::from("a/b.bin");
-            store.put(&path, payload(b"x")).await.unwrap();
-            store.delete(&path).await.unwrap();
+            for i in 0..3 {
+                store
+                    .put(&Path::from(format!("a/{i}.bin")), payload(b"x"))
+                    .await
+                    .unwrap();
+            }
+            // `delete` drives `delete_stream`; deleting three paths is still one
+            // logical delete request (a single batched request on real stores).
+            let paths =
+                futures::stream::iter((0..3).map(|i| Ok(Path::from(format!("a/{i}.bin"))))).boxed();
+            let _: Vec<_> = store.delete_stream(paths).collect().await;
         });
 
         assert_eq!(
             counter_value(
                 &recorded,
                 METRIC_REQUESTS,
-                &[("operation", "delete"), ("scheme", "memory")]
+                &[("operation", "delete"), ("base", "memory")]
             ),
             1
         );
@@ -709,7 +907,7 @@ mod tests {
             counter_value(
                 &recorded,
                 METRIC_REQUESTS,
-                &[("operation", "list"), ("scheme", "memory")]
+                &[("operation", "list"), ("base", "memory")]
             ),
             1
         );
@@ -723,7 +921,7 @@ mod tests {
             let _ = store.get(&Path::from("does/not/exist")).await;
         });
 
-        let labels = [("operation", "get"), ("scheme", "memory")];
+        let labels = [("operation", "get"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_ERRORS, &labels), 1);
         // A failed request is still counted as a request, with latency recorded.
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
@@ -742,7 +940,7 @@ mod tests {
             store.get_ranges(&path, &[2..5, 6..9]).await.unwrap();
         });
 
-        let labels = [("operation", "get"), ("scheme", "memory")];
+        let labels = [("operation", "get"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
         assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 6);
         assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
@@ -767,7 +965,7 @@ mod tests {
         });
 
         for operation in ["copy", "rename"] {
-            let labels = [("operation", operation), ("scheme", "memory")];
+            let labels = [("operation", operation), ("base", "memory")];
             assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
             assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 0);
             assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
@@ -785,7 +983,7 @@ mod tests {
                 .unwrap();
         });
 
-        let labels = [("operation", "list"), ("scheme", "memory")];
+        let labels = [("operation", "list"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
         assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
         assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 0);
@@ -811,14 +1009,14 @@ mod tests {
             counter_value(
                 &recorded,
                 METRIC_REQUESTS,
-                &[("operation", "list"), ("scheme", "memory")]
+                &[("operation", "list"), ("base", "memory")]
             ),
             1
         );
     }
 
     #[test]
-    fn test_multipart_records_each_part_as_put() {
+    fn test_multipart_records_each_part_and_complete() {
         let recorded = capture_metrics(|| async {
             let store = metered_store();
             let mut upload = store.put_multipart(&Path::from("a/big")).await.unwrap();
@@ -827,13 +1025,38 @@ mod tests {
             upload.complete().await.unwrap();
         });
 
-        let labels = [("operation", "put"), ("scheme", "memory")];
-        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 2);
-        assert_eq!(counter_value(&recorded, METRIC_BYTES, &labels), 12);
+        let part_labels = [("operation", "put_part"), ("base", "memory")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &part_labels), 2);
+        assert_eq!(counter_value(&recorded, METRIC_BYTES, &part_labels), 12);
         // Each part records its own latency sample, like a unary put.
-        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 2);
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &part_labels), 2);
         // A successful part upload records no error.
-        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &labels), 0);
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &part_labels), 0);
+
+        // Completing the upload is its own metered request.
+        let complete_labels = [("operation", "complete_multipart"), ("base", "memory")];
+        assert_eq!(
+            counter_value(&recorded, METRIC_REQUESTS, &complete_labels),
+            1
+        );
+        assert_eq!(
+            histogram_count(&recorded, METRIC_DURATION, &complete_labels),
+            1
+        );
+    }
+
+    #[test]
+    fn test_multipart_abort_is_recorded() {
+        let recorded = capture_metrics(|| async {
+            let store = metered_store();
+            let mut upload = store.put_multipart(&Path::from("a/big")).await.unwrap();
+            upload.put_part(payload(b"hello")).await.unwrap();
+            upload.abort().await.unwrap();
+        });
+
+        let labels = [("operation", "abort_multipart"), ("base", "memory")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
+        assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
     }
 
     #[test]
@@ -845,7 +1068,7 @@ mod tests {
             let _ = upload.put_part(payload(b"data")).await;
         });
 
-        let labels = [("operation", "put"), ("scheme", "memory")];
+        let labels = [("operation", "put_part"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &labels), 1);
         assert_eq!(counter_value(&recorded, METRIC_ERRORS, &labels), 1);
         assert_eq!(histogram_count(&recorded, METRIC_DURATION, &labels), 1);
@@ -857,7 +1080,7 @@ mod tests {
     fn test_in_flight_guard_tracks_and_releases() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let labels = [("operation", "get"), ("scheme", "memory")];
+        let labels = [("operation", "get"), ("base", "memory")];
         metrics::with_local_recorder(&recorder, || {
             let g1 = InFlightGuard::new("memory", "get");
             let g2 = InFlightGuard::new("memory", "get");
@@ -890,7 +1113,7 @@ mod tests {
         // The gauge is emitted for each operation (guard is wired in) and, once
         // the operation completes, balances back to zero.
         for operation in ["put", "get"] {
-            let labels = [("operation", operation), ("scheme", "memory")];
+            let labels = [("operation", operation), ("base", "memory")];
             assert!(has_metric(&recorded, METRIC_IN_FLIGHT, &labels));
             assert_eq!(gauge_value(&recorded, METRIC_IN_FLIGHT, &labels), 0.0);
         }
@@ -900,7 +1123,7 @@ mod tests {
     fn test_list_stream_holds_in_flight_until_dropped() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let labels = [("operation", "list"), ("scheme", "memory")];
+        let labels = [("operation", "list"), ("base", "memory")];
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -929,7 +1152,7 @@ mod tests {
     fn test_delete_stream_holds_in_flight_until_dropped() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let labels = [("operation", "delete"), ("scheme", "memory")];
+        let labels = [("operation", "delete"), ("base", "memory")];
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -958,7 +1181,7 @@ mod tests {
     fn test_in_flight_released_when_operation_future_dropped() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let labels = [("operation", "get"), ("scheme", "memory")];
+        let labels = [("operation", "get"), ("base", "memory")];
         metrics::with_local_recorder(&recorder, || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -1009,12 +1232,12 @@ mod tests {
         });
 
         // delete_stream counts the item and records an error when it fails.
-        let delete_labels = [("operation", "delete"), ("scheme", "memory")];
+        let delete_labels = [("operation", "delete"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &delete_labels), 1);
         assert_eq!(counter_value(&recorded, METRIC_ERRORS, &delete_labels), 1);
 
         // A list request is counted once; a failure while draining records an error.
-        let list_labels = [("operation", "list"), ("scheme", "memory")];
+        let list_labels = [("operation", "list"), ("base", "memory")];
         assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &list_labels), 1);
         assert_eq!(counter_value(&recorded, METRIC_ERRORS, &list_labels), 1);
     }

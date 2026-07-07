@@ -93,7 +93,7 @@ impl GcsStoreProvider {
         {
             builder = builder.with_http_connector(
                 crate::object_store::metrics::MeteringHttpConnector::new(
-                    base_path.scheme().to_string(),
+                    self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?,
                 ),
             );
         }

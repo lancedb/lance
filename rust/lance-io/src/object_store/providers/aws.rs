@@ -73,6 +73,12 @@ impl AwsStoreProvider {
             s3_storage_options.insert(AmazonS3ConfigKey::S3Express, true.to_string());
         }
 
+        // Compute the metrics label before rewriting the url below, so it
+        // matches the prefix the registry uses to key this store.
+        #[cfg(feature = "metrics")]
+        let store_prefix =
+            self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
+
         // before creating the OSObjectStore we need to rewrite the url to drop ddb related parts
         base_path.set_scheme("s3").unwrap();
         base_path.set_query(None);
@@ -92,9 +98,7 @@ impl AwsStoreProvider {
         #[cfg(feature = "metrics")]
         {
             builder = builder.with_http_connector(
-                crate::object_store::metrics::MeteringHttpConnector::new(
-                    base_path.scheme().to_string(),
-                ),
+                crate::object_store::metrics::MeteringHttpConnector::new(store_prefix),
             );
         }
 
