@@ -85,7 +85,6 @@ A single overlay is one of two shapes:
   embeddings means re-storing data that did not change. A sparse overlay stores
   exactly the changed cells.
 
-
 ## Protobuf
 
 <details>
@@ -162,20 +161,12 @@ Step 3 is what makes exclusion correct rather than merely safe: removing a row
 from index candidates without re-evaluating it would silently drop a row that
 should match under its new value.
 
-### Correctness invariant
-
-> For every indexed field `F` and every row offset `o` in a fragment the index
-> covers, the index's entry for `(o, F)` is trusted unless `o` is excluded.
-> `o` is excluded iff some overlay with `committed_version > index.dataset_version`
-> covers `(o, F)`.
-
-The write and compaction paths together preserve this:
-
-- **Writes** change a cell only by adding an overlay, and that overlay's
-  `committed_version` exceeds the version of any pre-existing index — so the
-  change is always covered by an exclusion.
-- **Compaction** may remove an overlay only if the index no longer relies on it
-  (see below).
+Exclusion is always *sufficient* because a write changes a cell only by adding an
+overlay, and that overlay's `committed_version` — the version of the commit that
+adds it — necessarily exceeds the `dataset_version` of any pre-existing index. So
+every cell a write changes is guaranteed to fall in that index's exclusion set.
+Compaction may remove an overlay only if no index still relies on it for exclusion
+(see [Compaction](#compaction)).
 
 ## Compaction
 
