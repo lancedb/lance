@@ -31,8 +31,7 @@ An overlay changes individual cells.
 
 Each overlay declares which cells it provides through a **coverage** bitmap (or,
 for sparse overlays, one bitmap per field). The bitmaps index **physical row
-offsets** — positions in the base data files, counting deleted rows — so they are
-stable across deletions, exactly like deletion vectors.
+offsets**. They include deleted rows and are stable even as deletion vectors change.
 
 To resolve a cell `(offset, field)` on read, walk the fragment's overlays from
 **newest to oldest**. The first overlay that covers `(offset, field)` wins; its
@@ -88,8 +87,6 @@ A single overlay is one of two shapes:
   embeddings means re-storing data that did not change. A sparse overlay stores
   exactly the changed cells.
 
-A writer may always express a non-rectangular update as **multiple dense overlays
-in one transaction** (one per coverage group) instead of a single sparse overlay.
 
 ## Protobuf
 
@@ -184,14 +181,15 @@ The write and compaction paths together preserve this:
 
 ## Compaction
 
-Overlays accumulate read cost — every overlay is a bitmap to test and a possible
-file to open. Compaction bounds that cost in two modes:
+Overlays accumulate read cost — every overlay is a bitmap to test, a possible
+file to open, and additional work to interleave values. Compaction bounds that cost in two modes:
 
 - **Overlay → overlay.** Merge several overlays into fewer, computing the
   post-image per `(offset, field)` by walking the merged overlays newest-first.
   The merged overlay takes the **maximum** `committed_version` of its inputs, so
-  the exclusion semantics are preserved. Indexes are unaffected. This is cheap and
-  does not touch the base.
+  the exclusion semantics are preserved. Indexes can still be re-used, but they
+  may now need to exclude more rows. This is cheap to write and does not touch
+  the base.
 - **Overlay → base.** Fold overlays into a fresh base data file, computing the
   post-image for every covered cell, then clear the overlays. The base is
   complete, so every post-image is well defined. Overlay offsets are physical, so
@@ -223,6 +221,8 @@ addressed by physical offset, they do **not** require stable row IDs to be
 enabled; lineage updates apply only when those features are on.
 
 ## Worked example
+
+The following example illustrates how overlays function across their lifecycle, to make the rules above concrete.
 
 A table `users` with stable row IDs enabled and these fields:
 
@@ -338,10 +338,8 @@ cleared. Row addresses are preserved (a column rewrite, not a row rewrite), so
 stable row IDs and the deletion vector are untouched.
 
 Because the fold removed the overlay that was excluding offset 1 from the `age`
-index, the same commit must reconcile that index: either rebuild it at
-`dataset_version >= 2`, or drop fragment `0` from its coverage so `age` queries
-fall to the flat path. After a rebuild at version 4, no overlay remains and the
-`age` index directly returns `26` for Bob with no exclusion needed.
+index, the commit must drop fragment `0` from its coverage so `age` queries
+fall to the flat path.
 
 ## Guidance
 
