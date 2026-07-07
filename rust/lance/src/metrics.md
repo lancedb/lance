@@ -6,13 +6,19 @@ is a cheap no-op. Metrics are only emitted when Lance is built with the
 
 ## Object store metrics
 
-These track I/O against the underlying object store. The `base` label is the
-store's unique prefix: `s3$my-bucket` / `gs$my-bucket` for bucketed stores,
-`az$container@account` for Azure (where the account also matters), or just
-`file` / `memory` for stores without buckets — so multiple buckets on the same
-cloud can be told apart. `operation` is one of `get`, `put`, `put_part`,
-`head`, `list`, `delete`, `copy`, `rename`, `complete_multipart`, or
-`abort_multipart`.
+These track I/O against the underlying object store. The `base` label
+identifies the store; its cardinality is controlled by the
+`LANCE_OBJECT_STORE_METRICS_LABEL` environment variable:
+
+- `scheme` (default) — the scheme only (`s3`, `gs`, `az`, `file`, `memory`);
+  low, bounded cardinality.
+- `full` — the store's unique prefix (`s3$my-bucket`, `az$container@account`
+  where Azure's account also matters), so multiple buckets on the same cloud
+  can be told apart. Cardinality grows with the number of stores accessed.
+- `off` — omit the `base` label entirely.
+
+`operation` is one of `get`, `put`, `put_part`, `head`, `list`, `delete`,
+`copy`, `rename`, `complete_multipart`, or `abort_multipart`.
 
 Request counts are per logical operation: a `list` or `delete` that spans many
 objects is one request, matching how backends batch them.

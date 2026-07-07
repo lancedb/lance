@@ -21,16 +21,23 @@
 //! bypass `object_store`'s HTTP client, so there is no place to install the
 //! connector for them.
 //!
-//! All metrics carry a `base` label identifying the store (e.g. `s3$bucket`,
-//! `az$container@account`), so multiple buckets on the same cloud can be told
-//! apart. The metric name constants ([`METRIC_REQUESTS`] etc.) and the recording
+//! Metrics carry a `base` label identifying the store. Its cardinality is
+//! controlled by the `LANCE_OBJECT_STORE_METRICS_LABEL` environment variable
+//! ([`BASE_LABEL_ENV_VAR`]):
+//!
+//! * `scheme` (default) — scheme only, e.g. `s3`; low, bounded cardinality.
+//! * `full` — the full store prefix, e.g. `s3$bucket` or `az$container@account`,
+//!   so multiple buckets on the same cloud can be told apart.
+//! * `off` — omit the `base` label entirely.
+//!
+//! The metric name constants ([`METRIC_REQUESTS`] etc.) and the recording
 //! helpers ([`record_request`], [`record_count`], [`record_error`],
 //! [`InFlightGuard`]) are public so custom object stores can emit the same
 //! metrics.
 
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -64,6 +71,64 @@ pub const METRIC_RETRYABLE: &str = "lance_object_store_retryable_responses_total
 /// and `base`.
 pub const METRIC_IN_FLIGHT: &str = "lance_object_store_in_flight_requests";
 
+/// Environment variable controlling the cardinality of the `base` label.
+pub const BASE_LABEL_ENV_VAR: &str = "LANCE_OBJECT_STORE_METRICS_LABEL";
+
+/// Controls how much of a store's identity the `base` label carries, traded off
+/// against metric cardinality. Selected via [`BASE_LABEL_ENV_VAR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseLabelMode {
+    /// Full store prefix, e.g. `s3$bucket` or `az$container@account`. Highest
+    /// cardinality: one series family per bucket/container.
+    Full,
+    /// Scheme only, e.g. `s3`. The default: low, bounded cardinality.
+    Scheme,
+    /// Omit the `base` label entirely.
+    Off,
+}
+
+fn parse_base_label_mode(value: Option<&str>) -> BaseLabelMode {
+    match value {
+        Some("full") => BaseLabelMode::Full,
+        Some("off") | Some("none") => BaseLabelMode::Off,
+        Some("scheme") | None => BaseLabelMode::Scheme,
+        Some(other) => {
+            tracing::warn!(
+                "Unrecognized {BASE_LABEL_ENV_VAR}={other:?}; \
+                 expected one of full, scheme, off. Defaulting to scheme."
+            );
+            BaseLabelMode::Scheme
+        }
+    }
+}
+
+/// The label mode is read once from the environment and cached for the process.
+fn base_label_mode() -> BaseLabelMode {
+    static MODE: OnceLock<BaseLabelMode> = OnceLock::new();
+    *MODE.get_or_init(|| parse_base_label_mode(std::env::var(BASE_LABEL_ENV_VAR).ok().as_deref()))
+}
+
+/// Reduce a full store prefix (`scheme$authority`, or just `scheme` for stores
+/// without buckets) to the configured `base` label value, or `None` when the
+/// label should be omitted.
+fn scoped_base(mode: BaseLabelMode, base: &str) -> Option<String> {
+    match mode {
+        BaseLabelMode::Full => Some(base.to_owned()),
+        BaseLabelMode::Scheme => Some(base.split('$').next().unwrap_or(base).to_owned()),
+        BaseLabelMode::Off => None,
+    }
+}
+
+/// Build the `operation` (+ optional `base`) label set shared by all
+/// store-level metrics, honoring the configured label mode.
+fn operation_labels(base: &str, operation: &'static str) -> Vec<metrics::Label> {
+    let mut labels = vec![metrics::Label::new("operation", operation)];
+    if let Some(base) = scoped_base(base_label_mode(), base) {
+        labels.push(metrics::Label::new("base", base));
+    }
+    labels
+}
+
 /// Record the outcome of a unary request: count, latency, bytes (on success), and errors.
 pub fn record_request<T>(
     base: &str,
@@ -86,54 +151,45 @@ pub fn record_outcome(
     is_error: bool,
 ) {
     let elapsed = start.elapsed().as_secs_f64();
-    metrics::counter!(METRIC_REQUESTS, "operation" => operation, "base" => base.to_owned())
-        .increment(1);
-    metrics::histogram!(METRIC_DURATION, "operation" => operation, "base" => base.to_owned())
-        .record(elapsed);
+    let labels = operation_labels(base, operation);
+    metrics::counter!(METRIC_REQUESTS, labels.clone()).increment(1);
+    metrics::histogram!(METRIC_DURATION, labels.clone()).record(elapsed);
     if is_error {
-        record_error(base, operation);
+        metrics::counter!(METRIC_ERRORS, labels).increment(1);
     } else if bytes > 0 {
-        metrics::counter!(METRIC_BYTES, "operation" => operation, "base" => base.to_owned())
-            .increment(bytes);
+        metrics::counter!(METRIC_BYTES, labels).increment(bytes);
     }
 }
 
 /// Record a single request count without latency, used for streaming operations
 /// (list / delete) whose work happens lazily as the stream is polled.
 pub fn record_count(base: &str, operation: &'static str) {
-    metrics::counter!(METRIC_REQUESTS, "operation" => operation, "base" => base.to_owned())
-        .increment(1);
+    metrics::counter!(METRIC_REQUESTS, operation_labels(base, operation)).increment(1);
 }
 
 /// Record a single error for an operation.
 pub fn record_error(base: &str, operation: &'static str) {
-    metrics::counter!(METRIC_ERRORS, "operation" => operation, "base" => base.to_owned())
-        .increment(1);
+    metrics::counter!(METRIC_ERRORS, operation_labels(base, operation)).increment(1);
 }
 
 /// Raises the in-flight gauge for an operation on creation and lowers it on
 /// drop, so the count stays balanced even if the request future or stream is
 /// cancelled or dropped before completing.
 pub struct InFlightGuard {
-    base: String,
-    operation: &'static str,
+    labels: Vec<metrics::Label>,
 }
 
 impl InFlightGuard {
     pub fn new(base: &str, operation: &'static str) -> Self {
-        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => operation, "base" => base.to_owned())
-            .increment(1.0);
-        Self {
-            base: base.to_owned(),
-            operation,
-        }
+        let labels = operation_labels(base, operation);
+        metrics::gauge!(METRIC_IN_FLIGHT, labels.clone()).increment(1.0);
+        Self { labels }
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        metrics::gauge!(METRIC_IN_FLIGHT, "operation" => self.operation, "base" => self.base.clone())
-            .decrement(1.0);
+        metrics::gauge!(METRIC_IN_FLIGHT, self.labels.clone()).decrement(1.0);
     }
 }
 
@@ -510,23 +566,23 @@ mod http {
             let is_throttle = status == 429 || status == 503;
             let is_retryable = status == 429 || status == 408 || (500..600).contains(&status);
             if is_throttle {
-                metrics::counter!(
-                    METRIC_THROTTLE,
-                    "status" => status.to_string(),
-                    "base" => self.base.clone(),
-                )
-                .increment(1);
+                metrics::counter!(METRIC_THROTTLE, status_labels(&self.base, status)).increment(1);
             }
             if is_retryable {
-                metrics::counter!(
-                    METRIC_RETRYABLE,
-                    "status" => status.to_string(),
-                    "base" => self.base.clone(),
-                )
-                .increment(1);
+                metrics::counter!(METRIC_RETRYABLE, status_labels(&self.base, status)).increment(1);
             }
             Ok(response)
         }
+    }
+
+    /// Build the `status` (+ optional `base`) label set for HTTP-layer metrics,
+    /// honoring the configured label mode.
+    fn status_labels(base: &str, status: u16) -> Vec<metrics::Label> {
+        let mut labels = vec![metrics::Label::new("status", status.to_string())];
+        if let Some(base) = scoped_base(base_label_mode(), base) {
+            labels.push(metrics::Label::new("base", base));
+        }
+        labels
     }
 
     #[cfg(test)]
@@ -592,17 +648,19 @@ mod http {
                 rt.block_on(async {
                     // Each attempt that object_store retries flows through `call`
                     // again; here we simulate that by issuing several responses.
-                    // The base is baked into the connector, so it labels the metric.
+                    // The base is baked into the connector, so it labels the
+                    // metric. Bases here have no `$`, so they are unaffected by
+                    // the label mode and this test isolates status handling.
                     for (base, status) in [
-                        ("s3$bucket", 429u16),
-                        ("s3$bucket", 503),
-                        ("s3$bucket", 503),
-                        ("s3$bucket", 500),
-                        ("s3$bucket", 408),
-                        ("s3$bucket", 409),
-                        ("s3$bucket", 200),
-                        ("s3$bucket", 404),
-                        ("gs$bucket", 429),
+                        ("s3", 429u16),
+                        ("s3", 503),
+                        ("s3", 503),
+                        ("s3", 500),
+                        ("s3", 408),
+                        ("s3", 409),
+                        ("s3", 200),
+                        ("s3", 404),
+                        ("gs", 429),
                     ] {
                         let service = MeteringHttpService {
                             base: base.into(),
@@ -624,27 +682,27 @@ mod http {
             let retryable = |base, status| metric_count(&recorded, METRIC_RETRYABLE, base, status);
 
             // Throttles are only 429 and 503.
-            assert_eq!(throttle("s3$bucket", "429"), 1);
-            assert_eq!(throttle("s3$bucket", "503"), 2);
-            assert_eq!(throttle("s3$bucket", "500"), 0);
-            assert_eq!(throttle("s3$bucket", "408"), 0);
+            assert_eq!(throttle("s3", "429"), 1);
+            assert_eq!(throttle("s3", "503"), 2);
+            assert_eq!(throttle("s3", "500"), 0);
+            assert_eq!(throttle("s3", "408"), 0);
 
             // Retryable is the broader set: 5xx, 429, 408 (but not 409).
-            assert_eq!(retryable("s3$bucket", "429"), 1);
-            assert_eq!(retryable("s3$bucket", "503"), 2);
-            assert_eq!(retryable("s3$bucket", "500"), 1);
-            assert_eq!(retryable("s3$bucket", "408"), 1);
+            assert_eq!(retryable("s3", "429"), 1);
+            assert_eq!(retryable("s3", "503"), 2);
+            assert_eq!(retryable("s3", "500"), 1);
+            assert_eq!(retryable("s3", "408"), 1);
             // 409 conflict is excluded so commit conflicts are not counted as retries.
-            assert_eq!(retryable("s3$bucket", "409"), 0);
+            assert_eq!(retryable("s3", "409"), 0);
 
             // Success and non-retryable client errors count as neither.
-            assert_eq!(throttle("s3$bucket", "200"), 0);
-            assert_eq!(retryable("s3$bucket", "404"), 0);
+            assert_eq!(throttle("s3", "200"), 0);
+            assert_eq!(retryable("s3", "404"), 0);
 
             // The base label is taken from the connector, not shared across stores.
-            assert_eq!(throttle("gs$bucket", "429"), 1);
-            assert_eq!(retryable("gs$bucket", "429"), 1);
-            assert_eq!(throttle("gs$bucket", "503"), 0);
+            assert_eq!(throttle("gs", "429"), 1);
+            assert_eq!(retryable("gs", "429"), 1);
+            assert_eq!(throttle("gs", "503"), 0);
         }
     }
 }
@@ -749,6 +807,69 @@ mod tests {
         metrics
             .iter()
             .any(|(key, _)| key_matches(key, name, labels))
+    }
+
+    #[test]
+    fn test_parse_base_label_mode() {
+        assert_eq!(parse_base_label_mode(None), BaseLabelMode::Scheme);
+        assert_eq!(parse_base_label_mode(Some("scheme")), BaseLabelMode::Scheme);
+        assert_eq!(parse_base_label_mode(Some("full")), BaseLabelMode::Full);
+        assert_eq!(parse_base_label_mode(Some("off")), BaseLabelMode::Off);
+        assert_eq!(parse_base_label_mode(Some("none")), BaseLabelMode::Off);
+        // Unrecognized values fall back to the conservative default.
+        assert_eq!(parse_base_label_mode(Some("bogus")), BaseLabelMode::Scheme);
+    }
+
+    #[test]
+    fn test_scoped_base() {
+        assert_eq!(
+            scoped_base(BaseLabelMode::Full, "s3$bucket").as_deref(),
+            Some("s3$bucket")
+        );
+        assert_eq!(
+            scoped_base(BaseLabelMode::Scheme, "s3$bucket").as_deref(),
+            Some("s3")
+        );
+        // Azure keeps only the scheme even though its prefix carries the account.
+        assert_eq!(
+            scoped_base(BaseLabelMode::Scheme, "az$container@account").as_deref(),
+            Some("az")
+        );
+        // A prefix without `$` (e.g. memory/file) is unchanged by scheme mode.
+        assert_eq!(
+            scoped_base(BaseLabelMode::Scheme, "memory").as_deref(),
+            Some("memory")
+        );
+        assert_eq!(scoped_base(BaseLabelMode::Off, "s3$bucket"), None);
+    }
+
+    #[test]
+    fn test_base_label_defaults_to_scheme() {
+        // No env var is set in the test process, so the default `scheme` mode
+        // applies: the full prefix collapses to just the scheme.
+        let recorded = capture_metrics(|| async {
+            let store = (Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>)
+                .metered("s3$my-bucket".into());
+            store.put(&Path::from("a"), payload(b"x")).await.unwrap();
+        });
+
+        assert_eq!(
+            counter_value(
+                &recorded,
+                METRIC_REQUESTS,
+                &[("operation", "put"), ("base", "s3")]
+            ),
+            1
+        );
+        // The full prefix is not emitted as the label under the default mode.
+        assert_eq!(
+            counter_value(
+                &recorded,
+                METRIC_REQUESTS,
+                &[("operation", "put"), ("base", "s3$my-bucket")]
+            ),
+            0
+        );
     }
 
     #[test]
