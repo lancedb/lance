@@ -1,7 +1,7 @@
 # MemTable & WAL Specification (Experimental)
 
-Lance MemTable & WAL (MemWAL) is an experimental Log-Structured-Merge architecture for Lance tables.
-It supports high-throughput streaming writes while preserving indexed read paths for scans, point lookups, vector search, and full-text search.
+Lance MemTable & WAL (MemWAL) specification describes a Log-Structured-Merge (LSM) tree architecture for Lance tables, enabling high-performance streaming write workloads while maintaining indexed read performance for key workloads including
+scan, point lookup, vector search and full-text search.
 
 ## Overall Architecture
 
