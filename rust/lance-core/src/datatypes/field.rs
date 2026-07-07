@@ -555,6 +555,14 @@ impl Field {
     fn is_blob_v2_descriptor(&self) -> bool {
         self.metadata.contains_key(BLOB_META_KEY)
             && self.logical_type == BLOB_V2_DESC_LANCE_FIELD.logical_type
+            && self.children.len() == BLOB_V2_DESC_LANCE_FIELD.children.len()
+            && self
+                .children
+                .iter()
+                .zip(BLOB_V2_DESC_LANCE_FIELD.children.iter())
+                .all(|(child, expected)| {
+                    child.name == expected.name && child.data_type() == expected.data_type()
+                })
     }
 
     // Blob columns intentionally have two schema representations:
@@ -595,10 +603,10 @@ impl Field {
         self.logical_type = LogicalType::try_from(&DataType::LargeBinary).unwrap();
         self.children.clear();
         self.encoding = Some(Encoding::VarBinary);
-        self.metadata.remove(BLOB_META_KEY);
-        self.metadata.remove("packed");
-        self.metadata.remove("lance-encoding:packed");
         if is_blob_v2 {
+            self.metadata.remove(BLOB_META_KEY);
+            self.metadata.remove("packed");
+            self.metadata.remove("lance-encoding:packed");
             self.metadata
                 .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
         }
@@ -1883,6 +1891,14 @@ mod tests {
     #[test]
     fn blob_unloaded_mut_selects_layout_from_metadata() {
         let metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let mut binary_field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
+            .with_metadata(metadata.clone())
+            .try_into()
+            .unwrap();
+        binary_field.binary_blob_mut();
+        assert!(binary_field.metadata.contains_key(BLOB_META_KEY));
+        assert!(!binary_field.is_blob_v2());
+
         let mut field: Field = ArrowField::new("blob", DataType::LargeBinary, true)
             .with_metadata(metadata)
             .try_into()
@@ -1890,6 +1906,12 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 2);
         assert_eq!(field.logical_type, BLOB_DESC_LANCE_FIELD.logical_type);
+        assert!(field.is_blob());
+        assert!(!field.is_blob_v2());
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 2);
+        assert_eq!(field.logical_type, BLOB_DESC_LANCE_FIELD.logical_type);
+        assert!(!field.is_blob_v2());
 
         let metadata =
             HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
