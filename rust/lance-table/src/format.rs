@@ -7,6 +7,7 @@ use uuid::Uuid;
 mod fragment;
 mod index;
 mod manifest;
+mod overlay;
 mod transaction;
 
 pub use crate::rowids::version::{
@@ -14,6 +15,7 @@ pub use crate::rowids::version::{
 };
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
+pub use overlay::{DataOverlayFile, OverlayCoverage};
 
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
