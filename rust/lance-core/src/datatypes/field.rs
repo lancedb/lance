@@ -549,6 +549,12 @@ impl Field {
             .get(ARROW_EXT_NAME_KEY)
             .map(|name| name == BLOB_V2_EXT_NAME)
             .unwrap_or(false)
+            || self.is_blob_v2_descriptor()
+    }
+
+    fn is_blob_v2_descriptor(&self) -> bool {
+        self.metadata.contains_key(BLOB_META_KEY)
+            && self.logical_type == BLOB_V2_DESC_LANCE_FIELD.logical_type
     }
 
     // Blob columns intentionally have two schema representations:
@@ -572,6 +578,29 @@ impl Field {
             self.logical_type = BLOB_DESC_LANCE_FIELD.logical_type.clone();
             self.children = BLOB_DESC_LANCE_FIELD.children.clone();
             self.metadata = BLOB_DESC_LANCE_FIELD.metadata.clone();
+        }
+    }
+
+    /// Convert a blob field to the materialized binary payload view.
+    ///
+    /// The field keeps its name and id but uses `LargeBinary` with no children.
+    /// Blob v2 fields retain their extension marker internally so scan planning
+    /// can recognize the binary view before exposing a plain Arrow binary field.
+    pub fn binary_blob_mut(&mut self) {
+        if !self.is_blob() {
+            return;
+        }
+        let is_blob_v2 = self.is_blob_v2();
+
+        self.logical_type = LogicalType::try_from(&DataType::LargeBinary).unwrap();
+        self.children.clear();
+        self.encoding = Some(Encoding::VarBinary);
+        self.metadata.remove(BLOB_META_KEY);
+        self.metadata.remove("packed");
+        self.metadata.remove("lance-encoding:packed");
+        if is_blob_v2 {
+            self.metadata
+                .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
         }
     }
 
@@ -812,6 +841,13 @@ impl Field {
         }
 
         if self.is_blob() != other.is_blob() {
+            if ignore_types {
+                return Ok(if self.id >= 0 {
+                    self.clone()
+                } else {
+                    other.clone()
+                });
+            }
             return Err(Error::arrow(format!(
                 "Attempt to intersect blob and non-blob field: {}",
                 self.name
@@ -847,7 +883,7 @@ impl Field {
                 .iter()
                 .filter_map(|c| {
                     if let Some(other_child) = other.child(&c.name) {
-                        let intersection = c.intersection(other_child).ok()?;
+                        let intersection = c.do_intersection(other_child, ignore_types).ok()?;
                         Some(intersection)
                     } else {
                         None
@@ -1874,6 +1910,12 @@ mod tests {
         field.unloaded_mut();
         assert_eq!(field.children.len(), 5);
         assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        assert!(!field.metadata.contains_key(ARROW_EXT_NAME_KEY));
+        assert!(field.is_blob_v2());
+        field.unloaded_mut();
+        assert_eq!(field.children.len(), 5);
+        assert_eq!(field.logical_type, BLOB_V2_DESC_LANCE_FIELD.logical_type);
+        assert!(!field.metadata.contains_key(ARROW_EXT_NAME_KEY));
     }
 
     #[test]

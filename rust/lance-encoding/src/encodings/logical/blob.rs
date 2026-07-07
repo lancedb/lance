@@ -267,16 +267,11 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        mut repdef: RepDefBuilder,
+        repdef: RepDefBuilder,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_arr = array.as_struct();
-        if let Some(validity) = struct_arr.nulls() {
-            repdef.add_validity_bitmap(validity.clone());
-        } else {
-            repdef.add_no_null(struct_arr.len());
-        }
 
         let kind_col = struct_arr
             .column_by_name("kind")
@@ -403,7 +398,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let descriptor_array = Arc::new(StructArray::try_new(
             BLOB_V2_DESC_FIELDS.clone(),
             children,
-            None,
+            struct_arr.nulls().cloned(),
         )?) as ArrayRef;
 
         self.descriptor_encoder.maybe_encode(

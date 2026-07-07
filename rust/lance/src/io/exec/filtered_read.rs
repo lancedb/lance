@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -59,6 +59,13 @@ use crate::dataset::scanner::{
 };
 
 use super::utils::IoMetrics;
+
+fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
+    let schema = projection.to_schema();
+    let schema = crate::dataset::blob::public_blob_v2_binary_output_schema(&schema);
+    let schema: ArrowSchema = (&schema).into();
+    Arc::new(schema)
+}
 
 #[derive(Debug)]
 pub struct EvaluatedIndex {
@@ -385,7 +392,7 @@ impl FilteredReadStream {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let output_schema = Arc::new(options.projection.to_arrow_schema());
+        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
 
         let obj_store = dataset.object_store.clone();
         // Explicit options take precedence; otherwise fall back to the
@@ -417,11 +424,14 @@ impl FilteredReadStream {
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map({
                 let scan_range_after_filter = scan_range_after_filter.clone();
+                let dataset = dataset.clone();
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                    let dataset = dataset.clone();
                     SpawnedTask::spawn(
-                        Self::read_fragment(scoped_fragment, metrics, limit).in_current_span(),
+                        Self::read_fragment(dataset, scoped_fragment, metrics, limit)
+                            .in_current_span(),
                     )
                     .map(|thread_result| thread_result.unwrap())
                 }
@@ -1076,11 +1086,13 @@ impl FilteredReadStream {
     // Reads a single fragment into a stream of batch tasks
     #[instrument(name = "read_fragment", level = "debug", skip_all)]
     async fn read_fragment(
+        dataset: Arc<Dataset>,
         mut fragment_read_task: ScopedFragmentRead,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         fragment_soft_limit: Option<u64>,
     ) -> Result<BoxStream<'static, Result<ReadBatchFut>>> {
-        let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
+        let output_schema =
+            public_blob_v2_binary_projection_schema(fragment_read_task.projection.as_ref());
 
         if let Some(filter) = &fragment_read_task.filter {
             let filter_cols = Planner::column_names_in_expr(filter);
@@ -1095,10 +1107,22 @@ impl FilteredReadStream {
             }
         }
 
-        let read_schema = fragment_read_task.projection.to_bare_schema();
+        let output_read_schema = Arc::new(fragment_read_task.projection.to_bare_schema());
+        let materialize_blob_v2_binary =
+            crate::dataset::blob::schema_has_blob_v2_binary_view(output_read_schema.as_ref());
+        let read_schema = if materialize_blob_v2_binary {
+            crate::dataset::blob::blob_v2_descriptor_schema(output_read_schema.as_ref())
+        } else {
+            output_read_schema.as_ref().clone()
+        };
+        let mut frag_read_config = fragment_read_task.frag_read_config();
+        if materialize_blob_v2_binary {
+            frag_read_config = frag_read_config.with_row_address(true);
+        }
+        let keep_materialized_row_addr = fragment_read_task.projection.with_row_addr;
         let mut fragment_reader = fragment_read_task
             .fragment
-            .open(&read_schema, fragment_read_task.frag_read_config())
+            .open(&read_schema, frag_read_config)
             .await?;
 
         if fragment_read_task.with_deleted_rows {
@@ -1112,8 +1136,9 @@ impl FilteredReadStream {
         let physical_filter = fragment_read_task
             .filter
             .map(|filter| {
-                let planner =
-                    Planner::new(Arc::new(fragment_read_task.projection.to_arrow_schema()));
+                let planner = Planner::new(public_blob_v2_binary_projection_schema(
+                    fragment_read_task.projection.as_ref(),
+                ));
                 planner.create_physical_expr(&filter)
             })
             .transpose()?;
@@ -1136,7 +1161,7 @@ impl FilteredReadStream {
                 let global_metrics = global_metrics.clone();
                 let fragment_counted = fragment_counted.clone();
                 let range_tracker = range_tracker.clone();
-                batch_fut
+                let batch_fut = batch_fut
                     .inspect_ok(move |batch| {
                         let num_rows = batch.num_rows();
                         global_metrics.rows_scanned.add(num_rows);
@@ -1151,7 +1176,28 @@ impl FilteredReadStream {
                             global_metrics.ranges_scanned.add(additional_ranges);
                         }
                     })
-                    .boxed()
+                    .boxed();
+                if materialize_blob_v2_binary {
+                    let dataset = dataset.clone();
+                    let output_read_schema = output_read_schema.clone();
+                    batch_fut
+                        .and_then(move |batch| {
+                            let dataset = dataset.clone();
+                            let output_read_schema = output_read_schema.clone();
+                            async move {
+                                crate::dataset::blob::materialize_blob_v2_binary_batch(
+                                    &dataset,
+                                    output_read_schema.as_ref(),
+                                    batch,
+                                    keep_materialized_row_addr,
+                                )
+                                .await
+                            }
+                        })
+                        .boxed()
+                } else {
+                    batch_fut
+                }
             })
             .zip(futures::stream::repeat((
                 physical_filter.clone(),
@@ -1595,7 +1641,7 @@ impl FilteredReadExec {
                 ));
             }
         }
-        let output_schema = Arc::new(options.projection.to_arrow_schema());
+        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -1973,7 +2019,7 @@ impl ExecutionPlan for FilteredReadExec {
             .clone()
             .union_columns(filter_columns, OnMissing::Error)?;
 
-        let read_schema = Arc::new(read_projection.to_arrow_schema());
+        let read_schema = public_blob_v2_binary_projection_schema(&read_projection);
 
         let planner = Arc::new(Planner::new(read_schema.clone()));
         let physical_filter = planner.create_physical_expr(filter)?;
