@@ -296,6 +296,12 @@ impl TokenStream for TTStream {
         &self.tokens[self.index - 1]
     }
 
+    fn token_or_none(&self) -> Option<&Token> {
+        self.index
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+    }
+
     fn token_mut(&mut self) -> &mut Token {
         &mut self.tokens[self.index - 1]
     }

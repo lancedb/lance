@@ -72,6 +72,10 @@ impl TokenStream for BoxTokenStream<'_> {
         self.0.token()
     }
 
+    fn token_or_none(&self) -> Option<&Token> {
+        self.0.token_or_none()
+    }
+
     fn token_mut(&mut self) -> &mut Token {
         self.0.token_mut()
     }
@@ -102,6 +106,11 @@ impl<'a> TokenStream for Box<dyn TokenStream + 'a> {
         token_stream.token()
     }
 
+    fn token_or_none(&self) -> Option<&Token> {
+        let token_stream: &(dyn TokenStream + 'a) = self.borrow();
+        token_stream.token_or_none()
+    }
+
     fn token_mut(&mut self) -> &mut Token {
         let token_stream: &mut (dyn TokenStream + 'a) = self.borrow_mut();
         token_stream.token_mut()
@@ -115,6 +124,11 @@ pub trait TokenStream {
 
     /// Access the current token.
     fn token(&self) -> &Token;
+
+    /// Access the current token if the stream can expose one safely.
+    fn token_or_none(&self) -> Option<&Token> {
+        None
+    }
 
     /// Mutate the current token.
     fn token_mut(&mut self) -> &mut Token;

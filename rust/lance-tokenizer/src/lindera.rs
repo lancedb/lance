@@ -75,6 +75,10 @@ impl<'a> TokenStream for LinderaTokenStream<'a> {
         self.token
     }
 
+    fn token_or_none(&self) -> Option<&Token> {
+        (self.token.position != usize::MAX).then_some(self.token)
+    }
+
     fn token_mut(&mut self) -> &mut Token {
         self.token
     }

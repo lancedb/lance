@@ -1428,19 +1428,18 @@ impl IndexWorker {
         })
     }
 
-    fn next_list_position_offset(
+    fn checked_token_position_end(
         row_id: u64,
-        current_offset: u32,
-        last_position: Option<u32>,
+        position_offset: u32,
+        token_position: usize,
+        position_length: usize,
     ) -> Result<u32> {
-        match last_position {
-            Some(position) => Ok(position.checked_add(1).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "token position overflow for row_id={row_id}: last_position={position}"
-                ))
-            })?),
-            None => Ok(current_offset),
-        }
+        let token_position_end = token_position.checked_add(position_length).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "token position overflow for row_id={row_id}: token_position={token_position}, position_length={position_length}"
+            ))
+        })?;
+        Self::checked_token_position(row_id, position_offset, token_position_end)
     }
 
     async fn process_document(
@@ -1470,14 +1469,21 @@ impl IndexWorker {
                 let memory_size = &mut self.memory_size;
                 let posting_tail_codec = builder.posting_tail_codec;
 
-                let mut process_text = |text: &str, position_offset: u32| -> Result<Option<u32>> {
+                let mut process_text = |text: &str, position_offset: u32| -> Result<u32> {
                     doc_length_bytes += text.len();
-                    let mut last_position = None;
+                    let mut next_position_offset = position_offset;
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
                     while token_stream.advance() {
                         let token = token_stream.token();
                         let position =
                             Self::checked_token_position(row_id, position_offset, token.position)?;
+                        let position_end = Self::checked_token_position_end(
+                            row_id,
+                            position_offset,
+                            token.position,
+                            token.position_length,
+                        )?;
+                        next_position_offset = next_position_offset.max(position_end);
                         let token_id = builder.tokens.get_or_add(&token.text);
                         if token_id as usize == builder.posting_lists.len() {
                             let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
@@ -1507,9 +1513,21 @@ impl IndexWorker {
                         posting_memory_delta +=
                             new_posting_memory_size as i64 - old_posting_memory_size as i64;
                         token_num += 1;
-                        last_position = Some(position);
                     }
-                    Ok(last_position)
+                    if let Some(token) = token_stream.token_or_none() {
+                        let position_end = if token.text.is_empty() {
+                            Self::checked_token_position(row_id, position_offset, token.position)?
+                        } else {
+                            Self::checked_token_position_end(
+                                row_id,
+                                position_offset,
+                                token.position,
+                                token.position_length,
+                            )?
+                        };
+                        next_position_offset = next_position_offset.max(position_end);
+                    }
+                    Ok(next_position_offset)
                 };
 
                 match document {
@@ -1519,15 +1537,10 @@ impl IndexWorker {
                     DocumentSource::StringList(elements) => {
                         let mut position_offset = 0;
                         for element in iter_str_array(elements) {
-                            let last_position = match element {
+                            position_offset = match element {
                                 Some(element) => process_text(element, position_offset)?,
-                                None => None,
+                                None => position_offset,
                             };
-                            position_offset = Self::next_list_position_offset(
-                                row_id,
-                                position_offset,
-                                last_position,
-                            )?;
                         }
                     }
                 }

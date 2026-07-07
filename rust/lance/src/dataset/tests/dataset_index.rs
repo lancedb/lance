@@ -1881,12 +1881,20 @@ async fn test_fts_list_phrase_query_can_cross_elements() {
     drop(tempdir);
 
     let mut list_col = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
-    list_col.values().append_value("alpha");
-    list_col.values().append_value("beta");
-    list_col.append(true);
+    let rows: &[&[&str]] = &[
+        &["alpha", "beta"],
+        &["want the", "apple"],
+        &["want", "apple"],
+    ];
+    for values in rows.iter().copied() {
+        for value in values {
+            list_col.values().append_value(value);
+        }
+        list_col.append(true);
+    }
 
     let docs = Arc::new(list_col.finish()) as ArrayRef;
-    let ids = Arc::new(UInt64Array::from(vec![0u64])) as ArrayRef;
+    let ids = Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef;
     let batch = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             ArrowField::new("doc", docs.data_type().clone(), true),
@@ -1898,7 +1906,9 @@ async fn test_fts_list_phrase_query_can_cross_elements() {
     let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
     let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
 
-    let params = InvertedIndexParams::default().with_position(true);
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .remove_stop_words(true);
     dataset
         .create_index(&["doc"], IndexType::Inverted, None, &params, true)
         .await
@@ -1917,6 +1927,20 @@ async fn test_fts_list_phrase_query_can_cross_elements() {
         .await
         .unwrap();
     assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[0]);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("want the apple".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[1]);
 }
 
 #[tokio::test]
