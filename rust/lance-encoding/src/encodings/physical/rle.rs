@@ -329,6 +329,16 @@ pub struct RleEncoder {
     run_length_width: RunLengthWidth,
     values_compression: Option<CompressionConfig>,
     run_lengths_compression: Option<CompressionConfig>,
+    use_child_bitpacking: bool,
+}
+
+#[derive(Clone)]
+struct RleChildCandidate {
+    encoding: CompressiveEncoding,
+    data: LanceBuffer,
+    chunk_sizes: Vec<u32>,
+    size: usize,
+    requires_num_values: bool,
 }
 
 impl Default for RleEncoder {
@@ -343,6 +353,7 @@ impl RleEncoder {
             run_length_width: RunLengthWidth::U8,
             values_compression: None,
             run_lengths_compression: None,
+            use_child_bitpacking: false,
         }
     }
 
@@ -351,18 +362,21 @@ impl RleEncoder {
             run_length_width,
             values_compression: None,
             run_lengths_compression: None,
+            use_child_bitpacking: false,
         }
     }
 
-    pub(crate) fn with_child_compression(
+    pub(crate) fn with_child_encoding(
         run_length_width: RunLengthWidth,
         values_compression: Option<CompressionConfig>,
         run_lengths_compression: Option<CompressionConfig>,
+        use_child_bitpacking: bool,
     ) -> Self {
         Self {
             run_length_width,
             values_compression,
             run_lengths_compression,
+            use_child_bitpacking,
         }
     }
 
@@ -700,20 +714,34 @@ impl RleEncoder {
         total_chunks * (type_size + self.run_length_width.bytes_per_value())
     }
 
-    fn maybe_compress_child_buffer(
-        buffers: &mut [LanceBuffer],
-        chunks: &mut [MiniBlockChunk],
+    fn flat_child_candidate(
+        buffers: &[LanceBuffer],
+        chunks: &[MiniBlockChunk],
         buffer_index: usize,
         bits_per_value: u64,
-        compression: Option<CompressionConfig>,
-    ) -> Result<CompressiveEncoding> {
-        let flat = ProtobufUtils21::flat(bits_per_value, None);
-        let Some(compression) = compression else {
-            return Ok(flat);
-        };
-        if buffers.is_empty() || buffers[buffer_index].is_empty() {
-            return Ok(flat);
+    ) -> RleChildCandidate {
+        RleChildCandidate {
+            encoding: ProtobufUtils21::flat(bits_per_value, None),
+            data: buffers[buffer_index].clone(),
+            chunk_sizes: chunks
+                .iter()
+                .map(|chunk| chunk.buffer_sizes[buffer_index])
+                .collect(),
+            size: buffers[buffer_index].len(),
+            requires_num_values: false,
         }
+    }
+
+    fn general_child_candidate(
+        buffers: &[LanceBuffer],
+        chunks: &[MiniBlockChunk],
+        buffer_index: usize,
+        bits_per_value: u64,
+        compression: CompressionConfig,
+    ) -> Result<Option<RleChildCandidate>> {
+        if buffers.is_empty() || buffers[buffer_index].is_empty() {
+            return Ok(None);
+        };
 
         let compressor = GeneralBufferCompressor::get_compressor(compression)?;
         let original = &buffers[buffer_index];
@@ -757,15 +785,217 @@ impl RleEncoder {
         }
 
         if compressed.len() >= total_original_size {
-            return Ok(flat);
+            return Ok(None);
         }
 
-        buffers[buffer_index] = LanceBuffer::from(compressed);
-        for (chunk, compressed_size) in chunks.iter_mut().zip(compressed_sizes) {
-            chunk.buffer_sizes[buffer_index] = compressed_size;
+        let encoding =
+            ProtobufUtils21::wrapped(compression, ProtobufUtils21::flat(bits_per_value, None))?;
+        Ok(Some(
+            RleChildCandidate {
+                encoding,
+                data: LanceBuffer::from(compressed),
+                chunk_sizes: compressed_sizes,
+                size: 0,
+                requires_num_values: false,
+            }
+            .with_size_from_data(),
+        ))
+    }
+
+    #[cfg(feature = "bitpacking")]
+    fn bitpacked_child_candidate(
+        buffers: &[LanceBuffer],
+        chunks: &[MiniBlockChunk],
+        buffer_index: usize,
+        bits_per_value: u64,
+    ) -> Result<Option<RleChildCandidate>> {
+        let original = &buffers[buffer_index];
+        if original.is_empty() {
+            return Ok(None);
+        }
+        let packed_bits = Self::required_bits(original, bits_per_value)?;
+        if packed_bits >= bits_per_value {
+            return Ok(None);
         }
 
-        ProtobufUtils21::wrapped(compression, flat)
+        let compressor = crate::encodings::physical::bitpacking::OutOfLineBitpacking::new(
+            packed_bits,
+            bits_per_value,
+        );
+        let mut packed = Vec::new();
+        let mut offset = 0usize;
+        let mut packed_sizes = Vec::with_capacity(chunks.len());
+        let bytes_per_value = usize::try_from(bits_per_value / 8).map_err(|_| {
+            Error::invalid_input_source(
+                format!("RLE child bit width is too large: {bits_per_value}").into(),
+            )
+        })?;
+
+        for chunk in chunks {
+            let chunk_size = chunk.buffer_sizes[buffer_index] as usize;
+            let end = offset.checked_add(chunk_size).ok_or_else(|| {
+                Error::invalid_input_source("RLE child buffer offset overflow".into())
+            })?;
+            if end > original.len() {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE child buffer {} chunk size exceeds buffer length: end {}, len {}",
+                        buffer_index,
+                        end,
+                        original.len()
+                    )
+                    .into(),
+                ));
+            }
+            if bytes_per_value == 0 || !chunk_size.is_multiple_of(bytes_per_value) {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE child buffer {} chunk has invalid size {} for {} bits per value",
+                        buffer_index, chunk_size, bits_per_value
+                    )
+                    .into(),
+                ));
+            }
+
+            let child_values = (chunk_size / bytes_per_value) as u64;
+            let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value,
+                data: original.slice_with_length(offset, chunk_size),
+                num_values: child_values,
+                block_info: BlockInfo::default(),
+            });
+            let chunk_packed = BlockCompressor::compress(&compressor, block)?;
+            let packed_size = u32::try_from(chunk_packed.len()).map_err(|_| {
+                Error::invalid_input_source(
+                    format!(
+                        "RLE child buffer {} bitpacked chunk is too large: {} bytes",
+                        buffer_index,
+                        chunk_packed.len()
+                    )
+                    .into(),
+                )
+            })?;
+            packed_sizes.push(packed_size);
+            packed.extend_from_slice(chunk_packed.as_ref());
+            offset = end;
+        }
+
+        if packed.len() >= original.len() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            RleChildCandidate {
+                encoding: ProtobufUtils21::out_of_line_bitpacking(
+                    bits_per_value,
+                    ProtobufUtils21::flat(packed_bits, None),
+                ),
+                data: LanceBuffer::from(packed),
+                chunk_sizes: packed_sizes,
+                size: 0,
+                requires_num_values: true,
+            }
+            .with_size_from_data(),
+        ))
+    }
+
+    #[cfg(feature = "bitpacking")]
+    fn required_bits(buffer: &LanceBuffer, bits_per_value: u64) -> Result<u64> {
+        let max_value = match bits_per_value {
+            8 => buffer.as_ref().iter().map(|value| *value as u64).max(),
+            16 => buffer
+                .as_ref()
+                .chunks_exact(2)
+                .map(|value| u16::from_le_bytes(value.try_into().unwrap()) as u64)
+                .max(),
+            32 => buffer
+                .as_ref()
+                .chunks_exact(4)
+                .map(|value| u32::from_le_bytes(value.try_into().unwrap()) as u64)
+                .max(),
+            64 => buffer
+                .as_ref()
+                .chunks_exact(8)
+                .map(|value| u64::from_le_bytes(value.try_into().unwrap()))
+                .max(),
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE child bitpacking only supports 8, 16, 32, or 64-bit values, got {bits_per_value}"
+                    )
+                    .into(),
+                ));
+            }
+        }
+        .unwrap_or(0);
+        Ok((u64::BITS - max_value.leading_zeros()).max(1) as u64)
+    }
+
+    fn child_candidates(
+        buffers: &[LanceBuffer],
+        chunks: &[MiniBlockChunk],
+        buffer_index: usize,
+        bits_per_value: u64,
+        compression: Option<CompressionConfig>,
+        use_child_bitpacking: bool,
+    ) -> Result<Vec<RleChildCandidate>> {
+        #[cfg(not(feature = "bitpacking"))]
+        let _ = use_child_bitpacking;
+        let mut candidates = vec![Self::flat_child_candidate(
+            buffers,
+            chunks,
+            buffer_index,
+            bits_per_value,
+        )];
+        if let Some(compression) = compression
+            && let Some(candidate) = Self::general_child_candidate(
+                buffers,
+                chunks,
+                buffer_index,
+                bits_per_value,
+                compression,
+            )?
+        {
+            candidates.push(candidate);
+        }
+        #[cfg(feature = "bitpacking")]
+        {
+            if use_child_bitpacking
+                && let Some(candidate) =
+                    Self::bitpacked_child_candidate(buffers, chunks, buffer_index, bits_per_value)?
+            {
+                candidates.push(candidate);
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn select_child_candidates(
+        values: Vec<RleChildCandidate>,
+        run_lengths: Vec<RleChildCandidate>,
+    ) -> (RleChildCandidate, RleChildCandidate) {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for (value_idx, value) in values.iter().enumerate() {
+            for (length_idx, length) in run_lengths.iter().enumerate() {
+                if value.requires_num_values && length.requires_num_values {
+                    continue;
+                }
+                let size = value.size + length.size;
+                if best.is_none_or(|(_, _, best_size)| size < best_size) {
+                    best = Some((value_idx, length_idx, size));
+                }
+            }
+        }
+        let (value_idx, length_idx, _) =
+            best.expect("flat RLE child candidates should always be selectable");
+        (values[value_idx].clone(), run_lengths[length_idx].clone())
+    }
+}
+
+impl RleChildCandidate {
+    fn with_size_from_data(mut self) -> Self {
+        self.size = self.data.len();
+        self
     }
 }
 
@@ -776,31 +1006,55 @@ impl MiniBlockCompressor for RleEncoder {
                 let num_values = fixed_width.num_values;
                 let bits_per_value = fixed_width.bits_per_value;
 
-                let (mut all_buffers, mut chunks) =
+                let (all_buffers, chunks) =
                     self.encode_data(&fixed_width.data, num_values, bits_per_value)?;
+                if all_buffers.is_empty() {
+                    let compressed = MiniBlockCompressed {
+                        data: all_buffers,
+                        chunks,
+                        num_values,
+                    };
+                    let encoding = ProtobufUtils21::rle(
+                        ProtobufUtils21::flat(bits_per_value, None),
+                        ProtobufUtils21::flat(self.run_length_width.bits_per_value(), None),
+                    );
+                    return Ok((compressed, encoding));
+                }
 
-                let values_encoding = Self::maybe_compress_child_buffer(
-                    &mut all_buffers,
-                    &mut chunks,
+                let values_candidates = Self::child_candidates(
+                    &all_buffers,
+                    &chunks,
                     0,
                     bits_per_value,
                     self.values_compression,
+                    self.use_child_bitpacking,
                 )?;
-                let run_lengths_encoding = Self::maybe_compress_child_buffer(
-                    &mut all_buffers,
-                    &mut chunks,
+                let run_lengths_candidates = Self::child_candidates(
+                    &all_buffers,
+                    &chunks,
                     1,
                     self.run_length_width.bits_per_value(),
                     self.run_lengths_compression,
+                    self.use_child_bitpacking,
                 )?;
+                let (values, run_lengths) =
+                    Self::select_child_candidates(values_candidates, run_lengths_candidates);
+                let chunks = chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, chunk)| MiniBlockChunk {
+                        buffer_sizes: vec![values.chunk_sizes[idx], run_lengths.chunk_sizes[idx]],
+                        log_num_values: chunk.log_num_values,
+                    })
+                    .collect();
 
                 let compressed = MiniBlockCompressed {
-                    data: all_buffers,
+                    data: vec![values.data, run_lengths.data],
                     chunks,
                     num_values,
                 };
 
-                let encoding = ProtobufUtils21::rle(values_encoding, run_lengths_encoding);
+                let encoding = ProtobufUtils21::rle(values.encoding, run_lengths.encoding);
 
                 Ok((compressed, encoding))
             }
@@ -1359,7 +1613,7 @@ mod tests {
     fn test_rle_miniblock_compressed_values_child() {
         let compression = test_general_compression();
         let encoder =
-            RleEncoder::with_child_compression(RunLengthWidth::U8, Some(compression), None);
+            RleEncoder::with_child_encoding(RunLengthWidth::U8, Some(compression), None, false);
         let array = Int32Array::from(repeating_runs(1024, 4));
         let (compressed, encoding) =
             MiniBlockCompressor::compress(&encoder, DataBlock::from_array(array)).unwrap();
@@ -1393,7 +1647,7 @@ mod tests {
     fn test_rle_miniblock_compressed_run_lengths_child() {
         let compression = test_general_compression();
         let encoder =
-            RleEncoder::with_child_compression(RunLengthWidth::U8, None, Some(compression));
+            RleEncoder::with_child_encoding(RunLengthWidth::U8, None, Some(compression), false);
         let expected = repeating_runs(1024, 4);
         let (compressed, encoding) = MiniBlockCompressor::compress(
             &encoder,
@@ -1518,10 +1772,11 @@ mod tests {
     #[cfg(any(feature = "lz4", feature = "zstd"))]
     fn test_rle_miniblock_compressed_children_multiple_chunks() {
         let compression = test_general_compression();
-        let encoder = RleEncoder::with_child_compression(
+        let encoder = RleEncoder::with_child_encoding(
             RunLengthWidth::U8,
             Some(compression),
             Some(compression),
+            false,
         );
         let expected = repeating_runs(8192, 4);
         let (compressed, encoding) = MiniBlockCompressor::compress(
@@ -1550,7 +1805,66 @@ mod tests {
         assert_eq!(decoded, expected);
     }
 
-    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_rle_miniblock_bitpacks_values_child_when_smaller() {
+        let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
+        let expected = monotonic_runs(2048, 4);
+        let (compressed, encoding) = MiniBlockCompressor::compress(
+            &encoder,
+            DataBlock::from_array(Int32Array::from(expected.clone())),
+        )
+        .unwrap();
+
+        let rle = expect_rle(&encoding);
+        assert!(matches!(
+            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+            crate::format::pb21::compressive_encoding::Compression::OutOfLineBitpacking(_)
+        ));
+        assert!(matches!(
+            rle.run_lengths
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            crate::format::pb21::compressive_encoding::Compression::Flat(_)
+        ));
+
+        let decoded = decompress_i32_chunks(&compressed, &encoding);
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_rle_miniblock_bitpacks_run_lengths_when_values_do_not_shrink() {
+        let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
+        let expected = high_entropy_runs(2048, 4);
+        let (compressed, encoding) = MiniBlockCompressor::compress(
+            &encoder,
+            DataBlock::from_array(Int32Array::from(expected.clone())),
+        )
+        .unwrap();
+
+        let rle = expect_rle(&encoding);
+        assert!(matches!(
+            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+            crate::format::pb21::compressive_encoding::Compression::Flat(_)
+        ));
+        assert!(matches!(
+            rle.run_lengths
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            crate::format::pb21::compressive_encoding::Compression::OutOfLineBitpacking(_)
+        ));
+
+        let decoded = decompress_i32_chunks(&compressed, &encoding);
+        assert_eq!(decoded, expected);
+    }
+
     fn decompress_i32_chunks(
         compressed: &MiniBlockCompressed,
         encoding: &CompressiveEncoding,
@@ -1587,6 +1901,28 @@ mod tests {
 
         assert_eq!(values_processed, compressed.num_values);
         decoded_values
+    }
+
+    #[cfg(feature = "bitpacking")]
+    fn monotonic_runs(num_runs: usize, run_length: usize) -> Vec<i32> {
+        let mut values = Vec::with_capacity(num_runs * run_length);
+        for run in 0..num_runs {
+            values.extend(std::iter::repeat_n(run as i32, run_length));
+        }
+        values
+    }
+
+    #[cfg(feature = "bitpacking")]
+    fn high_entropy_runs(num_runs: usize, run_length: usize) -> Vec<i32> {
+        let mut values = Vec::with_capacity(num_runs * run_length);
+        let mut state = 7u64;
+        for _ in 0..num_runs {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            values.extend(std::iter::repeat_n((state >> 32) as i32, run_length));
+        }
+        values
     }
 
     #[test]

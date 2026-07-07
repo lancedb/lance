@@ -222,10 +222,11 @@ fn try_rle_for_mini_block(
             }
         }
         let child_compression = rle_child_compression_config(params);
-        return Some(Box::new(RleEncoder::with_child_compression(
+        return Some(Box::new(RleEncoder::with_child_encoding(
             run_length_width,
             child_compression,
             child_compression,
+            true,
         )));
     }
     None
@@ -2127,6 +2128,48 @@ mod tests {
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         let (_compressed, encoding) = compressor.compress(data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 8);
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_rle_miniblock_strategy_bitpacks_child_values_when_smaller() {
+        let field = create_test_field("dict_indices", DataType::Int32);
+
+        let mut values = Vec::with_capacity(8192 * 4);
+        for value in 0..8192 {
+            values.extend(std::iter::repeat_n(value, 4));
+        }
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 8192 * 4,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let debug_str = format!("{compressor:?}");
+        assert!(debug_str.contains("RleEncoder"));
+
+        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
+            panic!("expected RLE encoding");
+        };
+        assert!(matches!(
+            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+            Compression::OutOfLineBitpacking(_)
+        ));
+        assert!(matches!(
+            rle.run_lengths
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            Compression::Flat(_)
+        ));
     }
 
     #[test]
