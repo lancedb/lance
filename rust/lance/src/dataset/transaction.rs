@@ -453,6 +453,12 @@ pub enum Operation {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
     },
+
+    /// EXPERIMENTAL: an action-based transaction. The ordered action list is
+    /// applied to the manifest atomically, enabling compound commits (e.g.
+    /// append + add index). Gated behind `unstable-action-transactions`.
+    #[cfg(feature = "unstable-action-transactions")]
+    UserOperation(lance_table::transaction::UserOperation),
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -502,6 +508,8 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+            #[cfg(feature = "unstable-action-transactions")]
+            Self::UserOperation(_) => write!(f, "UserOperation"),
         }
     }
 }
@@ -1345,6 +1353,14 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            // Two action-based operations compare by content; any pairing with a
+            // non-action operation is unequal (different discriminants). Gated so
+            // the match stays exhaustive without a catch-all when the feature is
+            // off.
+            #[cfg(feature = "unstable-action-transactions")]
+            (Self::UserOperation(a), Self::UserOperation(b)) => a == b,
+            #[cfg(feature = "unstable-action-transactions")]
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
 }
@@ -1524,6 +1540,8 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
+            #[cfg(feature = "unstable-action-transactions")]
+            Self::UserOperation(_) => "UserOperation",
         }
     }
 }
@@ -2317,6 +2335,19 @@ impl Transaction {
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(user_op) => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                Self::apply_user_operation(
+                    user_op,
+                    &mut fragment_id,
+                    &mut next_row_id,
+                    new_version,
+                    &mut final_fragments,
+                    &mut final_indices,
+                )?;
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -2360,6 +2391,16 @@ impl Transaction {
         };
 
         manifest.tag.clone_from(&self.tag);
+
+        // Declaring the experimental feature makes `apply_feature_flags` set
+        // FLAG_EXPERIMENTAL, so libraries without the feature refuse to commit.
+        #[cfg(feature = "unstable-action-transactions")]
+        if matches!(self.operation, Operation::UserOperation(_)) {
+            let feature = lance_table::transaction::FEATURE_NAME.to_string();
+            if !manifest.experimental_writer_features.contains(&feature) {
+                manifest.experimental_writer_features.push(feature);
+            }
+        }
 
         if config.auto_set_feature_flags {
             // Internal operations (e.g. CreateIndex) use ManifestWriteConfig::default()
@@ -2559,6 +2600,127 @@ impl Transaction {
         }
 
         Ok((manifest, final_indices))
+    }
+
+    /// Apply an action-based [`UserOperation`] to the in-progress fragment and
+    /// index lists. Fragment ids are minted from `fragment_id` (late binding),
+    /// and `NewFragment` placeholders are resolved so a later `AddIndex` in the
+    /// same operation can cover fragments it created. Re-run per commit attempt,
+    /// so ids and the placeholder map are recomputed against the latest manifest.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn apply_user_operation(
+        user_op: &lance_table::transaction::UserOperation,
+        fragment_id: &mut u64,
+        next_row_id: &mut Option<u64>,
+        new_version: u64,
+        final_fragments: &mut Vec<Fragment>,
+        final_indices: &mut Vec<IndexMetadata>,
+    ) -> Result<()> {
+        use lance_table::transaction::Action;
+        use prost::Message as _;
+
+        // Placeholders resolve to the fragment ids assigned during this apply.
+        let mut local_to_id: HashMap<u32, u64> = HashMap::new();
+
+        let to_bitmap_id = |id: u64| -> Result<u32> {
+            u32::try_from(id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "fragment id {} exceeds the u32 range of an index fragment bitmap",
+                    id
+                ))
+            })
+        };
+
+        for user_action in &user_op.actions {
+            for action in &user_action.actions {
+                match action {
+                    Action::AddFragments(add) => {
+                        let mut new_fragments = Vec::with_capacity(add.new_fragments.len());
+                        for new_fragment in &add.new_fragments {
+                            let mut fragment = new_fragment.fragment.clone();
+                            fragment.id = *fragment_id;
+                            *fragment_id += 1;
+                            if local_to_id
+                                .insert(new_fragment.local_id, fragment.id)
+                                .is_some()
+                            {
+                                return Err(Error::invalid_input(format!(
+                                    "duplicate NewFragment local_id {} within the operation",
+                                    new_fragment.local_id
+                                )));
+                            }
+                            new_fragments.push(fragment);
+                        }
+                        if let Some(next_row_id) = next_row_id.as_mut() {
+                            Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                            for fragment in new_fragments.iter_mut() {
+                                let version_meta = build_version_meta(fragment, new_version);
+                                fragment.last_updated_at_version_meta = version_meta.clone();
+                                fragment.created_at_version_meta = version_meta;
+                            }
+                        }
+                        final_fragments.extend(new_fragments);
+                    }
+                    Action::AddIndex(add) => {
+                        let mut fragment_bitmap = RoaringBitmap::new();
+                        for existing in &add.covers_existing {
+                            fragment_bitmap.insert(to_bitmap_id(*existing)?);
+                        }
+                        for local in &add.covers_local {
+                            let id = local_to_id.get(local).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "AddIndex covers_local placeholder {} was not produced by an \
+                                     earlier AddFragments in this operation",
+                                    local
+                                ))
+                            })?;
+                            fragment_bitmap.insert(to_bitmap_id(*id)?);
+                        }
+                        let uuid = Uuid::parse_str(&add.uuid).map_err(|e| {
+                            Error::invalid_input(format!(
+                                "AddIndex has an invalid uuid {:?}: {}",
+                                add.uuid, e
+                            ))
+                        })?;
+                        let index_details = add
+                            .index_details
+                            .as_ref()
+                            .map(|bytes| prost_types::Any::decode(bytes.as_slice()))
+                            .transpose()
+                            .map_err(|e| {
+                                Error::invalid_input(format!(
+                                    "AddIndex index_details is not a valid protobuf Any: {}",
+                                    e
+                                ))
+                            })?
+                            .map(Arc::new);
+                        let index = IndexMetadata {
+                            uuid,
+                            name: add.name.clone(),
+                            fields: add.fields.clone(),
+                            dataset_version: new_version,
+                            fragment_bitmap: Some(fragment_bitmap),
+                            index_details,
+                            index_version: 0,
+                            created_at: None,
+                            base_id: None,
+                            files: None,
+                        };
+                        // Replace-by-uuid, mirroring CreateIndex.
+                        final_indices.retain(|existing| existing.uuid != index.uuid);
+                        final_indices.push(index);
+                    }
+                    // `Action` is #[non_exhaustive]; a variant this build predates
+                    // cannot be applied.
+                    _ => {
+                        return Err(Error::not_supported_source(
+                            "unsupported experimental transaction action".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn register_pure_rewrite_rows_update_frags_in_indices(
@@ -3348,6 +3510,27 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::UpdateBases {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
+            #[cfg(feature = "unstable-action-transactions")]
+            Some(pb::transaction::Operation::ExperimentalUserOperation(inner)) => {
+                use prost::Message as _;
+                let user_op = pb::UserOperation::decode(inner.payload.as_slice()).map_err(|e| {
+                    Error::invalid_input(format!(
+                        "invalid experimental UserOperation payload: {}",
+                        e
+                    ))
+                })?;
+                Operation::UserOperation(user_op.try_into()?)
+            }
+            #[cfg(not(feature = "unstable-action-transactions"))]
+            Some(pb::transaction::Operation::ExperimentalUserOperation(_)) => {
+                // Unreadable without the feature: the payload is an experimental
+                // format this build does not understand.
+                return Err(Error::not_supported_source(
+                    "action-based (experimental) transactions require a build with the \
+                     `unstable-action-transactions` feature"
+                        .into(),
+                ));
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -3634,6 +3817,14 @@ impl From<&Transaction> for pb::Transaction {
                         .map(|bp: BasePath| -> pb::BasePath { bp.into() })
                         .collect::<Vec<pb::BasePath>>(),
                 })
+            }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(user_op) => {
+                use prost::Message as _;
+                let payload = pb::UserOperation::from(user_op).encode_to_vec();
+                pb::transaction::Operation::ExperimentalUserOperation(
+                    pb::transaction::ExperimentalUserOperation { payload },
+                )
             }
         };
 

@@ -86,6 +86,9 @@ bytes = "1.4"
 default = []
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+# EXPERIMENTAL: action-based (UserOperation) transactions. Non-default; the wire
+# format is unstable. Build with `maturin develop --features ...` to enable.
+unstable-action-transactions = ["lance/unstable-action-transactions"]
 
 [profile.ci]
 debug = "line-tables-only"

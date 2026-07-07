@@ -24,9 +24,9 @@
 //!
 //! # Scope
 //!
-//! Only [`AddFragments`] is implemented, as a proof of shape. The remaining
-//! actions and the translation/conflict-resolution machinery land in follow-up
-//! vertical slices.
+//! [`AddFragments`] and [`AddIndex`] are implemented, enough for the first
+//! compound-commit vertical slice (append data + register an index over it in
+//! one transaction). The remaining actions land in follow-up slices.
 
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -71,6 +71,27 @@ pub struct UserAction {
 pub enum Action {
     /// Append new fragments to the table.
     AddFragments(AddFragments),
+    /// Register a secondary index segment in the manifest.
+    AddIndex(AddIndex),
+}
+
+/// A fragment to be appended, before its final id is assigned.
+///
+/// Distinct from [`Fragment`]: a committed fragment has an assigned id, but a
+/// fragment being added does not yet, and instead carries an operation-local
+/// [`local_id`](Self::local_id) placeholder that later actions can reference.
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct NewFragment {
+    /// Operation-local placeholder token identifying this fragment within the
+    /// enclosing [`UserOperation`], unique among that operation's new fragments.
+    /// Later actions (e.g. [`AddIndex::covers_local`]) reference this token; at
+    /// apply time it is resolved to the real id assigned from the manifest
+    /// counter.
+    pub local_id: u32,
+    /// The fragment payload to append. Its `id` field is ignored: the real id is
+    /// assigned at apply time from the manifest's fragment counter (late
+    /// binding), and re-assigned on every commit retry.
+    pub fragment: Fragment,
 }
 
 /// Append new fragments to the table.
@@ -79,18 +100,65 @@ pub enum Action {
 /// produced by compaction.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddFragments {
-    /// The new fragments to append. Fragment IDs are assigned at apply time
-    /// from the manifest's counters (late binding), not carried here.
-    pub fragments: Vec<Fragment>,
+    /// The new fragments to append, each with an operation-local placeholder.
+    pub new_fragments: Vec<NewFragment>,
+}
+
+/// Register a secondary index segment in the manifest.
+///
+/// The index file(s) are expected to have already been written; this action only
+/// records the metadata. Coverage is the union of already-committed fragment ids
+/// ([`covers_existing`](Self::covers_existing)) and fragments added earlier in
+/// this same operation ([`covers_local`](Self::covers_local), resolved to their
+/// assigned ids at apply time).
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct AddIndex {
+    /// Unique identifier of the index across all dataset versions.
+    pub uuid: String,
+    /// Human-readable index name. Replace-by-uuid semantics apply on the manifest.
+    pub name: String,
+    /// The field ids the index is built on.
+    pub fields: Vec<i32>,
+    /// Already-committed fragment ids this index covers.
+    pub covers_existing: Vec<u64>,
+    /// Placeholders ([`NewFragment::local_id`]) of same-operation fragments this
+    /// index covers, resolved to real fragment ids at apply time.
+    pub covers_local: Vec<u32>,
+    /// Optional opaque, type-specific index metadata: a serialized
+    /// `google.protobuf.Any`. `None` when the index carries no details.
+    pub index_details: Option<Vec<u8>>,
+}
+
+impl From<&NewFragment> for pb::NewFragment {
+    fn from(new_fragment: &NewFragment) -> Self {
+        Self {
+            local_id: new_fragment.local_id,
+            fragment: Some(pb::DataFragment::from(&new_fragment.fragment)),
+        }
+    }
+}
+
+impl TryFrom<pb::NewFragment> for NewFragment {
+    type Error = Error;
+
+    fn try_from(proto: pb::NewFragment) -> Result<Self> {
+        let fragment = proto.fragment.ok_or_else(|| {
+            Error::invalid_input("NewFragment is missing its fragment".to_string())
+        })?;
+        Ok(Self {
+            local_id: proto.local_id,
+            fragment: Fragment::try_from(fragment)?,
+        })
+    }
 }
 
 impl From<&AddFragments> for pb::AddFragments {
     fn from(action: &AddFragments) -> Self {
         Self {
-            fragments: action
-                .fragments
+            new_fragments: action
+                .new_fragments
                 .iter()
-                .map(pb::DataFragment::from)
+                .map(pb::NewFragment::from)
                 .collect(),
         }
     }
@@ -101,11 +169,39 @@ impl TryFrom<pb::AddFragments> for AddFragments {
 
     fn try_from(proto: pb::AddFragments) -> Result<Self> {
         Ok(Self {
-            fragments: proto
-                .fragments
+            new_fragments: proto
+                .new_fragments
                 .into_iter()
-                .map(Fragment::try_from)
+                .map(NewFragment::try_from)
                 .collect::<Result<_>>()?,
+        })
+    }
+}
+
+impl From<&AddIndex> for pb::AddIndex {
+    fn from(action: &AddIndex) -> Self {
+        Self {
+            uuid: action.uuid.clone(),
+            name: action.name.clone(),
+            fields: action.fields.clone(),
+            covers_existing: action.covers_existing.clone(),
+            covers_local: action.covers_local.clone(),
+            index_details: action.index_details.clone(),
+        }
+    }
+}
+
+impl TryFrom<pb::AddIndex> for AddIndex {
+    type Error = Error;
+
+    fn try_from(proto: pb::AddIndex) -> Result<Self> {
+        Ok(Self {
+            uuid: proto.uuid,
+            name: proto.name,
+            fields: proto.fields,
+            covers_existing: proto.covers_existing,
+            covers_local: proto.covers_local,
+            index_details: proto.index_details,
         })
     }
 }
@@ -114,6 +210,7 @@ impl From<&Action> for pb::Action {
     fn from(action: &Action) -> Self {
         let action = match action {
             Action::AddFragments(add) => pb::action::Action::AddFragments(add.into()),
+            Action::AddIndex(add) => pb::action::Action::AddIndex(add.into()),
         };
         Self {
             action: Some(action),
@@ -127,6 +224,7 @@ impl TryFrom<pb::Action> for Action {
     fn try_from(proto: pb::Action) -> Result<Self> {
         match proto.action {
             Some(pb::action::Action::AddFragments(add)) => Ok(Self::AddFragments(add.try_into()?)),
+            Some(pb::action::Action::AddIndex(add)) => Ok(Self::AddIndex(add.try_into()?)),
             None => Err(Error::invalid_input(
                 "Action protobuf has no variant set".to_string(),
             )),
@@ -197,10 +295,29 @@ mod tests {
             uuid: "test-uuid".to_string(),
             read_version: 7,
             actions: vec![UserAction {
-                description: "append batch".to_string(),
-                actions: vec![Action::AddFragments(AddFragments {
-                    fragments: vec![Fragment::new(0), Fragment::new(1)],
-                })],
+                description: "append batch + index".to_string(),
+                actions: vec![
+                    Action::AddFragments(AddFragments {
+                        new_fragments: vec![
+                            NewFragment {
+                                local_id: 0,
+                                fragment: Fragment::new(0),
+                            },
+                            NewFragment {
+                                local_id: 1,
+                                fragment: Fragment::new(0),
+                            },
+                        ],
+                    }),
+                    Action::AddIndex(AddIndex {
+                        uuid: "idx-uuid".to_string(),
+                        name: "my_idx".to_string(),
+                        fields: vec![1],
+                        covers_existing: vec![3, 4],
+                        covers_local: vec![0],
+                        index_details: Some(vec![1, 2, 3]),
+                    }),
+                ],
             }],
         };
 

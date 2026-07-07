@@ -502,3 +502,193 @@ async fn test_list_detached_manifests() {
     assert_eq!(versions.len(), 1);
     assert_eq!(versions[0].version, 1);
 }
+
+#[cfg(feature = "unstable-action-transactions")]
+mod action_transactions {
+    use super::*;
+    use crate::dataset::transaction::Operation;
+    use lance_table::feature_flags::FLAG_EXPERIMENTAL;
+    use lance_table::format::Fragment;
+    use lance_table::transaction::{
+        Action, AddFragments, AddIndex, NewFragment, UserAction, UserOperation,
+    };
+
+    fn schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]))
+    }
+
+    fn batch(values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(values))]).unwrap()
+    }
+
+    /// Write a single uncommitted fragment against `dataset` and return it.
+    async fn write_one_fragment(dataset: Arc<Dataset>, values: Vec<i32>) -> Fragment {
+        let reader = RecordBatchIterator::new([Ok(batch(values))], schema());
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let txn = InsertBuilder::new(dataset)
+            .with_params(&params)
+            .execute_uncommitted_stream(reader)
+            .await
+            .unwrap();
+        match txn.operation {
+            Operation::Append { mut fragments } => {
+                assert_eq!(fragments.len(), 1, "expected exactly one fragment");
+                fragments.pop().unwrap()
+            }
+            other => panic!("expected Append, got {other}"),
+        }
+    }
+
+    // A pylance-equivalent flow: append two new fragments and register an index
+    // covering only the first, in a single action-based transaction.
+    #[tokio::test]
+    async fn append_and_add_index_in_one_transaction() {
+        let test_uri = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch(vec![1, 2, 3]))], schema()),
+                &test_uri,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let read_version = dataset.manifest().version;
+        // Initial dataset has a single fragment with id 0.
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let frag_a = write_one_fragment(dataset.clone(), vec![4, 5, 6]).await;
+        let frag_b = write_one_fragment(dataset.clone(), vec![7, 8]).await;
+
+        let index_uuid = "11111111-1111-1111-1111-111111111111";
+        let user_op = UserOperation {
+            description: "append + index".to_string(),
+            uuid: "test-op".to_string(),
+            read_version,
+            actions: vec![UserAction {
+                description: "append two fragments, index the first".to_string(),
+                actions: vec![
+                    Action::AddFragments(AddFragments {
+                        new_fragments: vec![
+                            NewFragment {
+                                local_id: 0,
+                                fragment: frag_a,
+                            },
+                            NewFragment {
+                                local_id: 1,
+                                fragment: frag_b,
+                            },
+                        ],
+                    }),
+                    Action::AddIndex(AddIndex {
+                        uuid: index_uuid.to_string(),
+                        name: "id_idx".to_string(),
+                        fields: vec![0],
+                        covers_existing: vec![],
+                        covers_local: vec![0],
+                        index_details: None,
+                    }),
+                ],
+            }],
+        };
+
+        let txn = Transaction::new(read_version, Operation::UserOperation(user_op), None);
+        let committed = CommitBuilder::new(dataset).execute(txn).await.unwrap();
+
+        // Both fragments landed alongside the original, and all rows are readable.
+        assert_eq!(committed.manifest().version, read_version + 1);
+        assert_eq!(committed.get_fragments().len(), 3);
+        assert_eq!(committed.count_rows(None).await.unwrap(), 8);
+
+        // The dataset now declares the experimental writer feature.
+        assert_ne!(
+            committed.manifest().writer_feature_flags & FLAG_EXPERIMENTAL,
+            0
+        );
+        assert!(
+            committed
+                .manifest()
+                .experimental_writer_features
+                .iter()
+                .any(|f| f == "action-transactions")
+        );
+
+        // The index was registered and covers exactly the first new fragment
+        // (assigned id 1), not the second (id 2) or the original (id 0).
+        let indices = committed.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = &indices[0];
+        assert_eq!(index.name, "id_idx");
+        assert_eq!(index.uuid.to_string(), index_uuid);
+        let bitmap = index.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(bitmap.len(), 1);
+        assert!(bitmap.contains(1));
+        assert!(!bitmap.contains(0));
+        assert!(!bitmap.contains(2));
+    }
+
+    // An action-based append must not conflict with a concurrent plain Append:
+    // the stale UserOperation rebases against the newer version and still lands.
+    #[tokio::test]
+    async fn does_not_conflict_with_concurrent_append() {
+        let test_uri = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch(vec![1, 2, 3]))], schema()),
+                &test_uri,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let read_version = dataset.manifest().version;
+
+        // Prepare the action-based append against the original version.
+        let frag = write_one_fragment(dataset.clone(), vec![4, 5]).await;
+        let user_op = UserOperation {
+            description: "action append".to_string(),
+            uuid: "action-op".to_string(),
+            read_version,
+            actions: vec![UserAction {
+                description: "append one fragment".to_string(),
+                actions: vec![Action::AddFragments(AddFragments {
+                    new_fragments: vec![NewFragment {
+                        local_id: 0,
+                        fragment: frag,
+                    }],
+                })],
+            }],
+        };
+        let action_txn = Transaction::new(read_version, Operation::UserOperation(user_op), None);
+
+        // A concurrent plain append commits first, advancing the version.
+        let after_append = CommitBuilder::new(dataset.clone())
+            .execute(Transaction::new(
+                read_version,
+                Operation::Append {
+                    fragments: vec![write_one_fragment(dataset.clone(), vec![6, 7]).await],
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(after_append.manifest().version, read_version + 1);
+
+        // Now the stale action-based transaction still commits (rebased).
+        let committed = CommitBuilder::new(dataset)
+            .execute(action_txn)
+            .await
+            .unwrap();
+        assert_eq!(committed.manifest().version, read_version + 2);
+        // Original fragment + concurrent append + action append.
+        assert_eq!(committed.get_fragments().len(), 3);
+        assert_eq!(committed.count_rows(None).await.unwrap(), 7);
+    }
+}

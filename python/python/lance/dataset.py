@@ -5708,6 +5708,124 @@ class LanceOperation:
             LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
+    class NewFragment:
+        """
+        EXPERIMENTAL. A fragment to append via an action-based transaction.
+
+        Attributes
+        ----------
+        local_id: int
+            Operation-local placeholder identifying this fragment, unique among
+            the operation's new fragments. A later :class:`AddIndex` references it
+            via ``covers_local``; it is resolved to the real fragment id assigned
+            at commit time.
+        fragment: FragmentMetadata
+            The fragment to append. Its ``id`` is ignored and assigned at commit.
+        """
+
+        local_id: int
+        fragment: FragmentMetadata
+
+    @dataclass
+    class AddFragments:
+        """
+        EXPERIMENTAL. Append new fragments within a
+        :class:`LanceOperation.UserOperation`.
+
+        Attributes
+        ----------
+        new_fragments: list[LanceOperation.NewFragment]
+            The fragments to append, each with an operation-local placeholder.
+        """
+
+        new_fragments: List["LanceOperation.NewFragment"]
+
+    @dataclass
+    class AddIndex:
+        """
+        EXPERIMENTAL. Register an index segment within a
+        :class:`LanceOperation.UserOperation`.
+
+        The index file(s) must already be written; this only records the index
+        metadata. Coverage is the union of already-committed fragment ids
+        (``covers_existing``) and same-operation placeholders (``covers_local``).
+
+        Attributes
+        ----------
+        uuid: str
+            Unique identifier of the index across all dataset versions.
+        name: str
+            Index name. Replace-by-uuid semantics apply on the manifest.
+        fields: list[int]
+            The field ids the index is built on.
+        covers_existing: list[int]
+            Already-committed fragment ids this index covers.
+        covers_local: list[int]
+            Placeholders (:attr:`NewFragment.local_id`) of same-operation
+            fragments this index covers.
+        index_details: bytes, optional
+            Opaque, type-specific index metadata (a serialized
+            ``google.protobuf.Any``). ``None`` when the index carries no details.
+        """
+
+        uuid: str
+        name: str
+        fields: List[int]
+        covers_existing: List[int]
+        covers_local: List[int]
+        index_details: Optional[bytes] = None
+
+    @dataclass
+    class UserAction:
+        """
+        EXPERIMENTAL. A named step within a
+        :class:`LanceOperation.UserOperation`, expanding to granular actions.
+
+        Attributes
+        ----------
+        description: str
+            Human-readable description of this step.
+        actions: list
+            The granular actions (:class:`AddFragments` / :class:`AddIndex`) this
+            step expands to.
+        """
+
+        description: str
+        actions: List[Union["LanceOperation.AddFragments", "LanceOperation.AddIndex"]]
+
+    @dataclass
+    class UserOperation(BaseOperation):
+        """
+        EXPERIMENTAL. An action-based transaction.
+
+        Models a transaction as an ordered list of actions applied atomically,
+        enabling compound commits such as *append data + register an index over
+        it* in one commit. Commit it through :meth:`LanceDataset.commit` like any
+        other operation.
+
+        Requires the ``pylance`` extension to be built with the
+        ``unstable-action-transactions`` feature; otherwise committing raises a
+        ``ValueError``. The wire format is unstable and carries no compatibility
+        guarantee.
+
+        Attributes
+        ----------
+        read_version: int
+            The dataset version this operation was planned against.
+        uuid: str
+            Unique identifier for this operation.
+        description: str
+            Human-readable description, e.g. ``"INSERT INTO t VALUES (1)"``.
+        actions: list[LanceOperation.UserAction]
+            The ordered user actions to apply.
+        """
+
+        read_version: int
+        uuid: str
+        description: str
+        actions: List["LanceOperation.UserAction"]
+
+    @dataclass
     class Delete(BaseOperation):
         """
         Remove fragments or rows from the dataset.

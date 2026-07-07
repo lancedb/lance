@@ -224,10 +224,101 @@ impl FromPyObject<'_, '_> for PyUpdateMode {
     }
 }
 
+// EXPERIMENTAL: parsing for action-based (UserOperation) transactions. Gated by
+// the non-default `unstable-action-transactions` feature.
+#[cfg(feature = "unstable-action-transactions")]
+mod action_transactions {
+    use super::*;
+    use lance_table::transaction::{
+        Action, AddFragments, AddIndex, NewFragment, UserAction, UserOperation,
+    };
+
+    impl FromPyObject<'_, '_> for PyLance<NewFragment> {
+        type Error = PyErr;
+        fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+            let local_id = ob.getattr("local_id")?.extract()?;
+            let PyLance(fragment) = ob.getattr("fragment")?.extract()?;
+            Ok(Self(NewFragment { local_id, fragment }))
+        }
+    }
+
+    impl FromPyObject<'_, '_> for PyLance<AddFragments> {
+        type Error = PyErr;
+        fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+            let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
+            Ok(Self(AddFragments { new_fragments }))
+        }
+    }
+
+    impl FromPyObject<'_, '_> for PyLance<AddIndex> {
+        type Error = PyErr;
+        fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+            Ok(Self(AddIndex {
+                uuid: ob.getattr("uuid")?.extract()?,
+                name: ob.getattr("name")?.extract()?,
+                fields: ob.getattr("fields")?.extract()?,
+                covers_existing: ob.getattr("covers_existing")?.extract()?,
+                covers_local: ob.getattr("covers_local")?.extract()?,
+                index_details: ob.getattr("index_details")?.extract()?,
+            }))
+        }
+    }
+
+    impl FromPyObject<'_, '_> for PyLance<Action> {
+        type Error = PyErr;
+        fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+            let action = match class_name(&ob)?.as_str() {
+                "AddFragments" => Action::AddFragments(PyLance::<AddFragments>::extract(ob)?.0),
+                "AddIndex" => Action::AddIndex(PyLance::<AddIndex>::extract(ob)?.0),
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "Unsupported action: {other}"
+                    )));
+                }
+            };
+            Ok(Self(action))
+        }
+    }
+
+    impl FromPyObject<'_, '_> for PyLance<UserAction> {
+        type Error = PyErr;
+        fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+            let description = ob.getattr("description")?.extract()?;
+            let actions = extract_vec(&ob.getattr("actions")?)?;
+            Ok(Self(UserAction {
+                description,
+                actions,
+            }))
+        }
+    }
+
+    impl FromPyObject<'_, '_> for PyLance<UserOperation> {
+        type Error = PyErr;
+        fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+            let description = ob.getattr("description")?.extract()?;
+            let uuid = ob.getattr("uuid")?.extract()?;
+            let read_version = ob.getattr("read_version")?.extract()?;
+            let actions = extract_vec(&ob.getattr("actions")?)?;
+            Ok(Self(UserOperation {
+                description,
+                uuid,
+                read_version,
+                actions,
+            }))
+        }
+    }
+}
+
 impl FromPyObject<'_, '_> for PyLance<Operation> {
     type Error = PyErr;
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         match class_name(&ob)?.as_str() {
+            #[cfg(feature = "unstable-action-transactions")]
+            "UserOperation" => {
+                let PyLance(user_op) =
+                    PyLance::<lance_table::transaction::UserOperation>::extract(ob)?;
+                Ok(Self(Operation::UserOperation(user_op)))
+            }
             "Overwrite" => {
                 let schema = extract_schema(&ob.getattr("new_schema")?)?;
 

@@ -62,6 +62,16 @@ impl<'a> TransactionRebase<'a> {
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_merged_gens: Vec::new(),
             }),
+            // Action-based operations currently only add fragments/indices.
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(Self {
+                transaction,
+                affected_rows,
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+            }),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -235,6 +245,30 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => {
+                self.check_user_operation_txn(other_transaction, other_version)
+            }
+        }
+    }
+
+    /// Conflict check for an action-based [`Operation::UserOperation`]. It
+    /// currently only adds fragments and indices, so it commutes with everything
+    /// except operations that replace the schema/table wholesale — mirroring
+    /// [`Self::check_append_txn`].
+    #[cfg(feature = "unstable-action-transactions")]
+    fn check_user_operation_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        match &other_transaction.operation {
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -252,6 +286,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Append { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                // Action-based op only adds new fragments/indices (like Append).
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -408,6 +445,14 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
+                // Action-based op adds new fragments like Append; same reasoning.
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    if self_inserted_rows_filter.is_some() {
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
+                    }
+                    Ok(())
+                }
                 Operation::Rewrite { groups, .. } => {
                     if groups
                         .iter()
@@ -515,6 +560,10 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                // Action-based op adds new fragments/indices; distinct-uuid indices
+                // don't collide with this CreateIndex (like a concurrent Append).
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
                     ..
@@ -674,6 +723,10 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                // Action-based op only adds new fragments; a rewrite of existing
+                // fragments doesn't touch them (like a concurrent Append).
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => Ok(()),
                 Operation::Delete {
                     updated_fragments,
                     deleted_fragment_ids,
@@ -880,6 +933,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            // An overwrite replaces everything, so a concurrent action-based op is
+            // irrelevant here (like a concurrent Append).
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
         }
     }
 
@@ -908,6 +965,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. } => Ok(()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
         }
     }
 
@@ -924,6 +983,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                // Action-based op only adds new fragments (like a concurrent Append).
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => Ok(()),
                 Operation::Merge { .. } => {
                     // Merge rewrites the whole fragment list; always conflict
                     // (symmetric with check_merge_txn).
@@ -1075,6 +1137,12 @@ impl<'a> TransactionRebase<'a> {
             | Operation::DataReplacement { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version))
             }
+            // Merge rewrites the whole fragment list, so it conflicts with an
+            // action-based op that added fragments (same as a concurrent Append).
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             Operation::Overwrite { .. }
             | Operation::Restore { .. }
             | Operation::Project { .. }
@@ -1104,6 +1172,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Project { .. }
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. } => Ok(()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
             Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
@@ -1132,6 +1202,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
         }
     }
 
@@ -1152,6 +1224,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            // Action-based op only adds fragments/indices; it doesn't change the
+            // schema (like a concurrent Append).
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
                 Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -1219,6 +1295,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                // Config updates don't conflict with a fragment/index add.
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1288,6 +1367,12 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Restore { .. }
                 | Operation::Clone { .. }
                 | Operation::Project { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
+                // Mem-WAL state changes are incompatible with a fragment add
+                // (same as a concurrent Append).
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
             }
@@ -1385,6 +1470,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
+            // No action-level rebase: retries re-run build_manifest against the
+            // latest manifest, which re-assigns ids and re-resolves placeholders.
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(self.transaction),
         }
     }
 
@@ -3226,6 +3315,8 @@ mod tests {
             | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Box::new(std::iter::empty()),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
