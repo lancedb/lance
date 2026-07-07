@@ -200,17 +200,26 @@ _pk_index/
 ```
 
 Readers load this directory as a BTree index using `BTreeIndexDetails` with default parameters.
-The logical rows indexed by the BTree are sorted pairs:
+The primary-key index type is the Arrow type of the primary-key column for a single-column primary key, or `Binary` for a composite primary key.
 
-```python
-pa.schema([
-    pa.field("value", <primary-key-index-type>, nullable=True),
-    pa.field("_rowid", pa.uint64(), nullable=False),
-])
-```
+The `page_lookup.lance` file has the following schema:
 
-For a single-column primary key, `value` has the Arrow type of the primary-key column and stores the primary-key scalar directly.
-For a composite primary key, `value` is `binary` and stores an order-preserving tuple encoding of all primary-key columns in primary-key column order.
+| Column       | Type                    | Nullable | Description                                    |
+|--------------|-------------------------|----------|------------------------------------------------|
+| `min`        | {PrimaryKeyIndexType}   | true     | Minimum primary-key index value in the page    |
+| `max`        | {PrimaryKeyIndexType}   | true     | Maximum primary-key index value in the page    |
+| `null_count` | UInt32                  | false    | Number of null values in the page              |
+| `page_idx`   | UInt32                  | false    | Page number pointing into `page_data.lance`    |
+
+The `page_data.lance` file has the following schema:
+
+| Column   | Type                  | Nullable | Description                                                       |
+|----------|-----------------------|----------|-------------------------------------------------------------------|
+| `values` | {PrimaryKeyIndexType} | true     | Sorted primary-key index values                                   |
+| `ids`    | UInt64                | false    | Forward row ids corresponding to each primary-key index value     |
+
+For a single-column primary key, the indexed value stores the primary-key scalar directly.
+For a composite primary key, the indexed value stores an order-preserving binary tuple encoding of all primary-key columns in primary-key column order.
 Each tuple column is encoded as:
 
 - `0x00` for null.
@@ -331,15 +340,11 @@ If a shard is absent from `index_catchup` for an index, that index is assumed to
 
 Shard snapshots, when present, use the following Lance file schema:
 
-```python
-pa.schema([
-    pa.field("shard_id", pa.utf8(), nullable=False),
-    pa.field("shard_spec_id", pa.uint32(), nullable=False),
-    # One field per ShardingField in the relevant ShardingSpec.
-    # Field name: "shard_field_{field_id}".
-    # Field type: ShardingField.result_type.
-])
-```
+| Column                     | Type                         | Nullable | Description                                            |
+|----------------------------|------------------------------|----------|--------------------------------------------------------|
+| `shard_id`                 | Utf8                         | false    | Shard UUID string                                      |
+| `shard_spec_id`            | UInt32                       | false    | Sharding spec that produced the shard                  |
+| `shard_field_{field_id}`   | `ShardingField.result_type`  | false    | Computed shard field value for the given sharding field |
 
 The MemWAL index data is stored inline.
 Readers discover the latest shard set by listing `_mem_wal/` shard directories and reading shard manifests.
