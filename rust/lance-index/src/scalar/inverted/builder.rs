@@ -1378,16 +1378,17 @@ impl IndexWorker {
                 while token_stream.advance() {
                     let token = token_stream.token();
                     let token_id = builder.tokens.get_or_add(&token.text);
-                    if token_id as usize == builder.posting_lists.len() {
+                    let token_idx = token_id as usize;
+                    if token_idx >= builder.posting_lists.len() {
                         let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
                             * std::mem::size_of::<PostingListBuilder>())
                             as u64;
-                        builder.posting_lists.push(
+                        builder.posting_lists.resize_with(token_idx + 1, || {
                             PostingListBuilder::new_with_posting_tail_codec(
                                 true,
                                 posting_tail_codec,
-                            ),
-                        );
+                            )
+                        });
                         let new_posting_lists_overhead_size = (builder.posting_lists.capacity()
                             * std::mem::size_of::<PostingListBuilder>())
                             as u64;
@@ -3824,6 +3825,66 @@ mod tests {
         worker.flush().await?;
         assert!(store.write_count() > 0);
         Ok(())
+    }
+
+    /// Regression test for #7313: `with_position` indexing must not panic when
+    /// `tokens.next_id` exceeds `posting_lists.len()`. The primary guard is in
+    /// `load_fst` (index.rs), which normalizes `next_id = max_id + 1` on load so
+    /// this gap never arises from a real partition. This test verifies `process_batch`
+    /// remains robust even when a stale `next_id` reaches it directly (e.g. in tests
+    /// or via direct builder construction).
+    #[tokio::test]
+    async fn test_process_batch_with_position_handles_token_id_gaps() {
+        const VOCAB_SIZE: usize = 1731;
+        const STALE_NEXT_ID: u32 = 4456;
+        const NEW_TOKEN: &str = "xyzzunique7313";
+
+        let tokenizer = InvertedIndexParams::default()
+            .with_position(true)
+            .stem(false)
+            .lower_case(false)
+            .build()
+            .unwrap();
+        let store = Arc::new(CountingStore::new());
+        let id_alloc = Arc::new(AtomicU64::new(0));
+        let mut worker = IndexWorker::new(
+            tokenizer,
+            store,
+            id_alloc,
+            IndexWorkerConfig {
+                with_position: true,
+                format_version: InvertedListFormatVersion::V1,
+                fragment_mask: None,
+                token_set_format: TokenSetFormat::default(),
+                worker_memory_limit_bytes: u64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut tokens = TokenSet::default();
+        for i in 0..VOCAB_SIZE {
+            tokens.add(format!("tok_{i}"));
+        }
+        tokens.next_id = STALE_NEXT_ID;
+        worker.builder.set_tokens(tokens);
+        let posting_tail_codec = worker.builder.posting_tail_codec;
+        worker.builder.posting_lists.resize_with(VOCAB_SIZE, || {
+            PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec)
+        });
+
+        worker
+            .process_batch(make_doc_batch(NEW_TOKEN, 0))
+            .await
+            .unwrap();
+
+        let new_token_id = worker
+            .builder
+            .tokens
+            .get(NEW_TOKEN)
+            .expect("new token indexed");
+        assert!((new_token_id as usize) < worker.builder.posting_lists.len());
+        assert_eq!(worker.builder.posting_lists.len(), 4457);
     }
 
     #[test]

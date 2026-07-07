@@ -2076,10 +2076,17 @@ impl TokenSet {
         let total_length_col =
             batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
 
-        // Token ids are dense `[0, len)`, so `next_id` must equal the token count. Recompute
-        // it instead of trusting the persisted value, which writers before #7115 could leave
-        // stale. Mirrors `load_arrow`.
-        let next_id = map.len() as u32;
+        // Compute next_id as max_token_id + 1 to handle both dense and sparse token ID
+        // spaces. Writers before #7115 could persist a stale next_id; sparse IDs can also
+        // arise from index repairs. Mirrors the load_arrow approach.
+        let next_id = {
+            let mut stream = map.stream();
+            let mut max_next_id: u32 = 0;
+            while let Some((_, id)) = stream.next() {
+                max_next_id = max_next_id.max(id as u32 + 1);
+            }
+            max_next_id
+        };
 
         let total_length = total_length_col
             .values()
