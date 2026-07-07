@@ -5628,6 +5628,149 @@ mod test {
         Ok(())
     }
 
+    // Regression for #6580: a scan with `filter` + `project` of a
+    // `(Large)List<Struct>` column used to panic in `merge_with_schema`
+    // (called from `TakeStream::map_batch`) because the filtered batch arrived
+    // as a sliced view of a larger batch and the cloned list offsets did not
+    // start at zero. The trigger requires (a) a `(Large)List<Struct>`
+    // projection where the struct is split across `filtered_read` and
+    // `TakeExec` and (b) a sparse-tail selectivity pattern so the trailing
+    // filter result lands deep inside the values buffer of its source batch.
+    // Parametrized over `List`/`LargeList` since the fix touches both offset
+    // widths in `merge_with_schema`.
+    #[rstest]
+    #[tokio::test]
+    async fn test_filter_project_list_struct_sparse_tail(
+        // The panic is specific to v2.x storage; the legacy reader takes a
+        // different code path. V2_0 and V2_2 are the versions called out in
+        // the original report.
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::Stable,
+            LanceFileVersion::V2_2
+        )]
+        data_storage_version: LanceFileVersion,
+        #[values(false, true)] large_list: bool,
+    ) {
+        use arrow_array::{LargeListArray, ListArray, UInt16Array};
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
+        let struct_fields = Fields::from(vec![
+            Arc::new(ArrowField::new("a", DataType::Int32, true)),
+            Arc::new(ArrowField::new("b", DataType::Int32, true)),
+        ]);
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields.clone()),
+            true,
+        ));
+        let items_dtype = if large_list {
+            DataType::LargeList(item_field.clone())
+        } else {
+            DataType::List(item_field.clone())
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("grp", DataType::UInt16, false),
+            ArrowField::new("items", items_dtype, false),
+        ]));
+
+        let make_batch = |start: i32, n: usize, group: u16| -> RecordBatch {
+            let ids = Int32Array::from_iter_values(start..start + n as i32);
+            let groups = UInt16Array::from(vec![group; n]);
+
+            let mut offsets = Vec::with_capacity(n + 1);
+            let mut a_vals: Vec<i32> = Vec::new();
+            let mut b_vals: Vec<i32> = Vec::new();
+            offsets.push(0i64);
+            for i in 0..n {
+                // Variable-length lists (1..=18) so offsets don't land on
+                // batch-row boundaries.
+                let len = 1 + (i % 18);
+                for j in 0..len {
+                    a_vals.push(j as i32);
+                    b_vals.push(-(j as i32));
+                }
+                offsets.push(a_vals.len() as i64);
+            }
+            let struct_arr = Arc::new(StructArray::new(
+                struct_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(a_vals)) as ArrayRef,
+                    Arc::new(Int32Array::from(b_vals)) as ArrayRef,
+                ],
+                None,
+            ));
+            let items: ArrayRef = if large_list {
+                Arc::new(LargeListArray::new(
+                    item_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                    struct_arr,
+                    None,
+                ))
+            } else {
+                let offsets_i32: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
+                Arc::new(ListArray::new(
+                    item_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(offsets_i32)),
+                    struct_arr,
+                    None,
+                ))
+            };
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(ids) as ArrayRef,
+                    Arc::new(groups) as ArrayRef,
+                    items,
+                ],
+            )
+            .unwrap()
+        };
+
+        // Sparse-tail selectivity (matching the original report's shape at a
+        // smaller scale): a large leading block of matches, a large gap of
+        // non-matches, then a small trailing match. Single fragment.
+        let batches = vec![
+            make_batch(0, 100_000, 7),
+            make_batch(100_000, 400_000, 1),
+            make_batch(500_000, 7_300, 7),
+        ];
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1_000_000,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Force a column split inside the `items` struct by marking `items.b`
+        // as a late-materialized field: `filtered_read` returns the batch with
+        // `items.a`, and `TakeExec` adds `items.b`. `merge_with_schema` then
+        // takes its `List<Struct>` branch, which is where the panic was.
+        let items_b_field_id = dataset
+            .schema()
+            .field("items")
+            .unwrap()
+            .child("item")
+            .unwrap()
+            .child("b")
+            .unwrap()
+            .id as u32;
+        let mut scan = dataset.scan();
+        scan.filter("grp = 7").unwrap();
+        scan.project(&["id", "items"]).unwrap();
+        scan.materialization_style(MaterializationStyle::AllEarlyExcept(vec![items_b_field_id]));
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 107_300);
+    }
+
     #[tokio::test]
     async fn test_scan_regexp_match_and_non_empty_captions() {
         // Build a small dataset with three Utf8 columns and verify the full
