@@ -196,6 +196,10 @@ name = "scan"
 harness = false
 
 [[bench]]
+name = "s3_file_reader_diagnostics"
+harness = false
+
+[[bench]]
 name = "count_pushdown"
 harness = false
 
