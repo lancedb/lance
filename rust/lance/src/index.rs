@@ -1026,6 +1026,12 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices().await?;
         let mut indices = if let Some(criteria) = criteria {
             indices.iter().filter(|idx| {
+                // System indices (e.g. __mem_wal, __frag_reuse) are inline state
+                // records with no fragment_bitmap, so they have no describable
+                // index and would trip IndexDescriptionImpl::try_new.
+                if is_system_index(idx) {
+                    return false;
+                }
                 if idx.index_details.is_none() {
                     log::warn!("The method describe_indices does not support indexes without index details.  Please retrain the index {}", idx.name);
                     return false;
@@ -1044,7 +1050,10 @@ impl DatasetIndexExt for Dataset {
                 }
             }).collect::<Vec<_>>()
         } else {
-            indices.iter().collect::<Vec<_>>()
+            indices
+                .iter()
+                .filter(|idx| !is_system_index(idx))
+                .collect::<Vec<_>>()
         };
         indices.sort_by_key(|idx| &idx.name);
 

@@ -490,4 +490,67 @@ mod tests {
 
         assert!(indices.is_empty());
     }
+
+    /// Regression: a committed `__mem_wal` system index (which legitimately has
+    /// `fragment_bitmap: None`) must not break `describe_indices`, the path
+    /// behind lancedb's `list_indices`/`wait_for_index`. Real indices must still
+    /// be returned; the system index must be skipped.
+    #[tokio::test]
+    async fn test_describe_indices_skips_mem_wal_system_index() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::ScalarIndexParams;
+
+        let mut dataset = test_dataset().await;
+
+        // A real user index that describe_indices must keep returning.
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Commit a __mem_wal index into the base manifest, exactly as WAL
+        // provisioning / merge-to-base does in production.
+        let shard = Uuid::new_v4();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(shard, 1)],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        // The system index is present with no fragment_bitmap (by design).
+        let mem_wal = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|i| i.name == MEM_WAL_INDEX_NAME)
+            .unwrap()
+            .clone();
+        assert!(mem_wal.fragment_bitmap.is_none());
+
+        // describe_indices no longer errors, skips __mem_wal, keeps the real one.
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert!(
+            descriptions.iter().all(|d| d.name() != MEM_WAL_INDEX_NAME),
+            "system index must be excluded from describe_indices"
+        );
+        assert_eq!(
+            descriptions.len(),
+            1,
+            "the real scalar index must still be listed"
+        );
+    }
 }
