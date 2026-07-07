@@ -1411,35 +1411,23 @@ impl IndexWorker {
         Ok(())
     }
 
-    fn checked_token_position(
-        row_id: u64,
-        position_offset: u32,
-        token_position: usize,
-    ) -> Result<u32> {
-        let token_position = u32::try_from(token_position).map_err(|_| {
+    fn checked_token_position(row_id: u64, token_position: usize) -> Result<u32> {
+        u32::try_from(token_position).map_err(|_| {
             Error::invalid_input(format!(
                 "token position overflow for row_id={row_id}: token_position={token_position}"
-            ))
-        })?;
-        position_offset.checked_add(token_position).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "token position overflow for row_id={row_id}: position_offset={position_offset}, token_position={token_position}"
             ))
         })
     }
 
-    fn checked_token_position_end(
-        row_id: u64,
-        position_offset: u32,
-        token_position: usize,
-        position_length: usize,
-    ) -> Result<u32> {
-        let token_position_end = token_position.checked_add(position_length).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "token position overflow for row_id={row_id}: token_position={token_position}, position_length={position_length}"
-            ))
-        })?;
-        Self::checked_token_position(row_id, position_offset, token_position_end)
+    fn materialize_string_list(elements: &dyn Array) -> String {
+        let mut doc = String::new();
+        for element in iter_str_array(elements).flatten() {
+            if !doc.is_empty() {
+                doc.push(' ');
+            }
+            doc.push_str(element);
+        }
+        doc
     }
 
     async fn process_document(
@@ -1469,21 +1457,12 @@ impl IndexWorker {
                 let memory_size = &mut self.memory_size;
                 let posting_tail_codec = builder.posting_tail_codec;
 
-                let mut process_text = |text: &str, position_offset: u32| -> Result<u32> {
+                let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
-                    let mut next_position_offset = position_offset;
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
                     while token_stream.advance() {
                         let token = token_stream.token();
-                        let position =
-                            Self::checked_token_position(row_id, position_offset, token.position)?;
-                        let position_end = Self::checked_token_position_end(
-                            row_id,
-                            position_offset,
-                            token.position,
-                            token.position_length,
-                        )?;
-                        next_position_offset = next_position_offset.max(position_end);
+                        let position = Self::checked_token_position(row_id, token.position)?;
                         let token_id = builder.tokens.get_or_add(&token.text);
                         if token_id as usize == builder.posting_lists.len() {
                             let old_posting_lists_overhead_size = (builder.posting_lists.capacity()
@@ -1514,34 +1493,16 @@ impl IndexWorker {
                             new_posting_memory_size as i64 - old_posting_memory_size as i64;
                         token_num += 1;
                     }
-                    if let Some(token) = token_stream.token_or_none() {
-                        let position_end = if token.text.is_empty() {
-                            Self::checked_token_position(row_id, position_offset, token.position)?
-                        } else {
-                            Self::checked_token_position_end(
-                                row_id,
-                                position_offset,
-                                token.position,
-                                token.position_length,
-                            )?
-                        };
-                        next_position_offset = next_position_offset.max(position_end);
-                    }
-                    Ok(next_position_offset)
+                    Ok(())
                 };
 
                 match document {
                     DocumentSource::Text(doc) => {
-                        process_text(doc, 0)?;
+                        process_text(doc)?;
                     }
                     DocumentSource::StringList(elements) => {
-                        let mut position_offset = 0;
-                        for element in iter_str_array(elements) {
-                            position_offset = match element {
-                                Some(element) => process_text(element, position_offset)?,
-                                None => position_offset,
-                            };
-                        }
+                        let doc = Self::materialize_string_list(elements);
+                        process_text(&doc)?;
                     }
                 }
             }
@@ -1569,9 +1530,8 @@ impl IndexWorker {
                 match document {
                     DocumentSource::Text(doc) => process_text(doc),
                     DocumentSource::StringList(elements) => {
-                        for element in iter_str_array(elements).flatten() {
-                            process_text(element);
-                        }
+                        let doc = Self::materialize_string_list(elements);
+                        process_text(&doc);
                     }
                 }
             }

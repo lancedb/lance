@@ -1876,11 +1876,20 @@ async fn test_fts_list_index_uses_row_level_documents() {
 
 #[tokio::test]
 async fn test_fts_list_phrase_query_can_cross_elements() {
+    assert_fts_list_phrase_query_can_cross_elements::<i32>().await;
+}
+
+#[tokio::test]
+async fn test_fts_large_list_phrase_query_can_cross_elements() {
+    assert_fts_list_phrase_query_can_cross_elements::<i64>().await;
+}
+
+async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::OffsetSizeTrait>() {
     let tempdir = TempStrDir::default();
     let uri = tempdir.to_owned();
     drop(tempdir);
 
-    let mut list_col = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    let mut list_col = GenericListBuilder::<Offset, _>::new(GenericStringBuilder::<Offset>::new());
     let rows: &[&[&str]] = &[
         &["alpha", "beta"],
         &["want the", "apple"],
@@ -1941,6 +1950,20 @@ async fn test_fts_list_phrase_query_can_cross_elements() {
         .await
         .unwrap();
     assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[1]);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("want apple".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[2]);
 }
 
 #[tokio::test]

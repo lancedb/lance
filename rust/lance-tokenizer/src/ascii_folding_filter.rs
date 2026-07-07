@@ -61,10 +61,6 @@ impl<T: TokenStream> TokenStream for AsciiFoldingFilterTokenStream<'_, T> {
         self.tail.token()
     }
 
-    fn token_or_none(&self) -> Option<&Token> {
-        self.tail.token_or_none()
-    }
-
     fn token_mut(&mut self) -> &mut Token {
         self.tail.token_mut()
     }

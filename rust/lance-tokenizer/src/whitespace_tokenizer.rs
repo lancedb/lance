@@ -62,10 +62,6 @@ impl TokenStream for WhitespaceTokenStream<'_> {
         self.token
     }
 
-    fn token_or_none(&self) -> Option<&Token> {
-        Some(self.token)
-    }
-
     fn token_mut(&mut self) -> &mut Token {
         self.token
     }

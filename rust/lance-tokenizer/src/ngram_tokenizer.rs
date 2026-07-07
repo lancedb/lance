@@ -112,10 +112,6 @@ impl TokenStream for NgramTokenStream<'_> {
         self.token
     }
 
-    fn token_or_none(&self) -> Option<&Token> {
-        (self.token.position != usize::MAX).then_some(self.token)
-    }
-
     fn token_mut(&mut self) -> &mut Token {
         self.token
     }
