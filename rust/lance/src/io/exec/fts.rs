@@ -39,7 +39,9 @@ use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
-    FREQS_COLLECTED_METRIC, MetricsCollector,
+    FREQS_COLLECTED_METRIC, FTS_BLOCK_METADATA_ROWS_METRIC, FTS_BLOCKS_PRUNED_METRIC,
+    FTS_PAYLOAD_BLOCKS_READ_METRIC, FTS_PAYLOAD_READ_RANGES_METRIC,
+    FTS_POSITION_BLOCKS_READ_METRIC, MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -166,6 +168,11 @@ pub struct FtsIndexMetrics {
     and_candidates_pruned_before_return: Count,
     and_full_scores: Count,
     freqs_collected: Count,
+    fts_block_metadata_rows: Count,
+    fts_payload_blocks_read: Count,
+    fts_position_blocks_read: Count,
+    fts_blocks_pruned: Count,
+    fts_payload_read_ranges: Count,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -179,6 +186,11 @@ impl FtsIndexMetrics {
                 .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            fts_block_metadata_rows: metrics.new_count(FTS_BLOCK_METADATA_ROWS_METRIC, partition),
+            fts_payload_blocks_read: metrics.new_count(FTS_PAYLOAD_BLOCKS_READ_METRIC, partition),
+            fts_position_blocks_read: metrics.new_count(FTS_POSITION_BLOCKS_READ_METRIC, partition),
+            fts_blocks_pruned: metrics.new_count(FTS_BLOCKS_PRUNED_METRIC, partition),
+            fts_payload_read_ranges: metrics.new_count(FTS_PAYLOAD_READ_RANGES_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -215,6 +227,26 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_freqs_collected(&self, num_collections: usize) {
         self.freqs_collected.add(num_collections);
+    }
+
+    fn record_fts_block_metadata_rows(&self, num_rows: usize) {
+        self.fts_block_metadata_rows.add(num_rows);
+    }
+
+    fn record_fts_payload_blocks_read(&self, num_blocks: usize) {
+        self.fts_payload_blocks_read.add(num_blocks);
+    }
+
+    fn record_fts_position_blocks_read(&self, num_blocks: usize) {
+        self.fts_position_blocks_read.add(num_blocks);
+    }
+
+    fn record_fts_blocks_pruned(&self, num_blocks: usize) {
+        self.fts_blocks_pruned.add(num_blocks);
+    }
+
+    fn record_fts_payload_read_ranges(&self, num_ranges: usize) {
+        self.fts_payload_read_ranges.add(num_ranges);
     }
 }
 

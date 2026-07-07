@@ -7,6 +7,11 @@ pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
 pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
 pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
 pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
+pub const FTS_BLOCK_METADATA_ROWS_METRIC: &str = "fts_block_metadata_rows";
+pub const FTS_PAYLOAD_BLOCKS_READ_METRIC: &str = "fts_payload_blocks_read";
+pub const FTS_POSITION_BLOCKS_READ_METRIC: &str = "fts_position_blocks_read";
+pub const FTS_BLOCKS_PRUNED_METRIC: &str = "fts_blocks_pruned";
+pub const FTS_PAYLOAD_READ_RANGES_METRIC: &str = "fts_payload_read_ranges";
 
 /// A trait used by the index to report metrics
 ///
@@ -63,6 +68,16 @@ pub trait MetricsCollector: Send + Sync {
 
     fn record_freqs_collected(&self, _num_collections: usize) {}
 
+    fn record_fts_block_metadata_rows(&self, _num_rows: usize) {}
+
+    fn record_fts_payload_blocks_read(&self, _num_blocks: usize) {}
+
+    fn record_fts_position_blocks_read(&self, _num_blocks: usize) {}
+
+    fn record_fts_blocks_pruned(&self, _num_blocks: usize) {}
+
+    fn record_fts_payload_read_ranges(&self, _num_ranges: usize) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///
@@ -91,6 +106,11 @@ pub struct LocalMetricsCollector {
     pub parts_loaded: AtomicUsize,
     pub index_loads: AtomicUsize,
     pub comparisons: AtomicUsize,
+    pub fts_block_metadata_rows: AtomicUsize,
+    pub fts_payload_blocks_read: AtomicUsize,
+    pub fts_position_blocks_read: AtomicUsize,
+    pub fts_blocks_pruned: AtomicUsize,
+    pub fts_payload_read_ranges: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -98,6 +118,12 @@ impl LocalMetricsCollector {
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
+        other.record_fts_block_metadata_rows(self.fts_block_metadata_rows.load(Ordering::Relaxed));
+        other.record_fts_payload_blocks_read(self.fts_payload_blocks_read.load(Ordering::Relaxed));
+        other
+            .record_fts_position_blocks_read(self.fts_position_blocks_read.load(Ordering::Relaxed));
+        other.record_fts_blocks_pruned(self.fts_blocks_pruned.load(Ordering::Relaxed));
+        other.record_fts_payload_read_ranges(self.fts_payload_read_ranges.load(Ordering::Relaxed));
     }
 }
 
@@ -113,5 +139,30 @@ impl MetricsCollector for LocalMetricsCollector {
     fn record_comparisons(&self, num_comparisons: usize) {
         self.comparisons
             .fetch_add(num_comparisons, Ordering::Relaxed);
+    }
+
+    fn record_fts_block_metadata_rows(&self, num_rows: usize) {
+        self.fts_block_metadata_rows
+            .fetch_add(num_rows, Ordering::Relaxed);
+    }
+
+    fn record_fts_payload_blocks_read(&self, num_blocks: usize) {
+        self.fts_payload_blocks_read
+            .fetch_add(num_blocks, Ordering::Relaxed);
+    }
+
+    fn record_fts_position_blocks_read(&self, num_blocks: usize) {
+        self.fts_position_blocks_read
+            .fetch_add(num_blocks, Ordering::Relaxed);
+    }
+
+    fn record_fts_blocks_pruned(&self, num_blocks: usize) {
+        self.fts_blocks_pruned
+            .fetch_add(num_blocks, Ordering::Relaxed);
+    }
+
+    fn record_fts_payload_read_ranges(&self, num_ranges: usize) {
+        self.fts_payload_read_ranges
+            .fetch_add(num_ranges, Ordering::Relaxed);
     }
 }

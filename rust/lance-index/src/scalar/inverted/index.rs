@@ -19,6 +19,7 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use arrow::array::{FixedSizeListBuilder, Float32Builder};
+use arrow::compute::concat_batches;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
     array::{
@@ -53,14 +54,18 @@ use std::sync::LazyLock;
 use tokio::{sync::OnceCell, task::spawn_blocking};
 use tracing::{info, instrument};
 
-use super::encoding::{PositionBlockBuilder, decode_group_starts};
+use super::encoding::{
+    PositionBlockBuilder, decode_group_starts, decode_position_stream_block,
+    decompress_posting_block, decompress_posting_remainder,
+};
 use super::iter::PostingListIterator;
 use super::lazy_docset::LazyDocSet;
 use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
         BLOCK_SIZE, PostingGroupAccumulator, PostingGroupConfig, ScoredDoc, doc_file_path,
-        inverted_list_schema_for_version, posting_file_path, token_file_path,
+        inverted_list_schema_for_version, posting_blocks_file_path, posting_coarse_skip_file_path,
+        posting_file_path, posting_positions_file_path, token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
@@ -86,10 +91,15 @@ use std::str::FromStr;
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
+// Version 3: Fst TokenSetFormat with one posting block per row.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
+pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
+pub const POSTING_BLOCKS_FILE: &str = "posting_blocks.lance";
+pub const POSTING_POSITIONS_FILE: &str = "posting_positions.lance";
+pub const POSTING_COARSE_SKIP_FILE: &str = "posting_coarse_skip.lance";
 pub const DOCS_FILE: &str = "docs.lance";
 pub const METADATA_FILE: &str = "metadata.lance";
 
@@ -106,12 +116,19 @@ pub const POSTING_COL: &str = "_posting";
 pub const MAX_SCORE_COL: &str = "_max_score";
 pub const LENGTH_COL: &str = "_length";
 pub const BLOCK_MAX_SCORE_COL: &str = "_block_max_score";
+pub const BLOCK_START_COL: &str = "_block_start";
+pub const NUM_BLOCKS_COL: &str = "_num_blocks";
+pub const COARSE_SKIP_GROUP_BLOCKS: usize = 128;
+pub const FIRST_DOC_ID_COL: &str = "_first_doc_id";
+pub const LAST_DOC_ID_COL: &str = "_last_doc_id";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 pub const TOKEN_SET_FORMAT_KEY: &str = "token_set_format";
 pub const POSTING_TAIL_CODEC_KEY: &str = "posting_tail_codec";
 pub const POSITIONS_LAYOUT_KEY: &str = "positions_layout";
 pub const POSITIONS_CODEC_KEY: &str = "positions_codec";
+pub const POSTING_BLOCK_LAYOUT_KEY: &str = "posting_block_layout";
+pub const POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3: &str = "block_row_v3";
 /// Schema-metadata key holding the 1-indexed global-buffer id of the
 /// varint-delta-encoded posting-list cache-group boundaries (issue #7040).
 /// Absent on indexes written before grouping was introduced, which fall back
@@ -152,7 +169,7 @@ pub fn current_fts_format_version() -> InvertedListFormatVersion {
 }
 
 pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
-    InvertedListFormatVersion::V2
+    InvertedListFormatVersion::V3
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -160,6 +177,7 @@ pub enum InvertedListFormatVersion {
     V1,
     #[default]
     V2,
+    V3,
 }
 
 impl InvertedListFormatVersion {
@@ -174,25 +192,30 @@ impl InvertedListFormatVersion {
         match self {
             Self::V1 => INVERTED_INDEX_VERSION_V1,
             Self::V2 => INVERTED_INDEX_VERSION_V2,
+            Self::V3 => INVERTED_INDEX_VERSION_V3,
         }
     }
 
     pub fn posting_tail_codec(self) -> PostingTailCodec {
         match self {
             Self::V1 => PostingTailCodec::Fixed32,
-            Self::V2 => PostingTailCodec::VarintDelta,
+            Self::V2 | Self::V3 => PostingTailCodec::VarintDelta,
         }
     }
 
     pub fn position_codec(self) -> Option<PositionStreamCodec> {
         match self {
             Self::V1 => None,
-            Self::V2 => Some(PositionStreamCodec::PackedDelta),
+            Self::V2 | Self::V3 => Some(PositionStreamCodec::PackedDelta),
         }
     }
 
     pub fn uses_shared_position_stream(self) -> bool {
-        matches!(self, Self::V2)
+        matches!(self, Self::V2 | Self::V3)
+    }
+
+    pub fn uses_block_row_layout(self) -> bool {
+        matches!(self, Self::V3)
     }
 }
 
@@ -203,8 +226,9 @@ impl FromStr for InvertedListFormatVersion {
         match s.trim() {
             "1" | "v1" | "V1" => Ok(Self::V1),
             "2" | "v2" | "V2" => Ok(Self::V2),
+            "3" | "v3" | "V3" => Ok(Self::V3),
             other => Err(Error::index(format!(
-                "unsupported FTS format version {}, expected 1 or 2",
+                "unsupported FTS format version {}, expected 1, 2, or 3",
                 other
             ))),
         }
@@ -247,6 +271,186 @@ impl LoadedPostings {
 struct GroupedExpansionTerms {
     position: u32,
     terms: Vec<ExpansionTermFreqs>,
+}
+
+#[derive(Debug, Clone)]
+struct V3TermPlan {
+    token_id: u32,
+    token: String,
+    position: u32,
+    term_index: u32,
+    posting_len: u32,
+    blocks: Vec<V3BlockMeta>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V3BlockMeta {
+    term_idx: usize,
+    block_idx: usize,
+    block_row: usize,
+    first_doc_id: u32,
+    last_doc_id: u32,
+    block_max_score: f32,
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+struct V3BlockSkipMeta {
+    block_idx: usize,
+    block_row: usize,
+    first_doc_id: u32,
+    last_doc_id: u32,
+    block_max_score: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V3Window {
+    first_doc_id: u32,
+    last_doc_id: u32,
+    upper_bound: f32,
+}
+
+#[derive(Debug)]
+struct V3BlockSearchResult {
+    candidates: Vec<DocCandidate>,
+    threshold: f32,
+}
+
+#[derive(Debug, Clone)]
+struct V3DecodedPostingBlock {
+    doc_ids: Vec<u32>,
+    freqs: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct V3DecodedPositionBlock {
+    values: Vec<u32>,
+    offsets: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct V3TermPositions {
+    position_in_query: i32,
+    positions: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct V3DocAccumulator {
+    freqs: Vec<Option<u32>>,
+    block_rows: Vec<Option<usize>>,
+    doc_offsets: Vec<Option<usize>>,
+}
+
+impl V3DocAccumulator {
+    fn new(num_terms: usize) -> Self {
+        Self {
+            freqs: vec![None; num_terms],
+            block_rows: vec![None; num_terms],
+            doc_offsets: vec![None; num_terms],
+        }
+    }
+
+    fn add(&mut self, term_idx: usize, block_row: usize, doc_offset: usize, freq: u32) {
+        self.freqs[term_idx] = Some(freq);
+        self.block_rows[term_idx] = Some(block_row);
+        self.doc_offsets[term_idx] = Some(doc_offset);
+    }
+
+    fn matches_operator(&self, operator: Operator) -> bool {
+        match operator {
+            Operator::And => self.freqs.iter().all(Option::is_some),
+            Operator::Or => self.freqs.iter().any(Option::is_some),
+        }
+    }
+
+    fn term_freqs(&self, term_plans: &[V3TermPlan]) -> Vec<(u32, u32)> {
+        self.freqs
+            .iter()
+            .enumerate()
+            .filter_map(|(term_idx, freq)| freq.map(|freq| (term_plans[term_idx].term_index, freq)))
+            .collect()
+    }
+}
+
+fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
+    let mut cur = slot.load(Ordering::Relaxed);
+    while val > f32::from_bits(cur) {
+        match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+fn v3_phrase_positions_match(mut terms: Vec<V3TermPositions>, slop: i32) -> bool {
+    if terms.is_empty() || terms.iter().any(|term| term.positions.is_empty()) {
+        return false;
+    }
+    for term in &mut terms {
+        term.positions.sort_unstable();
+        term.positions.dedup();
+    }
+    if slop == 0 {
+        return v3_exact_phrase_positions_match(terms);
+    }
+
+    terms.sort_unstable_by_key(|term| term.position_in_query);
+    let first = &terms[0];
+    for &position in &first.positions {
+        let relative = position as i32 - first.position_in_query;
+        if v3_sloppy_phrase_positions_match_from(&terms, 1, relative, slop) {
+            return true;
+        }
+    }
+    false
+}
+
+fn v3_exact_phrase_positions_match(mut terms: Vec<V3TermPositions>) -> bool {
+    terms.sort_unstable_by_key(|term| term.positions.len());
+    let lead = &terms[0];
+    for &anchor in &lead.positions {
+        let Some(base) = anchor.checked_sub(lead.position_in_query as u32) else {
+            continue;
+        };
+        if terms.iter().skip(1).all(|term| {
+            base.checked_add(term.position_in_query as u32)
+                .is_some_and(|target| term.positions.binary_search(&target).is_ok())
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn v3_sloppy_phrase_positions_match_from(
+    terms: &[V3TermPositions],
+    term_idx: usize,
+    previous_relative: i32,
+    slop: i32,
+) -> bool {
+    if term_idx == terms.len() {
+        return true;
+    }
+    let term = &terms[term_idx];
+    let lower = previous_relative + term.position_in_query;
+    let upper = previous_relative + slop + term.position_in_query;
+    for &position in &term.positions {
+        let position = position as i32;
+        if position < lower {
+            continue;
+        }
+        if position > upper {
+            break;
+        }
+        if v3_sloppy_phrase_positions_match_from(
+            terms,
+            term_idx + 1,
+            position - term.position_in_query,
+            slop,
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn grouped_rescore_wand_limit(
@@ -409,6 +613,12 @@ fn parse_shared_position_codec(metadata: &HashMap<String, String>) -> Result<Pos
 pub(super) fn parse_format_version_from_metadata(
     metadata: &HashMap<String, String>,
 ) -> Result<InvertedListFormatVersion> {
+    if matches!(
+        metadata.get(POSTING_BLOCK_LAYOUT_KEY).map(String::as_str),
+        Some(POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3)
+    ) {
+        return Ok(InvertedListFormatVersion::V3);
+    }
     if metadata.contains_key(POSITIONS_CODEC_KEY) || metadata.contains_key(POSITIONS_LAYOUT_KEY) {
         return Ok(InvertedListFormatVersion::V2);
     }
@@ -417,6 +627,10 @@ pub(super) fn parse_format_version_from_metadata(
     } else {
         Ok(InvertedListFormatVersion::V1)
     }
+}
+
+fn checked_usize(value: u64, name: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| Error::index(format!("{name} {value} exceeds usize::MAX")))
 }
 
 #[derive(Clone)]
@@ -869,6 +1083,22 @@ impl InvertedIndex {
                 let metrics = metrics.clone();
                 let shared_threshold = shared_threshold.clone();
                 async move {
+                    if let Some(mut partition_result) = part
+                        .try_bm25_search_v3_blocks(
+                            tokens.as_ref(),
+                            params.as_ref(),
+                            operator,
+                            mask.clone(),
+                            metrics.clone(),
+                            shared_threshold.clone(),
+                        )
+                        .await?
+                    {
+                        resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
+                            .await?;
+                        return Result::Ok(partition_result);
+                    }
+
                     let loaded_postings = part
                         .load_posting_lists(
                             tokens.as_ref(),
@@ -1244,6 +1474,23 @@ const PREWARM_MAX_CHUNK_TOKENS: usize = 256 * 1024;
 /// Floor on token rows per chunk, so a partition always makes progress.
 const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
 
+const V3_BLOCK_ROW_CACHE_ENV: &str = "LANCE_FTS_V3_BLOCK_ROW_CACHE";
+const V3_BYPASS_POSTING_LIST_CACHE_ENV: &str = "LANCE_FTS_V3_BYPASS_POSTING_LIST_CACHE";
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn v3_block_row_cache_enabled() -> bool {
+    env_flag_enabled(V3_BLOCK_ROW_CACHE_ENV)
+}
+
+fn v3_bypass_posting_list_cache_enabled() -> bool {
+    env_flag_enabled(V3_BYPASS_POSTING_LIST_CACHE_ENV)
+}
+
 /// Token rows per chunk: byte target / average bytes-per-token, clamped to `[MIN, MAX]`.
 fn prewarm_chunk_tokens(token_count: usize, file_size_bytes: u64) -> usize {
     if token_count == 0 {
@@ -1329,6 +1576,46 @@ impl InvertedIndex {
             part.docs.ensure_loaded().await?;
         }
         Ok(())
+    }
+
+    pub async fn prewarm_v3_top_blocks_for_queries(
+        &self,
+        queries: &[String],
+        percent: usize,
+        with_position: bool,
+    ) -> Result<usize> {
+        if !(1..=100).contains(&percent) {
+            return Err(Error::invalid_input(format!(
+                "top block percent must be in [1, 100], got {percent}"
+            )));
+        }
+        let mut tokenizer = self.tokenizer.clone();
+        let mut query_terms = HashSet::new();
+        for query in queries {
+            let tokens = collect_query_tokens(query, &mut tokenizer);
+            for token_idx in 0..tokens.len() {
+                query_terms.insert(tokens.get_token(token_idx).to_owned());
+            }
+        }
+
+        let mut warmed_blocks = 0usize;
+        for part in &self.partitions {
+            let mut token_ids = query_terms
+                .iter()
+                .filter_map(|term| part.map(term))
+                .collect::<Vec<_>>();
+            token_ids.sort_unstable();
+            token_ids.dedup();
+            warmed_blocks += part
+                .inverted_list
+                .prewarm_v3_top_blocks(&token_ids, percent, with_position)
+                .await?;
+            part.inverted_list
+                .prewarm_posting_lists_for_tokens(&token_ids, with_position)
+                .await?;
+            part.docs.ensure_loaded().await?;
+        }
+        Ok(warmed_blocks)
     }
     /// Search docs match the input text.
     async fn do_search(&self, text: &str) -> Result<RecordBatch> {
@@ -1500,7 +1787,37 @@ impl InvertedPartition {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        let format_version =
+            parse_format_version_from_metadata(&invert_list_file.schema().metadata)?;
+        let inverted_list = if format_version.uses_block_row_layout() {
+            let block_file = store.open_index_file(&posting_blocks_file_path(id)).await?;
+            let position_file = if invert_list_file
+                .schema()
+                .metadata
+                .contains_key(POSITIONS_LAYOUT_KEY)
+            {
+                Some(
+                    store
+                        .open_index_file(&posting_positions_file_path(id))
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let coarse_skip_file = store
+                .open_index_file(&posting_coarse_skip_file_path(id))
+                .await?;
+            PostingListReader::try_new_v3(
+                invert_list_file,
+                block_file,
+                position_file,
+                coarse_skip_file,
+                index_cache,
+            )
+            .await?
+        } else {
+            PostingListReader::try_new(invert_list_file, index_cache).await?
+        };
         // Defer the per-doc row_id/num_tokens read. Construction reads only
         // the doc count (one footer read) and then drops the reader; the bulk
         // load happens on first scoring use, re-opening the docs file on
@@ -1871,6 +2188,698 @@ impl InvertedPartition {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn try_bm25_search_v3_blocks(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        operator: Operator,
+        mask: Arc<RowAddrMask>,
+        metrics: Arc<dyn MetricsCollector>,
+        shared_threshold: Arc<AtomicU32>,
+    ) -> Result<Option<PartitionCandidates>> {
+        if !self.inverted_list.is_v3_block_row_layout()
+            || matches!(params.fuzziness, Some(n) if n != 0)
+        {
+            return Ok(None);
+        }
+
+        let token_ids = self.v3_query_token_ids(tokens, params, operator)?;
+        if token_ids.is_empty() {
+            return Ok(Some(PartitionCandidates::empty()));
+        }
+        let cache_token_ids = token_ids
+            .iter()
+            .map(|(token_id, _, _)| *token_id)
+            .collect::<Vec<_>>();
+        if self
+            .inverted_list
+            .v3_posting_lists_cached(&cache_token_ids)
+            .await
+        {
+            return Ok(None);
+        }
+        let top_blocks_cached = self
+            .inverted_list
+            .v3_top_blocks_cached(&cache_token_ids)
+            .await;
+        if !self.v3_should_use_block_executor(&cache_token_ids, params, top_blocks_cached) {
+            return Ok(None);
+        }
+
+        let term_plans = self.v3_term_plans(token_ids, metrics.as_ref()).await?;
+        if term_plans.is_empty() {
+            return Ok(Some(PartitionCandidates::empty()));
+        }
+
+        let max_position = term_plans
+            .iter()
+            .map(|term| term.term_index as usize)
+            .max()
+            .unwrap_or_default();
+        let mut tokens_by_position = vec![String::new(); max_position + 1];
+        for term in &term_plans {
+            tokens_by_position[term.term_index as usize] = term.token.clone();
+        }
+
+        let (search_term_plans, searched_top_rows) = if top_blocks_cached {
+            let Some(top_rows) = self
+                .inverted_list
+                .v3_top_block_row_set(&cache_token_ids)
+                .await
+            else {
+                return Ok(None);
+            };
+            let search_term_plans = term_plans
+                .iter()
+                .cloned()
+                .map(|mut plan| {
+                    plan.blocks
+                        .retain(|block| top_rows.contains(&block.block_row));
+                    plan
+                })
+                .collect::<Vec<_>>();
+            (search_term_plans, Some(top_rows))
+        } else {
+            (term_plans.clone(), None)
+        };
+
+        let docs_for_wand = self.docs.docs_for_wand(mask.as_ref()).await?;
+        let search_shared_threshold = if top_blocks_cached {
+            Arc::new(AtomicU32::new(shared_threshold.load(Ordering::Relaxed)))
+        } else {
+            shared_threshold.clone()
+        };
+        let search_result = self
+            .bm25_search_v3_blocks(
+                docs_for_wand.as_ref(),
+                params,
+                operator,
+                mask,
+                search_term_plans,
+                metrics.as_ref(),
+                search_shared_threshold,
+                top_blocks_cached,
+            )
+            .await?;
+        if let Some(top_rows) = searched_top_rows.as_ref()
+            && !self.v3_cached_top_search_is_complete(
+                &term_plans,
+                params,
+                operator,
+                top_rows,
+                search_result.threshold,
+                search_result.candidates.len(),
+            )
+        {
+            return Ok(None);
+        }
+        if top_blocks_cached && search_result.threshold.is_finite() && params.wand_factor > 0.0 {
+            atomic_store_max_f32(
+                &shared_threshold,
+                search_result.threshold / params.wand_factor,
+            );
+        }
+        Ok(Some(PartitionCandidates {
+            tokens_by_position,
+            grouped_expansions: Vec::new(),
+            candidates: search_result.candidates,
+        }))
+    }
+
+    fn v3_query_token_ids(
+        &self,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        operator: Operator,
+    ) -> Result<Vec<(u32, String, u32)>> {
+        let is_phrase_query = params.phrase_slop.is_some();
+        let is_and_query = operator == Operator::And;
+        let required_positions = (is_and_query || is_phrase_query).then(|| {
+            (0..tokens.len())
+                .map(|index| tokens.position(index))
+                .collect::<HashSet<_>>()
+        });
+
+        let token_positions = (0..tokens.len())
+            .map(|index| tokens.position(index))
+            .collect::<Vec<_>>();
+        let mut token_ids = Vec::with_capacity(tokens.len());
+        let mut matched_positions = required_positions.as_ref().map(|_| HashSet::new());
+        for (index, token) in tokens.into_iter().enumerate() {
+            if let Some(token_id) = self.map(token) {
+                let position = token_positions[index];
+                if let Some(matched_positions) = matched_positions.as_mut() {
+                    matched_positions.insert(position);
+                }
+                token_ids.push((token_id, token.clone(), position));
+            } else if is_phrase_query || is_and_query {
+                return Ok(Vec::new());
+            }
+        }
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(required_positions) = required_positions.as_ref()
+            && let Some(matched_positions) = matched_positions.as_ref()
+            && !required_positions.is_subset(matched_positions)
+        {
+            return Ok(Vec::new());
+        }
+
+        if !is_phrase_query {
+            token_ids.sort_unstable_by_key(|(token_id, _, _)| *token_id);
+            token_ids.dedup_by_key(|(token_id, _, _)| *token_id);
+        }
+
+        Ok(token_ids)
+    }
+
+    fn v3_should_use_block_executor(
+        &self,
+        token_ids: &[u32],
+        params: &FtsSearchParams,
+        top_blocks_cached: bool,
+    ) -> bool {
+        if top_blocks_cached {
+            return true;
+        }
+        let total_blocks = token_ids
+            .iter()
+            .map(|token_id| self.inverted_list.num_v3_blocks_for_token(*token_id))
+            .sum::<usize>();
+        if params.phrase_slop.is_some() {
+            return total_blocks <= 64;
+        }
+        if token_ids.len() == 1 {
+            return total_blocks > 64;
+        }
+        total_blocks <= 64
+    }
+
+    fn v3_cached_top_search_is_complete(
+        &self,
+        full_term_plans: &[V3TermPlan],
+        params: &FtsSearchParams,
+        operator: Operator,
+        searched_rows: &HashSet<usize>,
+        threshold: f32,
+        candidate_count: usize,
+    ) -> bool {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return true;
+        }
+        if candidate_count < limit || !threshold.is_finite() {
+            return false;
+        }
+        let candidate_operator = if params.phrase_slop.is_some() {
+            Operator::And
+        } else {
+            operator
+        };
+        for window in self.v3_search_windows(full_term_plans, candidate_operator) {
+            if window.upper_bound <= threshold {
+                continue;
+            }
+            if self
+                .v3_window_blocks(full_term_plans, window, candidate_operator)
+                .iter()
+                .any(|block| !searched_rows.contains(&block.block_row))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn v3_term_plans(
+        &self,
+        token_ids: Vec<(u32, String, u32)>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<V3TermPlan>> {
+        let mut term_plans = Vec::with_capacity(token_ids.len());
+        for (term_idx, (token_id, token, position)) in token_ids.into_iter().enumerate() {
+            let posting_len = self.inverted_list.posting_len_for_token(token_id).await? as u32;
+            let blocks = self
+                .inverted_list
+                .v3_block_metadata(token_id, term_idx, metrics)
+                .await?;
+            term_plans.push(V3TermPlan {
+                token_id,
+                token,
+                position,
+                term_index: position,
+                posting_len,
+                blocks,
+            });
+        }
+
+        Ok(term_plans)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_search_v3_blocks(
+        &self,
+        docs: &DocSet,
+        params: &FtsSearchParams,
+        operator: Operator,
+        mask: Arc<RowAddrMask>,
+        term_plans: Vec<V3TermPlan>,
+        metrics: &dyn MetricsCollector,
+        shared_threshold: Arc<AtomicU32>,
+        top_blocks_cached: bool,
+    ) -> Result<V3BlockSearchResult> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 || term_plans.is_empty() {
+            return Ok(V3BlockSearchResult {
+                candidates: Vec::new(),
+                threshold: f32::INFINITY,
+            });
+        }
+
+        let phrase_slop = params.phrase_slop.map(|slop| slop as i32);
+        let candidate_operator = if phrase_slop.is_some() {
+            Operator::And
+        } else {
+            operator
+        };
+        let mut windows = self.v3_search_windows(&term_plans, candidate_operator);
+        if windows.is_empty() {
+            return Ok(V3BlockSearchResult {
+                candidates: Vec::new(),
+                threshold: f32::NEG_INFINITY,
+            });
+        }
+        windows.sort_unstable_by(|left, right| {
+            right
+                .upper_bound
+                .total_cmp(&left.upper_bound)
+                .then_with(|| left.first_doc_id.cmp(&right.first_doc_id))
+                .then_with(|| left.last_doc_id.cmp(&right.last_doc_id))
+        });
+
+        let scorer = IndexBM25Scorer::new(std::iter::once(self));
+        let docs_has_row_ids = docs.has_row_ids();
+        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut threshold = f32::NEG_INFINITY;
+        let mut decoded_blocks = HashMap::<usize, V3DecodedPostingBlock>::new();
+        let mut decoded_positions = HashMap::<usize, V3DecodedPositionBlock>::new();
+        let mut seen_doc_ids = HashSet::new();
+        let mut num_comparisons = 0usize;
+        let prefetched_payload_batches = if phrase_slop.is_some() && !top_blocks_cached {
+            let block_rows = windows
+                .iter()
+                .flat_map(|window| self.v3_window_blocks(&term_plans, *window, candidate_operator))
+                .map(|block| block.block_row)
+                .collect::<Vec<_>>();
+            self.inverted_list
+                .v3_payload_block_batches(&block_rows, metrics)
+                .await?
+        } else {
+            HashMap::new()
+        };
+
+        for window in windows {
+            threshold =
+                threshold.max(self.v3_shared_threshold(params.wand_factor, &shared_threshold));
+            if candidates.len() >= limit && window.upper_bound <= threshold {
+                metrics.record_fts_blocks_pruned(
+                    self.v3_window_blocks(&term_plans, window, candidate_operator)
+                        .len()
+                        .max(1),
+                );
+                continue;
+            }
+
+            let window_blocks = self.v3_window_blocks(&term_plans, window, candidate_operator);
+            if window_blocks.is_empty() {
+                continue;
+            }
+            let block_rows = window_blocks
+                .iter()
+                .map(|block| block.block_row)
+                .collect::<Vec<_>>();
+            let block_batches = if prefetched_payload_batches.is_empty() {
+                self.inverted_list
+                    .v3_payload_block_batches(&block_rows, metrics)
+                    .await?
+            } else {
+                HashMap::new()
+            };
+            for block in &window_blocks {
+                if decoded_blocks.contains_key(&block.block_row) {
+                    continue;
+                }
+                let batch = prefetched_payload_batches
+                    .get(&block.block_row)
+                    .or_else(|| block_batches.get(&block.block_row))
+                    .ok_or_else(|| {
+                        Error::internal(format!("missing V3 payload block row {}", block.block_row))
+                    })?;
+                let decoded = self.inverted_list.decode_v3_payload_block(
+                    term_plans[block.term_idx].token_id,
+                    block.block_idx,
+                    batch,
+                )?;
+                decoded_blocks.insert(block.block_row, decoded);
+            }
+
+            let mut docs_in_window = HashMap::<u32, V3DocAccumulator>::new();
+            for block in &window_blocks {
+                let decoded = decoded_blocks.get(&block.block_row).ok_or_else(|| {
+                    Error::internal(format!("missing decoded V3 block row {}", block.block_row))
+                })?;
+                for (doc_offset, (&doc_id, &freq)) in
+                    decoded.doc_ids.iter().zip(decoded.freqs.iter()).enumerate()
+                {
+                    if doc_id < window.first_doc_id || doc_id > window.last_doc_id {
+                        continue;
+                    }
+                    docs_in_window
+                        .entry(doc_id)
+                        .or_insert_with(|| V3DocAccumulator::new(term_plans.len()))
+                        .add(block.term_idx, block.block_row, doc_offset, freq);
+                }
+            }
+
+            let mut docs_in_window = docs_in_window.into_iter().collect::<Vec<_>>();
+            docs_in_window.sort_unstable_by_key(|(doc_id, _)| *doc_id);
+            for (doc_id, acc) in docs_in_window {
+                if !seen_doc_ids.insert(doc_id) {
+                    continue;
+                }
+                if !acc.matches_operator(candidate_operator) {
+                    continue;
+                }
+                num_comparisons += 1;
+
+                let addr = if docs_has_row_ids {
+                    let row_id = docs.row_id(doc_id);
+                    if row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id) {
+                        continue;
+                    }
+                    CandidateAddr::RowId(row_id)
+                } else {
+                    CandidateAddr::Pending(doc_id)
+                };
+                let doc_length = docs.num_tokens(doc_id);
+                if self.v3_candidate_cannot_beat_threshold(
+                    &acc,
+                    &term_plans,
+                    doc_length,
+                    &scorer,
+                    threshold,
+                ) {
+                    continue;
+                }
+                if let Some(slop) = phrase_slop
+                    && !self
+                        .v3_candidate_matches_phrase(
+                            &term_plans,
+                            &acc,
+                            &decoded_blocks,
+                            &mut decoded_positions,
+                            metrics,
+                            slop,
+                        )
+                        .await?
+                {
+                    continue;
+                }
+
+                let score = self.v3_score_candidate(&acc, &term_plans, doc_length, &scorer);
+                let row_id_slot = match &addr {
+                    CandidateAddr::RowId(row_id) => *row_id,
+                    CandidateAddr::Pending(doc_id) => *doc_id as u64,
+                };
+                let term_freqs = acc.term_freqs(&term_plans);
+                if candidates.len() < limit {
+                    candidates.push(Reverse((
+                        ScoredDoc::new(row_id_slot, score),
+                        term_freqs,
+                        doc_length,
+                        doc_id,
+                    )));
+                    if candidates.len() == limit {
+                        threshold = self.v3_update_threshold(
+                            candidates.peek().unwrap().0.0.score.0,
+                            params.wand_factor,
+                            &shared_threshold,
+                        );
+                    }
+                } else if score > candidates.peek().unwrap().0.0.score.0 {
+                    candidates.pop();
+                    candidates.push(Reverse((
+                        ScoredDoc::new(row_id_slot, score),
+                        term_freqs,
+                        doc_length,
+                        doc_id,
+                    )));
+                    threshold = self.v3_update_threshold(
+                        candidates.peek().unwrap().0.0.score.0,
+                        params.wand_factor,
+                        &shared_threshold,
+                    );
+                }
+            }
+        }
+        metrics.record_comparisons(num_comparisons);
+
+        Ok(V3BlockSearchResult {
+            candidates: candidates
+                .into_iter()
+                .map(
+                    |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
+                        addr: if docs_has_row_ids {
+                            CandidateAddr::RowId(doc.row_id)
+                        } else {
+                            CandidateAddr::Pending(doc.row_id as u32)
+                        },
+                        posting_doc_id: posting_doc_id as u64,
+                        freqs,
+                        doc_length,
+                    },
+                )
+                .collect(),
+            threshold,
+        })
+    }
+
+    fn v3_search_windows(&self, term_plans: &[V3TermPlan], operator: Operator) -> Vec<V3Window> {
+        let seed_blocks = if operator == Operator::And {
+            term_plans
+                .iter()
+                .min_by_key(|term| (term.posting_len, term.blocks.len() as u32))
+                .map(|term| term.blocks.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &[]
+        };
+        let seed_iter: Box<dyn Iterator<Item = V3BlockMeta> + '_> = if operator == Operator::And {
+            Box::new(seed_blocks.iter().copied())
+        } else {
+            Box::new(
+                term_plans
+                    .iter()
+                    .flat_map(|term| term.blocks.iter().copied()),
+            )
+        };
+
+        let mut seen = HashSet::new();
+        let mut windows = Vec::new();
+        for seed in seed_iter {
+            if !seen.insert((seed.first_doc_id, seed.last_doc_id)) {
+                continue;
+            }
+            if let Some(upper_bound) = self.v3_window_upper_bound(
+                term_plans,
+                seed.first_doc_id,
+                seed.last_doc_id,
+                operator,
+            ) {
+                windows.push(V3Window {
+                    first_doc_id: seed.first_doc_id,
+                    last_doc_id: seed.last_doc_id,
+                    upper_bound,
+                });
+            }
+        }
+        windows
+    }
+
+    fn v3_window_upper_bound(
+        &self,
+        term_plans: &[V3TermPlan],
+        first_doc_id: u32,
+        last_doc_id: u32,
+        operator: Operator,
+    ) -> Option<f32> {
+        let mut upper_bound = 0.0;
+        for term in term_plans {
+            let term_bound = term
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block.first_doc_id <= last_doc_id && block.last_doc_id >= first_doc_id
+                })
+                .map(|block| block.block_max_score)
+                .max_by(f32::total_cmp);
+            match term_bound {
+                Some(bound) => upper_bound += bound,
+                None if operator == Operator::And => return None,
+                None => {}
+            }
+        }
+        Some(upper_bound)
+    }
+
+    fn v3_window_blocks(
+        &self,
+        term_plans: &[V3TermPlan],
+        window: V3Window,
+        operator: Operator,
+    ) -> Vec<V3BlockMeta> {
+        let mut blocks = Vec::new();
+        for term in term_plans {
+            let start_len = blocks.len();
+            blocks.extend(
+                term.blocks
+                    .iter()
+                    .filter(|block| {
+                        block.first_doc_id <= window.last_doc_id
+                            && block.last_doc_id >= window.first_doc_id
+                    })
+                    .copied(),
+            );
+            if operator == Operator::And && blocks.len() == start_len {
+                return Vec::new();
+            }
+        }
+        blocks
+    }
+
+    fn v3_update_threshold(
+        &self,
+        local_kth: f32,
+        wand_factor: f32,
+        shared_threshold: &AtomicU32,
+    ) -> f32 {
+        atomic_store_max_f32(shared_threshold, local_kth);
+        local_kth.max(f32::from_bits(shared_threshold.load(Ordering::Relaxed))) * wand_factor
+    }
+
+    fn v3_shared_threshold(&self, wand_factor: f32, shared_threshold: &AtomicU32) -> f32 {
+        f32::from_bits(shared_threshold.load(Ordering::Relaxed)) * wand_factor
+    }
+
+    fn v3_score_candidate(
+        &self,
+        acc: &V3DocAccumulator,
+        term_plans: &[V3TermPlan],
+        doc_length: u32,
+        scorer: &IndexBM25Scorer,
+    ) -> f32 {
+        acc.freqs
+            .iter()
+            .enumerate()
+            .filter_map(|(term_idx, freq)| freq.map(|freq| (term_idx, freq)))
+            .map(|(term_idx, freq)| {
+                idf(term_plans[term_idx].posting_len as usize, self.docs.len())
+                    * scorer.doc_weight(freq, doc_length)
+            })
+            .sum()
+    }
+
+    fn v3_candidate_cannot_beat_threshold(
+        &self,
+        acc: &V3DocAccumulator,
+        term_plans: &[V3TermPlan],
+        doc_length: u32,
+        scorer: &IndexBM25Scorer,
+        threshold: f32,
+    ) -> bool {
+        if !threshold.is_finite() {
+            return false;
+        }
+        self.v3_score_candidate(acc, term_plans, doc_length, scorer) <= threshold
+    }
+
+    async fn v3_candidate_matches_phrase(
+        &self,
+        term_plans: &[V3TermPlan],
+        acc: &V3DocAccumulator,
+        decoded_blocks: &HashMap<usize, V3DecodedPostingBlock>,
+        decoded_positions: &mut HashMap<usize, V3DecodedPositionBlock>,
+        metrics: &dyn MetricsCollector,
+        slop: i32,
+    ) -> Result<bool> {
+        let mut rows = Vec::with_capacity(term_plans.len());
+        for term_idx in 0..term_plans.len() {
+            rows.push(
+                acc.block_rows[term_idx].ok_or_else(|| {
+                    Error::internal("phrase candidate is missing a term block row")
+                })?,
+            );
+        }
+
+        let missing_rows = rows
+            .iter()
+            .filter(|row| !decoded_positions.contains_key(row))
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing_rows.is_empty() {
+            let payloads = self
+                .inverted_list
+                .v3_position_block_payloads(&missing_rows, metrics)
+                .await?;
+            let codec = match self.inverted_list.positions_layout {
+                PositionsLayout::SharedStream(codec) => codec,
+                PositionsLayout::None | PositionsLayout::LegacyPerDoc => {
+                    return Err(Error::invalid_input(
+                        "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
+                    ));
+                }
+            };
+            for row in missing_rows {
+                let posting_block = decoded_blocks.get(&row).ok_or_else(|| {
+                    Error::internal(format!(
+                        "V3 phrase candidate has positions for block row {row} but no decoded payload"
+                    ))
+                })?;
+                let payload = payloads.get(&row).ok_or_else(|| {
+                    Error::internal(format!("missing V3 position payload block row {row}"))
+                })?;
+                let mut values = Vec::new();
+                decode_position_stream_block(payload, &posting_block.freqs, codec, &mut values)?;
+                let mut offsets = Vec::with_capacity(posting_block.freqs.len() + 1);
+                offsets.push(0);
+                for freq in &posting_block.freqs {
+                    offsets.push(offsets.last().copied().unwrap_or(0) + *freq as usize);
+                }
+                decoded_positions.insert(row, V3DecodedPositionBlock { values, offsets });
+            }
+        }
+
+        let mut term_positions = Vec::with_capacity(term_plans.len());
+        for (term_idx, term) in term_plans.iter().enumerate() {
+            let row = acc.block_rows[term_idx]
+                .ok_or_else(|| Error::internal("phrase candidate is missing a term block row"))?;
+            let doc_offset = acc.doc_offsets[term_idx]
+                .ok_or_else(|| Error::internal("phrase candidate is missing a term doc offset"))?;
+            let position_block = decoded_positions.get(&row).ok_or_else(|| {
+                Error::internal(format!("missing decoded V3 positions for block row {row}"))
+            })?;
+            let start = position_block.offsets[doc_offset];
+            let end = position_block.offsets[doc_offset + 1];
+            term_positions.push(V3TermPositions {
+                position_in_query: term.position as i32,
+                positions: position_block.values[start..end].to_vec(),
+            });
+        }
+        Ok(v3_phrase_positions_match(term_positions, slop))
+    }
+
     #[instrument(level = "debug", skip_all)]
     // Deferred-DocSet adds the `docs` param (caller materializes it) on top of
     // the cross-partition `shared_threshold`, tipping this hot-path search fn
@@ -1901,11 +2910,18 @@ impl InvertedPartition {
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
-        let mut builder = InnerBuilder::new_with_posting_tail_codec(
+        let format_version = if matches!(self.inverted_list.metadata, PostingMetadata::V3 { .. }) {
+            InvertedListFormatVersion::V3
+        } else {
+            InvertedListFormatVersion::from_posting_tail_codec(
+                self.inverted_list.posting_tail_codec(),
+            )
+        };
+        let mut builder = InnerBuilder::new_with_format_version(
             self.id,
             self.inverted_list.has_positions(),
             self.token_set_format,
-            self.inverted_list.posting_tail_codec(),
+            format_version,
         );
         builder.tokens = self.tokens.into_mutable();
         // into_builder rewrites every doc, so materialize the full
@@ -2306,7 +3322,11 @@ impl TokenSet {
 }
 
 pub struct PostingListReader {
+    /// V1/V2: posting-list file. V3: terms file (one row per token).
     reader: Arc<dyn IndexReader>,
+    block_reader: Option<Arc<dyn IndexReader>>,
+    position_reader: Option<Arc<dyn IndexReader>>,
+    coarse_skip_reader: Option<Arc<dyn IndexReader>>,
 
     /// Layout-specific metadata. V2 keeps its per-token max-score and
     /// length columns lazy so opening a partition doesn't drag O(num_tokens)
@@ -2345,6 +3365,14 @@ enum PostingMetadata {
     V2 {
         metadata: OnceCell<LoadedPostingMetadata>,
     },
+    /// V3: terms table rows are token ids. `block_starts` has a trailing
+    /// sentinel derived from `block_start + num_blocks`; `lengths` /
+    /// `max_scores` are indexed by token id.
+    V3 {
+        block_starts: Vec<u64>,
+        max_scores: Vec<f32>,
+        lengths: Vec<u32>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2376,6 +3404,33 @@ impl std::fmt::Debug for PostingListReader {
                 s.field("layout", &"v2")
                     .field("metadata_loaded", &metadata.initialized());
             }
+            PostingMetadata::V3 {
+                block_starts,
+                lengths,
+                ..
+            } => {
+                s.field("layout", &"v3")
+                    .field("num_tokens", &lengths.len())
+                    .field("num_block_offsets", &block_starts.len())
+                    .field(
+                        "num_block_rows",
+                        &self.block_reader.as_ref().map(|reader| reader.num_rows()),
+                    )
+                    .field(
+                        "num_position_rows",
+                        &self
+                            .position_reader
+                            .as_ref()
+                            .map(|reader| reader.num_rows()),
+                    )
+                    .field(
+                        "num_coarse_skip_rows",
+                        &self
+                            .coarse_skip_reader
+                            .as_ref()
+                            .map(|reader| reader.num_rows()),
+                    );
+            }
         }
         s.finish()
     }
@@ -2395,6 +3450,15 @@ impl DeepSizeOf for PostingListReader {
                         + loaded.lengths.deep_size_of_children(context)
                 })
                 .unwrap_or(0),
+            PostingMetadata::V3 {
+                block_starts,
+                max_scores,
+                lengths,
+            } => {
+                block_starts.deep_size_of_children(context)
+                    + max_scores.deep_size_of_children(context)
+                    + lengths.deep_size_of_children(context)
+            }
         };
         metadata_size + self.group_starts.deep_size_of_children(context)
     }
@@ -2405,6 +3469,18 @@ impl PostingListReader {
         reader: Arc<dyn IndexReader>,
         index_cache: &LanceCache,
     ) -> Result<Self> {
+        if matches!(
+            reader
+                .schema()
+                .metadata
+                .get(POSTING_BLOCK_LAYOUT_KEY)
+                .map(String::as_str),
+            Some(POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3)
+        ) {
+            return Err(Error::index(
+                "V3 posting layout requires separate terms, blocks, positions, and coarse-skip readers; use PostingListReader::try_new_v3".to_owned(),
+            ));
+        }
         let positions_layout = if reader.schema().field(COMPRESSED_POSITION_COL).is_some() {
             PositionsLayout::SharedStream(parse_shared_position_codec(&reader.schema().metadata)?)
         } else if reader.schema().field(POSITION_COL).is_some() {
@@ -2430,11 +3506,114 @@ impl PostingListReader {
 
         Ok(Self {
             reader,
+            block_reader: None,
+            position_reader: None,
+            coarse_skip_reader: None,
             metadata,
             has_position,
             posting_tail_codec,
             positions_layout,
             group_starts,
+            index_cache: WeakLanceCache::from(index_cache),
+        })
+    }
+
+    pub(crate) async fn try_new_v3(
+        terms_reader: Arc<dyn IndexReader>,
+        block_reader: Arc<dyn IndexReader>,
+        position_reader: Option<Arc<dyn IndexReader>>,
+        coarse_skip_reader: Arc<dyn IndexReader>,
+        index_cache: &LanceCache,
+    ) -> Result<Self> {
+        if !matches!(
+            terms_reader
+                .schema()
+                .metadata
+                .get(POSTING_BLOCK_LAYOUT_KEY)
+                .map(String::as_str),
+            Some(POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3)
+        ) {
+            return Err(Error::index(
+                "V3 terms table is missing block-row layout metadata".to_owned(),
+            ));
+        }
+        if block_reader.schema().field(POSTING_COL).is_none() {
+            return Err(Error::index(
+                "V3 blocks table is missing posting payload column".to_owned(),
+            ));
+        }
+        if block_reader.schema().field(FIRST_DOC_ID_COL).is_none()
+            || block_reader.schema().field(LAST_DOC_ID_COL).is_none()
+            || block_reader.schema().field(BLOCK_MAX_SCORE_COL).is_none()
+        {
+            return Err(Error::index(
+                "V3 blocks table is missing skip columns".to_owned(),
+            ));
+        }
+        if coarse_skip_reader.schema().field(BLOCK_START_COL).is_none()
+            || coarse_skip_reader.schema().field(NUM_BLOCKS_COL).is_none()
+            || coarse_skip_reader
+                .schema()
+                .field(FIRST_DOC_ID_COL)
+                .is_none()
+            || coarse_skip_reader.schema().field(LAST_DOC_ID_COL).is_none()
+            || coarse_skip_reader
+                .schema()
+                .field(BLOCK_MAX_SCORE_COL)
+                .is_none()
+        {
+            return Err(Error::index(
+                "V3 coarse-skip table is missing required skip columns".to_owned(),
+            ));
+        }
+        let posting_tail_codec = parse_posting_tail_codec(&terms_reader.schema().metadata)?;
+        let block_tail_codec = parse_posting_tail_codec(&block_reader.schema().metadata)?;
+        if posting_tail_codec != block_tail_codec {
+            return Err(Error::index(format!(
+                "V3 terms posting tail codec {:?} does not match blocks codec {:?}",
+                posting_tail_codec, block_tail_codec
+            )));
+        }
+        let positions_layout = if let Some(reader) = &position_reader {
+            if reader.schema().field(COMPRESSED_POSITION_COL).is_none() {
+                return Err(Error::index(
+                    "V3 positions table is missing compressed position column".to_owned(),
+                ));
+            }
+            if reader.num_rows() != block_reader.num_rows() {
+                return Err(Error::index(format!(
+                    "V3 positions table has {} rows but blocks table has {} rows",
+                    reader.num_rows(),
+                    block_reader.num_rows()
+                )));
+            }
+            PositionsLayout::SharedStream(parse_shared_position_codec(&reader.schema().metadata)?)
+        } else {
+            PositionsLayout::None
+        };
+        let terms_has_positions = terms_reader
+            .schema()
+            .metadata
+            .contains_key(POSITIONS_LAYOUT_KEY);
+        if terms_has_positions != (positions_layout != PositionsLayout::None) {
+            return Err(Error::index(format!(
+                "V3 terms positions metadata ({terms_has_positions}) does not match positions file presence ({})",
+                positions_layout != PositionsLayout::None
+            )));
+        }
+        let metadata =
+            Self::load_v3_terms_metadata(terms_reader.as_ref(), block_reader.num_rows()).await?;
+
+        Ok(Self {
+            reader: terms_reader,
+            block_reader: Some(block_reader),
+            position_reader,
+            coarse_skip_reader: Some(coarse_skip_reader),
+            metadata,
+            has_position: positions_layout != PositionsLayout::None,
+            posting_tail_codec,
+            positions_layout,
+            group_starts: None,
             index_cache: WeakLanceCache::from(index_cache),
         })
     }
@@ -2454,6 +3633,64 @@ impl PostingListReader {
         let bytes = reader.read_global_buffer(buf_id).await?;
         let group_starts = decode_group_starts(&bytes)?;
         Ok(Some(group_starts))
+    }
+
+    async fn load_v3_terms_metadata(
+        terms_reader: &dyn IndexReader,
+        block_row_count: usize,
+    ) -> Result<PostingMetadata> {
+        let token_count = terms_reader.num_rows();
+        let batch = terms_reader
+            .read_range(
+                0..token_count,
+                Some(&[LENGTH_COL, MAX_SCORE_COL, BLOCK_START_COL, NUM_BLOCKS_COL]),
+            )
+            .await?;
+        if batch.num_rows() != token_count {
+            return Err(Error::index(format!(
+                "V3 terms table returned {} rows for {} tokens",
+                batch.num_rows(),
+                token_count
+            )));
+        }
+        let lengths = batch[LENGTH_COL]
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        let max_scores = batch[MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let starts = batch[BLOCK_START_COL].as_primitive::<UInt64Type>();
+        let num_blocks = batch[NUM_BLOCKS_COL].as_primitive::<UInt32Type>();
+
+        let mut block_starts = Vec::with_capacity(token_count + 1);
+        let mut expected_start = 0u64;
+        for row in 0..token_count {
+            let start = starts.value(row);
+            if start != expected_start {
+                return Err(Error::index(format!(
+                    "V3 terms metadata is not contiguous at token {row}: block_start is {start}, expected {expected_start}"
+                )));
+            }
+            block_starts.push(start);
+            expected_start = start
+                .checked_add(u64::from(num_blocks.value(row)))
+                .ok_or_else(|| Error::index("V3 block range overflow".to_owned()))?;
+        }
+        block_starts.push(expected_start);
+        if checked_usize(expected_start, "V3 final block start")? != block_row_count {
+            return Err(Error::index(format!(
+                "V3 terms metadata mismatch: final block start is {} but blocks file has {} rows",
+                expected_start, block_row_count
+            )));
+        }
+
+        Ok(PostingMetadata::V3 {
+            block_starts,
+            max_scores,
+            lengths,
+        })
     }
 
     // for legacy format
@@ -2480,6 +3717,7 @@ impl PostingListReader {
         match &self.metadata {
             PostingMetadata::LegacyV1 { offsets, .. } => offsets.len(),
             PostingMetadata::V2 { .. } => self.reader.num_rows(),
+            PostingMetadata::V3 { lengths, .. } => lengths.len(),
         }
     }
 
@@ -2497,6 +3735,10 @@ impl PostingListReader {
 
     fn is_legacy_layout(&self) -> bool {
         matches!(self.metadata, PostingMetadata::LegacyV1 { .. })
+    }
+
+    fn is_v3_block_row_layout(&self) -> bool {
+        matches!(self.metadata, PostingMetadata::V3 { .. })
     }
 
     /// Sync access to `posting_len`. Requires v2 metadata to already be
@@ -2519,6 +3761,7 @@ impl PostingListReader {
                     .expect("v2 posting metadata must be bulk-loaded before sync posting_len; call ensure_metadata_loaded first");
                 metadata.lengths[token_id] as usize
             }
+            PostingMetadata::V3 { lengths, .. } => lengths[token_id] as usize,
         }
     }
 
@@ -2539,6 +3782,7 @@ impl PostingListReader {
                     .map(|len| len as usize)
                     .ok_or_else(|| Error::index("posting length metadata missing".to_string()))
             }
+            PostingMetadata::V3 { lengths, .. } => Ok(lengths[token_id as usize] as usize),
         }
     }
 
@@ -2578,6 +3822,14 @@ impl PostingListReader {
                     .await?;
                 Ok((Some(metadata.max_score), Some(metadata.length)))
             }
+            PostingMetadata::V3 {
+                max_scores,
+                lengths,
+                ..
+            } => Ok((
+                Some(max_scores[token_id as usize]),
+                Some(lengths[token_id as usize]),
+            )),
         }
     }
 
@@ -2585,32 +3837,31 @@ impl PostingListReader {
     /// memory. Cheap to call repeatedly; no-op for legacy v1 indexes whose
     /// metadata is already populated from schema metadata at `try_new` time.
     pub(crate) async fn ensure_metadata_loaded(&self) -> Result<()> {
-        let PostingMetadata::V2 { metadata } = &self.metadata else {
-            return Ok(());
-        };
-        metadata
-            .get_or_try_init(|| async {
-                let batch = self
-                    .reader
-                    .read_range(
-                        0..self.reader.num_rows(),
-                        Some(&[MAX_SCORE_COL, LENGTH_COL]),
-                    )
-                    .await?;
-                let max_scores = batch[MAX_SCORE_COL]
-                    .as_primitive::<Float32Type>()
-                    .values()
-                    .to_vec();
-                let lengths = batch[LENGTH_COL]
-                    .as_primitive::<UInt32Type>()
-                    .values()
-                    .to_vec();
-                Ok::<LoadedPostingMetadata, Error>(LoadedPostingMetadata {
-                    max_scores,
-                    lengths,
+        if let PostingMetadata::V2 { metadata } = &self.metadata {
+            metadata
+                .get_or_try_init(|| async {
+                    let batch = self
+                        .reader
+                        .read_range(
+                            0..self.reader.num_rows(),
+                            Some(&[MAX_SCORE_COL, LENGTH_COL]),
+                        )
+                        .await?;
+                    let max_scores = batch[MAX_SCORE_COL]
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .to_vec();
+                    let lengths = batch[LENGTH_COL]
+                        .as_primitive::<UInt32Type>()
+                        .values()
+                        .to_vec();
+                    Ok::<LoadedPostingMetadata, Error>(LoadedPostingMetadata {
+                        max_scores,
+                        lengths,
+                    })
                 })
-            })
-            .await?;
+                .await?;
+        }
         Ok(())
     }
 
@@ -2621,6 +3872,8 @@ impl PostingListReader {
     ) -> Result<RecordBatch> {
         if self.is_legacy_layout() {
             self.posting_batch_legacy(token_id, with_position).await
+        } else if matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            self.posting_batch_v3(token_id, with_position).await
         } else {
             let token_id = token_id as usize;
             let columns = if with_position {
@@ -2646,6 +3899,423 @@ impl PostingListReader {
         }
     }
 
+    async fn posting_batch_v3(&self, token_id: u32, with_position: bool) -> Result<RecordBatch> {
+        let block_reader = self.v3_block_reader()?;
+        let block_range = self.posting_list_range(token_id);
+        let skip_batch = block_reader
+            .read_range(
+                block_range.clone(),
+                Some(&[FIRST_DOC_ID_COL, LAST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
+            )
+            .await?;
+        let payload_ranges = self.v3_payload_ranges_from_skip(block_range, &skip_batch)?;
+        if v3_block_row_cache_enabled() {
+            return self
+                .posting_batch_v3_cached(&payload_ranges, with_position)
+                .await;
+        }
+        self.read_v3_payload_ranges(&payload_ranges, with_position)
+            .await
+    }
+
+    async fn read_v3_payload_ranges(
+        &self,
+        payload_ranges: &[Range<usize>],
+        with_position: bool,
+    ) -> Result<RecordBatch> {
+        let block_reader = self.v3_block_reader()?;
+        let mut batch = block_reader
+            .read_ranges(
+                payload_ranges,
+                Some(&[POSTING_COL, FIRST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
+            )
+            .await?;
+        if with_position && matches!(self.positions_layout, PositionsLayout::SharedStream(_)) {
+            let position_batch = self
+                .v3_position_reader()?
+                .read_ranges(payload_ranges, Some(&[COMPRESSED_POSITION_COL]))
+                .await
+                .map_err(|e| match e {
+                    Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
+                    e => e,
+                })?;
+            batch = append_v3_position_column(batch, position_batch)?;
+        }
+        Ok(batch)
+    }
+
+    async fn posting_batch_v3_cached(
+        &self,
+        payload_ranges: &[Range<usize>],
+        with_position: bool,
+    ) -> Result<RecordBatch> {
+        let row_ids = row_ids_from_ranges(payload_ranges);
+        if row_ids.is_empty() {
+            return self
+                .read_v3_payload_ranges(payload_ranges, with_position)
+                .await;
+        }
+        let mut row_batches = Vec::with_capacity(row_ids.len());
+        let mut missing_rows = Vec::new();
+        for row_id in &row_ids {
+            let key = V3PostingBlockKey {
+                block_row: *row_id,
+                with_position,
+            };
+            if let Some(batch) = self.index_cache.get_with_key(&key).await {
+                row_batches.push(Some((*batch).clone()));
+            } else {
+                missing_rows.push(*row_id);
+                row_batches.push(None);
+            }
+        }
+
+        if !missing_rows.is_empty() {
+            let cache_missed_rows = !v3_bypass_posting_list_cache_enabled();
+            let row_to_slot = row_ids
+                .iter()
+                .enumerate()
+                .map(|(slot, row_id)| (*row_id, slot))
+                .collect::<HashMap<_, _>>();
+            let missing_ranges = ranges_from_sorted_rows(&missing_rows);
+            let missing_batch = self
+                .read_v3_payload_ranges(&missing_ranges, with_position)
+                .await?;
+            let mut offset = 0;
+            for range in missing_ranges {
+                for row_id in range {
+                    let row_batch = missing_batch.slice(offset, 1).shrink_to_fit()?;
+                    offset += 1;
+                    if cache_missed_rows {
+                        self.index_cache
+                            .insert_with_key(
+                                &V3PostingBlockKey {
+                                    block_row: row_id,
+                                    with_position,
+                                },
+                                Arc::new(row_batch.clone()),
+                            )
+                            .await;
+                    }
+                    let slot = *row_to_slot.get(&row_id).ok_or_else(|| {
+                        Error::internal(format!("missing V3 block row {row_id} has no output slot"))
+                    })?;
+                    row_batches[slot] = Some(row_batch);
+                }
+            }
+        }
+
+        let batches = row_batches
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::internal("V3 block-row cache assembly missed rows"))?;
+        concat_batches(batches[0].schema_ref(), batches.iter()).map_err(Error::from)
+    }
+
+    async fn v3_posting_lists_cached(&self, token_ids: &[u32]) -> bool {
+        if !self.is_v3_block_row_layout() || v3_bypass_posting_list_cache_enabled() {
+            return false;
+        }
+        for &token_id in token_ids {
+            if self
+                .index_cache
+                .get_with_key(&PostingListKey { token_id })
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn v3_block_metadata(
+        &self,
+        token_id: u32,
+        term_idx: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<V3BlockMeta>> {
+        let skip = self
+            .index_cache
+            .get_or_insert_with_key(V3BlockMetadataKey { token_id }, || async move {
+                let block_reader = self.v3_block_reader()?;
+                let block_range = self.posting_list_range(token_id);
+                let skip_batch = block_reader
+                    .read_range(
+                        block_range.clone(),
+                        Some(&[FIRST_DOC_ID_COL, LAST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
+                    )
+                    .await?;
+                let expected_rows = block_range.end.saturating_sub(block_range.start);
+                if skip_batch.num_rows() != expected_rows {
+                    return Err(Error::index(format!(
+                        "V3 skip metadata returned {} rows for block range {:?}",
+                        skip_batch.num_rows(),
+                        block_range
+                    )));
+                }
+                metrics.record_fts_block_metadata_rows(skip_batch.num_rows());
+                Self::v3_skip_metadata_from_batch(block_range, &skip_batch)
+            })
+            .await?;
+
+        Ok(skip
+            .iter()
+            .map(|block| V3BlockMeta {
+                term_idx,
+                block_idx: block.block_idx,
+                block_row: block.block_row,
+                first_doc_id: block.first_doc_id,
+                last_doc_id: block.last_doc_id,
+                block_max_score: block.block_max_score,
+            })
+            .collect())
+    }
+
+    async fn v3_top_blocks_cached(&self, token_ids: &[u32]) -> bool {
+        if !self.is_v3_block_row_layout() || v3_bypass_posting_list_cache_enabled() {
+            return false;
+        }
+        for &token_id in token_ids {
+            if self
+                .index_cache
+                .get_with_key(&V3TopBlockRowsKey { token_id })
+                .await
+                .is_none()
+            {
+                return false;
+            }
+            if self
+                .index_cache
+                .get_with_key(&V3BlockMetadataKey { token_id })
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn v3_top_block_row_set(&self, token_ids: &[u32]) -> Option<HashSet<usize>> {
+        if !self.is_v3_block_row_layout() || v3_bypass_posting_list_cache_enabled() {
+            return None;
+        }
+        let mut rows = HashSet::new();
+        for &token_id in token_ids {
+            let cached_rows = self
+                .index_cache
+                .get_with_key(&V3TopBlockRowsKey { token_id })
+                .await?;
+            rows.extend(cached_rows.iter().copied());
+        }
+        Some(rows)
+    }
+
+    async fn v3_payload_block_batches(
+        &self,
+        rows: &[usize],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<HashMap<usize, RecordBatch>> {
+        let mut rows = rows.to_vec();
+        rows.sort_unstable();
+        rows.dedup();
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut batches = HashMap::with_capacity(rows.len());
+        let mut missing_rows = Vec::new();
+        for row in rows {
+            let key = V3PostingBlockKey {
+                block_row: row,
+                with_position: false,
+            };
+            if let Some(batch) = self.index_cache.get_with_key(&key).await {
+                batches.insert(row, (*batch).clone());
+            } else {
+                missing_rows.push(row);
+            }
+        }
+
+        if !missing_rows.is_empty() {
+            let missing_ranges = ranges_from_sorted_rows(&missing_rows);
+            metrics.record_fts_payload_blocks_read(missing_rows.len());
+            metrics.record_fts_payload_read_ranges(missing_ranges.len());
+            let missing_batch = self
+                .v3_block_reader()?
+                .read_ranges(
+                    &missing_ranges,
+                    Some(&[POSTING_COL, FIRST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
+                )
+                .await?;
+            let cache_missed_rows = !v3_bypass_posting_list_cache_enabled();
+            let mut offset = 0;
+            for range in missing_ranges {
+                for row in range {
+                    let row_batch = missing_batch.slice(offset, 1).shrink_to_fit()?;
+                    offset += 1;
+                    if cache_missed_rows {
+                        self.index_cache
+                            .insert_with_key(
+                                &V3PostingBlockKey {
+                                    block_row: row,
+                                    with_position: false,
+                                },
+                                Arc::new(row_batch.clone()),
+                            )
+                            .await;
+                    }
+                    batches.insert(row, row_batch);
+                }
+            }
+        }
+
+        Ok(batches)
+    }
+
+    async fn v3_position_block_payloads(
+        &self,
+        rows: &[usize],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<HashMap<usize, bytes::Bytes>> {
+        let mut rows = rows.to_vec();
+        rows.sort_unstable();
+        rows.dedup();
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut payloads = HashMap::with_capacity(rows.len());
+        let mut missing_rows = Vec::new();
+        for row in rows {
+            let key = V3PositionBlockKey { block_row: row };
+            if let Some(payload) = self.index_cache.get_with_key(&key).await {
+                payloads.insert(row, (*payload).clone());
+            } else {
+                missing_rows.push(row);
+            }
+        }
+
+        if !missing_rows.is_empty() {
+            let missing_ranges = ranges_from_sorted_rows(&missing_rows);
+            metrics.record_fts_position_blocks_read(missing_rows.len());
+            let batch = self
+                .v3_position_reader()?
+                .read_ranges(&missing_ranges, Some(&[COMPRESSED_POSITION_COL]))
+                .await
+                .map_err(|e| match e {
+                    Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
+                    e => e,
+                })?;
+            let positions = batch[COMPRESSED_POSITION_COL].as_binary::<i64>();
+            let mut offset = 0;
+            for range in missing_ranges {
+                for row in range {
+                    let payload = bytes::Bytes::copy_from_slice(positions.value(offset));
+                    offset += 1;
+                    self.index_cache
+                        .insert_with_key(
+                            &V3PositionBlockKey { block_row: row },
+                            Arc::new(payload.clone()),
+                        )
+                        .await;
+                    payloads.insert(row, payload);
+                }
+            }
+        }
+
+        Ok(payloads)
+    }
+
+    fn decode_v3_payload_block(
+        &self,
+        token_id: u32,
+        block_idx: usize,
+        batch: &RecordBatch,
+    ) -> Result<V3DecodedPostingBlock> {
+        if batch.num_rows() != 1 {
+            return Err(Error::index(format!(
+                "V3 payload block decode expects 1 row, got {}",
+                batch.num_rows()
+            )));
+        }
+        let PostingMetadata::V3 {
+            block_starts,
+            lengths,
+            ..
+        } = &self.metadata
+        else {
+            return Err(Error::index(
+                "V3 payload block decode requires block-row layout".to_owned(),
+            ));
+        };
+        let token_idx = token_id as usize;
+        let start = checked_usize(block_starts[token_idx], "V3 posting block start")?;
+        let end = checked_usize(block_starts[token_idx + 1], "V3 posting block end")?;
+        let num_blocks = end.saturating_sub(start);
+        if block_idx >= num_blocks {
+            return Err(Error::index(format!(
+                "V3 block index {} is outside token {} block count {}",
+                block_idx, token_id, num_blocks
+            )));
+        }
+        let posting_len = lengths[token_idx] as usize;
+        let docs_before_block = block_idx.saturating_mul(BLOCK_SIZE);
+        let docs_in_block = if block_idx + 1 == num_blocks {
+            posting_len.saturating_sub(docs_before_block)
+        } else {
+            BLOCK_SIZE
+        };
+        if docs_in_block == 0 {
+            return Err(Error::index(format!(
+                "V3 token {} block {} is empty",
+                token_id, block_idx
+            )));
+        }
+
+        let payload = batch[POSTING_COL].as_binary::<i64>().value(0);
+        let first_doc_id = batch[FIRST_DOC_ID_COL]
+            .as_primitive::<UInt32Type>()
+            .value(0);
+        let block_max_score = batch[BLOCK_MAX_SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .value(0);
+        let is_remainder_block = docs_in_block != BLOCK_SIZE;
+        let mut block = Vec::with_capacity(payload.len() + 8);
+        block.extend_from_slice(&block_max_score.to_le_bytes());
+        if is_remainder_block && self.posting_tail_codec == PostingTailCodec::VarintDelta {
+            append_varint_u32(first_doc_id, &mut block);
+        } else {
+            block.extend_from_slice(&first_doc_id.to_le_bytes());
+        }
+        block.extend_from_slice(payload);
+
+        let mut doc_ids = Vec::with_capacity(docs_in_block);
+        let mut freqs = Vec::with_capacity(docs_in_block);
+        if is_remainder_block {
+            decompress_posting_remainder(
+                &block,
+                docs_in_block,
+                self.posting_tail_codec,
+                &mut doc_ids,
+                &mut freqs,
+            );
+        } else {
+            let mut buffer = Box::new([0u32; BLOCK_SIZE]);
+            decompress_posting_block(&block, &mut buffer, &mut doc_ids, &mut freqs);
+        }
+        if doc_ids.len() != docs_in_block || freqs.len() != docs_in_block {
+            return Err(Error::index(format!(
+                "V3 block decode returned {} docs and {} freqs, expected {}",
+                doc_ids.len(),
+                freqs.len(),
+                docs_in_block
+            )));
+        }
+        Ok(V3DecodedPostingBlock { doc_ids, freqs })
+    }
+
     async fn posting_batch_legacy(
         &self,
         token_id: u32,
@@ -2667,6 +4337,153 @@ impl PostingListReader {
             .read_range(offset..offset + length, Some(&columns))
             .await?;
         Ok(batch)
+    }
+
+    fn v3_block_reader(&self) -> Result<&Arc<dyn IndexReader>> {
+        self.block_reader.as_ref().ok_or_else(|| {
+            Error::index("V3 posting reader is missing blocks table reader".to_owned())
+        })
+    }
+
+    fn v3_position_reader(&self) -> Result<&Arc<dyn IndexReader>> {
+        self.position_reader.as_ref().ok_or_else(|| {
+            Error::invalid_input(
+                "position is not found but required for phrase queries, try recreating the index with position".to_owned(),
+            )
+        })
+    }
+
+    fn posting_row_reader(&self) -> Result<&Arc<dyn IndexReader>> {
+        if matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            self.v3_block_reader()
+        } else {
+            Ok(&self.reader)
+        }
+    }
+
+    fn num_v3_blocks_for_token(&self, token_id: u32) -> usize {
+        let PostingMetadata::V3 { block_starts, .. } = &self.metadata else {
+            return 0;
+        };
+        let token_idx = token_id as usize;
+        (block_starts[token_idx + 1] - block_starts[token_idx]) as usize
+    }
+
+    fn v3_payload_ranges_from_skip(
+        &self,
+        block_range: Range<usize>,
+        skip_batch: &RecordBatch,
+    ) -> Result<Vec<Range<usize>>> {
+        let expected_rows = block_range.end.saturating_sub(block_range.start);
+        if skip_batch.num_rows() != expected_rows {
+            return Err(Error::index(format!(
+                "V3 skip-first read returned {} rows for block range {:?}",
+                skip_batch.num_rows(),
+                block_range
+            )));
+        }
+        let first_doc_ids = skip_batch[FIRST_DOC_ID_COL].as_primitive::<UInt32Type>();
+        let last_doc_ids = skip_batch[LAST_DOC_ID_COL].as_primitive::<UInt32Type>();
+        let max_scores = skip_batch[BLOCK_MAX_SCORE_COL].as_primitive::<Float32Type>();
+        for row in 0..skip_batch.num_rows() {
+            let first_doc_id = first_doc_ids.value(row);
+            let last_doc_id = last_doc_ids.value(row);
+            if first_doc_id > last_doc_id {
+                return Err(Error::index(format!(
+                    "V3 skip row {} has first_doc_id {} greater than last_doc_id {}",
+                    block_range.start + row,
+                    first_doc_id,
+                    last_doc_id
+                )));
+            }
+            if max_scores.value(row).is_nan() {
+                return Err(Error::index(format!(
+                    "V3 skip row {} has NaN block max score",
+                    block_range.start + row
+                )));
+            }
+        }
+        if expected_rows == 0 {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![block_range])
+        }
+    }
+
+    fn v3_skip_metadata_from_batch(
+        block_range: Range<usize>,
+        skip_batch: &RecordBatch,
+    ) -> Result<Vec<V3BlockSkipMeta>> {
+        let expected_rows = block_range.end.saturating_sub(block_range.start);
+        if skip_batch.num_rows() != expected_rows {
+            return Err(Error::index(format!(
+                "V3 skip metadata returned {} rows for block range {:?}",
+                skip_batch.num_rows(),
+                block_range
+            )));
+        }
+
+        let first_doc_ids = skip_batch[FIRST_DOC_ID_COL].as_primitive::<UInt32Type>();
+        let last_doc_ids = skip_batch[LAST_DOC_ID_COL].as_primitive::<UInt32Type>();
+        let max_scores = skip_batch[BLOCK_MAX_SCORE_COL].as_primitive::<Float32Type>();
+        let mut blocks = Vec::with_capacity(skip_batch.num_rows());
+        for row in 0..skip_batch.num_rows() {
+            let first_doc_id = first_doc_ids.value(row);
+            let last_doc_id = last_doc_ids.value(row);
+            let block_max_score = max_scores.value(row);
+            if first_doc_id > last_doc_id {
+                return Err(Error::index(format!(
+                    "V3 skip row {} has first_doc_id {} greater than last_doc_id {}",
+                    block_range.start + row,
+                    first_doc_id,
+                    last_doc_id
+                )));
+            }
+            if block_max_score.is_nan() {
+                return Err(Error::index(format!(
+                    "V3 skip row {} has NaN block max score",
+                    block_range.start + row
+                )));
+            }
+            blocks.push(V3BlockSkipMeta {
+                block_idx: row,
+                block_row: block_range.start + row,
+                first_doc_id,
+                last_doc_id,
+                block_max_score,
+            });
+        }
+        Ok(blocks)
+    }
+
+    fn v3_top_payload_ranges_from_skip(
+        &self,
+        block_range: Range<usize>,
+        skip_batch: &RecordBatch,
+        percent: usize,
+    ) -> Result<Vec<Range<usize>>> {
+        let expected_rows = block_range.end.saturating_sub(block_range.start);
+        let full_ranges = self.v3_payload_ranges_from_skip(block_range.clone(), skip_batch)?;
+        if expected_rows == 0 || percent >= 100 {
+            return Ok(full_ranges);
+        }
+        let max_scores = skip_batch[BLOCK_MAX_SCORE_COL].as_primitive::<Float32Type>();
+        let keep = expected_rows.saturating_mul(percent).div_ceil(100).max(1);
+        let mut scored_rows = (0..expected_rows)
+            .map(|row| (max_scores.value(row), block_range.start + row))
+            .collect::<Vec<_>>();
+        scored_rows.sort_unstable_by(|(left_score, left_row), (right_score, right_row)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_row.cmp(right_row))
+        });
+        let mut selected_rows = scored_rows
+            .into_iter()
+            .take(keep)
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>();
+        selected_rows.sort_unstable();
+        Ok(ranges_from_sorted_rows(&selected_rows))
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -2700,24 +4517,37 @@ impl PostingListReader {
             }
             // Fallback for indexes written before grouping: one cache entry
             // per token.
-            None => self
-                .index_cache
-                .get_or_insert_with_key(PostingListKey { token_id }, || async move {
+            None => {
+                if matches!(self.metadata, PostingMetadata::V3 { .. })
+                    && v3_bypass_posting_list_cache_enabled()
+                {
                     metrics.record_part_load();
                     info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-                    // Fetch the posting batch and this token's (max_score,
-                    // length) in parallel; for cold v2 partitions this is one
-                    // single-row metadata read plus one posting-row read,
-                    // instead of pulling the full per-token metadata table.
                     let (batch, (max_score, length)) = futures::try_join!(
-                        self.posting_batch(token_id, false),
+                        self.posting_batch(token_id, is_phrase_query),
                         self.posting_metadata_for_token(token_id),
                     )?;
-                    self.posting_list_from_batch(&batch, max_score, length)
-                })
-                .await?
-                .as_ref()
-                .clone(),
+                    self.posting_list_from_batch(&batch, max_score, length)?
+                } else {
+                    self.index_cache
+                        .get_or_insert_with_key(PostingListKey { token_id }, || async move {
+                            metrics.record_part_load();
+                            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                            // Fetch the posting batch and this token's (max_score,
+                            // length) in parallel; for cold v2 partitions this is one
+                            // single-row metadata read plus one posting-row read,
+                            // instead of pulling the full per-token metadata table.
+                            let (batch, (max_score, length)) = futures::try_join!(
+                                self.posting_batch(token_id, false),
+                                self.posting_metadata_for_token(token_id),
+                            )?;
+                            self.posting_list_from_batch(&batch, max_score, length)
+                        })
+                        .await?
+                        .as_ref()
+                        .clone()
+                }
+            }
         };
 
         if is_phrase_query && !posting.has_position() {
@@ -2734,6 +4564,9 @@ impl PostingListReader {
     /// falls back to the per-token path. In v2 the token id is the row offset,
     /// so the group range is also the physical row range.
     fn group_range_for_token(&self, token_id: u32) -> Option<(u32, u32)> {
+        if matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            return None;
+        }
         let starts = self.group_starts.as_ref()?;
         // partition_point returns the count of group starts <= token_id, so the
         // owning group begins at index k - 1 and the next start (if any) is its
@@ -2872,8 +4705,26 @@ impl PostingListReader {
                 start..end
             }
             PostingMetadata::V2 { .. } => tok_start..tok_end,
+            PostingMetadata::V3 { block_starts, .. } => {
+                checked_usize(block_starts[tok_start], "V3 posting block start")?
+                    ..checked_usize(block_starts[tok_end], "V3 posting block end")?
+            }
         };
-        let batch = self.reader.read_range(row_range, Some(&columns)).await?;
+        let mut batch = self
+            .posting_row_reader()?
+            .read_range(row_range.clone(), Some(&columns))
+            .await?;
+        if with_position && matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            let position_batch = self
+                .v3_position_reader()?
+                .read_range(row_range, Some(&[COMPRESSED_POSITION_COL]))
+                .await
+                .map_err(|e| match e {
+                    Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
+                    e => e,
+                })?;
+            batch = append_v3_position_column(batch, position_batch)?;
+        }
         Ok(batch)
     }
 
@@ -2884,6 +4735,106 @@ impl PostingListReader {
     ) -> Result<()> {
         self.prewarm_posting_lists_chunked(with_position, None, chunk_concurrency)
             .await?;
+        Ok(())
+    }
+
+    async fn prewarm_v3_top_blocks(
+        &self,
+        token_ids: &[u32],
+        percent: usize,
+        with_position: bool,
+    ) -> Result<usize> {
+        if token_ids.is_empty() {
+            return Ok(0);
+        }
+        if !matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            return Err(Error::invalid_input(
+                "top-block FTS prewarm is only supported for V3 block-row posting layout"
+                    .to_owned(),
+            ));
+        }
+        if with_position && !self.has_positions() {
+            return Err(Error::invalid_input(
+                "cannot prewarm positions for an inverted index that was built without positions; recreate the index with with_position=true".to_owned(),
+            ));
+        }
+
+        let block_reader = self.v3_block_reader()?;
+        let mut selected_rows = HashSet::new();
+        for &token_id in token_ids {
+            let block_range = self.posting_list_range(token_id);
+            let skip_batch = block_reader
+                .read_range(
+                    block_range.clone(),
+                    Some(&[FIRST_DOC_ID_COL, LAST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
+                )
+                .await?;
+            let skip_metadata =
+                Self::v3_skip_metadata_from_batch(block_range.clone(), &skip_batch)?;
+            self.index_cache
+                .insert_with_key(&V3BlockMetadataKey { token_id }, Arc::new(skip_metadata))
+                .await;
+            let mut token_rows = Vec::new();
+            for range in self.v3_top_payload_ranges_from_skip(block_range, &skip_batch, percent)? {
+                token_rows.extend(range);
+            }
+            token_rows.sort_unstable();
+            token_rows.dedup();
+            selected_rows.extend(token_rows.iter().copied());
+            self.index_cache
+                .insert_with_key(&V3TopBlockRowsKey { token_id }, Arc::new(token_rows))
+                .await;
+        }
+
+        if selected_rows.is_empty() {
+            return Ok(0);
+        }
+        let mut selected_rows = selected_rows.into_iter().collect::<Vec<_>>();
+        selected_rows.sort_unstable();
+        self.cache_v3_payload_rows(&selected_rows, false).await?;
+        if with_position {
+            self.cache_v3_payload_rows(&selected_rows, true).await?;
+        }
+        Ok(selected_rows.len())
+    }
+
+    async fn prewarm_posting_lists_for_tokens(
+        &self,
+        token_ids: &[u32],
+        with_position: bool,
+    ) -> Result<()> {
+        stream::iter(token_ids.iter().copied())
+            .map(|token_id| async move {
+                self.posting_list(token_id, with_position, &NoOpMetricsCollector)
+                    .await?;
+                Result::Ok(())
+            })
+            .buffer_unordered(16)
+            .try_collect::<()>()
+            .await
+    }
+
+    async fn cache_v3_payload_rows(
+        &self,
+        sorted_rows: &[usize],
+        with_position: bool,
+    ) -> Result<()> {
+        let selected_ranges = ranges_from_sorted_rows(sorted_rows);
+        let batch = self
+            .read_v3_payload_ranges(&selected_ranges, with_position)
+            .await?;
+        for (offset, row_id) in sorted_rows.iter().enumerate() {
+            let row_batch = batch.slice(offset, 1).shrink_to_fit()?;
+            self.index_cache
+                .insert_with_key(
+                    &V3PostingBlockKey {
+                        block_row: *row_id,
+                        with_position,
+                    },
+                    Arc::new(row_batch),
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -2974,6 +4925,21 @@ impl PostingListReader {
                 None,
                 metadata.get().map(|loaded| loaded.max_scores.clone()),
                 metadata.get().map(|loaded| loaded.lengths.clone()),
+            ),
+            PostingMetadata::V3 {
+                block_starts,
+                max_scores,
+                lengths,
+            } => (
+                Some(
+                    block_starts
+                        .iter()
+                        .map(|offset| checked_usize(*offset, "V3 posting block start"))
+                        .collect::<Result<Vec<_>>>()
+                        .expect("V3 block starts were validated at load"),
+                ),
+                Some(max_scores.clone()),
+                Some(lengths.clone()),
             ),
         };
         ChunkBuildState {
@@ -3115,21 +5081,37 @@ impl PostingListReader {
     /// data read), used only to size prewarm chunks. Falls back to a row-count
     /// proxy when the reader can't surface the length (legacy v1).
     pub(crate) fn posting_data_size_bytes(&self) -> u64 {
-        if let Some(size) = self.reader.file_size_bytes() {
+        let reader = if matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            self.block_reader.as_ref().unwrap_or(&self.reader)
+        } else {
+            &self.reader
+        };
+        if let Some(size) = reader.file_size_bytes() {
             return size;
         }
         // Fallback proxy for readers that don't cache their file length: just needs
         // to be monotonic in partition size.
         const ESTIMATED_BYTES_PER_ROW: u64 = 16;
-        (self.reader.num_rows() as u64).saturating_mul(ESTIMATED_BYTES_PER_ROW)
+        (reader.num_rows() as u64).saturating_mul(ESTIMATED_BYTES_PER_ROW)
     }
 
     pub(crate) async fn read_batch(&self, with_position: bool) -> Result<RecordBatch> {
         let columns = self.posting_columns(with_position);
-        let batch = self
-            .reader
-            .read_range(0..self.reader.num_rows(), Some(&columns))
+        let reader = self.posting_row_reader()?;
+        let mut batch = reader
+            .read_range(0..reader.num_rows(), Some(&columns))
             .await?;
+        if with_position && matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            let position_batch = self
+                .v3_position_reader()?
+                .read_range(0..reader.num_rows(), Some(&[COMPRESSED_POSITION_COL]))
+                .await
+                .map_err(|e| match e {
+                    Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
+                    e => e,
+                })?;
+            batch = append_v3_position_column(batch, position_batch)?;
+        }
         Ok(batch)
     }
 
@@ -3145,7 +5127,7 @@ impl PostingListReader {
         Ok((0..self.len()).map(move |i| {
             let token_id = i as u32;
             let range = self.posting_list_range(token_id);
-            let batch = batch.slice(i, range.end - range.start);
+            let batch = batch.slice(range.start, range.end - range.start);
             let (max_score, length) = self.bulk_metadata_for_token(token_id);
             self.posting_list_from_batch(&batch, max_score, length)
         }))
@@ -3169,6 +5151,14 @@ impl PostingListReader {
                     Some(loaded.lengths[token_id as usize]),
                 )
             }
+            PostingMetadata::V3 {
+                max_scores,
+                lengths,
+                ..
+            } => (
+                Some(max_scores[token_id as usize]),
+                Some(lengths[token_id as usize]),
+            ),
         }
     }
 
@@ -3194,34 +5184,48 @@ impl PostingListReader {
                     )
                 }
                 PositionsLayout::SharedStream(codec) => {
-                    let batch = self
-                        .reader
-                        .read_range(
-                            self.posting_list_range(token_id),
-                            Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
-                        )
-                        .await
+                    let batch = if matches!(self.metadata, PostingMetadata::V3 { .. }) {
+                        self.v3_position_reader()?
+                            .read_range(
+                                self.posting_list_range(token_id),
+                                Some(&[COMPRESSED_POSITION_COL]),
+                            )
+                            .await
+                    } else {
+                        self.reader
+                            .read_range(
+                                self.posting_list_range(token_id),
+                                Some(&[COMPRESSED_POSITION_COL, POSITION_BLOCK_OFFSET_COL]),
+                            )
+                            .await
+                    };
+                    let batch = batch
                         .map_err(|e| match e {
                             Error::Schema { .. } => Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position".to_owned()),
                             e => e,
                         })?;
-                    let bytes = bytes::Bytes::from(
-                        batch[COMPRESSED_POSITION_COL]
-                            .as_binary::<i64>()
-                            .value(0)
-                            .to_vec(),
-                    );
-                    let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
-                        .as_list::<i32>()
-                        .value(0)
-                        .as_primitive::<UInt32Type>()
-                        .values()
-                        .to_vec();
-                    CompressedPositionStorage::SharedStream(SharedPositionStream::new(
-                        codec,
-                        block_offsets,
-                        bytes,
-                    ))
+                    let positions = batch[COMPRESSED_POSITION_COL].as_binary::<i64>();
+                    let (block_offsets, bytes) =
+                        if let Some(offset_col) = batch.column_by_name(POSITION_BLOCK_OFFSET_COL) {
+                            (
+                                offset_col
+                                    .as_list::<i32>()
+                                    .value(0)
+                                    .as_primitive::<UInt32Type>()
+                                    .values()
+                                    .to_vec(),
+                                bytes::Bytes::from(positions.value(0).to_vec()),
+                            )
+                        } else {
+                            let mut block_offsets = Vec::with_capacity(positions.len());
+                            let mut bytes = Vec::new();
+                            for block_idx in 0..positions.len() {
+                                block_offsets.push(bytes.len() as u32);
+                                bytes.extend_from_slice(positions.value(block_idx));
+                            }
+                            (block_offsets, bytes::Bytes::from(bytes))
+                        };
+                    CompressedPositionStorage::SharedStream(SharedPositionStream::new(codec, block_offsets, bytes))
                 }
             };
             Result::Ok(Positions(positions))
@@ -3240,6 +5244,13 @@ impl PostingListReader {
                 let token_id = token_id as usize;
                 token_id..token_id + 1
             }
+            PostingMetadata::V3 { block_starts, .. } => {
+                let token_id = token_id as usize;
+                checked_usize(block_starts[token_id], "V3 posting block start")
+                    .expect("V3 block starts were validated at load")
+                    ..checked_usize(block_starts[token_id + 1], "V3 posting block end")
+                        .expect("V3 block starts were validated at load")
+            }
         }
     }
 
@@ -3249,18 +5260,91 @@ impl PostingListReader {
         } else {
             vec![POSTING_COL]
         };
+        if matches!(self.metadata, PostingMetadata::V3 { .. }) {
+            base_columns.push(FIRST_DOC_ID_COL);
+            base_columns.push(BLOCK_MAX_SCORE_COL);
+        }
         if with_position {
+            if matches!(self.metadata, PostingMetadata::V3 { .. }) {
+                return base_columns;
+            }
             match self.positions_layout {
                 PositionsLayout::None => {}
                 PositionsLayout::LegacyPerDoc => base_columns.push(POSITION_COL),
                 PositionsLayout::SharedStream(_) => {
                     base_columns.push(COMPRESSED_POSITION_COL);
-                    base_columns.push(POSITION_BLOCK_OFFSET_COL);
+                    if !matches!(self.metadata, PostingMetadata::V3 { .. }) {
+                        base_columns.push(POSITION_BLOCK_OFFSET_COL);
+                    }
                 }
             }
         }
         base_columns
     }
+}
+
+fn append_v3_position_column(
+    block_batch: RecordBatch,
+    position_batch: RecordBatch,
+) -> Result<RecordBatch> {
+    if block_batch.num_rows() != position_batch.num_rows() {
+        return Err(Error::index(format!(
+            "V3 positions table returned {} rows for {} posting block rows",
+            position_batch.num_rows(),
+            block_batch.num_rows()
+        )));
+    }
+    let mut fields: Vec<Field> = block_batch
+        .schema_ref()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    let (_, position_field) = position_batch
+        .schema_ref()
+        .column_with_name(COMPRESSED_POSITION_COL)
+        .ok_or_else(|| {
+            Error::index("V3 positions batch is missing compressed position column".to_owned())
+        })?;
+    fields.push(position_field.clone());
+
+    let mut columns = block_batch.columns().to_vec();
+    columns.push(position_batch[COMPRESSED_POSITION_COL].clone());
+
+    let mut metadata = block_batch.schema_ref().metadata().clone();
+    metadata.extend(position_batch.schema_ref().metadata().clone());
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, metadata)),
+        columns,
+    )
+    .map_err(Error::from)
+}
+
+fn row_ids_from_ranges(ranges: &[Range<usize>]) -> Vec<usize> {
+    ranges
+        .iter()
+        .flat_map(|range| range.start..range.end)
+        .collect()
+}
+
+fn ranges_from_sorted_rows(rows: &[usize]) -> Vec<Range<usize>> {
+    let Some((&first, rest)) = rows.split_first() else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    let mut start = first;
+    let mut end = first + 1;
+    for &row in rest {
+        if row == end {
+            end += 1;
+        } else {
+            ranges.push(start..end);
+            start = row;
+            end = row + 1;
+        }
+    }
+    ranges.push(start..end);
+    ranges
 }
 
 /// Loop-invariant state for [`InvertedPartition::build_chunk_postings`]. The
@@ -3417,6 +5501,80 @@ impl CacheKey for PostingMetadataKey {
 
     fn type_name() -> &'static str {
         "PostingMetadata"
+    }
+}
+
+#[derive(Debug, Clone)]
+struct V3PostingBlockKey {
+    block_row: usize,
+    with_position: bool,
+}
+
+impl CacheKey for V3PostingBlockKey {
+    type ValueType = RecordBatch;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!(
+            "v3-posting-block-{}-{}",
+            self.block_row,
+            if self.with_position { "pos" } else { "nopos" }
+        )
+        .into()
+    }
+
+    fn type_name() -> &'static str {
+        "V3PostingBlock"
+    }
+}
+
+#[derive(Debug, Clone)]
+struct V3BlockMetadataKey {
+    token_id: u32,
+}
+
+impl CacheKey for V3BlockMetadataKey {
+    type ValueType = Vec<V3BlockSkipMeta>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("v3-block-metadata-{}", self.token_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "V3BlockMetadata"
+    }
+}
+
+#[derive(Debug, Clone)]
+struct V3TopBlockRowsKey {
+    token_id: u32,
+}
+
+impl CacheKey for V3TopBlockRowsKey {
+    type ValueType = Vec<usize>;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("v3-top-block-rows-{}", self.token_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "V3TopBlockRows"
+    }
+}
+
+#[derive(Debug, Clone)]
+struct V3PositionBlockKey {
+    block_row: usize,
+}
+
+impl CacheKey for V3PositionBlockKey {
+    type ValueType = bytes::Bytes;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("v3-position-block-{}", self.block_row).into()
+    }
+
+    fn type_name() -> &'static str {
+        "V3PositionBlock"
     }
 }
 
@@ -3861,24 +6019,50 @@ impl CompressedPostingList {
         posting_tail_codec: PostingTailCodec,
         shared_position_codec: Option<PositionStreamCodec>,
     ) -> Self {
-        debug_assert_eq!(batch.num_rows(), 1);
-        let blocks = batch[POSTING_COL]
-            .as_list::<i32>()
-            .value(0)
-            .as_binary::<i64>()
-            .clone();
+        let blocks = match batch[POSTING_COL].data_type() {
+            DataType::List(_) => {
+                debug_assert_eq!(batch.num_rows(), 1);
+                batch[POSTING_COL]
+                    .as_list::<i32>()
+                    .value(0)
+                    .as_binary::<i64>()
+                    .clone()
+            }
+            DataType::LargeBinary if batch.column_by_name(FIRST_DOC_ID_COL).is_some() => {
+                rehydrate_block_row_postings(batch, length, posting_tail_codec)
+            }
+            DataType::LargeBinary => batch[POSTING_COL].as_binary::<i64>().clone(),
+            data_type => {
+                panic!("unsupported compressed posting column type {data_type}");
+            }
+        };
         let positions = if let Some(col) = batch.column_by_name(COMPRESSED_POSITION_COL) {
-            let bytes = bytes::Bytes::from(col.as_binary::<i64>().value(0).to_vec());
-            let block_offsets = batch[POSITION_BLOCK_OFFSET_COL]
-                .as_list::<i32>()
-                .value(0)
-                .as_primitive::<UInt32Type>()
-                .values()
-                .to_vec();
             let codec = shared_position_codec.unwrap_or_else(|| {
                 parse_shared_position_codec(batch.schema_ref().metadata())
                     .expect("shared position stream codec metadata should be valid")
             });
+            let positions = col.as_binary::<i64>();
+            let (block_offsets, bytes) =
+                if let Some(offset_col) = batch.column_by_name(POSITION_BLOCK_OFFSET_COL) {
+                    debug_assert_eq!(batch.num_rows(), 1);
+                    (
+                        offset_col
+                            .as_list::<i32>()
+                            .value(0)
+                            .as_primitive::<UInt32Type>()
+                            .values()
+                            .to_vec(),
+                        bytes::Bytes::from(positions.value(0).to_vec()),
+                    )
+                } else {
+                    let mut offsets = Vec::with_capacity(positions.len());
+                    let mut bytes = Vec::new();
+                    for block_idx in 0..positions.len() {
+                        offsets.push(bytes.len() as u32);
+                        bytes.extend_from_slice(positions.value(block_idx));
+                    }
+                    (offsets, bytes::Bytes::from(bytes))
+                };
             Some(CompressedPositionStorage::SharedStream(
                 SharedPositionStream::new(codec, block_offsets, bytes),
             ))
@@ -3923,6 +6107,54 @@ impl CompressedPostingList {
             block[4..8].try_into().map(u32::from_le_bytes).unwrap()
         }
     }
+}
+
+fn rehydrate_block_row_postings(
+    batch: &RecordBatch,
+    length: u32,
+    posting_tail_codec: PostingTailCodec,
+) -> LargeBinaryArray {
+    let payloads = batch[POSTING_COL].as_binary::<i64>();
+    let first_doc_ids = batch[FIRST_DOC_ID_COL].as_primitive::<UInt32Type>();
+    let block_max_scores = batch[BLOCK_MAX_SCORE_COL].as_primitive::<Float32Type>();
+    let mut builder = LargeBinaryBuilder::with_capacity(
+        payloads.len(),
+        payloads.value_data().len() + payloads.len() * 8,
+    );
+    let remainder = length as usize % BLOCK_SIZE;
+    for block_idx in 0..payloads.len() {
+        let payload = payloads.value(block_idx);
+        let mut block = Vec::with_capacity(payload.len() + 8);
+        block.extend_from_slice(&block_max_scores.value(block_idx).to_le_bytes());
+        let is_remainder_block = remainder > 0 && block_idx + 1 == payloads.len();
+        if is_remainder_block && posting_tail_codec == PostingTailCodec::VarintDelta {
+            append_varint_u32(first_doc_ids.value(block_idx), &mut block);
+        } else {
+            block.extend_from_slice(&first_doc_ids.value(block_idx).to_le_bytes());
+        }
+        block.extend_from_slice(payload);
+        builder.append_value(block);
+    }
+    builder.finish()
+}
+
+fn append_varint_u32(mut value: u32, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn encoded_varint_u32_len(bytes: &[u8]) -> Result<usize> {
+    for (idx, byte) in bytes.iter().enumerate() {
+        if byte & 0x80 == 0 {
+            return Ok(idx + 1);
+        }
+    }
+    Err(Error::index(
+        "posting remainder payload ended before first doc id varint completed".to_owned(),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -4050,7 +6282,15 @@ pub struct PostingListBuilder {
     len: u32,
 }
 
-pub(super) struct PostingListBatchBuilder {
+pub(super) enum PostingListBatchBuilder {
+    TokenRows(TokenRowPostingListBatchBuilder),
+}
+
+pub(super) enum PostingWriteMetadata {
+    TokenRows { group_starts: Vec<u32> },
+}
+
+pub(super) struct TokenRowPostingListBatchBuilder {
     schema: SchemaRef,
     postings: ListBuilder<LargeBinaryBuilder>,
     max_scores: Float32Builder,
@@ -4061,6 +6301,36 @@ pub(super) struct PostingListBatchBuilder {
     /// batches this builder produces (issue #7040). Outlives `finish`, which
     /// only resets the per-batch column builders.
     group_accumulator: PostingGroupAccumulator,
+}
+
+pub(super) struct V3PostingLayoutBatch {
+    pub(super) blocks: RecordBatch,
+    pub(super) positions: Option<RecordBatch>,
+    pub(super) coarse_skip: Option<RecordBatch>,
+}
+
+pub(super) struct V3PostingLayoutBatchBuilder {
+    block_schema: SchemaRef,
+    position_schema: Option<SchemaRef>,
+    coarse_schema: SchemaRef,
+    first_doc_ids: UInt32Builder,
+    last_doc_ids: UInt32Builder,
+    block_max_scores: Float32Builder,
+    postings: LargeBinaryBuilder,
+    position_payloads: Option<LargeBinaryBuilder>,
+    coarse_block_starts: UInt64Builder,
+    coarse_num_blocks: UInt32Builder,
+    coarse_first_doc_ids: UInt32Builder,
+    coarse_last_doc_ids: UInt32Builder,
+    coarse_max_scores: Float32Builder,
+    term_lengths: Vec<u32>,
+    term_max_scores: Vec<f32>,
+    term_block_starts: Vec<u64>,
+    term_num_blocks: Vec<u32>,
+    posting_tail_codec: PostingTailCodec,
+    len: usize,
+    coarse_len: usize,
+    next_block_row: u64,
 }
 
 enum BatchPositionsBuilder {
@@ -4084,6 +6354,61 @@ struct PostingListParts<'a> {
 
 impl PostingListBatchBuilder {
     pub fn new(
+        schema: SchemaRef,
+        with_positions: bool,
+        format_version: InvertedListFormatVersion,
+        capacity: usize,
+        group_config: PostingGroupConfig,
+    ) -> Self {
+        debug_assert!(!format_version.uses_block_row_layout());
+        Self::TokenRows(TokenRowPostingListBatchBuilder::new(
+            schema,
+            with_positions,
+            format_version,
+            capacity,
+            group_config,
+        ))
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::TokenRows(builder) => builder.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn append(
+        &mut self,
+        compressed: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        positions: Option<&CompressedPositionStorage>,
+    ) -> Result<()> {
+        match self {
+            Self::TokenRows(builder) => builder.append(compressed, max_score, length, positions),
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<RecordBatch> {
+        match self {
+            Self::TokenRows(builder) => builder.finish(),
+        }
+    }
+
+    pub fn into_write_metadata(self) -> PostingWriteMetadata {
+        match self {
+            Self::TokenRows(builder) => PostingWriteMetadata::TokenRows {
+                group_starts: builder.into_group_starts(),
+            },
+        }
+    }
+}
+
+impl TokenRowPostingListBatchBuilder {
+    fn new(
         schema: SchemaRef,
         with_positions: bool,
         format_version: InvertedListFormatVersion,
@@ -4114,12 +6439,8 @@ impl PostingListBatchBuilder {
         }
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     fn append(
@@ -4196,7 +6517,7 @@ impl PostingListBatchBuilder {
         Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<RecordBatch> {
+    fn finish(&mut self) -> Result<RecordBatch> {
         let mut columns = vec![
             Arc::new(self.postings.finish()) as ArrayRef,
             Arc::new(self.max_scores.finish()) as ArrayRef,
@@ -4222,8 +6543,248 @@ impl PostingListBatchBuilder {
     /// Consume the builder and return the posting-list cache-group boundaries
     /// accumulated across all batches (issue #7040). Each entry is the first
     /// row of a group; the sequence is monotonically increasing.
-    pub fn into_group_starts(self) -> Vec<u32> {
+    fn into_group_starts(self) -> Vec<u32> {
         self.group_accumulator.into_starts()
+    }
+}
+
+fn stripped_posting_payload_start(
+    block: &[u8],
+    is_remainder_block: bool,
+    posting_tail_codec: PostingTailCodec,
+) -> Result<usize> {
+    if is_remainder_block && posting_tail_codec == PostingTailCodec::VarintDelta {
+        Ok(4 + encoded_varint_u32_len(&block[4..])?)
+    } else {
+        Ok(8)
+    }
+}
+
+impl V3PostingLayoutBatchBuilder {
+    pub(super) fn new(
+        block_schema: SchemaRef,
+        position_schema: Option<SchemaRef>,
+        coarse_schema: SchemaRef,
+        posting_tail_codec: PostingTailCodec,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            block_schema,
+            position_schema: position_schema.clone(),
+            coarse_schema,
+            first_doc_ids: UInt32Builder::with_capacity(capacity),
+            last_doc_ids: UInt32Builder::with_capacity(capacity),
+            block_max_scores: Float32Builder::with_capacity(capacity),
+            postings: LargeBinaryBuilder::with_capacity(capacity, 0),
+            position_payloads: position_schema
+                .is_some()
+                .then(|| LargeBinaryBuilder::with_capacity(capacity, 0)),
+            coarse_block_starts: UInt64Builder::new(),
+            coarse_num_blocks: UInt32Builder::new(),
+            coarse_first_doc_ids: UInt32Builder::new(),
+            coarse_last_doc_ids: UInt32Builder::new(),
+            coarse_max_scores: Float32Builder::new(),
+            term_lengths: Vec::new(),
+            term_max_scores: Vec::new(),
+            term_block_starts: Vec::new(),
+            term_num_blocks: Vec::new(),
+            posting_tail_codec,
+            len: 0,
+            coarse_len: 0,
+            next_block_row: 0,
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(super) fn append(
+        &mut self,
+        compressed: LargeBinaryArray,
+        max_score: f32,
+        length: u32,
+        positions: Option<&CompressedPositionStorage>,
+    ) -> Result<()> {
+        let position_stream = match (&mut self.position_payloads, positions) {
+            (None, _) => None,
+            (Some(_), Some(CompressedPositionStorage::SharedStream(stream))) => Some(stream),
+            (Some(_), Some(CompressedPositionStorage::LegacyPerDoc(_))) => {
+                return Err(Error::index(
+                    "V3 positions writer received legacy positions".to_owned(),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(Error::index(format!(
+                    "V3 positions writer missing position data for posting length {}",
+                    length
+                )));
+            }
+        };
+
+        let term_block_start = self.next_block_row;
+        let num_blocks = compressed.len();
+        let remainder = length as usize % BLOCK_SIZE;
+        let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
+        let mut frequencies = Vec::with_capacity(BLOCK_SIZE);
+        let mut buffer = [0u32; BLOCK_SIZE];
+        let mut coarse_first_doc_id = 0;
+        let mut coarse_last_doc_id = 0;
+        let mut coarse_max_score = f32::MIN;
+        let mut coarse_count = 0u32;
+        let mut coarse_start = term_block_start;
+
+        for block_idx in 0..num_blocks {
+            let block = compressed.value(block_idx);
+            let block_max_score = block[0..4].try_into().map(f32::from_le_bytes).unwrap();
+            doc_ids.clear();
+            frequencies.clear();
+            let is_remainder_block = remainder > 0 && block_idx + 1 == num_blocks;
+            if is_remainder_block {
+                super::encoding::decompress_posting_remainder(
+                    block,
+                    remainder,
+                    self.posting_tail_codec,
+                    &mut doc_ids,
+                    &mut frequencies,
+                );
+            } else {
+                super::encoding::decompress_posting_block(
+                    block,
+                    &mut buffer,
+                    &mut doc_ids,
+                    &mut frequencies,
+                );
+            }
+            let first_doc_id = doc_ids.first().copied().ok_or_else(|| {
+                Error::index(format!(
+                    "posting block {} for posting length {} decoded no docs",
+                    block_idx, length
+                ))
+            })?;
+            let last_doc_id = doc_ids.last().copied().expect("first_doc_id exists");
+            self.first_doc_ids.append_value(first_doc_id);
+            self.last_doc_ids.append_value(last_doc_id);
+            self.block_max_scores.append_value(block_max_score);
+            let payload_start =
+                stripped_posting_payload_start(block, is_remainder_block, self.posting_tail_codec)?;
+            self.postings.append_value(&block[payload_start..]);
+            if let (Some(payloads), Some(stream)) = (&mut self.position_payloads, position_stream) {
+                payloads.append_value(stream.block(block_idx));
+            }
+
+            if coarse_count == 0 {
+                coarse_start = self.next_block_row;
+                coarse_first_doc_id = first_doc_id;
+                coarse_max_score = block_max_score;
+            } else {
+                coarse_max_score = coarse_max_score.max(block_max_score);
+            }
+            coarse_last_doc_id = last_doc_id;
+            coarse_count += 1;
+            if coarse_count as usize == COARSE_SKIP_GROUP_BLOCKS {
+                self.append_coarse_skip(
+                    coarse_start,
+                    coarse_count,
+                    coarse_first_doc_id,
+                    coarse_last_doc_id,
+                    coarse_max_score,
+                );
+                coarse_count = 0;
+                coarse_max_score = f32::MIN;
+            }
+
+            self.len += 1;
+            self.next_block_row += 1;
+        }
+        if coarse_count > 0 {
+            self.append_coarse_skip(
+                coarse_start,
+                coarse_count,
+                coarse_first_doc_id,
+                coarse_last_doc_id,
+                coarse_max_score,
+            );
+        }
+
+        self.term_lengths.push(length);
+        self.term_max_scores.push(max_score);
+        self.term_block_starts.push(term_block_start);
+        self.term_num_blocks.push(num_blocks as u32);
+        Ok(())
+    }
+
+    fn append_coarse_skip(
+        &mut self,
+        block_start: u64,
+        num_blocks: u32,
+        first_doc_id: u32,
+        last_doc_id: u32,
+        max_score: f32,
+    ) {
+        self.coarse_block_starts.append_value(block_start);
+        self.coarse_num_blocks.append_value(num_blocks);
+        self.coarse_first_doc_ids.append_value(first_doc_id);
+        self.coarse_last_doc_ids.append_value(last_doc_id);
+        self.coarse_max_scores.append_value(max_score);
+        self.coarse_len += 1;
+    }
+
+    pub(super) fn finish(&mut self) -> Result<V3PostingLayoutBatch> {
+        let blocks = RecordBatch::try_new(
+            self.block_schema.clone(),
+            vec![
+                Arc::new(self.first_doc_ids.finish()) as ArrayRef,
+                Arc::new(self.last_doc_ids.finish()) as ArrayRef,
+                Arc::new(self.block_max_scores.finish()) as ArrayRef,
+                Arc::new(self.postings.finish()) as ArrayRef,
+            ],
+        )?;
+        let positions = match (&self.position_schema, &mut self.position_payloads) {
+            (Some(schema), Some(payloads)) => Some(RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(payloads.finish()) as ArrayRef],
+            )?),
+            _ => None,
+        };
+        let coarse_skip = if self.coarse_len > 0 {
+            Some(RecordBatch::try_new(
+                self.coarse_schema.clone(),
+                vec![
+                    Arc::new(self.coarse_block_starts.finish()) as ArrayRef,
+                    Arc::new(self.coarse_num_blocks.finish()) as ArrayRef,
+                    Arc::new(self.coarse_first_doc_ids.finish()) as ArrayRef,
+                    Arc::new(self.coarse_last_doc_ids.finish()) as ArrayRef,
+                    Arc::new(self.coarse_max_scores.finish()) as ArrayRef,
+                ],
+            )?)
+        } else {
+            None
+        };
+        self.len = 0;
+        self.coarse_len = 0;
+        Ok(V3PostingLayoutBatch {
+            blocks,
+            positions,
+            coarse_skip,
+        })
+    }
+
+    pub(super) fn finish_terms(self, terms_schema: SchemaRef) -> Result<RecordBatch> {
+        RecordBatch::try_new(
+            terms_schema,
+            vec![
+                Arc::new(UInt32Array::from(self.term_lengths)) as ArrayRef,
+                Arc::new(Float32Array::from(self.term_max_scores)) as ArrayRef,
+                Arc::new(UInt64Array::from(self.term_block_starts)) as ArrayRef,
+                Arc::new(UInt32Array::from(self.term_num_blocks)) as ArrayRef,
+            ],
+        )
+        .map_err(Error::from)
     }
 }
 
@@ -4679,6 +7240,46 @@ impl PostingListBuilder {
             Some(positions) => Some(CompressedPositionStorage::LegacyPerDoc(positions)),
             None => shared_positions.map(CompressedPositionStorage::SharedStream),
         };
+        batch_builder.append(compressed, max_score, len, positions.as_ref())
+    }
+
+    pub(super) fn append_to_v3_layout_with_docs(
+        self,
+        docs: &DocSet,
+        batch_builder: &mut V3PostingLayoutBatchBuilder,
+    ) -> Result<()> {
+        let Self {
+            with_positions,
+            posting_tail_codec,
+            encoded_blocks,
+            encoded_position_blocks,
+            tail_entries,
+            tail_positions,
+            open_doc_id,
+            open_doc_frequency,
+            open_doc_last_position,
+            len,
+            ..
+        } = self;
+        debug_assert!(open_doc_id.is_none());
+        debug_assert_eq!(open_doc_frequency, 0);
+        debug_assert!(open_doc_last_position.is_none());
+        let parts = PostingListParts {
+            with_positions,
+            posting_tail_codec,
+            length: len as usize,
+            encoded_blocks: encoded_blocks
+                .map(|encoded_blocks| *encoded_blocks)
+                .unwrap_or_default(),
+            encoded_position_blocks: encoded_position_blocks
+                .map(|encoded_positions| *encoded_positions)
+                .unwrap_or_default(),
+            tail_entries: tail_entries.as_slice(),
+            tail_position_block: with_positions.then(|| tail_positions.finish()),
+        };
+        let (compressed, shared_positions, max_score) =
+            Self::build_compressed_with_scores_from_parts(parts, docs)?;
+        let positions = shared_positions.map(CompressedPositionStorage::SharedStream);
         batch_builder.append(compressed, max_score, len, positions.as_ref())
     }
 
@@ -6248,6 +8849,224 @@ mod tests {
             resolve_fts_format_version(Some("2")).unwrap(),
             InvertedListFormatVersion::V2
         );
+        assert_eq!(
+            resolve_fts_format_version(Some("3")).unwrap(),
+            InvertedListFormatVersion::V3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v3_block_row_layout_roundtrip_with_positions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V3,
+        );
+        builder.tokens.add("alpha".to_owned());
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec(
+            true,
+            InvertedListFormatVersion::V3.posting_tail_codec(),
+        );
+        let mut expected = Vec::new();
+        for doc_id in 0..(BLOCK_SIZE as u32 + 3) {
+            let positions = vec![doc_id % 5, doc_id % 5 + 7];
+            posting.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+            builder.docs.append(doc_id as u64, positions.len() as u32);
+            expected.push((doc_id, positions.len() as u32, positions));
+        }
+        builder.posting_lists.push(posting);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let terms_reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        assert!(terms_reader.schema().field(POSTING_COL).is_none());
+        assert_eq!(
+            terms_reader.schema().field(LENGTH_COL).unwrap().data_type(),
+            DataType::UInt32
+        );
+        assert_eq!(
+            terms_reader
+                .schema()
+                .field(MAX_SCORE_COL)
+                .unwrap()
+                .data_type(),
+            DataType::Float32
+        );
+        assert_eq!(
+            terms_reader
+                .schema()
+                .field(BLOCK_START_COL)
+                .unwrap()
+                .data_type(),
+            DataType::UInt64
+        );
+        assert_eq!(
+            terms_reader
+                .schema()
+                .field(NUM_BLOCKS_COL)
+                .unwrap()
+                .data_type(),
+            DataType::UInt32
+        );
+        let terms_batch = terms_reader
+            .read_range(
+                0..terms_reader.num_rows(),
+                Some(&[LENGTH_COL, MAX_SCORE_COL, BLOCK_START_COL, NUM_BLOCKS_COL]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terms_batch.num_rows(), 1);
+        assert_eq!(
+            terms_batch[LENGTH_COL]
+                .as_primitive::<UInt32Type>()
+                .value(0),
+            (BLOCK_SIZE + 3) as u32
+        );
+        assert_eq!(
+            terms_batch[BLOCK_START_COL]
+                .as_primitive::<UInt64Type>()
+                .value(0),
+            0
+        );
+        assert_eq!(
+            terms_batch[NUM_BLOCKS_COL]
+                .as_primitive::<UInt32Type>()
+                .value(0),
+            2
+        );
+
+        let blocks_reader = store
+            .open_index_file(&posting_blocks_file_path(0))
+            .await
+            .unwrap();
+        assert_eq!(
+            blocks_reader
+                .schema()
+                .field(POSTING_COL)
+                .unwrap()
+                .data_type(),
+            DataType::LargeBinary
+        );
+        assert!(blocks_reader.schema().field(FIRST_DOC_ID_COL).is_some());
+        assert!(blocks_reader.schema().field(LAST_DOC_ID_COL).is_some());
+        assert!(blocks_reader.schema().field(BLOCK_MAX_SCORE_COL).is_some());
+        assert!(
+            blocks_reader
+                .schema()
+                .field(POSITION_BLOCK_OFFSET_COL)
+                .is_none()
+        );
+        assert!(
+            blocks_reader
+                .schema()
+                .field(COMPRESSED_POSITION_COL)
+                .is_none()
+        );
+
+        let positions_reader = store
+            .open_index_file(&posting_positions_file_path(0))
+            .await
+            .unwrap();
+        assert_eq!(positions_reader.num_rows(), blocks_reader.num_rows());
+        assert!(
+            positions_reader
+                .schema()
+                .field(COMPRESSED_POSITION_COL)
+                .is_some()
+        );
+
+        let coarse_reader = store
+            .open_index_file(&posting_coarse_skip_file_path(0))
+            .await
+            .unwrap();
+        assert_eq!(coarse_reader.num_rows(), 1);
+        let coarse_batch = coarse_reader
+            .read_range(
+                0..coarse_reader.num_rows(),
+                Some(&[
+                    BLOCK_START_COL,
+                    NUM_BLOCKS_COL,
+                    FIRST_DOC_ID_COL,
+                    LAST_DOC_ID_COL,
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            coarse_batch[BLOCK_START_COL]
+                .as_primitive::<UInt64Type>()
+                .value(0),
+            0
+        );
+        assert_eq!(
+            coarse_batch[NUM_BLOCKS_COL]
+                .as_primitive::<UInt32Type>()
+                .value(0),
+            2
+        );
+
+        let skip_batch = blocks_reader
+            .read_range(
+                0..blocks_reader.num_rows(),
+                Some(&[FIRST_DOC_ID_COL, LAST_DOC_ID_COL, BLOCK_MAX_SCORE_COL]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skip_batch.num_rows(), 2);
+        assert!(skip_batch.column_by_name(POSTING_COL).is_none());
+        assert_eq!(
+            skip_batch[FIRST_DOC_ID_COL]
+                .as_primitive::<UInt32Type>()
+                .value(0),
+            0
+        );
+        assert_eq!(
+            skip_batch[LAST_DOC_ID_COL]
+                .as_primitive::<UInt32Type>()
+                .value(1),
+            BLOCK_SIZE as u32 + 2
+        );
+        let payload_batch = blocks_reader
+            .read_range(0..1, Some(&[POSTING_COL]))
+            .await
+            .unwrap();
+        let on_disk_payload_len = payload_batch[POSTING_COL].as_binary::<i64>().value(0).len();
+
+        let posting_reader = PostingListReader::try_new_v3(
+            terms_reader,
+            blocks_reader,
+            Some(positions_reader),
+            coarse_reader,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            posting_reader.posting_len_for_token(0).await.unwrap(),
+            BLOCK_SIZE + 3
+        );
+        let posting = posting_reader
+            .posting_list(0, true, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let PostingList::Compressed(compressed) = &posting else {
+            panic!("V3 posting list should be compressed");
+        };
+        assert_eq!(on_disk_payload_len + 8, compressed.blocks.value(0).len());
+        let actual = posting
+            .iter()
+            .map(|(doc_id, freq, positions)| {
+                (doc_id as u32, freq, positions.unwrap().collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -6831,6 +9650,7 @@ mod tests {
     #[rstest::rstest]
     #[case::v1(InvertedListFormatVersion::V1)]
     #[case::v2(InvertedListFormatVersion::V2)]
+    #[case::v3(InvertedListFormatVersion::V3)]
     #[tokio::test]
     async fn test_prewarm_streams_in_chunks_preserves_content(
         #[case] format_version: InvertedListFormatVersion,
@@ -6878,7 +9698,7 @@ mod tests {
         }
         builder.write(store.as_ref()).await.unwrap();
 
-        let metadata = std::collections::HashMap::from_iter(vec![
+        let mut metadata = std::collections::HashMap::from_iter(vec![
             (
                 "partitions".to_owned(),
                 serde_json::to_string(&vec![0u64]).unwrap(),
@@ -6896,6 +9716,12 @@ mod tests {
                 posting_tail_codec.as_str().to_owned(),
             ),
         ]);
+        if format_version.uses_block_row_layout() {
+            metadata.insert(
+                POSTING_BLOCK_LAYOUT_KEY.to_owned(),
+                POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3.to_owned(),
+            );
+        }
         let mut writer = store
             .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
             .await
@@ -6945,8 +9771,13 @@ mod tests {
     /// With positions, the chunked prewarm must strip positions into their own
     /// per-token cache entries (leaving the posting cache positions-free) and still
     /// round-trip exact doc ids, frequencies, and positions across chunk boundaries.
+    #[rstest::rstest]
+    #[case::v2(InvertedListFormatVersion::V2)]
+    #[case::v3(InvertedListFormatVersion::V3)]
     #[tokio::test]
-    async fn test_prewarm_streams_in_chunks_with_positions() {
+    async fn test_prewarm_streams_in_chunks_with_positions(
+        #[case] format_version: InvertedListFormatVersion,
+    ) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -6954,7 +9785,6 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let format_version = InvertedListFormatVersion::V2;
         let posting_tail_codec = format_version.posting_tail_codec();
         const NUM_TOKENS: u32 = 16;
         const DOCS_PER_TOKEN: u32 = 3;
@@ -6991,7 +9821,7 @@ mod tests {
         }
         builder.write(store.as_ref()).await.unwrap();
 
-        let metadata = std::collections::HashMap::from_iter(vec![
+        let mut metadata = std::collections::HashMap::from_iter(vec![
             (
                 "partitions".to_owned(),
                 serde_json::to_string(&vec![0u64]).unwrap(),
@@ -7017,6 +9847,12 @@ mod tests {
                 PositionStreamCodec::PackedDelta.as_str().to_owned(),
             ),
         ]);
+        if format_version.uses_block_row_layout() {
+            metadata.insert(
+                POSTING_BLOCK_LAYOUT_KEY.to_owned(),
+                POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3.to_owned(),
+            );
+        }
         let mut writer = store
             .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
             .await
@@ -7041,17 +9877,28 @@ mod tests {
 
         for token_id in 0..NUM_TOKENS {
             // The prewarmed posting cache entry is positions-free.
-            let (start, end) = inverted_list.group_range_for_token(token_id).unwrap();
-            let group = inverted_list
-                .index_cache
-                .get_with_key(&PostingListGroupKey { start, end })
-                .await
-                .unwrap();
-            let slot = (token_id - start) as usize;
-            assert!(
-                !group.get(slot).unwrap().has_position(),
-                "token {token_id} posting cache entry must be positions-free after prewarm"
-            );
+            if let Some((start, end)) = inverted_list.group_range_for_token(token_id) {
+                let group = inverted_list
+                    .index_cache
+                    .get_with_key(&PostingListGroupKey { start, end })
+                    .await
+                    .unwrap();
+                let slot = (token_id - start) as usize;
+                assert!(
+                    !group.get(slot).unwrap().has_position(),
+                    "token {token_id} posting cache entry must be positions-free after prewarm"
+                );
+            } else {
+                let posting = inverted_list
+                    .index_cache
+                    .get_with_key(&PostingListKey { token_id })
+                    .await
+                    .unwrap();
+                assert!(
+                    !posting.has_position(),
+                    "token {token_id} posting cache entry must be positions-free after prewarm"
+                );
+            }
 
             // Full content (doc ids, frequencies, positions) round-trips; the
             // positions come from the dedicated per-token cache prewarm populated.
@@ -7982,6 +10829,493 @@ mod tests {
             .await
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v3_block_wand_prunes_without_payload_reads() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            false,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V3,
+        );
+        builder.tokens.add("alpha".to_owned());
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V3.posting_tail_codec(),
+        );
+        const NUM_BLOCKS: usize = 80;
+        for doc_id in 0..(BLOCK_SIZE * NUM_BLOCKS) as u32 {
+            let (freq, num_tokens) = if doc_id == 0 {
+                (200, 1)
+            } else if doc_id < BLOCK_SIZE as u32 {
+                (10, 10)
+            } else {
+                (1, 1_000_000)
+            };
+            posting.add(doc_id, PositionRecorder::Count(freq));
+            builder.docs.append(10_000 + doc_id as u64, num_tokens);
+        }
+        builder.posting_lists.push(posting);
+        builder.write(store.as_ref()).await.unwrap();
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+
+        let cache = Arc::new(LanceCache::no_cache());
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let metrics = Arc::new(LocalMetricsCollector::default());
+        let (row_ids, _scores) = index
+            .bm25_search(
+                Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+                Arc::new(FtsSearchParams::new().with_limit(Some(1))),
+                Operator::Or,
+                Arc::new(NoFilter),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids, vec![10_000]);
+        assert_eq!(
+            metrics
+                .fts_block_metadata_rows
+                .load(std::sync::atomic::Ordering::Relaxed),
+            NUM_BLOCKS
+        );
+        assert_eq!(
+            metrics
+                .fts_payload_blocks_read
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the low-score block should be pruned before payload read"
+        );
+        assert_eq!(
+            metrics
+                .fts_payload_read_ranges
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(
+            metrics
+                .fts_blocks_pruned
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
+        assert_eq!(
+            metrics
+                .fts_position_blocks_read
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v3_positions_are_lazy_until_phrase_candidate() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::with_capacity(1 << 20)),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V3,
+        );
+        builder.tokens.add("hello".to_owned());
+        builder.tokens.add("world".to_owned());
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                InvertedListFormatVersion::V3.posting_tail_codec(),
+            ));
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                InvertedListFormatVersion::V3.posting_tail_codec(),
+            ));
+        builder.posting_lists[0].add(0, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(0, PositionRecorder::Position(vec![1].into()));
+        builder.posting_lists[0].add(1, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(1, PositionRecorder::Position(vec![2].into()));
+        builder.docs.append(100, 2);
+        builder.docs.append(101, 2);
+        builder.write(store.as_ref()).await.unwrap();
+        write_test_metadata(
+            &store,
+            vec![0],
+            InvertedIndexParams::default().with_position(true),
+        )
+        .await;
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let non_phrase_metrics = Arc::new(LocalMetricsCollector::default());
+        let (mut non_phrase_row_ids, _) = index
+            .bm25_search(
+                Arc::new(Tokens::new(vec!["hello".to_owned()], DocType::Text)),
+                Arc::new(FtsSearchParams::new().with_limit(Some(10))),
+                Operator::Or,
+                Arc::new(NoFilter),
+                non_phrase_metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        non_phrase_row_ids.sort_unstable();
+        assert_eq!(non_phrase_row_ids, vec![100, 101]);
+        assert_eq!(
+            non_phrase_metrics
+                .fts_position_blocks_read
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "non-phrase queries must not read V3 positions"
+        );
+
+        let phrase_metrics = Arc::new(LocalMetricsCollector::default());
+        let (row_ids, _) = index
+            .bm25_search(
+                Arc::new(Tokens::new(
+                    vec!["hello".to_owned(), "world".to_owned()],
+                    DocType::Text,
+                )),
+                Arc::new(
+                    FtsSearchParams::new()
+                        .with_limit(Some(10))
+                        .with_phrase_slop(Some(0)),
+                ),
+                Operator::And,
+                Arc::new(NoFilter),
+                phrase_metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_ids, vec![100]);
+        assert_eq!(
+            phrase_metrics
+                .fts_position_blocks_read
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "phrase validation should read one positions block per matching term block"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v3_block_executor_matches_v2_and_v2_keeps_legacy_metrics() {
+        async fn build_index(
+            format_version: InvertedListFormatVersion,
+        ) -> (Arc<InvertedIndex>, TempObjDir) {
+            let tmpdir = TempObjDir::default();
+            let store = Arc::new(LanceIndexStore::new(
+                ObjectStore::local().into(),
+                tmpdir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            ));
+            let mut builder = InnerBuilder::new_with_format_version(
+                0,
+                false,
+                TokenSetFormat::default(),
+                format_version,
+            );
+            for token in ["alpha", "beta", "gamma"] {
+                builder.tokens.add(token.to_owned());
+                builder
+                    .posting_lists
+                    .push(PostingListBuilder::new_with_posting_tail_codec(
+                        false,
+                        format_version.posting_tail_codec(),
+                    ));
+            }
+            for doc_id in 0..6u32 {
+                builder.docs.append(200 + doc_id as u64, 4 + doc_id);
+            }
+            for (doc_id, freq) in [(0, 2), (1, 1), (3, 4), (5, 1)] {
+                builder.posting_lists[0].add(doc_id, PositionRecorder::Count(freq));
+            }
+            for (doc_id, freq) in [(1, 3), (2, 1), (3, 1)] {
+                builder.posting_lists[1].add(doc_id, PositionRecorder::Count(freq));
+            }
+            builder.posting_lists[2].add(4, PositionRecorder::Count(1));
+            builder.write(store.as_ref()).await.unwrap();
+            write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+            let cache = Arc::new(LanceCache::no_cache());
+            let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+                .await
+                .unwrap();
+            (index, tmpdir)
+        }
+
+        let (v2, _v2_tmpdir) = build_index(InvertedListFormatVersion::V2).await;
+        let (v3, _v3_tmpdir) = build_index(InvertedListFormatVersion::V3).await;
+        let tokens = Arc::new(Tokens::new(
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            DocType::Text,
+        ));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+
+        let v2_metrics = Arc::new(LocalMetricsCollector::default());
+        let (mut v2_row_ids, _) = v2
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                v2_metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let v3_metrics = Arc::new(LocalMetricsCollector::default());
+        let (mut v3_row_ids, _) = v3
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                v3_metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        v2_row_ids.sort_unstable();
+        v3_row_ids.sort_unstable();
+        assert_eq!(v3_row_ids, v2_row_ids);
+        assert_eq!(
+            v2_metrics
+                .fts_payload_blocks_read
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "V2 must stay on the legacy posting-list materialization path"
+        );
+        assert!(
+            v3_metrics
+                .fts_payload_blocks_read
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "V3 should use block payload reads"
+        );
+        assert!(
+            v3_metrics
+                .fts_block_metadata_rows
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "V3 should read block metadata before payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v3_top_block_cache_covers_large_multi_term_query() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            false,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V3,
+        );
+        builder.tokens.add("hot".to_owned());
+        builder.tokens.add("topic".to_owned());
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                false,
+                InvertedListFormatVersion::V3.posting_tail_codec(),
+            ));
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                false,
+                InvertedListFormatVersion::V3.posting_tail_codec(),
+            ));
+
+        const NUM_BLOCKS: usize = 80;
+        for doc_id in 0..(BLOCK_SIZE * NUM_BLOCKS) as u32 {
+            let (freq, num_tokens) = if doc_id == 0 {
+                (200, 1)
+            } else if doc_id < BLOCK_SIZE as u32 {
+                (10, 10)
+            } else {
+                (1, 1_000_000)
+            };
+            builder.posting_lists[0].add(doc_id, PositionRecorder::Count(freq));
+            if doc_id < BLOCK_SIZE as u32 {
+                builder.posting_lists[1].add(doc_id, PositionRecorder::Count(1));
+            }
+            builder.docs.append(10_000 + doc_id as u64, num_tokens);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let warmed = index.partitions[0]
+            .inverted_list
+            .prewarm_v3_top_blocks(&[0, 1], 10, false)
+            .await
+            .unwrap();
+        assert!(warmed > 0);
+        index.partitions[0].docs.ensure_loaded().await.unwrap();
+
+        let metrics = Arc::new(LocalMetricsCollector::default());
+        let (row_ids, _) = index
+            .bm25_search(
+                Arc::new(Tokens::new(
+                    vec!["hot".to_owned(), "topic".to_owned()],
+                    DocType::Text,
+                )),
+                Arc::new(FtsSearchParams::new().with_limit(Some(1))),
+                Operator::Or,
+                Arc::new(NoFilter),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids, vec![10_000]);
+        assert_eq!(
+            metrics.parts_loaded.load(Ordering::Relaxed),
+            0,
+            "top-block cache should avoid legacy posting-list fallback"
+        );
+        assert_eq!(
+            metrics.fts_block_metadata_rows.load(Ordering::Relaxed),
+            0,
+            "top-block prewarm should cache skip metadata"
+        );
+        assert_eq!(
+            metrics.fts_payload_blocks_read.load(Ordering::Relaxed),
+            0,
+            "top-ranked payload blocks should be served from top-block cache"
+        );
+        assert!(
+            metrics.fts_blocks_pruned.load(Ordering::Relaxed) > 0,
+            "cached top blocks should establish a threshold that prunes cold blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v3_top_block_cache_keeps_large_phrase_positions_lazy() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new_with_format_version(
+            0,
+            true,
+            TokenSetFormat::default(),
+            InvertedListFormatVersion::V3,
+        );
+        builder.tokens.add("hello".to_owned());
+        builder.tokens.add("world".to_owned());
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                InvertedListFormatVersion::V3.posting_tail_codec(),
+            ));
+        builder
+            .posting_lists
+            .push(PostingListBuilder::new_with_posting_tail_codec(
+                true,
+                InvertedListFormatVersion::V3.posting_tail_codec(),
+            ));
+
+        const NUM_BLOCKS: usize = 80;
+        for doc_id in 0..(BLOCK_SIZE * NUM_BLOCKS) as u32 {
+            builder.posting_lists[0].add(doc_id, PositionRecorder::Position(vec![0].into()));
+            builder.posting_lists[1].add(doc_id, PositionRecorder::Position(vec![1].into()));
+            builder.docs.append(20_000 + doc_id as u64, 2);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+        write_test_metadata(
+            &store,
+            vec![0],
+            InvertedIndexParams::default().with_position(true),
+        )
+        .await;
+
+        let cache = Arc::new(LanceCache::with_capacity(1 << 20));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        let warmed = index.partitions[0]
+            .inverted_list
+            .prewarm_v3_top_blocks(&[0, 1], 10, false)
+            .await
+            .unwrap();
+        assert!(warmed > 0);
+        index.partitions[0].docs.ensure_loaded().await.unwrap();
+
+        let metrics = Arc::new(LocalMetricsCollector::default());
+        let (row_ids, _) = index
+            .bm25_search(
+                Arc::new(Tokens::new(
+                    vec!["hello".to_owned(), "world".to_owned()],
+                    DocType::Text,
+                )),
+                Arc::new(
+                    FtsSearchParams::new()
+                        .with_limit(Some(1))
+                        .with_phrase_slop(Some(0)),
+                ),
+                Operator::And,
+                Arc::new(NoFilter),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids, vec![20_000]);
+        assert_eq!(
+            metrics.parts_loaded.load(Ordering::Relaxed),
+            0,
+            "top-block cache should keep large phrase queries on the block executor"
+        );
+        assert_eq!(
+            metrics.fts_block_metadata_rows.load(Ordering::Relaxed),
+            0,
+            "phrase query should reuse prewarmed block metadata"
+        );
+        assert_eq!(
+            metrics.fts_payload_blocks_read.load(Ordering::Relaxed),
+            0,
+            "top-cache phrase execution should not prefetch cold payload blocks"
+        );
+        assert_eq!(
+            metrics.fts_position_blocks_read.load(Ordering::Relaxed),
+            2,
+            "positions should be read lazily only for the winning phrase candidate"
+        );
     }
 
     #[tokio::test]

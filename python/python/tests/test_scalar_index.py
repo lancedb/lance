@@ -4853,7 +4853,7 @@ def test_json_inverted_match_query(tmp_path):
 
 @pytest.mark.parametrize(
     ("format_version", "expected_format_version"),
-    [(1, 1), (2, 2), ("v1", 1), ("v2", 2)],
+    [(1, 1), (2, 2), (3, 3), ("v1", 1), ("v2", 2), ("v3", 3)],
 )
 def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
@@ -5000,7 +5000,7 @@ def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
     ds = lance.write_dataset(data, tmp_path)
 
     with pytest.raises(ValueError, match="unsupported FTS format version"):
-        ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
 
 
 def test_vector_filter_fts_search(tmp_path):

@@ -217,7 +217,7 @@ where
         serde_json::Value::Number(value) => {
             let Some(value) = value.as_u64() else {
                 return Err(serde::de::Error::custom(
-                    "FTS format_version must be 1 or 2",
+                    "FTS format_version must be 1, 2, or 3",
                 ));
             };
             resolve_fts_format_version(Some(&value.to_string()))
@@ -225,7 +225,7 @@ where
                 .map_err(serde::de::Error::custom)
         }
         other => Err(serde::de::Error::custom(format!(
-            "FTS format_version must be 1 or 2, got {other}"
+            "FTS format_version must be 1, 2, or 3, got {other}"
         ))),
     }
 }
