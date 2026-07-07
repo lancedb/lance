@@ -181,12 +181,13 @@ Read planning then filters `_tombstone = false`, so the key is absent from query
 
 ### Flushed Primary-Key Sidecars
 
-Primary-key flushed generations write two sidecars:
+Primary-key MemTables maintain an implicit BTree for primary-key deduplication, independent of `maintained_indexes`.
+When a primary-key MemTable is flushed, the flushed generation writes two primary-key sidecars:
 
 - `bloom_filter.bin` stores the generation's primary-key bloom filter and lets point lookups skip generations that cannot contain the queried key.
 - `_pk_index/` stores a standalone BTree over primary-key values to forward row ids.
 
-The `_pk_index/` sidecar is not registered in the generation manifest and has no manifest UUID.
+The `_pk_index/` sidecar is not a maintained user index, is not registered in the generation manifest, and has no manifest UUID.
 Its identity is its immutable generation path.
 Readers open it directly from `{generation_path}/_pk_index`.
 
@@ -198,6 +199,7 @@ It is not used to choose the newest row inside the same flushed generation; the 
 
 When the MemWAL index lists `maintained_indexes`, flush may build matching indexes inside the flushed generation.
 These index files live in the generation's `_indices/{index_uuid}/` directory and are recorded in the generation manifest.
+The implicit primary-key BTree sidecar is not included in `maintained_indexes` and does not live under `_indices/`.
 
 These indexes use the same row-position space as the forward-written data files.
 If the generation has a primary key, the generation deletion vector masks stale duplicate rows for indexed reads as well.
