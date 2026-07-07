@@ -1125,7 +1125,6 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
-            | Operation::UpdateMemWalState { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
             // A concurrent Update or Delete that *removes* one of our overlaid
@@ -1169,7 +1168,12 @@ impl<'a> TransactionRebase<'a> {
                 // Merge rewrites the whole fragment list; always conflict.
                 Err(self.retryable_conflict_err(other_transaction, other_version))
             }
-            Operation::Overwrite { .. } | Operation::Restore { .. } => {
+            // Overwrite/Restore replace the dataset; UpdateMemWalState does not
+            // rebase against data operations (mirroring check_update_mem_wal_state_txn,
+            // which likewise treats a concurrent DataOverlay as incompatible).
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -3000,6 +3004,23 @@ mod tests {
                 Retryable,
             ),
             (Operation::Restore { version: 1 }, NotCompatible),
+            // Overwrite/Restore replace the dataset, and UpdateMemWalState does
+            // not rebase against data operations — all hard conflicts.
+            (
+                Operation::Overwrite {
+                    fragments: vec![fragment0.clone()],
+                    schema: lance_core::datatypes::Schema::default(),
+                    config_upsert_values: None,
+                    initial_bases: None,
+                },
+                NotCompatible,
+            ),
+            (
+                Operation::UpdateMemWalState {
+                    merged_generations: vec![],
+                },
+                NotCompatible,
+            ),
         ];
 
         for (other, expected) in cases {
