@@ -1812,6 +1812,73 @@ def test_commit_timeout(tmp_path: Path):
     # throttling would be flaky on fast runners.
 
 
+def test_user_operation_append_and_add_index(tmp_path: Path):
+    # EXPERIMENTAL: action-based transactions are gated behind a non-default
+    # Cargo feature, so this only runs when pylance was built with it.
+    if not getattr(lance.lance, "_action_transactions_enabled", False):
+        pytest.skip("pylance built without the unstable-action-transactions feature")
+
+    base_dir = tmp_path / "action_txn"
+    dataset = lance.write_dataset(pa.Table.from_pydict({"id": [1, 2, 3]}), base_dir)
+    assert len(dataset.get_fragments()) == 1
+
+    # Two fragments written but not yet committed.
+    frag_a = lance.fragment.LanceFragment.create(
+        base_dir, pa.Table.from_pydict({"id": [4, 5, 6]})
+    )
+    frag_b = lance.fragment.LanceFragment.create(
+        base_dir, pa.Table.from_pydict({"id": [7, 8]})
+    )
+
+    index_uuid = "11111111-1111-1111-1111-111111111111"
+    op = lance.LanceOperation.UserOperation(
+        read_version=dataset.version,
+        uuid="test-op",
+        description="append + index",
+        actions=[
+            lance.LanceOperation.UserAction(
+                description="append two fragments, index the first",
+                actions=[
+                    lance.LanceOperation.AddFragments(
+                        new_fragments=[
+                            lance.LanceOperation.NewFragment(
+                                local_id=0, fragment=frag_a
+                            ),
+                            lance.LanceOperation.NewFragment(
+                                local_id=1, fragment=frag_b
+                            ),
+                        ]
+                    ),
+                    lance.LanceOperation.AddIndex(
+                        uuid=index_uuid,
+                        name="id_idx",
+                        fields=[0],
+                        covers_existing=[],
+                        covers_local=[0],
+                    ),
+                ],
+            )
+        ],
+    )
+
+    committed = lance.LanceDataset.commit(dataset, op, read_version=dataset.version)
+
+    # Both fragments landed alongside the original and all rows are readable.
+    assert committed.version == dataset.version + 1
+    assert committed.count_rows() == 8
+    assert len(committed.get_fragments()) == 3
+
+    # The index was registered and covers exactly the first new fragment
+    # (assigned id 1), not the second (id 2) or the original (id 0).
+    indices = committed.describe_indices()
+    assert len(indices) == 1
+    assert indices[0].name == "id_idx"
+    segments = indices[0].segments
+    assert len(segments) == 1
+    assert segments[0].uuid == index_uuid
+    assert sorted(segments[0].fragment_ids) == [1]
+
+
 def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
