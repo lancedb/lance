@@ -43,6 +43,82 @@ use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
+async fn test_scan_wide_fixed_size_list_at_batch_boundary() {
+    const DIM_A: usize = 140_000;
+    const DIM_B: usize = 4_096;
+    const SHORT_ROWS: usize = 68;
+    const LONG_ROWS: usize = 128;
+
+    fn make_batch(schema: SchemaRef, rows: usize, base: usize) -> RecordBatch {
+        let values_a = Float32Array::from_iter_values(
+            (0..rows * DIM_A).map(|idx| ((idx + base) % 1009) as f32 / 1009.0),
+        );
+        let values_b = Float32Array::from_iter_values(
+            (0..rows * DIM_B).map(|idx| ((idx + base) % 251) as f32 / 251.0),
+        );
+        let arr_a = FixedSizeListArray::try_new_from_values(values_a, DIM_A as i32).unwrap();
+        let arr_b = FixedSizeListArray::try_new_from_values(values_b, DIM_B as i32).unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(arr_a), Arc::new(arr_b)]).unwrap()
+    }
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "a",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM_A as i32,
+            ),
+            true,
+        ),
+        ArrowField::new(
+            "b",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM_B as i32,
+            ),
+            true,
+        ),
+    ]));
+
+    let batches = vec![
+        make_batch(schema.clone(), SHORT_ROWS, 0),
+        make_batch(schema.clone(), LONG_ROWS, 17),
+    ];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let write_params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_1),
+        ..WriteParams::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dataset = Dataset::write(reader, dir.path().to_str().unwrap(), Some(write_params))
+        .await
+        .unwrap();
+
+    // The first column splits into 9 read chunks. The second column is a
+    // higher-priority request that can reserve the remaining buffer while the
+    // first column is still awaited.
+    let mut scanner = dataset.scan();
+    scanner.io_buffer_size(70 * 1024 * 1024);
+    scanner
+        .limit(Some(LONG_ROWS as i64), Some(SHORT_ROWS as i64))
+        .unwrap();
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        scanner.try_into_stream(),
+    )
+    .await
+    .expect("stream creation timed out")
+    .unwrap();
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(20), stream.try_next())
+        .await
+        .expect("first batch timed out")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(batch.num_rows(), LONG_ROWS);
+}
+
+#[tokio::test]
 async fn test_vector_filter_fts_search() {
     let dataset = prepare_query_filter_dataset().await;
     let schema: ArrowSchema = dataset.schema().into();

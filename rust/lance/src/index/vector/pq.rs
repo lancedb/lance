@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::any::Any;
 use std::sync::Arc;
-use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
 use arrow_array::types::UInt64Type;
@@ -438,14 +439,14 @@ impl VectorIndex for PQIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, mapping: &RowAddrRemap) -> Result<()> {
         let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
             .enumerate()
             .filter_map(|(vec_idx, old_row_id)| {
-                let new_row_id = mapping.get(old_row_id).cloned();
+                let new_row_id = mapping.get(*old_row_id);
                 // If the row id is not in the mapping then this row is not remapped and we keep as is
                 let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
                 new_row_id.map(|new_row_id| {
@@ -644,6 +645,7 @@ pub(crate) fn build_pq_storage(
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::{ops::Range, sync::Mutex};
 
     use arrow::datatypes::Float32Type;

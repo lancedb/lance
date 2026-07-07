@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use core::fmt;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::{collections::HashMap, fmt::Debug};
 
 use arrow::{array::AsArray, compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
@@ -240,7 +241,7 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
 
     fn metadata(&self) -> &Self::Metadata;
 
-    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
+    fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
         let batches = self
             .to_batches()?
             .map(|b| {
@@ -249,10 +250,10 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
 
                 let row_ids = b.column(0).as_primitive::<UInt64Type>().values();
                 for (i, row_id) in row_ids.iter().enumerate() {
-                    match mapping.get(row_id) {
+                    match mapping.get(*row_id) {
                         Some(Some(new_id)) => {
                             indices.push(i as u32);
-                            new_row_ids.push(*new_id);
+                            new_row_ids.push(new_id);
                         }
                         Some(None) => {}
                         None => {

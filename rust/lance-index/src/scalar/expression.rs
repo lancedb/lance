@@ -1462,6 +1462,175 @@ impl PartialEq for ScalarIndexExpr {
     }
 }
 
+/// Returns the tighter (more restrictive) lower bound.
+/// Priority: Included/Excluded > Unbounded; Excluded > Included for same value.
+fn tighter_lower_bound(a: &Bound<ScalarValue>, b: &Bound<ScalarValue>) -> Bound<ScalarValue> {
+    match (a, b) {
+        (Bound::Unbounded, other) | (other, Bound::Unbounded) => other.clone(),
+        (Bound::Included(va), Bound::Included(vb)) => {
+            if va >= vb {
+                Bound::Included(va.clone())
+            } else {
+                Bound::Included(vb.clone())
+            }
+        }
+        (Bound::Excluded(va), Bound::Excluded(vb)) => {
+            if va >= vb {
+                Bound::Excluded(va.clone())
+            } else {
+                Bound::Excluded(vb.clone())
+            }
+        }
+        (Bound::Excluded(va), Bound::Included(vb)) => {
+            if va >= vb {
+                Bound::Excluded(va.clone())
+            } else {
+                Bound::Included(vb.clone())
+            }
+        }
+        (Bound::Included(va), Bound::Excluded(vb)) => {
+            if vb >= va {
+                Bound::Excluded(vb.clone())
+            } else {
+                Bound::Included(va.clone())
+            }
+        }
+    }
+}
+
+/// Returns the tighter (more restrictive) upper bound.
+/// Priority: Included/Excluded > Unbounded; Excluded > Included for same value.
+fn tighter_upper_bound(a: &Bound<ScalarValue>, b: &Bound<ScalarValue>) -> Bound<ScalarValue> {
+    match (a, b) {
+        (Bound::Unbounded, other) | (other, Bound::Unbounded) => other.clone(),
+        (Bound::Included(va), Bound::Included(vb)) => {
+            if va <= vb {
+                Bound::Included(va.clone())
+            } else {
+                Bound::Included(vb.clone())
+            }
+        }
+        (Bound::Excluded(va), Bound::Excluded(vb)) => {
+            if va <= vb {
+                Bound::Excluded(va.clone())
+            } else {
+                Bound::Excluded(vb.clone())
+            }
+        }
+        (Bound::Excluded(va), Bound::Included(vb)) => {
+            if va <= vb {
+                Bound::Excluded(va.clone())
+            } else {
+                Bound::Included(vb.clone())
+            }
+        }
+        (Bound::Included(va), Bound::Excluded(vb)) => {
+            if vb <= va {
+                Bound::Excluded(vb.clone())
+            } else {
+                Bound::Included(va.clone())
+            }
+        }
+    }
+}
+
+impl ScalarIndexExpr {
+    /// Optimize the expression tree by merging range queries on the same index.
+    ///
+    /// This collects all leaf Range queries from the AND tree, groups them by
+    /// index name, merges overlapping ranges into a single closed-range query,
+    /// and rebuilds the tree. This handles the case where `log_time >= X` and
+    /// `log_time <= Y` end up in different branches of a nested AND tree.
+    pub fn optimize(self) -> Self {
+        match self {
+            Self::And(_, _) => self.optimize_and_tree(),
+            Self::Or(lhs, rhs) => Self::Or(Box::new(lhs.optimize()), Box::new(rhs.optimize())),
+            Self::Not(inner) => Self::Not(Box::new(inner.optimize())),
+            other => other,
+        }
+    }
+
+    /// Flatten an AND tree, merge ranges on same index, rebuild.
+    fn optimize_and_tree(self) -> Self {
+        let mut leaves = Vec::new();
+        self.collect_and_leaves(&mut leaves);
+
+        // Try to merge Range queries on the same index
+        let mut merged_indices: Vec<bool> = vec![false; leaves.len()];
+        let mut result_leaves: Vec<Self> = Vec::new();
+
+        for i in 0..leaves.len() {
+            if merged_indices[i] {
+                continue;
+            }
+            let mut current = leaves[i].clone();
+
+            // Try to merge with subsequent leaves on the same index
+            for j in (i + 1)..leaves.len() {
+                if merged_indices[j] {
+                    continue;
+                }
+                if let Some(merged) = try_merge_range_pair(&current, &leaves[j]) {
+                    current = merged;
+                    merged_indices[j] = true;
+                }
+            }
+
+            result_leaves.push(current);
+        }
+
+        // Rebuild the AND tree from remaining leaves
+        let mut iter = result_leaves.into_iter();
+        let first = iter.next().expect("AND tree must have at least one leaf");
+        iter.fold(first, |acc, leaf| Self::And(Box::new(acc), Box::new(leaf)))
+    }
+
+    /// Recursively collect all leaf nodes from an AND tree.
+    fn collect_and_leaves(self, leaves: &mut Vec<Self>) {
+        match self {
+            Self::And(lhs, rhs) => {
+                lhs.collect_and_leaves(leaves);
+                rhs.collect_and_leaves(leaves);
+            }
+            other => leaves.push(other),
+        }
+    }
+}
+
+/// Try to merge two ScalarIndexExpr nodes if they are both Range queries on the same index.
+fn try_merge_range_pair(lhs: &ScalarIndexExpr, rhs: &ScalarIndexExpr) -> Option<ScalarIndexExpr> {
+    let (ScalarIndexExpr::Query(l), ScalarIndexExpr::Query(r)) = (lhs, rhs) else {
+        return None;
+    };
+    if l.index_name != r.index_name || l.column != r.column {
+        return None;
+    }
+
+    let l_query = l.query.as_any().downcast_ref::<SargableQuery>()?;
+    let r_query = r.query.as_any().downcast_ref::<SargableQuery>()?;
+
+    let (SargableQuery::Range(l_low, l_high), SargableQuery::Range(r_low, r_high)) =
+        (l_query, r_query)
+    else {
+        return None;
+    };
+
+    let merged_low = tighter_lower_bound(l_low, r_low);
+    let merged_high = tighter_upper_bound(l_high, r_high);
+
+    Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+        column: l.column.clone(),
+        index_name: l.index_name.clone(),
+        index_type: l.index_type.clone(),
+        query: Arc::new(SargableQuery::Range(merged_low, merged_high)),
+        needs_recheck: l.needs_recheck || r.needs_recheck,
+        // Both queries target the same index (checked above), so they share
+        // the same fragment coverage; carry it over to keep the merged query
+        // usable by coverage-dependent optimizer rules.
+        fragment_bitmap: l.fragment_bitmap.clone(),
+    }))
+}
+
 impl std::fmt::Display for ScalarIndexExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3629,5 +3798,831 @@ mod tests {
 
         // Query against an unindexed path must not bind to either index.
         check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+    }
+
+    #[test]
+    fn test_optimize_nested_and_tree() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // Simulate: AND(AND(fqdn@idx_fqdn, log_time >= X @idx_time), AND(log_time <= Y @idx_time, channel@idx_ch))
+        let fqdn_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "fqdn".to_string(),
+            index_name: "fqdn_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                "eng.bhd.0068".to_string(),
+            )))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let time_gte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "log_time".to_string(),
+            index_name: "log_time_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(100))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let time_lte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "log_time".to_string(),
+            index_name: "log_time_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(200))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let channel_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "channel".to_string(),
+            index_name: "channel_idx".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                "/ados/node/monitor".to_string(),
+            )))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        // Build nested AND: AND(AND(fqdn, time_gte), AND(time_lte, channel))
+        let nested = ScalarIndexExpr::And(
+            Box::new(ScalarIndexExpr::And(
+                Box::new(fqdn_query),
+                Box::new(time_gte),
+            )),
+            Box::new(ScalarIndexExpr::And(
+                Box::new(time_lte),
+                Box::new(channel_query),
+            )),
+        );
+
+        // Optimize should merge time_gte + time_lte into a single Range
+        let optimized = nested.optimize();
+
+        // The optimized tree should contain a merged Range(Included(100), Included(200))
+        // and the other queries as separate leaves
+        // Let's verify by collecting leaves
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves);
+
+        // Should have 3 leaves: fqdn, merged_time, channel
+        assert_eq!(
+            leaves.len(),
+            3,
+            "Expected 3 leaves after merge, got: {:?}",
+            leaves
+        );
+
+        // Find the merged time query
+        let time_query = leaves
+            .iter()
+            .find(|l| {
+                if let ScalarIndexExpr::Query(s) = l {
+                    s.index_name == "log_time_idx"
+                } else {
+                    false
+                }
+            })
+            .expect("Should have a log_time query");
+
+        if let ScalarIndexExpr::Query(s) = time_query {
+            let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            assert_eq!(
+                *range,
+                SargableQuery::Range(
+                    Bound::Included(ScalarValue::Int64(Some(100))),
+                    Bound::Included(ScalarValue::Int64(Some(200))),
+                ),
+                "Range should be merged into closed interval"
+            );
+        }
+    }
+
+    #[test]
+    fn test_optimize_no_merge_different_indexes() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // Two range queries on DIFFERENT indexes should NOT be merged
+        let range_a = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "a".to_string(),
+            index_name: "idx_a".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(10))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let range_b = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "b".to_string(),
+            index_name: "idx_b".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(100))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(Box::new(range_a), Box::new(range_b));
+        let optimized = expr.optimize();
+
+        // Should remain as two separate leaves (not merged)
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves);
+        assert_eq!(leaves.len(), 2);
+    }
+
+    #[test]
+    fn test_optimize_no_merge_non_range() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // Equals + Range on same index should NOT merge
+        let eq_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::Int64(Some(42)))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let range_query = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(100))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(Box::new(eq_query), Box::new(range_query));
+        let optimized = expr.optimize();
+
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves);
+        assert_eq!(leaves.len(), 2, "Equals + Range should not merge");
+    }
+
+    #[test]
+    fn test_optimize_exclusive_bounds() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // x > 10 AND x < 20 → Range(Excluded(10), Excluded(20))
+        let gt = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Int64(Some(10))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let lt = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int64(Some(20))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(Box::new(gt), Box::new(lt));
+        let optimized = expr.optimize();
+
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves);
+        assert_eq!(leaves.len(), 1);
+
+        if let ScalarIndexExpr::Query(s) = &leaves[0] {
+            let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            assert_eq!(
+                *range,
+                SargableQuery::Range(
+                    Bound::Excluded(ScalarValue::Int64(Some(10))),
+                    Bound::Excluded(ScalarValue::Int64(Some(20))),
+                )
+            );
+        } else {
+            panic!("Expected a Query leaf");
+        }
+    }
+
+    #[test]
+    fn test_optimize_preserves_or_and_not() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // AND(OR(a, b), Range_gte, Range_lte)
+        // OR node should be preserved, ranges should merge
+        let or_node = ScalarIndexExpr::Or(
+            Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "c".to_string(),
+                index_name: "idx_c".to_string(),
+                index_type: "".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "a".to_string(),
+                )))),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })),
+            Box::new(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "c".to_string(),
+                index_name: "idx_c".to_string(),
+                index_type: "".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                    "b".to_string(),
+                )))),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })),
+        );
+        let range_gte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "t".to_string(),
+            index_name: "idx_t".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(5))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+        let range_lte = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "t".to_string(),
+            index_name: "idx_t".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(50))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(
+            Box::new(ScalarIndexExpr::And(Box::new(or_node), Box::new(range_gte))),
+            Box::new(range_lte),
+        );
+        let optimized = expr.optimize();
+
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves);
+        // Should have 2 leaves: OR node (preserved) + merged range
+        assert_eq!(leaves.len(), 2);
+
+        // One leaf should be the merged range
+        let merged = leaves
+            .iter()
+            .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "idx_t"))
+            .expect("Should have merged range");
+
+        if let ScalarIndexExpr::Query(s) = merged {
+            let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+            assert_eq!(
+                *range,
+                SargableQuery::Range(
+                    Bound::Included(ScalarValue::Int64(Some(5))),
+                    Bound::Included(ScalarValue::Int64(Some(50))),
+                )
+            );
+        }
+
+        // Other leaf should be the OR node
+        assert!(
+            leaves
+                .iter()
+                .any(|l| matches!(l, ScalarIndexExpr::Or(_, _)))
+        );
+    }
+
+    #[test]
+    fn test_optimize_needs_recheck_preserved() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // If either range has needs_recheck=true, merged result should too
+        let range_a = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(1))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: true,
+            fragment_bitmap: None,
+        });
+        let range_b = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(99))),
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let expr = ScalarIndexExpr::And(Box::new(range_a), Box::new(range_b));
+        let optimized = expr.optimize();
+
+        let mut leaves = Vec::new();
+        optimized.collect_and_leaves(&mut leaves);
+        assert_eq!(leaves.len(), 1);
+
+        if let ScalarIndexExpr::Query(s) = &leaves[0] {
+            assert!(
+                s.needs_recheck,
+                "Merged query should preserve needs_recheck=true"
+            );
+        } else {
+            panic!("Expected a Query leaf");
+        }
+    }
+
+    #[test]
+    fn test_optimize_single_query_passthrough() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        // A single query (not in AND) should pass through unchanged
+        let single = ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: "x".to_string(),
+            index_name: "idx_x".to_string(),
+            index_type: "".to_string(),
+            query: Arc::new(SargableQuery::Range(
+                Bound::Included(ScalarValue::Int64(Some(1))),
+                Bound::Unbounded,
+            )),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        });
+
+        let optimized = single.clone().optimize();
+        assert_eq!(optimized, single);
+    }
+
+    #[test]
+    fn test_optimize_complex_nested_cases() {
+        use super::{ScalarIndexExpr, ScalarIndexSearch};
+        use crate::scalar::SargableQuery;
+        use datafusion_common::ScalarValue;
+        use std::ops::Bound;
+        use std::sync::Arc;
+
+        let make_range =
+            |col: &str, idx: &str, low: Bound<ScalarValue>, high: Bound<ScalarValue>| {
+                ScalarIndexExpr::Query(ScalarIndexSearch {
+                    column: col.to_string(),
+                    index_name: idx.to_string(),
+                    index_type: "".to_string(),
+                    query: Arc::new(SargableQuery::Range(low, high)),
+                    needs_recheck: false,
+                    fragment_bitmap: None,
+                })
+            };
+        let make_eq = |col: &str, idx: &str, val: ScalarValue| {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: col.to_string(),
+                index_name: idx.to_string(),
+                index_type: "".to_string(),
+                query: Arc::new(SargableQuery::Equals(val)),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })
+        };
+
+        // Case 1: Multiple ranges on same index should all merge
+        // x >= 10 AND x <= 200 AND x >= 50 AND x <= 100 → Range(50, 100)
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )),
+                )),
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Included(ScalarValue::Int64(Some(50))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "x",
+                        "idx_x",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                    )),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves);
+            assert_eq!(leaves.len(), 1, "All 4 ranges should merge into 1");
+
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(50))),
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                    )
+                );
+            } else {
+                panic!("Expected merged Query");
+            }
+        }
+
+        // Case 2: NOT(range) should NOT be merged with sibling range
+        // AND(NOT(x >= 10), x <= 20) → stays as 2 leaves
+        {
+            let not_node = ScalarIndexExpr::Not(Box::new(make_range(
+                "x",
+                "idx_x",
+                Bound::Included(ScalarValue::Int64(Some(10))),
+                Bound::Unbounded,
+            )));
+            let range_lte = make_range(
+                "x",
+                "idx_x",
+                Bound::Unbounded,
+                Bound::Included(ScalarValue::Int64(Some(20))),
+            );
+
+            let expr = ScalarIndexExpr::And(Box::new(not_node), Box::new(range_lte));
+            let optimized = expr.optimize();
+
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves);
+            assert_eq!(
+                leaves.len(),
+                2,
+                "NOT(range) should not merge with sibling range"
+            );
+            assert!(leaves.iter().any(|l| matches!(l, ScalarIndexExpr::Not(_))));
+        }
+
+        // Case 3: Ranges inside OR branches get optimized independently
+        // OR(AND(x >= 10, x <= 20), AND(x >= 30, x <= 40))
+        {
+            let branch1 = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(10))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Unbounded,
+                    Bound::Included(ScalarValue::Int64(Some(20))),
+                )),
+            );
+            let branch2 = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(30))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Unbounded,
+                    Bound::Included(ScalarValue::Int64(Some(40))),
+                )),
+            );
+
+            let expr = ScalarIndexExpr::Or(Box::new(branch1), Box::new(branch2));
+            let optimized = expr.optimize();
+
+            // Top level should still be OR
+            if let ScalarIndexExpr::Or(lhs, rhs) = &optimized {
+                // Each branch should be a single merged range
+                let mut left_leaves = Vec::new();
+                lhs.clone().collect_and_leaves(&mut left_leaves);
+                assert_eq!(
+                    left_leaves.len(),
+                    1,
+                    "Left OR branch should have merged range"
+                );
+                if let ScalarIndexExpr::Query(s) = &left_leaves[0] {
+                    let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                    assert_eq!(
+                        *range,
+                        SargableQuery::Range(
+                            Bound::Included(ScalarValue::Int64(Some(10))),
+                            Bound::Included(ScalarValue::Int64(Some(20))),
+                        )
+                    );
+                }
+
+                let mut right_leaves = Vec::new();
+                rhs.clone().collect_and_leaves(&mut right_leaves);
+                assert_eq!(
+                    right_leaves.len(),
+                    1,
+                    "Right OR branch should have merged range"
+                );
+                if let ScalarIndexExpr::Query(s) = &right_leaves[0] {
+                    let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                    assert_eq!(
+                        *range,
+                        SargableQuery::Range(
+                            Bound::Included(ScalarValue::Int64(Some(30))),
+                            Bound::Included(ScalarValue::Int64(Some(40))),
+                        )
+                    );
+                }
+            } else {
+                panic!("Expected OR at top level");
+            }
+        }
+
+        // Case 4: Multiple indexes, each with its own range pair
+        // AND(a >= 1, a <= 10, b >= 100, b <= 200)
+        // → merged into: AND(a in [1,10], b in [100,200])
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "a",
+                        "idx_a",
+                        Bound::Included(ScalarValue::Int64(Some(1))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "a",
+                        "idx_a",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                    )),
+                )),
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "b",
+                        "idx_b",
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Unbounded,
+                    )),
+                    Box::new(make_range(
+                        "b",
+                        "idx_b",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves);
+            assert_eq!(
+                leaves.len(),
+                2,
+                "Two indexes should each merge independently"
+            );
+
+            let a_leaf = leaves
+                .iter()
+                .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "idx_a"))
+                .expect("Should have idx_a");
+            if let ScalarIndexExpr::Query(s) = a_leaf {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(1))),
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                    )
+                );
+            }
+
+            let b_leaf = leaves
+                .iter()
+                .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "idx_b"))
+                .expect("Should have idx_b");
+            if let ScalarIndexExpr::Query(s) = b_leaf {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )
+                );
+            }
+        }
+
+        // Case 5: Mix of Equals and Range on different indexes
+        // AND(fqdn = 'x', time >= 100, time <= 200, channel = 'y')
+        // → AND(fqdn = 'x', time in [100,200], channel = 'y')
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_eq(
+                        "fqdn",
+                        "fqdn_idx",
+                        ScalarValue::Utf8(Some("x".to_string())),
+                    )),
+                    Box::new(make_range(
+                        "time",
+                        "time_idx",
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Unbounded,
+                    )),
+                )),
+                Box::new(ScalarIndexExpr::And(
+                    Box::new(make_range(
+                        "time",
+                        "time_idx",
+                        Bound::Unbounded,
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )),
+                    Box::new(make_eq(
+                        "channel",
+                        "ch_idx",
+                        ScalarValue::Utf8(Some("y".to_string())),
+                    )),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves);
+            assert_eq!(leaves.len(), 3, "fqdn + merged_time + channel = 3 leaves");
+
+            let time_leaf = leaves
+                .iter()
+                .find(|l| matches!(l, ScalarIndexExpr::Query(s) if s.index_name == "time_idx"))
+                .expect("Should have time query");
+            if let ScalarIndexExpr::Query(s) = time_leaf {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                    )
+                );
+            }
+        }
+
+        // Case 6: Overlapping closed ranges → takes intersection
+        // Range(10, 50) AND Range(30, 80) → Range(30, 50)
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(10))),
+                    Bound::Included(ScalarValue::Int64(Some(50))),
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(30))),
+                    Bound::Included(ScalarValue::Int64(Some(80))),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves);
+            assert_eq!(leaves.len(), 1);
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(30))),
+                        Bound::Included(ScalarValue::Int64(Some(50))),
+                    )
+                );
+            }
+        }
+
+        // Case 7: Mixed Included/Excluded on same value
+        // x >= 5 AND x > 5 → Excluded(5) (stricter)
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(5))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Excluded(ScalarValue::Int64(Some(5))),
+                    Bound::Unbounded,
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves);
+            assert_eq!(leaves.len(), 1);
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Excluded(ScalarValue::Int64(Some(5))),
+                        Bound::Unbounded,
+                    )
+                );
+            }
+        }
+
+        // Case 8: Empty range (lower > upper) — still valid, just produces empty results
+        // x >= 200 AND x <= 100 → Range(Included(200), Included(100))
+        // BTree search will find 0 pages matching this, which is correct.
+        {
+            let expr = ScalarIndexExpr::And(
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Included(ScalarValue::Int64(Some(200))),
+                    Bound::Unbounded,
+                )),
+                Box::new(make_range(
+                    "x",
+                    "idx_x",
+                    Bound::Unbounded,
+                    Bound::Included(ScalarValue::Int64(Some(100))),
+                )),
+            );
+
+            let optimized = expr.optimize();
+            let mut leaves = Vec::new();
+            optimized.collect_and_leaves(&mut leaves);
+            assert_eq!(leaves.len(), 1);
+            if let ScalarIndexExpr::Query(s) = &leaves[0] {
+                let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
+                // Merged: lower=Included(200), upper=Included(100) — empty range, but valid
+                assert_eq!(
+                    *range,
+                    SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(200))),
+                        Bound::Included(ScalarValue::Int64(Some(100))),
+                    )
+                );
+            }
+        }
     }
 }

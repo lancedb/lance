@@ -163,8 +163,8 @@ if TYPE_CHECKING:
     import numpy
     import pandas
     import polars
-    import tensorflow
-    import torch
+    import tensorflow  # type: ignore[reportMissingImports]
+    import torch  # type: ignore[reportMissingImports]
 else:
     # heavy/optional third party libs
     numpy, _NUMPY_AVAILABLE = _lazy_import("numpy")

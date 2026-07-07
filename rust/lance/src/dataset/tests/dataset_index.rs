@@ -1804,6 +1804,169 @@ async fn test_fts_index_with_large_string() {
 }
 
 #[tokio::test]
+async fn test_fts_list_index_uses_row_level_documents() {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.to_owned();
+    drop(tempdir);
+
+    let mut list_col = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    list_col.values().append_value("lance");
+    list_col.values().append_value("lance database");
+    list_col.append(true);
+    list_col.values().append_value("database");
+    list_col.append(true);
+    list_col.append(true);
+    list_col.values().append_null();
+    list_col.append(true);
+    list_col.append(false);
+
+    let docs = Arc::new(list_col.finish()) as ArrayRef;
+    let ids = Arc::new(UInt64Array::from_iter_values(0..docs.len() as u64)) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("doc", docs.data_type().clone(), true),
+            ArrowField::new("id", DataType::UInt64, false),
+        ])),
+        vec![docs, ids],
+    )
+    .unwrap();
+    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("lance".to_owned()).limit(Some(10)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[0]);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("database".to_owned()).limit(Some(10)))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut ids = result["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![0, 1], "{:?}", result);
+}
+
+#[tokio::test]
+async fn test_fts_list_phrase_query_can_cross_elements() {
+    assert_fts_list_phrase_query_can_cross_elements::<i32>().await;
+}
+
+#[tokio::test]
+async fn test_fts_large_list_phrase_query_can_cross_elements() {
+    assert_fts_list_phrase_query_can_cross_elements::<i64>().await;
+}
+
+async fn assert_fts_list_phrase_query_can_cross_elements<Offset: arrow::array::OffsetSizeTrait>() {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.to_owned();
+    drop(tempdir);
+
+    let mut list_col = GenericListBuilder::<Offset, _>::new(GenericStringBuilder::<Offset>::new());
+    let rows: &[&[&str]] = &[
+        &["alpha", "beta"],
+        &["want the", "apple"],
+        &["want", "apple"],
+    ];
+    for values in rows.iter().copied() {
+        for value in values {
+            list_col.values().append_value(value);
+        }
+        list_col.append(true);
+    }
+
+    let docs = Arc::new(list_col.finish()) as ArrayRef;
+    let ids = Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("doc", docs.data_type().clone(), true),
+            ArrowField::new("id", DataType::UInt64, false),
+        ])),
+        vec![docs, ids],
+    )
+    .unwrap();
+    let batches = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+
+    let params = InvertedIndexParams::default()
+        .with_position(true)
+        .remove_stop_words(true);
+    dataset
+        .create_index(&["doc"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("alpha beta".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[0]);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("want the apple".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[1]);
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new_query(PhraseQuery::new("want apple".to_owned()).into())
+                .limit(Some(10)),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["id"].as_primitive::<UInt64Type>().values(), &[2]);
+}
+
+#[tokio::test]
 async fn test_fts_accented_chars() {
     let ds = create_fts_dataset::<i32, i32>(false, false, InvertedIndexParams::default()).await;
     let result = ds
@@ -3742,4 +3905,69 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
         LanceFileVersion::V2_0,
         "Index files should never use legacy format, even for legacy datasets"
     );
+}
+
+#[tokio::test]
+async fn test_manifest_read_recovers_from_stale_size() {
+    // A cached `ManifestLocation.size` can lag the real object: a reader may pick
+    // up a size from a stale listing/hint while another writer is committing
+    // concurrently. Reading the manifest (or its index section) with that stale
+    // size must not fail with a spurious "file size is too small" error. The
+    // reader should drop the cached size, fetch the true size, and succeed.
+    use crate::session::Session;
+    use lance_table::io::commit::ManifestLocation;
+    use lance_table::io::manifest::read_manifest_indexes;
+
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let real_location = dataset.manifest_location().clone();
+    assert!(real_location.size.is_some());
+
+    // A deliberately-too-small size stands in for a stale cached size. Without the
+    // retry, both reads below decode a bogus footer offset and fail with
+    // "file size is too small".
+    let stale_location = ManifestLocation {
+        size: Some(1),
+        ..real_location.clone()
+    };
+
+    let session = Session::default();
+    let manifest = Dataset::load_manifest(
+        dataset.object_store.as_ref(),
+        &stale_location,
+        test_uri.as_ref(),
+        &session,
+    )
+    .await
+    .expect("load_manifest should recover from a stale manifest size");
+    assert_eq!(manifest.version, real_location.version);
+
+    let indices = read_manifest_indexes(dataset.object_store.as_ref(), &stale_location, &manifest)
+        .await
+        .expect("read_manifest_indexes should recover from a stale manifest size");
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].name, "id_idx");
 }

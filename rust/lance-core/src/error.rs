@@ -51,6 +51,28 @@ pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedErro
     Box::new(e)
 }
 
+/// Why a writer is fenced. Both reasons are terminal, but callers must tell them
+/// apart (a peer takeover vs. our own failure) rather than parse the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FenceReason {
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    PeerClaimedEpoch,
+    /// Our own WAL persistence failed, so in-memory state may have diverged from
+    /// the durable WAL. The writer must be reopened to replay.
+    PersistenceFailure,
+}
+
+impl std::fmt::Display for FenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Stable strings — surfaced in error messages.
+        let s = match self {
+            Self::PeerClaimedEpoch => "peer claimed epoch",
+            Self::PersistenceFailure => "persistence failure",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -248,6 +270,16 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// A writer has been fenced and must stop (see [`FenceReason`]). The message
+    /// keeps the `Writer fenced` prefix for legacy string consumers; new code
+    /// should match on [`Error::fence_reason`].
+    #[snafu(display("Writer fenced ({reason}): {message}, {location}"))]
+    Fenced {
+        reason: FenceReason,
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
@@ -269,6 +301,36 @@ impl Error {
     #[track_caller]
     pub fn io(message: impl Into<String>) -> Self {
         IOSnafu.into_error(message.into().into())
+    }
+
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    #[track_caller]
+    pub fn fenced_by_peer(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PeerClaimedEpoch,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Our WAL persistence failed; in-memory state may have diverged from the
+    /// durable WAL, so the writer must be reopened to replay.
+    #[track_caller]
+    pub fn writer_poisoned(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PersistenceFailure,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// The [`FenceReason`] if this is [`Error::Fenced`], else `None`. Prefer this
+    /// over matching the error message to decide how to react to a fence.
+    pub fn fence_reason(&self) -> Option<FenceReason> {
+        match self {
+            Self::Fenced { reason, .. } => Some(*reason),
+            _ => None,
+        }
     }
 
     #[track_caller]
@@ -549,7 +611,11 @@ impl From<std::io::Error> for Error {
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::io_source(box_error(e))
+        match e {
+            // source intentionally dropped; Error::NotFound carries only the path
+            object_store::Error::NotFound { path, .. } => Self::not_found(path),
+            other => Self::io_source(box_error(other)),
+        }
     }
 }
 
@@ -731,6 +797,41 @@ mod test {
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
+        }
+    }
+
+    #[test]
+    fn test_caller_location_capture_not_found() {
+        let current_fn = get_caller_location();
+        let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
+            Err(object_store::Error::NotFound {
+                path: "some/path".to_string(),
+                source: "not found".into(),
+            })?;
+            Ok(())
+        });
+        match f().unwrap_err() {
+            Error::NotFound { location, .. } => {
+                // +2 is the beginning of object_store::Error::NotFound...
+                assert_eq!(location.line(), current_fn.line() + 2, "{}", location)
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_object_store_not_found_converts_to_not_found() {
+        let os_err = object_store::Error::NotFound {
+            path: "test/path".to_string(),
+            source: "no such file".into(),
+        };
+        let lance_err: Error = os_err.into();
+        match lance_err {
+            Error::NotFound { uri, .. } => {
+                assert_eq!(uri, "test/path");
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
         }
     }
 

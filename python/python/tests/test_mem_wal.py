@@ -11,6 +11,7 @@ import pytest
 from lance.mem_wal import (
     LsmPointLookupPlanner,
     LsmScanner,
+    LsmVectorSearchPlanner,
     ShardingField,
     ShardingSpec,
     ShardSnapshot,
@@ -163,6 +164,11 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[2] == "gen1_2", "Flushed gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
 
+    offset_table = (
+        LsmScanner.from_snapshots(base_ds, [snap]).limit(None, offset=1).to_table()
+    )
+    assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
+
 
 def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
     ds_path = str(tmp_path / "base")
@@ -219,6 +225,40 @@ def _vector_search_table(ids):
         {"id": pa.array(ids, pa.int32()), "vector": vectors},
         schema=_vector_search_schema(),
     )
+
+
+def test_lsm_vector_search_filter_binding(tmp_path):
+    ds_path = str(tmp_path / "vec")
+    ds = lance.write_dataset(
+        _vector_search_table(range(400)), ds_path, schema=_vector_search_schema()
+    )
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        name="vector_idx",
+        num_partitions=2,
+        num_sub_vectors=2,
+    )
+    ds.initialize_mem_wal(maintained_indexes=["vector_idx"])
+
+    planner = LsmVectorSearchPlanner(ds, [], "vector", filter="id >= 200")
+    query_id = 250
+    query = pa.array([25.0, 25.1, 25.2, 25.3], type=pa.float32())
+    table = planner.plan_search(query, k=20, nprobes=2, columns=["id"]).to_table()
+
+    ids = table.column("id").to_pylist()
+    assert ids, "filtered vector search should return at least one row"
+    assert min(ids) >= 200
+    assert query_id in ids, f"filtered vector search recall missed id={query_id}: {ids}"
+
+    with pytest.raises(ValueError, match="k must be positive"):
+        planner.plan_search(query, k=0, nprobes=2, columns=["id"])
+    with pytest.raises(ValueError, match="nprobes must be positive"):
+        planner.plan_search(query, k=20, nprobes=0, columns=["id"])
+    with pytest.raises(ValueError, match="overfetch_factor must be finite"):
+        planner.plan_search(
+            query, k=20, nprobes=2, columns=["id"], overfetch_factor=math.inf
+        )
 
 
 VECTOR_DIM = 32

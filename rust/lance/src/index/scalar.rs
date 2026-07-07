@@ -47,12 +47,12 @@ use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
 use lance_index::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
+    ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
-    ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
-    lance_format::LanceIndexStore,
+    RowIdRemapper, ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME,
+    inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
 };
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
@@ -297,8 +297,13 @@ pub(super) async fn build_scalar_index(
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
 
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
+        Error::invalid_input_source(
+            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
+        )
+    })?;
     let training_request =
-        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+        trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match preprocessed_data {
@@ -317,7 +322,7 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
-    let created_index = plugin
+    let created_index = trainer
         .train_index(
             training_data,
             &index_store,
@@ -354,8 +359,13 @@ pub(super) async fn build_bitmap_index_segment(
 
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
+        Error::invalid_input_source(
+            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
+        )
+    })?;
     let training_request =
-        plugin.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+        trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
     let criteria = training_request.criteria();
 
     progress.stage_start("load_data", None, "rows").await?;
@@ -364,7 +374,7 @@ pub(super) async fn build_bitmap_index_segment(
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
-    plugin
+    trainer
         .train_index(
             training_data,
             &index_store,
@@ -449,29 +459,35 @@ pub async fn open_scalar_index(
         .index_cache
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
-    if let Some(index) = plugin
-        .get_from_cache(index_store.clone(), frag_reuse_index.clone(), &index_cache)
-        .await?
-    {
-        // Compatibility check is only needed on first load; a cache hit means
-        // the index was already validated when it was originally opened in
-        // this session, so we can skip the extra `open_index_file` IOP.
-        return Ok(index);
-    }
+    let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
+        frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
 
-    if index_details.type_url.ends_with("LabelListIndexDetails") {
-        validate_label_list_index_compatibility(dataset, column, index, &index_store).await?;
-    }
+    // Runs only on a cold miss, and at most once even under concurrent opens
+    // (the plugin coalesces). The compat check lives here because a warm hit was
+    // already validated this session, saving the extra `open_index_file` IOP.
+    let load: ScalarIndexLoad = Box::pin({
+        let index_store = index_store.clone();
+        let frag_reuse_index = frag_reuse_index.clone();
+        let index_cache = index_cache.clone();
+        async move {
+            if index_details.type_url.ends_with("LabelListIndexDetails") {
+                validate_label_list_index_compatibility(dataset, column, index, &index_store)
+                    .await?;
+            }
 
-    let index = plugin
-        .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
-        .await?;
+            let index = plugin
+                .load_index(index_store, &index_details, frag_reuse_index, &index_cache)
+                .await?;
 
-    tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
-    metrics.record_index_load();
+            tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
+            metrics.record_index_load();
+            Ok(index)
+        }
+    });
 
-    plugin.put_in_cache(&index_cache, index.clone()).await?;
-    Ok(index)
+    plugin
+        .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
+        .await
 }
 
 pub(crate) async fn infer_scalar_index_details(
@@ -1037,6 +1053,51 @@ mod tests {
             },
             other => panic!("expected Map type, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_open_scalar_index_coalesces_concurrent_cold_opens() {
+        use crate::dataset::builder::DatasetBuilder;
+        use arrow::datatypes::Int64Type;
+        use futures::future::try_join_all;
+        use lance_index::metrics::LocalMetricsCollector;
+        use std::sync::atomic::Ordering;
+
+        let dir = TempStrDir::default();
+        let uri = dir.as_ref();
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_dataset(uri, FragmentCount::from(1), FragmentRowCount::from(200))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Reopen so the index cache is cold for the concurrent opens below.
+        let ds = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        let id_field = ds.schema().field("id").unwrap().id;
+        let index_meta = ds
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.fields == [id_field])
+            .cloned()
+            .expect("btree index on `id`");
+
+        // Eight concurrent cold opens; single-flight means the loader (which calls
+        // `record_index_load`) runs exactly once, not once per open.
+        let metrics = LocalMetricsCollector::default();
+        let indices =
+            try_join_all((0..8).map(|_| open_scalar_index(&ds, "id", &index_meta, &metrics)))
+                .await
+                .unwrap();
+
+        assert_eq!(indices.len(), 8);
+        assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1772,6 +1833,122 @@ mod tests {
             after_ids,
             &[0, 2, 4, 6, 8],
             "Zonemap index with deletions returns wrong results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dataset_column_value_range() {
+        use crate::index::DatasetIndexExt;
+        use arrow::datatypes::Int64Type;
+        use datafusion::scalar::ScalarValue;
+        use lance_datagen::array;
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // 2 fragments x 5 rows: `id` and `other` both step 0..9.
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .col("other", array::step::<Int64Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Folded straight from the ZoneMap summaries: global [0, 9].
+        assert_eq!(
+            ds.statistics().column_value_range("id").await.unwrap(),
+            Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
+        );
+        // `other` has no ZoneMap index -> no precomputed range.
+        assert_eq!(
+            ds.statistics().column_value_range("other").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_column_value_range_none_when_index_misses_fragments() {
+        use crate::index::DatasetIndexExt;
+        use arrow::datatypes::Int64Type;
+        use lance_datagen::{BatchCount, RowCount, array};
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // Index covers the initial 2 fragments.
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        assert!(
+            ds.statistics()
+                .column_value_range("id")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Append a fragment the index doesn't cover. Its rows may hold values
+        // outside the indexed range, so any non-None range would be a subset
+        // unsound to prune with -> must return None until the index is rebuilt.
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_reader_rows(RowCount::from(5), BatchCount::from(1));
+        ds.append(reader, None).await.unwrap();
+
+        assert_eq!(
+            ds.statistics().column_value_range("id").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_column_value_range_folds_multiple_segments() {
+        use crate::index::DatasetIndexExt;
+        use arrow::datatypes::Int64Type;
+        use datafusion::scalar::ScalarValue;
+        use lance_datagen::array;
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // 2 fragments x 5 rows (`id` steps 0..9). Build one ZoneMap segment per
+        // fragment, then commit them as a single multi-segment logical index.
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int64Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(5))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        let columns = ["id"];
+        let mut segments = Vec::new();
+        for fragment_id in [0_u32, 1_u32] {
+            let mut builder = ds
+                .create_index_builder(&columns, IndexType::Scalar, &params)
+                .name("id_idx".to_string())
+                .fragments(vec![fragment_id]);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+        // execute_uncommitted yields ready IndexMetadata segments (IntoIndexSegment);
+        // build_all is vector-only, so commit the per-fragment segments directly.
+        ds.commit_existing_index_segments("id_idx", "id", segments)
+            .await
+            .unwrap();
+
+        // Two disjoint segments jointly cover every live fragment -> the fold
+        // spans both and yields the global range, not None.
+        assert_eq!(ds.load_indices_by_name("id_idx").await.unwrap().len(), 2);
+        assert_eq!(
+            ds.statistics().column_value_range("id").await.unwrap(),
+            Some((ScalarValue::Int64(Some(0)), ScalarValue::Int64(Some(9))))
         );
     }
 

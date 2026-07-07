@@ -5120,3 +5120,28 @@ def test_vector_filter_fts_search(tmp_path):
     )
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "ZONEMAP"])
+def test_large_string_scalar_index(tmp_path, index_type):
+    """large_string (LargeUtf8) must be accepted by BTREE, BITMAP, and ZONEMAP."""
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int32()),
+            "category": pa.array(["alpha", "beta", "alpha"], pa.large_string()),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    assert ds.schema.field("category").type == pa.large_string()
+
+    # Must not raise TypeError
+    ds.create_scalar_index("category", index_type=index_type)
+
+    indices = ds.describe_indices()
+    assert any("category" in idx.field_names for idx in indices), (
+        f"{index_type} index for large_string column not found in describe_indices()"
+    )
+
+    result = ds.scanner(filter="category = 'alpha'").to_table()
+    assert result.num_rows == 2
+    assert set(result.column("id").to_pylist()) == {1, 3}

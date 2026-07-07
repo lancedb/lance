@@ -238,6 +238,7 @@ impl Updater {
         cleanup_data_fragments(
             &self.dataset().object_store,
             &self.dataset().base,
+            None,
             &[fragment],
         )
         .await;

@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use super::index::IndexStore;
 use super::util::{WatchableOnceCell, WatchableOnceCellReader};
+use super::wal::WalFlushFailure;
 use super::write::{DurabilityResult, WalFlushResult};
 use crate::Dataset;
 use batch_store::BatchStore;
@@ -103,9 +104,10 @@ pub struct MemTable {
     /// Set when the memtable is frozen and a WAL flush request is sent.
     /// The reader can be awaited to know when WAL flush is complete.
     /// Uses Mutex for interior mutability since the MemTable is wrapped in Arc when frozen.
-    /// Uses Result<WalFlushResult, String> since lance_core::Error doesn't implement Clone.
+    /// Uses `WalFlushFailure` (not `Error`) since `lance_core::Error` doesn't
+    /// implement Clone; the carrier preserves the fence reason for the waiter.
     wal_flush_completion: std::sync::Mutex<
-        Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, String>>>,
+        Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>>,
     >,
 
     /// Cell for memtable flush completion notification.
@@ -266,7 +268,7 @@ impl MemTable {
     /// the WAL flush is complete.
     pub fn set_wal_flush_completion(
         &self,
-        reader: WatchableOnceCellReader<std::result::Result<WalFlushResult, String>>,
+        reader: WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>,
     ) {
         *self.wal_flush_completion.lock().unwrap() = Some(reader);
     }
@@ -278,7 +280,7 @@ impl MemTable {
     /// Thread-safe via interior mutability.
     pub fn take_wal_flush_completion(
         &self,
-    ) -> Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, String>>> {
+    ) -> Option<WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>> {
         self.wal_flush_completion.lock().unwrap().take()
     }
 

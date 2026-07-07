@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     collections::HashMap,
@@ -34,15 +35,14 @@ use super::{
 };
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
-use crate::frag_reuse::FragReuseIndex;
 use crate::pbold;
 use crate::scalar::bitmap::{BitmapIndexPlugin, BitmapIndexState};
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+    TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
 };
-use crate::scalar::{CreatedIndex, UpdateCriteria};
+use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
@@ -93,7 +93,7 @@ impl LabelListIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let values_index =
@@ -213,7 +213,7 @@ impl ScalarIndex for LabelListIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let state = self.values_index.load_bitmap_index_state().await?;
@@ -221,10 +221,7 @@ impl ScalarIndex for LabelListIndex {
         let remapped_nulls =
             RowAddrTreeMap::from_iter(self.list_nulls.row_addrs().unwrap().filter_map(|addr| {
                 let addr_as_u64 = u64::from(addr);
-                mapping
-                    .get(&addr_as_u64)
-                    .copied()
-                    .unwrap_or(Some(addr_as_u64))
+                mapping.get(addr_as_u64).unwrap_or(Some(addr_as_u64))
             }));
         let file = write_label_list_bitmap_index(
             remapped_state,
@@ -443,7 +440,7 @@ fn unnest_chunks(
 
 async fn read_list_nulls(
     store: Arc<dyn IndexStore>,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 ) -> Result<RowAddrTreeMap> {
     let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
     if let Some(buffer_idx_str) = reader.schema().metadata.get(LABEL_LIST_NULLS_METADATA_KEY) {
@@ -597,11 +594,23 @@ impl LabelListIndexState {
         })
     }
 
+    fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let label_list = index
+            .as_any()
+            .downcast_ref::<LabelListIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "LabelListIndexState::from_scalar_index called with a non-label-list index",
+                )
+            })?;
+        Self::from_index(label_list)
+    }
+
     fn into_label_list_index(
         self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<LabelListIndex>> {
         let bitmap = self
             .bitmap_state
@@ -664,11 +673,7 @@ impl CacheKey for LabelListIndexStateKey {
 pub struct LabelListIndexPlugin;
 
 #[async_trait]
-impl ScalarIndexPlugin for LabelListIndexPlugin {
-    fn name(&self) -> &str {
-        "LabelList"
-    }
-
+impl BasicTrainer for LabelListIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -687,25 +692,6 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
 
         Ok(Box::new(DefaultTrainingRequest::new(
             TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
-        )))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        true
-    }
-
-    fn version(&self) -> u32 {
-        LABEL_LIST_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(LabelListQueryParser::new(
-            index_name,
-            self.name().to_string(),
         )))
     }
 
@@ -763,13 +749,43 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             files: vec![file],
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "LabelList"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        LABEL_LIST_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(LabelListQueryParser::new(
+            index_name,
+            self.name().to_string(),
+        )))
+    }
 
     /// Load an index from storage
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
@@ -781,7 +797,7 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&LabelListIndexStateKey).await else {
@@ -793,19 +809,33 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     }
 
     async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
-        let label_list = index
-            .as_any()
-            .downcast_ref::<LabelListIndex>()
-            .ok_or_else(|| {
-                Error::internal(
-                    "LabelListIndexPlugin::put_in_cache called with a non-label-list index",
-                )
-            })?;
-        let state = LabelListIndexState::from_index(label_list)?;
+        let state = LabelListIndexState::from_scalar_index(index.as_ref())?;
         cache
             .insert_with_key(&LabelListIndexStateKey, Arc::new(state))
             .await;
         Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            LabelListIndexStateKey,
+            load,
+            LabelListIndexState::from_scalar_index,
+            move |state| {
+                Ok((*state)
+                    .clone()
+                    .into_label_list_index(index_store, cache, frag_reuse_index)?
+                    as Arc<dyn ScalarIndex>)
+            },
+        )
+        .await
     }
 }
 

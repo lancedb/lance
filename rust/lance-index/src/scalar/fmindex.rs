@@ -32,21 +32,21 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
 use roaring::RoaringBitmap;
 
-use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::MetricsCollector;
 use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-    VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
-    ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
+    RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::{Index, IndexType};
 
@@ -1686,7 +1686,7 @@ impl FMIndexScalarIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let files = store.list_files_with_sizes().await?;
@@ -1829,11 +1829,7 @@ impl ScalarIndex for FMIndexScalarIndex {
     fn can_remap(&self) -> bool {
         false
     }
-    async fn remap(
-        &self,
-        _: &HashMap<u64, Option<u64>>,
-        _: &dyn IndexStore,
-    ) -> Result<CreatedIndex> {
+    async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(
@@ -2433,10 +2429,7 @@ async fn write_empty_fmindex_partition(store: &dyn IndexStore) -> Result<IndexFi
 pub struct FMIndexPlugin;
 
 #[async_trait]
-impl ScalarIndexPlugin for FMIndexPlugin {
-    fn name(&self) -> &str {
-        "Fm"
-    }
+impl BasicTrainer for FMIndexPlugin {
     fn new_training_request(
         &self,
         _params: &str,
@@ -2470,6 +2463,17 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             files,
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for FMIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Fm"
+    }
     fn provides_exact_answer(&self) -> bool {
         true
     }
@@ -2494,7 +2498,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
-        fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let _ = details.to_msg::<pb::FmIndexDetails>().unwrap_or_default();
@@ -2521,6 +2525,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::registry::BasicTrainer;
 
     #[derive(Debug, Clone)]
     struct FailNewFileStore {

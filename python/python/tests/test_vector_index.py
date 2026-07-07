@@ -576,6 +576,8 @@ def test_index_with_pq_codebook(tmp_path):
         ivf_centroids=np.random.randn(1, 128).astype(np.float32),
         pq_codebook=pq_codebook,
     )
+    index = dataset.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 8
     validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
 
     pq_codebook = pa.FixedShapeTensorArray.from_numpy_ndarray(pq_codebook)
@@ -590,6 +592,54 @@ def test_index_with_pq_codebook(tmp_path):
         replace=True,
     )
     validate_vector_index(dataset, "vector", refine_factor=10, pass_threshold=0.99)
+
+
+def test_index_with_4bit_numpy_pq_codebook(tmp_path):
+    tbl = create_table(nvec=1024, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 16, 128 // 4).astype(np.float32)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=4,
+        num_bits=4,
+        ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+        pq_codebook=pq_codebook,
+    )
+
+    index = dataset.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 4
+
+    result = dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": np.random.randn(128).astype(np.float32),
+            "k": 10,
+        }
+    )
+    assert result.num_rows == 10
+
+
+def test_index_with_pq_codebook_rejects_wrong_num_bits_shape(tmp_path):
+    tbl = create_table(nvec=8, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    pq_codebook = np.random.randn(4, 256, 128 // 4).astype(np.float32)
+
+    with pytest.raises(
+        ValueError,
+        match=r"\(sub_vectors, 16, dim\) for num_bits=4, got \(4, 256, 32\)",
+    ):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=1,
+            num_sub_vectors=4,
+            num_bits=4,
+            ivf_centroids=np.random.randn(1, 128).astype(np.float32),
+            pq_codebook=pq_codebook,
+        )
 
 
 @pytest.mark.cuda

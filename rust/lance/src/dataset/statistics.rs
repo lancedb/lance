@@ -5,11 +5,16 @@
 
 use std::{collections::HashMap, future::Future, sync::Arc};
 
+use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
+use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::scalar::zonemap::ZoneMapIndex;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use roaring::RoaringBitmap;
 
 use super::{Dataset, fragment::FileFragment};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 /// Statistics about a single field in the dataset
 pub struct FieldStatistics {
@@ -80,6 +85,98 @@ impl DatasetStatisticsExt for Dataset {
         Ok(DataStatistics {
             fields: field_stats,
         })
+    }
+}
+
+/// A read-only handle for cheap, index-derived statistics about a [`Dataset`].
+///
+/// Obtained via [`Dataset::statistics`]. Groups statistics accessors behind one
+/// handle instead of accreting one-off methods on [`Dataset`]. Every accessor is
+/// served from index metadata and never scans data.
+#[derive(Debug, Clone, Copy)]
+pub struct DatasetStatistics<'a> {
+    dataset: &'a Dataset,
+}
+
+impl<'a> DatasetStatistics<'a> {
+    pub(crate) fn new(dataset: &'a Dataset) -> Self {
+        Self { dataset }
+    }
+
+    /// Global `[min, max]` for `column` from its min/max-capable scalar index
+    /// (currently ZoneMap), without a scan.
+    ///
+    /// `None` unless the column's index segments *jointly* cover every live
+    /// fragment and the column can be soundly bounded — fragments appended after
+    /// the index was built, or a NaN-bearing column, yield `None`. The disjoint
+    /// segments of a multi-segment index are folded together.
+    ///
+    /// When `Some`, the range is a superset of live values, conservative under
+    /// deletion vectors: safe to prune with. See [`ScalarIndex::value_range`].
+    ///
+    /// [`ScalarIndex::value_range`]: lance_index::scalar::ScalarIndex::value_range
+    pub async fn column_value_range(
+        &self,
+        column: &str,
+    ) -> Result<Option<(ScalarValue, ScalarValue)>> {
+        let dataset = self.dataset;
+        let Some(field) = dataset.schema().field(column) else {
+            return Err(Error::invalid_input(format!(
+                "column_value_range: column '{column}' not found in dataset schema"
+            )));
+        };
+        let field_id = field.id;
+        let field_path = dataset.schema().field_path(field_id)?;
+
+        // A multi-segment ZoneMap is several index entries over the same column,
+        // each covering a disjoint fragment subset. Match the field, then the
+        // details type (the column may also carry e.g. a BTree).
+        let indices = dataset.load_indices().await?;
+        let segments: Vec<_> = indices
+            .iter()
+            .filter(|idx| matches!(idx.fields.as_slice(), [only] if *only == field_id))
+            .filter(|idx| {
+                idx.index_details
+                    .as_ref()
+                    .is_some_and(|d| d.type_url.ends_with("ZoneMapIndexDetails"))
+            })
+            .collect();
+        if segments.is_empty() {
+            return Ok(None);
+        }
+
+        // Soundness: the segments must *jointly* cover every live fragment, else
+        // the fold sees only a subset and could prune live rows (e.g. fragments
+        // appended after the index was built). Extra dead fragments are harmless.
+        let mut covered = RoaringBitmap::new();
+        for idx in &segments {
+            let Some(bitmap) = idx.fragment_bitmap.as_ref() else {
+                return Ok(None);
+            };
+            covered |= bitmap.clone();
+        }
+        if !dataset.fragment_bitmap.as_ref().is_subset(&covered) {
+            return Ok(None);
+        }
+
+        // Keep the opened indices alive so the `ZoneMapIndex` refs we fold over
+        // stay borrowed.
+        let mut opened = Vec::with_capacity(segments.len());
+        for idx in &segments {
+            opened.push(
+                dataset
+                    .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                    .await?,
+            );
+        }
+        let Some(zonemaps) = opened
+            .iter()
+            .map(|index| index.as_any().downcast_ref::<ZoneMapIndex>())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        Ok(ZoneMapIndex::value_range_over(zonemaps))
     }
 }
 

@@ -89,6 +89,15 @@ impl GcsStoreProvider {
             builder = builder.with_credentials(credential_provider);
         }
 
+        #[cfg(feature = "metrics")]
+        {
+            builder = builder.with_http_connector(
+                crate::object_store::metrics::MeteringHttpConnector::new(
+                    self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?,
+                ),
+            );
+        }
+
         Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
     }
 }

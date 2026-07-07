@@ -109,10 +109,12 @@ message Manifest {
   // should not attempt to read the dataset.
   //
   // Known flags:
-  // * 1: deletion files are present
-  // * 2: row ids are stable and stored as part of the fragment metadata.
-  // * 4: use v2 format (deprecated)
-  // * 8: table config is present
+  // * 1 << 0: deletion files are present
+  // * 1 << 1: row ids are stable and stored as part of the fragment metadata.
+  // * 1 << 2: use v2 format (deprecated)
+  // * 1 << 3: table config is present
+  // * 1 << 4: dataset uses multiple base paths
+  // * 1 << 5: transaction file writes are disabled
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
