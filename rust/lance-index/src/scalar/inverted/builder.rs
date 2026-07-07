@@ -280,8 +280,12 @@ impl InvertedIndexBuilder {
     }
 
     pub fn with_posting_tail_codec(mut self, posting_tail_codec: PostingTailCodec) -> Self {
-        self.format_version =
-            InvertedListFormatVersion::from_posting_tail_codec(posting_tail_codec);
+        if !(self.format_version.uses_block_row_layout()
+            && self.format_version.posting_tail_codec() == posting_tail_codec)
+        {
+            self.format_version =
+                InvertedListFormatVersion::from_posting_tail_codec(posting_tail_codec);
+        }
         self.posting_tail_codec = posting_tail_codec;
         self
     }
@@ -635,20 +639,7 @@ impl InvertedIndexBuilder {
             ),
         ]);
 
-        if self.params.with_position && self.format_version.uses_shared_position_stream() {
-            metadata.insert(
-                POSITIONS_LAYOUT_KEY.to_owned(),
-                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
-            );
-            metadata.insert(
-                POSITIONS_CODEC_KEY.to_owned(),
-                self.format_version
-                    .position_codec()
-                    .expect("shared positions require a codec")
-                    .as_str()
-                    .to_owned(),
-            );
-        }
+        self.add_format_metadata(&mut metadata);
 
         let metadata_file_schema = Arc::new(Schema::new(vec![Field::new(
             DELETED_FRAGMENTS_COL,
@@ -690,6 +681,16 @@ impl InvertedIndexBuilder {
                 self.posting_tail_codec.as_str().to_owned(),
             ),
         ]);
+        self.add_format_metadata(&mut metadata);
+        // Use partition ID to generate a unique temporary filename
+        let file_name = part_metadata_file_path(partition);
+        let mut writer = dest_store
+            .new_index_file(&file_name, Arc::new(Schema::empty()))
+            .await?;
+        writer.finish_with_metadata(metadata).await
+    }
+
+    fn add_format_metadata(&self, metadata: &mut HashMap<String, String>) {
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),
@@ -704,12 +705,12 @@ impl InvertedIndexBuilder {
                     .to_owned(),
             );
         }
-        // Use partition ID to generate a unique temporary filename
-        let file_name = part_metadata_file_path(partition);
-        let mut writer = dest_store
-            .new_index_file(&file_name, Arc::new(Schema::empty()))
-            .await?;
-        writer.finish_with_metadata(metadata).await
+        if self.format_version.uses_block_row_layout() {
+            metadata.insert(
+                POSTING_BLOCK_LAYOUT_KEY.to_owned(),
+                POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3.to_owned(),
+            );
+        }
     }
 
     async fn write_metadata_with_progress(
@@ -759,6 +760,8 @@ impl InvertedIndexBuilder {
         let mut copied = 0;
         let mut files = Vec::new();
         let target = self.partition_write_target();
+        let extra_suffixes =
+            v3_extra_partition_file_suffixes(self.format_version, self.params.with_position);
         for part in self.partitions.iter() {
             files.push(
                 self.src_store
@@ -789,6 +792,19 @@ impl InvertedIndexBuilder {
                     .copy_index_file_to(&doc_file_path(*part), &target.doc_path(*part), dest_store)
                     .await?,
             );
+            for suffix in &extra_suffixes {
+                files.push(
+                    self.src_store
+                        .as_ref()
+                        .expect("existing partitions require a source store")
+                        .copy_index_file_to(
+                            &partition_file_path(*part, suffix),
+                            &target.file_path(*part, suffix),
+                            dest_store,
+                        )
+                        .await?,
+                );
+            }
             copied += 1;
             self.progress
                 .stage_progress("copy_partitions", copied)
@@ -1053,14 +1069,23 @@ impl InnerBuilder {
         target: PartitionWriteTarget,
     ) -> Result<Vec<IndexFile>> {
         let docs = Arc::new(std::mem::take(&mut self.docs));
-        let files = vec![
-            self.write_posting_lists(store, docs.clone(), &target.posting_path(self.id))
-                .await?,
+        let mut files = if self.format_version.uses_block_row_layout() {
+            self.write_v3_posting_layout(store, docs.clone(), target)
+                .await?
+        } else {
+            vec![
+                self.write_posting_lists(store, docs.clone(), &target.posting_path(self.id))
+                    .await?,
+            ]
+        };
+        files.push(
             self.write_tokens(store, &target.token_path(self.id))
                 .await?,
+        );
+        files.push(
             self.write_docs(store, docs, &target.doc_path(self.id))
                 .await?,
-        ];
+        );
         Ok(files)
     }
 
@@ -1153,7 +1178,7 @@ impl InnerBuilder {
                 }
             }
 
-            Result::Ok(batch_builder.into_group_starts())
+            Result::Ok(batch_builder.into_write_metadata())
         });
 
         while let Ok(batch) = rx.recv().await {
@@ -1165,22 +1190,158 @@ impl InnerBuilder {
             }
         }
         drop(rx);
-        let group_starts = producer.await??;
+        let write_metadata = producer.await??;
 
-        // Persist the posting-list cache-group boundaries as a global buffer,
-        // recording its 1-indexed id in schema metadata so the reader can group
-        // small posting lists into a single cache entry (issue #7040). Empty
-        // partitions skip this entirely and fall back to the per-token path.
         let mut extra_metadata = HashMap::new();
-        if !group_starts.is_empty() {
-            let encoded = encode_group_starts(&group_starts);
-            let buffer_id = writer.add_global_buffer(Bytes::from(encoded)).await?;
-            extra_metadata.insert(
-                POSTING_GROUP_OFFSETS_BUF_KEY.to_owned(),
-                buffer_id.to_string(),
-            );
+        match write_metadata {
+            PostingWriteMetadata::TokenRows { group_starts } => {
+                // Persist the posting-list cache-group boundaries as a global buffer,
+                // recording its 1-indexed id in schema metadata so the reader can group
+                // small posting lists into a single cache entry (issue #7040). Empty
+                // partitions skip this entirely and fall back to the per-token path.
+                if !group_starts.is_empty() {
+                    let encoded = encode_group_starts(&group_starts);
+                    let buffer_id = writer.add_global_buffer(Bytes::from(encoded)).await?;
+                    extra_metadata.insert(
+                        POSTING_GROUP_OFFSETS_BUF_KEY.to_owned(),
+                        buffer_id.to_string(),
+                    );
+                }
+            }
         }
         writer.finish_with_metadata(extra_metadata).await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn write_v3_posting_layout(
+        &mut self,
+        store: &dyn IndexStore,
+        docs: Arc<DocSet>,
+        target: PartitionWriteTarget,
+    ) -> Result<Vec<IndexFile>> {
+        let id = self.id;
+        let terms_schema =
+            inverted_list_schema_for_version(self.with_position, self.format_version);
+        let block_schema = posting_blocks_schema_v3();
+        let position_schema = self.with_position.then(posting_positions_schema_v3);
+        let coarse_schema = posting_coarse_skip_schema_v3();
+
+        let mut block_writer = store
+            .new_index_file(&target.posting_blocks_path(id), block_schema.clone())
+            .await?;
+        let mut position_writer = if let Some(schema) = position_schema.clone() {
+            Some(
+                store
+                    .new_index_file(&target.posting_positions_path(id), schema)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut coarse_writer = store
+            .new_index_file(&target.posting_coarse_skip_path(id), coarse_schema.clone())
+            .await?;
+
+        let posting_lists = std::mem::take(&mut self.posting_lists);
+        log::info!(
+            "writing {} V3 posting lists of partition {}, with position {}",
+            posting_lists.len(),
+            id,
+            self.with_position
+        );
+
+        let docs_for_batches = docs.clone();
+        let with_position = self.with_position;
+        let posting_tail_codec = self.format_version.posting_tail_codec();
+        let batch_rows = *LANCE_FTS_POSTING_BATCH_ROWS;
+        let (tx, rx) = async_channel::bounded(*LANCE_FTS_WRITE_QUEUE_SIZE);
+        let producer = tokio::spawn(async move {
+            let mut batch_builder = V3PostingLayoutBatchBuilder::new(
+                block_schema,
+                position_schema,
+                coarse_schema,
+                posting_tail_codec,
+                batch_rows,
+            );
+            let mut posting_lists = posting_lists.into_iter();
+            loop {
+                let docs_for_batches = docs_for_batches.clone();
+                let (next_builder, next_posting_lists, batch) = spawn_cpu(move || {
+                    let mut batch_builder = batch_builder;
+                    let mut posting_lists = posting_lists;
+                    let mut batch = None;
+                    for posting_list in posting_lists.by_ref() {
+                        posting_list
+                            .append_to_v3_layout_with_docs(&docs_for_batches, &mut batch_builder)?;
+                        if batch_builder.len() >= batch_rows {
+                            batch = Some(batch_builder.finish()?);
+                            break;
+                        }
+                    }
+                    if batch.is_none() && !batch_builder.is_empty() {
+                        batch = Some(batch_builder.finish()?);
+                    }
+                    Result::Ok((batch_builder, posting_lists, batch))
+                })
+                .await?;
+                batch_builder = next_builder;
+                posting_lists = next_posting_lists;
+
+                let Some(batch) = batch else {
+                    break;
+                };
+                if tx.send(batch).await.is_err() {
+                    break;
+                }
+            }
+
+            batch_builder.finish_terms(terms_schema)
+        });
+
+        while let Ok(batch) = rx.recv().await {
+            if let Err(err) = block_writer.write_record_batch(batch.blocks).await {
+                drop(rx);
+                let _ = producer.await;
+                return Err(err);
+            }
+            if let (Some(writer), Some(positions)) = (&mut position_writer, batch.positions)
+                && let Err(err) = writer.write_record_batch(positions).await
+            {
+                drop(rx);
+                let _ = producer.await;
+                return Err(err);
+            }
+            if let Some(coarse_skip) = batch.coarse_skip
+                && let Err(err) = coarse_writer.write_record_batch(coarse_skip).await
+            {
+                drop(rx);
+                let _ = producer.await;
+                return Err(err);
+            }
+        }
+        drop(rx);
+        let terms_batch = producer.await??;
+
+        let mut files = Vec::new();
+        files.push(block_writer.finish().await?);
+        if let Some(mut writer) = position_writer {
+            files.push(writer.finish().await?);
+        }
+        files.push(coarse_writer.finish().await?);
+
+        let mut terms_writer = store
+            .new_index_file(&target.posting_path(id), terms_batch.schema())
+            .await?;
+        terms_writer.write_record_batch(terms_batch).await?;
+        files.push(terms_writer.finish().await?);
+        if !with_position {
+            debug_assert!(
+                !files
+                    .iter()
+                    .any(|file| file.path == target.posting_positions_path(id))
+            );
+        }
+        Ok(files)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1228,6 +1389,18 @@ impl PartitionWriteTarget {
 
     fn posting_path(self, partition_id: u64) -> String {
         self.file_path(partition_id, INVERT_LIST_FILE)
+    }
+
+    fn posting_blocks_path(self, partition_id: u64) -> String {
+        self.file_path(partition_id, POSTING_BLOCKS_FILE)
+    }
+
+    fn posting_positions_path(self, partition_id: u64) -> String {
+        self.file_path(partition_id, POSTING_POSITIONS_FILE)
+    }
+
+    fn posting_coarse_skip_path(self, partition_id: u64) -> String {
+        self.file_path(partition_id, POSTING_COARSE_SKIP_FILE)
     }
 
     fn doc_path(self, partition_id: u64) -> String {
@@ -1344,10 +1517,7 @@ impl IndexWorker {
     }
 
     fn has_position(&self) -> bool {
-        self.schema
-            .column_with_name(COMPRESSED_POSITION_COL)
-            .is_some()
-            || self.schema.column_with_name(POSITION_COL).is_some()
+        schema_has_positions(self.schema.as_ref())
     }
 
     async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
@@ -1706,6 +1876,12 @@ impl IndexWorker {
     }
 }
 
+fn schema_has_positions(schema: &Schema) -> bool {
+    schema.column_with_name(COMPRESSED_POSITION_COL).is_some()
+        || schema.column_with_name(POSITION_COL).is_some()
+        || schema.metadata().contains_key(POSITIONS_LAYOUT_KEY)
+}
+
 #[derive(Debug, Clone)]
 pub enum PositionRecorder {
     Position(SmallVec<[u32; 2]>),
@@ -1793,6 +1969,7 @@ pub fn inverted_list_schema_for_version(
             PostingTailCodec::VarintDelta,
             Some(PositionStreamCodec::PackedDelta),
         ),
+        InvertedListFormatVersion::V3 => inverted_terms_schema_v3(with_position),
     }
 }
 
@@ -1892,12 +2069,106 @@ fn inverted_list_schema_with_tail_codec_and_position_codec(
     Arc::new(arrow_schema::Schema::new_with_metadata(fields, metadata))
 }
 
+fn inverted_terms_schema_v3(with_position: bool) -> SchemaRef {
+    let fields = vec![
+        arrow_schema::Field::new(LENGTH_COL, datatypes::DataType::UInt32, false),
+        arrow_schema::Field::new(MAX_SCORE_COL, datatypes::DataType::Float32, false),
+        arrow_schema::Field::new(BLOCK_START_COL, datatypes::DataType::UInt64, false),
+        arrow_schema::Field::new(NUM_BLOCKS_COL, datatypes::DataType::UInt32, false),
+    ];
+    let mut metadata = HashMap::from([
+        (
+            POSTING_TAIL_CODEC_KEY.to_owned(),
+            PostingTailCodec::VarintDelta.as_str().to_owned(),
+        ),
+        (
+            POSTING_BLOCK_LAYOUT_KEY.to_owned(),
+            POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3.to_owned(),
+        ),
+    ]);
+    if with_position {
+        metadata.insert(
+            POSITIONS_LAYOUT_KEY.to_owned(),
+            POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
+        );
+        metadata.insert(
+            POSITIONS_CODEC_KEY.to_owned(),
+            PositionStreamCodec::PackedDelta.as_str().to_owned(),
+        );
+    }
+    Arc::new(arrow_schema::Schema::new_with_metadata(fields, metadata))
+}
+
+pub(crate) fn posting_blocks_schema_v3() -> SchemaRef {
+    let fields = vec![
+        arrow_schema::Field::new(FIRST_DOC_ID_COL, datatypes::DataType::UInt32, false),
+        arrow_schema::Field::new(LAST_DOC_ID_COL, datatypes::DataType::UInt32, false),
+        arrow_schema::Field::new(BLOCK_MAX_SCORE_COL, datatypes::DataType::Float32, false),
+        arrow_schema::Field::new(POSTING_COL, datatypes::DataType::LargeBinary, false),
+    ];
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        HashMap::from([
+            (
+                POSTING_TAIL_CODEC_KEY.to_owned(),
+                PostingTailCodec::VarintDelta.as_str().to_owned(),
+            ),
+            (
+                POSTING_BLOCK_LAYOUT_KEY.to_owned(),
+                POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3.to_owned(),
+            ),
+        ]),
+    ))
+}
+
+pub(crate) fn posting_positions_schema_v3() -> SchemaRef {
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        vec![arrow_schema::Field::new(
+            COMPRESSED_POSITION_COL,
+            arrow_schema::DataType::LargeBinary,
+            false,
+        )],
+        HashMap::from([
+            (
+                POSITIONS_LAYOUT_KEY.to_owned(),
+                POSITIONS_LAYOUT_SHARED_STREAM_V2.to_owned(),
+            ),
+            (
+                POSITIONS_CODEC_KEY.to_owned(),
+                PositionStreamCodec::PackedDelta.as_str().to_owned(),
+            ),
+        ]),
+    ))
+}
+
+pub(crate) fn posting_coarse_skip_schema_v3() -> SchemaRef {
+    Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new(BLOCK_START_COL, datatypes::DataType::UInt64, false),
+        arrow_schema::Field::new(NUM_BLOCKS_COL, datatypes::DataType::UInt32, false),
+        arrow_schema::Field::new(FIRST_DOC_ID_COL, datatypes::DataType::UInt32, false),
+        arrow_schema::Field::new(LAST_DOC_ID_COL, datatypes::DataType::UInt32, false),
+        arrow_schema::Field::new(BLOCK_MAX_SCORE_COL, datatypes::DataType::Float32, false),
+    ]))
+}
+
 pub(crate) fn token_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, TOKENS_FILE)
 }
 
 pub(crate) fn posting_file_path(partition_id: u64) -> String {
     format!("part_{}_{}", partition_id, INVERT_LIST_FILE)
+}
+
+pub(crate) fn posting_blocks_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, POSTING_BLOCKS_FILE)
+}
+
+pub(crate) fn posting_positions_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, POSTING_POSITIONS_FILE)
+}
+
+pub(crate) fn posting_coarse_skip_file_path(partition_id: u64) -> String {
+    format!("part_{}_{}", partition_id, POSTING_COARSE_SKIP_FILE)
 }
 
 pub(crate) fn doc_file_path(partition_id: u64) -> String {
@@ -2088,7 +2359,10 @@ async fn merge_metadata_files(
         .map(|(new_id, &old_id)| (old_id, new_id as u64))
         .collect();
 
-    let total_copies = id_mapping.len() as u64 * PARTITION_FILE_SUFFIXES.len() as u64;
+    let params = params.unwrap_or_default();
+    let format_version = format_version.unwrap_or(InvertedListFormatVersion::V1);
+    let remap_suffixes = partition_file_suffixes_for_layout(format_version, params.with_position);
+    let total_copies = id_mapping.len() as u64 * remap_suffixes.len() as u64;
     progress
         .stage_start("remap_partition_files", Some(total_copies), "files")
         .await?;
@@ -2096,7 +2370,7 @@ async fn merge_metadata_files(
     let mut copied_files = 0u64;
 
     for &(old_id, new_id) in &id_mapping {
-        for suffix in PARTITION_FILE_SUFFIXES {
+        for suffix in &remap_suffixes {
             let staged_path = staged_partition_file_path(old_id, suffix);
             let final_path = partition_file_path(new_id, suffix);
             store
@@ -2112,7 +2386,6 @@ async fn merge_metadata_files(
 
     // Write merged metadata with remapped IDs
     let remapped_partitions: Vec<u64> = (0..id_mapping.len() as u64).collect();
-    let params = params.unwrap_or_default();
     let token_set_format = token_set_format.unwrap_or(TokenSetFormat::Arrow);
     let builder = InvertedIndexBuilder::from_existing_index(
         params,
@@ -2122,7 +2395,7 @@ async fn merge_metadata_files(
         None,
         deleted_fragments,
     )
-    .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
+    .with_format_version(format_version)
     .with_posting_tail_codec(posting_tail_codec.unwrap_or(PostingTailCodec::Fixed32));
     progress
         .stage_start("write_merged_metadata", Some(1), "files")
@@ -2138,7 +2411,7 @@ async fn merge_metadata_files(
         let _ = store.delete_index_file(file_name).await;
     }
     for &(old_id, _) in &id_mapping {
-        for suffix in PARTITION_FILE_SUFFIXES {
+        for suffix in &remap_suffixes {
             let _ = store
                 .delete_index_file(&staged_partition_file_path(old_id, suffix))
                 .await;
@@ -2146,6 +2419,32 @@ async fn merge_metadata_files(
     }
 
     Ok(())
+}
+
+fn partition_file_suffixes_for_layout(
+    format_version: InvertedListFormatVersion,
+    with_position: bool,
+) -> Vec<&'static str> {
+    let mut suffixes = PARTITION_FILE_SUFFIXES.to_vec();
+    suffixes.extend(v3_extra_partition_file_suffixes(
+        format_version,
+        with_position,
+    ));
+    suffixes
+}
+
+fn v3_extra_partition_file_suffixes(
+    format_version: InvertedListFormatVersion,
+    with_position: bool,
+) -> Vec<&'static str> {
+    if !format_version.uses_block_row_layout() {
+        return Vec::new();
+    }
+    let mut suffixes = vec![POSTING_BLOCKS_FILE, POSTING_COARSE_SKIP_FILE];
+    if with_position {
+        suffixes.push(POSTING_POSITIONS_FILE);
+    }
+    suffixes
 }
 
 /// Convert input stream into a stream of documents.
@@ -2221,6 +2520,14 @@ mod tests {
         let docs = Arc::new(StringArray::from(vec![Some(doc)]));
         let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
         RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
+    }
+
+    #[test]
+    fn test_v3_terms_schema_marks_positions_without_position_column() {
+        let schema = inverted_list_schema_for_version(true, InvertedListFormatVersion::V3);
+        assert!(schema.column_with_name(COMPRESSED_POSITION_COL).is_none());
+        assert!(schema.column_with_name(POSITION_COL).is_none());
+        assert!(schema_has_positions(schema.as_ref()));
     }
 
     struct FailingListObjectStore {
@@ -2801,10 +3108,31 @@ mod tests {
         partition_id: u64,
         target: PartitionWriteTarget,
     ) -> Result<()> {
-        write_partition_file_marker(store, &target.token_path(partition_id), partition_id).await?;
-        write_partition_file_marker(store, &target.posting_path(partition_id), partition_id)
+        write_partition_files_for_layout(
+            store,
+            partition_id,
+            target,
+            InvertedListFormatVersion::V2,
+            false,
+        )
+        .await
+    }
+
+    async fn write_partition_files_for_layout(
+        store: &dyn IndexStore,
+        partition_id: u64,
+        target: PartitionWriteTarget,
+        format_version: InvertedListFormatVersion,
+        with_position: bool,
+    ) -> Result<()> {
+        for suffix in partition_file_suffixes_for_layout(format_version, with_position) {
+            write_partition_file_marker(
+                store,
+                &target.file_path(partition_id, suffix),
+                partition_id,
+            )
             .await?;
-        write_partition_file_marker(store, &target.doc_path(partition_id), partition_id).await?;
+        }
         Ok(())
     }
 
@@ -2832,6 +3160,24 @@ mod tests {
             read_partition_file_marker(store, &doc_file_path(partition_id)).await?,
             expected_marker
         );
+        Ok(())
+    }
+
+    async fn assert_partition_file_markers_for_layout(
+        store: &dyn IndexStore,
+        partition_id: u64,
+        expected_marker: u64,
+        format_version: InvertedListFormatVersion,
+        with_position: bool,
+    ) -> Result<()> {
+        for suffix in partition_file_suffixes_for_layout(format_version, with_position) {
+            assert_eq!(
+                read_partition_file_marker(store, &partition_file_path(partition_id, suffix))
+                    .await?,
+                expected_marker,
+                "unexpected marker in partition file suffix {suffix}"
+            );
+        }
         Ok(())
     }
 
@@ -2904,6 +3250,83 @@ mod tests {
                         .await
                         .is_err(),
                     "staged partition files should be cleaned up after final metadata is written"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_merge_index_files_remaps_v3_staged_extra_files() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let base_store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = Arc::new(NoRenameStore::new(base_store.clone()));
+        let partitions = vec![5_u64, 1_u64];
+        let format_version = InvertedListFormatVersion::V3;
+        let with_position = true;
+        let metadata_builder = InvertedIndexBuilder::from_existing_index(
+            InvertedIndexParams::default().with_position(with_position),
+            None,
+            Vec::new(),
+            TokenSetFormat::default(),
+            None,
+            RoaringBitmap::new(),
+        )
+        .with_format_version(format_version);
+
+        for partition_id in &partitions {
+            write_partition_files_for_layout(
+                base_store.as_ref(),
+                *partition_id,
+                PartitionWriteTarget::Staged,
+                format_version,
+                with_position,
+            )
+            .await?;
+            metadata_builder
+                .write_part_metadata(base_store.as_ref(), *partition_id)
+                .await?;
+        }
+
+        merge_index_files(
+            object_store.as_ref(),
+            &index_dir.obj_path(),
+            store,
+            noop_progress(),
+        )
+        .await?;
+
+        let metadata_reader = base_store.open_index_file(METADATA_FILE).await?;
+        let metadata = &metadata_reader.schema().metadata;
+        assert_eq!(
+            metadata.get(POSTING_BLOCK_LAYOUT_KEY).map(String::as_str),
+            Some(POSTING_BLOCK_LAYOUT_BLOCK_ROW_V3)
+        );
+
+        let mut expected_partitions = partitions.clone();
+        expected_partitions.sort_unstable();
+        for (new_id, old_id) in expected_partitions.iter().enumerate() {
+            assert_partition_file_markers_for_layout(
+                base_store.as_ref(),
+                new_id as u64,
+                *old_id,
+                format_version,
+                with_position,
+            )
+            .await?;
+            for suffix in partition_file_suffixes_for_layout(format_version, with_position) {
+                assert!(
+                    base_store
+                        .open_index_file(&staged_partition_file_path(*old_id, suffix))
+                        .await
+                        .is_err(),
+                    "staged V3 partition file suffix {suffix} should be cleaned up"
                 );
             }
         }

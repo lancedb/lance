@@ -1019,6 +1019,40 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    async fn prewarm_fts_v3_top_blocks_for_queries(
+        &self,
+        name: &str,
+        queries: &[String],
+        percent: usize,
+        with_position: bool,
+    ) -> Result<usize> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::index_not_found(format!("name={}", name)));
+        }
+
+        let mut warmed_blocks = 0usize;
+        for index_meta in indices {
+            let index = self
+                .open_generic_index(name, &index_meta.uuid, &NoOpMetricsCollector)
+                .await?;
+            let inverted = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "V3 top-block FTS prewarm is only supported for inverted indices, got {:?}",
+                        index.index_type()
+                    ))
+                })?;
+            warmed_blocks += inverted
+                .prewarm_v3_top_blocks_for_queries(queries, percent, with_position)
+                .await?;
+        }
+
+        Ok(warmed_blocks)
+    }
+
     async fn describe_indices<'a, 'b>(
         &'a self,
         criteria: Option<IndexCriteria<'b>>,

@@ -2462,7 +2462,7 @@ impl Dataset {
                             value.to_string()
                         } else {
                             return Err(PyValueError::new_err(
-                                "format_version must be 1, 2, 'v1', or 'v2'",
+                                "format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'",
                             ));
                         };
                         let format_version = value
@@ -2613,6 +2613,27 @@ impl Dataset {
             } else {
                 self.ds.prewarm_index(name).await
             }
+        })?
+        .infer_error()
+    }
+
+    #[pyo3(signature = (name, queries, percent, *, with_position = false))]
+    fn _prewarm_fts_v3_top_blocks_for_queries(
+        &self,
+        name: &str,
+        queries: Vec<String>,
+        percent: usize,
+        with_position: bool,
+    ) -> PyResult<usize> {
+        rt().block_on(None, async {
+            self.ds
+                .prewarm_fts_v3_top_blocks_for_queries(
+                    name,
+                    &queries,
+                    percent,
+                    with_position,
+                )
+                .await
         })?
         .infer_error()
     }

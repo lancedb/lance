@@ -167,6 +167,19 @@ pub trait DatasetIndexExt {
         ))
     }
 
+    /// Prewarm the highest-scoring V3 posting blocks for the supplied FTS queries.
+    async fn prewarm_fts_v3_top_blocks_for_queries(
+        &self,
+        _name: &str,
+        _queries: &[String],
+        _percent: usize,
+        _with_position: bool,
+    ) -> Result<usize> {
+        Err(Error::not_supported(
+            "V3 top-block FTS prewarm is not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
     /// Read all indices of this Dataset version.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
