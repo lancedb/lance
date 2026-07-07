@@ -13,6 +13,7 @@ use arrow_buffer::{Buffer, MutableBuffer};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Schema;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_linalg::distance::DistanceType;
 use log::{info, warn};
 use rand::rngs::SmallRng;
@@ -473,6 +474,7 @@ async fn sample_training_data(
         .data_type()
         .byte_width_opt()
         .unwrap_or(4 * 1024);
+    let compact_readahead = get_num_compute_intensive_cpus().max(1);
 
     if let Some(fragment_ids) = fragment_ids {
         if !is_nullable {
@@ -495,7 +497,15 @@ async fn sample_training_data(
         )?;
         return match vector_field.data_type() {
             DataType::FixedSizeList(_, _) => {
-                sample_nullable_fsl(column, sample_size_hint, byte_width, vector_field, scan).await
+                sample_nullable_fsl(
+                    column,
+                    sample_size_hint,
+                    byte_width,
+                    vector_field,
+                    scan,
+                    compact_readahead,
+                )
+                .await
             }
             _ => sample_nullable_fallback(column, sample_size_hint, is_nullable, scan).await,
         };
@@ -516,7 +526,15 @@ async fn sample_training_data(
         DataType::FixedSizeList(_, _) => {
             let scan =
                 sample_training_data_scan(dataset, column, sample_size_hint, num_rows, byte_width)?;
-            sample_nullable_fsl(column, sample_size_hint, byte_width, vector_field, scan).await
+            sample_nullable_fsl(
+                column,
+                sample_size_hint,
+                byte_width,
+                vector_field,
+                scan,
+                compact_readahead,
+            )
+            .await
         }
         _ => {
             let scan =
@@ -708,6 +726,38 @@ fn fsl_values_to_array(
     )?)
 }
 
+struct CompactedFslBatch {
+    num_rows: usize,
+    num_non_null: usize,
+    values: Buffer,
+}
+
+fn compact_nullable_fsl_batch(
+    batch: RecordBatch,
+    column: &str,
+    byte_width: usize,
+) -> Result<CompactedFslBatch> {
+    let num_rows = batch.num_rows();
+    let array = get_column_from_batch(&batch, column)?;
+    if array.logical_null_count() >= array.len() {
+        return Ok(CompactedFslBatch {
+            num_rows,
+            num_non_null: 0,
+            values: MutableBuffer::new(0).into(),
+        });
+    }
+
+    let mut values_buf = MutableBuffer::with_capacity(num_rows * byte_width);
+    let mut num_non_null = 0;
+    accumulate_fsl_values(&mut values_buf, &mut num_non_null, &array, byte_width, true)?;
+
+    Ok(CompactedFslBatch {
+        num_rows,
+        num_non_null,
+        values: values_buf.into(),
+    })
+}
+
 /// Stream-and-compact sampling for nullable FixedSizeList vector columns.
 ///
 /// Unlike [`sample_nullable_fallback`], which must collect all source batches
@@ -720,42 +770,52 @@ async fn sample_nullable_fsl<S>(
     sample_size_hint: usize,
     byte_width: usize,
     vector_field: &lance_core::datatypes::Field,
-    mut scan: S,
+    scan: S,
+    compact_readahead: usize,
 ) -> Result<FixedSizeListArray>
 where
-    S: Stream<Item = Result<RecordBatch>> + Unpin,
+    S: Stream<Item = Result<RecordBatch>> + Unpin + Send,
 {
     let mut values_buf = MutableBuffer::with_capacity(sample_size_hint * byte_width);
     let mut num_non_null: usize = 0;
     let mut batch_count: usize = 0;
     let mut rows_scanned: usize = 0;
+    let column = Arc::<str>::from(column);
+    let mut compacted_batches = scan
+        .map(|batch| {
+            let column = column.clone();
+            spawn_cpu(move || {
+                let batch = batch?;
+                compact_nullable_fsl_batch(batch, &column, byte_width)
+            })
+        })
+        .buffered(compact_readahead.max(1));
 
     while num_non_null < sample_size_hint {
-        let Some(batch) = scan.next().await else {
+        let Some(batch) = compacted_batches.next().await else {
             break;
         };
         let batch = batch?;
         batch_count += 1;
-        rows_scanned += batch.num_rows();
-        let array = get_column_from_batch(&batch, column)?;
-        if array.logical_null_count() >= array.len() {
+        rows_scanned += batch.num_rows;
+        if batch.num_non_null == 0 {
             info!(
                 "Sample training data: batch {} read {} rows ({} scanned, {}/{} sampled after null filtering)",
                 batch_count,
-                batch.num_rows(),
+                batch.num_rows,
                 rows_scanned,
                 num_non_null.min(sample_size_hint),
                 sample_size_hint
             );
             continue;
         }
-        let previous_num_non_null = num_non_null;
-        accumulate_fsl_values(&mut values_buf, &mut num_non_null, &array, byte_width, true)?;
+        values_buf.extend_from_slice(batch.values.as_slice());
+        num_non_null += batch.num_non_null;
         info!(
             "Sample training data: batch {} read {} rows, accepted {} rows ({} scanned, {}/{} sampled after null filtering)",
             batch_count,
-            batch.num_rows(),
-            num_non_null - previous_num_non_null,
+            batch.num_rows,
+            batch.num_non_null,
             rows_scanned,
             num_non_null.min(sample_size_hint),
             sample_size_hint
