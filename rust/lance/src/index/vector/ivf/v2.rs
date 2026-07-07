@@ -122,6 +122,22 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) rq_search_cache: RabitSearchCacheCell,
 }
 
+/// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
+/// streaming search path.
+///
+/// The streaming path deliberately avoids per-partition CPU-task fan-out (a measured
+/// 14-30% latency win, see #6475). Searching a batch of partitions per `spawn_cpu`
+/// keeps most of that benefit — the per-dispatch overhead is paid once per
+/// `STREAMING_SEARCH_BATCH_SIZE` partitions instead of once per partition — while
+/// keeping the channel `recv`/`send` in async code so no CPU-pool thread ever parks on
+/// a channel (which can deadlock the pool on small hosts, see #7642). `should_stop` is
+/// still checked per partition, so early-stop granularity is unchanged.
+///
+/// This is a tunable knob: larger batches amortize dispatch overhead further and keep
+/// more work on a single CPU thread, at the cost of a higher time-to-first-result and
+/// more prepared partitions held in memory at once.
+pub(crate) const STREAMING_SEARCH_BATCH_SIZE: usize = 16;
+
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
     query: Query,
     pre_filter: Arc<dyn PreFilter>,
@@ -1665,61 +1681,112 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
         let search_metrics = metrics.clone();
-        let batch_tx_for_search = batch_tx.clone();
         let search_control = control.clone();
         let scratch_pool = self.scratch_pool.clone();
+        // Search prepared partitions in batches. Each batch is searched in a single
+        // `spawn_cpu` dispatch (amortizing the per-dispatch overhead the single-worker
+        // design in #6475 avoided), but the channel `recv`/`send` stay in async code so
+        // no CPU-pool thread ever parks on a channel — parking one can deadlock the pool
+        // on small hosts (#7642). `should_stop` is checked per partition, so early-stop
+        // granularity is unchanged.
         tokio::spawn(async move {
-            let search_result = spawn_cpu(move || -> DataFusionResult<()> {
-                scratch_pool.with_scratch(|scratch| {
-                    while let Some(prepared) = prepared_rx.blocking_recv() {
-                        let prepared = match prepared {
-                            Ok(prepared) => prepared,
-                            Err(err) => {
-                                let _ = batch_tx_for_search
-                                    .blocking_send(Err(DataFusionError::from(err)));
-                                return Ok(());
-                            }
-                        };
-
-                        if search_control
-                            .as_ref()
-                            .is_some_and(|control| control.should_stop())
-                        {
-                            return Ok(());
+            loop {
+                let mut prepared_batch = Vec::with_capacity(STREAMING_SEARCH_BATCH_SIZE);
+                let mut prepare_error = None;
+                let mut producer_done = false;
+                while prepared_batch.len() < STREAMING_SEARCH_BATCH_SIZE {
+                    // Stop pulling as soon as the search is done so the producer stops
+                    // preparing partitions we would never search.
+                    if search_control
+                        .as_ref()
+                        .is_some_and(|control| control.should_stop())
+                    {
+                        return;
+                    }
+                    match prepared_rx.recv().await {
+                        Some(Ok(prepared)) => prepared_batch.push(prepared),
+                        Some(Err(err)) => {
+                            prepare_error = Some(DataFusionError::from(err));
+                            break;
                         }
-
-                        let batch = {
-                            Self::run_prepared_partition_search(
-                                use_query_residual,
-                                use_residual_scratch,
-                                prepared,
-                                search_metrics.as_ref(),
-                                scratch,
-                            )
-                        }
-                        .map_err(DataFusionError::from);
-                        match batch {
-                            Ok(batch) => {
-                                if let Some(control) = search_control.as_ref() {
-                                    control.record_batch(&batch);
-                                }
-                                if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            Err(err) => {
-                                let _ = batch_tx_for_search.blocking_send(Err(err));
-                                return Ok(());
-                            }
+                        None => {
+                            producer_done = true;
+                            break;
                         }
                     }
-                    Ok(())
-                })
-            })
-            .await;
+                }
 
-            if let Err(err) = search_result {
-                let _ = batch_tx.send(Err(err)).await;
+                if !prepared_batch.is_empty() {
+                    let scratch_pool = scratch_pool.clone();
+                    let search_metrics = search_metrics.clone();
+                    let search_control = search_control.clone();
+                    let search_output = spawn_cpu(move || {
+                        let mut outputs: Vec<DataFusionResult<RecordBatch>> =
+                            Vec::with_capacity(prepared_batch.len());
+                        // `stopped` means the whole search should end (an error, or an
+                        // early-stop signal), not just this batch.
+                        let mut stopped = false;
+                        scratch_pool.with_scratch(|scratch| {
+                            for prepared in prepared_batch {
+                                if search_control
+                                    .as_ref()
+                                    .is_some_and(|control| control.should_stop())
+                                {
+                                    stopped = true;
+                                    break;
+                                }
+                                match Self::run_prepared_partition_search(
+                                    use_query_residual,
+                                    use_residual_scratch,
+                                    prepared,
+                                    search_metrics.as_ref(),
+                                    scratch,
+                                )
+                                .map_err(DataFusionError::from)
+                                {
+                                    Ok(batch) => {
+                                        if let Some(control) = search_control.as_ref() {
+                                            control.record_batch(&batch);
+                                        }
+                                        outputs.push(Ok(batch));
+                                    }
+                                    Err(err) => {
+                                        outputs.push(Err(err));
+                                        stopped = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        Ok::<_, DataFusionError>((outputs, stopped))
+                    })
+                    .await;
+
+                    let (outputs, stopped) = match search_output {
+                        Ok(output) => output,
+                        // `spawn_cpu` only fails if the closure panics; forward and stop.
+                        Err(err) => {
+                            let _ = batch_tx.send(Err(err)).await;
+                            return;
+                        }
+                    };
+                    for output in outputs {
+                        if batch_tx.send(output).await.is_err() {
+                            return;
+                        }
+                    }
+                    if stopped {
+                        return;
+                    }
+                }
+
+                if let Some(err) = prepare_error {
+                    let _ = batch_tx.send(Err(err)).await;
+                    return;
+                }
+                if producer_done {
+                    return;
+                }
             }
         });
 
