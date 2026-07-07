@@ -52,9 +52,7 @@ applies.
 
 Deletions take precedence over overlays. If a row offset is marked deleted in the
 fragment's deletion file, any overlay value for that offset is dead and is
-ignored, regardless of commit order. This keeps the invariant simple: a deletion
-is the final word on a row, so a concurrent overlay against a row that was
-deleted needs no special conflict handling — its values are merely inert.
+ignored, regardless of commit order.
 
 ### Physical layout
 
@@ -296,7 +294,7 @@ correctly dropped.
 ```sql
 MERGE INTO users USING staged ON users.id = staged.id
 WHEN MATCHED AND staged.kind = 'rename'  THEN UPDATE SET name = staged.name        -- Carol(2), Dave(3)
-WHEN MATCHED AND staged.kind = 'revec'   THEN UPDATE SET embedding = staged.embedding -- Bob(1)
+WHEN MATCHED AND staged.kind = 'embed'   THEN UPDATE SET embedding = staged.embedding -- Bob(1)
 ```
 
 `name` is updated for offsets `{2, 3}` and `embedding` for offset `{1}` — different
@@ -333,7 +331,7 @@ Overlays from different versions coexist and apply per field.
 The scheduler folds both overlays into fragment `0` at version 4, computing
 post-images for `age`, `name`, and `embedding`, and writing a new base data file
 `data/file1.lance` with those columns. In the old file, fields 2, 3, and 4 are
-tombstoned (`-2`); field 1 (`id`) remains. The fragment's `overlays` list is
+marked with a tombstone (`-2`); field 1 (`id`) remains. The fragment's `overlays` list is
 cleared. Row addresses are preserved (a column rewrite, not a row rewrite), so
 stable row IDs and the deletion vector are untouched.
 
@@ -383,24 +381,11 @@ overlays in one transaction.
 different costs; a cost/benefit scheduler decides when each is worthwhile, using
 the version gap as a staleness signal.
 
-### Open questions
-
-*(To be resolved.)*
-
-- **Per-fragment vs. per-table overlays.** Overlays are attached per fragment.
-  Should there be a table-level overlay concept, and how would it interact with
-  fragment-level row addressing?
-- **Relationship to LSM.** Overlays plus compaction resemble an LSM tree (newest
-  layer wins, periodic merge). How far should that analogy be taken, and what do
-  we deliberately do differently given Lance's random-access requirements?
-- **Coverage bitmap spill.** Coverage bitmaps live inline in the manifest. Very
-  large coverage (an overlay touching many rows) may warrant external spill, as
-  the row-ID and last-updated-at sequences already do above a size threshold.
-
 ## Related specifications
 
 - [Table format overview](index.md)
-- [Transactions](transaction.md)
+- [Transactions: DataOverlay operation](transaction.md#dataoverlay) — write path
+  and conflict semantics
 - [Row ID & Lineage](row_id_lineage.md)
-- [Index Formats](../index/index.md)
+- [Index Formats: handling overlay rows](../index/index.md#handling-deleted-and-invalidated-rows)
 - [Format Versioning](versioning.md)

@@ -330,25 +330,9 @@ message Transaction {
 
   // Attach overlay files to fragments, supplying new values for a subset of
   // (row offset, field) cells without rewriting the fragments' base data files.
-  // See the DataOverlayFile message in table.proto and the Data Overlay Files
-  // specification for resolution, coverage, and versioning rules.
-  //
-  // Conflict semantics (intentionally permissive, like DataReplacement). Against
-  // a concurrent operation that touches one of the same fragments:
-  //  * Another DataOverlay (any fields): COMPATIBLE. Overlays stack; when two
-  //    overlays cover the same (offset, field) the one with the higher
-  //    `committed_version` wins, so independent backfills never conflict.
-  //  * Append / new fragments: COMPATIBLE.
-  //  * Delete: COMPATIBLE. A deletion takes precedence over an overlay, so an
-  //    overlay value for a deleted offset is inert (no special handling needed).
-  //  * DataReplacement or column-rewrite (Update with REWRITE_COLUMNS) of the
-  //    same field: COMPATIBLE. Both preserve physical row addresses, so overlay
-  //    offsets stay valid; the overlay is newer and wins its covered cells, and
-  //    the version gate excludes those cells from any rebuilt index.
-  //  * Row-rewrite, compaction, or an overlay->base fold of the fragment:
-  //    CONFLICT. These change physical row addresses or consume the overlays, so
-  //    the overlay's offsets are no longer valid. The writer must re-read the new
-  //    fragment, recompute, and retry.
+  // See the DataOverlayFile message in table.proto for resolution, coverage, and
+  // versioning rules, and the Data Overlay Files and Transactions specifications
+  // for the (intentionally permissive) conflict semantics.
   message DataOverlay {
     repeated DataOverlayGroup groups = 1;
   }
