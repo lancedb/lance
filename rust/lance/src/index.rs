@@ -866,14 +866,6 @@ impl IndexDescription for IndexDescriptionImpl {
         let Some(details) = self.details.as_ref() else {
             return Ok("{}".to_string());
         };
-        // The MemWAL system index has no scalar/vector plugin — decode its state
-        // directly. Identified by system-index name, mirroring try_new's ordering.
-        if matches!(
-            lance_index::infer_system_index_type(&self.segments[0]),
-            Some(IndexType::MemWal)
-        ) {
-            return crate::index::mem_wal::mem_wal_details_as_json(&details.0);
-        }
         if details.is_vector() {
             vector_details_as_json(&details.0)
         } else {
