@@ -36,6 +36,7 @@ import java.util.List;
  * <pre>{@code
  * try (ShardWriter writer = dataset.memWalWriter(shardId)) {
  *   writer.put(reader);
+ *   writer.delete(keys);
  * }
  * }</pre>
  *
@@ -98,6 +99,34 @@ public class ShardWriter implements Closeable {
   }
 
   private native void nativePut(long streamAddress);
+
+  /**
+   * Delete rows from the MemWAL by primary key.
+   *
+   * <p>Each batch in {@code reader} must carry this shard's primary key column(s); other columns
+   * are ignored. Lance builds a tombstone row per key — the primary key plus {@code _tombstone =
+   * true} and null in every other column — and appends it like an ordinary write. The tombstone is
+   * the newest value for its key: it wins newest-per-PK resolution (suppressing the older real row)
+   * and is then dropped from query results.
+   *
+   * <p>Only supported in memtable mode. Because a tombstone nulls every non-PK column, those
+   * columns must be nullable in the base schema; deleting against a schema with a non-nullable
+   * non-PK column errors. Deleting on a shard with no primary key columns also errors.
+   *
+   * @param reader the keys to delete; consumed fully by this call
+   */
+  public void delete(ArrowReader reader) {
+    Preconditions.checkNotNull(reader, "reader must not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeShardWriterHandle != 0, "ShardWriter is closed");
+      try (ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+        nativeDelete(stream.memoryAddress());
+      }
+    }
+  }
+
+  private native void nativeDelete(long streamAddress);
 
   /** Return a snapshot of cumulative write statistics. */
   public WriteStats stats() {
