@@ -505,13 +505,24 @@ The following operations are retryable conflicts with DataOverlay:
   overlay→base fold changes physical row addresses or consumes the overlays, so
   the overlay's offsets are no longer valid; the writer must re-read the new
   fragment, recompute, and retry.
-- Merge (always)
+- Merge (always).
+- A row-moving Update that touches an overlaid fragment — a delete-and-reinsert
+  update (any update that is not a `REWRITE_COLUMNS` column rewrite) relocates the
+  updated rows into new fragments, so the overlay's physical offsets no longer
+  address them; the writer must re-read and retry.
 
-DataOverlay is compatible with another DataOverlay (any fields), Append, Delete,
-and DataReplacement or a column rewrite (Update with `REWRITE_COLUMNS`) of the same
-field, because all of these preserve physical row addresses: overlay offsets stay
-valid, the overlay is newer and wins its covered cells, and the version gate
-excludes those cells from any rebuilt index.
+DataOverlay is compatible with another DataOverlay (any fields), Append, Delete, a
+`REWRITE_COLUMNS` column rewrite, and DataReplacement, because all of these
+preserve physical row addresses: overlay offsets stay valid, the overlay is newer
+and wins its covered cells, and the version gate excludes those cells from any
+rebuilt index.
+
+When a DataReplacement or a `REWRITE_COLUMNS` update writes new base values for a
+field, it supersedes any older overlay on that field: the writer tombstones the
+overlay's entry for the rewritten field — replacing the field id with the obsolete
+sentinel, as with obsolete base columns — so the fresh base values are not silently
+shadowed. Overlay entries for other fields are preserved, and an overlay left with
+no live fields is dropped.
 
 ### UpdateMemWalState
 

@@ -31,9 +31,9 @@ use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataOverlayFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata,
-        Manifest, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
-        RowIdMeta, pb,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
+        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        overlay::DataOverlayFile, pb,
     },
     io::{
         commit::CommitHandler,
@@ -1945,7 +1945,20 @@ impl Transaction {
                             return None;
                         }
                         if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
-                            Some(updated.clone())
+                            let mut updated = updated.clone();
+                            // Carry forward the fragment's current overlays (which
+                            // may include ones added by a concurrent commit). An
+                            // in-place column rewrite then tombstones the overlaid
+                            // fields it rewrote, since the fresh base values
+                            // supersede them.
+                            updated.overlays = f.overlays.clone();
+                            if matches!(update_mode, Some(RewriteColumns)) {
+                                lance_table::format::overlay::tombstone_overlay_fields(
+                                    &mut updated.overlays,
+                                    fields_modified,
+                                );
+                            }
+                            Some(updated)
                         } else {
                             Some(f.clone())
                         }
@@ -2292,6 +2305,15 @@ impl Transaction {
                             "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
                         ));
                     }
+
+                    // New base values for these fields supersede any overlay
+                    // still shadowing them; tombstone the overlaid fields so the
+                    // replacement is not silently masked.
+                    lance_table::format::overlay::tombstone_overlay_fields(
+                        &mut new_frag.overlays,
+                        &replaced_fields,
+                    );
+
                     final_fragments.push(new_frag);
                 }
 
@@ -4001,9 +4023,9 @@ mod tests {
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::LanceFileVersion;
     use lance_io::utils::CachedFileSize;
+    use lance_table::format::overlay::OverlayCoverage;
     use lance_table::format::{
-        OverlayCoverage, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
-        RowIdMeta,
+        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
     };
     use lance_table::rowids::segment::U64Segment;
     use lance_table::rowids::write_row_ids;
@@ -6386,53 +6408,14 @@ mod tests {
     }
 
     #[test]
-    fn test_data_overlay_build_manifest_appends_and_stamps() {
-        // A fragment already carrying an overlay (committed at v3) gets a new
-        // overlay appended and stamped to the new dataset version; the existing
-        // overlay is preserved with its version.
-        let mut fragment = Fragment::new(0);
-        fragment.overlays = vec![overlay_with_field(1, 3)];
-        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
-        let manifest = Manifest::new(
-            LanceSchema::try_from(&schema).unwrap(),
-            Arc::new(vec![fragment]),
-            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
-            HashMap::new(),
-        );
-
-        let txn = Transaction::new(
-            manifest.version,
-            Operation::DataOverlay {
-                groups: vec![DataOverlayGroup {
-                    fragment_id: 0,
-                    overlays: vec![overlay_with_field(2, 0)],
-                }],
-            },
-            None,
-        );
-
-        let (result, _) = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default(),
-            )
-            .unwrap();
-
-        let frag = &result.fragments[0];
-        assert_eq!(frag.overlays.len(), 2);
-        assert_eq!(frag.overlays[0].committed_version, 3);
-        assert_eq!(frag.overlays[1].committed_version, result.version);
-        assert!(result.version > manifest.version);
-    }
-
-    #[test]
     fn test_data_overlay_build_manifest_multi_fragment() {
-        // Overlays targeting two distinct fragments are each applied and stamped,
-        // while a fragment the operation does not target is passed through with
-        // its existing overlays untouched.
-        let frag0 = Fragment::new(0);
+        // Overlays targeting two distinct fragments are each applied and stamped.
+        // A targeted fragment already carrying an overlay (committed at v3) gets
+        // the new overlay appended and stamped while its existing overlay is
+        // preserved, and a fragment the operation does not target is passed
+        // through with its existing overlays untouched.
+        let mut frag0 = Fragment::new(0);
+        frag0.overlays = vec![overlay_with_field(5, 3)]; // targeted, pre-existing at v3
         let frag1 = Fragment::new(1);
         let mut frag2 = Fragment::new(2);
         frag2.overlays = vec![overlay_with_field(9, 3)]; // untargeted, committed at v3
@@ -6477,14 +6460,82 @@ mod tests {
                 .find(|f| f.id == id)
                 .unwrap_or_else(|| panic!("fragment {id} missing from result"))
         };
-        // Both targeted fragments get their overlay, stamped to the new version.
-        assert_eq!(frag(0).overlays.len(), 1);
-        assert_eq!(frag(0).overlays[0].committed_version, result.version);
+        // The already-overlaid target keeps its v3 overlay and appends the new
+        // one, stamped to the new version.
+        assert_eq!(frag(0).overlays.len(), 2);
+        assert_eq!(frag(0).overlays[0].committed_version, 3);
+        assert_eq!(frag(0).overlays[1].committed_version, result.version);
+        // The fresh target gets its overlay, stamped to the new version.
         assert_eq!(frag(1).overlays.len(), 1);
         assert_eq!(frag(1).overlays[0].committed_version, result.version);
         // The untargeted fragment is unchanged: same overlay, original version.
         assert_eq!(frag(2).overlays.len(), 1);
         assert_eq!(frag(2).overlays[0].committed_version, 3);
+        assert!(result.version > manifest.version);
+    }
+
+    #[test]
+    fn test_data_replacement_tombstones_overlaid_fields() {
+        // A DataReplacement writing new base values for field 5 must stop any
+        // overlay from shadowing those cells: field 5 is tombstoned in place
+        // (preserving the overlay's field 3), and an overlay covering only field
+        // 5 is dropped entirely.
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![
+            DataFile::new_legacy_from_fields("f3.lance", vec![3], None),
+            DataFile::new_legacy_from_fields("f5.lance", vec![5], None),
+        ];
+        fragment.overlays = vec![
+            DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("o35.lance", vec![3, 5], None),
+                coverage: OverlayCoverage::sparse(vec![
+                    roaring::RoaringBitmap::from_iter([0u32]),
+                    roaring::RoaringBitmap::from_iter([0u32]),
+                ]),
+                committed_version: 3,
+            },
+            DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("o5.lance", vec![5], None),
+                coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+                committed_version: 3,
+            },
+        ];
+
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![fragment]),
+            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("f5-new.lance", vec![5], None),
+                )],
+            },
+            None,
+        );
+
+        let (result, _) = txn
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let frag = &result.fragments[0];
+        // The base data file for field 5 was swapped in.
+        assert!(frag.files.iter().any(|f| f.path == "f5-new.lance"));
+        // The [3, 5] overlay keeps field 3 and tombstones field 5; the [5]-only
+        // overlay is dropped.
+        assert_eq!(frag.overlays.len(), 1);
+        assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
     }
 
     #[test]

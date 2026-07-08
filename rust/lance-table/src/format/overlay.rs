@@ -25,6 +25,13 @@
 //!   stable-sorted by `committed_version` on load (see [`sort_overlays_newest_last`]),
 //!   with list position breaking ties for equal versions. When two overlays cover
 //!   the same `(offset, field)`, the higher `committed_version` wins.
+//! - **Field tombstones.** When new base values are written for a field (a
+//!   DataReplacement, or an in-place column rewrite), any overlay value for that
+//!   field is stale and must stop shadowing the fresh base. The field is marked
+//!   obsolete in the overlay's `data_file.fields` with [`TOMBSTONE_FIELD_ID`]
+//!   (the same sentinel used for obsolete base columns) rather than physically
+//!   removed, so the overlay's other fields — and its coverage positions — stay
+//!   intact (see [`tombstone_overlay_fields`]).
 
 use std::sync::Arc;
 
@@ -36,6 +43,11 @@ use serde::{Deserialize, Serialize};
 
 use super::DataFile;
 use crate::format::pb;
+
+/// Field-id sentinel marking a tombstoned (obsolete) field within an overlay's
+/// `data_file.fields`. Matches the tombstone convention for obsolete columns in
+/// base data files; a tombstoned field's values are ignored on read.
+pub const TOMBSTONE_FIELD_ID: i32 = -2;
 
 /// Which `(physical offset, field)` cells a [`DataOverlayFile`] provides values
 /// for.
@@ -181,6 +193,41 @@ pub fn sort_overlays_newest_last(overlays: &mut [DataOverlayFile]) {
     overlays.sort_by_key(|overlay| overlay.committed_version);
 }
 
+/// Tombstone `fields` across a fragment's `overlays`, dropping any overlay left
+/// with no live fields.
+///
+/// Called when new base values are written for those fields (a DataReplacement,
+/// or an in-place column rewrite): the stale overlay values must stop shadowing
+/// the fresh base. Each matching field id is replaced with [`TOMBSTONE_FIELD_ID`]
+/// in place, preserving the overlay's remaining fields and its coverage positions
+/// (a per-field coverage bitmap stays aligned with `data_file.fields`). An overlay
+/// whose fields are now all tombstoned is removed entirely. See the [module
+/// documentation](self) for the tombstone invariant.
+pub fn tombstone_overlay_fields(overlays: &mut Vec<DataOverlayFile>, fields: &[u32]) {
+    for overlay in overlays.iter_mut() {
+        let tombstoned: Vec<i32> = overlay
+            .data_file
+            .fields
+            .iter()
+            .map(|&field| {
+                if field >= 0 && fields.contains(&(field as u32)) {
+                    TOMBSTONE_FIELD_ID
+                } else {
+                    field
+                }
+            })
+            .collect();
+        overlay.data_file.fields = tombstoned.into();
+    }
+    overlays.retain(|overlay| {
+        overlay
+            .data_file
+            .fields
+            .iter()
+            .any(|&field| field != TOMBSTONE_FIELD_ID)
+    });
+}
+
 impl From<&DataOverlayFile> for pb::DataOverlayFile {
     fn from(overlay: &DataOverlayFile) -> Self {
         let coverage = match &overlay.coverage {
@@ -279,6 +326,45 @@ mod tests {
             let back: OverlayCoverage = serde_json::from_str(&json).unwrap();
             assert_eq!(back, coverage);
         }
+    }
+
+    #[test]
+    fn test_tombstone_overlay_fields() {
+        // An overlay covering fields [3, 5]: replacing field 5 tombstones just
+        // field 5's slot and keeps field 3. An overlay covering only field 5 is
+        // dropped entirely. An overlay touching no replaced field is untouched.
+        let mut overlays = vec![
+            DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("a.lance", vec![3, 5], None),
+                coverage: OverlayCoverage::sparse(vec![
+                    RoaringBitmap::from_iter([0u32]),
+                    RoaringBitmap::from_iter([1u32]),
+                ]),
+                committed_version: 1,
+            },
+            DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("b.lance", vec![5], None),
+                coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                committed_version: 1,
+            },
+            DataOverlayFile {
+                data_file: DataFile::new_legacy_from_fields("c.lance", vec![7], None),
+                coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                committed_version: 1,
+            },
+        ];
+
+        tombstone_overlay_fields(&mut overlays, &[5]);
+
+        // The single-field overlay on field 5 is gone; the others remain.
+        assert_eq!(overlays.len(), 2);
+        // Field 3 preserved, field 5 tombstoned in place (coverage stays aligned).
+        assert_eq!(
+            overlays[0].data_file.fields.as_ref(),
+            &[3, TOMBSTONE_FIELD_ID]
+        );
+        // The untouched overlay keeps its field.
+        assert_eq!(overlays[1].data_file.fields.as_ref(), &[7]);
     }
 
     #[test]

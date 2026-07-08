@@ -756,7 +756,7 @@ impl From<&Fragment> for pb::DataFragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::OverlayCoverage;
+    use crate::format::overlay::OverlayCoverage;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
