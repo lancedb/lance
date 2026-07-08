@@ -782,12 +782,9 @@ impl IndexDescriptionImpl {
 
         for shard in &segments {
             let Some(fragment_bitmap) = shard.fragment_bitmap.as_ref() else {
-                // A system index (e.g. __mem_wal) is an inline state record that
-                // indexes no fragments, so a missing bitmap is expected and
-                // contributes zero indexed rows. For a data index a missing bitmap
-                // means the covered fragment set is unknown (the index predates
-                // bitmap persistence), so we reject it rather than report a
-                // fabricated row count — retraining rebuilds it with a bitmap.
+                // A system index (e.g. __mem_wal) indexes no fragments, so a
+                // missing bitmap means zero indexed rows. For a data index it
+                // means unknown coverage — reject rather than fabricate a count.
                 if is_system_index(shard) {
                     continue;
                 }

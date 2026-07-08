@@ -491,11 +491,10 @@ mod tests {
         assert!(indices.is_empty());
     }
 
-    /// Regression: a committed `__mem_wal` system index (which legitimately has
-    /// `fragment_bitmap: None`) must not break `describe_indices`, the path
-    /// behind lancedb's `list_indices`/`wait_for_index`. The bitmap-less system
-    /// index is described (as zero indexed rows), consistent with `__frag_reuse`,
-    /// alongside the real user index.
+    /// Regression: a committed `__mem_wal` (legitimately `fragment_bitmap:
+    /// None`) must not break `describe_indices` — the path behind lancedb's
+    /// `list_indices`/`wait_for_index`. It's described as zero indexed rows,
+    /// like `__frag_reuse`.
     #[tokio::test]
     async fn test_describe_indices_includes_mem_wal_system_index() {
         use crate::index::DatasetIndexExt;
@@ -516,8 +515,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Commit a __mem_wal index into the base manifest, exactly as WAL
-        // provisioning / merge-to-base does in production.
+        // Commit a __mem_wal index, as WAL provisioning does in production.
         let shard = Uuid::new_v4();
         let txn = Transaction::new(
             dataset.manifest.version,
@@ -542,8 +540,8 @@ mod tests {
             .clone();
         assert!(mem_wal.fragment_bitmap.is_none());
 
-        // describe_indices no longer errors: it describes the bitmap-less
-        // __mem_wal index (zero indexed rows) alongside the real scalar index.
+        // describe_indices describes the bitmap-less __mem_wal alongside the
+        // real index instead of erroring.
         let descriptions = dataset.describe_indices(None).await.unwrap();
         let mem_wal_desc = descriptions
             .iter()
