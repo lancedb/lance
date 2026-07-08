@@ -611,7 +611,11 @@ impl From<std::io::Error> for Error {
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::io_source(box_error(e))
+        match e {
+            // source intentionally dropped; Error::NotFound carries only the path
+            object_store::Error::NotFound { path, .. } => Self::not_found(path),
+            other => Self::io_source(box_error(other)),
+        }
     }
 }
 
@@ -793,6 +797,41 @@ mod test {
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
+        }
+    }
+
+    #[test]
+    fn test_caller_location_capture_not_found() {
+        let current_fn = get_caller_location();
+        let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
+            Err(object_store::Error::NotFound {
+                path: "some/path".to_string(),
+                source: "not found".into(),
+            })?;
+            Ok(())
+        });
+        match f().unwrap_err() {
+            Error::NotFound { location, .. } => {
+                // +2 is the beginning of object_store::Error::NotFound...
+                assert_eq!(location.line(), current_fn.line() + 2, "{}", location)
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_object_store_not_found_converts_to_not_found() {
+        let os_err = object_store::Error::NotFound {
+            path: "test/path".to_string(),
+            source: "no such file".into(),
+        };
+        let lance_err: Error = os_err.into();
+        match lance_err {
+            Error::NotFound { uri, .. } => {
+                assert_eq!(uri, "test/path");
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
         }
     }
 

@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use pyo3::{pyclass, pymethods};
+use pyo3::{PyResult, pyclass, pymethods};
 
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
@@ -61,6 +61,13 @@ impl Session {
     /// Return the current size of the session in bytes
     pub fn size_bytes(&self) -> u64 {
         self.inner.size_bytes()
+    }
+
+    /// Return the current size of the index cache in bytes.
+    pub fn index_cache_size_bytes(&self) -> PyResult<u64> {
+        rt().block_on(None, async move {
+            self.inner.index_cache_stats().await.size_bytes as u64
+        })
     }
 
     /// Return whether the other session is the same as this one.

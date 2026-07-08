@@ -58,8 +58,8 @@ use lance_table::{
         manifest::{read_manifest, read_manifest_indexes},
     },
 };
+use object_store::ObjectMeta;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectMeta};
 use std::fmt::Debug;
 use std::{
     collections::{HashMap, HashSet},
@@ -625,16 +625,7 @@ impl<'a> CleanupTask<'a> {
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
 
-        let is_not_found_err = |e: &Error| {
-            matches!(
-                e,
-                Error::IO { source,.. }
-                    if source
-                      .downcast_ref::<ObjectStoreError>()
-                      .map(|os_err| matches!(os_err, ObjectStoreError::NotFound {.. }))
-                      .unwrap_or(false)
-            )
-        };
+        let is_not_found_err = |e: &Error| matches!(e, Error::NotFound { .. });
         // Build stream for a managed subtree
         let build_listing_stream = |dir: Path| {
             let inspection_ref = &inspection;

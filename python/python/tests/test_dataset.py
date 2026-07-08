@@ -2566,6 +2566,66 @@ def test_merge_insert_full_fragment_rewrite_json_e2e(tmp_path: Path):
     assert sample_result.num_rows == 3
 
 
+def test_merge_insert_subcols_with_json_column(tmp_path: Path):
+    """Test merge_insert with subschema update on a JSON extension type column.
+
+    Previously this would fail with:
+    'Incorrect datatype for StructArray field, expected Utf8 got LargeBinary'
+    because the update_fragments path didn't handle the Arrow JSON ↔ Lance JSON
+    type mismatch during interleave.
+    """
+    import json
+
+    json_type = pa.json_()
+    initial_data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4, 5], type=pa.int64()),
+            "name": pa.array(["a", "b", "c", "d", "e"], type=pa.utf8()),
+            "score": pa.array([10, 20, 30, 40, 50], type=pa.int64()),
+            "meta": pa.array(
+                ['{"x":1}', '{"x":2}', '{"x":3}', '{"x":4}', '{"x":5}'],
+                type=json_type,
+            ),
+        }
+    )
+    dataset = lance.write_dataset(initial_data, tmp_path / "merge_json_subcols")
+
+    # Subschema update: only provide id (key) + meta (JSON column to update)
+    new_values = pa.table(
+        {
+            "id": pa.array([2, 4], type=pa.int64()),
+            "meta": pa.array(
+                ['{"updated":true,"id":2}', '{"updated":true,"id":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    # This should NOT raise a type mismatch error
+    dataset.merge_insert("id").when_matched_update_all().execute(new_values)
+
+    # Verify results
+    result = dataset.to_table().sort_by("id")
+    ids = result.column("id").to_pylist()
+    scores = result.column("score").to_pylist()
+    metas = result.column("meta").to_pylist()
+
+    # Score column (not in update) should be preserved
+    assert scores == [10, 20, 30, 40, 50]
+
+    # Meta column should be updated for id=2 and id=4
+    for id_val, meta_val in zip(ids, metas):
+        parsed = json.loads(meta_val) if isinstance(meta_val, str) else meta_val
+        if id_val in (2, 4):
+            assert parsed.get("updated") is True, (
+                f"id={id_val} should have updated meta, got {meta_val}"
+            )
+        else:
+            assert "x" in str(parsed), (
+                f"id={id_val} should have original meta, got {meta_val}"
+            )
+
+
 def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):
     base_dir = tmp_path / "merge_insert_pk_default"
 

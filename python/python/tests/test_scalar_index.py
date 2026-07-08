@@ -2793,6 +2793,15 @@ def test_index_prewarm(tmp_path: Path):
     cache_entries_after_query = ds._ds.index_cache_entry_count()
     assert cache_entries_after_query == cache_entries_after_prewarm
 
+    segment_uuid = ds.describe_indices()[0].segments[0].uuid
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx", with_position=True, index_segments=[segment_uuid])
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query == cache_entries_after_prewarm
+
     with pytest.raises(
         TypeError,
         match="takes 2 positional arguments",

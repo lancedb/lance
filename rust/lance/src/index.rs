@@ -7,6 +7,7 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -60,7 +61,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::index_matches_criteria;
 use serde_json::json;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use uuid::Uuid;
 use vector::details::{
     derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
@@ -205,6 +206,227 @@ pub(crate) async fn build_index_metadata_from_segments(
 
 fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
     files.retain(|file| !file.path.starts_with("staging/"));
+}
+
+async fn prewarm_opened_index(
+    index: Arc<dyn Index>,
+    options: Option<&PrewarmOptions>,
+) -> Result<()> {
+    match options {
+        None => index.prewarm().await,
+        Some(PrewarmOptions::Fts(fts_options)) => {
+            let inverted = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "FTS prewarm options are only supported for inverted indices, got {:?}",
+                        index.index_type()
+                    ))
+                })?;
+            inverted.prewarm_with_options(fts_options).await
+        }
+        Some(_) => Err(Error::not_supported(
+            "unsupported prewarm options for this lance version".to_owned(),
+        )),
+    }
+}
+
+fn total_index_segment_size_bytes(indices: &[IndexMetadata]) -> Option<u64> {
+    let mut total = 0u64;
+    for index_meta in indices {
+        total += index_meta.total_size_bytes()?;
+    }
+    Some(total)
+}
+
+fn cache_size_delta(after: usize, before: usize) -> i64 {
+    after.saturating_sub(before) as i64 - before.saturating_sub(after) as i64
+}
+
+fn prewarm_options_fields(options: Option<&PrewarmOptions>) -> (&'static str, bool) {
+    match options {
+        None => ("default", false),
+        Some(PrewarmOptions::Fts(fts_options)) => ("fts", fts_options.with_position),
+        Some(_) => ("unsupported", false),
+    }
+}
+
+async fn prewarm_index_segments_by_metadata(
+    dataset: &Dataset,
+    name: &str,
+    indices: Vec<IndexMetadata>,
+    options: Option<&PrewarmOptions>,
+    available_segment_count: usize,
+    requested_segment_count: Option<usize>,
+) -> Result<()> {
+    let request_started = Instant::now();
+    let selected_segment_count = indices.len();
+    let selected_size_bytes = total_index_segment_size_bytes(&indices);
+    let (prewarm_options, fts_with_position) = prewarm_options_fields(options);
+    let cache_stats_before = dataset.session.index_cache_stats().await;
+    info!(
+        index_name = name,
+        selected_segment_count,
+        available_segment_count,
+        requested_segment_count = requested_segment_count.unwrap_or(0),
+        segment_filter = requested_segment_count.is_some(),
+        selected_size_bytes = selected_size_bytes.unwrap_or(0),
+        selected_size_bytes_known = selected_size_bytes.is_some(),
+        index_cache_entries_before = cache_stats_before.num_entries,
+        index_cache_size_bytes_before = cache_stats_before.size_bytes,
+        prewarm_options,
+        fts_with_position,
+        "prewarm index segments started"
+    );
+
+    let result = futures::future::try_join_all(indices.into_iter().map(|index_meta| async move {
+        let index_uuid = index_meta.uuid;
+        let size_bytes = index_meta.total_size_bytes();
+        let fragment_count = index_meta
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.len());
+        let segment_started = Instant::now();
+        info!(
+            index_name = name,
+            %index_uuid,
+            index_version = index_meta.index_version,
+            dataset_version = index_meta.dataset_version,
+            fragment_count = fragment_count.unwrap_or(0),
+            fragment_count_known = fragment_count.is_some(),
+            size_bytes = size_bytes.unwrap_or(0),
+            size_bytes_known = size_bytes.is_some(),
+            "prewarm index segment started"
+        );
+
+        let index = match dataset
+            .open_generic_index(name, &index_uuid, &NoOpMetricsCollector)
+            .await
+        {
+            Ok(index) => {
+                info!(
+                    index_name = name,
+                    %index_uuid,
+                    index_type = ?index.index_type(),
+                    elapsed_ms = segment_started.elapsed().as_millis() as u64,
+                    "opened index segment for prewarm"
+                );
+                index
+            }
+            Err(err) => {
+                warn!(
+                    index_name = name,
+                    %index_uuid,
+                    error = %err,
+                    elapsed_ms = segment_started.elapsed().as_millis() as u64,
+                    "failed to open index segment for prewarm"
+                );
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = prewarm_opened_index(index, options).await {
+            warn!(
+                index_name = name,
+                %index_uuid,
+                error = %err,
+                elapsed_ms = segment_started.elapsed().as_millis() as u64,
+                "prewarm index segment failed"
+            );
+            return Err(err);
+        }
+
+        info!(
+            index_name = name,
+            %index_uuid,
+            elapsed_ms = segment_started.elapsed().as_millis() as u64,
+            "prewarm index segment finished"
+        );
+        Ok(())
+    }))
+    .await;
+
+    match result {
+        Ok(_) => {
+            let cache_stats_after = dataset.session.index_cache_stats().await;
+            info!(
+                index_name = name,
+                selected_segment_count,
+                index_cache_entries_after = cache_stats_after.num_entries,
+                index_cache_entries_delta = cache_size_delta(
+                    cache_stats_after.num_entries,
+                    cache_stats_before.num_entries,
+                ),
+                index_cache_size_bytes_after = cache_stats_after.size_bytes,
+                index_cache_size_bytes_delta =
+                    cache_size_delta(cache_stats_after.size_bytes, cache_stats_before.size_bytes,),
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "prewarm index segments finished"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            let cache_stats_after = dataset.session.index_cache_stats().await;
+            warn!(
+                index_name = name,
+                selected_segment_count,
+                index_cache_entries_after = cache_stats_after.num_entries,
+                index_cache_entries_delta = cache_size_delta(
+                    cache_stats_after.num_entries,
+                    cache_stats_before.num_entries,
+                ),
+                index_cache_size_bytes_after = cache_stats_after.size_bytes,
+                index_cache_size_bytes_delta = cache_size_delta(
+                    cache_stats_after.size_bytes,
+                    cache_stats_before.size_bytes,
+                ),
+                error = %err,
+                elapsed_ms = request_started.elapsed().as_millis() as u64,
+                "prewarm index segments failed"
+            );
+            Err(err)
+        }
+    }
+}
+
+fn filter_index_segments_by_ids(
+    name: &str,
+    indices: Vec<IndexMetadata>,
+    segment_ids: &[Uuid],
+) -> Result<Vec<IndexMetadata>> {
+    if segment_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let requested = segment_ids.iter().copied().collect::<HashSet<_>>();
+    let mut matched = HashSet::new();
+    let filtered = indices
+        .into_iter()
+        .filter(|index_meta| {
+            if requested.contains(&index_meta.uuid) {
+                matched.insert(index_meta.uuid);
+                true
+            } else {
+                false
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if matched.len() != requested.len() {
+        let mut missing = requested
+            .difference(&matched)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        missing.sort();
+        return Err(Error::index_not_found(format!(
+            "name={}, segment_ids=[{}]",
+            name,
+            missing.join(", ")
+        )));
+    }
+
+    Ok(filtered)
 }
 
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
@@ -974,14 +1196,9 @@ impl DatasetIndexExt for Dataset {
             return Err(Error::index_not_found(format!("name={}", name)));
         }
 
-        for index_meta in indices {
-            let index = self
-                .open_generic_index(name, &index_meta.uuid, &NoOpMetricsCollector)
-                .await?;
-            index.prewarm().await?;
-        }
-
-        Ok(())
+        let available_segment_count = indices.len();
+        prewarm_index_segments_by_metadata(self, name, indices, None, available_segment_count, None)
+            .await
     }
 
     async fn prewarm_index_with_options(&self, name: &str, options: &PrewarmOptions) -> Result<()> {
@@ -990,33 +1207,59 @@ impl DatasetIndexExt for Dataset {
             return Err(Error::index_not_found(format!("name={}", name)));
         }
 
-        for index_meta in indices {
-            let index = self
-                .open_generic_index(name, &index_meta.uuid, &NoOpMetricsCollector)
-                .await?;
+        let available_segment_count = indices.len();
+        prewarm_index_segments_by_metadata(
+            self,
+            name,
+            indices,
+            Some(options),
+            available_segment_count,
+            None,
+        )
+        .await
+    }
 
-            match options {
-                PrewarmOptions::Fts(fts_options) => {
-                    let inverted = index
-                        .as_any()
-                        .downcast_ref::<InvertedIndex>()
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "FTS prewarm options are only supported for inverted indices, got {:?}",
-                                index.index_type()
-                            ))
-                        })?;
-                    inverted.prewarm_with_options(fts_options).await?;
-                }
-                _ => {
-                    return Err(Error::not_supported(
-                        "unsupported prewarm options for this lance version".to_owned(),
-                    ));
-                }
-            }
+    async fn prewarm_index_segments(&self, name: &str, segment_ids: &[Uuid]) -> Result<()> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::index_not_found(format!("name={}", name)));
         }
+        let available_segment_count = indices.len();
+        let indices = filter_index_segments_by_ids(name, indices, segment_ids)?;
 
-        Ok(())
+        prewarm_index_segments_by_metadata(
+            self,
+            name,
+            indices,
+            None,
+            available_segment_count,
+            Some(segment_ids.len()),
+        )
+        .await
+    }
+
+    async fn prewarm_index_segments_with_options(
+        &self,
+        name: &str,
+        segment_ids: &[Uuid],
+        options: &PrewarmOptions,
+    ) -> Result<()> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::index_not_found(format!("name={}", name)));
+        }
+        let available_segment_count = indices.len();
+        let indices = filter_index_segments_by_ids(name, indices, segment_ids)?;
+
+        prewarm_index_segments_by_metadata(
+            self,
+            name,
+            indices,
+            Some(options),
+            available_segment_count,
+            Some(segment_ids.len()),
+        )
+        .await
     }
 
     async fn describe_indices<'a, 'b>(
