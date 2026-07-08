@@ -193,3 +193,60 @@ unreferenced index files.
 
 This split keeps distributed scheduling outside the storage engine while still
 letting Lance own the on-disk index format.
+
+## Distributed centroid training
+
+Lance exposes primitive functions that let an external scheduler (Spark, Ray,
+custom RPC) train a single global IVF centroid set across N workers. The
+caller controls broadcast, tree-reduce, and convergence; Lance provides only
+the math: one E-step, one merge, one M-step, plus a Round-0 reservoir-sample
+init.
+
+The primitives live under `lance.indices.distributed_kmeans` (Python) and
+`org.lance.index.vector.DistributedKMeans` (Java). Internally they delegate to
+the Rust modules:
+
+- `lance_index::vector::kmeans::distributed` — pure-function Arrow primitives.
+- `lance::index::vector::ivf::distributed` — async dataset-aware wrappers
+  (`sample_round_0`, `compute_partial_stats`).
+
+### Python example
+
+```python
+import lance
+import lance.indices.distributed_kmeans as dk
+
+ds = lance.dataset("s3://bucket/vec.lance")
+fragment_groups = chunked(
+    [f.fragment_id for f in ds.get_fragments()],
+    num_workers=200,
+)
+
+# Round 0 — each worker reservoir-samples its slice; driver bootstraps centroids.
+samples = spark.parallelize(fragment_groups).map(
+    lambda fids: dk.sample_round_0(
+        ds, "vec", target=256 * K, fragment_ids=fids,
+        distance_type="l2", rng_seed=42,
+    )
+).collect()
+centroids = dk.bootstrap_centroids(samples, k=K, distance_type="l2", rng_seed=42)
+
+# Rounds r = 1..max_iter — broadcast centroids, treeReduce partial stats.
+for r in range(50):
+    centroids_b = spark.broadcast(centroids)
+    merged = (
+        spark.parallelize(fragment_groups)
+             .map(lambda fids: dk.compute_partial_stats(
+                 ds, "vec", centroids_b.value, fragment_ids=fids,
+             ))
+             .treeReduce(dk.merge_partial_stats)
+    )
+    next_centroids = dk.finalize_centroids(merged, centroids)
+    if converged(merged, centroids):
+        break
+    centroids = next_centroids
+```
+
+`PartialStats` batches are plain Arrow `RecordBatch`es and round-trip cleanly
+through Arrow IPC, so they can flow through any RPC layer that already speaks
+Arrow.

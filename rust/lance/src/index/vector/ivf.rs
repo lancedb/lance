@@ -130,6 +130,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 pub mod builder;
+pub mod distributed;
 pub mod io;
 mod partition_serde;
 pub mod v2;
@@ -3321,60 +3322,23 @@ fn train_ivf_kmeans_step_arrow_array_no_loss(
 fn accumulate_refine_assignments(
     data: &FixedSizeListArray,
     centroids: &FixedSizeListArray,
-    cluster_sums: &mut [f32],
-    cluster_weights: &mut [f64],
+    accumulator: &mut Option<lance_index::vector::kmeans::distributed::PartialStats>,
 ) -> Result<f64> {
-    let dimension = data.value_length() as usize;
-    let kmeans = KMeans::with_centroids(
-        centroids.values().clone(),
-        dimension,
-        DistanceType::L2,
-        f64::MAX,
-    );
-    let (membership, distances) = kmeans.compute_membership_and_distances(data)?;
-    let data_values = data.values().as_primitive::<Float32Type>().values();
-    let mut loss = 0.0;
-
-    for row_idx in 0..data.len() {
-        let (Some(cluster_id), Some(distance)) = (membership[row_idx], distances[row_idx]) else {
-            continue;
-        };
-        let cluster_id = cluster_id as usize;
-        cluster_weights[cluster_id] += 1.0;
-        loss += distance as f64;
-        let vector = &data_values[row_idx * dimension..(row_idx + 1) * dimension];
-        let sum = &mut cluster_sums[cluster_id * dimension..(cluster_id + 1) * dimension];
-        for (sum, value) in sum.iter_mut().zip(vector) {
-            *sum += *value;
-        }
-    }
-
-    Ok(loss)
+    use lance_index::vector::kmeans::distributed::{compute_partial_stats, merge_partial_stats};
+    let chunk = compute_partial_stats(centroids, data, DistanceType::L2)?;
+    let chunk_loss = chunk.total_loss();
+    *accumulator = Some(match accumulator.take() {
+        Some(prev) => merge_partial_stats(prev, chunk)?,
+        None => chunk,
+    });
+    Ok(chunk_loss)
 }
 
 fn update_refined_centroids(
     centroids: &FixedSizeListArray,
-    cluster_sums: &[f32],
-    cluster_weights: &[f64],
+    accumulator: lance_index::vector::kmeans::distributed::PartialStats,
 ) -> Result<FixedSizeListArray> {
-    let dimension = centroids.value_length() as usize;
-    let mut next = centroids
-        .values()
-        .as_primitive::<Float32Type>()
-        .values()
-        .to_vec();
-    for cluster_id in 0..centroids.len() {
-        let weight = cluster_weights[cluster_id];
-        if weight <= 0.0 {
-            continue;
-        }
-        let centroid = &mut next[cluster_id * dimension..(cluster_id + 1) * dimension];
-        let sum = &cluster_sums[cluster_id * dimension..(cluster_id + 1) * dimension];
-        for (value, sum) in centroid.iter_mut().zip(sum) {
-            *value = *sum / weight as f32;
-        }
-    }
-    f32_fsl_from_values(next, dimension)
+    lance_index::vector::kmeans::distributed::finalize_centroids(&accumulator, centroids)
 }
 
 async fn refine_streaming_f32_kmeans_with_sampler(
@@ -3386,11 +3350,9 @@ async fn refine_streaming_f32_kmeans_with_sampler(
     passes: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
 ) -> Result<FixedSizeListArray> {
-    let dimension = initial_centroids.value_length() as usize;
     let mut centroids = initial_centroids.clone();
     for pass in 1..=passes {
-        let mut cluster_sums = vec![0.0_f32; centroids.len() * dimension];
-        let mut cluster_weights = vec![0.0_f64; centroids.len()];
+        let mut accumulator: Option<lance_index::vector::kmeans::distributed::PartialStats> = None;
         let mut loss = 0.0;
         let mut row_offset = 0;
         while row_offset < sample_ranges.num_rows() {
@@ -3408,21 +3370,19 @@ async fn refine_streaming_f32_kmeans_with_sampler(
                     metric_type
                 )));
             }
-            loss += accumulate_refine_assignments(
-                &training_data,
-                &centroids,
-                &mut cluster_sums,
-                &mut cluster_weights,
-            )?;
+            loss += accumulate_refine_assignments(&training_data, &centroids, &mut accumulator)?;
         }
-        centroids = update_refined_centroids(&centroids, &cluster_sums, &cluster_weights)?;
+        let stats = accumulator.ok_or_else(|| {
+            Error::invalid_input(
+                "streaming IVF refinement: no training data assigned in this pass".to_string(),
+            )
+        })?;
+        let assigned = stats.total_count() as usize;
+        centroids = update_refined_centroids(&centroids, stats)?;
         on_progress(pass as u32, passes as u32);
         info!(
             "Streaming IVF raw-vector refinement pass {} / {} assigned {} vectors; pre-update loss={}",
-            pass,
-            passes,
-            cluster_weights.iter().sum::<f64>() as usize,
-            loss
+            pass, passes, assigned, loss
         );
     }
     Ok(centroids)
@@ -3441,11 +3401,9 @@ async fn refine_streaming_f32_kmeans_with_resampling(
     passes: usize,
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
 ) -> Result<FixedSizeListArray> {
-    let dimension = initial_centroids.value_length() as usize;
     let mut centroids = initial_centroids.clone();
     for pass in 1..=passes {
-        let mut cluster_sums = vec![0.0_f32; centroids.len() * dimension];
-        let mut cluster_weights = vec![0.0_f64; centroids.len()];
+        let mut accumulator: Option<lance_index::vector::kmeans::distributed::PartialStats> = None;
         let mut remaining_sample_rate = total_sample_rate;
         let mut loss = 0.0;
         while remaining_sample_rate > 0 {
@@ -3470,22 +3428,20 @@ async fn refine_streaming_f32_kmeans_with_resampling(
                     metric_type
                 )));
             }
-            loss += accumulate_refine_assignments(
-                &training_data,
-                &centroids,
-                &mut cluster_sums,
-                &mut cluster_weights,
-            )?;
+            loss += accumulate_refine_assignments(&training_data, &centroids, &mut accumulator)?;
             remaining_sample_rate -= step_sample_rate;
         }
-        centroids = update_refined_centroids(&centroids, &cluster_sums, &cluster_weights)?;
+        let stats = accumulator.ok_or_else(|| {
+            Error::invalid_input(
+                "streaming IVF refinement: no training data assigned in this pass".to_string(),
+            )
+        })?;
+        let assigned = stats.total_count() as usize;
+        centroids = update_refined_centroids(&centroids, stats)?;
         on_progress(pass as u32, passes as u32);
         info!(
             "Streaming IVF resampled raw-vector refinement pass {} / {} assigned {} vectors; pre-update loss={}",
-            pass,
-            passes,
-            cluster_weights.iter().sum::<f64>() as usize,
-            loss
+            pass, passes, assigned, loss
         );
     }
     Ok(centroids)
@@ -4583,6 +4539,79 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    #[test]
+    fn test_streaming_refine_unchanged_partial_stats() {
+        // Regression contract for I6: the refactored streaming refine
+        // (compute_partial_stats + finalize_centroids) must produce centroids
+        // bit-identical to the legacy `cluster_sums / cluster_weights` path on
+        // the same input. Inline the legacy reference implementation so the
+        // test still works after the legacy helpers are deleted.
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Float32Type;
+        use arrow_array::{FixedSizeListArray, Float32Array};
+        use lance_index::vector::kmeans::KMeans;
+        use lance_index::vector::kmeans::distributed::{compute_partial_stats, finalize_centroids};
+        use lance_linalg::distance::DistanceType;
+
+        let dim = 2;
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32, 0.0, 10.0, 0.0, 0.0, 10.0, 10.0, 10.0]),
+            dim as i32,
+        )
+        .unwrap();
+        let data = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                0.1_f32, 0.0, 10.1, 0.1, 0.0, 9.9, 9.8, 10.2, 0.2, 0.1, 10.0, 0.0,
+            ]),
+            dim as i32,
+        )
+        .unwrap();
+
+        let kmeans =
+            KMeans::with_centroids(centroids.values().clone(), dim, DistanceType::L2, f64::MAX);
+        let (membership, distances) = kmeans.compute_membership_and_distances(&data).unwrap();
+        let data_values = data.values().as_primitive::<Float32Type>().values();
+        let k = centroids.len();
+        let mut cluster_sums = vec![0.0_f32; k * dim];
+        let mut cluster_weights = vec![0.0_f64; k];
+        for i in 0..data.len() {
+            if let (Some(c), Some(_d)) = (membership[i], distances[i]) {
+                let ci = c as usize;
+                cluster_weights[ci] += 1.0;
+                let row = &data_values[i * dim..(i + 1) * dim];
+                for d in 0..dim {
+                    cluster_sums[ci * dim + d] += row[d];
+                }
+            }
+        }
+        let mut baseline = centroids
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        for ci in 0..k {
+            if cluster_weights[ci] > 0.0 {
+                for d in 0..dim {
+                    baseline[ci * dim + d] =
+                        cluster_sums[ci * dim + d] / cluster_weights[ci] as f32;
+                }
+            }
+        }
+
+        let stats = compute_partial_stats(&centroids, &data, DistanceType::L2).unwrap();
+        let new_new = finalize_centroids(&stats, &centroids).unwrap();
+        let v_new = new_new.values().as_primitive::<Float32Type>().values();
+
+        for (a, b) in baseline.iter().zip(v_new.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "centroid mismatch: baseline={} new={}",
+                a,
+                b
+            );
+        }
+    }
 
     async fn compute_test_ivf_loss(dataset: &Dataset, column: &str, ivf: &IvfModel) -> f64 {
         let centroids = ivf

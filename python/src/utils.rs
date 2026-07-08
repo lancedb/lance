@@ -89,11 +89,7 @@ impl KMeans {
                 return Err(PyValueError::new_err("Must be a FixedSizeList"));
             }
             let fixed_size_arr = FixedSizeListArray::from(data);
-            let params = KMeansParams {
-                distance_type: metric_type.try_into().unwrap(),
-                max_iters,
-                ..Default::default()
-            };
+            let params = KMeansParams::new(None, max_iters, 1, metric_type.try_into().unwrap());
             let kmeans =
                 LanceKMeans::new_with_params(&fixed_size_arr, k, &params).map_err(|e| {
                     PyRuntimeError::new_err(format!(
@@ -120,11 +116,7 @@ impl KMeans {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
         let fixed_size_arr = FixedSizeListArray::from(data);
-        let params = KMeansParams {
-            distance_type: self.metric_type,
-            max_iters: self.max_iters,
-            ..Default::default()
-        };
+        let params = KMeansParams::new(None, self.max_iters, 1, self.metric_type);
         let kmeans = LanceKMeans::new_with_params(&fixed_size_arr, self.k, &params)
             .map_err(|e| PyRuntimeError::new_err(format!("Error training KMeans: {}", e)))?;
         self.trained_kmeans = Some(kmeans);

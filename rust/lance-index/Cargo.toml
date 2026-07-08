@@ -74,6 +74,7 @@ async-channel = "2.3.1"
 rand_distr.workspace = true
 lance-datagen.workspace = true
 rangemap.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
@@ -82,6 +83,7 @@ env_logger = "0.11.6"
 geo-traits.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
+proptest.workspace = true
 test-log.workspace = true
 rstest.workspace = true
 chrono.workspace = true
