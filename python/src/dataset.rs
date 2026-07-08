@@ -70,11 +70,11 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
-use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
@@ -2541,10 +2541,9 @@ impl Dataset {
                                 "format_version must be 1, 2, 'v1', or 'v2'",
                             ));
                         };
-                        let format_version =
-                            value.parse::<InvertedListFormatVersion>().map_err(|err| {
-                                PyValueError::new_err(err.to_string())
-                            })?;
+                        let format_version = value
+                            .parse::<InvertedListFormatVersion>()
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
                         params = params.format_version(format_version);
                     }
                 }
