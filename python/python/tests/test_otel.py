@@ -35,6 +35,10 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
     catalog = {desc.name: desc for desc in lance_metrics_catalog()}
     assert "lance_object_store_requests_total" in catalog
     assert catalog["lance_object_store_request_duration_seconds"].kind == "histogram"
+    # Gauges and the retryable counter are described too, so they surface in the
+    # export even when a plain write doesn't happen to emit them.
+    assert catalog["lance_object_store_retryable_responses_total"].kind == "counter"
+    assert catalog["lance_object_store_in_flight_requests"].kind == "gauge"
 
     # Generate object store activity on the local filesystem (scheme "file").
     table = pa.table({"id": pa.array(range(256))})
@@ -46,7 +50,8 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
     requests = metrics["lance_object_store_requests_total"]
     points = list(requests.data.data_points)
     assert points, "expected at least one request data point"
-    assert all("scheme" in p.attributes and "operation" in p.attributes for p in points)
+    # The `base` label carries the store scheme ("file") by default.
+    assert all("base" in p.attributes and "operation" in p.attributes for p in points)
     assert sum(p.value for p in points) > 0
 
     # Histograms are decomposed into bucket / count / sum observable counters.

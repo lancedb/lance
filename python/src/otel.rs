@@ -376,10 +376,15 @@ pub fn register_lance_metrics_recorder() -> bool {
     let recorder = LanceRecorder {
         registry: registry.clone(),
     };
+    // Register histogram bounds *before* installing the recorder. Once the
+    // recorder is global, another thread can emit a metric and create the
+    // histogram handle concurrently; if the bounds aren't registered yet that
+    // handle would be built with the fallback bounds and keep them for the
+    // life of the process. `register_bounds()` doesn't need the recorder.
+    register_bounds();
     match metrics::set_global_recorder(recorder) {
         Ok(()) => {
             let _ = REGISTRY.set(registry);
-            register_bounds();
             describe_all();
             true
         }
@@ -605,5 +610,27 @@ mod tests {
         let desc = catalog.get(name).expect("described");
         assert!(matches!(desc.kind, MetricKind::Counter));
         assert_eq!(desc.description, "a test counter");
+    }
+
+    #[test]
+    fn describe_all_covers_object_store_metrics() {
+        use lance_io::object_store::metrics as os;
+
+        let registry = Arc::new(Registry::new(LanceStorage));
+        let recorder = LanceRecorder { registry };
+        metrics::with_local_recorder(&recorder, describe_all);
+
+        let catalog = CATALOG.lock().unwrap();
+        let kind = |name: &str| catalog.get(name).expect("described").kind;
+        // Every emitted object store metric must be described so the OTel
+        // bridge can create an instrument for it, including the gauge and the
+        // retryable counter that a plain request path might never emit.
+        assert!(matches!(kind(os::METRIC_REQUESTS), MetricKind::Counter));
+        assert!(matches!(kind(os::METRIC_BYTES), MetricKind::Counter));
+        assert!(matches!(kind(os::METRIC_ERRORS), MetricKind::Counter));
+        assert!(matches!(kind(os::METRIC_THROTTLE), MetricKind::Counter));
+        assert!(matches!(kind(os::METRIC_RETRYABLE), MetricKind::Counter));
+        assert!(matches!(kind(os::METRIC_IN_FLIGHT), MetricKind::Gauge));
+        assert!(matches!(kind(os::METRIC_DURATION), MetricKind::Histogram));
     }
 }

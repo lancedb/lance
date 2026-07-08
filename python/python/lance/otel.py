@@ -143,10 +143,11 @@ def instrument_lance_metrics(meter_provider: Optional["MeterProvider"] = None) -
                 description=desc.description,
             )
         elif desc.kind == "histogram":
+            # `_bucket` and `_count` observe cumulative counts, so they are
+            # unitless; only `_sum` carries the histogram's unit (e.g. seconds).
             meter.create_observable_counter(
                 f"{desc.name}_bucket",
                 callbacks=[bucket_callback(desc.name)],
-                unit=unit,
                 description=f"{desc.description} (cumulative buckets)",
             )
             meter.create_observable_counter(

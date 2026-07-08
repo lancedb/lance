@@ -173,6 +173,16 @@ pub fn describe_metrics() {
         metrics::Unit::Count,
         "Total number of throttle responses (HTTP 429 / 503) seen at the HTTP layer, by status and scheme."
     );
+    metrics::describe_counter!(
+        METRIC_RETRYABLE,
+        metrics::Unit::Count,
+        "Total number of retryable responses (HTTP 5xx / 429 / 408) seen at the HTTP layer, by status and scheme."
+    );
+    metrics::describe_gauge!(
+        METRIC_IN_FLIGHT,
+        metrics::Unit::Count,
+        "Number of object store requests currently in flight, by operation and scheme."
+    );
 }
 
 /// Recommended fixed bucket boundaries for the histogram metrics defined here,
