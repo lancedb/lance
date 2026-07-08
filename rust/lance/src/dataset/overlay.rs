@@ -45,26 +45,9 @@ use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
 use lance_table::format::DataFile;
-use lance_table::format::overlay::DataOverlayFile;
 use lance_table::utils::stream::ReadBatchFut;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
-
-/// Order a fragment's overlays from newest to oldest for read resolution.
-///
-/// Precedence is by `committed_version` (higher is newer); ties are broken by
-/// position in the fragment's `overlays` list, where a later entry is newer.
-/// Returns indices into `overlays`.
-pub fn overlay_indices_newest_first(overlays: &[DataOverlayFile]) -> Vec<usize> {
-    let mut indices: Vec<usize> = (0..overlays.len()).collect();
-    indices.sort_by(|&a, &b| {
-        overlays[b]
-            .committed_version
-            .cmp(&overlays[a].committed_version)
-            .then(b.cmp(&a))
-    });
-    indices
-}
 
 /// The plan for merging one field's overlays into one batch: which source (base or
 /// a particular overlay) supplies each output row, and which overlay values must be
@@ -380,62 +363,72 @@ impl OverlayReadPlanner {
 /// alone. No files are opened here (see [`resolve_overlays`]) — this only reads the
 /// already-parsed coverage bitmaps, so it is cheap enough to run on every open.
 ///
-/// For each projected (top-level) field, the fragment's overlays are walked
-/// newest-first; an overlay contributes if its `data_file.fields` includes the
-/// field. Overlays on nested (non-top-level) fields are not yet supported and are
-/// simply not matched here. Each contributing overlay *file* appears once in
-/// `files`, shared by every field it covers.
+/// Overlays are stored oldest-first (sorted newest-last on load, see
+/// `sort_overlays_newest_last`), so walking them in reverse gives newest-first
+/// precedence. A single pass — visiting only each overlay's own fields and matching
+/// them against the projection through a field-id map — builds the per-field overlay
+/// lists, so planning is `O(total overlay fields + projected fields)` rather than
+/// `O(projected fields × overlays)` (a fragment can have thousands of fields).
+///
+/// An overlay contributes to a projected field when its `data_file.fields` includes
+/// that field's id. Overlays on nested (non-top-level) fields are not yet supported
+/// and simply match no projected field. Each contributing overlay *file* appears once
+/// in `files`, shared by every field it covers.
 pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<OverlayReadPlanner> {
-    let order = overlay_indices_newest_first(&fragment.metadata.overlays);
+    let overlays = &fragment.metadata.overlays;
+    debug_assert!(
+        overlays
+            .windows(2)
+            .all(|w| w[0].committed_version <= w[1].committed_version),
+        "overlays must be sorted newest-last (see sort_overlays_newest_last)"
+    );
 
-    // One entry per contributing overlay file, newest-first. `pos_to_file[pos]` maps
-    // a position in `order` to its index in `files` (None if it covers no projected
-    // field, so it is never referenced and never opened).
+    // Projected fields indexed by id, so each overlay field is matched in O(1).
+    let projected: HashMap<i32, &lance_core::datatypes::Field> =
+        projection.fields.iter().map(|f| (f.id, f)).collect();
+
+    // Walk overlays newest-first, visiting only each overlay's own fields. Every
+    // covered field is appended to its entry in `field_overlays`; because we walk
+    // newest-first, each entry ends up ordered newest-first for free.
     let mut files = Vec::new();
-    let mut pos_to_file = vec![None; order.len()];
-    for (pos, &overlay_idx) in order.iter().enumerate() {
-        let overlay = &fragment.metadata.overlays[overlay_idx];
-        let covered: Vec<lance_core::datatypes::Field> = projection
-            .fields
-            .iter()
-            .filter(|f| overlay.data_file.fields.contains(&f.id))
-            .cloned()
-            .collect();
-        if covered.is_empty() {
+    let mut field_overlays: HashMap<i32, Vec<PlannedFieldOverlay>> = HashMap::new();
+    for overlay in overlays.iter().rev() {
+        // (field_id, field_pos) for each of this overlay's fields that we project.
+        let mut contributions = Vec::new();
+        let mut covered_fields = Vec::new();
+        for (field_pos, &field_id) in overlay.data_file.fields.iter().enumerate() {
+            if let Some(field) = projected.get(&field_id) {
+                contributions.push((field_id, field_pos));
+                covered_fields.push((*field).clone());
+            }
+        }
+        if contributions.is_empty() {
             continue;
         }
-        pos_to_file[pos] = Some(files.len());
+        let file = files.len();
         files.push(PlannedOverlayFile {
             data_file: overlay.data_file.clone(),
             open_projection: Arc::new(Schema {
-                fields: covered,
+                fields: covered_fields,
                 metadata: Default::default(),
             }),
         });
+        for (field_id, field_pos) in contributions {
+            field_overlays
+                .entry(field_id)
+                .or_default()
+                .push(PlannedFieldOverlay {
+                    file,
+                    coverage: overlay.coverage_for_field(field_pos)?,
+                });
+        }
     }
 
+    // Emit one PlannedField per projected field that has overlays, in projection
+    // order for deterministic results.
     let mut fields = Vec::new();
     for field in &projection.fields {
-        let mut overlays_newest_first = Vec::new();
-        for (pos, &overlay_idx) in order.iter().enumerate() {
-            let overlay = &fragment.metadata.overlays[overlay_idx];
-            let Some(field_pos) = overlay
-                .data_file
-                .fields
-                .iter()
-                .position(|&id| id == field.id)
-            else {
-                continue;
-            };
-            let Some(file) = pos_to_file[pos] else {
-                continue;
-            };
-            overlays_newest_first.push(PlannedFieldOverlay {
-                file,
-                coverage: overlay.coverage_for_field(field_pos)?,
-            });
-        }
-        if !overlays_newest_first.is_empty() {
+        if let Some(overlays_newest_first) = field_overlays.remove(&field.id) {
             fields.push(PlannedField {
                 field_name: field.name.clone(),
                 field_projection: Arc::new(Schema {
@@ -827,23 +820,5 @@ mod tests {
             );
             assert_eq!(fast.any_overlay, general.any_overlay, "any_overlay differs");
         }
-    }
-
-    #[test]
-    fn test_overlay_ordering_newest_first() {
-        use lance_table::format::DataFile;
-        use lance_table::format::overlay::OverlayCoverage;
-        let mk = |version: u64| DataOverlayFile {
-            data_file: DataFile::new_legacy_from_fields("o.lance", vec![1], None),
-            coverage: OverlayCoverage::dense(RoaringBitmap::new()),
-            committed_version: version,
-        };
-        // List order [v2, v5, v3]; newest-first should be v5(idx1), v3(idx2), v2(idx0).
-        let overlays = vec![mk(2), mk(5), mk(3)];
-        assert_eq!(overlay_indices_newest_first(&overlays), vec![1, 2, 0]);
-
-        // Equal versions: later list position is newer.
-        let overlays = vec![mk(4), mk(4)];
-        assert_eq!(overlay_indices_newest_first(&overlays), vec![1, 0]);
     }
 }
