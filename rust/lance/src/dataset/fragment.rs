@@ -3906,6 +3906,87 @@ mod tests {
             assert_eq!(col(&batch, "id").values(), &[0, 1, 6, 7]);
             assert_eq!(col(&batch, "val").values(), &[1000, 10, 6000, 70]);
         }
+
+        /// A scan whose read splits into multiple batches must slice
+        /// `offsets_in_frag` per batch correctly — the running `rows_seen`
+        /// accumulator in `merge_overlays` gives each batch its start. Every other
+        /// scan test uses single-batch fragments, so this is the only guard for the
+        /// cross-batch (`start > 0`) path.
+        #[rstest]
+        #[tokio::test]
+        async fn test_scan_multi_batch_overlay_slicing(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use futures::TryStreamExt;
+
+            // One fragment of 10 rows so the read can be chunked below.
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..10)),
+                    Arc::new(Int32Array::from_iter_values((0..10).map(|v| v * 10))),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 100,
+                max_rows_per_group: 100,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay one offset in each batch that batch_size 4 produces (batches
+            // [0,4), [4,8), [8,10)): offsets 1, 5, 9 with distinct values. A wrong
+            // per-batch slice would misalign these.
+            let dataset = commit_overlay(
+                dataset,
+                "multibatch",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 5, 9])),
+                vec![i32_array([Some(111), Some(555), Some(999)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let mut scanner = frag.scan();
+            scanner.batch_size(4).project(&["val"]).unwrap();
+            let batches: Vec<RecordBatch> = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            // Guard the guard: the read must actually span multiple batches, else
+            // this would not exercise the cross-batch slice at all.
+            assert!(
+                batches.len() > 1,
+                "expected a multi-batch scan, got {} batch(es)",
+                batches.len()
+            );
+
+            let merged =
+                arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+            let expected: Vec<i32> = (0..10)
+                .map(|i| match i {
+                    1 => 111,
+                    5 => 555,
+                    9 => 999,
+                    other => other * 10,
+                })
+                .collect();
+            assert_eq!(col(&merged, "val").values(), &expected);
+        }
     }
 
     #[rstest]
