@@ -46,7 +46,7 @@ use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
-const NULL_BITMAP_META_KEY: &str = "lance:null_bitmap";
+const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 

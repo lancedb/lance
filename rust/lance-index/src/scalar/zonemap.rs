@@ -51,7 +51,7 @@ const ROWS_PER_ZONE_DEFAULT: u64 = 8192; // 1 zone every two batches
 
 const ZONEMAP_FILENAME: &str = "zonemap.lance";
 const ZONEMAP_SIZE_META_KEY: &str = "rows_per_zone";
-const NULL_BITMAP_META_KEY: &str = "lance:null_bitmap";
+const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const ZONEMAP_INDEX_VERSION: u32 = 0;
 
 /// Basic stats about zonemap index
@@ -2923,8 +2923,8 @@ mod tests {
         )
         .unwrap();
         let mut modern_null_rows = RowAddrTreeMap::new();
-        modern_null_rows.insert(0u64 << 32 | 3); // frag 0 row 3
-        modern_null_rows.insert(0u64 << 32 | 7); // frag 0 row 7
+        modern_null_rows.insert(3); // frag 0 row 3
+        modern_null_rows.insert(7); // frag 0 row 7
         let cache = LanceCache::no_cache();
         let index_a = Arc::new(
             ZoneMapIndex::try_from_serialized(
