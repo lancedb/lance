@@ -337,7 +337,6 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             split_on_numerics: params.split_on_numerics,
             preserve_original: params.preserve_original,
             index_operators: params.index_operators,
-            custom_stop_words: params.custom_stop_words.clone().unwrap_or_default(),
         })
     }
 }
@@ -384,8 +383,6 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
         params.lower_case = details.lower_case;
         params.stem = details.stem;
         params.remove_stop_words = details.remove_stop_words;
-        params.custom_stop_words =
-            (!details.custom_stop_words.is_empty()).then(|| details.custom_stop_words.clone());
         params.ascii_folding = details.ascii_folding;
         params.min_ngram_length = details.min_ngram_length;
         params.max_ngram_length = details.max_ngram_length;

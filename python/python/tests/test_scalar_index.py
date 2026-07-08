@@ -1105,18 +1105,6 @@ def test_fts_custom_stop_words(tmp_path):
     assert len(results["_rowid"].to_pylist()) == 1
 
 
-def test_fts_custom_stop_words_none(tmp_path):
-    data = pa.table({"text": ["alpha beta", "gamma"]})
-    ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", "INVERTED", custom_stop_words=None)
-
-    results = ds.to_table(full_text_query="alpha")
-    assert results.num_rows == 1
-
-    stats = ds.stats.index_stats("text_idx")["indices"][0]
-    assert stats["params"]["custom_stop_words"] is None
-
-
 def test_fts_stop_words_respect_language_for_simple_tokenizer(tmp_path):
     data = pa.table({"text": ["the lance data", "的 lance data"]})
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
@@ -5158,7 +5146,6 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
     assert details["lower_case"]
     assert details["stem"]
     assert details["remove_stop_words"]
-    assert details["custom_stop_words"] is None
     assert details["ascii_folding"]
     assert details["min_ngram_length"] == 3
     assert details["max_ngram_length"] == 3

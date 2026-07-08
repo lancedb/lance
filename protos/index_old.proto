@@ -68,5 +68,4 @@ message InvertedIndexDetails {
   // Disabled by default because operators are often high-frequency noise, but
   // when enabled it changes query semantics and must be persisted.
   bool index_operators = 17;
-  repeated string custom_stop_words = 19;
 }
