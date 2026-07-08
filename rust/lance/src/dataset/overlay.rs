@@ -57,7 +57,7 @@ use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
 /// column is read — so the caller can fetch only the overlay values it will
 /// actually use (see [`OverlayRouting::offsets_in_overlay`]) rather than whole
 /// columns, then build the merged column with [`assemble_overlay_column`].
-pub struct OverlayRouting {
+struct OverlayRouting {
     /// One `(source, position)` pair per output row, ready to hand to `interleave`.
     /// Source `0` is the base column, with `position` = the row's `offset_in_batch`;
     /// source `k + 1` is overlay `k`'s fetched values, with `position` = the row's
@@ -75,13 +75,13 @@ pub struct OverlayRouting {
 impl OverlayRouting {
     /// Per overlay (newest-first), the `offset_in_overlay` values to fetch from its
     /// value column.
-    pub fn offsets_in_overlay(&self) -> &[Vec<u32>] {
+    fn offsets_in_overlay(&self) -> &[Vec<u32>] {
         &self.offsets_in_overlay
     }
 
     /// True when no row is covered by any overlay, so the base column is already the
     /// answer and no overlay values need to be read.
-    pub fn all_fall_through(&self) -> bool {
+    fn all_fall_through(&self) -> bool {
         !self.any_overlay
     }
 }
@@ -96,7 +96,7 @@ impl OverlayRouting {
 /// A scan asks for a contiguous, ascending range of offsets, which enables a faster
 /// bitmap-driven path ([`route_contiguous`]); `take` asks for arbitrary offsets and
 /// uses the general path ([`route_arbitrary`]). Both produce identical routing.
-pub fn route_overlays(
+fn route_overlays(
     offsets_in_frag: &[u32],
     coverages_newest_first: &[&RoaringBitmap],
 ) -> OverlayRouting {
@@ -256,7 +256,7 @@ fn route_arbitrary(
 /// `offsets_in_overlay()[k]`, in that order. The result has the same length and
 /// type as `base`. A covered row whose overlay value is NULL resolves **to** NULL
 /// (distinct from a fall-through, which keeps the base value).
-pub fn assemble_overlay_column(
+fn assemble_overlay_column(
     base: &ArrayRef,
     routing: &OverlayRouting,
     fetched_newest_first: &[ArrayRef],
