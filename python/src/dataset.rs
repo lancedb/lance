@@ -74,6 +74,7 @@ use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
 };
+use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
@@ -2401,7 +2402,7 @@ impl Dataset {
                 })
             }
             "INVERTED" | "FTS" => {
-                let mut params_json = serde_json::Map::new();
+                let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     let allowed_kwargs = [
                         "analyzer",
@@ -2437,126 +2438,116 @@ impl Dataset {
                             )));
                         }
                     }
-                    fn insert_fts_param<T: serde::Serialize>(
-                        params_json: &mut serde_json::Map<String, serde_json::Value>,
-                        name: &str,
-                        value: T,
-                    ) -> PyResult<()> {
-                        let value = serde_json::to_value(value).map_err(|err| {
-                            PyValueError::new_err(format!(
-                                "failed to serialize FTS parameter {}: {}",
-                                name, err
-                            ))
-                        })?;
-                        params_json.insert(name.to_string(), value);
-                        Ok(())
-                    }
-                    fn insert_optional_fts_param<'py, T>(
-                        params_json: &mut serde_json::Map<String, serde_json::Value>,
-                        kwargs: &Bound<'py, PyDict>,
-                        name: &str,
-                    ) -> PyResult<()>
-                    where
-                        for<'a> T: FromPyObject<'a, 'py> + serde::Serialize,
-                    {
-                        if let Some(value) = kwargs.get_item(name)? {
-                            let value: T = value.extract().map_err(Into::into)?;
-                            insert_fts_param(params_json, name, value)?;
+
+                    let analyzer: Option<String> = kwargs
+                        .get_item("analyzer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+                    let base_tokenizer: Option<String> = kwargs
+                        .get_item("base_tokenizer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+
+                    match (analyzer.as_deref(), base_tokenizer.as_deref()) {
+                        (Some("text"), Some("code")) => {
+                            return Err(PyValueError::new_err(
+                                "base_tokenizer='code' requires analyzer='code'",
+                            ));
                         }
-                        Ok(())
+                        (Some("code"), Some(base_tokenizer)) if base_tokenizer != "code" => {
+                            return Err(PyValueError::new_err(format!(
+                                "analyzer='code' requires base_tokenizer='code', got '{}'",
+                                base_tokenizer
+                            )));
+                        }
+                        _ => {}
                     }
-                    insert_optional_fts_param::<String>(
-                        &mut params_json,
-                        kwargs,
-                        "analyzer",
-                    )?;
-                    insert_optional_fts_param::<bool>(
-                        &mut params_json,
-                        kwargs,
-                        "with_position",
-                    )?;
-                    insert_optional_fts_param::<String>(
-                        &mut params_json,
-                        kwargs,
-                        "base_tokenizer",
-                    )?;
+
+                    if let Some(analyzer) = analyzer {
+                        params = params
+                            .analyzer(&analyzer)
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
+                    if let Some(with_position) = kwargs.get_item("with_position")? {
+                        params = params.with_position(with_position.extract()?);
+                    }
+                    if let Some(base_tokenizer) = base_tokenizer {
+                        params = params.base_tokenizer(base_tokenizer);
+                    }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.cast::<PyString>()?.clone().try_into()?;
-                        params_json.insert(
-                            "language".to_string(),
-                            serde_json::Value::String(language.to_string()),
-                        );
+                        params = params.language(&language).map_err(|err| {
+                            PyValueError::new_err(format!(
+                                "can't set tokenizer language to {}: {}",
+                                language, err
+                            ))
+                        })?;
                     }
-                    insert_optional_fts_param::<Option<usize>>(
-                        &mut params_json,
-                        kwargs,
-                        "max_token_length",
-                    )?;
-                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "lower_case")?;
-                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "stem")?;
-                    insert_optional_fts_param::<bool>(
-                        &mut params_json,
-                        kwargs,
-                        "remove_stop_words",
-                    )?;
-                    insert_optional_fts_param::<Option<Vec<String>>>(
-                        &mut params_json,
-                        kwargs,
-                        "custom_stop_words",
-                    )?;
-                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "ascii_folding")?;
-                    insert_optional_fts_param::<u32>(
-                        &mut params_json,
-                        kwargs,
-                        "min_ngram_length",
-                    )?;
-                    insert_optional_fts_param::<u32>(
-                        &mut params_json,
-                        kwargs,
-                        "max_ngram_length",
-                    )?;
-                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "prefix_only")?;
-                    insert_optional_fts_param::<bool>(
-                        &mut params_json,
-                        kwargs,
-                        "split_identifiers",
-                    )?;
-                    insert_optional_fts_param::<bool>(
-                        &mut params_json,
-                        kwargs,
-                        "split_on_numerics",
-                    )?;
-                    insert_optional_fts_param::<bool>(
-                        &mut params_json,
-                        kwargs,
-                        "preserve_original",
-                    )?;
-                    insert_optional_fts_param::<bool>(
-                        &mut params_json,
-                        kwargs,
-                        "index_operators",
-                    )?;
-                    insert_optional_fts_param::<u64>(&mut params_json, kwargs, "memory_limit")?;
-                    insert_optional_fts_param::<usize>(&mut params_json, kwargs, "num_workers")?;
+                    if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
+                        params = params.max_token_length(max_token_length.extract()?);
+                    }
+                    if let Some(lower_case) = kwargs.get_item("lower_case")? {
+                        params = params.lower_case(lower_case.extract()?);
+                    }
+                    if let Some(stem) = kwargs.get_item("stem")? {
+                        params = params.stem(stem.extract()?);
+                    }
+                    if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
+                        params = params.remove_stop_words(remove_stop_words.extract()?);
+                    }
+                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
+                        params = params.custom_stop_words(custom_stop_words.extract()?);
+                    }
+                    if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
+                        params = params.ascii_folding(ascii_folding.extract()?);
+                    }
+                    if let Some(min_ngram_length) = kwargs.get_item("min_ngram_length")? {
+                        params = params.ngram_min_length(min_ngram_length.extract()?);
+                    }
+                    if let Some(max_ngram_length) = kwargs.get_item("max_ngram_length")? {
+                        params = params.ngram_max_length(max_ngram_length.extract()?);
+                    }
+                    if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
+                        params = params.ngram_prefix_only(prefix_only.extract()?);
+                    }
+                    if let Some(split_identifiers) = kwargs.get_item("split_identifiers")? {
+                        params = params.split_identifiers(split_identifiers.extract()?);
+                    }
+                    if let Some(split_on_numerics) = kwargs.get_item("split_on_numerics")? {
+                        params = params.split_on_numerics(split_on_numerics.extract()?);
+                    }
+                    if let Some(preserve_original) = kwargs.get_item("preserve_original")? {
+                        params = params.preserve_original(preserve_original.extract()?);
+                    }
+                    if let Some(index_operators) = kwargs.get_item("index_operators")? {
+                        params = params.index_operators(index_operators.extract()?);
+                    }
+                    if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
+                        params = params.memory_limit_mb(memory_limit.extract()?);
+                    }
+                    if let Some(num_workers) = kwargs.get_item("num_workers")? {
+                        params = params.num_workers(num_workers.extract()?);
+                    }
                     if let Some(format_version) = kwargs.get_item("format_version")?
                         && !format_version.is_none()
                     {
                         let value = if let Ok(value) = format_version.cast::<PyString>() {
-                            serde_json::Value::String(value.to_string_lossy().to_string())
+                            value.to_string_lossy().to_string()
                         } else if let Ok(value) = format_version.extract::<u32>() {
-                            serde_json::Value::from(value)
+                            value.to_string()
                         } else {
                             return Err(PyValueError::new_err(
                                 "format_version must be 1, 2, 'v1', or 'v2'",
                             ));
                         };
-                        params_json.insert("format_version".to_string(), value);
+                        let format_version =
+                            value.parse::<InvertedListFormatVersion>().map_err(|err| {
+                                PyValueError::new_err(err.to_string())
+                            })?;
+                        params = params.format_version(format_version);
                     }
                 }
-                let params: InvertedIndexParams =
-                    serde_json::from_value(serde_json::Value::Object(params_json))
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?;
                 Box::new(params)
             }
             _ => {
