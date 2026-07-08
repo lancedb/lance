@@ -1728,18 +1728,11 @@ impl FilteredReadExec {
         let input_schema = input.schema();
         let has_row_id = input_schema.column_with_name(ROW_ID).is_some();
         let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
+        // Prefer the row id when both are present: ids survive compaction,
+        // addresses are pinned to this dataset version
         let key_column = if has_row_id {
             ROW_ID
         } else if has_row_addr {
-            if dataset.manifest.uses_stable_row_ids() {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "cannot read rows by '{}' on a dataset with stable row ids; the input plan must provide '{}'",
-                        ROW_ADDR, ROW_ID
-                    )
-                    .into(),
-                ));
-            }
             ROW_ADDR
         } else {
             return Err(Error::invalid_input_source(
@@ -2204,6 +2197,43 @@ impl RowStreamRead {
             .await
     }
 
+    /// Build a round's per-fragment read ranges directly from physical row
+    /// addresses.
+    ///
+    /// An address already encodes (fragment id, offset), so no row-id
+    /// sequence translation is needed — this works with and without stable
+    /// row ids.  Addresses pointing at deleted rows or unknown fragments
+    /// produce no ranges and their input rows drop like stale keys.
+    fn plan_round_from_addresses(
+        addrs: &RowAddrTreeMap,
+        fragments: &[LoadedFragment],
+    ) -> FilteredReadInternalPlan {
+        let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+        for fragment in fragments {
+            let fragment_id = fragment.fragment.id() as u32;
+            let requested = match addrs.get(&fragment_id) {
+                None => continue,
+                Some(RowAddrSelection::Full) => vec![0..fragment.num_physical_rows],
+                Some(RowAddrSelection::Partial(bitmap)) => bitmap_to_ranges(bitmap),
+            };
+            let valid = FilteredReadStream::full_frag_range(
+                fragment.num_physical_rows,
+                &fragment.deletion_vector,
+            );
+            let matched = FilteredReadStream::intersect_ranges(&valid, &requested);
+            if !matched.is_empty() {
+                rows.insert(fragment_id, matched);
+            }
+        }
+        FilteredReadInternalPlan {
+            rows,
+            // A row-stream read has no filters or scan ranges (rejected at
+            // construction)
+            filters: HashMap::new(),
+            scan_range_after_filter: None,
+        }
+    }
+
     async fn map_batch(
         self: Arc<Self>,
         batch: RecordBatch,
@@ -2229,20 +2259,27 @@ impl RowStreamRead {
 
         // Null keys identify rows that don't exist in the dataset; they are
         // excluded here and the rows are dropped by the unmatched filter below
-        let row_ids = if keys.null_count() == 0 {
+        let round_keys = if keys.null_count() == 0 {
             RowAddrTreeMap::from_iter(keys.values().iter().copied())
         } else {
             RowAddrTreeMap::from_iter(keys.iter().flatten())
         };
-        let evaluated_index = Arc::new(EvaluatedIndex {
-            index_result: IndexExprResult::exact(RowAddrMask::from_allowed(row_ids)),
-            applicable_fragments: self.dataset.fragment_bitmap.as_ref().clone(),
-        });
         drop(compute_timer);
 
         let fragments = self.load_fragments().await?;
-        let internal_plan =
-            FilteredReadStream::plan_scan(fragments, &Some(evaluated_index), &self.read_options);
+        let internal_plan = if self.key_column == ROW_ADDR {
+            // Addresses already encode (fragment, offset), so build the read
+            // ranges directly.  The mask path below cannot be used here: on a
+            // stable-row-id dataset it would translate the values through the
+            // row-id sequence, misreading addresses as row ids.
+            Self::plan_round_from_addresses(&round_keys, fragments)
+        } else {
+            let evaluated_index = Arc::new(EvaluatedIndex {
+                index_result: IndexExprResult::exact(RowAddrMask::from_allowed(round_keys)),
+                applicable_fragments: self.dataset.fragment_bitmap.as_ref().clone(),
+            });
+            FilteredReadStream::plan_scan(fragments, &Some(evaluated_index), &self.read_options)
+        };
         let mut scoped_fragments = FilteredReadStream::plan_to_scoped_fragments(
             &internal_plan,
             fragments,
@@ -4694,26 +4731,36 @@ mod tests {
                 .unwrap()
         }
 
-        /// Take with shuffled, duplicated row addresses and a payload column:
-        /// the output must preserve the input's row order, duplicates, and the
+        /// Take with shuffled, duplicated keys and a payload column: the
+        /// output must preserve the input's row order, duplicates, and the
         /// payload (small input batches coalesce into a single read round)
         #[rstest]
-        #[case::by_row_addr(ROW_ADDR)]
-        #[case::by_row_id(ROW_ID)]
+        #[case::by_row_addr(false, ROW_ADDR)]
+        #[case::by_row_id(false, ROW_ID)]
+        #[case::stable_by_row_addr(true, ROW_ADDR)]
+        #[case::stable_by_row_id(true, ROW_ID)]
         #[tokio::test]
-        async fn take_preserves_order_dups_and_payload(#[case] key: &str) {
-            let fixture = take_fixture(false).await;
+        async fn take_preserves_order_dups_and_payload(
+            #[case] stable_row_ids: bool,
+            #[case] key: &str,
+        ) {
+            let fixture = take_fixture(stable_row_ids).await;
 
             // Rows span all 3 fragments; 21 appears twice; order is shuffled.
-            // (Without stable row ids, ids and addresses are the same values.)
+            // Row ids are assigned sequentially on write, so with stable row
+            // ids the id of row `i` is just `i`; without them id == address.
             let addr = |frag: u64, off: u64| (frag << 32) | off;
-            let keys: Vec<u64> = vec![
-                addr(2, 1), // i = 21
-                addr(0, 3), // i = 3
-                addr(1, 5), // i = 15
-                addr(2, 1), // i = 21 (duplicate)
-                addr(0, 0), // i = 0
-            ];
+            let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
+                vec![21, 3, 15, 21, 0]
+            } else {
+                vec![
+                    addr(2, 1), // i = 21
+                    addr(0, 3), // i = 3
+                    addr(1, 5), // i = 15
+                    addr(2, 1), // i = 21 (duplicate)
+                    addr(0, 0), // i = 0
+                ]
+            };
             let expected_i: Vec<i32> = vec![21, 3, 15, 21, 0];
 
             let input_schema = Arc::new(ArrowSchema::new(vec![
@@ -4885,10 +4932,12 @@ mod tests {
 
         /// Input rows whose key no longer exists (deleted rows) are dropped
         #[rstest]
-        #[case::unstable(false)]
-        #[case::stable(true)]
+        #[case::by_row_addr(false, ROW_ADDR)]
+        #[case::by_row_id(false, ROW_ID)]
+        #[case::stable_by_row_addr(true, ROW_ADDR)]
+        #[case::stable_by_row_id(true, ROW_ID)]
         #[tokio::test]
-        async fn take_drops_stale_keys(#[case] stable_row_ids: bool) {
+        async fn take_drops_stale_keys(#[case] stable_row_ids: bool, #[case] key: &str) {
             let fixture = take_fixture(stable_row_ids).await;
             let mut dataset = fixture.dataset.as_ref().clone();
             dataset.delete("i = 15").await.unwrap();
@@ -4896,16 +4945,16 @@ mod tests {
 
             let addr = |frag: u64, off: u64| (frag << 32) | off;
             // Row ids are assigned sequentially on write, so with stable row
-            // ids the id of row `i` is just `i`; without them it is the
-            // address.  Either way these are the pre-delete ids of rows 15
-            // (now deleted) and 16.
-            let keys: Vec<u64> = if stable_row_ids {
+            // ids the id of row `i` is just `i`; without them id == address.
+            // Either way these identify the pre-delete rows 15 (now deleted)
+            // and 16.
+            let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
                 vec![15, 16]
             } else {
                 vec![addr(1, 5), addr(1, 6)]
             };
             let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                ROW_ID,
+                key,
                 DataType::UInt64,
                 true,
             )]));
@@ -4922,8 +4971,7 @@ mod tests {
             assert_eq!(i_col.value(0), 16);
         }
 
-        /// Construction errors: no key column, taking by address on a
-        /// stable-row-id dataset, nothing to read
+        /// Construction errors: no key column, nothing to read
         #[tokio::test]
         async fn take_construction_errors() {
             let fixture = take_fixture(false).await;
@@ -4944,15 +4992,6 @@ mod tests {
                     .contains("must have a column")
             );
 
-            let addr_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                ROW_ADDR,
-                DataType::UInt64,
-                true,
-            )]));
-            let addr_batch =
-                RecordBatch::try_new(addr_schema, vec![Arc::new(UInt64Array::from(vec![0_u64]))])
-                    .unwrap();
-
             // Taking fields the input already has: nothing to read
             let with_s_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(ROW_ADDR, DataType::UInt64, true),
@@ -4971,19 +5010,6 @@ mod tests {
                     .unwrap_err()
                     .to_string()
                     .contains("nothing to read")
-            );
-
-            // Taking by address on a stable-row-id dataset is rejected
-            let stable_fixture = take_fixture(true).await;
-            assert!(
-                take_plan(
-                    &stable_fixture.dataset,
-                    rows_input(vec![addr_batch]),
-                    &["s"]
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("stable row ids")
             );
         }
 

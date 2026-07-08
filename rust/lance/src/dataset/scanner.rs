@@ -4849,8 +4849,7 @@ impl Scanner {
 
         let input_schema = input.schema();
         let has_usable_key = input_schema.column_with_name(ROW_ID).is_some()
-            || (input_schema.column_with_name(ROW_ADDR).is_some()
-                && !self.dataset.manifest.uses_stable_row_ids());
+            || input_schema.column_with_name(ROW_ADDR).is_some();
         // INVARIANT: every site that replaces TakeExec with FilteredReadExec
         // must check is_legacy_storage() first.  The v1 reader's
         // read_ranges_tasks is a stub that errors ("Attempt to perform
