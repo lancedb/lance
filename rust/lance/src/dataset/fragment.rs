@@ -65,7 +65,9 @@ use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
-use crate::dataset::overlay::{FieldOverlayPlan, load_overlay_plan, merge_overlay_batch};
+use crate::dataset::overlay::{
+    OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
+};
 use crate::io::deletion::read_dataset_deletion_file;
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
@@ -650,7 +652,7 @@ impl GenericFileReader for NullReader {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FragReadConfig {
     // Add the row id column
     pub with_row_id: bool,
@@ -923,24 +925,11 @@ impl FileFragment {
             futures::future::Either::Right(futures::future::ready(Ok(None)))
         };
 
-        // Open overlay value-column readers concurrently with the base files
-        // (no value bytes are read yet — that happens per batch on read).
-        let overlay_plan_load = if self.metadata.overlays.is_empty() {
-            futures::future::Either::Left(futures::future::ready(Ok(Vec::new())))
-        } else {
-            futures::future::Either::Right(load_overlay_plan(self, projection, &read_config))
-        };
-
-        let (opened_files, deletion_vec, row_id_sequence, overlay_plans) = join!(
-            open_files,
-            deletion_vec_load,
-            row_id_load,
-            overlay_plan_load
-        );
+        let (opened_files, deletion_vec, row_id_sequence) =
+            join!(open_files, deletion_vec_load, row_id_load);
         let opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
-        let overlay_plans = overlay_plans?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::not_found(format!(
@@ -963,8 +952,17 @@ impl FileFragment {
             Arc::new(self.metadata.clone()),
         )?;
 
-        if !overlay_plans.is_empty() {
-            reader.overlay_plans = Arc::new(overlay_plans);
+        // Plan overlay resolution from coverage metadata (no files opened here); the
+        // readers are opened lazily on read, pruned to the rows each read touches.
+        if !self.metadata.overlays.is_empty() {
+            let planner = plan_overlays(self, projection)?;
+            if !planner.is_empty() {
+                reader.overlay = Some(OverlayReadState {
+                    planner: Arc::new(planner),
+                    fragment: Arc::new(self.clone()),
+                    read_config: Arc::new(read_config.clone()),
+                });
+            }
         }
 
         if read_config.with_row_id {
@@ -2273,10 +2271,22 @@ pub struct FragmentReader {
     // total number of physical rows in the fragment (all rows, ignoring deletions)
     num_physical_rows: usize,
 
-    /// Overlay value columns for the projected fields, loaded newest-first.
-    /// Empty when the fragment has no data overlay files. Merged into base
-    /// batches (by physical offset) before deletion filtering on every read.
-    overlay_plans: Arc<Vec<FieldOverlayPlan>>,
+    /// Read-time state for resolving data overlay files: the coverage plan plus
+    /// what is needed to open overlay readers. `None` when the fragment has no
+    /// overlays. Overlays are merged into base batches (by `offset_in_frag`) before
+    /// deletion filtering, opening only the files each read's rows touch.
+    overlay: Option<OverlayReadState>,
+}
+
+/// What [`FragmentReader`] needs to resolve overlays at read time: the coverage
+/// plan (from metadata, cheap to build), and the fragment + config needed to open
+/// overlay readers once the read's rows — and therefore which files it touches —
+/// are known. All `Arc` so cloning a reader stays cheap.
+#[derive(Clone, Debug)]
+struct OverlayReadState {
+    planner: Arc<OverlayReadPlanner>,
+    fragment: Arc<FileFragment>,
+    read_config: Arc<FragReadConfig>,
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -2305,7 +2315,7 @@ impl Clone for FragmentReader {
             created_at_sequence: self.created_at_sequence.clone(),
             num_rows: self.num_rows,
             num_physical_rows: self.num_physical_rows,
-            overlay_plans: self.overlay_plans.clone(),
+            overlay: self.overlay.clone(),
         }
     }
 }
@@ -2373,7 +2383,7 @@ impl FragmentReader {
             created_at_sequence: None,
             num_rows,
             num_physical_rows,
-            overlay_plans: Arc::new(Vec::new()),
+            overlay: None,
         })
     }
 
@@ -2639,30 +2649,44 @@ impl FragmentReader {
     /// value for a deleted row is dropped along with the row downstream. A no-op
     /// when the fragment has no overlays.
     ///
-    /// Each batch's `offset_in_frag` values are known from `params` and the task's
-    /// `num_rows` without reading any data, so the overlay reads (only the values
-    /// the batch actually needs) are issued concurrently with the base read rather
-    /// than after it.
-    fn merge_overlays(
+    /// The read's `offset_in_frag` values are known from `params` up front, so
+    /// overlays are resolved here to just the files this read's rows touch — an
+    /// overlay whose cells fall outside the read is not opened at all. Within each
+    /// batch, the overlay reads (only the values that batch needs) are then issued
+    /// concurrently with the base read rather than after it.
+    async fn merge_overlays(
         &self,
         merged: ReadBatchTaskStream,
         params: &ReadBatchParams,
         total_num_rows: u32,
-    ) -> ReadBatchTaskStream {
-        if self.overlay_plans.is_empty() {
-            return merged;
-        }
+    ) -> Result<ReadBatchTaskStream> {
+        let Some(overlay) = &self.overlay else {
+            return Ok(merged);
+        };
         // The offset_in_frag of every row this read will return, materialized once.
-        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row),
-        // and it lets each batch below slice out its own offsets without reading
-        // any data. Only paid when the fragment actually has overlays.
+        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row), and
+        // it lets us both prune overlays to the read and slice each batch's offsets
+        // below without reading any data. Only paid when the fragment has overlays.
         let offsets_in_frag: Arc<Vec<u32>> =
             Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
-        let plans = self.overlay_plans.clone();
+
+        // Open only the overlay readers this read touches (pruned by row selection).
+        let plans = resolve_overlays(
+            &overlay.planner,
+            &offsets_in_frag,
+            &overlay.fragment,
+            &overlay.read_config,
+        )
+        .await?;
+        if plans.is_empty() {
+            return Ok(merged);
+        }
+        let plans = Arc::new(plans);
+
         // Batches arrive in physical read order, so a running total of the rows seen
         // so far gives each batch its starting offset_in_batch into `offsets_in_frag`.
         let mut rows_seen = 0usize;
-        merged
+        let stream = merged
             .map(move |task| {
                 let num_rows = task.num_rows;
                 let start = rows_seen;
@@ -2679,7 +2703,8 @@ impl FragmentReader {
                     .boxed(),
                 }
             })
-            .boxed()
+            .boxed();
+        Ok(stream)
     }
 
     async fn new_read_impl<'a, F>(
@@ -2749,7 +2774,7 @@ impl FragmentReader {
             lance_table::utils::stream::merge_streams(read_streams)
         };
 
-        let merged = self.merge_overlays(merged, &params, total_num_rows);
+        let merged = self.merge_overlays(merged, &params, total_num_rows).await?;
 
         // Add the row id column (if needed) and delete rows (if a deletion
         // vector is present).
@@ -2922,7 +2947,9 @@ impl FragmentReader {
         };
 
         let params = ReadBatchParams::Ranges(ranges);
-        let merged_stream = self.merge_overlays(merged_stream, &params, total_num_rows);
+        let merged_stream = self
+            .merge_overlays(merged_stream, &params, total_num_rows)
+            .await?;
 
         // Add the row id column (if needed) and delete rows (if a deletion
         // vector is present).
@@ -3610,6 +3637,51 @@ mod tests {
             let val = col(&batch, "val");
             assert_eq!(val.value(0), values[0]);
             assert_eq!(val.value(1), values[1]);
+        }
+
+        /// Row-selection pruning: an overlay whose coverage is disjoint from the
+        /// requested rows must not be opened at all. Proven by deleting the overlay's
+        /// data file — a `take` that misses its coverage still succeeds (the file is
+        /// never touched), while a `take` that hits it then fails because the file is
+        /// genuinely needed.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_prunes_overlays_outside_row_selection(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Overlay on fragment 0 (offsets 0..6) covering only offset_in_frag 5.
+            let dataset = commit_overlay(
+                dataset,
+                "miss",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([5])),
+                vec![i32_array([Some(5000)])],
+                version,
+            )
+            .await;
+
+            // Delete the overlay's data file: opening it now fails.
+            dataset
+                .object_store
+                .delete(&Path::from("data/miss.lance"))
+                .await
+                .unwrap();
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let val_only = dataset.schema().project_by_ids(&[1], true);
+
+            // A take that misses the overlay's coverage must not open it, so it
+            // succeeds and returns base values (val = offset * 10).
+            let batch = frag.take(&[0, 1], &val_only).await.unwrap();
+            assert_eq!(col(&batch, "val").values(), &[0, 10]);
+
+            // A take that hits the coverage does need the file, so it now fails.
+            assert!(
+                frag.take(&[5], &val_only).await.is_err(),
+                "take hitting the overlay's coverage should require its missing file",
+            );
         }
 
         /// The overlay merge runs before `wrap_with_row_id_and_delete`, so the

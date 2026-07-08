@@ -44,6 +44,7 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
+use lance_table::format::DataFile;
 use lance_table::format::overlay::DataOverlayFile;
 use lance_table::utils::stream::ReadBatchFut;
 
@@ -306,82 +307,117 @@ pub fn assemble_overlay_column(
     interleave(&sources, &routing.indices).map_err(Error::from)
 }
 
-/// One overlay's contribution to one projected field: the cells it covers, and an
-/// opened (but unread) reader over the overlay file from which the field's values
-/// are fetched by `offset_in_overlay` at merge time.
+/// One overlay's contribution to one projected field, with its file reader opened:
+/// the cells it covers, and the reader from which the field's values are fetched by
+/// `offset_in_overlay` at merge time.
 #[derive(Debug, Clone)]
 struct LoadedFieldOverlay {
     /// The `offset_in_frag` cells this overlay covers for the field.
     coverage: Arc<RoaringBitmap>,
-    /// Reader over the overlay data file, projected to this field; shared across
-    /// the fields that the same file covers.
+    /// Reader over the overlay data file, projected to the covered fields; shared
+    /// across the fields that the same file covers.
     reader: Arc<dyn GenericFileReader>,
     /// Single-field projection used when fetching the value column.
     field_projection: Arc<Schema>,
 }
 
-/// The overlays that apply to a single projected field, ordered newest-first.
-/// `field_name` is the top-level read-batch column name the plan applies to.
+/// The overlays that apply to a single projected field, ordered newest-first, with
+/// readers opened and pruned to a specific read. `field_name` is the top-level
+/// read-batch column name the plan applies to. Produced by [`resolve_overlays`] and
+/// consumed by [`merge_overlay_batch`].
 #[derive(Debug, Clone)]
 pub struct FieldOverlayPlan {
     field_name: String,
     overlays_newest_first: Vec<LoadedFieldOverlay>,
 }
 
-/// Open the overlay value-column readers for `fragment`'s projected fields, ordered
-/// newest-first, ready to be merged into base batches on read.
-///
-/// Each contributing overlay *file* is opened once (its metadata loaded), projected
-/// to the fields it covers that the read also projects. The value columns
-/// themselves are **not** read here — the per-batch merge fetches only the overlay
-/// values it needs (see [`merge_overlay_batch`]), so a `take` of a few rows no
-/// longer reads a whole overlay column.
+/// One overlay file that may contribute to a read, before it is opened. Opened
+/// lazily by [`resolve_overlays`], and only if the read actually touches it.
+#[derive(Debug, Clone)]
+struct PlannedOverlayFile {
+    data_file: DataFile,
+    /// The covered ∩ projected fields to project when the file is opened, so a
+    /// single reader serves every field the file contributes to.
+    open_projection: Arc<Schema>,
+}
+
+/// One overlay's contribution to one projected field, before the file is opened.
+#[derive(Debug, Clone)]
+struct PlannedFieldOverlay {
+    /// Index into [`OverlayReadPlanner::files`] of the file that supplies the value.
+    file: usize,
+    coverage: Arc<RoaringBitmap>,
+}
+
+/// The overlays that apply to a single projected field, ordered newest-first,
+/// before any file is opened.
+#[derive(Debug, Clone)]
+struct PlannedField {
+    field_name: String,
+    /// Single-field projection used when fetching this field's value column.
+    field_projection: Arc<Schema>,
+    overlays_newest_first: Vec<PlannedFieldOverlay>,
+}
+
+/// A fragment's overlay-resolution plan for a projection, derived from coverage
+/// metadata alone — no file opened, no IO. [`resolve_overlays`] turns it into opened
+/// [`FieldOverlayPlan`]s for one specific read, opening only the files whose cells
+/// the read's rows actually touch.
+#[derive(Debug, Clone)]
+pub struct OverlayReadPlanner {
+    files: Vec<PlannedOverlayFile>,
+    fields: Vec<PlannedField>,
+}
+
+impl OverlayReadPlanner {
+    /// True when no projected field has any overlay, so there is nothing to resolve.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+/// Plan `fragment`'s overlay resolution for a projection from coverage metadata
+/// alone. No files are opened here (see [`resolve_overlays`]) — this only reads the
+/// already-parsed coverage bitmaps, so it is cheap enough to run on every open.
 ///
 /// For each projected (top-level) field, the fragment's overlays are walked
 /// newest-first; an overlay contributes if its `data_file.fields` includes the
 /// field. Overlays on nested (non-top-level) fields are not yet supported and are
-/// simply not matched here.
-pub async fn load_overlay_plan(
-    fragment: &FileFragment,
-    projection: &Schema,
-    read_config: &FragReadConfig,
-) -> Result<Vec<FieldOverlayPlan>> {
+/// simply not matched here. Each contributing overlay *file* appears once in
+/// `files`, shared by every field it covers.
+pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<OverlayReadPlanner> {
     let order = overlay_indices_newest_first(&fragment.metadata.overlays);
 
-    // Open each contributing overlay file once, concurrently. The reader is
-    // shared (via `Arc`) by every field that file covers.
-    //
-    // TODO(overlay perf): these reads use the default reader priority. Once
-    // we benchmark take/scan over overlays, decide whether overlay value
-    // reads should inherit `read_config.reader_priority` (or get a dedicated
-    // priority) so they schedule alongside the base reads.
-    let opened: Vec<Option<Arc<dyn GenericFileReader>>> =
-        futures::future::try_join_all(order.iter().map(|&overlay_idx| async move {
-            let overlay = &fragment.metadata.overlays[overlay_idx];
-            let covered: Vec<lance_core::datatypes::Field> = projection
-                .fields
-                .iter()
-                .filter(|f| overlay.data_file.fields.contains(&f.id))
-                .cloned()
-                .collect();
-            if covered.is_empty() {
-                return Ok::<_, Error>(None);
-            }
-            let schema = Schema {
+    // One entry per contributing overlay file, newest-first. `pos_to_file[pos]` maps
+    // a position in `order` to its index in `files` (None if it covers no projected
+    // field, so it is never referenced and never opened).
+    let mut files = Vec::new();
+    let mut pos_to_file = vec![None; order.len()];
+    for (pos, &overlay_idx) in order.iter().enumerate() {
+        let overlay = &fragment.metadata.overlays[overlay_idx];
+        let covered: Vec<lance_core::datatypes::Field> = projection
+            .fields
+            .iter()
+            .filter(|f| overlay.data_file.fields.contains(&f.id))
+            .cloned()
+            .collect();
+        if covered.is_empty() {
+            continue;
+        }
+        pos_to_file[pos] = Some(files.len());
+        files.push(PlannedOverlayFile {
+            data_file: overlay.data_file.clone(),
+            open_projection: Arc::new(Schema {
                 fields: covered,
                 metadata: Default::default(),
-            };
-            Ok(fragment
-                .open_reader(&overlay.data_file, Some(&schema), read_config)
-                .await?
-                .map(Arc::from))
-        }))
-        .await?;
+            }),
+        });
+    }
 
-    let mut plans = Vec::new();
+    let mut fields = Vec::new();
     for field in &projection.fields {
         let mut overlays_newest_first = Vec::new();
-        for (slot, &overlay_idx) in order.iter().enumerate() {
+        for (pos, &overlay_idx) in order.iter().enumerate() {
             let overlay = &fragment.metadata.overlays[overlay_idx];
             let Some(field_pos) = overlay
                 .data_file
@@ -391,26 +427,114 @@ pub async fn load_overlay_plan(
             else {
                 continue;
             };
-            let Some(reader) = &opened[slot] else {
+            let Some(file) = pos_to_file[pos] else {
                 continue;
             };
-            overlays_newest_first.push(LoadedFieldOverlay {
+            overlays_newest_first.push(PlannedFieldOverlay {
+                file,
                 coverage: overlay.coverage_for_field(field_pos)?,
-                reader: reader.clone(),
+            });
+        }
+        if !overlays_newest_first.is_empty() {
+            fields.push(PlannedField {
+                field_name: field.name.clone(),
                 field_projection: Arc::new(Schema {
                     fields: vec![field.clone()],
                     metadata: Default::default(),
                 }),
+                overlays_newest_first,
+            });
+        }
+    }
+    Ok(OverlayReadPlanner { files, fields })
+}
+
+/// Open the overlay readers a specific read needs and return the per-field plans to
+/// merge, pruned to that read.
+///
+/// `offsets_in_frag` are the rows the read will return. An overlay whose coverage is
+/// disjoint from those rows contributes nothing, so it is dropped and its file is
+/// never opened — a `take` that misses an overlay's cells pays no IO for it. Each
+/// surviving file is opened once, concurrently, projected to the covered fields; the
+/// value bytes are still not read here (the per-batch [`merge_overlay_batch`] fetches
+/// only the values it needs).
+pub async fn resolve_overlays(
+    planner: &OverlayReadPlanner,
+    offsets_in_frag: &[u32],
+    fragment: &FileFragment,
+    read_config: &FragReadConfig,
+) -> Result<Vec<FieldOverlayPlan>> {
+    let read_offsets = read_offsets_bitmap(offsets_in_frag);
+
+    // A file is opened only if some field it covers has cells among the requested
+    // rows. This is the row-selection pruning: overlays outside the read are skipped.
+    let mut file_needed = vec![false; planner.files.len()];
+    for field in &planner.fields {
+        for overlay in &field.overlays_newest_first {
+            if !overlay.coverage.is_disjoint(&read_offsets) {
+                file_needed[overlay.file] = true;
+            }
+        }
+    }
+
+    // Open each needed file once, concurrently. The reader is shared (via `Arc`) by
+    // every field that file covers.
+    //
+    // TODO(overlay perf): these reads use the default reader priority. Once we
+    // benchmark take/scan over overlays, decide whether overlay value reads should
+    // inherit `read_config.reader_priority` (or get a dedicated priority) so they
+    // schedule alongside the base reads.
+    let opened: Vec<Option<Arc<dyn GenericFileReader>>> =
+        futures::future::try_join_all(planner.files.iter().enumerate().map(|(i, file)| {
+            let needed = file_needed[i];
+            async move {
+                if !needed {
+                    return Ok::<_, Error>(None);
+                }
+                Ok(fragment
+                    .open_reader(&file.data_file, Some(&file.open_projection), read_config)
+                    .await?
+                    .map(Arc::from))
+            }
+        }))
+        .await?;
+
+    let mut plans = Vec::new();
+    for field in &planner.fields {
+        let mut overlays_newest_first = Vec::new();
+        for overlay in &field.overlays_newest_first {
+            let Some(reader) = &opened[overlay.file] else {
+                continue; // pruned: coverage disjoint from the read
+            };
+            overlays_newest_first.push(LoadedFieldOverlay {
+                coverage: overlay.coverage.clone(),
+                reader: reader.clone(),
+                field_projection: field.field_projection.clone(),
             });
         }
         if !overlays_newest_first.is_empty() {
             plans.push(FieldOverlayPlan {
-                field_name: field.name.clone(),
+                field_name: field.field_name.clone(),
                 overlays_newest_first,
             });
         }
     }
     Ok(plans)
+}
+
+/// The set of `offset_in_frag` a read will return, as a bitmap for cheap
+/// intersection against overlay coverages. Contiguous scans build a single range;
+/// arbitrary `take` offsets (small batches) are inserted individually.
+fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
+    let mut bitmap = RoaringBitmap::new();
+    match contiguous_frag_start(offsets_in_frag) {
+        Some(start) => {
+            let end = (start as u64 + offsets_in_frag.len() as u64).min(u32::MAX as u64) as u32;
+            bitmap.insert_range(start..end);
+        }
+        None => bitmap.extend(offsets_in_frag.iter().copied()),
+    }
+    bitmap
 }
 
 /// Resolve overlays for one base batch: route each projected field against the
