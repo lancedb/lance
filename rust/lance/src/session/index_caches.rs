@@ -22,10 +22,13 @@ use uuid::Uuid;
 pub struct GlobalIndexCache(pub(super) LanceCache);
 
 impl GlobalIndexCache {
-    pub fn for_dataset(&self, uri: &str) -> DSIndexCache {
-        // Create a sub-cache for the dataset by adding the URI as a key prefix.
-        // This prevents collisions between different datasets.
-        DSIndexCache(self.0.with_key_prefix(uri))
+    pub fn for_dataset(&self, dataset_key: &str) -> DSIndexCache {
+        // Create a sub-cache for the dataset by adding the dataset key
+        // (object store prefix + URI, see `Dataset::cache_dataset_key`) as a
+        // key prefix. This prevents collisions between different datasets,
+        // including datasets that share a URI but live in different object
+        // stores.
+        DSIndexCache(self.0.with_key_prefix(dataset_key))
     }
 }
 

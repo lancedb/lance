@@ -899,7 +899,12 @@ async fn test_checkout_removed_version_not_served_from_cache() {
 
     let version = dataset.manifest().version;
     let location = dataset.manifest_location().clone();
-    let cache = session.metadata_cache.for_dataset(&dataset.uri);
+    let cache = session
+        .metadata_cache
+        .for_dataset(&Dataset::cache_dataset_key(
+            &dataset.object_store,
+            &dataset.uri,
+        ));
 
     assert!(
         cache

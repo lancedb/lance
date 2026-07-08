@@ -327,8 +327,16 @@ impl<'a> CommitBuilder<'a> {
         let (metadata_cache, index_cache) = match &dest {
             WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
             WriteDestination::Uri(uri) => (
-                Arc::new(session.metadata_cache.for_dataset(uri)),
-                Arc::new(session.index_cache.for_dataset(uri)),
+                Arc::new(
+                    session
+                        .metadata_cache
+                        .for_dataset(&Dataset::cache_dataset_key(&object_store, uri)),
+                ),
+                Arc::new(
+                    session
+                        .index_cache
+                        .for_dataset(&Dataset::cache_dataset_key(&object_store, uri)),
+                ),
             ),
         };
 

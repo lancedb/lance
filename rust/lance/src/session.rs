@@ -39,16 +39,19 @@ pub struct Session {
     /// Global cache for opened indices.
     ///
     /// Sub-caches are created from this cache for each dataset by adding the
-    /// URI and index UUID as a key prefix. If there is a fragment re-use index,
-    /// that is also in the key prefix. This prevents collisions between different
-    /// datasets and indices.
+    /// dataset key (object store prefix + URI) and index UUID as a key prefix.
+    /// If there is a fragment re-use index, that is also in the key prefix.
+    /// This prevents collisions between different datasets and indices, even
+    /// when datasets share a URI across different object stores.
     pub(crate) index_cache: GlobalIndexCache,
 
     /// Global cache for file metadata.
     ///
     /// Sub-caches are created from this cache for each dataset by adding the
-    /// URI as a key prefix. See the [`LanceDataset::metadata_cache`] field.
-    /// This prevents collisions between different datasets.
+    /// dataset key (object store prefix + URI) as a key prefix. See the
+    /// [`LanceDataset::metadata_cache`] field. This prevents collisions
+    /// between different datasets, even when datasets share a URI across
+    /// different object stores.
     pub(crate) metadata_cache: caches::GlobalMetadataCache,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,

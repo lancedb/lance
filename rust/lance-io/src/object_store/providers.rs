@@ -71,6 +71,13 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     /// this will be something like 'az$account_name@container'
     ///
     /// Providers should override this if they have special requirements like Azure's.
+    ///
+    /// The prefix must uniquely identify the backing store: it participates in
+    /// store-instance caching and in session dataset-cache keys (joined with the
+    /// dataset URI using `|`, so it should not contain `|`). If two different
+    /// physical stores can be reached through the same URL (for example via a
+    /// storage option selecting an account or endpoint), the distinguishing
+    /// option must be reflected in the prefix.
     fn calculate_object_store_prefix(
         &self,
         url: &Url,

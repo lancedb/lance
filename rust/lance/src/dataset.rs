@@ -423,6 +423,10 @@ impl From<Schema> for ProjectionRequest {
 }
 
 impl Dataset {
+    pub(crate) fn cache_dataset_key(object_store: &ObjectStore, uri: &str) -> String {
+        format!("{}|{}", object_store.store_prefix, uri)
+    }
+
     /// Open an existing dataset.
     ///
     /// See also [DatasetBuilder].
@@ -720,7 +724,9 @@ impl Dataset {
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
             retain_supported_indices(&mut indices);
-            let ds_index_cache = session.index_cache.for_dataset(uri);
+            let ds_index_cache = session
+                .index_cache
+                .for_dataset(&Self::cache_dataset_key(object_store, uri));
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
             };
@@ -741,7 +747,9 @@ impl Dataset {
             let transaction: Transaction =
                 lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
 
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
+            let metadata_cache = session
+                .metadata_cache
+                .for_dataset(&Self::cache_dataset_key(object_store, uri));
             let metadata_key = TransactionKey {
                 version: manifest_location.version,
             };
@@ -770,7 +778,9 @@ impl Dataset {
                 Self::load_manifest(object_store, manifest_location, uri, session).await?,
             ));
         }
-        let metadata_cache = session.metadata_cache.for_dataset(uri);
+        let metadata_cache = session
+            .metadata_cache
+            .for_dataset(&Self::cache_dataset_key(object_store, uri));
         let manifest_key = ManifestKey {
             version: manifest_location.version,
             e_tag: manifest_location.e_tag.as_deref(),
@@ -808,8 +818,16 @@ impl Dataset {
                 branch: manifest.branch.clone(),
             },
         );
-        let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
-        let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
+        let metadata_cache = Arc::new(
+            session
+                .metadata_cache
+                .for_dataset(&Self::cache_dataset_key(&object_store, &uri)),
+        );
+        let index_cache = Arc::new(
+            session
+                .index_cache
+                .for_dataset(&Self::cache_dataset_key(&object_store, &uri)),
+        );
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
         write::log_unregistered_base_scoped_options(
             store_params.as_ref(),

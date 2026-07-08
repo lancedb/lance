@@ -30,10 +30,13 @@ use crate::dataset::transaction::Transaction;
 pub struct GlobalMetadataCache(pub(super) LanceCache);
 
 impl GlobalMetadataCache {
-    pub fn for_dataset(&self, uri: &str) -> DSMetadataCache {
-        // Create a sub-cache for the dataset by adding the URI as a key prefix.
-        // This prevents collisions between different datasets.
-        DSMetadataCache(self.0.with_key_prefix(uri))
+    pub fn for_dataset(&self, dataset_key: &str) -> DSMetadataCache {
+        // Create a sub-cache for the dataset by adding the dataset key
+        // (object store prefix + URI, see `Dataset::cache_dataset_key`) as a
+        // key prefix. This prevents collisions between different datasets,
+        // including datasets that share a URI but live in different object
+        // stores.
+        DSMetadataCache(self.0.with_key_prefix(dataset_key))
     }
 }
 

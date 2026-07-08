@@ -4113,3 +4113,148 @@ async fn test_manifest_read_recovers_from_stale_size() {
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
 }
+
+/// Provider that multiplexes multiple "accounts" behind identical URIs, the way
+/// per-tenant storage accounts are served through a shared table URI: the account
+/// comes from a storage option and each account maps to its own local directory
+/// and its own `store_prefix`.
+#[derive(Debug)]
+struct AccountScopedStoreProvider {
+    root: std::path::PathBuf,
+}
+
+const ACCOUNT_OPTION_KEY: &str = "account_name";
+
+impl AccountScopedStoreProvider {
+    fn account(storage_options: Option<&HashMap<String, String>>) -> String {
+        storage_options
+            .and_then(|opts| opts.get(ACCOUNT_OPTION_KEY).cloned())
+            .unwrap_or_else(|| "default".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl lance_io::object_store::ObjectStoreProvider for AccountScopedStoreProvider {
+    async fn new_store(
+        &self,
+        base_path: url::Url,
+        params: &lance_io::object_store::ObjectStoreParams,
+    ) -> Result<lance_io::object_store::ObjectStore> {
+        let account_root = self.root.join(Self::account(params.storage_options()));
+        std::fs::create_dir_all(&account_root).unwrap();
+        let mut store = lance_io::object_store::ObjectStore::new(
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&account_root).unwrap()),
+            base_path.clone(),
+            params.block_size,
+            None,
+            false,
+            true,
+            lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
+            3,
+            params.storage_options(),
+        );
+        store.store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        Ok(store)
+    }
+
+    fn extract_path(&self, url: &url::Url) -> Result<object_store::path::Path> {
+        object_store::path::Path::from_url_path(url.path())
+            .map_err(|e| Error::invalid_input(format!("invalid path {}: {e}", url.path())))
+    }
+
+    fn calculate_object_store_prefix(
+        &self,
+        url: &url::Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        Ok(format!(
+            "{}${}@{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            Self::account(storage_options)
+        ))
+    }
+}
+
+/// Two datasets that share a URI but live in different object stores (distinct
+/// `store_prefix`) must not share session-cache entries. Regression test for
+/// cross-account index-metadata leakage: the per-dataset cache namespace used to
+/// be the URI alone, so the account opened second overwrote the first account's
+/// `IndexMetadataKey{version}` entry and queries planned against a foreign index
+/// UUID that does not exist in their own store.
+#[tokio::test]
+async fn test_session_caches_scoped_by_object_store() {
+    let tmp = TempStrDir::default();
+    let root = std::path::PathBuf::from(tmp.as_str());
+    let uri = "mock-acct://store/tables/tbl";
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+
+    // Create one dataset per account through plain file:// paths (writes are not
+    // under test), each with a scalar index so index metadata exists at the same
+    // version in both accounts.
+    let mut truth = HashMap::new();
+    for account in ["acct_a", "acct_b"] {
+        let dir = root.join(account).join("tables").join("tbl");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let mut ds = Dataset::write(reader, dir.to_str().unwrap(), None)
+            .await
+            .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let indices = ds.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        truth.insert(account, indices[0].uuid);
+    }
+
+    // Shared session with real cache capacities and the multiplexing provider.
+    let registry = Arc::new(lance_io::object_store::ObjectStoreRegistry::default());
+    registry.insert(
+        "mock-acct",
+        Arc::new(AccountScopedStoreProvider { root: root.clone() }),
+    );
+    let session = Arc::new(Session::new(64 * 1024 * 1024, 64 * 1024 * 1024, registry));
+
+    let open = |account: &'static str, session: Arc<Session>| async move {
+        DatasetBuilder::from_uri(uri)
+            .with_storage_options(HashMap::from([(
+                ACCOUNT_OPTION_KEY.to_string(),
+                account.to_string(),
+            )]))
+            .with_session(session)
+            .load()
+            .await
+            .unwrap()
+    };
+
+    // Open A first, then B: B's manifest read populates the index-metadata cache
+    // at the same dataset version as A. With URI-only cache namespaces A then
+    // observes B's index list; store-scoped namespaces must keep them apart.
+    let ds_a = open("acct_a", session.clone()).await;
+    let ds_b = open("acct_b", session.clone()).await;
+
+    let a_indices = ds_a.load_indices().await.unwrap();
+    let b_indices = ds_b.load_indices().await.unwrap();
+    assert_eq!(a_indices.len(), 1);
+    assert_eq!(b_indices.len(), 1);
+    assert_eq!(a_indices[0].uuid, truth["acct_a"]);
+    assert_eq!(b_indices[0].uuid, truth["acct_b"]);
+    assert_ne!(a_indices[0].uuid, b_indices[0].uuid);
+}
