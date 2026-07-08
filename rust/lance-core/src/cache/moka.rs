@@ -203,3 +203,79 @@ mod tests {
         assert_ne!(weight, u32::MAX);
     }
 }
+
+/// Registry identifier for the built-in Moka backend.
+pub const MOKA_BACKEND_KIND: &str = "moka";
+
+/// [`BackendBuildFn`](super::registry::BackendBuildFn) for [`MokaCacheBackend`].
+///
+/// Recognized options:
+///   * `capacity` — total weighted capacity in bytes (`usize`).
+///     A missing or empty value defaults to 0, i.e. a disabled cache.
+///
+/// Unknown options are rejected so typos surface immediately instead of
+/// silently falling through to the default capacity.
+pub(super) fn build_moka(config: &super::registry::BackendConfig) -> Result<Arc<dyn CacheBackend>> {
+    let mut capacity: usize = 0;
+    for (key, value) in &config.options {
+        match key.as_str() {
+            "capacity" => {
+                if value.is_empty() {
+                    capacity = 0;
+                } else {
+                    capacity = value.parse::<usize>().map_err(|err| {
+                        crate::Error::invalid_input(format!(
+                            "moka cache backend: cannot parse capacity {:?}: {}",
+                            value, err
+                        ))
+                    })?;
+                }
+            }
+            other => {
+                return Err(crate::Error::invalid_input(format!(
+                    "moka cache backend: unknown option {:?}",
+                    other
+                )));
+            }
+        }
+    }
+    Ok(Arc::new(MokaCacheBackend::with_capacity(capacity)))
+}
+
+#[cfg(test)]
+mod moka_registry_tests {
+    use super::super::backend_uri::build_from_uri;
+    use super::super::registry::{BackendConfig, build_from_config, registry_test_lock};
+
+    #[test]
+    fn test_moka_builds_from_config() {
+        let _lock = registry_test_lock();
+        let cfg = BackendConfig::new("moka").with_option("capacity", "1048576");
+        // Any Arc<dyn CacheBackend> we can construct is a pass; we're
+        // checking that "moka" is discoverable in the registry without
+        // the caller having to register it manually.
+        let _backend = build_from_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn test_moka_builds_from_uri() {
+        let _lock = registry_test_lock();
+        let _backend = build_from_uri("moka://?capacity=1048576").unwrap();
+    }
+
+    #[test]
+    fn test_moka_rejects_unknown_option() {
+        let _lock = registry_test_lock();
+        let cfg = BackendConfig::new("moka").with_option("mystery", "1");
+        let err = build_from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("unknown option"));
+    }
+
+    #[test]
+    fn test_moka_rejects_bad_capacity() {
+        let _lock = registry_test_lock();
+        let cfg = BackendConfig::new("moka").with_option("capacity", "not-a-number");
+        let err = build_from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("cannot parse capacity"));
+    }
+}

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+import pytest
 
 
 def test_cache_size_bytes(
@@ -37,3 +38,41 @@ def test_share_session(tmp_path: Path):
     assert ds1.session().size_bytes() == ds2.session().size_bytes()
 
     assert ds1.to_table() == ds2.to_table()
+
+
+def test_cache_backend_uri_config():
+    session = lance.Session(index_cache_backend="moka://?capacity=1048576")
+
+    assert session.index_cache_size_bytes() == 0
+
+
+def test_cache_backend_dict_config():
+    session = lance.Session(
+        index_cache_backend={
+            "kind": "moka",
+            "options": {"capacity": "1048576"},
+        },
+    )
+
+    assert session.index_cache_size_bytes() == 0
+
+
+def test_cache_backend_rejects_size_and_backend():
+    with pytest.raises(
+        ValueError,
+        match="index_cache_size_bytes and index_cache_backend are mutually exclusive",
+    ):
+        lance.Session(
+            index_cache_size_bytes=1024,
+            index_cache_backend="moka://?capacity=1048576",
+        )
+
+
+def test_cache_backend_rejects_unknown_dict_key():
+    with pytest.raises(ValueError, match="unknown dict key"):
+        lance.Session(
+            index_cache_backend={
+                "kind": "moka",
+                "capacity": "1048576",
+            },
+        )
