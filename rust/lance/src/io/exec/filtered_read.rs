@@ -2111,6 +2111,18 @@ impl FilteredReadExec {
     }
 }
 
+/// How many read rounds run ahead of the consumer.
+///
+/// This is a prefetch factor, not a CPU or I/O parallelism setting: rounds
+/// are I/O bound (their CPU work parallelizes via spawned tasks), and a deep
+/// window is what keeps the I/O scheduler saturated when a long input stream
+/// touches few fragments per round.  The cost is memory — output emits in
+/// round order, so a straggler round holds up to this many completed rounds
+/// buffered (~rounds × batch_size × fetched-row width).  If that becomes a
+/// problem the fix is a memory-pool reservation per round that pauses input
+/// consumption, not a smaller constant.
+const ROW_STREAM_PREFETCH_ROUNDS: usize = 64;
+
 /// Executes a [`FilteredReadExec`] over a row-stream source (see
 /// [`RowSource::RowStream`]).
 ///
@@ -2287,11 +2299,18 @@ impl RowStreamRead {
             &self.read_options,
             self.scan_scheduler.clone(),
         );
+        let num_fragments = fragments.len() as u32;
         for scoped in &mut scoped_fragments {
-            // One read round per input batch: read each fragment's rows as a
-            // single batch, and prioritize earlier input batches so consuming
-            // the (ordered) output is not starved by later batches
-            scoped.priority = batch_index;
+            // Keep both levels of I/O ordering: earlier rounds strictly before
+            // later ones (output emits in round order, so the scheduler should
+            // finish rounds in the order the consumer drains them), fragments
+            // in dataset order within a round.  A stride is used instead of a
+            // running counter because rounds plan concurrently; the values are
+            // not dense but the scheduler only compares them.
+            scoped.priority = scoped
+                .priority
+                .saturating_add(batch_index.saturating_mul(num_fragments));
+            // Read each fragment's rows for this round as a single batch
             scoped.batch_size = u32::MAX;
         }
 
@@ -2344,6 +2363,19 @@ impl RowStreamRead {
                 ))
             })?
             .as_primitive::<UInt64Type>();
+
+        // Fast path: the read produced exactly one row per input row with an
+        // identical key sequence (typical when the input is already in
+        // storage order with no duplicates or stale keys), so the rows are
+        // aligned as-is — skip the hash map and the permutation
+        if keys.null_count() == 0
+            && read_data.num_rows() == batch.num_rows()
+            && read_keys.values() == keys.values()
+        {
+            let new_data = read_data.project_by_schema(self.new_fields_schema.as_ref())?;
+            return Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?);
+        }
+
         let key_to_index: HashMap<u64, u32> = read_keys
             .values()
             .iter()
@@ -2467,7 +2499,7 @@ impl RowStreamRead {
                 )
             })
             .boxed()
-            .try_buffered(get_num_compute_intensive_cpus())
+            .try_buffered(ROW_STREAM_PREFETCH_ROUNDS)
             .map(move |result| {
                 result_metrics.io_metrics.record(&result_scheduler);
                 match result_baseline.record_poll(Poll::Ready(Some(result))) {
@@ -4863,6 +4895,55 @@ mod tests {
             let plan =
                 take_plan_sized(&fixture.dataset, rows_input(vec![batch]), &["i"], 3).unwrap();
             assert_rounds(run(&plan).await, plan.schema());
+        }
+
+        /// Storage-ordered input (strictly increasing keys, no duplicates or
+        /// stale rows) exercises the aligned fast path and must produce the
+        /// same exact output as the permuted path
+        #[rstest]
+        #[case::by_row_addr(ROW_ADDR)]
+        #[case::by_row_id(ROW_ID)]
+        #[tokio::test]
+        async fn take_aligned_input_fast_path(#[case] key: &str) {
+            let fixture = take_fixture(false).await;
+
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            let keys: Vec<u64> = vec![
+                addr(0, 0), // i = 0
+                addr(0, 3), // i = 3
+                addr(1, 5), // i = 15
+                addr(2, 1), // i = 21
+                addr(2, 9), // i = 29
+            ];
+            let expected_i: Vec<i32> = vec![0, 3, 15, 21, 29];
+
+            let input_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("payload", DataType::Float32, false),
+                ArrowField::new(key, DataType::UInt64, true),
+            ]));
+            let payload: Vec<f32> = (0..keys.len()).map(|v| v as f32 * 0.5).collect();
+            let batch = RecordBatch::try_new(
+                input_schema,
+                vec![
+                    Arc::new(Float32Array::from(payload.clone())),
+                    Arc::new(UInt64Array::from(keys)),
+                ],
+            )
+            .unwrap();
+
+            let plan = take_plan(&fixture.dataset, rows_input(vec![batch]), &["i"]).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(result.num_rows(), 5);
+            let i_col = result.column_by_name("i").unwrap();
+            assert_eq!(
+                i_col.as_primitive::<arrow::datatypes::Int32Type>().values(),
+                &expected_i[..]
+            );
+            let payload_col = result
+                .column_by_name("payload")
+                .unwrap()
+                .as_primitive::<Float32Type>();
+            assert_eq!(payload_col.values(), &payload[..]);
         }
 
         /// Take of new sub-fields into an existing struct column: the fields
