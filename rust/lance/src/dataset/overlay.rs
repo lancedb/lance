@@ -34,13 +34,13 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
@@ -370,10 +370,13 @@ impl OverlayReadPlanner {
 /// lists, so planning is `O(total overlay fields + projected fields)` rather than
 /// `O(projected fields × overlays)` (a fragment can have thousands of fields).
 ///
-/// An overlay contributes to a projected field when its `data_file.fields` includes
-/// that field's id. Overlays on nested (non-top-level) fields are not yet supported
-/// and simply match no projected field. Each contributing overlay *file* appears once
-/// in `files`, shared by every field it covers.
+/// An overlay contributes to a projected field when any id in its `data_file.fields`
+/// belongs to that top-level field's subtree. Overlays are written against the field
+/// ids the file actually stores, which for a struct or list column is its *leaf*
+/// child ids (the V2_1 structural encoding does not record the parent id), so a leaf
+/// is mapped back to its top-level projected ancestor — the whole column is then
+/// fetched and replaced as a unit. Each contributing overlay *file* appears once in
+/// `files`, shared by every top-level field it covers.
 pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<OverlayReadPlanner> {
     let overlays = &fragment.metadata.overlays;
     debug_assert!(
@@ -383,23 +386,31 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         "overlays must be sorted newest-last (see sort_overlays_newest_last)"
     );
 
-    // Projected fields indexed by id, so each overlay field is matched in O(1).
-    let projected: HashMap<i32, &lance_core::datatypes::Field> =
-        projection.fields.iter().map(|f| (f.id, f)).collect();
+    // Every id in the projection subtree (top-level fields *and* their nested
+    // descendants) mapped to its top-level projected field, so an overlay written
+    // against leaf ids still resolves to the column it belongs to, in O(1).
+    let mut top_level_of: HashMap<i32, &Field> = HashMap::new();
+    for field in &projection.fields {
+        index_field_subtree(field, field, &mut top_level_of);
+    }
 
     // Walk overlays newest-first, visiting only each overlay's own fields. Every
-    // covered field is appended to its entry in `field_overlays`; because we walk
-    // newest-first, each entry ends up ordered newest-first for free.
+    // covered top-level field is appended to its entry in `field_overlays`; because we
+    // walk newest-first, each entry ends up ordered newest-first for free.
     let mut files = Vec::new();
     let mut field_overlays: HashMap<i32, Vec<PlannedFieldOverlay>> = HashMap::new();
     for overlay in overlays.iter().rev() {
-        // (field_id, field_pos) for each of this overlay's fields that we project.
-        let mut contributions = Vec::new();
-        let mut covered_fields = Vec::new();
+        // The distinct top-level fields this overlay covers, each with the
+        // `data_file.fields` position whose coverage to read (a struct/list stores
+        // several leaf ids all mapping to the same top-level field — the first wins,
+        // as whole-value replacement shares one coverage across the leaves).
+        let mut seen = HashSet::new();
+        let mut contributions: Vec<(&Field, usize)> = Vec::new();
         for (field_pos, &field_id) in overlay.data_file.fields.iter().enumerate() {
-            if let Some(field) = projected.get(&field_id) {
-                contributions.push((field_id, field_pos));
-                covered_fields.push((*field).clone());
+            if let Some(&top) = top_level_of.get(&field_id)
+                && seen.insert(top.id)
+            {
+                contributions.push((top, field_pos));
             }
         }
         if contributions.is_empty() {
@@ -409,13 +420,16 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         files.push(PlannedOverlayFile {
             data_file: overlay.data_file.clone(),
             open_projection: Arc::new(Schema {
-                fields: covered_fields,
+                fields: contributions
+                    .iter()
+                    .map(|(top, _)| (*top).clone())
+                    .collect(),
                 metadata: Default::default(),
             }),
         });
-        for (field_id, field_pos) in contributions {
+        for (top, field_pos) in contributions {
             field_overlays
-                .entry(field_id)
+                .entry(top.id)
                 .or_default()
                 .push(PlannedFieldOverlay {
                     file,
@@ -440,6 +454,16 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         }
     }
     Ok(OverlayReadPlanner { files, fields })
+}
+
+/// Map `node` and every descendant field id to `top`, the top-level projected field
+/// the subtree belongs to. Used so an overlay written against a struct/list's leaf
+/// ids resolves to the top-level column.
+fn index_field_subtree<'a>(top: &'a Field, node: &'a Field, out: &mut HashMap<i32, &'a Field>) {
+    out.insert(node.id, top);
+    for child in &node.children {
+        index_field_subtree(top, child, out);
+    }
 }
 
 /// Open the overlay readers a specific read needs and return the per-field plans to

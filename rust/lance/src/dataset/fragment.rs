@@ -4123,6 +4123,164 @@ mod tests {
                 "projecting the overlaid column should require its missing file",
             );
         }
+
+        /// A top-level struct column resolves through overlays: the overlay stores
+        /// the struct's leaf columns (under V2_1 those are the only ids in
+        /// `data_file.fields`), and `plan_overlays` maps them back to the top-level
+        /// struct so the whole value is fetched and replaced as a unit.
+        #[rstest]
+        #[tokio::test]
+        async fn test_struct_overlay_end_to_end(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use arrow_array::StructArray;
+            use arrow_schema::Fields;
+
+            let struct_fields = Fields::from(vec![
+                ArrowField::new("x", DataType::Int32, true),
+                ArrowField::new("y", DataType::Int32, true),
+            ]);
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("info", DataType::Struct(struct_fields.clone()), true),
+            ]));
+            let info = Arc::new(StructArray::new(
+                struct_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(Int32Array::from_iter_values((0..6).map(|v| v * 100))),
+                ],
+                None,
+            ));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(0..6)), info],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay the whole `info` struct (top-level field id 1) at offset 2.
+            let overlay_info = Arc::new(StructArray::new(
+                struct_fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![777])),
+                    Arc::new(Int32Array::from(vec![888])),
+                ],
+                None,
+            )) as ArrayRef;
+            let dataset = commit_overlay(
+                dataset,
+                "structov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![overlay_info],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let info = batch
+                .column(batch.schema().index_of("info").unwrap())
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let x = info
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let y = info
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            // Offset 1 falls through to base {1, 100}; offset 2 takes the overlay.
+            assert_eq!(x.values(), &[1, 777]);
+            assert_eq!(y.values(), &[100, 888]);
+        }
+
+        /// A top-level list column resolves through overlays the same way — the
+        /// overlay's leaf (item) id maps back to the top-level list, and the whole
+        /// list value at a covered offset is replaced.
+        #[rstest]
+        #[tokio::test]
+        async fn test_list_overlay_end_to_end(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use arrow_array::ListArray;
+            use arrow_array::types::Int32Type;
+
+            let item = Arc::new(ArrowField::new("item", DataType::Int32, true));
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("tags", DataType::List(item.clone()), true),
+            ]));
+            let base_tags = ListArray::from_iter_primitive::<Int32Type, _, _>(
+                (0..6i32).map(|i| Some(vec![Some(i), Some(i * 10)])),
+            );
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(base_tags),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `tags` (top-level field id 1) at offset 2 with a new list.
+            let overlay_tags =
+                ListArray::from_iter_primitive::<Int32Type, _, _>(std::iter::once(Some(vec![
+                    Some(77),
+                    Some(88),
+                    Some(99),
+                ])));
+            let dataset = commit_overlay(
+                dataset,
+                "listov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(overlay_tags) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let tags = batch
+                .column(batch.schema().index_of("tags").unwrap())
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let row1 = tags.value(0);
+            let row1 = row1.as_any().downcast_ref::<Int32Array>().unwrap();
+            let row2 = tags.value(1);
+            let row2 = row2.as_any().downcast_ref::<Int32Array>().unwrap();
+            // Offset 1 falls through to base [1, 10]; offset 2 takes the overlay.
+            assert_eq!(row1.values(), &[1, 10]);
+            assert_eq!(row2.values(), &[77, 88, 99]);
+        }
     }
 
     #[rstest]
