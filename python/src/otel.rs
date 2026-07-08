@@ -9,7 +9,8 @@
 //! state to Python so the bindings can feed it into the user's OpenTelemetry
 //! `MeterProvider`.
 //!
-//! The recorder is *generic*: it records any metric emitted through the facade,
+//! While it targets OpenTelemetry on the Python side, the recorder is agnostic
+//! to the metric *source*: it records any metric emitted through the facade,
 //! keyed by name and labels. Object store metrics are the first producer, but
 //! nothing here is specific to them. New metrics flow through automatically;
 //! they only need to be described (see [`describe_all`]) so the Python layer can
@@ -20,8 +21,10 @@
 //! OpenTelemetry collects on its own schedule and invokes observable-instrument
 //! callbacks at collection time. Cumulative counters map directly onto OTel's
 //! `ObservableCounter` semantics. So the bridge aggregates in Rust and lets the
-//! Python collection thread pull a [`snapshot`](snapshot_lance_metrics): the
-//! caller already holds the GIL, and the lock-free read runs with it released.
+//! Python collection thread pull a [`snapshot`](snapshot_lance_metrics). The
+//! snapshot is lock-free, but it still walks every registered series and
+//! allocates owned copies of their names and labels, so it runs with the GIL
+//! released to avoid stalling other Python threads during collection.
 //!
 //! ## Histograms
 //!
@@ -409,7 +412,8 @@ pub fn lance_metrics_catalog() -> Vec<PyMetricDescription> {
 }
 
 /// A point-in-time snapshot of every recorded metric. Empty until the recorder
-/// is installed. The lock-free read runs with the GIL released.
+/// is installed. The read is lock-free but walks every series and allocates, so
+/// it runs with the GIL released.
 #[pyfunction]
 pub fn snapshot_lance_metrics(py: Python<'_>) -> Vec<PyMetricPoint> {
     let Some(registry) = REGISTRY.get() else {
