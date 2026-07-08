@@ -4294,13 +4294,22 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.drop_index(name)
 
-    def prewarm_index(self, name: str, *, with_position: bool = False):
+    def prewarm_index(
+        self,
+        name: str,
+        *,
+        with_position: bool = False,
+        index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
+    ):
         """
         Prewarm an index
 
-        This will load the entire index into memory.  This can help avoid cold start
-        issues with index queries.  If the index does not fit in the index cache, then
-        this will result in wasted I/O.
+        By default, this will load the entire index into memory. This can help
+        avoid cold start issues with index queries. If the index does not fit in
+        the index cache, then this will result in wasted I/O.
+
+        Use ``session().index_cache_size_bytes()`` before and after prewarm to
+        inspect how much the index cache grew.
 
         Parameters
         ----------
@@ -4310,8 +4319,26 @@ class LanceDataset(pa.dataset.Dataset):
             This is only supported for ``INVERTED`` indices. If True, positions are
             also loaded into the cache during prewarm so phrase queries do not need a
             separate lazy positions read.
+        index_segments: iterable of str or uuid.UUID, default None
+            If specified, prewarm only these physical index segment UUIDs from the
+            named logical index. Use :meth:`describe_indices` to inspect logical
+            indices and obtain segment UUIDs from ``IndexDescription.segments``.
         """
-        return self._ds.prewarm_index(name, with_position=with_position)
+        if index_segments is not None:
+            segment_ids = []
+            for segment_id in index_segments:
+                if isinstance(segment_id, (str, uuid.UUID)):
+                    segment_ids.append(str(segment_id))
+                else:
+                    raise TypeError(
+                        "index_segments must be an iterable of str or uuid.UUID. "
+                        f"Got {type(segment_id)} instead."
+                    )
+            index_segments = segment_ids
+
+        return self._ds.prewarm_index(
+            name, with_position=with_position, index_segments=index_segments
+        )
 
     def merge_index_metadata(
         self,

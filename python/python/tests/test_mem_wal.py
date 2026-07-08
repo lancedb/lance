@@ -196,6 +196,34 @@ def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
             time.sleep(0.05)
 
 
+def test_shard_writer_delete_binding_masks_base_row(tmp_path):
+    ds_path = str(tmp_path / "base")
+    shard_id = str(uuid.uuid4())
+    ds = lance.write_dataset(
+        _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
+    )
+    ds.initialize_mem_wal()
+
+    delete_keys = pa.table({"id": pa.array([2], type=pa.int64())})
+
+    with ds.mem_wal_writer(
+        shard_id,
+        durable_write=True,
+        sync_indexed_write=True,
+        max_wal_buffer_size=1,
+        max_wal_flush_interval_ms=10,
+    ) as writer:
+        writer.put(_lookup_table([4], "writer"))
+        writer.delete(delete_keys)
+        table = writer.lsm_scanner().to_table()
+
+    rows = {row["id"]: row["name"] for row in table.to_pylist()}
+    assert rows[1] == "base_1"
+    assert 2 not in rows, "deleted base row should be masked by the tombstone"
+    assert rows[3] == "base_3"
+    assert rows[4] == "writer_4"
+
+
 _VDIM = 4  # matches Rust test fixture dimension
 
 

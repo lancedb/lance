@@ -21,7 +21,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
-use std::io::ErrorKind;
 use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
@@ -611,16 +610,8 @@ impl Branches<'_> {
             && let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await
         {
             match &e {
-                Error::IO { source, .. } => {
-                    if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                        if io_err.kind() == ErrorKind::NotFound {
-                            log::debug!("Branch directory already deleted: {}", io_err);
-                        } else {
-                            return Err(e);
-                        }
-                    } else {
-                        return Err(e);
-                    }
+                Error::NotFound { .. } => {
+                    log::debug!("Branch directory already deleted");
                 }
                 _ => return Err(e),
             }

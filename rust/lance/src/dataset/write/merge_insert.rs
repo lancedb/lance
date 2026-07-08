@@ -1289,9 +1289,16 @@ impl MergeInsertJob {
                     // will be the original source data, and all subsequent batches
                     // will be updates.
                     let mut source_batches = Vec::with_capacity(batches.len() + 1);
-                    source_batches.push(batches[0].clone()); // placeholder for source data
+                    // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) so every
+                    // batch is in physical format, matching what the updater reads from the
+                    // fragment. `convert_json_columns` is a no-op clone when there is nothing
+                    // to convert, so it can be applied unconditionally. The first entry is a
+                    // placeholder for the source data (overwritten each iteration below); it
+                    // must be converted too, otherwise its schema would diverge from the rest.
+                    source_batches.push(convert_json_columns(&batches[0]).map_err(Error::from)?);
                     for batch in &batches {
-                        source_batches.push(batch.drop_column(ROW_ADDR)?);
+                        let dropped = batch.drop_column(ROW_ADDR)?;
+                        source_batches.push(convert_json_columns(&dropped).map_err(Error::from)?);
                     }
 
                     // This function is here to help rustc with lifetimes.
@@ -11310,5 +11317,135 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             "take() should return Arrow JSON, got {:?}",
             take_meta_field
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_subschema_with_json_columns() {
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::ARROW_JSON_EXT_NAME;
+
+        // Create a dataset with an Arrow JSON extension column
+        let test_dir = TempStrDir::default();
+        let mut json_metadata = HashMap::new();
+        json_metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Int64, true),
+            Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata.clone()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"x":1}"#,
+                    r#"{"x":2}"#,
+                    r#"{"x":3}"#,
+                    r#"{"x":4}"#,
+                    r#"{"x":5}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(reader, test_dir.as_ref(), None)
+                .await
+                .unwrap(),
+        );
+
+        // Perform a subschema merge_insert: only update "meta" column (JSON type)
+        // This exercises the update_fragments path with interleave_batches
+        let update_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![2, 4])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"updated":true,"id":2}"#,
+                    r#"{"updated":true,"id":4}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let update_reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)],
+            update_schema,
+        ));
+        let stream = reader_to_stream(update_reader);
+
+        // Execute merge_insert with subschema (only id + meta columns)
+        let mut builder =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()]).unwrap();
+        builder.when_matched(WhenMatched::UpdateAll);
+        builder.when_not_matched(WhenNotMatched::DoNothing);
+        let job = builder.try_build().unwrap();
+        let (updated_dataset, stats) = job.execute(stream).await.unwrap();
+
+        // Verify: the merge should not fail with type mismatch
+        assert_eq!(stats.num_updated_rows, 2);
+
+        // Read back and verify the JSON column was updated correctly
+        let batches = updated_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let result = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(result.num_rows(), 5);
+
+        // Verify the "score" column (not in update) is preserved, and "meta" updated
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let scores = result
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let metas = result
+            .column_by_name("meta")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..5 {
+            let id = ids.value(i);
+            let score = scores.value(i);
+            let meta = metas.value(i);
+            // score = id * 10, regardless of row order
+            assert_eq!(score, id * 10, "id={} score mismatch", id);
+            if id == 2 || id == 4 {
+                assert!(
+                    meta.contains("updated"),
+                    "id={} should have updated meta, got: {}",
+                    id,
+                    meta
+                );
+            } else {
+                assert!(
+                    meta.contains("\"x\""),
+                    "id={} should have original meta, got: {}",
+                    id,
+                    meta
+                );
+            }
+        }
     }
 }

@@ -490,4 +490,77 @@ mod tests {
 
         assert!(indices.is_empty());
     }
+
+    /// Regression: a committed `__mem_wal` (legitimately `fragment_bitmap:
+    /// None`) must not break `describe_indices` — the path behind lancedb's
+    /// `list_indices`/`wait_for_index`. It's described as zero indexed rows,
+    /// like `__frag_reuse`.
+    #[tokio::test]
+    async fn test_describe_indices_includes_mem_wal_system_index() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::ScalarIndexParams;
+
+        let mut dataset = test_dataset().await;
+
+        // A real user index that describe_indices must keep returning.
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Commit a __mem_wal index, as WAL provisioning does in production.
+        let shard = Uuid::new_v4();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                merged_generations: vec![MergedGeneration::new(shard, 1)],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        // The system index is present with no fragment_bitmap (by design).
+        let mem_wal = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|i| i.name == MEM_WAL_INDEX_NAME)
+            .unwrap()
+            .clone();
+        assert!(mem_wal.fragment_bitmap.is_none());
+
+        // describe_indices describes the bitmap-less __mem_wal alongside the
+        // real index instead of erroring.
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        let mem_wal_desc = descriptions
+            .iter()
+            .find(|d| d.name() == MEM_WAL_INDEX_NAME)
+            .expect("__mem_wal must be described, not skipped");
+        assert_eq!(
+            mem_wal_desc.index_type(),
+            "MemWal",
+            "system index type must resolve via infer_system_index_type"
+        );
+        assert_eq!(
+            mem_wal_desc.rows_indexed(),
+            0,
+            "a bitmap-less system index indexes zero rows"
+        );
+        assert_eq!(
+            descriptions.len(),
+            2,
+            "both the real scalar index and __mem_wal must be listed"
+        );
+    }
 }
