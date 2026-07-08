@@ -4851,6 +4851,12 @@ impl Scanner {
         let has_usable_key = input_schema.column_with_name(ROW_ID).is_some()
             || (input_schema.column_with_name(ROW_ADDR).is_some()
                 && !self.dataset.manifest.uses_stable_row_ids());
+        // INVARIANT: every site that replaces TakeExec with FilteredReadExec
+        // must check is_legacy_storage() first.  The v1 reader's
+        // read_ranges_tasks is a stub that errors ("Attempt to perform
+        // FilteredRead on v1 files"), so TakeExec remains the only take that
+        // can read v1 files.  The fallback becomes deletable when v1 read
+        // support is dropped.
         if !self.dataset.is_legacy_storage() && has_usable_key {
             // Each coalesced batch becomes one planned read.  The coalesce
             // target stays at the scanner batch size because take output
@@ -10223,7 +10229,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[s@2 as s]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: ..., projection=[i], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10) AND i < Int32(20), refine_filter=i > Int32(10) AND i < Int32(20)"
         };
@@ -10249,7 +10255,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                   LanceScan: uri..., projection=[i, s], row_id=true, row_addr=false, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
-  LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+  LanceRead: uri=..., projection=[vec], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[i, s], num_fragments=2, range_before=None, range_after=None, \
       row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
@@ -10292,7 +10298,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         LanceScan: uri..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@0 as s, vec@3 as vec]
-  LanceRead: uri=..., projection=[i, vec], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, vec], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, \
       range_after=None, row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
@@ -10317,7 +10323,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         LanceScan: uri..., projection=[s, vec], row_id=true, row_addr=false, ordered=true, range=None"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@0 as s, vec@1 as vec]
-  LanceRead: uri=..., projection=[i], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[s, vec], num_fragments=2, range_before=None, range_after=None, \
       row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
@@ -10363,7 +10369,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@2 IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
@@ -10393,7 +10399,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
               LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       GlobalLimitExec: skip=0, fetch=1
         FilterExec: _distance@2 IS NOT NULL
@@ -10422,7 +10428,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
           ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  LanceRead: uri=..., projection=[i, s, vec], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1, metric=L2
@@ -10450,12 +10456,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=10), expr=...
           KNNVectorDistance: metric=l2
-            LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+            LanceRead: uri=..., projection=[vec], source=stream(_rowid)
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1, metric=L2
@@ -10480,7 +10486,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=13), expr=...
@@ -10508,10 +10514,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
         } else {
             "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
-  LanceRead: uri=..., projection=[s, vec], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s, vec], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@2 > 10
-        LanceRead: uri=..., projection=[i], mode=take(_rowid)
+        LanceRead: uri=..., projection=[i], source=stream(_rowid)
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1, metric=L2
@@ -10542,7 +10548,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  LanceRead: uri=..., projection=[i, s, vec], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1, metric=L2
@@ -10586,7 +10592,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                         ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=6), expr=...
@@ -10598,7 +10604,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     SortExec: TopK(fetch=6), expr=...
                       KNNVectorDistance: metric=l2
                         LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+                LanceRead: uri=..., projection=[vec], source=stream(_rowid)
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1, metric=L2
@@ -10639,10 +10645,10 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                               ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@3 > 10
-        LanceRead: uri=..., projection=[i], mode=take(_rowid)
+        LanceRead: uri=..., projection=[i], source=stream(_rowid)
           CoalesceBatchesExec: target_batch_size=8192
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=15), expr=...
@@ -10654,7 +10660,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                           SortExec: TopK(fetch=15), expr=...
                             KNNVectorDistance: metric=l2
                               LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                      LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+                      LanceRead: uri=..., projection=[vec], source=stream(_rowid)
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1, metric=L2
@@ -10693,7 +10699,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                           LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
@@ -10706,7 +10712,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
                           LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+                LanceRead: uri=..., projection=[vec], source=stream(_rowid)
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1, metric=L2
@@ -10745,7 +10751,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
           ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  LanceRead: uri=..., projection=[i, s, vec], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1, metric=L2
@@ -10776,7 +10782,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
         } else {
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  LanceRead: uri=..., projection=[i, s, vec], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1, metric=L2
@@ -10823,7 +10829,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                         ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=8), expr=...
@@ -10836,7 +10842,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
                           LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+                LanceRead: uri=..., projection=[vec], source=stream(_rowid)
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1, metric=L2
@@ -10882,7 +10888,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                         ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
         } else {
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=11), expr=...
@@ -10895,7 +10901,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
                           LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+                LanceRead: uri=..., projection=[vec], source=stream(_rowid)
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1, metric=L2
@@ -10947,7 +10953,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                         .filter("i > 10")
                 },
                 "ProjectionExec: expr=[s@2 as s]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       LanceRead: uri=..., projection=[i], num_fragments=4, range_before=None, \
       range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)",
@@ -11066,7 +11072,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       MatchQuery: column=s, query=hello"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello"#
         };
@@ -11089,7 +11095,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       PhraseQuery: column=s, query=hello world"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       PhraseQuery: column=s, query=hello world"#
         };
@@ -11115,7 +11121,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         MatchQuery: column=s, query=world"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
         MatchQuery: column=s, query=hello
@@ -11151,7 +11157,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
@@ -11187,7 +11193,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
               LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
@@ -11216,7 +11222,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       MatchQuery: column=s, query=hello"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       MatchQuery: column=s, query=hello"#
         };
@@ -11264,7 +11270,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                       LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], mode=take(_rowid)
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
@@ -11351,7 +11357,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
                     LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-            LanceRead: uri=..., projection=[vec], mode=take(_rowid)
+            LanceRead: uri=..., projection=[vec], source=stream(_rowid)
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1, metric=L2

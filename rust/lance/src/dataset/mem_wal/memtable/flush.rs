@@ -2172,7 +2172,7 @@ mod tests {
         crate::utils::test::assert_plan_node_equals(
             plan,
             "ProjectionExec: expr=[id@2 as id, text@3 as text, _score@1 as _score]
-  LanceRead: ..., mode=take(_rowid)
+  LanceRead: ..., source=stream(_rowid)
     CoalesceBatchesExec: ...
       MatchQuery: column=text, query=hello",
         )

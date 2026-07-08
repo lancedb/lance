@@ -1490,8 +1490,10 @@ impl FilteredReadOptions {
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
 ///
-/// This node may execute a scan or it may execute a take.  By default, it picks the best
-/// approach based the expected query cost which is determined by:
+/// This is a single, general I/O node: `output = read(row_source,
+/// fields_to_read) ⊕ carry_columns` (see [`RowSource`]).  For set-shaped row
+/// sources it picks the best read strategy based on the expected query cost
+/// which is determined by:
 ///  - Size of data in desired columns
 ///  - Number of rows matching the index search
 ///  - Filesystem parameters (e.g. block size)
@@ -1508,7 +1510,7 @@ pub struct FilteredReadExec {
     options: FilteredReadOptions,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    input: FilteredReadInput,
+    input: RowSource,
     // Precomputed internal plan
     plan: Arc<OnceCell<FilteredReadInternalPlan>>,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
@@ -1516,68 +1518,81 @@ pub struct FilteredReadExec {
     running_stream: Arc<AsyncMutex<Option<FilteredReadStream>>>,
 }
 
-/// How the (optional) input plan tells the node which rows to read.
+/// Who names the rows that a [`FilteredReadExec`] reads.
 ///
-/// Both plan-carrying variants communicate the same information — "which
-/// rows" — in different encodings.  `IndexQuery` is a row *set*: exactly one
-/// batch in the serialized [`IndexExprResult`] wire layout.  `TakeRows` is a
-/// row *stream*: ordinary record batches with a `_rowid` or `_rowaddr`
-/// column, where any additional columns (e.g. `_distance`) are carried
-/// through to the output.  Each `TakeRows` batch is converted to an in-memory
-/// [`IndexExprResult`] internally, so it is the streaming generalization of
-/// `IndexQuery`.
+/// The node itself is a single, general I/O operator:
 ///
-/// The variant is chosen by [`FilteredReadExec::try_new`] from the input
-/// plan's schema: the wire layouts are unmistakable (binary mask columns),
-/// anything else must carry a row id or row address column.
+/// ```text
+/// output = read(row_source, fields_to_read) ⊕ carry_columns
+///
+/// schema() = carry_columns + fields_to_read     (uniform for every source)
+/// ```
+///
+/// Only the row source varies, and the differences between the variants are
+/// inherent to what the sources *are* — not modes of the node:
+///
+/// - [`AllRows`](Self::AllRows): no input plan; every live row.  No carry
+///   columns.
+/// - [`RowSet`](Self::RowSet): a *set* of rows, delivered as exactly one
+///   batch in the serialized [`IndexExprResult`] wire layout (produced by
+///   e.g. [`ScalarIndexExec`](super::scalar_index::ScalarIndexExec) or a
+///   `_rowid IN (...)` filter).  Sets are unordered and unique by nature, so
+///   the output is in storage order and deduplicated.  No carry columns.
+/// - [`RowStream`](Self::RowStream): a *stream* of rows — ordinary record
+///   batches with a `_rowid`/`_rowaddr` column.  Streams have row order,
+///   duplicates, and their own columns, and all three are preserved: the
+///   stream's columns are carried through to the output next to the newly
+///   read fields (the contract [`TakeExec`](super::TakeExec) provides).
+///   Internally each batch is converted to an in-memory [`IndexExprResult`],
+///   so a stream is the streaming generalization of a set.
+///
+/// The source kind is *derived*, never configured: [`FilteredReadExec::try_new`]
+/// inspects the input plan's schema (the wire layouts are unmistakable —
+/// binary mask columns; anything else must carry a row id or row address
+/// column).
 #[derive(Debug)]
-enum FilteredReadInput {
-    /// Scan the dataset with no input plan
-    FullScan,
-    /// Scan the dataset, scoped by the serialized [`IndexExprResult`]
-    /// produced by this plan (e.g. [`ScalarIndexExec`], `_rowid IN (...)`)
-    ///
-    /// [`ScalarIndexExec`]: super::scalar_index::ScalarIndexExec
-    IndexQuery(Arc<dyn ExecutionPlan>),
-    /// Take: read the projected fields for the rows produced by this plan and
-    /// merge them into its batches, preserving row order, duplicates, and
-    /// payload columns (the same contract as [`TakeExec`](super::TakeExec))
-    TakeRows(Box<TakeRowsInput>),
+enum RowSource {
+    /// Every live row of the dataset (no input plan)
+    AllRows,
+    /// A set of rows: one serialized [`IndexExprResult`] batch
+    RowSet(Arc<dyn ExecutionPlan>),
+    /// A stream of rows: record batches whose columns are carried through
+    RowStream(Box<RowStreamSource>),
 }
 
-impl FilteredReadInput {
-    /// The input plan driving an index-query scan, if any
-    fn index_query(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+impl RowSource {
+    /// The plan producing the serialized row set, if this source is a set
+    fn row_set_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match self {
-            Self::IndexQuery(plan) => Some(plan),
+            Self::RowSet(plan) => Some(plan),
             _ => None,
         }
     }
 
-    /// The child plan, regardless of encoding
+    /// The child plan, regardless of the source kind
     fn child(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match self {
-            Self::FullScan => None,
-            Self::IndexQuery(plan) => Some(plan),
-            Self::TakeRows(take) => Some(&take.input),
+            Self::AllRows => None,
+            Self::RowSet(plan) => Some(plan),
+            Self::RowStream(source) => Some(&source.plan),
         }
     }
 }
 
-/// State derived at construction for a take-mode read
+/// State derived at construction for a row-stream source
 #[derive(Debug)]
-struct TakeRowsInput {
-    input: Arc<dyn ExecutionPlan>,
-    /// The input column identifying rows: [`ROW_ID`] or [`ROW_ADDR`].
+struct RowStreamSource {
+    plan: Arc<dyn ExecutionPlan>,
+    /// The stream column identifying rows: [`ROW_ID`] or [`ROW_ADDR`].
     ///
     /// `_rowid` works on any dataset (the mask is resolved through each
     /// fragment's row id sequence); `_rowaddr` only when row addresses
     /// coincide with row ids (no stable row ids).
     key_column: &'static str,
-    /// `options.projection` minus the fields already present in the input
+    /// `options.projection` minus the fields already present in the stream's
     /// schema — the fields this node actually reads
-    fields_to_take: Projection,
-    /// A copy of the node options whose projection is `fields_to_take` plus
+    fields_to_read: Projection,
+    /// A copy of the node options whose projection is `fields_to_read` plus
     /// the key column, used to plan and read the fragments
     read_options: FilteredReadOptions,
 }
@@ -1637,11 +1652,11 @@ impl FilteredReadExec {
     ///   [`ScalarIndexExec`](super::scalar_index::ScalarIndexExec)): a row
     ///   *set* scoping a scan.  This is the classic behavior.
     /// - Any other plan carrying a `_rowid` or `_rowaddr` column: a row
-    ///   *stream* to take.  The node reads `options.projection` for exactly
-    ///   those rows and merges the columns into the input's batches,
-    ///   preserving row order, duplicates, and the input's other columns —
+    ///   *stream* of rows.  The node reads `options.projection` for exactly
+    ///   those rows and merges the columns into the stream's batches,
+    ///   preserving row order, duplicates, and the stream's own columns —
     ///   the same contract as [`TakeExec`](super::TakeExec).  Fields already
-    ///   present in the input schema are not re-read.
+    ///   present in the stream's schema are not re-read.
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -1649,12 +1664,12 @@ impl FilteredReadExec {
     ) -> Result<Self> {
         if let Some(input) = index_input {
             if Self::is_index_query_schema(input.schema().as_ref()) {
-                Self::try_new_scan(dataset, options, FilteredReadInput::IndexQuery(input))
+                Self::try_new_scan(dataset, options, RowSource::RowSet(input))
             } else {
-                Self::try_new_take_rows(dataset, options, input)
+                Self::try_new_row_stream(dataset, options, input)
             }
         } else {
-            Self::try_new_scan(dataset, options, FilteredReadInput::FullScan)
+            Self::try_new_scan(dataset, options, RowSource::AllRows)
         }
     }
 
@@ -1669,9 +1684,9 @@ impl FilteredReadExec {
         .any(|format| schema.fields() == format.schema().fields())
     }
 
-    /// Construct a take-mode read: fetch `options.projection` for the rows
-    /// produced by `input` and merge the columns into its batches
-    fn try_new_take_rows(
+    /// Construct a read over a row-stream source: fetch `options.projection`
+    /// for the rows produced by `input` and merge the columns into its batches
+    fn try_new_row_stream(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
         input: Arc<dyn ExecutionPlan>,
@@ -1700,7 +1715,7 @@ impl FilteredReadExec {
         }
         if options.projection.with_row_id || options.projection.with_row_addr {
             return Err(Error::invalid_input_source(
-                "a take cannot be used to insert the row id / row address; the input plan must provide them".into(),
+                "a row-stream read cannot be used to insert the row id / row address; the input plan must provide them".into(),
             ));
         }
 
@@ -1713,7 +1728,7 @@ impl FilteredReadExec {
             if dataset.manifest.uses_stable_row_ids() {
                 return Err(Error::invalid_input_source(
                     format!(
-                        "cannot take rows by '{}' on a dataset with stable row ids; the input plan must provide '{}'",
+                        "cannot read rows by '{}' on a dataset with stable row ids; the input plan must provide '{}'",
                         ROW_ADDR, ROW_ID
                     )
                     .into(),
@@ -1723,18 +1738,18 @@ impl FilteredReadExec {
         } else {
             return Err(Error::invalid_input_source(
                 format!(
-                    "the input plan of a take must have a column named '{}' or '{}'",
+                    "a row-stream input plan must have a column named '{}' or '{}'",
                     ROW_ADDR, ROW_ID
                 )
                 .into(),
             ));
         };
 
-        let fields_to_take = options
+        let fields_to_read = options
             .projection
             .clone()
             .subtract_arrow_schema(input_schema.as_ref(), OnMissing::Ignore)?;
-        if !fields_to_take.has_data_fields() {
+        if !fields_to_read.has_data_fields() {
             return Err(Error::invalid_input_source(
                 "the input plan already contains every projected field; there is nothing to read"
                     .into(),
@@ -1745,11 +1760,11 @@ impl FilteredReadExec {
             &super::TakeExec::calculate_output_schema(
                 dataset.schema(),
                 input_schema.as_ref(),
-                &fields_to_take,
+                &fields_to_read,
             ),
         ));
-        // Take mode transforms the input stream in place, so partitioning and
-        // emission behavior follow the input
+        // A row-stream read transforms its input in place, so partitioning
+        // and emission behavior follow the input
         let properties = Arc::new(
             input
                 .properties()
@@ -1759,9 +1774,9 @@ impl FilteredReadExec {
         );
 
         let read_projection = if key_column == ROW_ID {
-            fields_to_take.clone().with_row_id()
+            fields_to_read.clone().with_row_id()
         } else {
-            fields_to_take.clone().with_row_addr()
+            fields_to_read.clone().with_row_addr()
         };
         let mut read_options = options.clone();
         read_options.projection = read_projection;
@@ -1771,10 +1786,10 @@ impl FilteredReadExec {
             options,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            input: FilteredReadInput::TakeRows(Box::new(TakeRowsInput {
-                input,
+            input: RowSource::RowStream(Box::new(RowStreamSource {
+                plan: input,
                 key_column,
-                fields_to_take,
+                fields_to_read,
                 read_options,
             })),
             plan: Arc::new(OnceCell::new()),
@@ -1785,7 +1800,7 @@ impl FilteredReadExec {
     fn try_new_scan(
         dataset: Arc<Dataset>,
         mut options: FilteredReadOptions,
-        input: FilteredReadInput,
+        input: RowSource,
     ) -> Result<Self> {
         if options.with_deleted_rows {
             // Ensure we have the row id column if with_deleted_rows is set
@@ -1801,7 +1816,7 @@ impl FilteredReadExec {
             // Validate that there's a filter when using scan_range_after_filter
             if options.full_filter.is_none()
                 && options.refine_filter.is_none()
-                && input.index_query().is_none()
+                && input.row_set_plan().is_none()
             {
                 return Err(Error::invalid_input_source("scan_range_after_filter requires a filter to be applied. Use scan_range_before_filter for unfiltered scans."
                     .into()));
@@ -1939,9 +1954,9 @@ impl FilteredReadExec {
 
     /// Get the existing plan or create it if it doesn't exist
     pub async fn get_or_create_plan(&self, ctx: Arc<TaskContext>) -> Result<FilteredReadPlan> {
-        if self.is_take() {
+        if self.row_stream_input().is_some() {
             return Err(Error::not_supported_source(
-                "a FilteredReadExec that takes rows from an input plan does not have a precomputable plan"
+                "a FilteredReadExec with a row-stream source does not have a precomputable plan"
                     .to_string()
                     .into(),
             ));
@@ -1950,7 +1965,7 @@ impl FilteredReadExec {
             &self.plan,
             self.dataset.clone(),
             &self.options,
-            self.input.index_query(),
+            self.input.row_set_plan(),
             0,
             ctx,
         )
@@ -1982,7 +1997,7 @@ impl FilteredReadExec {
             .as_ref()
             .and_then(|o| o.batch_size_bytes);
         let metrics = self.metrics.clone();
-        let index_input = self.input.index_query().cloned();
+        let index_input = self.input.row_set_plan().cloned();
         let plan_cell = self.plan.clone();
 
         let stream = futures::stream::once(async move {
@@ -2041,13 +2056,16 @@ impl FilteredReadExec {
     /// The plan producing the serialized index-query result, if this node is
     /// an index-query scan
     pub fn index_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
-        self.input.index_query()
+        self.input.row_set_plan()
     }
 
-    /// Whether this node takes rows from an input plan (see
-    /// [`Self::try_new`]) rather than scanning the dataset
-    pub fn is_take(&self) -> bool {
-        matches!(self.input, FilteredReadInput::TakeRows(_))
+    /// The plan whose rows this node reads for (carrying its columns
+    /// through), if the row source is a stream (see [`Self::try_new`])
+    pub fn row_stream_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        match &self.input {
+            RowSource::RowStream(source) => Some(&source.plan),
+            _ => None,
+        }
     }
 
     /// Return the pre-computed plan if one exists, without triggering initialization.
@@ -2055,27 +2073,27 @@ impl FilteredReadExec {
         self.plan.get().map(|p| p.to_external_plan())
     }
 
-    fn execute_take(
+    fn execute_row_stream(
         &self,
-        take: &TakeRowsInput,
+        source: &RowStreamSource,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let input_stream = take.input.execute(partition, context)?;
+        let input_stream = source.plan.execute(partition, context)?;
         let dataset = self.dataset.clone();
-        let read_options = take.read_options.clone();
-        let key_column = take.key_column;
+        let read_options = source.read_options.clone();
+        let key_column = source.key_column;
         let new_fields_schema = Arc::new(arrow_schema::Schema::from(
-            &take.fields_to_take.to_bare_schema(),
+            &source.fields_to_read.to_bare_schema(),
         ));
         let output_schema = self.schema();
         let metrics = self.metrics.clone();
 
         // ScanScheduler::new launches the I/O scheduler in the background and
         // we aren't allowed to do work in `execute`, so defer creation of the
-        // take stream until first polled.
+        // read until first polled.
         let lazy_stream = futures::stream::once(async move {
-            let take_stream = Arc::new(FilteredReadTakeStream::new(
+            let row_stream_read = Arc::new(RowStreamRead::new(
                 dataset,
                 read_options,
                 key_column,
@@ -2084,7 +2102,7 @@ impl FilteredReadExec {
                 &metrics,
                 partition,
             ));
-            take_stream.apply(input_stream)
+            row_stream_read.apply(input_stream)
         })
         .flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -2094,8 +2112,8 @@ impl FilteredReadExec {
     }
 }
 
-/// Executes the take mode of a [`FilteredReadExec`] (see
-/// [`FilteredReadInput::TakeRows`]).
+/// Executes a [`FilteredReadExec`] over a row-stream source (see
+/// [`RowSource::RowStream`]).
 ///
 /// Each input batch is converted into an in-memory exact [`IndexExprResult`]
 /// and pushed through the same planning and read pipeline as an index-query
@@ -2103,7 +2121,7 @@ impl FilteredReadExec {
 /// freshly read columns are then aligned to the input's row order and merged
 /// into the batch, so row order, duplicates, and payload columns are all
 /// preserved.
-struct FilteredReadTakeStream {
+struct RowStreamRead {
     dataset: Arc<Dataset>,
     /// Node options whose projection is the fields to read plus the key column
     read_options: FilteredReadOptions,
@@ -2120,7 +2138,7 @@ struct FilteredReadTakeStream {
     baseline_metrics: BaselineMetrics,
 }
 
-impl FilteredReadTakeStream {
+impl RowStreamRead {
     fn new(
         dataset: Arc<Dataset>,
         read_options: FilteredReadOptions,
@@ -2191,13 +2209,13 @@ impl FilteredReadTakeStream {
         let compute_timer = self.baseline_metrics.elapsed_compute().timer();
         let keys_arr = batch.column_by_name(self.key_column).ok_or_else(|| {
             DataFusionError::Internal(format!(
-                "the take input lost its '{}' column",
+                "the row-stream input lost its '{}' column",
                 self.key_column
             ))
         })?;
         let keys = keys_arr.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
             DataFusionError::Internal(format!(
-                "expected the take input column '{}' to be UInt64 but it was {}",
+                "expected the row-stream column '{}' to be UInt64 but it was {}",
                 self.key_column,
                 keys_arr.data_type()
             ))
@@ -2227,14 +2245,14 @@ impl FilteredReadTakeStream {
             self.scan_scheduler.clone(),
         );
         for scoped in &mut scoped_fragments {
-            // One take round per input batch: read each fragment's rows as a
+            // One read round per input batch: read each fragment's rows as a
             // single batch, and prioritize earlier input batches so consuming
             // the (ordered) output is not starved by later batches
             scoped.priority = batch_index;
             scoped.batch_size = u32::MAX;
         }
 
-        // Open all the fragments in parallel.  A random take touches many
+        // Open all the fragments in parallel.  A random read touches many
         // fragments (often one row per fragment) and the CPU-bound part of a
         // fragment open serializes under plain future concurrency, so spawn
         // one task per fragment like the scan path does (see
@@ -2278,7 +2296,7 @@ impl FilteredReadTakeStream {
             .column_by_name(self.key_column)
             .ok_or_else(|| {
                 DataFusionError::Internal(format!(
-                    "the take read did not produce the '{}' column",
+                    "the row-stream read did not produce the '{}' column",
                     self.key_column
                 ))
             })?
@@ -2363,9 +2381,9 @@ impl FilteredReadTakeStream {
 
 impl DisplayAs for FilteredReadExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if let FilteredReadInput::TakeRows(take) = &self.input {
-            let columns = take
-                .fields_to_take
+        if let RowSource::RowStream(source) = &self.input {
+            let columns = source
+                .fields_to_read
                 .to_bare_schema()
                 .fields
                 .iter()
@@ -2376,19 +2394,19 @@ impl DisplayAs for FilteredReadExec {
                 DisplayFormatType::Default | DisplayFormatType::Verbose => {
                     write!(
                         f,
-                        "LanceRead: uri={}, projection=[{}], mode=take({})",
+                        "LanceRead: uri={}, projection=[{}], source=stream({})",
                         self.dataset.data_dir(),
                         columns,
-                        take.key_column,
+                        source.key_column,
                     )
                 }
                 DisplayFormatType::TreeRender => {
                     write!(
                         f,
-                        "LanceRead\nuri={}\nprojection=[{}]\nmode=take({})",
+                        "LanceRead\nuri={}\nprojection=[{}]\nsource=stream({})",
                         self.dataset.data_dir(),
                         columns,
-                        take.key_column,
+                        source.key_column,
                     )
                 }
             };
@@ -2483,9 +2501,9 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        // Take mode is I/O bound and partitioning it would create multiple
-        // I/O schedulers, which could use a lot of RAM (same reasoning as
-        // TakeExec).  Scan mode has no row-carrying input.
+        // A row-stream read is I/O bound and partitioning it would create
+        // multiple I/O schedulers, which could use a lot of RAM (same
+        // reasoning as TakeExec).  The other sources have no row input.
         vec![false; self.children().len()]
     }
 
@@ -2497,10 +2515,10 @@ impl ExecutionPlan for FilteredReadExec {
         &self,
         partition: Option<usize>,
     ) -> datafusion::error::Result<Statistics> {
-        if let FilteredReadInput::TakeRows(take) = &self.input {
-            // A take emits (at most) one output row per input row
+        if let RowSource::RowStream(source) = &self.input {
+            // A row-stream read emits (at most) one output row per input row
             return Ok(Statistics {
-                num_rows: take.input.partition_statistics(partition)?.num_rows,
+                num_rows: source.plan.partition_statistics(partition)?.num_rows,
                 ..Statistics::new_unknown(self.schema().as_ref())
             });
         }
@@ -2643,13 +2661,13 @@ impl ExecutionPlan for FilteredReadExec {
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         match &self.input {
-            FilteredReadInput::TakeRows(take) => self.execute_take(take, partition, context),
+            RowSource::RowStream(source) => self.execute_row_stream(source, partition, context),
             _ => Ok(self.obtain_stream(partition, context)),
         }
     }
 
     fn fetch(&self) -> Option<usize> {
-        if self.is_take() {
+        if self.row_stream_input().is_some() {
             return None;
         }
         if self.options.full_filter.is_none() {
@@ -2666,15 +2684,15 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        // In take mode the limit can be pushed through to the input plan (a
-        // take emits one output row per input row).  In scan mode the only
-        // upstream node is the index search and we can't push the limit to
-        // that node.
-        self.is_take()
+        // With a row-stream source the limit can be pushed through to the
+        // input plan (one output row per input row).  For the other sources
+        // the only upstream node is the index search and we can't push the
+        // limit to that node.
+        self.row_stream_input().is_some()
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        if self.is_take() {
+        if self.row_stream_input().is_some() {
             return None;
         }
         // TODO: Support multiple partitions in the future by coordinating limits across partitions
@@ -2707,7 +2725,7 @@ impl ExecutionPlan for FilteredReadExec {
         match Self::try_new(
             self.dataset.clone(),
             updated_options,
-            self.input.index_query().cloned(),
+            self.input.row_set_plan().cloned(),
         ) {
             Ok(exec) => Some(Arc::new(exec)),
             Err(e) => {
@@ -4489,10 +4507,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // Take mode (a row-stream input instead of a serialized index result)
+    // Row-stream sources (an input of ordinary record batches instead of a
+    // serialized index result)
     // ------------------------------------------------------------------------
 
-    mod take_rows {
+    mod row_stream {
         use super::*;
         use arrow_array::{Float32Array, StringArray, UInt64Array};
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -4631,7 +4650,7 @@ mod tests {
             let batches = vec![batch.slice(0, 3), batch.slice(3, 2)];
 
             let plan = take_plan(&fixture.dataset, rows_input(batches), &["s", "i"]).unwrap();
-            assert!(plan.is_take());
+            assert!(plan.row_stream_input().is_some());
             // Output schema: input columns then new fields in dataset order
             assert_eq!(
                 plan.schema()
@@ -4833,7 +4852,7 @@ mod tests {
             );
         }
 
-        /// with_new_children re-derives take mode and preserves the schema
+        /// with_new_children re-derives the row-stream source and preserves the schema
         #[tokio::test]
         async fn take_with_new_children() {
             let fixture = take_fixture(false).await;
@@ -4857,7 +4876,8 @@ mod tests {
                     .as_any()
                     .downcast_ref::<FilteredReadExec>()
                     .unwrap()
-                    .is_take()
+                    .row_stream_input()
+                    .is_some()
             );
         }
 

@@ -46,11 +46,11 @@ pub async fn filtered_read_exec_to_proto(
     exec: &FilteredReadExec,
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
-    if exec.is_take() {
-        // TODO: define a proto representation for the streaming row input so
-        // take-mode reads can participate in distributed plan pushdown
+    if exec.row_stream_input().is_some() {
+        // TODO: define a proto representation for row-stream sources so these
+        // reads can participate in distributed plan pushdown
         return Err(Error::not_supported_source(
-            "a FilteredReadExec that takes rows from an input plan cannot be serialized"
+            "a FilteredReadExec with a row-stream source cannot be serialized"
                 .to_string()
                 .into(),
         ));

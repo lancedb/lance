@@ -22,10 +22,10 @@ use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
 /// Rule that eliminates take nodes that are immediately followed by another
 /// take node, fetching the union of the columns in a single node instead.
 ///
-/// A "take" is either a [TakeExec] (legacy storage) or a take-mode
-/// [FilteredReadExec] (see `FilteredReadExec::is_take`); the scanner emits
-/// stacked takes in some plan shapes (e.g. filter columns then projection
-/// columns).
+/// A "take" is either a [TakeExec] (legacy storage) or a [FilteredReadExec]
+/// with a row-stream source (see `FilteredReadExec::row_stream_input`); the
+/// scanner emits stacked takes in some plan shapes (e.g. filter columns then
+/// projection columns).
 #[derive(Debug)]
 pub struct CoalesceTake;
 
@@ -35,7 +35,10 @@ impl CoalesceTake {
         if plan.as_any().is::<TakeExec>() {
             Some(plan.as_ref())
         } else if let Some(filtered_read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
-            filtered_read.is_take().then_some(plan.as_ref())
+            filtered_read
+                .row_stream_input()
+                .is_some()
+                .then_some(plan.as_ref())
         } else {
             None
         }

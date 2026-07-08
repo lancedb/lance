@@ -147,9 +147,17 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     };
 
     let options = filtered_read.options();
-    // A take-mode read emits one row per input row; its count is driven by
-    // the input plan, not by fragment metadata.
-    if filtered_read.is_take() {
+    // A read with a row-stream source emits one row per input row; its count
+    // is driven by the input plan, not by fragment metadata.
+    //
+    // COUNT over such a read == the count of input rows whose id still
+    // exists.  A future CountLiveRowsExec could answer that without any
+    // column I/O: stream the input and, per batch, build the live-row set
+    // from fragment metadata + deletion vectors and count member rows
+    // (per row, so duplicates count).  Deferred because no plan shape today
+    // places a row-stream read under a COUNT — count plans request no
+    // columns, so the scanner never builds one.
+    if filtered_read.row_stream_input().is_some() {
         return Ok(None);
     }
     // A refine filter is a residual the index couldn't fully evaluate — it

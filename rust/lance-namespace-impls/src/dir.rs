@@ -12256,7 +12256,7 @@ mod tests {
             &plan_str,
             &[
                 "ProjectionExec: expr=[id@0 as id, name@2 as name",
-                "projection=[name], mode=take(_rowid)",
+                "projection=[name], source=stream(_rowid)",
                 "LanceRead: uri=",
                 "projection=[id]",
                 "row_id=true, row_addr=false",
@@ -12353,7 +12353,7 @@ mod tests {
                 "AnalyzeExec verbose=true",
                 "ProjectionExec: elapsed=",
                 "expr=[id@0 as id, name@2 as name",
-                "projection=[name], mode=take(_rowid)",
+                "projection=[name], source=stream(_rowid)",
                 "CoalesceBatchesExec: elapsed=",
                 "LanceRead: elapsed=",
                 "projection=[id]",
