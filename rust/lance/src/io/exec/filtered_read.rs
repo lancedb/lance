@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::{ops::Range, sync::Arc};
 
+use arrow::compute::BatchCoalescer;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
@@ -1277,6 +1278,9 @@ pub struct FilteredReadOptions {
     /// Include deleted rows in the scan
     pub with_deleted_rows: bool,
     /// The maximum number of rows per batch
+    ///
+    /// For a row-stream source this is also the number of input rows
+    /// coalesced into each read round (output batches mirror their round).
     pub batch_size: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
@@ -1405,6 +1409,8 @@ impl FilteredReadOptions {
     /// batches across fragments).
     ///
     /// A CoalesceBatchesExec can (and often should) be used to merge together tiny batches
+    /// from a scan.  A row-stream source coalesces its own input: this value is the number of
+    /// input rows gathered into each read round.
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size);
         self
@@ -2343,6 +2349,66 @@ impl RowStreamRead {
         Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
+    /// The number of input rows gathered into each read round (and therefore
+    /// the size of each output batch, which mirrors its round).
+    ///
+    /// Resolution matches the scan path (explicit option, then the
+    /// `LANCE_DEFAULT_BATCH_SIZE` env var) except for the final fallback: a
+    /// flat [`BATCH_SIZE_FALLBACK`] instead of the scan's block-size
+    /// heuristic.  The scan heuristic sizes I/O transfers for full-column
+    /// scans; a round's per-batch cost is planning and fragment-open
+    /// overhead, which row count amortizes directly.
+    fn round_target_rows(&self) -> usize {
+        self.read_options
+            .batch_size
+            .map(|batch_size| batch_size as usize)
+            .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK))
+    }
+
+    /// Coalesce the input stream into read rounds of exactly `target` rows
+    /// (the final round holds the remainder).
+    ///
+    /// Merging small batches amortizes per-round planning overhead; slicing
+    /// oversized batches bounds each round's memory (the round holds all
+    /// fetched columns for its rows at once) and keeps output batches within
+    /// the documented `batch_size` maximum.  Order is preserved: rounds are
+    /// cut from the input in sequence.
+    fn coalesce_rounds(
+        input: SendableRecordBatchStream,
+        target: usize,
+    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+        struct CoalesceState {
+            input: SendableRecordBatchStream,
+            coalescer: BatchCoalescer,
+            exhausted: bool,
+        }
+        let coalescer = BatchCoalescer::new(input.schema(), target);
+        futures::stream::try_unfold(
+            CoalesceState {
+                input,
+                coalescer,
+                exhausted: false,
+            },
+            |mut state| async move {
+                loop {
+                    if let Some(round) = state.coalescer.next_completed_batch() {
+                        return Ok(Some((round, state)));
+                    }
+                    if state.exhausted {
+                        return Ok(None);
+                    }
+                    match state.input.try_next().await? {
+                        Some(batch) => state.coalescer.push_batch(batch)?,
+                        None => {
+                            state.exhausted = true;
+                            state.coalescer.finish_buffered_batch()?;
+                        }
+                    }
+                }
+            },
+        )
+    }
+
     fn apply(
         self: Arc<Self>,
         input: SendableRecordBatchStream,
@@ -2353,7 +2419,7 @@ impl RowStreamRead {
         let final_metrics = self.global_metrics.clone();
         let result_baseline = self.baseline_metrics.clone();
         let final_baseline = self.baseline_metrics.clone();
-        input
+        Self::coalesce_rounds(input, self.round_target_rows())
             .enumerate()
             .map(move |(batch_index, batch)| {
                 let batch = batch?;
@@ -4603,6 +4669,23 @@ mod tests {
             )
         }
 
+        fn take_plan_sized(
+            dataset: &Arc<Dataset>,
+            input: Arc<dyn ExecutionPlan>,
+            columns: &[&str],
+            batch_size: u32,
+        ) -> Result<FilteredReadExec> {
+            let projection = dataset
+                .empty_projection()
+                .union_columns(columns, OnMissing::Error)
+                .unwrap();
+            FilteredReadExec::try_new(
+                dataset.clone(),
+                FilteredReadOptions::new(projection).with_batch_size(batch_size),
+                Some(input),
+            )
+        }
+
         async fn run(plan: &FilteredReadExec) -> Vec<RecordBatch> {
             plan.execute(0, Arc::new(TaskContext::default()))
                 .unwrap()
@@ -4612,8 +4695,8 @@ mod tests {
         }
 
         /// Take with shuffled, duplicated row addresses and a payload column:
-        /// the output must preserve the input's row order, duplicates, batch
-        /// boundaries, and the payload
+        /// the output must preserve the input's row order, duplicates, and the
+        /// payload (small input batches coalesce into a single read round)
         #[rstest]
         #[case::by_row_addr(ROW_ADDR)]
         #[case::by_row_id(ROW_ID)]
@@ -4646,7 +4729,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            // Two batches to verify batch boundaries survive
+            // Two input batches: they coalesce into one read round
             let batches = vec![batch.slice(0, 3), batch.slice(3, 2)];
 
             let plan = take_plan(&fixture.dataset, rows_input(batches), &["s", "i"]).unwrap();
@@ -4662,9 +4745,8 @@ mod tests {
             );
 
             let result = run(&plan).await;
-            assert_eq!(result.len(), 2);
-            assert_eq!(result[0].num_rows(), 3);
-            assert_eq!(result[1].num_rows(), 2);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].num_rows(), 5);
             let result = concat_batches(&plan.schema(), &result).unwrap();
 
             let i_col = result.column_by_name("i").unwrap();
@@ -4681,6 +4763,59 @@ mod tests {
                 .unwrap()
                 .as_primitive::<Float32Type>();
             assert_eq!(payload_col.values(), &payload[..]);
+        }
+
+        /// The row-stream input coalesces to the batch_size target: tiny
+        /// batches merge into one round and an oversized batch is sliced into
+        /// exact target-sized rounds, preserving order across boundaries
+        #[tokio::test]
+        async fn take_coalesces_input_to_batch_size() {
+            let fixture = take_fixture(false).await;
+
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            let keys: Vec<u64> = vec![
+                addr(2, 3), // i = 23
+                addr(0, 1), // i = 1
+                addr(1, 4), // i = 14
+                addr(0, 7), // i = 7
+                addr(2, 0), // i = 20
+                addr(1, 1), // i = 11
+                addr(0, 2), // i = 2
+            ];
+            let expected_i: Vec<i32> = vec![23, 1, 14, 7, 20, 11, 2];
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ADDR,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(
+                input_schema.clone(),
+                vec![Arc::new(UInt64Array::from(keys.clone()))],
+            )
+            .unwrap();
+
+            let assert_rounds = |result: Vec<RecordBatch>, schema: SchemaRef| {
+                assert_eq!(
+                    result.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+                    vec![3, 3, 1]
+                );
+                let merged = concat_batches(&schema, &result).unwrap();
+                let i_col = merged.column_by_name("i").unwrap();
+                assert_eq!(
+                    i_col.as_primitive::<arrow::datatypes::Int32Type>().values(),
+                    &expected_i[..]
+                );
+            };
+
+            // Seven one-row batches merge into rounds of exactly 3, 3, 1
+            let tiny = (0..7).map(|i| batch.slice(i, 1)).collect::<Vec<_>>();
+            let plan = take_plan_sized(&fixture.dataset, rows_input(tiny), &["i"], 3).unwrap();
+            assert_rounds(run(&plan).await, plan.schema());
+
+            // One oversized batch is sliced into the same rounds
+            let plan =
+                take_plan_sized(&fixture.dataset, rows_input(vec![batch]), &["i"], 3).unwrap();
+            assert_rounds(run(&plan).await, plan.schema());
         }
 
         /// Take of new sub-fields into an existing struct column: the fields

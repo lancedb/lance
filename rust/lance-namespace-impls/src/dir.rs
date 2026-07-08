@@ -12354,7 +12354,6 @@ mod tests {
                 "ProjectionExec: elapsed=",
                 "expr=[id@0 as id, name@2 as name",
                 "projection=[name], source=stream(_rowid)",
-                "CoalesceBatchesExec: elapsed=",
                 "LanceRead: elapsed=",
                 "projection=[id]",
                 "row_id=true, row_addr=false",
