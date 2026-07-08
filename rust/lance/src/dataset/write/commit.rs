@@ -345,7 +345,6 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-
         // Validate storage format matches existing dataset
         if let Some(ds) = dest.dataset()
             && let Some(storage_format) = self.storage_format
@@ -503,7 +502,6 @@ impl<'a> CommitBuilder<'a> {
             },
             read_version,
             tag: None,
-            //TODO: handle batch transaction merges in the future
             transaction_properties: None,
         };
         let dataset = self.execute(merged.clone()).await?;

@@ -323,6 +323,7 @@ pub struct WriteParams {
     ///
     /// Newer versions are more efficient but the data can only be read by more recent versions
     /// of lance.
+    /// Lance file version 2.3 enables RLE v2 run length widths by default.
     ///
     /// If not specified then the latest stable version will be used.
     pub data_storage_version: Option<LanceFileVersion>,

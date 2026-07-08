@@ -788,6 +788,8 @@ async fn run_lance(
     let big = args.rows.saturating_mul(args.value_size + 256).max(1 << 30);
     let config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: true,
         sync_indexed_write: true,

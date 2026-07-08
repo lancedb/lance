@@ -8,6 +8,52 @@ use snafu::{IntoError as _, Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+#[cfg(feature = "backtrace")]
+mod backtrace_support {
+    use std::backtrace::Backtrace;
+
+    use snafu::{AsBacktrace, GenerateImplicitData};
+
+    #[derive(Debug)]
+    pub struct MaybeBacktrace(pub Option<Backtrace>);
+
+    impl GenerateImplicitData for MaybeBacktrace {
+        fn generate() -> Self {
+            Self(<Option<Backtrace>>::generate())
+        }
+    }
+
+    impl AsBacktrace for MaybeBacktrace {
+        fn as_backtrace(&self) -> Option<&Backtrace> {
+            self.0.as_ref()
+        }
+    }
+}
+
+#[cfg(not(feature = "backtrace"))]
+mod backtrace_support {
+    use std::backtrace::Backtrace;
+
+    use snafu::{AsBacktrace, GenerateImplicitData};
+
+    #[derive(Debug)]
+    pub struct MaybeBacktrace;
+
+    impl GenerateImplicitData for MaybeBacktrace {
+        fn generate() -> Self {
+            Self
+        }
+    }
+
+    impl AsBacktrace for MaybeBacktrace {
+        fn as_backtrace(&self) -> Option<&Backtrace> {
+            None
+        }
+    }
+}
+
+use backtrace_support::MaybeBacktrace;
+
 /// Error for when a requested field is not found in a schema.
 ///
 /// This error computes suggestions lazily (only when displayed) to avoid
@@ -51,6 +97,28 @@ pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedErro
     Box::new(e)
 }
 
+/// Why a writer is fenced. Both reasons are terminal, but callers must tell them
+/// apart (a peer takeover vs. our own failure) rather than parse the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FenceReason {
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    PeerClaimedEpoch,
+    /// Our own WAL persistence failed, so in-memory state may have diverged from
+    /// the durable WAL. The writer must be reopened to replay.
+    PersistenceFailure,
+}
+
+impl std::fmt::Display for FenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Stable strings — surfaced in error messages.
+        let s = match self {
+            Self::PeerClaimedEpoch => "peer claimed epoch",
+            Self::PersistenceFailure => "persistence failure",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -59,18 +127,24 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists {
         uri: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Append with different schema: {difference}, location: {location}"))]
     SchemaMismatch {
         difference: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
     DatasetNotFound {
@@ -78,6 +152,8 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Encountered corrupt file {path}: {source}, {location}"))]
     CorruptFile {
@@ -85,13 +161,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
-        // TODO: add backtrace?
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Not supported: {source}, {location}"))]
     NotSupported {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Commit conflict for version {version}: {source}, {location}"))]
     CommitConflict {
@@ -99,12 +178,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Incompatible transaction: {source}, {location}"))]
     IncompatibleTransaction {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
     RetryableCommitConflict {
@@ -112,12 +195,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Operation timed out: {message}, {location}"))]
     Timeout {
@@ -132,54 +219,72 @@ pub enum Error {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Unprocessable: {message}, {location}"))]
     Unprocessable {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Arrow): {message}, {location}"))]
     Arrow {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]
     Schema {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound {
         uri: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(IO): {source}, {location}"))]
     IO {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Lance index not found: {identity}, {location}"))]
     IndexNotFound {
         identity: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Cannot infer storage location from: {message}"))]
     InvalidTableLocation { message: String },
@@ -190,18 +295,24 @@ pub enum Error {
         error: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Cloned error: {message}, {location}"))]
     Cloned {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Query Execution error: {message}, {location}"))]
     Execution {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Ref is invalid: {message}"))]
     InvalidRef { message: String },
@@ -220,12 +331,16 @@ pub enum Error {
         minor_version: u16,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Namespace error: {source}, {location}"))]
     Namespace {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     /// External error passed through from user code.
     ///
@@ -248,9 +363,78 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// A writer has been fenced and must stop (see [`FenceReason`]). The message
+    /// keeps the `Writer fenced` prefix for legacy string consumers; new code
+    /// should match on [`Error::fence_reason`].
+    #[snafu(display("Writer fenced ({reason}): {message}, {location}"))]
+    Fenced {
+        reason: FenceReason,
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
+    /// Returns the captured Rust backtrace, if available.
+    ///
+    /// Requires the `backtrace` feature to be enabled at compile time
+    /// and `RUST_BACKTRACE=1` at runtime.
+    #[cfg(feature = "backtrace")]
+    pub fn backtrace(&self) -> Option<&std::backtrace::Backtrace> {
+        match self {
+            Self::InvalidInput { backtrace, .. }
+            | Self::DatasetAlreadyExists { backtrace, .. }
+            | Self::SchemaMismatch { backtrace, .. }
+            | Self::DatasetNotFound { backtrace, .. }
+            | Self::CorruptFile { backtrace, .. }
+            | Self::NotSupported { backtrace, .. }
+            | Self::CommitConflict { backtrace, .. }
+            | Self::IncompatibleTransaction { backtrace, .. }
+            | Self::RetryableCommitConflict { backtrace, .. }
+            | Self::TooMuchWriteContention { backtrace, .. }
+            | Self::Internal { backtrace, .. }
+            | Self::PrerequisiteFailed { backtrace, .. }
+            | Self::Unprocessable { backtrace, .. }
+            | Self::Arrow { backtrace, .. }
+            | Self::Schema { backtrace, .. }
+            | Self::NotFound { backtrace, .. }
+            | Self::IO { backtrace, .. }
+            | Self::Index { backtrace, .. }
+            | Self::IndexNotFound { backtrace, .. }
+            | Self::Wrapped { backtrace, .. }
+            | Self::Cloned { backtrace, .. }
+            | Self::Execution { backtrace, .. }
+            | Self::VersionConflict { backtrace, .. }
+            | Self::Namespace { backtrace, .. } => {
+                use snafu::AsBacktrace;
+                backtrace.as_backtrace()
+            }
+            // Variants without a backtrace field — listed explicitly so that
+            // adding a new variant with a backtrace field triggers a compiler error.
+            Self::InvalidTableLocation { .. }
+            | Self::Stop
+            | Self::InvalidRef { .. }
+            | Self::RefConflict { .. }
+            | Self::RefNotFound { .. }
+            | Self::Cleanup { .. }
+            | Self::VersionNotFound { .. }
+            | Self::External { .. }
+            | Self::FieldNotFound { .. }
+            | Self::Timeout { .. }
+            | Self::DiskCapExceeded { .. }
+            | Self::Fenced { .. } => None,
+        }
+    }
+
+    /// Returns the captured Rust backtrace, if available.
+    ///
+    /// Always returns `None` when the `backtrace` feature is not enabled.
+    #[cfg(not(feature = "backtrace"))]
+    pub fn backtrace(&self) -> Option<&std::backtrace::Backtrace> {
+        None
+    }
+
     #[track_caller]
     pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
         CorruptFileSnafu { path }.into_error(message.into().into())
@@ -269,6 +453,36 @@ impl Error {
     #[track_caller]
     pub fn io(message: impl Into<String>) -> Self {
         IOSnafu.into_error(message.into().into())
+    }
+
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    #[track_caller]
+    pub fn fenced_by_peer(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PeerClaimedEpoch,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Our WAL persistence failed; in-memory state may have diverged from the
+    /// durable WAL, so the writer must be reopened to replay.
+    #[track_caller]
+    pub fn writer_poisoned(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PersistenceFailure,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// The [`FenceReason`] if this is [`Error::Fenced`], else `None`. Prefer this
+    /// over matching the error message to decide how to react to a fence.
+    pub fn fence_reason(&self) -> Option<FenceReason> {
+        match self {
+            Self::Fenced { reason, .. } => Some(*reason),
+            _ => None,
+        }
     }
 
     #[track_caller]
@@ -549,7 +763,11 @@ impl From<std::io::Error> for Error {
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::io_source(box_error(e))
+        match e {
+            // source intentionally dropped; Error::NotFound carries only the path
+            object_store::Error::NotFound { path, .. } => Self::not_found(path),
+            other => Self::io_source(box_error(other)),
+        }
     }
 }
 
@@ -731,6 +949,41 @@ mod test {
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
+        }
+    }
+
+    #[test]
+    fn test_caller_location_capture_not_found() {
+        let current_fn = get_caller_location();
+        let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
+            Err(object_store::Error::NotFound {
+                path: "some/path".to_string(),
+                source: "not found".into(),
+            })?;
+            Ok(())
+        });
+        match f().unwrap_err() {
+            Error::NotFound { location, .. } => {
+                // +2 is the beginning of object_store::Error::NotFound...
+                assert_eq!(location.line(), current_fn.line() + 2, "{}", location)
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_object_store_not_found_converts_to_not_found() {
+        let os_err = object_store::Error::NotFound {
+            path: "test/path".to_string(),
+            source: "no such file".into(),
+        };
+        let lance_err: Error = os_err.into();
+        match lance_err {
+            Error::NotFound { uri, .. } => {
+                assert_eq!(uri, "test/path");
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
         }
     }
 
@@ -985,5 +1238,69 @@ mod test {
             }
             _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
         }
+    }
+
+    #[test]
+    fn test_backtrace_accessor() {
+        // Verify that backtrace() returns the expected result based on feature state
+        let err = Error::io("test backtrace");
+        let bt = err.backtrace();
+        #[cfg(feature = "backtrace")]
+        {
+            // With the backtrace feature enabled, whether a backtrace is captured
+            // depends on the RUST_BACKTRACE env var at runtime. We just verify
+            // the accessor doesn't panic and returns a valid Option.
+            let _ = bt;
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            // Without the backtrace feature, this must always be None.
+            assert!(bt.is_none());
+        }
+    }
+
+    #[test]
+    fn test_backtrace_captured_when_feature_enabled() {
+        // Test that backtrace is actually captured when the feature is on and
+        // RUST_BACKTRACE=1 is set in the environment before the process starts.
+        //
+        // NOTE: std::backtrace::Backtrace caches the RUST_BACKTRACE env check,
+        // so set_var at runtime does not reliably enable capture. This test
+        // verifies the accessor works correctly in both cases:
+        // - If RUST_BACKTRACE=1 was set before the test binary started, we get Some.
+        // - If not, we get None (even with the feature on), which is expected.
+        #[cfg(feature = "backtrace")]
+        {
+            let err = Error::io("backtrace capture test");
+            if std::env::var("RUST_BACKTRACE").is_ok() {
+                assert!(
+                    err.backtrace().is_some(),
+                    "Expected a backtrace when RUST_BACKTRACE=1 and backtrace feature is enabled"
+                );
+            }
+            // When RUST_BACKTRACE is not set, backtrace() may return None even
+            // with the feature enabled — this is correct runtime gating behavior.
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            let err = Error::io("backtrace capture test");
+            assert!(err.backtrace().is_none());
+        }
+    }
+
+    #[test]
+    fn test_backtrace_returns_none_for_variants_without_location() {
+        let err = Error::InvalidTableLocation {
+            message: "test".to_string(),
+        };
+        assert!(err.backtrace().is_none());
+
+        let err = Error::InvalidRef {
+            message: "test".to_string(),
+        };
+        assert!(err.backtrace().is_none());
+
+        let err = Error::Stop;
+        assert!(err.backtrace().is_none());
     }
 }

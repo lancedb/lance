@@ -3803,13 +3803,17 @@ class LanceDataset(pa.dataset.Dataset):
                 if _check_for_numpy(pq_codebook) and isinstance(
                     pq_codebook, np.ndarray
                 ):
+                    num_bits = kwargs.get("num_bits", 8)
+                    expected_centroids = 2**num_bits
                     if (
                         len(pq_codebook.shape) != 3
                         or pq_codebook.shape[0] != num_sub_vectors
-                        or pq_codebook.shape[1] != 256
+                        or pq_codebook.shape[1] != expected_centroids
                     ):
                         raise ValueError(
-                            f"PQ codebook must be 3D array: (sub_vectors, 256, dim), "
+                            "PQ codebook must be 3D array: "
+                            f"(sub_vectors, {expected_centroids}, dim) "
+                            f"for num_bits={num_bits}, "
                             f"got {pq_codebook.shape}"
                         )
                     if pq_codebook.dtype not in [np.float16, np.float32, np.float64]:
@@ -3931,10 +3935,9 @@ class LanceDataset(pa.dataset.Dataset):
         pq_codebook : optional,
             It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
             or :py:class:`pyarrow.FixedShapeTensorArray`.
-            A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
-            array of K-mean centroids for PQ codebook.
-
-            Note: ``nbits`` is always 8 for now.
+            A ``num_sub_vectors x (2 ^ num_bits) x
+            (dimensions // num_sub_vectors)`` array of K-mean centroids for PQ
+            codebook. ``num_bits`` defaults to 8.
             If not provided, a new PQ model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
@@ -4291,13 +4294,22 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.drop_index(name)
 
-    def prewarm_index(self, name: str, *, with_position: bool = False):
+    def prewarm_index(
+        self,
+        name: str,
+        *,
+        with_position: bool = False,
+        index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
+    ):
         """
         Prewarm an index
 
-        This will load the entire index into memory.  This can help avoid cold start
-        issues with index queries.  If the index does not fit in the index cache, then
-        this will result in wasted I/O.
+        By default, this will load the entire index into memory. This can help
+        avoid cold start issues with index queries. If the index does not fit in
+        the index cache, then this will result in wasted I/O.
+
+        Use ``session().index_cache_size_bytes()`` before and after prewarm to
+        inspect how much the index cache grew.
 
         Parameters
         ----------
@@ -4307,8 +4319,26 @@ class LanceDataset(pa.dataset.Dataset):
             This is only supported for ``INVERTED`` indices. If True, positions are
             also loaded into the cache during prewarm so phrase queries do not need a
             separate lazy positions read.
+        index_segments: iterable of str or uuid.UUID, default None
+            If specified, prewarm only these physical index segment UUIDs from the
+            named logical index. Use :meth:`describe_indices` to inspect logical
+            indices and obtain segment UUIDs from ``IndexDescription.segments``.
         """
-        return self._ds.prewarm_index(name, with_position=with_position)
+        if index_segments is not None:
+            segment_ids = []
+            for segment_id in index_segments:
+                if isinstance(segment_id, (str, uuid.UUID)):
+                    segment_ids.append(str(segment_id))
+                else:
+                    raise TypeError(
+                        "index_segments must be an iterable of str or uuid.UUID. "
+                        f"Got {type(segment_id)} instead."
+                    )
+            index_segments = segment_ids
+
+        return self._ds.prewarm_index(
+            name, with_position=with_position, index_segments=index_segments
+        )
 
     def merge_index_metadata(
         self,
@@ -6164,17 +6194,13 @@ class ScannerBuilder:
         used by the scanner.  If the buffer is full then the scanner will block until
         the buffer is processed.
 
-        Generally this should scale with the number of concurrent I/O threads.  The
-        default is 2GiB which comfortably provides enough space for somewhere between
-        32 and 256 concurrent I/O threads.
+        Generally this should scale with the number of concurrent I/O threads.  If
+        unset, v2 scans choose a default based on the object store and
+        ``LANCE_DEFAULT_IO_BUFFER_SIZE`` can override that default.
 
         This value is not a hard cap on the amount of RAM the scanner will use.  Some
         space is used for the compute (which can be controlled by the batch size) and
         Lance does not keep track of memory after it is returned to the user.
-
-        Currently, if there is a single batch of data which is larger than the io buffer
-        size then the scanner will deadlock.  This is a known issue and will be fixed in
-        a future release.
 
         This parameter is only used when reading v2 files
         """
@@ -7565,8 +7591,7 @@ def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
         if isinstance(query.type, pa.FixedSizeListType):
             query = query.values
     elif isinstance(query, (list, tuple)) or (
-        _check_for_numpy(query),
-        isinstance(query, np.ndarray),
+        _check_for_numpy(query) and isinstance(query, np.ndarray)
     ):
         query = np.array(query).astype("float64")  # workaround for GH-608
         query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())

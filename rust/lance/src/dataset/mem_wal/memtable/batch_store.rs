@@ -43,7 +43,9 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
+use arrow_schema::DataType;
 
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
@@ -75,13 +77,55 @@ impl StoredBatch {
     }
 
     /// Estimate the memory size of a RecordBatch.
+    ///
+    /// Sums each column's slice-aware buffer size (see
+    /// [`Self::estimate_array_size`]) plus the struct overhead, so a column that
+    /// is a zero-copy slice of a larger parent contributes only its own window
+    /// rather than the whole shared buffer.
     fn estimate_batch_size(batch: &RecordBatch) -> usize {
         batch
             .columns()
             .iter()
-            .map(|col| col.get_array_memory_size())
+            .map(|col| Self::estimate_array_size(&col.to_data()))
             .sum::<usize>()
             + std::mem::size_of::<RecordBatch>()
+    }
+
+    /// Slice-aware buffer size of a single array.
+    ///
+    /// [`ArrayData::get_slice_memory_size`] reports each buffer's own window
+    /// (not the whole shared buffer), but omits the variadic data buffers of
+    /// `Utf8View`/`BinaryView` (values > 12 bytes) while still returning `Ok`, so
+    /// [`Self::view_data_buffers_size`] adds them. Those buffers are shared across
+    /// zero-copy slices and are counted at full capacity for each slice — an
+    /// over-count in the safe direction.
+    fn estimate_array_size(data: &ArrayData) -> usize {
+        match data.get_slice_memory_size() {
+            Ok(size) => size + Self::view_data_buffers_size(data),
+            // Fall back to the full-buffer sum for layouts the slice-aware call
+            // cannot handle.
+            Err(_) => data.get_array_memory_size(),
+        }
+    }
+
+    /// Capacity of the variadic `Utf8View`/`BinaryView` data buffers that
+    /// [`ArrayData::get_slice_memory_size`] omits, summed recursively over children.
+    fn view_data_buffers_size(data: &ArrayData) -> usize {
+        let mut size = 0;
+        if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+            // buffers()[0] is the 16-byte view array that get_slice_memory_size
+            // already counts; [1..] are the data buffers it skips.
+            size += data
+                .buffers()
+                .iter()
+                .skip(1)
+                .map(|b| b.capacity())
+                .sum::<usize>();
+        }
+        for child in data.child_data() {
+            size += Self::view_data_buffers_size(child);
+        }
+        size
     }
 }
 
@@ -970,6 +1014,122 @@ mod tests {
         // Very small memtable should get minimum capacity
         let cap = BatchStore::recommended_capacity(1024);
         assert_eq!(cap, 16); // minimum
+    }
+
+    #[test]
+    fn test_estimated_size_is_slice_aware() {
+        // A batch that is a zero-copy slice of a larger parent must contribute
+        // only its own window to the estimate, not the whole shared buffer.
+        // `get_array_memory_size` counts every buffer's full capacity regardless
+        // of offset/length, so N slices tiling one parent each report the
+        // parent's size and inflate the memtable estimate ~N×, tripping the
+        // flush threshold far below the configured size.
+        let chunk = 1_000;
+        let num_slices = 100;
+        let parent = create_test_batch(chunk * num_slices);
+
+        // One window vs an equivalently-sized owned batch should track each
+        // other; the buggy per-slice estimate would be ~num_slices× larger.
+        let slice_est = StoredBatch::estimate_batch_size(&parent.slice(0, chunk));
+        let owned_est = StoredBatch::estimate_batch_size(&create_test_batch(chunk));
+        assert!(
+            slice_est <= owned_est * 2,
+            "slice estimate {slice_est} should track its own window (~{owned_est}), not the parent"
+        );
+
+        // End-to-end: tiling the parent with zero-copy slices must not multiply
+        // the store's running estimate. Track what the old full-buffer behavior
+        // would have summed to for contrast.
+        let store = BatchStore::with_capacity(num_slices);
+        let mut over_counting_sum = 0usize;
+        for k in 0..num_slices {
+            let s = parent.slice(k * chunk, chunk);
+            over_counting_sum += s
+                .columns()
+                .iter()
+                .map(|col| col.get_array_memory_size())
+                .sum::<usize>()
+                + std::mem::size_of::<RecordBatch>();
+            store.append(s).unwrap();
+        }
+
+        // Two non-nullable Int32 columns → exactly 4 bytes/row/col of payload.
+        let payload_bytes = num_slices * chunk * 2 * std::mem::size_of::<i32>();
+        let estimated = store.estimated_bytes();
+        assert!(
+            estimated >= payload_bytes,
+            "estimate {estimated} should cover the actual payload {payload_bytes}"
+        );
+        // The old behavior over-counts by ~num_slices×; the fix must be far
+        // below it (generous 10× margin against struct/alignment overhead).
+        assert!(
+            estimated * 10 < over_counting_sum,
+            "estimate {estimated} should be far below the over-counting sum {over_counting_sum}"
+        );
+    }
+
+    #[test]
+    fn test_estimated_size_counts_view_data_buffers() {
+        // Long Utf8View/BinaryView values live in variadic data buffers that
+        // `get_slice_memory_size` ignores (returning ~16 * rows). The estimate
+        // must include them, both for a top-level view column and for a view
+        // array nested in a container, which is only reached via child_data
+        // recursion.
+        use arrow_array::{Array, ArrayRef, StringViewArray, StructArray};
+
+        let num_rows = 1_000;
+        // Each value exceeds the 12-byte inline limit, so it spills to a data buffer.
+        let long_value = "x".repeat(64);
+        let payload_bytes = num_rows * long_value.len();
+        // What the slice-aware call alone reports: just the 16-byte view entries.
+        let view_entries_only = num_rows * 16;
+
+        let make_views = || {
+            StringViewArray::from(
+                (0..num_rows)
+                    .map(|_| Some(long_value.as_str()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let assert_covers = |batch: &RecordBatch| {
+            let estimated = StoredBatch::estimate_batch_size(batch);
+            assert!(
+                estimated >= payload_bytes,
+                "estimate {estimated} should cover the view data-buffer payload {payload_bytes}"
+            );
+            assert!(
+                estimated > view_entries_only * 2,
+                "estimate {estimated} must exceed the ~{view_entries_only}-byte view-entry-only undercount"
+            );
+        };
+
+        // Top-level view column.
+        let flat = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "s",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(make_views())],
+        )
+        .unwrap();
+        assert_covers(&flat);
+
+        // View nested inside a struct — reachable only through child_data recursion.
+        let nested = StructArray::from(vec![(
+            Arc::new(Field::new("s", DataType::Utf8View, false)),
+            Arc::new(make_views()) as ArrayRef,
+        )]);
+        let nested = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "st",
+                nested.data_type().clone(),
+                false,
+            )])),
+            vec![Arc::new(nested)],
+        )
+        .unwrap();
+        assert_covers(&nested);
     }
 
     #[test]

@@ -342,12 +342,13 @@ class DirectoryNamespace(LanceNamespace):
     >>>
     >>> # With AWS credential vending (requires credential-vendor-aws feature)
     >>> # Use **dict to pass property names with dots
-    >>> ns = lance.namespace.DirectoryNamespace(**{
+    >>> aws_properties = {
     ...     "root": "s3://my-bucket/data",
     ...     "credential_vendor.enabled": "true",
     ...     "credential_vendor.aws_role_arn": "arn:aws:iam::123456789012:role/MyRole",
     ...     "credential_vendor.aws_duration_millis": "3600000",
-    ... })
+    ... }
+    >>> # ns = lance.namespace.DirectoryNamespace(**aws_properties)
 
     With dynamic context provider:
 

@@ -100,6 +100,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
     stream::{self},
 };
+use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::address::RowAddress;
@@ -1222,6 +1223,20 @@ impl MergeInsertJob {
                             Err(e) => Err(e),
                         })?;
 
+                    // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary/JSONB)
+                    // before writing. Without this, Utf8 data is written raw while the
+                    // schema says LargeBinary, causing decoder panics on subsequent reads.
+                    let needs_json_conversion = batches[0]
+                        .schema()
+                        .fields()
+                        .iter()
+                        .any(|f| is_arrow_json_field(f) || has_json_fields(f));
+                    if needs_json_conversion {
+                        for batch in batches.iter_mut() {
+                            *batch = convert_json_columns(batch).map_err(Error::from)?;
+                        }
+                    }
+
                     if data_storage_version == LanceFileVersion::Legacy {
                         // Need to match the existing batch size exactly, otherwise
                         // we'll get errors.
@@ -1274,9 +1289,16 @@ impl MergeInsertJob {
                     // will be the original source data, and all subsequent batches
                     // will be updates.
                     let mut source_batches = Vec::with_capacity(batches.len() + 1);
-                    source_batches.push(batches[0].clone()); // placeholder for source data
+                    // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) so every
+                    // batch is in physical format, matching what the updater reads from the
+                    // fragment. `convert_json_columns` is a no-op clone when there is nothing
+                    // to convert, so it can be applied unconditionally. The first entry is a
+                    // placeholder for the source data (overwritten each iteration below); it
+                    // must be converted too, otherwise its schema would diverge from the rest.
+                    source_batches.push(convert_json_columns(&batches[0]).map_err(Error::from)?);
                     for batch in &batches {
-                        source_batches.push(batch.drop_column(ROW_ADDR)?);
+                        let dropped = batch.drop_column(ROW_ADDR)?;
+                        source_batches.push(convert_json_columns(&dropped).map_err(Error::from)?);
                     }
 
                     // This function is here to help rustc with lifetimes.
@@ -11144,5 +11166,286 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             baseline_files,
             "Newly written merge-insert data files should be cleaned up on apply_deletions failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_full_fragment_rewrite_with_json_columns() {
+        // This test verifies the "all rows updated" fast path in handle_fragment
+        // correctly converts Arrow JSON (Utf8) to Lance JSON (LargeBinary/JSONB)
+        // before writing. Without conversion, the file would have Utf8 data (i32
+        // offsets) but schema says LargeBinary (i64 offsets), causing decoder panic
+        // on subsequent reads.
+        //
+        // To trigger the fast path we need:
+        // 1. Subschema update (not all columns) → forces v1 update_fragments path
+        // 2. ALL rows in a fragment updated → triggers the fast path
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
+
+        let test_dir = TempStrDir::default();
+        let mut json_metadata = HashMap::new();
+        json_metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Int64, true),
+            Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata.clone()),
+        ]));
+        // Small fragment so ALL rows will be updated
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"x":1}"#,
+                    r#"{"x":2}"#,
+                    r#"{"x":3}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let dataset = Arc::new(
+            Dataset::write(reader, test_dir.as_ref(), Some(write_params))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        // Subschema update: only provide [id, meta] (missing "name" and "score")
+        // This forces the v1 path (update_fragments) instead of v2 (create_plan).
+        // Update ALL rows → triggers the "all rows updated" fast path.
+        let update_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])), // all rows
+                Arc::new(StringArray::from(vec![
+                    r#"{"updated":true,"id":1}"#,
+                    r#"{"updated":true,"id":2}"#,
+                    r#"{"updated":true,"id":3}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let update_reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)],
+            update_schema,
+        ));
+        let stream = reader_to_stream(update_reader);
+
+        // Execute merge_insert with subschema
+        let mut builder =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()]).unwrap();
+        builder.when_matched(WhenMatched::UpdateAll);
+        builder.when_not_matched(WhenNotMatched::DoNothing);
+        let job = builder.try_build().unwrap();
+        let (updated_dataset, stats) = job.execute(stream).await.unwrap();
+
+        assert_eq!(stats.num_updated_rows, 3);
+
+        // Critical: read the data back. Without the fix, this would PANIC with:
+        // "the offset of the new Buffer cannot exceed the existing Length:
+        //  slice offset=0 Length=N selfLen=N/2"
+        let batches = updated_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let result = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(result.num_rows(), 3);
+
+        // Verify JSON column is in Arrow JSON format (Utf8) on read
+        let result_schema = result.schema();
+        let meta_field = result_schema.field_with_name("meta").unwrap();
+        assert!(
+            is_arrow_json_field(meta_field),
+            "Expected Arrow JSON (Utf8 + arrow.json), got {:?}",
+            meta_field
+        );
+
+        // Verify data correctness
+        let metas = result
+            .column_by_name("meta")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("meta should be StringArray after read conversion");
+        for i in 0..3 {
+            let val = metas.value(i);
+            assert!(
+                val.contains("updated"),
+                "row {} should have updated meta, got: {}",
+                i,
+                val
+            );
+        }
+
+        // Verify non-updated columns are preserved
+        let scores = result
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(scores.values(), &[10, 20, 30]);
+
+        // Also verify via take (exercises the take read conversion path)
+        let take_result = updated_dataset
+            .take(&[0, 1, 2], updated_dataset.schema().clone())
+            .await
+            .unwrap();
+        let take_schema = take_result.schema();
+        let take_meta_field = take_schema.field_with_name("meta").unwrap();
+        assert!(
+            is_arrow_json_field(take_meta_field),
+            "take() should return Arrow JSON, got {:?}",
+            take_meta_field
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_subschema_with_json_columns() {
+        use lance_arrow::ARROW_EXT_NAME_KEY;
+        use lance_arrow::json::ARROW_JSON_EXT_NAME;
+
+        // Create a dataset with an Arrow JSON extension column
+        let test_dir = TempStrDir::default();
+        let mut json_metadata = HashMap::new();
+        json_metadata.insert(
+            ARROW_EXT_NAME_KEY.to_string(),
+            ARROW_JSON_EXT_NAME.to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Int64, true),
+            Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata.clone()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"x":1}"#,
+                    r#"{"x":2}"#,
+                    r#"{"x":3}"#,
+                    r#"{"x":4}"#,
+                    r#"{"x":5}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Arc::new(
+            Dataset::write(reader, test_dir.as_ref(), None)
+                .await
+                .unwrap(),
+        );
+
+        // Perform a subschema merge_insert: only update "meta" column (JSON type)
+        // This exercises the update_fragments path with interleave_batches
+        let update_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![2, 4])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"updated":true,"id":2}"#,
+                    r#"{"updated":true,"id":4}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let update_reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)],
+            update_schema,
+        ));
+        let stream = reader_to_stream(update_reader);
+
+        // Execute merge_insert with subschema (only id + meta columns)
+        let mut builder =
+            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()]).unwrap();
+        builder.when_matched(WhenMatched::UpdateAll);
+        builder.when_not_matched(WhenNotMatched::DoNothing);
+        let job = builder.try_build().unwrap();
+        let (updated_dataset, stats) = job.execute(stream).await.unwrap();
+
+        // Verify: the merge should not fail with type mismatch
+        assert_eq!(stats.num_updated_rows, 2);
+
+        // Read back and verify the JSON column was updated correctly
+        let batches = updated_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let result = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(result.num_rows(), 5);
+
+        // Verify the "score" column (not in update) is preserved, and "meta" updated
+        let ids = result
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let scores = result
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let metas = result
+            .column_by_name("meta")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..5 {
+            let id = ids.value(i);
+            let score = scores.value(i);
+            let meta = metas.value(i);
+            // score = id * 10, regardless of row order
+            assert_eq!(score, id * 10, "id={} score mismatch", id);
+            if id == 2 || id == 4 {
+                assert!(
+                    meta.contains("updated"),
+                    "id={} should have updated meta, got: {}",
+                    id,
+                    meta
+                );
+            } else {
+                assert!(
+                    meta.contains("\"x\""),
+                    "id={} should have original meta, got: {}",
+                    id,
+                    meta
+                );
+            }
+        }
     }
 }
