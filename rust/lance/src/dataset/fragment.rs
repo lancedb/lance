@@ -3987,6 +3987,142 @@ mod tests {
                 .collect();
             assert_eq!(col(&merged, "val").values(), &expected);
         }
+
+        /// An empty selection must not trip over the overlay path: the plan exists
+        /// but there are no offsets to route, so the result is an empty batch.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_empty_selection(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            let dataset = commit_overlay(
+                dataset,
+                "ov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[], &full_schema(&dataset)).await.unwrap();
+            assert_eq!(batch.num_rows(), 0);
+        }
+
+        /// Overlays resolve variable-width columns end-to-end, not just fixed-width
+        /// ones: the value column is fetched through the real file reader (a
+        /// different value-pushdown path than the fixed-width case) and assembled.
+        #[rstest]
+        #[tokio::test]
+        async fn test_string_overlay_end_to_end(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            use arrow_array::StringArray;
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("name", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e", "f"])),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `name` at offsets {1, 4}, one of the values NULL.
+            let dataset = commit_overlay(
+                dataset,
+                "strov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![Arc::new(StringArray::from(vec![Some("B"), None])) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[0, 1, 4], &full_schema(&dataset)).await.unwrap();
+            let name = batch
+                .column(batch.schema().index_of("name").unwrap())
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(name.value(0), "a"); // falls through to base
+            assert_eq!(name.value(1), "B"); // overlay value
+            assert!(name.is_null(2)); // overlay NULL wins
+        }
+
+        /// Projection pruning must do NO IO to overlay files whose fields are not
+        /// projected. Proven the same way as row-selection pruning: delete the
+        /// overlay's data file, then read projecting only the *unrelated* `id`
+        /// column — it must succeed (the `val` overlay file is never opened), while
+        /// projecting the overlaid `val` column then fails because its file is gone.
+        #[rstest]
+        #[tokio::test]
+        async fn test_projection_prunes_overlay_files_no_io(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let dataset = create_base_dataset(version).await;
+            // Overlay covers `val` (field 1) only.
+            let dataset = commit_overlay(
+                dataset,
+                "valov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([0, 1])),
+                vec![i32_array([Some(1000), Some(1010)])],
+                version,
+            )
+            .await;
+
+            // Delete the overlay's data file: opening it now fails.
+            dataset
+                .object_store
+                .delete(&Path::from("data/valov.lance"))
+                .await
+                .unwrap();
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let id_only = dataset.schema().project_by_ids(&[0], true);
+            let val_only = dataset.schema().project_by_ids(&[1], true);
+
+            // Projecting only `id` must not open the `val` overlay file, so it
+            // succeeds and returns untouched base values.
+            let batch = frag.take(&[0, 1], &id_only).await.unwrap();
+            assert_eq!(col(&batch, "id").values(), &[0, 1]);
+            // A scan projecting only `id` must likewise never touch the file.
+            let batch = frag
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(col(&batch, "id").values(), &[0, 1, 2, 3, 4, 5]);
+
+            // Projecting the overlaid `val` column does need the file, so it fails.
+            assert!(
+                frag.take(&[0], &val_only).await.is_err(),
+                "projecting the overlaid column should require its missing file",
+            );
+        }
     }
 
     #[rstest]
