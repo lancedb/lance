@@ -1899,6 +1899,38 @@ impl Scanner {
         }
     }
 
+    /// Ensure `input` exposes `column_name` as a top-level column.
+    ///
+    /// Nested FTS flat-search paths read the projected struct column from storage
+    /// but the FTS executor consumes a single document column by name.
+    fn ensure_column_alias(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        column_name: &str,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input_schema = input.schema();
+        if input_schema.column_with_name(column_name).is_some() {
+            return Ok(input);
+        }
+
+        let mut projection_exprs = Vec::with_capacity(input_schema.fields().len() + 1);
+        for field in input_schema.fields() {
+            projection_exprs.push((
+                Arc::new(Column::new_with_schema(
+                    field.name(),
+                    input_schema.as_ref(),
+                )?) as Arc<dyn PhysicalExpr>,
+                field.name().clone(),
+            ));
+        }
+        projection_exprs.push((
+            Self::create_column_expr(column_name, self.dataset.as_ref(), input_schema.as_ref())?,
+            column_name.to_string(),
+        ));
+
+        Ok(Arc::new(ProjectionExec::try_new(projection_exprs, input)?))
+    }
+
     /// Set whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -3587,7 +3619,7 @@ impl Scanner {
             ))?
             .clone();
 
-        let mut columns = vec![column];
+        let mut columns = vec![column.clone()];
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             columns.extend(Planner::column_names_in_expr(refine_expr));
         }
@@ -3611,6 +3643,7 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
+        plan = self.ensure_column_alias(plan, &column)?;
 
         let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
@@ -4360,7 +4393,8 @@ impl Scanner {
                         .dataset
                         .empty_projection()
                         .union_column(&column, OnMissing::Error)?;
-                    self.take(input, projection)?
+                    let input = self.take(input, projection)?;
+                    self.ensure_column_alias(input, &column)?
                 } else {
                     input
                 };
@@ -4410,7 +4444,8 @@ impl Scanner {
                         .dataset
                         .empty_projection()
                         .union_column(&column, OnMissing::Error)?;
-                    self.take(input, projection)?
+                    let input = self.take(input, projection)?;
+                    self.ensure_column_alias(input, &column)?
                 } else {
                     input
                 };
@@ -4895,24 +4930,25 @@ impl Scanner {
     }
 }
 
+fn is_fts_indexable_field(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::List(inner_field) | DataType::LargeList(inner_field) => {
+            matches!(
+                inner_field.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8
+            )
+        }
+        _ => false,
+    }
+}
+
 // Search over all indexed fields including nested ones, collecting columns that have an
 // inverted index
 async fn fts_indexed_columns(dataset: Arc<Dataset>) -> Result<Vec<String>> {
     let mut indexed_columns = Vec::new();
     for field in dataset.schema().fields_pre_order() {
-        // Check if this field is a string type that could have an inverted index
-        let is_string_field = match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => true,
-            DataType::List(inner_field) | DataType::LargeList(inner_field) => {
-                matches!(
-                    inner_field.data_type(),
-                    DataType::Utf8 | DataType::LargeUtf8
-                )
-            }
-            _ => false,
-        };
-
-        if is_string_field {
+        if is_fts_indexable_field(field) {
             // Build the full field path for nested fields
             let column_path =
                 if let Some(ancestors) = dataset.schema().field_ancestry_by_id(field.id) {
