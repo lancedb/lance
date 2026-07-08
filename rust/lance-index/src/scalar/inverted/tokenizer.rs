@@ -168,6 +168,7 @@ struct RawInvertedIndexParams {
     base_tokenizer: Option<String>,
     language: Option<Language>,
     with_position: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_explicit_option")]
     max_token_length: Option<Option<usize>>,
     lower_case: Option<bool>,
     stem: Option<bool>,
@@ -444,6 +445,16 @@ where
             "FTS format_version must be 1 or 2, got {other}"
         ))),
     }
+}
+
+fn deserialize_explicit_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 impl Default for InvertedIndexParams {
@@ -886,6 +897,16 @@ mod tests {
             json.get("format_version"),
             Some(&serde_json::Value::from(1))
         );
+    }
+
+    #[test]
+    fn test_training_json_preserves_disabled_max_token_length() {
+        let params = InvertedIndexParams::default().max_token_length(None);
+        let json = params.to_training_json().unwrap();
+        assert_eq!(json.get("max_token_length"), Some(&serde_json::Value::Null));
+
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.max_token_length, None);
     }
 
     #[test]

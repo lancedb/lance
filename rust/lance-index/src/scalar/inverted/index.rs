@@ -18,7 +18,7 @@ use std::{
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
-use arrow::array::{FixedSizeListBuilder, Float32Builder};
+use arrow::array::{FixedSizeListBuilder, Float32Builder, Int32Builder};
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
     array::{
@@ -1682,6 +1682,49 @@ impl InvertedPartition {
         )))
     }
 
+    fn union_plain_posting_lists_with_positions(postings: Vec<PostingList>) -> Result<PostingList> {
+        let mut positions_by_row_id = BTreeMap::<u64, Vec<u32>>::new();
+        for posting in postings {
+            for (row_id, _, positions) in posting.iter() {
+                let positions = positions.ok_or_else(|| {
+                    Error::index("cannot union grouped phrase terms without positions".to_string())
+                })?;
+                positions_by_row_id
+                    .entry(row_id)
+                    .or_default()
+                    .extend(positions);
+            }
+        }
+        if positions_by_row_id.is_empty() {
+            return Ok(PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(Vec::<u64>::new()),
+                ScalarBuffer::from(Vec::<f32>::new()),
+                None,
+                None,
+            )));
+        }
+
+        let mut row_ids = Vec::with_capacity(positions_by_row_id.len());
+        let mut frequencies = Vec::with_capacity(positions_by_row_id.len());
+        let mut positions_builder = ListBuilder::new(Int32Builder::new());
+        for (row_id, mut positions) in positions_by_row_id {
+            positions.sort_unstable();
+            row_ids.push(row_id);
+            frequencies.push(positions.len() as f32);
+            for position in positions {
+                positions_builder.values().append_value(position as i32);
+            }
+            positions_builder.append(true);
+        }
+
+        Ok(PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(row_ids),
+            ScalarBuffer::from(frequencies),
+            None,
+            Some(positions_builder.finish()),
+        )))
+    }
+
     fn union_compressed_posting_lists(
         postings: Vec<PostingList>,
         docs: &DocSet,
@@ -1725,7 +1768,59 @@ impl InvertedPartition {
         PostingList::from_batch(&batch, Some(max_score), Some(length))
     }
 
-    fn union_posting_lists(postings: Vec<PostingList>, docs: &DocSet) -> Result<PostingList> {
+    fn union_compressed_posting_lists_with_positions(
+        postings: Vec<PostingList>,
+        docs: &DocSet,
+    ) -> Result<PostingList> {
+        let mut positions_by_doc_id = BTreeMap::<u32, Vec<u32>>::new();
+        for posting in postings {
+            for (doc_id, _, positions) in posting.iter() {
+                let doc_id = u32::try_from(doc_id).map_err(|_| {
+                    Error::index(format!(
+                        "compressed posting doc id {} exceeds u32::MAX",
+                        doc_id
+                    ))
+                })?;
+                let positions = positions.ok_or_else(|| {
+                    Error::index("cannot union grouped phrase terms without positions".to_string())
+                })?;
+                positions_by_doc_id
+                    .entry(doc_id)
+                    .or_default()
+                    .extend(positions);
+            }
+        }
+        if positions_by_doc_id.is_empty() {
+            return Ok(PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(Vec::<u64>::new()),
+                ScalarBuffer::from(Vec::<f32>::new()),
+                None,
+                None,
+            )));
+        }
+
+        let mut builder = PostingListBuilder::new(true);
+        let mut doc_ids = Vec::with_capacity(positions_by_doc_id.len());
+        let mut frequencies = Vec::with_capacity(positions_by_doc_id.len());
+        for (doc_id, mut positions) in positions_by_doc_id {
+            positions.sort_unstable();
+            let frequency = positions.len() as u32;
+            builder.add(doc_id, PositionRecorder::Position(positions.into()));
+            doc_ids.push(doc_id);
+            frequencies.push(frequency);
+        }
+        let block_max_scores = docs.calculate_block_max_scores(doc_ids.iter(), frequencies.iter());
+        let batch = builder.to_batch(block_max_scores)?;
+        let max_score = batch[MAX_SCORE_COL].as_primitive::<Float32Type>().value(0);
+        let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
+        PostingList::from_batch(&batch, Some(max_score), Some(length))
+    }
+
+    fn union_posting_lists(
+        postings: Vec<PostingList>,
+        docs: &DocSet,
+        with_positions: bool,
+    ) -> Result<PostingList> {
         let has_plain = postings
             .iter()
             .any(|posting| matches!(posting, PostingList::Plain(_)));
@@ -1736,7 +1831,13 @@ impl InvertedPartition {
             (true, true) => Err(Error::index(
                 "cannot union mixed plain and compressed posting lists".to_owned(),
             )),
+            (true, false) if with_positions => {
+                Self::union_plain_posting_lists_with_positions(postings)
+            }
             (true, false) => Self::union_plain_posting_lists(postings),
+            (false, true) if with_positions => {
+                Self::union_compressed_posting_lists_with_positions(postings, docs)
+            }
             (false, true) => Self::union_compressed_posting_lists(postings, docs),
             (false, false) => Ok(PostingList::Plain(PlainPostingList::new(
                 ScalarBuffer::from(Vec::<u64>::new()),
@@ -1859,6 +1960,7 @@ impl InvertedPartition {
                     docs_for_union
                         .as_deref()
                         .expect("union docs must be loaded for grouped query terms"),
+                    is_phrase_query,
                 )?;
                 if posting.is_empty() && (is_and_query || is_phrase_query) {
                     return Ok(LoadedPostings::empty());
@@ -8180,6 +8282,81 @@ mod tests {
             DocType::Text,
         ));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let (mut row_ids, _) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, vec![100, 101]);
+    }
+
+    #[tokio::test]
+    async fn test_phrase_query_accepts_same_position_alternatives() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, true, TokenSetFormat::default());
+        for token in ["getusername", "get", "user", "name"] {
+            builder.tokens.add(token.to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(true));
+        }
+        // Doc 0 only has split words. Doc 1 has both the complete identifier
+        // and split words at the same position. Doc 2 has the terms but not as
+        // an exact phrase.
+        builder.posting_lists[1].add(0, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[2].add(0, PositionRecorder::Position(vec![1].into()));
+        builder.posting_lists[3].add(0, PositionRecorder::Position(vec![2].into()));
+        builder.docs.append(100, 3);
+
+        builder.posting_lists[0].add(1, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[1].add(1, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[2].add(1, PositionRecorder::Position(vec![1].into()));
+        builder.posting_lists[3].add(1, PositionRecorder::Position(vec![2].into()));
+        builder.docs.append(101, 3);
+
+        builder.posting_lists[0].add(2, PositionRecorder::Position(vec![0].into()));
+        builder.posting_lists[2].add(2, PositionRecorder::Position(vec![2].into()));
+        builder.posting_lists[3].add(2, PositionRecorder::Position(vec![3].into()));
+        builder.docs.append(102, 3);
+
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(
+            &store,
+            vec![0],
+            InvertedIndexParams::code().with_position(true),
+        )
+        .await;
+        let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::with_positions(
+            vec![
+                "getusername".to_string(),
+                "get".to_string(),
+                "user".to_string(),
+                "name".to_string(),
+            ],
+            vec![0, 0, 1, 2],
+            DocType::Text,
+        ));
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_phrase_slop(Some(0)),
+        );
         let (mut row_ids, _) = index
             .bm25_search(
                 tokens,

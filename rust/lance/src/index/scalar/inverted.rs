@@ -11,7 +11,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
-use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexParams};
+use lance_index::scalar::inverted::{
+    InvertedIndex, InvertedIndexParams, document_tokenizer::DocType,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_table::format::IndexMetadata;
@@ -203,7 +205,7 @@ pub async fn load_segment_details(
                     "failed to decode InvertedIndexDetails payload: {err}"
                 ))
             })?;
-        let details = canonicalize_inverted_index_details(details)?;
+        let details = canonicalize_inverted_index_details(dataset, column, details)?;
         match &expected_details {
             Some(expected) if expected != &details => {
                 return Err(Error::invalid_input(format!(
@@ -224,15 +226,45 @@ pub async fn load_segment_details(
 }
 
 fn canonicalize_inverted_index_details(
+    dataset: &Dataset,
+    column: &str,
     details: InvertedIndexDetails,
 ) -> Result<InvertedIndexDetails> {
+    let field = dataset.schema().field(column).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "FTS index details require column {} to exist in the dataset schema",
+            column
+        ))
+    })?;
+    let field = ArrowField::from(field);
+    canonicalize_inverted_index_details_for_field(&field, details)
+}
+
+fn canonicalize_inverted_index_details_for_field(
+    field: &ArrowField,
+    details: InvertedIndexDetails,
+) -> Result<InvertedIndexDetails> {
+    let inferred_lance_tokenizer = if details.lance_tokenizer.is_none() {
+        Some(DocType::try_from(field)?.as_ref().to_string())
+    } else {
+        None
+    };
     let params = InvertedIndexParams::try_from(&details)?;
+    let params = if let Some(lance_tokenizer) = inferred_lance_tokenizer {
+        params.lance_tokenizer(lance_tokenizer)
+    } else {
+        params
+    };
     InvertedIndexDetails::try_from(&params)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_field() -> ArrowField {
+        ArrowField::new("text", arrow_schema::DataType::Utf8, true)
+    }
 
     #[test]
     fn decode_legacy_inverted_details_type_url() {
@@ -251,8 +283,8 @@ mod tests {
 
         assert_ne!(legacy, current);
         assert_eq!(
-            canonicalize_inverted_index_details(legacy).unwrap(),
-            canonicalize_inverted_index_details(current).unwrap()
+            canonicalize_inverted_index_details_for_field(&text_field(), legacy).unwrap(),
+            canonicalize_inverted_index_details_for_field(&text_field(), current).unwrap()
         );
     }
 
@@ -263,8 +295,24 @@ mod tests {
 
         assert_ne!(legacy, current);
         assert_eq!(
-            canonicalize_inverted_index_details(legacy).unwrap(),
-            canonicalize_inverted_index_details(current).unwrap()
+            canonicalize_inverted_index_details_for_field(&text_field(), legacy).unwrap(),
+            canonicalize_inverted_index_details_for_field(&text_field(), current).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonicalize_inverted_details_infers_missing_lance_tokenizer() {
+        let mut legacy = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        legacy.lance_tokenizer = None;
+        let current = InvertedIndexDetails::try_from(
+            &InvertedIndexParams::default().lance_tokenizer("text".to_string()),
+        )
+        .unwrap();
+
+        assert_ne!(legacy, current);
+        assert_eq!(
+            canonicalize_inverted_index_details_for_field(&text_field(), legacy).unwrap(),
+            canonicalize_inverted_index_details_for_field(&text_field(), current).unwrap()
         );
     }
 }
