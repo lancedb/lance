@@ -147,6 +147,8 @@ filterwarnings = [
     'ignore:.*the load_module\(\) method is deprecated.*:DeprecationWarning',
     # Pytorch uses deprecated jit.script_method internally (torch/utils/mkldnn.py)
     'ignore:.*torch\.jit\.script_method.*is deprecated.*:DeprecationWarning',
+    # Pytorch uses the same API internally on Python 3.14+ with a different warning message.
+    'ignore:.*torch\.jit\.script_method.*is not supported in Python 3\.14\+.*:DeprecationWarning',
     # huggingface_hub still calls the deprecated hf_xet.download_files() during Xet downloads
     'ignore:.*hf_xet\.download_files\(\) is deprecated.*:DeprecationWarning',
 ]
