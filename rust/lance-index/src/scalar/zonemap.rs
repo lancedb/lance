@@ -16,14 +16,18 @@ use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, single_flight_open,
 };
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,
     compute_next_prefix,
 };
 use lance_arrow_stats::StatisticsAccumulator;
-use lance_core::cache::{LanceCache, WeakLanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+    WeakLanceCache,
+};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -580,6 +584,156 @@ impl ZoneMapIndex {
     }
 }
 
+/// Encode zone statistics as the `RecordBatch` used both on disk and in the
+/// cache. Inverse of [`ZoneMapIndex::try_from_serialized`], which reads the
+/// columns back by name.
+fn zones_to_batch(zones: &[ZoneMapStatistics], items_type: &DataType) -> Result<RecordBatch> {
+    let mins = if zones.is_empty() {
+        new_empty_array(items_type)
+    } else {
+        ScalarValue::iter_to_array(zones.iter().map(|stat| stat.min.clone()))?
+    };
+    let maxs = if zones.is_empty() {
+        new_empty_array(items_type)
+    } else {
+        ScalarValue::iter_to_array(zones.iter().map(|stat| stat.max.clone()))?
+    };
+    let null_counts = UInt32Array::from_iter_values(zones.iter().map(|stat| stat.null_count));
+    let nan_counts = UInt32Array::from_iter_values(zones.iter().map(|stat| stat.nan_count));
+    let fragment_ids =
+        UInt64Array::from_iter_values(zones.iter().map(|stat| stat.bound.fragment_id));
+    let zone_lengths =
+        UInt64Array::from_iter_values(zones.iter().map(|stat| stat.bound.length as u64));
+    let zone_starts = UInt64Array::from_iter_values(zones.iter().map(|stat| stat.bound.start));
+
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        // min and max can be null if the entire batch is null values
+        Field::new("min", items_type.clone(), true),
+        Field::new("max", items_type.clone(), true),
+        Field::new("null_count", DataType::UInt32, false),
+        Field::new("nan_count", DataType::UInt32, false),
+        Field::new("fragment_id", DataType::UInt64, false),
+        Field::new("zone_start", DataType::UInt64, false),
+        Field::new("zone_length", DataType::UInt64, false),
+    ]));
+
+    let columns: Vec<ArrayRef> = vec![
+        mins,
+        maxs,
+        Arc::new(null_counts) as ArrayRef,
+        Arc::new(nan_counts) as ArrayRef,
+        Arc::new(fragment_ids) as ArrayRef,
+        Arc::new(zone_starts) as ArrayRef,
+        Arc::new(zone_lengths) as ArrayRef,
+    ];
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
+/// Serializable, store-free state of a [`ZoneMapIndex`].
+///
+/// Caching the live index would pin session-scoped resources (its `IndexStore`,
+/// cache handle, fragment-reuse index). This keeps only the zone-statistics batch
+/// and zone size; [`ZoneMapIndex::try_from_serialized`] rebuilds the index IO-free.
+#[derive(Debug, Clone)]
+pub struct ZoneMapIndexState {
+    /// Zone statistics as a `RecordBatch` (see [`zones_to_batch`]); the indexed
+    /// value type is recovered from the `min` column on reconstruct.
+    zone_maps: RecordBatch,
+    rows_per_zone: u64,
+}
+
+impl DeepSizeOf for ZoneMapIndexState {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        self.zone_maps.get_array_memory_size()
+    }
+}
+
+impl ZoneMapIndexState {
+    fn from_index(index: &ZoneMapIndex) -> Result<Self> {
+        Ok(Self {
+            zone_maps: zones_to_batch(&index.zones, &index.data_type)?,
+            rows_per_zone: index.rows_per_zone,
+        })
+    }
+
+    fn from_scalar_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let zonemap = index
+            .as_any()
+            .downcast_ref::<ZoneMapIndex>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "ZoneMapIndexState::from_scalar_index called with a non-zonemap index",
+                )
+            })?;
+        Self::from_index(zonemap)
+    }
+
+    fn to_zonemap_index(
+        &self,
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<ZoneMapIndex>> {
+        Ok(Arc::new(ZoneMapIndex::try_from_serialized(
+            self.zone_maps.clone(),
+            store,
+            fri,
+            index_cache,
+            self.rows_per_zone,
+        )?))
+    }
+}
+
+impl CacheCodecImpl for ZoneMapIndexState {
+    const TYPE_ID: &'static str = "lance.scalar.ZoneMapIndexState";
+    const CURRENT_VERSION: u32 = 1;
+
+    /// Wire format:
+    /// ```text
+    /// RAW_BLOB  : rows_per_zone (u64 little-endian)
+    /// ARROW_IPC : zone statistics (min, max, null_count, nan_count, bounds)
+    /// ```
+    /// The indexed value type is recovered from the IPC section's `min` field.
+    fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
+        w.write_raw(&self.rows_per_zone.to_le_bytes())?;
+        w.write_ipc(&self.zone_maps)?;
+        Ok(())
+    }
+
+    fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let rows_per_zone_bytes = r.read_raw()?;
+        let rows_per_zone =
+            u64::from_le_bytes(rows_per_zone_bytes.as_ref().try_into().map_err(|_| {
+                Error::internal("ZoneMapIndexState: rows_per_zone must be 8 bytes")
+            })?);
+        let zone_maps = r.read_ipc()?;
+        Ok(Self {
+            zone_maps,
+            rows_per_zone,
+        })
+    }
+}
+
+/// Cache key for a [`ZoneMapIndexState`]. The cache is already namespaced
+/// per-index by the caller, so a constant key suffices.
+struct ZoneMapIndexStateKey;
+
+impl CacheKey for ZoneMapIndexStateKey {
+    type ValueType = ZoneMapIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+
+    fn type_name() -> &'static str {
+        "ZoneMapIndexState"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<ZoneMapIndexState>())
+    }
+}
+
 #[async_trait]
 impl Index for ZoneMapIndex {
     fn as_any(&self) -> &dyn Any {
@@ -807,57 +961,8 @@ impl ZoneMapIndexBuilder {
         Ok(())
     }
 
-    fn zonemap_stats_as_batch(&self) -> Result<RecordBatch> {
-        // Flush self.maps as a RecordBatch
-        let mins = if self.maps.is_empty() {
-            new_empty_array(&self.items_type)
-        } else {
-            ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.min.clone()))?
-        };
-        let maxs = if self.maps.is_empty() {
-            new_empty_array(&self.items_type)
-        } else {
-            ScalarValue::iter_to_array(self.maps.iter().map(|stat| stat.max.clone()))?
-        };
-        let null_counts =
-            UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.null_count));
-
-        let nan_counts = UInt32Array::from_iter_values(self.maps.iter().map(|stat| stat.nan_count));
-
-        let fragment_ids =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.fragment_id));
-
-        let zone_lengths =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.length as u64));
-
-        let zone_starts =
-            UInt64Array::from_iter_values(self.maps.iter().map(|stat| stat.bound.start));
-
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            // min and max can be null if the entire batch is null values
-            Field::new("min", self.items_type.clone(), true),
-            Field::new("max", self.items_type.clone(), true),
-            Field::new("null_count", DataType::UInt32, false),
-            Field::new("nan_count", DataType::UInt32, false),
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
-        ]));
-
-        let columns: Vec<ArrayRef> = vec![
-            mins,
-            maxs,
-            Arc::new(null_counts) as ArrayRef,
-            Arc::new(nan_counts) as ArrayRef,
-            Arc::new(fragment_ids) as ArrayRef,
-            Arc::new(zone_starts) as ArrayRef,
-            Arc::new(zone_lengths) as ArrayRef,
-        ];
-        Ok(RecordBatch::try_new(schema, columns)?)
-    }
-
     pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
-        let record_batch = self.zonemap_stats_as_batch()?;
+        let record_batch = zones_to_batch(&self.maps, &self.items_type)?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
         file_schema.metadata.insert(
@@ -1091,6 +1196,49 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
     }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&ZoneMapIndexStateKey).await else {
+            return Ok(None);
+        };
+        let index = state.to_zonemap_index(index_store, frag_reuse_index, cache)?;
+        Ok(Some(index as Arc<dyn ScalarIndex>))
+    }
+
+    async fn put_in_cache(&self, cache: &LanceCache, index: Arc<dyn ScalarIndex>) -> Result<()> {
+        let state = ZoneMapIndexState::from_scalar_index(index.as_ref())?;
+        cache
+            .insert_with_key(&ZoneMapIndexStateKey, Arc::new(state))
+            .await;
+        Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            ZoneMapIndexStateKey,
+            load,
+            ZoneMapIndexState::from_scalar_index,
+            move |state| {
+                Ok(
+                    state.to_zonemap_index(index_store, frag_reuse_index, cache)?
+                        as Arc<dyn ScalarIndex>,
+                )
+            },
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1200,6 +1348,187 @@ mod tests {
         ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
             .await
             .expect("Failed to load ZoneMapIndex")
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_state_codec_roundtrip() {
+        use super::{ZoneMapIndexState, zones_to_batch};
+        use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+
+        let index = train_and_load::<Int64Type>(vec![
+            vec![Some(10), Some(50), Some(30)],
+            vec![Some(5), Some(99), Some(42)],
+        ])
+        .await;
+        let state = ZoneMapIndexState::from_index(&index).unwrap();
+
+        let mut buf = Vec::new();
+        state
+            .serialize(&mut CacheEntryWriter::new(&mut buf))
+            .unwrap();
+        let data = bytes::Bytes::from(buf);
+        let mut reader = CacheEntryReader::new(&data, 0, ZoneMapIndexState::CURRENT_VERSION);
+        let restored = ZoneMapIndexState::deserialize(&mut reader).unwrap();
+
+        assert_eq!(restored.rows_per_zone, state.rows_per_zone);
+        assert_eq!(restored.zone_maps, state.zone_maps);
+        assert_eq!(
+            restored.zone_maps,
+            zones_to_batch(&index.zones, &index.data_type).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_state_reconstruct_is_io_free() {
+        use super::ZoneMapIndexState;
+
+        let index = train_and_load::<Int64Type>(vec![
+            vec![Some(10), Some(50), Some(30)],
+            vec![Some(5), Some(99), Some(42)],
+        ])
+        .await;
+        let state = ZoneMapIndexState::from_index(&index).unwrap();
+
+        // Reconstruct against a store rooted at an empty dir: the index file is
+        // absent, so any store IO during reconstruct or search would error.
+        let empty_dir = TempObjDir::default();
+        let empty_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            empty_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let rebuilt = state
+            .to_zonemap_index(empty_store, None, &LanceCache::no_cache())
+            .unwrap();
+
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int64(Some(40))),
+            std::ops::Bound::Included(ScalarValue::Int64(Some(60))),
+        );
+        let original = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let reconstructed = rebuilt.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(original, reconstructed);
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_state_deep_size_excludes_shared_resources() {
+        use super::ZoneMapIndexState;
+        use lance_core::deepsize::DeepSizeOf;
+
+        let index = train_and_load::<Int64Type>(vec![
+            vec![Some(10), Some(50), Some(30)],
+            vec![Some(5), Some(99), Some(42)],
+        ])
+        .await;
+        let state = ZoneMapIndexState::from_index(&index).unwrap();
+
+        // The cached state owns only its zone-statistics batch: no IndexStore,
+        // object store, metadata cache, or scheduler. Guards against re-adding a
+        // shared field, which would recharge every cache entry for shared bytes.
+        assert_eq!(
+            state.deep_size_of(),
+            std::mem::size_of::<ZoneMapIndexState>() + state.zone_maps.get_array_memory_size()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zonemap_plugin_cache_is_single_flight_state() {
+        use super::ZoneMapIndexStateKey;
+        use crate::scalar::registry::ScalarIndexPlugin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Train a zonemap into a store we keep alive across opens.
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            Int64Type::DATA_TYPE,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(PrimitiveArray::<Int64Type>::from(vec![
+                Some(10i64),
+                Some(50),
+                Some(30),
+                Some(5),
+            ]))],
+        )
+        .unwrap();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        ZoneMapIndexPlugin::train_zonemap_index(
+            add_row_addr(stream),
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(2)),
+        )
+        .await
+        .unwrap();
+
+        let plugin = ZoneMapIndexPlugin;
+        let index_cache = LanceCache::with_capacity(64 * 1024 * 1024);
+        let loads = Arc::new(AtomicUsize::new(0));
+
+        // Cold open: `load` runs once, its result is converted to state and cached.
+        let loads1 = loads.clone();
+        let store1 = test_store.clone();
+        let first = plugin
+            .get_or_insert_in_cache(
+                test_store.clone(),
+                None,
+                &index_cache,
+                Box::pin(async move {
+                    loads1.fetch_add(1, Ordering::SeqCst);
+                    Ok(
+                        ZoneMapIndex::load(store1, None, &LanceCache::no_cache()).await?
+                            as Arc<dyn ScalarIndex>,
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+        // The cache holds a store-free `ZoneMapIndexState` (typed key), not a live index.
+        assert!(
+            index_cache
+                .get_with_key(&ZoneMapIndexStateKey)
+                .await
+                .is_some()
+        );
+
+        // Warm open: the cached state is reused; this `load` is dropped un-awaited.
+        let loads2 = loads.clone();
+        let store2 = test_store.clone();
+        let second = plugin
+            .get_or_insert_in_cache(
+                test_store.clone(),
+                None,
+                &index_cache,
+                Box::pin(async move {
+                    loads2.fetch_add(1, Ordering::SeqCst);
+                    Ok(
+                        ZoneMapIndex::load(store2, None, &LanceCache::no_cache()).await?
+                            as Arc<dyn ScalarIndex>,
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        let query = SargableQuery::Range(
+            std::ops::Bound::Included(ScalarValue::Int64(Some(0))),
+            std::ops::Bound::Included(ScalarValue::Int64(Some(100))),
+        );
+        assert_eq!(
+            first.search(&query, &NoOpMetricsCollector).await.unwrap(),
+            second.search(&query, &NoOpMetricsCollector).await.unwrap()
+        );
     }
 
     #[tokio::test]
