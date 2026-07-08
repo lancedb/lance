@@ -2634,14 +2634,15 @@ impl FragmentReader {
     /// Merge data overlay values into a stream of base batches.
     ///
     /// Runs on physical rows in read order, *before* deletion filtering, so each
-    /// row can be addressed by its physical offset (from `params`) and deletions
-    /// take precedence naturally (an overlay value for a deleted row is dropped
-    /// with the row downstream). A no-op when the fragment has no overlays.
+    /// row can be addressed by its position in the fragment (its `offset_in_frag`,
+    /// derived from `params`) and deletions take precedence naturally: an overlay
+    /// value for a deleted row is dropped along with the row downstream. A no-op
+    /// when the fragment has no overlays.
     ///
-    /// Each batch's physical offsets are known from `params` and the task's
-    /// `num_rows` without reading any data, so the overlay value reads (only the
-    /// coverage ranks the batch actually touches) are issued concurrently with
-    /// the base read rather than after it.
+    /// Each batch's `offset_in_frag` values are known from `params` and the task's
+    /// `num_rows` without reading any data, so the overlay reads (only the values
+    /// the batch actually needs) are issued concurrently with the base read rather
+    /// than after it.
     fn merge_overlays(
         &self,
         merged: ReadBatchTaskStream,
@@ -2651,23 +2652,29 @@ impl FragmentReader {
         if self.overlay_plans.is_empty() {
             return merged;
         }
-        let offsets: Arc<Vec<u32>> =
+        // The offset_in_frag of every row this read will return, materialized once.
+        // Cost is one u32 per output row (a whole-fragment scan is 4 bytes/row),
+        // and it lets each batch below slice out its own offsets without reading
+        // any data. Only paid when the fragment actually has overlays.
+        let offsets_in_frag: Arc<Vec<u32>> =
             Arc::new(params.to_offsets_total(total_num_rows).values().to_vec());
         let plans = self.overlay_plans.clone();
-        let mut row_start = 0usize;
+        // Batches arrive in physical read order, so a running total of the rows seen
+        // so far gives each batch its starting offset_in_batch into `offsets_in_frag`.
+        let mut rows_seen = 0usize;
         merged
             .map(move |task| {
                 let num_rows = task.num_rows;
-                let start = row_start;
-                row_start += num_rows as usize;
-                let offsets = offsets.clone();
+                let start = rows_seen;
+                rows_seen += num_rows as usize;
+                let offsets_in_frag = offsets_in_frag.clone();
                 let plans = plans.clone();
                 let inner = task.task;
                 ReadBatchTask {
                     num_rows,
                     task: async move {
-                        let slice = &offsets[start..start + num_rows as usize];
-                        merge_overlay_batch(inner, slice, &plans).await
+                        let batch_offsets = &offsets_in_frag[start..start + num_rows as usize];
+                        merge_overlay_batch(inner, batch_offsets, &plans).await
                     }
                     .boxed(),
                 }
@@ -3525,13 +3532,13 @@ mod tests {
             assert_eq!(col(&batch, "val").values(), &expected);
         }
 
-        /// A `take` of a few rows must read only the overlay value-column ranks
-        /// those rows touch — not the whole column. Uses v2.1 (which slices pages
-        /// on read) and an incompressible, all-covering overlay, so reading the
-        /// full column would be far more bytes than reading a couple of ranks.
-        /// This is the regression guard for the lazy, rank-pushdown overlay read.
+        /// A `take` of a few rows must read only the overlay values those rows
+        /// touch — not the whole column. Uses v2.1 (which slices pages on read) and
+        /// an incompressible, all-covering overlay, so reading the full column would
+        /// be far more bytes than reading a couple of values. This is the regression
+        /// guard for the lazy, value-pushdown overlay read.
         #[tokio::test]
-        async fn test_take_reads_only_needed_overlay_ranks() {
+        async fn test_take_reads_only_needed_overlay_values() {
             let version = LanceFileVersion::V2_1;
             const N: usize = 100_000;
 
@@ -3647,18 +3654,18 @@ mod tests {
         }
 
         /// When the newest overlay covers every requested offset, an older overlay
-        /// in the same plan is routed zero ranks and its value column must not be
-        /// read (the empty-ranks branch of `fetch_overlay_ranks`). The result still
+        /// in the same plan needs zero values and its value column must not be read
+        /// (the empty-input branch of `fetch_overlay_values`). The result still
         /// resolves to the newest overlay.
         #[rstest]
         #[tokio::test]
-        async fn test_take_older_overlay_contributes_no_ranks(
+        async fn test_take_older_overlay_contributes_no_values(
             #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         ) {
             let dataset = create_base_dataset(version).await;
             // Older covers {1, 4}; newer re-covers {1}. A take of only offset 1
             // routes entirely to the newer overlay, leaving the older one with no
-            // ranks to fetch even though it is part of the field's plan.
+            // values to fetch even though it is part of the field's plan.
             let dataset = commit_overlay(
                 dataset,
                 "older",
