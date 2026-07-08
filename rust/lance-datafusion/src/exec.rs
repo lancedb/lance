@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
+    num::NonZero,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -14,7 +15,6 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -36,6 +36,7 @@ use datafusion::{
         streaming::PartitionStream,
     },
 };
+use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -360,20 +361,27 @@ impl LanceExecutionOptions {
 }
 
 pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    let sort_spill_reservation_bytes = (options.mem_pool_size() / 3) as usize;
-    let mut session_config =
-        SessionConfig::new().with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
+    let mut session_config = SessionConfig::new();
     let mut runtime_env_builder = RuntimeEnvBuilder::new();
     if let Some(target_partition) = options.target_partition {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        // The default 10MB sort spill reservation seems to be too small for many common cases.
+        //
+        // There currently is no reasonable guidance provided by DataFusion for setting this value.
+        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        let sort_spill_reservation_bytes =
+            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
+        session_config =
+            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
             .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(FairSpillPool::new(
-                options.mem_pool_size() as usize
+            .with_memory_pool(Arc::new(TrackConsumersPool::new(
+                FairSpillPool::new(options.mem_pool_size() as usize),
+                NonZero::try_from(16).unwrap(),
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
