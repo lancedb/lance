@@ -2437,30 +2437,49 @@ impl Dataset {
                             )));
                         }
                     }
-                    macro_rules! insert_param {
-                        ($name:literal, $ty:ty) => {
-                            if let Some(value) = kwargs.get_item($name)? {
-                                let value: $ty = value.extract()?;
-                                params_json.insert(
-                                    $name.to_string(),
-                                    serde_json::to_value(value).map_err(|err| {
-                                        PyValueError::new_err(format!(
-                                            "failed to serialize FTS parameter {}: {}",
-                                            $name, err
-                                        ))
-                                    })?,
-                                );
-                            }
-                        };
+                    fn insert_fts_param<T: serde::Serialize>(
+                        params_json: &mut serde_json::Map<String, serde_json::Value>,
+                        name: &str,
+                        value: T,
+                    ) -> PyResult<()> {
+                        let value = serde_json::to_value(value).map_err(|err| {
+                            PyValueError::new_err(format!(
+                                "failed to serialize FTS parameter {}: {}",
+                                name, err
+                            ))
+                        })?;
+                        params_json.insert(name.to_string(), value);
+                        Ok(())
                     }
-                    insert_param!("analyzer", String);
-                    if let Some(with_position) = kwargs.get_item("with_position")? {
-                        params_json.insert(
-                            "with_position".to_string(),
-                            serde_json::Value::Bool(with_position.extract()?),
-                        );
+                    fn insert_optional_fts_param<'py, T>(
+                        params_json: &mut serde_json::Map<String, serde_json::Value>,
+                        kwargs: &Bound<'py, PyDict>,
+                        name: &str,
+                    ) -> PyResult<()>
+                    where
+                        for<'a> T: FromPyObject<'a, 'py> + serde::Serialize,
+                    {
+                        if let Some(value) = kwargs.get_item(name)? {
+                            let value: T = value.extract().map_err(Into::into)?;
+                            insert_fts_param(params_json, name, value)?;
+                        }
+                        Ok(())
                     }
-                    insert_param!("base_tokenizer", String);
+                    insert_optional_fts_param::<String>(
+                        &mut params_json,
+                        kwargs,
+                        "analyzer",
+                    )?;
+                    insert_optional_fts_param::<bool>(
+                        &mut params_json,
+                        kwargs,
+                        "with_position",
+                    )?;
+                    insert_optional_fts_param::<String>(
+                        &mut params_json,
+                        kwargs,
+                        "base_tokenizer",
+                    )?;
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.cast::<PyString>()?.clone().try_into()?;
@@ -2469,44 +2488,57 @@ impl Dataset {
                             serde_json::Value::String(language.to_string()),
                         );
                     }
-                    if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        let max_token_length: Option<usize> = max_token_length.extract()?;
-                        params_json.insert(
-                            "max_token_length".to_string(),
-                            serde_json::to_value(max_token_length).map_err(|err| {
-                                PyValueError::new_err(format!(
-                                    "failed to serialize FTS parameter max_token_length: {}",
-                                    err
-                                ))
-                            })?,
-                        );
-                    }
-                    insert_param!("lower_case", bool);
-                    insert_param!("stem", bool);
-                    insert_param!("remove_stop_words", bool);
-                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
-                        let custom_stop_words: Option<Vec<String>> =
-                            custom_stop_words.extract()?;
-                        params_json.insert(
-                            "custom_stop_words".to_string(),
-                            serde_json::to_value(custom_stop_words).map_err(|err| {
-                                PyValueError::new_err(format!(
-                                    "failed to serialize FTS parameter custom_stop_words: {}",
-                                    err
-                                ))
-                            })?,
-                        );
-                    }
-                    insert_param!("ascii_folding", bool);
-                    insert_param!("min_ngram_length", u32);
-                    insert_param!("max_ngram_length", u32);
-                    insert_param!("prefix_only", bool);
-                    insert_param!("split_identifiers", bool);
-                    insert_param!("split_on_numerics", bool);
-                    insert_param!("preserve_original", bool);
-                    insert_param!("index_operators", bool);
-                    insert_param!("memory_limit", u64);
-                    insert_param!("num_workers", usize);
+                    insert_optional_fts_param::<Option<usize>>(
+                        &mut params_json,
+                        kwargs,
+                        "max_token_length",
+                    )?;
+                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "lower_case")?;
+                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "stem")?;
+                    insert_optional_fts_param::<bool>(
+                        &mut params_json,
+                        kwargs,
+                        "remove_stop_words",
+                    )?;
+                    insert_optional_fts_param::<Option<Vec<String>>>(
+                        &mut params_json,
+                        kwargs,
+                        "custom_stop_words",
+                    )?;
+                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "ascii_folding")?;
+                    insert_optional_fts_param::<u32>(
+                        &mut params_json,
+                        kwargs,
+                        "min_ngram_length",
+                    )?;
+                    insert_optional_fts_param::<u32>(
+                        &mut params_json,
+                        kwargs,
+                        "max_ngram_length",
+                    )?;
+                    insert_optional_fts_param::<bool>(&mut params_json, kwargs, "prefix_only")?;
+                    insert_optional_fts_param::<bool>(
+                        &mut params_json,
+                        kwargs,
+                        "split_identifiers",
+                    )?;
+                    insert_optional_fts_param::<bool>(
+                        &mut params_json,
+                        kwargs,
+                        "split_on_numerics",
+                    )?;
+                    insert_optional_fts_param::<bool>(
+                        &mut params_json,
+                        kwargs,
+                        "preserve_original",
+                    )?;
+                    insert_optional_fts_param::<bool>(
+                        &mut params_json,
+                        kwargs,
+                        "index_operators",
+                    )?;
+                    insert_optional_fts_param::<u64>(&mut params_json, kwargs, "memory_limit")?;
+                    insert_optional_fts_param::<usize>(&mut params_json, kwargs, "num_workers")?;
                     if let Some(format_version) = kwargs.get_item("format_version")?
                         && !format_version.is_none()
                     {
