@@ -51,6 +51,28 @@ pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedErro
     Box::new(e)
 }
 
+/// Why a writer is fenced. Both reasons are terminal, but callers must tell them
+/// apart (a peer takeover vs. our own failure) rather than parse the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FenceReason {
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    PeerClaimedEpoch,
+    /// Our own WAL persistence failed, so in-memory state may have diverged from
+    /// the durable WAL. The writer must be reopened to replay.
+    PersistenceFailure,
+}
+
+impl std::fmt::Display for FenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Stable strings — surfaced in error messages.
+        let s = match self {
+            Self::PeerClaimedEpoch => "peer claimed epoch",
+            Self::PersistenceFailure => "persistence failure",
+        };
+        f.write_str(s)
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -238,6 +260,26 @@ pub enum Error {
     /// A requested field was not found in a schema.
     #[snafu(transparent)]
     FieldNotFound { source: FieldNotFoundError },
+
+    #[snafu(display(
+        "Spill disk cap of {cap_bytes} bytes exceeded; currently using {used_bytes} bytes, {location}"
+    ))]
+    DiskCapExceeded {
+        cap_bytes: u64,
+        used_bytes: u64,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    /// A writer has been fenced and must stop (see [`FenceReason`]). The message
+    /// keeps the `Writer fenced` prefix for legacy string consumers; new code
+    /// should match on [`Error::fence_reason`].
+    #[snafu(display("Writer fenced ({reason}): {message}, {location}"))]
+    Fenced {
+        reason: FenceReason,
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
@@ -259,6 +301,36 @@ impl Error {
     #[track_caller]
     pub fn io(message: impl Into<String>) -> Self {
         IOSnafu.into_error(message.into().into())
+    }
+
+    /// A successor writer claimed a higher epoch; this writer lost ownership.
+    #[track_caller]
+    pub fn fenced_by_peer(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PeerClaimedEpoch,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Our WAL persistence failed; in-memory state may have diverged from the
+    /// durable WAL, so the writer must be reopened to replay.
+    #[track_caller]
+    pub fn writer_poisoned(message: impl Into<String>) -> Self {
+        FencedSnafu {
+            reason: FenceReason::PersistenceFailure,
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// The [`FenceReason`] if this is [`Error::Fenced`], else `None`. Prefer this
+    /// over matching the error message to decide how to react to a fence.
+    pub fn fence_reason(&self) -> Option<FenceReason> {
+        match self {
+            Self::Fenced { reason, .. } => Some(*reason),
+            _ => None,
+        }
     }
 
     #[track_caller]
@@ -431,6 +503,15 @@ impl Error {
         IncompatibleTransactionSnafu.into_error(source)
     }
 
+    #[track_caller]
+    pub fn disk_cap_exceeded(cap_bytes: u64, used_bytes: u64) -> Self {
+        DiskCapExceededSnafu {
+            cap_bytes,
+            used_bytes,
+        }
+        .build()
+    }
+
     /// Create an External error from a boxed error source.
     pub fn external(source: BoxedError) -> Self {
         Self::External { source }
@@ -512,6 +593,17 @@ impl From<&ArrowError> for Error {
 impl From<std::io::Error> for Error {
     #[track_caller]
     fn from(e: std::io::Error) -> Self {
+        // A lance `Error` may have been wrapped in an `io::Error` (e.g. via
+        // `io::Error::other(Error::...)`) to cross an `AsyncWrite`/`AsyncRead`
+        // boundary. Recover it so typed errors such as `DiskCapExceeded`
+        // survive the round-trip instead of collapsing into an opaque `IO`.
+        if e.get_ref().is_some_and(|inner| inner.is::<Self>()) {
+            return *e
+                .into_inner()
+                .expect("checked Some above")
+                .downcast::<Self>()
+                .expect("checked type above");
+        }
         Self::io_source(box_error(e))
     }
 }
@@ -519,7 +611,11 @@ impl From<std::io::Error> for Error {
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::io_source(box_error(e))
+        match e {
+            // source intentionally dropped; Error::NotFound carries only the path
+            object_store::Error::NotFound { path, .. } => Self::not_found(path),
+            other => Self::io_source(box_error(other)),
+        }
     }
 }
 
@@ -704,6 +800,41 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_caller_location_capture_not_found() {
+        let current_fn = get_caller_location();
+        let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
+            Err(object_store::Error::NotFound {
+                path: "some/path".to_string(),
+                source: "not found".into(),
+            })?;
+            Ok(())
+        });
+        match f().unwrap_err() {
+            Error::NotFound { location, .. } => {
+                // +2 is the beginning of object_store::Error::NotFound...
+                assert_eq!(location.line(), current_fn.line() + 2, "{}", location)
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_object_store_not_found_converts_to_not_found() {
+        let os_err = object_store::Error::NotFound {
+            path: "test/path".to_string(),
+            source: "no such file".into(),
+        };
+        let lance_err: Error = os_err.into();
+        match lance_err {
+            Error::NotFound { uri, .. } => {
+                assert_eq!(uri, "test/path");
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
+        }
+    }
+
     #[derive(Debug)]
     struct MyCustomError {
         code: i32,
@@ -717,6 +848,33 @@ mod test {
     }
 
     impl std::error::Error for MyCustomError {}
+
+    #[test]
+    fn test_io_error_recovers_wrapped_lance_error() {
+        // A lance Error wrapped in io::Error::other should round-trip back to
+        // the original variant rather than collapsing into Error::IO.
+        let io_err = std::io::Error::other(Error::disk_cap_exceeded(100, 50));
+        let recovered: Error = io_err.into();
+        match recovered {
+            Error::DiskCapExceeded {
+                cap_bytes,
+                used_bytes,
+                ..
+            } => {
+                assert_eq!(cap_bytes, 100);
+                assert_eq!(used_bytes, 50);
+            }
+            other => panic!("expected DiskCapExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_io_error_without_lance_error_stays_io() {
+        // A plain io::Error (no wrapped lance Error) should become Error::IO.
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+        let converted: Error = io_err.into();
+        assert!(matches!(converted, Error::IO { .. }));
+    }
 
     #[test]
     fn test_external_error_creation() {

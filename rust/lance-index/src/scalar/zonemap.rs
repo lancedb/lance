@@ -16,7 +16,7 @@ use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BuiltinIndexType, CreatedIndex, IndexFile, SargableQuery, ScalarIndexParams, UpdateCriteria,
@@ -24,6 +24,7 @@ use crate::scalar::{
 };
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
@@ -33,10 +34,10 @@ use arrow_array::{
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::scalar::FragReuseIndex;
+use crate::scalar::RowIdRemapper;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -107,7 +108,7 @@ pub struct ZoneMapIndex {
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
     store: Arc<dyn IndexStore>,
-    fri: Option<Arc<FragReuseIndex>>,
+    fri: Option<Arc<dyn RowIdRemapper>>,
     index_cache: WeakLanceCache,
 }
 
@@ -148,6 +149,48 @@ impl ZoneMapIndex {
     /// Returns true if both min and max are non-null / non-NaN.
     fn zone_has_finite_extrema(zone: &ZoneMapStatistics) -> bool {
         Self::zone_has_finite_min(zone) && !(zone.max.is_null() || Self::scalar_is_nan(&zone.max))
+    }
+
+    /// Global `[min, max]` folded across one or more ZoneMap segments (the
+    /// disjoint per-column segments of a multi-segment index), without a scan.
+    ///
+    /// `None` when no zone has a finite bound, or when any zone's `max` is NaN:
+    /// `ScalarValue`'s total order ranks NaN above every finite value, so a
+    /// NaN-bearing zone hides its true finite max and no sound upper bound exists
+    /// without a scan — folding only the finite maxes would yield a *subset* that
+    /// prunes live rows. Folding raw zones (not each segment's `value_range`)
+    /// keeps this exact across segments.
+    ///
+    /// Otherwise the range is a superset of the segments' live values,
+    /// conservative under deletion vectors: safe to prune with, not guaranteed
+    /// tight. The caller must ensure the segments jointly cover every live
+    /// fragment.
+    pub fn value_range_over<'a>(
+        segments: impl IntoIterator<Item = &'a Self>,
+    ) -> Option<(ScalarValue, ScalarValue)> {
+        let mut min: Option<&ScalarValue> = None;
+        let mut max: Option<&ScalarValue> = None;
+        for zone in segments.into_iter().flat_map(|seg| seg.zones.iter()) {
+            if Self::scalar_is_nan(&zone.max) {
+                return None;
+            }
+            if Self::scalar_is_finite_bound(&zone.min)
+                && min.is_none_or(|cur| zone.min.partial_cmp(cur).is_some_and(|o| o.is_lt()))
+            {
+                min = Some(&zone.min);
+            }
+            if Self::scalar_is_finite_bound(&zone.max)
+                && max.is_none_or(|cur| zone.max.partial_cmp(cur).is_some_and(|o| o.is_gt()))
+            {
+                max = Some(&zone.max);
+            }
+        }
+        Some((min?.clone(), max?.clone()))
+    }
+
+    /// A scalar usable as a global-range bound: non-null and, for floats, non-NaN.
+    fn scalar_is_finite_bound(v: &ScalarValue) -> bool {
+        !v.is_null() && !Self::scalar_is_nan(v)
     }
 
     /// Evaluates whether a zone could potentially contain values matching the query.
@@ -409,7 +452,7 @@ impl ZoneMapIndex {
     /// Load the scalar index from storage
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
@@ -438,7 +481,7 @@ impl ZoneMapIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<FragReuseIndex>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         rows_per_zone: u64,
     ) -> Result<Self> {
@@ -595,7 +638,7 @@ impl ScalarIndex for ZoneMapIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(
@@ -642,6 +685,12 @@ impl ScalarIndex for ZoneMapIndex {
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         let params = serde_json::to_value(ZoneMapIndexBuilderParams::new(self.rows_per_zone))?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&params))
+    }
+
+    /// Single-segment `[min, max]` folded from this index's zones; see
+    /// [`value_range_over`](Self::value_range_over) for the full contract.
+    fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        Self::value_range_over([self])
     }
 }
 
@@ -961,11 +1010,7 @@ impl TrainingRequest for ZoneMapIndexTrainingRequest {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for ZoneMapIndexPlugin {
-    fn name(&self) -> &str {
-        "ZoneMap"
-    }
-
+impl BasicTrainer for ZoneMapIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -980,26 +1025,6 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         let params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
 
         Ok(Box::new(ZoneMapIndexTrainingRequest::new(params)))
-    }
-
-    fn provides_exact_answer(&self) -> bool {
-        false
-    }
-
-    fn version(&self) -> u32 {
-        ZONEMAP_INDEX_VERSION
-    }
-
-    fn new_query_parser(
-        &self,
-        index_name: String,
-        _index_details: &prost_types::Any,
-    ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            true,
-        )))
     }
 
     async fn train_index(
@@ -1025,12 +1050,43 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
             files: vec![file],
         })
     }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for ZoneMapIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "ZoneMap"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        ZONEMAP_INDEX_VERSION
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
+    }
 
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(ZoneMapIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
@@ -1045,8 +1101,8 @@ mod tests {
 
     use crate::scalar::zoned::ZoneBound;
     use crate::scalar::zonemap::{ZoneMapIndexPlugin, ZoneMapStatistics};
-    use arrow::datatypes::Float32Type;
-    use arrow_array::{Array, RecordBatch, UInt64Array, record_batch};
+    use arrow::datatypes::{ArrowPrimitiveType, Float32Type, Int64Type};
+    use arrow_array::{Array, PrimitiveArray, RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::SendableRecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1096,6 +1152,124 @@ mod tests {
             )?)
         });
         Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+    }
+
+    /// Build a single-column ZoneMap of primitive type `T` from `fragments`
+    /// (one batch -> one fragment), with small zones, then load it back.
+    async fn train_and_load<T: ArrowPrimitiveType>(
+        fragments: Vec<Vec<Option<T::Native>>>,
+    ) -> Arc<ZoneMapIndex>
+    where
+        PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
+    {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            VALUE_COLUMN_NAME,
+            T::DATA_TYPE,
+            true,
+        )]));
+        let batches: Vec<RecordBatch> = fragments
+            .into_iter()
+            .map(|vals| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(PrimitiveArray::<T>::from(vals))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(batches.into_iter().map(Ok)),
+        ));
+        let stream = add_row_addr(stream);
+
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(2)),
+        )
+        .await
+        .unwrap();
+
+        ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .expect("Failed to load ZoneMapIndex")
+    }
+
+    #[tokio::test]
+    async fn test_value_range_spans_fragments() {
+        // Two fragments, multiple zones each; global min/max straddle both.
+        let index = train_and_load::<Int64Type>(vec![
+            vec![Some(10), Some(50), Some(30)],
+            vec![Some(5), Some(99), Some(42)],
+        ])
+        .await;
+        assert_eq!(
+            index.value_range(),
+            Some((ScalarValue::Int64(Some(5)), ScalarValue::Int64(Some(99))))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_value_range_all_null_is_none() {
+        let index = train_and_load::<Int64Type>(vec![vec![None, None, None]]).await;
+        assert_eq!(index.value_range(), None);
+    }
+
+    #[tokio::test]
+    async fn test_value_range_nan_max_is_none() {
+        // Zones of size 2: [1.0, 2.0] then [100.0, NaN]. The NaN-bearing zone hides
+        // its finite max (100.0), so the only sound answer is None.
+        let index = train_and_load::<Float32Type>(vec![vec![
+            Some(1.0),
+            Some(2.0),
+            Some(100.0),
+            Some(f32::NAN),
+        ]])
+        .await;
+        assert_eq!(index.value_range(), None);
+    }
+
+    #[tokio::test]
+    async fn test_value_range_over_folds_segments() {
+        // Two disjoint segments of one logical index; the global range straddles
+        // both (min and max from `b`), proving the fold spans segments.
+        let a = train_and_load::<Int64Type>(vec![vec![Some(5), Some(9)]]).await;
+        let b = train_and_load::<Int64Type>(vec![vec![Some(1), Some(20)]]).await;
+        assert_eq!(
+            ZoneMapIndex::value_range_over([a.as_ref(), b.as_ref()]),
+            Some((ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(20))))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_value_range_over_nan_in_any_segment_is_none() {
+        // NaN in one segment hides that segment's finite max; the cross-segment
+        // fold must bail to None just as the single-segment path does.
+        let a = train_and_load::<Float32Type>(vec![vec![Some(1.0), Some(2.0)]]).await;
+        let b = train_and_load::<Float32Type>(vec![vec![Some(100.0), Some(f32::NAN)]]).await;
+        assert_eq!(
+            ZoneMapIndex::value_range_over([a.as_ref(), b.as_ref()]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_value_range_over_skips_all_null_segment() {
+        // An all-null segment yields no finite zone; folding it with a finite
+        // segment returns the finite segment's range (null contributes nothing).
+        let a = train_and_load::<Int64Type>(vec![vec![None, None]]).await;
+        let b = train_and_load::<Int64Type>(vec![vec![Some(3), Some(7)]]).await;
+        assert_eq!(
+            ZoneMapIndex::value_range_over([a.as_ref(), b.as_ref()]),
+            Some((ScalarValue::Int64(Some(3)), ScalarValue::Int64(Some(7))))
+        );
     }
 
     #[tokio::test]

@@ -3660,7 +3660,18 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
         let mut remaining = num_rows;
         let mut tasks = Vec::new();
         while remaining > 0 {
-            let cur_page = self.page_decoders.front_mut().unwrap();
+            let queued_pages = self.page_decoders.len();
+            let Some(cur_page) = self.page_decoders.front_mut() else {
+                return Err(Error::internal(format!(
+                    "Primitive decoder missing page decoder while draining field '{}' (data_type={:?}, requested_rows={}, remaining_rows={}, rows_drained_in_current={}, queued_pages={})",
+                    self.field.name(),
+                    self.field.data_type(),
+                    num_rows,
+                    remaining,
+                    self.rows_drained_in_current,
+                    queued_pages
+                )));
+            };
             let num_in_page = cur_page.num_rows() - self.rows_drained_in_current;
             let to_take = num_in_page.min(remaining);
 
@@ -5794,9 +5805,9 @@ mod tests {
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
-    use crate::decoder::PageEncoding;
+    use crate::decoder::{PageEncoding, StructuralFieldDecoder};
     use crate::encodings::logical::primitive::{
-        ChunkDrainInstructions, PrimitiveStructuralEncoder,
+        ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
     };
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
@@ -5805,7 +5816,7 @@ mod tests {
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
 
@@ -5827,6 +5838,33 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[test]
+    fn test_primitive_decoder_empty_page_queue_returns_error() {
+        let field = Arc::new(ArrowField::new("vector", DataType::Float32, true));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let err = decoder.drain(1).unwrap_err();
+        assert!(
+            matches!(&err, lance_core::Error::Internal { .. }),
+            "expected internal error, got: {err:?}"
+        );
+        let message = err.to_string();
+        for expected in [
+            "Primitive decoder missing page decoder",
+            "field 'vector'",
+            "data_type=Float32",
+            "requested_rows=1",
+            "remaining_rows=1",
+            "rows_drained_in_current=0",
+            "queued_pages=0",
+        ] {
+            assert!(
+                message.contains(expected),
+                "expected error to contain {expected:?}, got: {message}"
+            );
+        }
     }
 
     #[test]

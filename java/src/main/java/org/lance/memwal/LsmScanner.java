@@ -101,9 +101,11 @@ public class LsmScanner implements Closeable {
   private native void nativeFilter(String expr);
 
   /** Limit the number of rows returned, optionally skipping {@code offset} rows first. */
-  public LsmScanner limit(long limit, Optional<Long> offset) {
+  public LsmScanner limit(Optional<Long> limit, Optional<Long> offset) {
+    Preconditions.checkNotNull(limit, "limit must not be null");
     Preconditions.checkNotNull(offset, "offset must not be null");
-    Preconditions.checkArgument(limit >= 0, "limit must not be negative, got %s", limit);
+    limit.ifPresent(
+        l -> Preconditions.checkArgument(l >= 0, "limit must not be negative, got %s", l));
     offset.ifPresent(
         o -> Preconditions.checkArgument(o >= 0, "offset must not be negative, got %s", o));
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
@@ -113,12 +115,17 @@ public class LsmScanner implements Closeable {
     }
   }
 
+  /** Limit the number of rows returned, optionally skipping {@code offset} rows first. */
+  public LsmScanner limit(long limit, Optional<Long> offset) {
+    return limit(Optional.of(limit), offset);
+  }
+
   /** Limit the number of rows returned. */
   public LsmScanner limit(long limit) {
     return limit(limit, Optional.empty());
   }
 
-  private native void nativeLimit(long limit, Optional<Long> offset);
+  private native void nativeLimit(Optional<Long> limit, Optional<Long> offset);
 
   /** Include the {@code _rowaddr} internal column in results. */
   public LsmScanner withRowAddress() {

@@ -592,17 +592,21 @@ pub(crate) async fn migrate_fragments(
 
             let mut data_files = fragment.files.clone();
 
-            // For each of the data files in the fragment, we need to get the file size
-            let object_store = dataset.object_store.as_ref();
+            // For each of the data files in the fragment, we need to get the file size.
+            // Resolve each file against its own storage base: multi-base datasets
+            // keep data files outside the dataset root (DataFile.base_id).
             let get_sizes = data_files
                 .iter()
                 .map(|file| {
                     if let Some(size) = file.file_size_bytes.get() {
                         Either::Left(futures::future::ready(Ok(size)))
                     } else {
-                        Either::Right(async {
+                        let dataset = dataset.clone();
+                        Either::Right(async move {
+                            let object_store = dataset.object_store_for_data_file(file).await?;
+                            let data_dir = dataset.data_file_dir_for_base(file.base_id)?;
                             object_store
-                                .size(&dataset.base.clone().join("data").join(file.path.clone()))
+                                .size(&data_dir.join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
                                         Error::internal(format!("File {} has size 0", file.path))

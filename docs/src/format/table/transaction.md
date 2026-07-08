@@ -445,20 +445,26 @@ Replaces data in specific column regions with new data files.
 #### DataReplacement Compatibility
 
 A DataReplacement operation only replaces a single column's worth of data. As a result, it can be safer and simpler than Merge
-or Update operations. Here are the operations that conflict with DataReplacement:
+or Update operations. It rewrites a column file positionally against the fragments it targets, so a concurrent operation only
+conflicts when it removes one of those fragments or invalidates the rows the column file covers. Here are the operations that
+conflict with DataReplacement (non-retryable):
 
 - Overwrite
 - Restore
 - UpdateMemWalState
+- Delete (only if it removes a target fragment outright)
+- Update (only if it removes a target fragment outright)
 
 The following operations are retryable conflicts with DataReplacement:
 
 - DataReplacement (only if same field and overlapping fragments)
 - CreateIndex (only if the field being replaced is being indexed)
 - Rewrite (only if overlapping fragments)
-- Update (only if overlapping fragments)
-- Delete (only if overlapping fragments)
+- Update (only if it rewrites rows out of a target fragment, or rewrites one of the replaced fields in place)
 - Merge (always)
+
+A concurrent Delete or Update that only adds a deletion vector to a target fragment (without removing it) is compatible: the
+positional column file stays aligned and the rebase preserves the deletion vector.
 
 ### UpdateMemWalState
 

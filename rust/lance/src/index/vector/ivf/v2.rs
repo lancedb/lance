@@ -3,6 +3,7 @@
 
 //! IVF - Inverted File index.
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -1790,7 +1791,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
         Err(Error::index(
             "Remapping IVF in this way not supported".to_string(),
         ))
@@ -4399,6 +4400,17 @@ mod tests {
         test_remap(params, nlist, recall_requirement).await;
     }
 
+    #[tokio::test]
+    async fn test_build_ivf_sq_dot_with_negative_values() {
+        let nlist = 4;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let params =
+            VectorIndexParams::with_ivf_sq_params(DistanceType::Dot, ivf_params, sq_params);
+
+        test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
+    }
+
     // RQ doesn't perform well for random data
     // need to verify recall with real-world dataset (e.g. sift1m)
     #[rstest]
@@ -4569,6 +4581,22 @@ mod tests {
         test_distance_range(Some(params.clone()), nlist).await;
         test_delete_all_rows(params.clone()).await;
         test_remap(params, nlist, recall_requirement).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_sq_dot_with_negative_values() {
+        let nlist = 4;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let sq_params = SQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            DistanceType::Dot,
+            ivf_params,
+            hnsw_params,
+            sq_params,
+        );
+
+        test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
     }
 
     #[rstest]

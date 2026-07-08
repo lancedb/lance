@@ -43,7 +43,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             return Ok(path);
         }
 
-        Path::parse(url.path()).map_err(|e| {
+        Path::from_url_path(url.path()).map_err(|e| {
             Error::invalid_input(format!("Failed to parse path '{}': {}", url.path(), e))
         })
     }

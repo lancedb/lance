@@ -1869,6 +1869,55 @@ def test_icu_tokenizer(tmp_path):
     assert results["_rowid"].to_pylist() == [0]
 
 
+def test_icu_tokenizer_split_on_non_alphanumeric_default(tmp_path):
+    data = pa.table({"text": ["hello_world"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    results = ds.to_table(full_text_query="hello", prefilter=True, with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(
+        full_text_query="hello_world", prefilter=True, with_row_id=True
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_icu_tokenizer_split_on_non_alphanumeric(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "hello_world こんにちは世界",
+                "alpha.beta",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu/split",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    for query, expected_row_ids in [
+        ("hello", [0]),
+        ("world", [0]),
+        ("世界", [0]),
+        ("alpha", [1]),
+        ("beta", [1]),
+    ]:
+        results = ds.to_table(full_text_query=query, prefilter=True, with_row_id=True)
+        assert results["_rowid"].to_pylist() == expected_row_ids
+
+
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):
     set_language_model_path()
     data = pa.table(
@@ -2738,6 +2787,15 @@ def test_index_prewarm(tmp_path: Path):
 
     ds = lance.dataset(phrase_path)
     ds.prewarm_index("fts_idx", with_position=True)
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query == cache_entries_after_prewarm
+
+    segment_uuid = ds.describe_indices()[0].segments[0].uuid
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx", with_position=True, index_segments=[segment_uuid])
     cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
     results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
     assert results.num_rows == test_table_size
@@ -4670,6 +4728,77 @@ def test_nested_field_fts_index(tmp_path):
     assert results.num_rows == 50
 
 
+def test_multiple_nested_field_fts_indices_e2e(tmp_path):
+    """Test FTS queries against multiple indexed nested string fields."""
+
+    def make_table(ids, text_values, summary_values):
+        return pa.table(
+            {
+                "id": ids,
+                "data": pa.StructArray.from_arrays(
+                    [
+                        pa.array(text_values, type=pa.string()),
+                        pa.array(summary_values, type=pa.string()),
+                    ],
+                    names=["text", "summary"],
+                ),
+            }
+        )
+
+    def result_ids(query):
+        return sorted(ds.to_table(full_text_query=query)["id"].to_pylist())
+
+    ds = lance.write_dataset(
+        make_table(
+            [0, 1, 2, 3],
+            [
+                "lance nested alpha",
+                "plain text",
+                None,
+                "phrase target here",
+            ],
+            [
+                "metadata only",
+                "database nested beta",
+                "lance beta",
+                "other",
+            ],
+        ),
+        tmp_path,
+    )
+
+    ds.create_scalar_index("data.text", index_type="INVERTED", with_position=True)
+    ds.create_scalar_index("data.summary", index_type="INVERTED", with_position=False)
+
+    indexed_fields = {
+        tuple(index.field_names)
+        for index in ds.describe_indices()
+        if index.index_type == "Inverted"
+    }
+    assert indexed_fields == {("data.text",), ("data.summary",)}
+
+    assert result_ids(MatchQuery("alpha", "data.text")) == [0]
+    assert result_ids(MatchQuery("beta", "data.summary")) == [1, 2]
+    assert result_ids("lance") == [0, 2]
+    assert result_ids(MultiMatchQuery("nested", ["data.text", "data.summary"])) == [
+        0,
+        1,
+    ]
+    assert result_ids(PhraseQuery("phrase target", "data.text")) == [3]
+
+    ds = lance.write_dataset(
+        make_table(
+            [4, 5],
+            ["fresh lance append", "plain append"],
+            ["other", "fresh beta append"],
+        ),
+        tmp_path,
+        mode="append",
+    )
+
+    assert result_ids("fresh") == [4, 5]
+
+
 def test_nested_field_bitmap_index(tmp_path):
     """Test BITMAP index creation and querying on nested fields"""
     # Create dataset with nested categorical field
@@ -4802,9 +4931,11 @@ def test_json_inverted_match_query(tmp_path):
     assert results.num_rows == 1
 
 
-@pytest.mark.parametrize("fts_format_version", ["1", "2"])
-def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
-    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", fts_format_version)
+@pytest.mark.parametrize(
+    ("format_version", "expected_format_version"),
+    [(1, 1), (2, 2), ("v1", 1), ("v2", 2)],
+)
+def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
         {
             "id": range(100),
@@ -4820,7 +4951,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
         }
     )
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", index_type="INVERTED")
+    ds.create_scalar_index("text", index_type="INVERTED", format_version=format_version)
     indices = ds.describe_indices()
     assert len(indices) == 1
 
@@ -4834,7 +4965,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     assert indices[0].segments[0].uuid is not None
     assert indices[0].segments[0].fragment_ids == {0}
     assert indices[0].segments[0].dataset_version_at_last_update == 1
-    assert indices[0].segments[0].index_version == int(fts_format_version)
+    assert indices[0].segments[0].index_version == expected_format_version
     assert indices[0].segments[0].created_at is not None
     assert isinstance(indices[0].segments[0].created_at, datetime)
     assert indices[0].segments[0].size_bytes is not None
@@ -4931,6 +5062,25 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     indices = ds.describe_indices()
     for index in indices:
         assert index.num_rows_indexed == 50
+
+
+def test_create_inverted_index_defaults_to_v2_and_ignores_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", "1")
+    data = pa.table({"text": ["document about lance database"]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    ds.create_scalar_index("text", index_type="INVERTED")
+
+    indices = ds.describe_indices()
+    assert indices[0].segments[0].index_version == 2
+
+
+def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
+    data = pa.table({"text": ["document about lance database"]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported FTS format version"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
 
 
 def test_vector_filter_fts_search(tmp_path):
@@ -5050,3 +5200,28 @@ def test_vector_filter_fts_search(tmp_path):
     )
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "ZONEMAP"])
+def test_large_string_scalar_index(tmp_path, index_type):
+    """large_string (LargeUtf8) must be accepted by BTREE, BITMAP, and ZONEMAP."""
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int32()),
+            "category": pa.array(["alpha", "beta", "alpha"], pa.large_string()),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    assert ds.schema.field("category").type == pa.large_string()
+
+    # Must not raise TypeError
+    ds.create_scalar_index("category", index_type=index_type)
+
+    indices = ds.describe_indices()
+    assert any("category" in idx.field_names for idx in indices), (
+        f"{index_type} index for large_string column not found in describe_indices()"
+    )
+
+    result = ds.scanner(filter="category = 'alpha'").to_table()
+    assert result.num_rows == 2
+    assert set(result.column("id").to_pylist()) == {1, 3}

@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::Field;
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 
 pub const LEGACY_FORMAT_VERSION: &str = "0.1";
@@ -36,6 +37,12 @@ pub enum LanceFileVersion {
     /// The latest unstable release
     Next,
     V2_3,
+}
+
+impl DeepSizeOf for LanceFileVersion {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
 }
 
 impl LanceFileVersion {

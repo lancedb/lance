@@ -760,10 +760,6 @@ impl Schema {
         Ok(schema)
     }
 
-    pub fn all_fields_nullable(&self) -> bool {
-        SchemaFieldIterPreOrder::new(self).all(|f| f.nullable)
-    }
-
     /// Returns the properly formatted path from root to the field.
     /// Field names containing dots are quoted (e.g., struct.`field.with.dot`)
     pub fn field_path(&self, field_id: i32) -> Result<String> {
@@ -2472,86 +2468,6 @@ mod tests {
         assert!(out_of_order.compare_with_options(&expected, &options));
         let res = out_of_order.explain_difference(&expected, &options);
         assert!(res.is_none(), "Expected None, got {:?}", res);
-    }
-
-    #[test]
-    pub fn test_all_fields_nullable() {
-        let test_cases = vec![
-            (
-                vec![], // empty schema
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, true).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ], // basic case
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, false).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, parent is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            false,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, child is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        false,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, all is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                true,
-            ),
-        ];
-
-        for (fields, expected) in test_cases {
-            let schema = Schema {
-                fields,
-                metadata: Default::default(),
-            };
-            assert_eq!(schema.all_fields_nullable(), expected);
-        }
     }
 
     #[test]

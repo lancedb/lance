@@ -108,6 +108,43 @@ fn install_atfork() {}
 ///
 /// This can also be used to convert a big chunk of synchronous work into a future
 /// so that it can be run in parallel with something like StreamExt::buffered()
+///
+/// # Only hand over substantial CPU work
+///
+/// Dispatching to the pool has real overhead (a `spawn_blocking` hop plus a oneshot
+/// channel round trip). As a rule of thumb the closure should be expected to do at
+/// least ~100µs of CPU work; below that the thread-pool overhead is likely to
+/// outweigh any parallelism benefit, and the work is better left inline.
+///
+/// # The task must never wait on anything
+///
+/// The CPU pool is sized to [`get_num_compute_intensive_cpus`], which is
+/// `max(1, num_cpus - LANCE_IO_CORE_RESERVATION)`. On a big host that is plenty of
+/// workers (e.g. 62 on a 64-core box), but in resource-constrained environments it can
+/// collapse to a **single blocking thread** — on machines with `<= 3` visible CPUs
+/// (1-vCPU VMs, CI runners, CPU-limited Kubernetes pods) the pool has exactly one
+/// worker. A closure passed to `spawn_cpu` occupies one of these threads for its entire
+/// lifetime, including any time it spends *parked*. So the closure must only consume
+/// CPU and return; it must
+/// **never** block, wait, or park. Concretely, the closure must not, directly or
+/// transitively:
+///
+/// * **No channels** — no blocking send/recv (`send_blocking`, blocking `recv`, etc.).
+///   A full/empty channel parks the thread, and whatever would drain/fill the channel
+///   may need the same pool to run.
+/// * **No I/O** — no file, network, or object-store reads/writes, and no disk spills.
+///   I/O parks the thread while making no progress on CPU work.
+/// * **No locks** — no acquiring a contended lock (or any lock that is held across an
+///   `.await` elsewhere). Waiting for the lock parks the thread.
+/// * **No `block_on` / `.blocking_*`** — never drive or wait on another async task
+///   from inside the closure.
+///
+/// If any of these hold, the parked thread can starve the exact work that would
+/// unblock it, deadlocking the whole pool with no timeout and no error — a silent
+/// hang at 0% CPU. (See <https://github.com/lancedb/lance/pull/7423>.) When work
+/// needs to wait on a channel/lock/I/O, keep the waiting in an async task and only
+/// hand the pure-CPU portion to `spawn_cpu`, e.g. build each batch with `spawn_cpu`
+/// and dispatch it with `tx.send(batch).await` in the surrounding async code.
 pub fn spawn_cpu<
     E: std::error::Error + Send + 'static,
     F: FnOnce() -> std::result::Result<R, E> + Send + 'static,

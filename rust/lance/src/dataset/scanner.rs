@@ -1358,17 +1358,14 @@ impl Scanner {
     /// used by the scanner.  If the buffer is full then the scanner will block until
     /// the buffer is processed.
     ///
-    /// Generally this should scale with the number of concurrent I/O threads.  The
-    /// default is 2GiB which comfortably provides enough space for somewhere between
-    /// 32 and 256 concurrent I/O threads.
+    /// Generally this should scale with the number of concurrent I/O threads.  If
+    /// unset, v2 scans choose a default based on the object store and
+    /// `LANCE_DEFAULT_IO_BUFFER_SIZE` can override that default.
     ///
     /// This value is not a hard cap on the amount of RAM the scanner will use.  Some
     /// space is used for the compute (which can be controlled by the batch size) and
     /// Lance does not keep track of memory after it is returned to the user.
     ///
-    /// Currently, if there is a single batch of data which is larger than the io buffer
-    /// size then the scanner will deadlock.  This is a known issue and will be fixed in
-    /// a future release.
     pub fn io_buffer_size(&mut self, size: u64) -> &mut Self {
         self.io_buffer_size = Some(size);
         self
@@ -1900,6 +1897,38 @@ impl Scanner {
                 ))
             })
         }
+    }
+
+    /// Ensure `input` exposes `column_name` as a top-level column.
+    ///
+    /// Nested FTS flat-search paths read the projected struct column from storage
+    /// but the FTS executor consumes a single document column by name.
+    fn ensure_column_alias(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        column_name: &str,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input_schema = input.schema();
+        if input_schema.column_with_name(column_name).is_some() {
+            return Ok(input);
+        }
+
+        let mut projection_exprs = Vec::with_capacity(input_schema.fields().len() + 1);
+        for field in input_schema.fields() {
+            projection_exprs.push((
+                Arc::new(Column::new_with_schema(
+                    field.name(),
+                    input_schema.as_ref(),
+                )?) as Arc<dyn PhysicalExpr>,
+                field.name().clone(),
+            ));
+        }
+        projection_exprs.push((
+            Self::create_column_expr(column_name, self.dataset.as_ref(), input_schema.as_ref())?,
+            column_name.to_string(),
+        ));
+
+        Ok(Arc::new(ProjectionExec::try_new(projection_exprs, input)?))
     }
 
     /// Set whether to use statistics to optimize the scan (default: true)
@@ -3590,7 +3619,7 @@ impl Scanner {
             ))?
             .clone();
 
-        let mut columns = vec![column];
+        let mut columns = vec![column.clone()];
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             columns.extend(Planner::column_names_in_expr(refine_expr));
         }
@@ -3614,6 +3643,7 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
+        plan = self.ensure_column_alias(plan, &column)?;
 
         let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
             self.dataset.clone(),
@@ -4363,7 +4393,8 @@ impl Scanner {
                         .dataset
                         .empty_projection()
                         .union_column(&column, OnMissing::Error)?;
-                    self.take(input, projection)?
+                    let input = self.take(input, projection)?;
+                    self.ensure_column_alias(input, &column)?
                 } else {
                     input
                 };
@@ -4413,7 +4444,8 @@ impl Scanner {
                         .dataset
                         .empty_projection()
                         .union_column(&column, OnMissing::Error)?;
-                    self.take(input, projection)?
+                    let input = self.take(input, projection)?;
+                    self.ensure_column_alias(input, &column)?
                 } else {
                     input
                 };
@@ -4898,24 +4930,25 @@ impl Scanner {
     }
 }
 
+fn is_fts_indexable_field(field: &Field) -> bool {
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => true,
+        DataType::List(inner_field) | DataType::LargeList(inner_field) => {
+            matches!(
+                inner_field.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8
+            )
+        }
+        _ => false,
+    }
+}
+
 // Search over all indexed fields including nested ones, collecting columns that have an
 // inverted index
 async fn fts_indexed_columns(dataset: Arc<Dataset>) -> Result<Vec<String>> {
     let mut indexed_columns = Vec::new();
     for field in dataset.schema().fields_pre_order() {
-        // Check if this field is a string type that could have an inverted index
-        let is_string_field = match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => true,
-            DataType::List(inner_field) | DataType::LargeList(inner_field) => {
-                matches!(
-                    inner_field.data_type(),
-                    DataType::Utf8 | DataType::LargeUtf8
-                )
-            }
-            _ => false,
-        };
-
-        if is_string_field {
+        if is_fts_indexable_field(field) {
             // Build the full field path for nested fields
             let column_path =
                 if let Some(ancestors) = dataset.schema().field_ancestry_by_id(field.id) {
@@ -5199,7 +5232,13 @@ pub mod test_dataset {
         }
 
         pub async fn make_fts_index(&mut self) -> Result<()> {
-            let params = InvertedIndexParams::default().with_position(true);
+            // These scanner tests search for the token "s" (from the `s-{N}`
+            // column values) to exercise fragment/append coverage, and "s" is
+            // in the full English stop-word list. Keep the token searchable;
+            // stop-word behavior itself is covered by the tokenizer tests.
+            let params = InvertedIndexParams::default()
+                .with_position(true)
+                .remove_stop_words(false);
             self.dataset
                 .create_index(&["s"], IndexType::Inverted, None, &params, true)
                 .await?;
@@ -5629,6 +5668,149 @@ mod test {
             assert_eq!(batch, expected_batch);
         }
         Ok(())
+    }
+
+    // Regression for #6580: a scan with `filter` + `project` of a
+    // `(Large)List<Struct>` column used to panic in `merge_with_schema`
+    // (called from `TakeStream::map_batch`) because the filtered batch arrived
+    // as a sliced view of a larger batch and the cloned list offsets did not
+    // start at zero. The trigger requires (a) a `(Large)List<Struct>`
+    // projection where the struct is split across `filtered_read` and
+    // `TakeExec` and (b) a sparse-tail selectivity pattern so the trailing
+    // filter result lands deep inside the values buffer of its source batch.
+    // Parametrized over `List`/`LargeList` since the fix touches both offset
+    // widths in `merge_with_schema`.
+    #[rstest]
+    #[tokio::test]
+    async fn test_filter_project_list_struct_sparse_tail(
+        // The panic is specific to v2.x storage; the legacy reader takes a
+        // different code path. V2_0 and V2_2 are the versions called out in
+        // the original report.
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::Stable,
+            LanceFileVersion::V2_2
+        )]
+        data_storage_version: LanceFileVersion,
+        #[values(false, true)] large_list: bool,
+    ) {
+        use arrow_array::{LargeListArray, ListArray, UInt16Array};
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
+        let struct_fields = Fields::from(vec![
+            Arc::new(ArrowField::new("a", DataType::Int32, true)),
+            Arc::new(ArrowField::new("b", DataType::Int32, true)),
+        ]);
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields.clone()),
+            true,
+        ));
+        let items_dtype = if large_list {
+            DataType::LargeList(item_field.clone())
+        } else {
+            DataType::List(item_field.clone())
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("grp", DataType::UInt16, false),
+            ArrowField::new("items", items_dtype, false),
+        ]));
+
+        let make_batch = |start: i32, n: usize, group: u16| -> RecordBatch {
+            let ids = Int32Array::from_iter_values(start..start + n as i32);
+            let groups = UInt16Array::from(vec![group; n]);
+
+            let mut offsets = Vec::with_capacity(n + 1);
+            let mut a_vals: Vec<i32> = Vec::new();
+            let mut b_vals: Vec<i32> = Vec::new();
+            offsets.push(0i64);
+            for i in 0..n {
+                // Variable-length lists (1..=18) so offsets don't land on
+                // batch-row boundaries.
+                let len = 1 + (i % 18);
+                for j in 0..len {
+                    a_vals.push(j as i32);
+                    b_vals.push(-(j as i32));
+                }
+                offsets.push(a_vals.len() as i64);
+            }
+            let struct_arr = Arc::new(StructArray::new(
+                struct_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(a_vals)) as ArrayRef,
+                    Arc::new(Int32Array::from(b_vals)) as ArrayRef,
+                ],
+                None,
+            ));
+            let items: ArrayRef = if large_list {
+                Arc::new(LargeListArray::new(
+                    item_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                    struct_arr,
+                    None,
+                ))
+            } else {
+                let offsets_i32: Vec<i32> = offsets.iter().map(|&o| o as i32).collect();
+                Arc::new(ListArray::new(
+                    item_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(offsets_i32)),
+                    struct_arr,
+                    None,
+                ))
+            };
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(ids) as ArrayRef,
+                    Arc::new(groups) as ArrayRef,
+                    items,
+                ],
+            )
+            .unwrap()
+        };
+
+        // Sparse-tail selectivity (matching the original report's shape at a
+        // smaller scale): a large leading block of matches, a large gap of
+        // non-matches, then a small trailing match. Single fragment.
+        let batches = vec![
+            make_batch(0, 100_000, 7),
+            make_batch(100_000, 400_000, 1),
+            make_batch(500_000, 7_300, 7),
+        ];
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1_000_000,
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Force a column split inside the `items` struct by marking `items.b`
+        // as a late-materialized field: `filtered_read` returns the batch with
+        // `items.a`, and `TakeExec` adds `items.b`. `merge_with_schema` then
+        // takes its `List<Struct>` branch, which is where the panic was.
+        let items_b_field_id = dataset
+            .schema()
+            .field("items")
+            .unwrap()
+            .child("item")
+            .unwrap()
+            .child("b")
+            .unwrap()
+            .id as u32;
+        let mut scan = dataset.scan();
+        scan.filter("grp = 7").unwrap();
+        scan.project(&["id", "items"]).unwrap();
+        scan.materialization_style(MaterializationStyle::AllEarlyExcept(vec![items_b_field_id]));
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 107_300);
     }
 
     #[tokio::test]
@@ -9357,6 +9539,191 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             !plan_str.contains("LikePrefix"),
             "LIKE '%app%' should not use LikePrefix index, but got: {}",
             plan_str
+        );
+    }
+
+    /// Regression for over-matching on the zone-map recheck path: a literal prefix
+    /// containing LIKE metacharacters (`_`, `%`) must be matched literally, not as
+    /// wildcards. The indexed (recheck) result must equal the unindexed ground truth.
+    #[tokio::test]
+    async fn test_like_prefix_zone_map_escapes_metacharacters() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let names: Vec<&str> = vec!["a_b", "a_c", "axb", "a1c", "b%c", "bxc", "bcc", "zoo"];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..names.len() as i32)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://test_like_zonemap_escape", None)
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_zonemap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let collect_names = |batch: &RecordBatch| -> BTreeSet<String> {
+            batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect()
+        };
+
+        // Ensure the predicate actually exercises the zone-map LikePrefix recheck path.
+        let mut scanner = dataset.scan();
+        scanner.filter("starts_with(name, 'a_')").unwrap();
+        let plan_str = format!("{:?}", scanner.create_plan().await.unwrap());
+        assert!(
+            plan_str.contains("LikePrefix"),
+            "expected a zone-map LikePrefix plan, got: {plan_str}"
+        );
+
+        // `_` and `%` in the prefix are literal characters; the indexed result must match
+        // the unindexed evaluation for each predicate (no wildcard over-match).
+        for predicate in ["starts_with(name, 'a_')", "starts_with(name, 'b%')"] {
+            let with_index = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let without_index = dataset
+                .scan()
+                .use_scalar_index(false)
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                collect_names(&with_index),
+                collect_names(&without_index),
+                "indexed result over-matched for predicate `{predicate}`"
+            );
+        }
+
+        // Explicit expectation so the intended (non-over-matching) result is obvious.
+        let result = dataset
+            .scan()
+            .filter("starts_with(name, 'a_')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from(["a_b".to_string(), "a_c".to_string()])
+        );
+    }
+
+    /// A bitmap index cannot answer prefix queries, so `LIKE 'prefix%'` / `starts_with`
+    /// must fall back to ordinary filtering (returning correct results) instead of being
+    /// planned as a `LikePrefix` index scan that bitmap search would reject.
+    #[tokio::test]
+    async fn test_like_prefix_bitmap_falls_back_to_filter() {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let names: Vec<&str> = vec!["apple", "app", "application", "banana", "band", "zoo"];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("name", DataType::Utf8, false),
+            ArrowField::new("id", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names.clone())),
+                Arc::new(Int32Array::from_iter_values(0..names.len() as i32)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://test_like_bitmap_fallback", None)
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
+        dataset
+            .create_index(
+                &["name"],
+                IndexType::Scalar,
+                Some("name_bitmap".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // The predicate must not be planned as a LikePrefix index scan (bitmap rejects it).
+        let mut scanner = dataset.scan();
+        scanner.filter("name LIKE 'app%'").unwrap();
+        let plan_str = format!("{:?}", scanner.create_plan().await.unwrap());
+        assert!(
+            !plan_str.contains("LikePrefix"),
+            "bitmap LIKE must not use a LikePrefix index scan, got: {plan_str}"
+        );
+
+        let collect_names = |batch: &RecordBatch| -> BTreeSet<String> {
+            batch
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|s| s.unwrap().to_string())
+                .collect()
+        };
+
+        // And it must execute successfully with correct results (previously errored).
+        let result = dataset
+            .scan()
+            .filter("name LIKE 'app%'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from([
+                "apple".to_string(),
+                "app".to_string(),
+                "application".to_string(),
+            ])
+        );
+
+        let result = dataset
+            .scan()
+            .filter("starts_with(name, 'ban')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_names(&result),
+            BTreeSet::from(["banana".to_string(), "band".to_string()])
         );
     }
 

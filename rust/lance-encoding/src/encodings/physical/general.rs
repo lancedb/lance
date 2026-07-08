@@ -161,7 +161,7 @@ mod tests {
             // Small data with RLE - should not compress due to size threshold
             TestCase {
                 name: "small_rle_data",
-                inner_encoder: Box::new(RleEncoder),
+                inner_encoder: Box::new(RleEncoder::new()),
                 compression: CompressionConfig {
                     scheme: CompressionScheme::Lz4,
                     level: None,
@@ -173,7 +173,7 @@ mod tests {
             // Large repeated data with RLE + LZ4
             TestCase {
                 name: "large_rle_lz4",
-                inner_encoder: Box::new(RleEncoder),
+                inner_encoder: Box::new(RleEncoder::new()),
                 compression: CompressionConfig {
                     scheme: CompressionScheme::Lz4,
                     level: None,
@@ -185,7 +185,7 @@ mod tests {
             // Large repeated data with RLE + Zstd
             TestCase {
                 name: "large_rle_zstd",
-                inner_encoder: Box::new(RleEncoder),
+                inner_encoder: Box::new(RleEncoder::new()),
                 compression: CompressionConfig {
                     scheme: CompressionScheme::Zstd,
                     level: Some(3),
@@ -403,7 +403,7 @@ mod tests {
         // Test that small buffers don't get compressed
         let small_test = TestCase {
             name: "small_buffer_no_compression",
-            inner_encoder: Box::new(RleEncoder),
+            inner_encoder: Box::new(RleEncoder::new()),
             compression: CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
@@ -496,7 +496,7 @@ mod tests {
         // RLE produces 2 buffers (values and lengths), test that both are handled correctly
         let data = create_repeated_i32_block(vec![1; 100]);
         let compressor = GeneralMiniBlockCompressor::new(
-            Box::new(RleEncoder),
+            Box::new(RleEncoder::new()),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
@@ -519,7 +519,7 @@ mod tests {
         // Test case 1: 32-bit RLE data
         let test_32 = TestCase {
             name: "rle_32bit_with_general_wrapper",
-            inner_encoder: Box::new(RleEncoder),
+            inner_encoder: Box::new(RleEncoder::new()),
             compression: CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
@@ -532,7 +532,7 @@ mod tests {
         // For 32-bit RLE, the compression strategy should automatically wrap it
         // Let's directly test the compressor
         let compressor = GeneralMiniBlockCompressor::new(
-            Box::new(RleEncoder),
+            Box::new(RleEncoder::new()),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,
@@ -589,7 +589,7 @@ mod tests {
         let block_64 = DataBlock::from_array(array_64);
 
         let compressor_64 = GeneralMiniBlockCompressor::new(
-            Box::new(RleEncoder),
+            Box::new(RleEncoder::new()),
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
                 level: None,

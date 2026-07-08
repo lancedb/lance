@@ -6,7 +6,7 @@ use std::io::Write;
 use super::builder::BLOCK_SIZE;
 use super::index::{PositionStreamCodec, PostingTailCodec};
 use arrow::array::LargeBinaryBuilder;
-use bitpacking::{BitPacker, BitPacker4x};
+use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::{Error, Result};
 
 // we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),

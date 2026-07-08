@@ -24,7 +24,7 @@ use lance_core::ROW_ID;
 use lance_core::Result;
 use tokio::sync::OnceCell;
 
-use crate::frag_reuse::FragReuseIndex;
+use crate::scalar::RowIdRemapper;
 use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
 use crate::scalar::{IndexReader, IndexStore};
 use lance_select::mask::RowAddrMask;
@@ -63,7 +63,7 @@ pub struct DeferredDocSet {
     store: Arc<dyn IndexStore>,
     docs_path: String,
     is_legacy: bool,
-    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
     /// `sum(num_tokens)` cached on first compute.
@@ -74,6 +74,11 @@ pub struct DeferredDocSet {
     row_ids_col: OnceCell<Arc<UInt64Array>>,
     /// Full DocSet, materialized on first `ensure_loaded`.
     full: OnceCell<Arc<DocSet>>,
+    /// num_tokens-only DocSet, materialized on first
+    /// `ensure_num_tokens_loaded`. Cached because wand scoring calls this
+    /// once per query per partition; rebuilding it copied the whole
+    /// num_tokens column (tens of MB per partition) on every query.
+    tokens_only: OnceCell<Arc<DocSet>>,
 }
 
 impl std::fmt::Debug for LazyDocSet {
@@ -103,6 +108,10 @@ impl lance_core::deepsize::DeepSizeOf for LazyDocSet {
                     .get()
                     .map(|d| d.deep_size_of_children(ctx))
                     .unwrap_or(0)
+                    + d.tokens_only
+                        .get()
+                        .map(|d| d.deep_size_of_children(ctx))
+                        .unwrap_or(0)
                     + d.num_tokens_col
                         .get()
                         .map(|arr| arr.len() * std::mem::size_of::<u32>())
@@ -122,7 +131,7 @@ impl LazyDocSet {
         docs_path: String,
         num_rows: usize,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
         Self::Deferred(Box::new(DeferredDocSet {
             store,
@@ -134,6 +143,7 @@ impl LazyDocSet {
             num_tokens_col: OnceCell::new(),
             row_ids_col: OnceCell::new(),
             full: OnceCell::new(),
+            tokens_only: OnceCell::new(),
         }))
     }
 
@@ -319,8 +329,14 @@ impl DeferredDocSet {
         if let Some(full) = self.full.get() {
             return Ok(full.clone());
         }
-        let num_tokens = self.num_tokens_column().await?;
-        let docs = Arc::new(DocSet::from_num_tokens_only(num_tokens.as_ref()));
+        let docs = self
+            .tokens_only
+            .get_or_try_init(|| async {
+                let num_tokens = self.num_tokens_column().await?;
+                Result::Ok(Arc::new(DocSet::from_num_tokens_only(num_tokens.as_ref())))
+            })
+            .await?
+            .clone();
         let _ = self.total_tokens.set(docs.total_tokens_num());
         Ok(docs)
     }

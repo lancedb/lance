@@ -38,7 +38,9 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
 use dataset::blob::LanceBlobFile;
-use dataset::cleanup::CleanupStats;
+use dataset::cleanup::{
+    CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+};
 use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -60,6 +62,7 @@ use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -94,6 +97,9 @@ pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
 
+use crate::blob::{
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+};
 use crate::executor::BackgroundExecutor;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -255,6 +261,10 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
+    m.add_class::<PyBlobDescriptor>()?;
+    m.add_class::<PyBlobDescriptorArrayBuilder>()?;
+    m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileSession>()?;
@@ -265,6 +275,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<CleanupCandidateFile>()?;
+    m.add_class::<CleanupReferencedBranch>()?;
+    m.add_class::<CleanupExplanation>()?;
     m.add_class::<IoStats>()?;
     m.add_class::<KMeans>()?;
     m.add_class::<Hnsw>()?;

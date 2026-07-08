@@ -266,13 +266,19 @@ impl Stream for PkBlockFilterStream {
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(None) => {
-                    // >= k candidates in, < k out: over-fetch missed superseded rows.
+                    // >= k candidates in, < k out: over-fetch missed superseded
+                    // rows. Each is a PK shadowed by a newer generation — an
+                    // update (replaced elsewhere) or a delete (a tombstone that
+                    // emits nothing, so it is pure, uncompensated subtraction).
+                    // A burst of deletes between compactions is the likeliest
+                    // cause of repeated warnings.
                     if !this.warned && this.input_seen >= this.k && this.kept < this.k {
                         warn!(
                             k = this.k,
                             fetched = this.input_seen,
                             kept = this.kept,
-                            "LSM vector search: < k live rows survived the PK post-filter; \
+                            "LSM vector search: < k live rows survived the PK post-filter \
+                             (superseded by newer-generation updates or deletes); \
                              raise the over-fetch factor or use a true KNN prefilter."
                         );
                         this.warned = true;

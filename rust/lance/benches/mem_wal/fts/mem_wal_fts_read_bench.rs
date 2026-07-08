@@ -524,7 +524,7 @@ async fn run_local(planner: &LsmFtsSearchPlanner, queries: &[String], k: usize) 
     for q in queries {
         let t0 = Instant::now();
         let plan = planner
-            .plan_search(TEXT_COL, FullTextSearchQuery::new(q.clone()), k, None)
+            .plan_search(TEXT_COL, FullTextSearchQuery::new(q.clone()), Some(k), None)
             .await?;
         let stream = plan.execute(0, ctx.task_ctx())?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
@@ -684,6 +684,8 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     let batches_per_gen = (args.max_memtable_rows / args.batch_rows).max(1);
     let config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
         sync_indexed_write: false,
