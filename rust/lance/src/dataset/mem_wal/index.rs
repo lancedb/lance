@@ -139,11 +139,14 @@ impl MemIndexConfig {
 
         // Extract InvertedIndexParams from index_details if available
         let params = if let Some(details_any) = &index_meta.index_details {
-            if let Ok(details) = pbold::InvertedIndexDetails::decode(details_any.value.as_slice()) {
-                InvertedIndexParams::try_from(&details)?
-            } else {
-                InvertedIndexParams::default()
-            }
+            let details = pbold::InvertedIndexDetails::decode(details_any.value.as_slice())
+                .map_err(|err| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails for MemWAL FTS index '{}': {}",
+                        index_meta.name, err
+                    ))
+                })?;
+            InvertedIndexParams::try_from(&details)?
         } else {
             InvertedIndexParams::default()
         };

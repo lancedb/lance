@@ -21,6 +21,7 @@ from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
     BoostQuery,
+    FullTextOperator,
     MatchQuery,
     MultiMatchQuery,
     Occur,
@@ -806,6 +807,239 @@ def test_full_text_search(dataset, with_position, base_tokenizer):
         )
 
 
+def test_code_analyzer_full_text_search(tmp_path):
+    table = pa.table(
+        {
+            "code": [
+                "getUserName",
+                "set_user_name",
+                "user-name",
+                "username",
+                "other",
+            ]
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code")
+
+    results = ds.to_table(
+        columns=["code"],
+        full_text_query=MatchQuery("user", "code"),
+    )
+    assert set(results["code"].to_pylist()) == {
+        "getUserName",
+        "set_user_name",
+        "user-name",
+    }
+
+    stats = ds.stats.index_stats("code_idx")["indices"][0]
+    params = stats["params"]
+    assert params["analyzer"] == "code"
+    assert params["base_tokenizer"] == "code"
+    assert params["split_identifiers"] is True
+    assert params["split_on_numerics"] is True
+    assert params["preserve_original"] is True
+    assert params["stem"] is False
+    assert params["remove_stop_words"] is False
+
+
+def test_code_analyzer_complex_code_constructs(tmp_path):
+    table = pa.table(
+        {
+            "path": [
+                "edge/trait.rs",
+                "edge/impl.rs",
+                "edge/fn_pointer.rs",
+                "edge/unit_result.rs",
+                "edge/hrtb.rs",
+                "edge/associated.rs",
+                "edge/operators.rs",
+            ],
+            "code": [
+                """
+pub trait EdgeAsyncRepository<'a, T: Send + Sync>
+where
+    T: TryFrom<&'a str, Error = EdgeParseError>,
+{
+    type Output<'b>: Iterator<Item = Result<T, EdgeRepoError>>
+    where
+        Self: 'b;
+
+    async fn fetch_by_key<const N: usize>(
+        &'a self,
+        key: [u8; N],
+    ) -> Result<Self::Output<'a>, EdgeRepoError>;
+}
+""",
+                """
+impl<'a, T, S> EdgeAsyncRepository<'a, T> for EdgeStore<S>
+where
+    T: TryFrom<&'a str, Error = EdgeParseError> + Clone + Send + Sync,
+    S: EdgeBackend<T> + ?Sized,
+{
+    type Output<'b> = std::vec::IntoIter<Result<T, EdgeRepoError>> where Self: 'b;
+
+    async fn fetch_by_key<const N: usize>(
+        &'a self,
+        key: [u8; N],
+    ) -> Result<Self::Output<'a>, EdgeRepoError> {
+        self.backend.fetch::<T, N>(key).await
+    }
+}
+""",
+                """
+pub fn build_edge_handler<T, F>(
+    factory: F,
+) -> impl Fn() -> Result<EdgeHandler<T>, EdgeError>
+where
+    F: FnOnce() -> Result<T, EdgeError> + Send + 'static,
+    T: Default + Send + Sync + 'static,
+{
+    move || factory().map(EdgeHandler::new)
+}
+""",
+                """
+pub fn edge_unit_result_callback() -> Result<()> {
+    Ok(())
+}
+""",
+                """
+pub fn edge_higher_ranked<'a, T>(
+    visitor: impl for<'b> Fn(&'b T) -> Result<&'b str, EdgeVisitError>,
+    value: &'a T,
+) -> Result<&'a str, EdgeVisitError> {
+    visitor(value)
+}
+""",
+                """
+pub fn edge_collect_stream<I, E>(items: I) -> Result<Vec<E::Item>, E::Error>
+where
+    I: IntoIterator<Item = E>,
+    E: EdgeExtract,
+{
+    items.into_iter().map(E::extract).collect()
+}
+""",
+                """
+pub fn edge_operator_arrow() -> Result<EdgeArrow, EdgeError> {
+    let variant = EdgeModule::EdgeVariant;
+    if variant != EdgeModule::Default && EdgeMask::enabled() {
+        return Ok(EdgeArrow::new(variant));
+    }
+    Err(EdgeError::empty())
+}
+""",
+            ],
+        }
+    )
+    table = table.append_column("code_ops", table["code"])
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code")
+    ds.create_scalar_index(
+        "code_ops",
+        index_type="INVERTED",
+        analyzer="code",
+        index_operators=True,
+    )
+
+    ds.insert(
+        pa.table(
+            {
+                "path": ["edge/flat_unindexed.rs"],
+                "code": [
+                    """
+pub async fn edge_flat_generic_return<T, E>() -> Result<T, EdgeFlatError>
+where
+    T: TryFrom<String, Error = E> + Send,
+    E: Into<EdgeFlatError>,
+{
+    T::try_from(String::new()).map_err(Into::into)
+}
+"""
+                ],
+                "code_ops": [
+                    """
+pub async fn edge_flat_operator() -> Result<EdgeFlat, EdgeFlatError> {
+    EdgeFlat::try_new() -> Result<EdgeFlat, EdgeFlatError>
+}
+"""
+                ],
+            }
+        )
+    )
+    ds = lance.dataset(tmp_path)
+
+    def assert_search(column, query, expected_path, operator=FullTextOperator.AND):
+        result = ds.scanner(
+            columns=["path", "_score"],
+            full_text_query=MatchQuery(query, column, operator=operator),
+            limit=50,
+        ).to_table()
+        assert expected_path in result["path"].to_pylist()
+
+    assert_search(
+        "code",
+        "EdgeAsyncRepository fetch_by_key TryFrom EdgeRepoError",
+        "edge/trait.rs",
+    )
+    assert_search(
+        "code",
+        "EdgeStore fetch_by_key const usize where Result",
+        "edge/impl.rs",
+    )
+    assert_search(
+        "code",
+        "build_edge_handler FnOnce Result EdgeHandler",
+        "edge/fn_pointer.rs",
+    )
+    assert_search(
+        "code",
+        "edge_unit_result_callback fn () -> Result",
+        "edge/unit_result.rs",
+    )
+    assert_search(
+        "code",
+        "edge_higher_ranked for Fn EdgeVisitError Result",
+        "edge/hrtb.rs",
+    )
+    assert_search(
+        "code",
+        "edge_collect_stream IntoIterator Item Error Result",
+        "edge/associated.rs",
+    )
+    assert_search(
+        "code",
+        "edge_flat_generic_return TryFrom EdgeFlatError Result",
+        "edge/flat_unindexed.rs",
+    )
+    assert_search(
+        "code_ops",
+        "edge_operator_arrow -> Result",
+        "edge/operators.rs",
+    )
+    assert_search(
+        "code_ops",
+        "EdgeModule :: EdgeVariant !=",
+        "edge/operators.rs",
+    )
+    assert_search(
+        "code_ops",
+        "edge_flat_operator -> Result EdgeFlatError",
+        "edge/flat_unindexed.rs",
+    )
+
+    default_operator_results = ds.scanner(
+        columns=["path", "_score"],
+        full_text_query=MatchQuery("->", "code", operator=FullTextOperator.OR),
+    ).to_table()
+    operator_results = ds.scanner(
+        columns=["path", "_score"],
+        full_text_query=MatchQuery("->", "code_ops", operator=FullTextOperator.OR),
+    ).to_table()
+    assert default_operator_results.num_rows == 0
+    assert operator_results.num_rows > 0
+
+
 def test_unindexed_full_text_search_on_empty_index(tmp_path):
     # Create fts index on empty table.
     schema = pa.schema({"text": pa.string()})
@@ -869,6 +1103,18 @@ def test_fts_custom_stop_words(tmp_path):
         with_row_id=True,
     )
     assert len(results["_rowid"].to_pylist()) == 1
+
+
+def test_fts_custom_stop_words_none(tmp_path):
+    data = pa.table({"text": ["alpha beta", "gamma"]})
+    ds = lance.write_dataset(data, tmp_path)
+    ds.create_scalar_index("text", "INVERTED", custom_stop_words=None)
+
+    results = ds.to_table(full_text_query="alpha")
+    assert results.num_rows == 1
+
+    stats = ds.stats.index_stats("text_idx")["indices"][0]
+    assert stats["params"]["custom_stop_words"] is None
 
 
 def test_fts_stop_words_respect_language_for_simple_tokenizer(tmp_path):

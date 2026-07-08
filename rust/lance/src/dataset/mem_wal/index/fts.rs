@@ -59,8 +59,8 @@ use fst::{Map, Streamer};
 use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::query::Operator;
-use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
+use lance_index::scalar::inverted::query::{Operator, Tokens};
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_tokenizer::TokenStream;
 use rayon::prelude::*;
@@ -369,6 +369,37 @@ fn char_prefix(term: &str, prefix_length: u32) -> &str {
         .nth(prefix_length as usize)
         .map(|(idx, _)| &term[..idx])
         .unwrap_or(term)
+}
+
+fn query_tokens_to_vec(tokens: &Tokens) -> Vec<String> {
+    (0..tokens.len())
+        .map(|idx| tokens.get_token(idx).to_string())
+        .collect()
+}
+
+fn has_grouped_positions(tokens: &Tokens) -> bool {
+    let mut seen = HashSet::new();
+    (0..tokens.len()).any(|idx| !seen.insert(tokens.position(idx)))
+}
+
+fn query_position_groups(tokens: &Tokens) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    let mut current_position = None;
+    for idx in 0..tokens.len() {
+        let position = tokens.position(idx);
+        if current_position != Some(position) {
+            current_position = Some(position);
+            groups.push(Vec::new());
+        }
+        let group = groups
+            .last_mut()
+            .expect("a group should exist after pushing for position");
+        let token = tokens.get_token(idx).to_string();
+        if !group.contains(&token) {
+            group.push(token);
+        }
+    }
+    groups
 }
 
 /// Builder for constructing Boolean queries.
@@ -1267,7 +1298,7 @@ impl FtsMemIndex {
     /// use `search_with_options` for sorted/limited output.
     pub fn search(&self, term: &str) -> Vec<FtsEntry> {
         let st = self.state.load_full();
-        let tokens = self.tokenize_for_search(term);
+        let tokens = self.analyze_for_search(term);
         self.search_match(&st, &tokens, Operator::Or, None, true, true)
     }
 
@@ -1322,6 +1353,22 @@ impl FtsMemIndex {
     /// shared rising threshold (instead of every partition cold-starting).
     /// Without a limit, an exact O(matches) scan across partitions + tail.
     fn search_match(
+        &self,
+        st: &IndexState,
+        query_tokens: &Tokens,
+        operator: Operator,
+        limit: Option<usize>,
+        include_tail: bool,
+        tail_skip: bool,
+    ) -> Vec<FtsEntry> {
+        if operator == Operator::And && has_grouped_positions(query_tokens) {
+            return self.search_grouped_and(st, query_tokens, limit, include_tail, tail_skip);
+        }
+        let tokens = query_tokens_to_vec(query_tokens);
+        self.search_match_strings(st, &tokens, operator, limit, include_tail, tail_skip)
+    }
+
+    fn search_match_strings(
         &self,
         st: &IndexState,
         tokens: &[String],
@@ -1390,6 +1437,58 @@ impl FtsMemIndex {
         }
     }
 
+    fn search_grouped_and(
+        &self,
+        st: &IndexState,
+        query_tokens: &Tokens,
+        limit: Option<usize>,
+        include_tail: bool,
+        tail_skip: bool,
+    ) -> Vec<FtsEntry> {
+        let mut result_map: Option<HashMap<RowPosition, f32>> = None;
+        for group in query_position_groups(query_tokens) {
+            let group_results =
+                self.search_match_strings(st, &group, Operator::Or, None, include_tail, tail_skip);
+            let group_map = group_results
+                .into_iter()
+                .map(|entry| (entry.row_position, entry.score))
+                .collect::<HashMap<_, _>>();
+            let Some(current) = result_map.as_mut() else {
+                result_map = Some(group_map);
+                continue;
+            };
+            current.retain(|row_position, score| {
+                if let Some(group_score) = group_map.get(row_position) {
+                    *score += group_score;
+                    true
+                } else {
+                    false
+                }
+            });
+            if current.is_empty() {
+                return Vec::new();
+            }
+        }
+
+        let mut results = result_map
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(row_position, score)| FtsEntry {
+                row_position,
+                score,
+            })
+            .collect::<Vec<_>>();
+        if let Some(limit) = limit {
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            results.truncate(limit);
+        }
+        results
+    }
+
     fn search_phrase_tokens(
         &self,
         st: &IndexState,
@@ -1402,7 +1501,7 @@ impl FtsMemIndex {
         }
         if tokens.len() == 1 {
             // A single-token phrase reduces to a regular term search.
-            return self.search_match(st, tokens, Operator::Or, None, include_tail, true);
+            return self.search_match_strings(st, tokens, Operator::Or, None, include_tail, true);
         }
         // A multi-token phrase needs token positions; without them (the index
         // was built `with_position = false`) phrase search is unsupported, as
@@ -1464,7 +1563,7 @@ impl FtsMemIndex {
         if expanded.is_empty() {
             return Vec::new();
         }
-        self.search_match(st, &expanded, Operator::Or, None, include_tail, true)
+        self.search_match_strings(st, &expanded, Operator::Or, None, include_tail, true)
     }
 
     /// Expand `term` against the term dictionaries of every partition (and the
@@ -1556,7 +1655,7 @@ impl FtsMemIndex {
                 operator,
                 boost,
             } => {
-                let tokens = self.tokenize_for_search(query);
+                let tokens = self.analyze_for_search(query);
                 let mut results =
                     self.search_match(st, &tokens, *operator, limit, include_tail, tail_skip);
                 apply_boost(&mut results, *boost);
@@ -1736,13 +1835,19 @@ impl FtsMemIndex {
     }
 
     fn tokenize_for_search(&self, text: &str) -> Vec<String> {
+        query_tokens_to_vec(&self.analyze_for_search(text))
+    }
+
+    fn analyze_for_search(&self, text: &str) -> Tokens {
         let mut tok = PooledTokenizer::new(&self.tokenizer_pool);
         let mut stream = tok.get_mut().token_stream_for_search(text);
-        let mut out = Vec::new();
+        let mut tokens = Vec::new();
+        let mut positions = Vec::new();
         while let Some(t) = stream.next() {
-            out.push(t.text.clone());
+            tokens.push(t.text.clone());
+            positions.push(t.position as u32);
         }
-        out
+        Tokens::with_positions(tokens, positions, DocType::Text)
     }
 
     // ------------------------------------------------------------------
@@ -3650,6 +3755,31 @@ mod tests {
 
         let entries = index.search("nonexistent");
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_code_analyzer_and_query_uses_position_alternatives() {
+        let schema = create_test_schema();
+        let index =
+            FtsMemIndex::with_params(1, "description".to_string(), InvertedIndexParams::code());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                Arc::new(StringArray::from(vec!["get user name", "getUserName"])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let query = FtsQueryExpr::match_query_with_operator("getUserName", Operator::And);
+        let mut rows = index
+            .search_query(&query)
+            .into_iter()
+            .map(|entry| entry.row_position)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![0, 1]);
     }
 
     fn create_phrase_test_batch(schema: &ArrowSchema) -> RecordBatch {

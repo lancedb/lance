@@ -1758,7 +1758,6 @@ impl InvertedPartition {
         operator: Operator,
         metrics: &dyn MetricsCollector,
     ) -> Result<LoadedPostings> {
-        let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
         let required_positions = (is_and_query || is_phrase_query).then(|| {
@@ -1784,9 +1783,6 @@ impl InvertedPartition {
                     matched_positions.insert(position);
                 }
                 token_ids.push((token_id, token, position));
-            } else if is_phrase_query || is_and_query {
-                // if the token is not found, we can't do phrase or AND query
-                return Ok(LoadedPostings::empty());
             }
         }
         if token_ids.is_empty() {
@@ -1799,16 +1795,8 @@ impl InvertedPartition {
             return Ok(LoadedPostings::empty());
         }
 
-        let is_fuzzy_and_query = is_fuzzy && is_and_query && !is_phrase_query;
-        if !is_phrase_query {
-            if is_fuzzy_and_query {
-                token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
-                token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
-            } else {
-                token_ids.sort_unstable_by_key(|(token_id, _, _)| *token_id);
-                token_ids.dedup_by_key(|(token_id, _, _)| *token_id);
-            }
-        }
+        token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
+        token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
 
         let num_docs = self.docs.len();
         let loaded_postings = stream::iter(token_ids)
@@ -1823,35 +1811,6 @@ impl InvertedPartition {
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-
-        if (is_and_query || is_phrase_query)
-            && !is_fuzzy_and_query
-            && loaded_postings
-                .iter()
-                .any(|(_, _, _, posting)| posting.is_empty())
-        {
-            return Ok(LoadedPostings::empty());
-        }
-
-        if !is_fuzzy_and_query {
-            return Ok(LoadedPostings {
-                postings: loaded_postings
-                    .into_iter()
-                    .map(|(token_id, token, position, posting)| {
-                        let query_weight = idf(posting.len(), num_docs);
-                        PostingIterator::with_query_weight(
-                            token,
-                            token_id,
-                            position,
-                            query_weight,
-                            posting,
-                            num_docs,
-                        )
-                    })
-                    .collect(),
-                grouped_expansions: Vec::new(),
-            });
-        }
 
         let needs_union = loaded_postings
             .windows(2)
@@ -1880,6 +1839,10 @@ impl InvertedPartition {
             } else {
                 let token_id = group[0].0;
                 let token = group[0].1.clone();
+                let query_weight = group
+                    .iter()
+                    .map(|(_, _, posting)| idf(posting.len(), num_docs))
+                    .sum::<f32>();
                 grouped_expansions.push(GroupedExpansionTerms {
                     position,
                     terms: group
@@ -1895,12 +1858,26 @@ impl InvertedPartition {
                     postings,
                     docs_for_union
                         .as_deref()
-                        .expect("union docs must be loaded for grouped fuzzy AND"),
+                        .expect("union docs must be loaded for grouped query terms"),
                 )?;
-                (token_id, token, posting)
+                if posting.is_empty() && (is_and_query || is_phrase_query) {
+                    return Ok(LoadedPostings::empty());
+                }
+                grouped_postings.push(PostingIterator::with_query_weight(
+                    token,
+                    token_id,
+                    position,
+                    query_weight,
+                    posting,
+                    num_docs,
+                ));
+                continue;
             };
             if posting.is_empty() {
-                return Ok(LoadedPostings::empty());
+                if is_and_query || is_phrase_query {
+                    return Ok(LoadedPostings::empty());
+                }
+                continue;
             }
 
             let query_weight = idf(posting.len(), num_docs);
@@ -5575,6 +5552,7 @@ async fn tokenize_and_count(
         ),
     ]));
     let output_schema_clone = output_schema.clone();
+    let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
     let bytes_accumulated = Arc::new(AtomicU64::new(0));
     let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
 
@@ -5583,6 +5561,7 @@ async fn tokenize_and_count(
             let mut tokenizer = tokenizer.box_clone();
             let output_schema = output_schema.clone();
             let query_tokens = query_tokens.clone();
+            let query_token_indices = query_token_indices.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
@@ -5606,8 +5585,10 @@ async fn tokenize_and_count(
                     let mut all_tokens = 0;
                     while let Some(token) = stream.next() {
                         all_tokens += 1;
-                        if let Some(token_index) = query_tokens.token_index(&token.text) {
-                            temp_query_token_counts[token_index] += 1;
+                        if let Some(token_indices) = query_token_indices.get(&token.text) {
+                            for token_index in token_indices {
+                                temp_query_token_counts[*token_index] += 1;
+                            }
                         }
                     }
                     all_tokens
@@ -5737,6 +5718,17 @@ fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
     Ok(())
 }
 
+fn query_token_indices(query_tokens: &Tokens) -> HashMap<String, Vec<usize>> {
+    let mut indices = HashMap::new();
+    for idx in 0..query_tokens.len() {
+        indices
+            .entry(query_tokens.get_token(idx).to_string())
+            .or_insert_with(Vec::new)
+            .push(idx);
+    }
+    indices
+}
+
 /// Initialize the BM25 scorer
 ///
 /// In order to calculate BM25 scores we need to know token counts for the entire corpus.  We extract these from the
@@ -5800,9 +5792,11 @@ fn flat_bm25_score(
     query_tokens: &Tokens,
     counted_input: &RecordBatch,
     scorer: &MemBM25Scorer,
+    operator: Operator,
 ) -> Result<RecordBatch> {
     let mut row_ids_builder = UInt64Builder::with_capacity(counted_input.num_rows());
     let mut scores_builder = Float32Builder::with_capacity(counted_input.num_rows());
+    let query_groups = query_position_groups(query_tokens);
 
     let mut row_ids_iter = counted_input
         .column(FLAT_ROW_ID_COL_IDX)
@@ -5827,16 +5821,24 @@ fn flat_bm25_score(
     for _ in 0..counted_input.num_rows() {
         let num_tokens_in_doc = all_token_counts_iter.next().expect_ok()?;
         let row_id = row_ids_iter.next().expect_ok()?;
+        let mut query_token_counts = Vec::with_capacity(query_tokens.len());
+        for _ in query_tokens {
+            query_token_counts.push(query_token_counts_iter.next().expect_ok()?);
+        }
         if num_tokens_in_doc == 0 {
-            for _ in query_tokens {
-                query_token_counts_iter.next().expect_ok()?;
-            }
+            continue;
+        }
+        if operator == Operator::And
+            && !query_groups
+                .iter()
+                .all(|group| group.iter().any(|idx| query_token_counts[*idx] > 0))
+        {
             continue;
         }
         let doc_norm = K1 * (1.0 - B + B * num_tokens_in_doc as f32 / scorer.avg_doc_length());
         let mut score = 0.0;
-        for token in query_tokens {
-            let freq = query_token_counts_iter.next().expect_ok()? as f32;
+        for (token, freq) in query_tokens.into_iter().zip(query_token_counts.into_iter()) {
+            let freq = freq as f32;
             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
@@ -5853,6 +5855,23 @@ fn flat_bm25_score(
         vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
     )?;
     Ok(batch)
+}
+
+fn query_position_groups(query_tokens: &Tokens) -> Vec<Vec<usize>> {
+    let mut groups = Vec::new();
+    let mut current_position = None;
+    for idx in 0..query_tokens.len() {
+        let position = query_tokens.position(idx);
+        if current_position != Some(position) {
+            current_position = Some(position);
+            groups.push(Vec::new());
+        }
+        groups
+            .last_mut()
+            .expect("a group should exist after pushing for position")
+            .push(idx);
+    }
+    groups
 }
 
 #[deprecated(
@@ -5891,6 +5910,32 @@ pub async fn flat_bm25_search_stream_with_metrics(
     tokenizer: Box<dyn LanceTokenizer>,
     base_scorer: Option<MemBM25Scorer>,
     target_batch_size: usize,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    flat_bm25_search_stream_with_metrics_and_operator(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        base_scorer,
+        target_batch_size,
+        Operator::Or,
+        elapsed_compute,
+    )
+    .await
+}
+
+/// Same as [`flat_bm25_search_stream_with_metrics`] but applies the provided
+/// match operator when deciding whether a flat-scanned row is a hit.
+#[allow(clippy::too_many_arguments)]
+pub async fn flat_bm25_search_stream_with_metrics_and_operator(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
+    target_batch_size: usize,
+    operator: Operator,
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
@@ -5947,7 +5992,7 @@ pub async fn flat_bm25_search_stream_with_metrics(
     // All post-await work is synchronous; time the scorer + score + slicing loop together.
     let post_await_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
-    let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer)?;
+    let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer, operator)?;
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -8090,6 +8135,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_and_query_accepts_same_position_alternatives() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for token in ["getusername", "get", "user", "name"] {
+            builder.tokens.add(token.to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+        }
+        // Doc 0 only has the split words. Doc 1 has both the complete
+        // identifier and split words. A grouped AND query should accept either
+        // `getusername` or `get` at position 0.
+        builder.posting_lists[1].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(0, PositionRecorder::Count(1));
+        builder.posting_lists[3].add(0, PositionRecorder::Count(1));
+        builder.docs.append(100, 3);
+
+        builder.posting_lists[0].add(1, PositionRecorder::Count(1));
+        builder.posting_lists[1].add(1, PositionRecorder::Count(1));
+        builder.posting_lists[2].add(1, PositionRecorder::Count(1));
+        builder.posting_lists[3].add(1, PositionRecorder::Count(1));
+        builder.docs.append(101, 4);
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::code()).await;
+        let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::with_positions(
+            vec![
+                "getusername".to_string(),
+                "get".to_string(),
+                "user".to_string(),
+                "name".to_string(),
+            ],
+            vec![0, 0, 1, 2],
+            DocType::Text,
+        ));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let (mut row_ids, _) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, vec![100, 101]);
+    }
+
     // Enough distinct tokens that `write_posting_lists` emits several posting-list
     // batches (the default batch size is 256 rows), exercising the restructured
     // producer and async send path.
@@ -9245,6 +9350,100 @@ mod tests {
         let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
 
         assert_eq!(row_ids.values(), &[0]);
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_search_code_and_uses_position_groups() {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("code", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    "get user name",
+                    "getUserName",
+                    "get user",
+                    "username",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        let tokenizer = InvertedIndexParams::code().build().unwrap();
+
+        let result_stream = flat_bm25_search_stream_with_metrics_and_operator(
+            input,
+            "code".to_string(),
+            "getUserName".to_string(),
+            tokenizer,
+            None,
+            100,
+            Operator::And,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+        let mut row_ids = scored[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        row_ids.sort_unstable();
+
+        assert_eq!(row_ids, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_search_code_and_counts_repeated_subwords() {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("code", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1])),
+                Arc::new(StringArray::from(vec![
+                    "pub fn edge_flat_generic_return<T>() -> Result<T, EdgeFlatError> where T: TryFrom<String> { todo!() }",
+                    "pub fn edge_flat_generic_return<T>() -> Result<T> { todo!() }",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        let tokenizer = InvertedIndexParams::code().build().unwrap();
+
+        let result_stream = flat_bm25_search_stream_with_metrics_and_operator(
+            input,
+            "code".to_string(),
+            "edge_flat_generic_return TryFrom EdgeFlatError Result".to_string(),
+            tokenizer,
+            None,
+            100,
+            Operator::And,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+        let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>().values();
+
+        assert_eq!(row_ids, &[0]);
     }
 
     /// An [`IndexReader`] wrapper that hides the posting-group-offsets schema

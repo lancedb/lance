@@ -78,7 +78,6 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::inverted::InvertedListFormatVersion,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
@@ -2402,75 +2401,130 @@ impl Dataset {
                 })
             }
             "INVERTED" | "FTS" => {
-                let mut params = InvertedIndexParams::default();
+                let mut params_json = serde_json::Map::new();
                 if let Some(kwargs) = kwargs {
+                    let allowed_kwargs = [
+                        "analyzer",
+                        "with_position",
+                        "base_tokenizer",
+                        "language",
+                        "max_token_length",
+                        "lower_case",
+                        "stem",
+                        "remove_stop_words",
+                        "custom_stop_words",
+                        "ascii_folding",
+                        "min_ngram_length",
+                        "max_ngram_length",
+                        "prefix_only",
+                        "split_identifiers",
+                        "split_on_numerics",
+                        "preserve_original",
+                        "index_operators",
+                        "memory_limit",
+                        "num_workers",
+                        "format_version",
+                        "fragment_ids",
+                        "index_uuid",
+                        "progress_callback",
+                    ];
+                    for (key, _) in kwargs.iter() {
+                        let key: String = key.extract()?;
+                        if !allowed_kwargs.contains(&key.as_str()) {
+                            return Err(PyValueError::new_err(format!(
+                                "unknown FTS index parameter '{}'",
+                                key
+                            )));
+                        }
+                    }
+                    macro_rules! insert_param {
+                        ($name:literal, $ty:ty) => {
+                            if let Some(value) = kwargs.get_item($name)? {
+                                let value: $ty = value.extract()?;
+                                params_json.insert(
+                                    $name.to_string(),
+                                    serde_json::to_value(value).map_err(|err| {
+                                        PyValueError::new_err(format!(
+                                            "failed to serialize FTS parameter {}: {}",
+                                            $name, err
+                                        ))
+                                    })?,
+                                );
+                            }
+                        };
+                    }
+                    insert_param!("analyzer", String);
                     if let Some(with_position) = kwargs.get_item("with_position")? {
-                        params = params.with_position(with_position.extract()?);
+                        params_json.insert(
+                            "with_position".to_string(),
+                            serde_json::Value::Bool(with_position.extract()?),
+                        );
                     }
-                    if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params = params.base_tokenizer(base_tokenizer.extract()?);
-                    }
+                    insert_param!("base_tokenizer", String);
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.cast::<PyString>()?.clone().try_into()?;
-                        params = params.language(&language).map_err(|e| {
-                            PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {:?}",
-                                language, e
-                            ))
-                        })?;
+                        params_json.insert(
+                            "language".to_string(),
+                            serde_json::Value::String(language.to_string()),
+                        );
                     }
                     if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params = params.max_token_length(max_token_length.extract()?);
+                        let max_token_length: Option<usize> = max_token_length.extract()?;
+                        params_json.insert(
+                            "max_token_length".to_string(),
+                            serde_json::to_value(max_token_length).map_err(|err| {
+                                PyValueError::new_err(format!(
+                                    "failed to serialize FTS parameter max_token_length: {}",
+                                    err
+                                ))
+                            })?,
+                        );
                     }
-                    if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params = params.lower_case(lower_case.extract()?);
+                    insert_param!("lower_case", bool);
+                    insert_param!("stem", bool);
+                    insert_param!("remove_stop_words", bool);
+                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
+                        let custom_stop_words: Option<Vec<String>> =
+                            custom_stop_words.extract()?;
+                        params_json.insert(
+                            "custom_stop_words".to_string(),
+                            serde_json::to_value(custom_stop_words).map_err(|err| {
+                                PyValueError::new_err(format!(
+                                    "failed to serialize FTS parameter custom_stop_words: {}",
+                                    err
+                                ))
+                            })?,
+                        );
                     }
-                    if let Some(stem) = kwargs.get_item("stem")? {
-                        params = params.stem(stem.extract()?);
-                    }
-                    if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params = params.remove_stop_words(remove_stop_words.extract()?);
-                    }
-                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
-                        params = params.custom_stop_words(stop_words_file.extract()?);
-                    }
-                    if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params = params.ascii_folding(ascii_folding.extract()?);
-                    }
-                    if let Some(min_ngram_length) = kwargs.get_item("min_ngram_length")? {
-                        params = params.ngram_min_length(min_ngram_length.extract()?);
-                    }
-                    if let Some(max_ngram_length) = kwargs.get_item("max_ngram_length")? {
-                        params = params.ngram_max_length(max_ngram_length.extract()?);
-                    }
-                    if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
-                        params = params.ngram_prefix_only(prefix_only.extract()?);
-                    }
-                    if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
-                        params = params.memory_limit_mb(memory_limit.extract()?);
-                    }
-                    if let Some(num_workers) = kwargs.get_item("num_workers")? {
-                        params = params.num_workers(num_workers.extract()?);
-                    }
+                    insert_param!("ascii_folding", bool);
+                    insert_param!("min_ngram_length", u32);
+                    insert_param!("max_ngram_length", u32);
+                    insert_param!("prefix_only", bool);
+                    insert_param!("split_identifiers", bool);
+                    insert_param!("split_on_numerics", bool);
+                    insert_param!("preserve_original", bool);
+                    insert_param!("index_operators", bool);
+                    insert_param!("memory_limit", u64);
+                    insert_param!("num_workers", usize);
                     if let Some(format_version) = kwargs.get_item("format_version")?
                         && !format_version.is_none()
                     {
                         let value = if let Ok(value) = format_version.cast::<PyString>() {
-                            value.to_string_lossy().to_string()
+                            serde_json::Value::String(value.to_string_lossy().to_string())
                         } else if let Ok(value) = format_version.extract::<u32>() {
-                            value.to_string()
+                            serde_json::Value::from(value)
                         } else {
                             return Err(PyValueError::new_err(
                                 "format_version must be 1, 2, 'v1', or 'v2'",
                             ));
                         };
-                        let format_version = value
-                            .parse::<InvertedListFormatVersion>()
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                        params = params.format_version(format_version);
+                        params_json.insert("format_version".to_string(), value);
                     }
                 }
+                let params: InvertedIndexParams =
+                    serde_json::from_value(serde_json::Value::Object(params_json))
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?;
                 Box::new(params)
             }
             _ => {
