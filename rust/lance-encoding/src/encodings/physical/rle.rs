@@ -990,6 +990,34 @@ impl RleEncoder {
             best.expect("flat RLE child candidates should always be selectable");
         (values[value_idx].clone(), run_lengths[length_idx].clone())
     }
+
+    pub(crate) fn selected_payload_size(&self, data: &FixedWidthDataBlock) -> Result<u128> {
+        let (all_buffers, chunks) =
+            self.encode_data(&data.data, data.num_values, data.bits_per_value)?;
+        if all_buffers.is_empty() {
+            return Ok(0);
+        }
+
+        let values_candidates = Self::child_candidates(
+            &all_buffers,
+            &chunks,
+            0,
+            data.bits_per_value,
+            self.values_compression,
+            self.use_child_bitpacking,
+        )?;
+        let run_lengths_candidates = Self::child_candidates(
+            &all_buffers,
+            &chunks,
+            1,
+            self.run_length_width.bits_per_value(),
+            self.run_lengths_compression,
+            self.use_child_bitpacking,
+        )?;
+        let (values, run_lengths) =
+            Self::select_child_candidates(values_candidates, run_lengths_candidates);
+        Ok((values.size as u128).saturating_add(run_lengths.size as u128))
+    }
 }
 
 impl RleChildCandidate {

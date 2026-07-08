@@ -171,6 +171,7 @@ fn try_bss_for_mini_block(
 
 fn try_rle_for_mini_block(
     data: &FixedWidthDataBlock,
+    version: LanceFileVersion,
     params: &CompressionFieldParams,
     use_rle_v2: bool,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
@@ -212,22 +213,46 @@ fn try_rle_for_mini_block(
         )
     };
 
-    if rle_bytes < raw_bytes {
-        #[cfg(feature = "bitpacking")]
-        {
-            if let Some(bitpack_bytes) = estimate_inline_bitpacking_bytes(data)
-                && (bitpack_bytes as u128) < rle_bytes
-            {
-                return None;
-            }
+    let use_child_encodings = version.resolve() >= LanceFileVersion::V2_2;
+    let child_compression = if use_child_encodings {
+        rle_child_compression_config(params)
+    } else {
+        None
+    };
+    let use_child_bitpacking = use_child_encodings;
+    let rle_encoder = || {
+        if use_child_encodings {
+            RleEncoder::with_child_encoding(
+                run_length_width,
+                child_compression,
+                child_compression,
+                use_child_bitpacking,
+            )
+        } else {
+            RleEncoder::with_run_length_width(run_length_width)
         }
-        let child_compression = rle_child_compression_config(params);
-        return Some(Box::new(RleEncoder::with_child_encoding(
-            run_length_width,
-            child_compression,
-            child_compression,
-            true,
-        )));
+    };
+
+    #[cfg(feature = "bitpacking")]
+    let bitpack_bytes = estimate_inline_bitpacking_bytes(data).map(u128::from);
+    #[cfg(not(feature = "bitpacking"))]
+    let bitpack_bytes = None::<u128>;
+
+    let mut selected_rle_bytes = rle_bytes;
+    let should_estimate_child_size = use_child_encodings
+        && (child_compression.is_some() || cfg!(feature = "bitpacking"))
+        && (rle_bytes >= raw_bytes || bitpack_bytes.is_some_and(|bytes| bytes < rle_bytes));
+    if should_estimate_child_size {
+        selected_rle_bytes = rle_encoder().selected_payload_size(data).ok()?;
+    }
+
+    if selected_rle_bytes < raw_bytes {
+        if let Some(bitpack_bytes) = bitpack_bytes
+            && bitpack_bytes < selected_rle_bytes
+        {
+            return None;
+        }
+        return Some(Box::new(rle_encoder()));
     }
     None
 }
@@ -606,7 +631,7 @@ impl DefaultCompressionStrategy {
         }
 
         let base = try_bss_for_mini_block(data, params)
-            .or_else(|| try_rle_for_mini_block(data, params, self.use_rle_v2()))
+            .or_else(|| try_rle_for_mini_block(data, self.version, params, self.use_rle_v2()))
             .or_else(|| try_bitpack_for_mini_block(data))
             .unwrap_or_else(|| Box::new(ValueEncoder::default()));
 
@@ -1433,6 +1458,20 @@ mod tests {
         run_lengths.bits_per_value
     }
 
+    fn expect_rle_encoding(encoding: &CompressiveEncoding) -> &crate::format::pb21::Rle {
+        match encoding.compression.as_ref().unwrap() {
+            Compression::Rle(rle) => rle,
+            Compression::General(general) => {
+                let inner = general.values.as_ref().unwrap();
+                let Compression::Rle(rle) = inner.compression.as_ref().unwrap() else {
+                    panic!("expected wrapped RLE encoding");
+                };
+                rle
+            }
+            other => panic!("expected RLE encoding, got {}", compression_name(other)),
+        }
+    }
+
     fn create_variable_width_block(
         bits_per_offset: u8,
         num_values: u64,
@@ -2131,6 +2170,55 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn test_rle_miniblock_v2_1_keeps_flat_children_when_compression_requested() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "dict_indices".to_string(),
+            CompressionFieldParams {
+                compression: Some(if cfg!(feature = "lz4") { "lz4" } else { "zstd" }.to_string()),
+                rle_threshold: Some(1.0),
+                bss: Some(BssMode::Off),
+                ..Default::default()
+            },
+        );
+        let strategy =
+            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_1);
+        let field = create_test_field("dict_indices", DataType::UInt32);
+
+        let mut values = Vec::with_capacity(8192 * 4);
+        for value in 0..8192u32 {
+            values.extend(std::iter::repeat_n(value, 4));
+        }
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 32,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 8192 * 4,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let rle = expect_rle_encoding(&encoding);
+
+        assert!(matches!(
+            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+            Compression::Flat(_)
+        ));
+        assert!(matches!(
+            rle.run_lengths
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            Compression::Flat(_)
+        ));
+    }
+
+    #[test]
     #[cfg(feature = "bitpacking")]
     fn test_rle_miniblock_strategy_bitpacks_child_values_when_smaller() {
         let field = create_test_field("dict_indices", DataType::Int32);
@@ -2157,6 +2245,54 @@ mod tests {
         let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
             panic!("expected RLE encoding");
         };
+        assert!(matches!(
+            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+            Compression::OutOfLineBitpacking(_)
+        ));
+        assert!(matches!(
+            rle.run_lengths
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            Compression::Flat(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_rle_miniblock_keeps_child_bitpacked_rle_when_smaller_than_inline_bitpacking() {
+        let field = create_test_field("int_score", DataType::UInt64);
+
+        let mut values = Vec::with_capacity(8192 * 8);
+        for run_idx in 0..8192 {
+            let value = match run_idx % 3 {
+                0 => 3u64,
+                1 => 4u64,
+                _ => 5u64,
+            };
+            values.extend(std::iter::repeat_n(value, 8));
+        }
+        let mut data = FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(values),
+            num_values: 8192 * 8,
+            block_info: BlockInfo::default(),
+        };
+        data.compute_stat();
+        let data = DataBlock::FixedWidth(data);
+
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let debug_str = format!("{compressor:?}");
+        assert!(
+            debug_str.contains("RleEncoder"),
+            "expected RLE to beat inline bitpacking after child selection, got: {debug_str}"
+        );
+
+        let (_compressed, encoding) = compressor.compress(data).unwrap();
+        let rle = expect_rle_encoding(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
             Compression::OutOfLineBitpacking(_)
