@@ -736,18 +736,8 @@ impl MergeInsertJob {
             )?);
         }
 
-        // 4 - Take the mapped row ids.  On the v2 storage format the take is
-        //     planned as a FilteredReadExec fed by the index-mapper stream:
-        //     the row ids become a row-id mask read through the planned
-        //     range-read path, which is considerably faster than TakeExec's
-        //     point-lookup path.  Both nodes have the same output contract
-        //     (input columns first, then the fetched columns).
-        //
-        //     INVARIANT: every site that replaces TakeExec with
-        //     FilteredReadExec must check is_legacy_storage() first.  The v1
-        //     reader's read_ranges_tasks is a stub that errors ("Attempt to
-        //     perform FilteredRead on v1 files"), so TakeExec remains the
-        //     only take that can read v1 files.
+        // 4 - Take the mapped row ids.  TakeExec stays for legacy storage
+        //     only: the v1 reader cannot serve a FilteredReadExec.
         let projection = self
             .dataset
             .empty_projection()

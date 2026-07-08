@@ -4850,12 +4850,8 @@ impl Scanner {
         let input_schema = input.schema();
         let has_usable_key = input_schema.column_with_name(ROW_ID).is_some()
             || input_schema.column_with_name(ROW_ADDR).is_some();
-        // INVARIANT: every site that replaces TakeExec with FilteredReadExec
-        // must check is_legacy_storage() first.  The v1 reader's
-        // read_ranges_tasks is a stub that errors ("Attempt to perform
-        // FilteredRead on v1 files"), so TakeExec remains the only take that
-        // can read v1 files.  The fallback becomes deletable when v1 read
-        // support is dropped.
+        // TakeExec stays for legacy storage only: the v1 reader cannot serve
+        // a FilteredReadExec.
         if !self.dataset.is_legacy_storage() && has_usable_key {
             let mut read_options = FilteredReadOptions::new(fields_to_take);
             // The node coalesces its input into read rounds itself; forward

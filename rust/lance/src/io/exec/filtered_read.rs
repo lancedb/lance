@@ -1497,7 +1497,7 @@ impl FilteredReadOptions {
 /// A plan node that reads a dataset, applying an optional filter and projection.
 ///
 /// This is a single, general I/O node: `output = read(row_source,
-/// fields_to_read) ⊕ carry_columns` (see [`RowSource`]).  For set-shaped row
+/// fields_to_read) ⊕ carry_columns` (see [`RowSelector`]).  For set-shaped row
 /// sources it picks the best read strategy based on the expected query cost
 /// which is determined by:
 ///  - Size of data in desired columns
@@ -1516,7 +1516,7 @@ pub struct FilteredReadExec {
     options: FilteredReadOptions,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
-    input: RowSource,
+    input: RowSelector,
     // Precomputed internal plan
     plan: Arc<OnceCell<FilteredReadInternalPlan>>,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
@@ -1524,49 +1524,30 @@ pub struct FilteredReadExec {
     running_stream: Arc<AsyncMutex<Option<FilteredReadStream>>>,
 }
 
-/// Who names the rows that a [`FilteredReadExec`] reads.
+/// Describes which rows a [`FilteredReadExec`] should read
 ///
-/// The node itself is a single, general I/O operator:
-///
-/// ```text
-/// output = read(row_source, fields_to_read) ⊕ carry_columns
-///
-/// schema() = carry_columns + fields_to_read     (uniform for every source)
-/// ```
-///
-/// Only the row source varies, and the differences between the variants are
-/// inherent to what the sources *are* — not modes of the node:
-///
-/// - [`AllRows`](Self::AllRows): no input plan; every live row.  No carry
-///   columns.
-/// - [`RowSet`](Self::RowSet): a *set* of rows, delivered as exactly one
-///   batch in the serialized [`IndexExprResult`] wire layout (produced by
-///   e.g. [`ScalarIndexExec`](super::scalar_index::ScalarIndexExec) or a
-///   `_rowid IN (...)` filter).  Sets are unordered and unique by nature, so
-///   the output is in storage order and deduplicated.  No carry columns.
-/// - [`RowStream`](Self::RowStream): a *stream* of rows — ordinary record
-///   batches with a `_rowid`/`_rowaddr` column.  Streams have row order,
-///   duplicates, and their own columns, and all three are preserved: the
-///   stream's columns are carried through to the output next to the newly
-///   read fields (the contract [`TakeExec`](super::TakeExec) provides).
-///   Internally each batch is converted to an in-memory [`IndexExprResult`],
-///   so a stream is the streaming generalization of a set.
-///
-/// The source kind is *derived*, never configured: [`FilteredReadExec::try_new`]
-/// inspects the input plan's schema (the wire layouts are unmistakable —
-/// binary mask columns; anything else must carry a row id or row address
-/// column).
+/// This can be all rows, a specific set of rows, or the read can be a
+/// "take" which reads new columns into an existing stream of rows using
+/// the `_rowid` or `_rowaddr`.  The kind is derived from the input plan's
+/// schema, never configured.
 #[derive(Debug)]
-enum RowSource {
+enum RowSelector {
     /// Every live row of the dataset (no input plan)
     AllRows,
-    /// A set of rows: one serialized [`IndexExprResult`] batch
+    /// A set of rows: one serialized [`IndexExprResult`] batch (the wire
+    /// layout emitted by e.g.
+    /// [`ScalarIndexExec`](super::scalar_index::ScalarIndexExec)).  Sets are
+    /// unordered and unique by nature, so the output is in storage order and
+    /// deduplicated.
     RowSet(Arc<dyn ExecutionPlan>),
-    /// A stream of rows: record batches whose columns are carried through
+    /// A stream of rows: record batches with a `_rowid`/`_rowaddr` column.
+    /// Row order, duplicates, and the stream's own columns are all preserved
+    /// in the output, next to the newly read fields (the contract
+    /// [`TakeExec`](super::TakeExec) provides).
     RowStream(Box<RowStreamSource>),
 }
 
-impl RowSource {
+impl RowSelector {
     /// The plan producing the serialized row set, if this source is a set
     fn row_set_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match self {
@@ -1591,9 +1572,8 @@ struct RowStreamSource {
     plan: Arc<dyn ExecutionPlan>,
     /// The stream column identifying rows: [`ROW_ID`] or [`ROW_ADDR`].
     ///
-    /// `_rowid` works on any dataset (the mask is resolved through each
-    /// fragment's row id sequence); `_rowaddr` only when row addresses
-    /// coincide with row ids (no stable row ids).
+    /// Both work on any dataset: ids resolve through each fragment's row id
+    /// sequence, addresses read directly by physical position.
     key_column: &'static str,
     /// `options.projection` minus the fields already present in the stream's
     /// schema — the fields this node actually reads
@@ -1649,33 +1629,23 @@ impl FilteredReadInternalPlan {
 }
 
 impl FilteredReadExec {
-    /// Create a new filtered read.
+    /// Create a new filtered read
     ///
-    /// `index_input` generalizes to "a plan that tells this node which rows to
-    /// read" and accepts two encodings, detected from the plan's schema:
-    ///
-    /// - A serialized [`IndexExprResult`] batch (the wire layout emitted by
-    ///   [`ScalarIndexExec`](super::scalar_index::ScalarIndexExec)): a row
-    ///   *set* scoping a scan.  This is the classic behavior.
-    /// - Any other plan carrying a `_rowid` or `_rowaddr` column: a row
-    ///   *stream* of rows.  The node reads `options.projection` for exactly
-    ///   those rows and merges the columns into the stream's batches,
-    ///   preserving row order, duplicates, and the stream's own columns —
-    ///   the same contract as [`TakeExec`](super::TakeExec).  Fields already
-    ///   present in the stream's schema are not re-read.
+    /// `input` identifies which rows to read.  It is parsed into a
+    /// [`RowSelector`] based on its schema.
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
-        index_input: Option<Arc<dyn ExecutionPlan>>,
+        input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
-        if let Some(input) = index_input {
+        if let Some(input) = input {
             if Self::is_index_query_schema(input.schema().as_ref()) {
-                Self::try_new_scan(dataset, options, RowSource::RowSet(input))
+                Self::try_new_scan(dataset, options, RowSelector::RowSet(input))
             } else {
                 Self::try_new_row_stream(dataset, options, input)
             }
         } else {
-            Self::try_new_scan(dataset, options, RowSource::AllRows)
+            Self::try_new_scan(dataset, options, RowSelector::AllRows)
         }
     }
 
@@ -1785,7 +1755,7 @@ impl FilteredReadExec {
             options,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            input: RowSource::RowStream(Box::new(RowStreamSource {
+            input: RowSelector::RowStream(Box::new(RowStreamSource {
                 plan: input,
                 key_column,
                 fields_to_read,
@@ -1799,7 +1769,7 @@ impl FilteredReadExec {
     fn try_new_scan(
         dataset: Arc<Dataset>,
         mut options: FilteredReadOptions,
-        input: RowSource,
+        input: RowSelector,
     ) -> Result<Self> {
         if options.with_deleted_rows {
             // Ensure we have the row id column if with_deleted_rows is set
@@ -2059,10 +2029,10 @@ impl FilteredReadExec {
     }
 
     /// The plan whose rows this node reads for (carrying its columns
-    /// through), if the row source is a stream (see [`Self::try_new`])
+    /// through), if the row selector is a stream (see [`Self::try_new`])
     pub fn row_stream_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match &self.input {
-            RowSource::RowStream(source) => Some(&source.plan),
+            RowSelector::RowStream(source) => Some(&source.plan),
             _ => None,
         }
     }
@@ -2124,7 +2094,7 @@ impl FilteredReadExec {
 const ROW_STREAM_PREFETCH_ROUNDS: usize = 64;
 
 /// Executes a [`FilteredReadExec`] over a row-stream source (see
-/// [`RowSource::RowStream`]).
+/// [`RowSelector::RowStream`]).
 ///
 /// Each input batch is converted into an in-memory exact [`IndexExprResult`]
 /// and pushed through the same planning and read pipeline as an index-query
@@ -2516,7 +2486,7 @@ impl RowStreamRead {
 
 impl DisplayAs for FilteredReadExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        if let RowSource::RowStream(source) = &self.input {
+        if let RowSelector::RowStream(source) = &self.input {
             let columns = source
                 .fields_to_read
                 .to_bare_schema()
@@ -2650,7 +2620,7 @@ impl ExecutionPlan for FilteredReadExec {
         &self,
         partition: Option<usize>,
     ) -> datafusion::error::Result<Statistics> {
-        if let RowSource::RowStream(source) = &self.input {
+        if let RowSelector::RowStream(source) = &self.input {
             // A row-stream read emits (at most) one output row per input row
             return Ok(Statistics {
                 num_rows: source.plan.partition_statistics(partition)?.num_rows,
@@ -2796,7 +2766,7 @@ impl ExecutionPlan for FilteredReadExec {
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         match &self.input {
-            RowSource::RowStream(source) => self.execute_row_stream(source, partition, context),
+            RowSelector::RowStream(source) => self.execute_row_stream(source, partition, context),
             _ => Ok(self.obtain_stream(partition, context)),
         }
     }
@@ -4946,6 +4916,47 @@ mod tests {
             assert_eq!(payload_col.values(), &payload[..]);
         }
 
+        /// A fragment-scoped take reads from the scoped fragments only; keys
+        /// pointing outside the scope drop like stale rows
+        #[tokio::test]
+        async fn take_scoped_to_fragments() {
+            let fixture = take_fixture(false).await;
+            let subset = Arc::new(vec![fixture.dataset.fragments()[1].clone()]);
+
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            let keys: Vec<u64> = vec![
+                addr(1, 2), // i = 12, inside the scoped fragment
+                addr(0, 3), // i = 3, outside the scope
+            ];
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ADDR,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
+                .unwrap();
+
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection).with_fragments(subset),
+                Some(rows_input(vec![batch])),
+            )
+            .unwrap();
+
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(result.num_rows(), 1);
+            let i_col = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            assert_eq!(i_col.value(0), 12);
+        }
+
         /// Take of new sub-fields into an existing struct column: the fields
         /// merge into the struct in dataset-schema order
         #[tokio::test]
@@ -5067,7 +5078,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                take_plan(&fixture.dataset, rows_input(vec![batch.clone()]), &["s"])
+                take_plan(&fixture.dataset, rows_input(vec![batch]), &["s"])
                     .unwrap_err()
                     .to_string()
                     .contains("must have a column")
