@@ -1084,4 +1084,22 @@ mod tests {
         let v = f32x8::gather(&a, &idx);
         assert_eq!(v.reduce_sum(), 113.0);
     }
+
+    /// Directly exercises `gather_scalar_x86`, the per-index scalar fallback
+    /// `f32x8::gather` takes on x86_64 hosts without AVX2. Runtime AVX2 hosts
+    /// route through `gather_avx2` instead, so the fallback is otherwise never
+    /// hit under coverage. Reading the `__m256`-backed result needs AVX, so
+    /// skip on hosts without it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_gather_scalar_x86() {
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        let a = (0..256).map(|f| f as f32).collect::<Vec<_>>();
+        let idx = [0_i32, 4, 8, 12, 16, 20, 24, 29];
+        let v = gather_scalar_x86(&a, &idx);
+        let expected = idx.map(|i| a[i as usize]);
+        assert_eq!(v.as_array(), expected);
+    }
 }

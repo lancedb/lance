@@ -1718,4 +1718,63 @@ mod tests {
             prop_assert!(approx::relative_eq!(scalar, avx, max_relative = 1e-5));
         }
     }
+
+    /// Asserts a batch-level f32 cosine SIMD kernel matches the scalar
+    /// `cosine_fast` reference for every vector in a multi-vector batch. Runs
+    /// each of the kernel's three internal dimension arms (8, 16, and the
+    /// general `chunks_exact` path). The batch kernels only run at runtime on
+    /// sub-AVX2 builds, so a direct call is the only way they get covered.
+    #[cfg(target_arch = "x86_64")]
+    fn check_cosine_batch_kernel(kernel: unsafe fn(&[f32], f32, &[f32], usize) -> Vec<f32>) {
+        for dimension in [8_usize, 16, 40] {
+            let x: Vec<f32> = (0..dimension).map(|i| (i as f32) * 0.5 + 1.0).collect();
+            let x_norm = norm_l2(&x);
+            let num_vectors = 3;
+            let batch: Vec<f32> = (0..dimension * num_vectors)
+                .map(|i| ((i % 7) as f32) + 1.0)
+                .collect();
+
+            let got = unsafe { kernel(&x, x_norm, &batch, dimension) };
+            assert_eq!(got.len(), num_vectors);
+
+            let x_f64: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+            for (chunk, &g) in batch.chunks_exact(dimension).zip(got.iter()) {
+                let y_f64: Vec<f64> = chunk.iter().map(|&v| v as f64).collect();
+                let expected = cosine_fast_scalar(&x_f64, x_norm, &y_f64);
+                assert_relative_eq!(g, expected, max_relative = 1e-3, epsilon = 1e-6);
+            }
+        }
+    }
+
+    /// AVX + FMA batch kernel parity (AVX2 / AVX+FMA tiers). Runs on any
+    /// Haswell-or-newer host; early-returns without AVX and FMA.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cosine_batch_avx_fma_matches_scalar() {
+        if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        check_cosine_batch_kernel(super::f32::cosine_batch_avx_fma);
+    }
+
+    /// AVX-only batch kernel parity (Sandy Bridge / Ivy Bridge tier).
+    /// Early-returns on hosts without AVX.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cosine_batch_avx_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        check_cosine_batch_kernel(super::f32::cosine_batch_avx);
+    }
+
+    /// AVX-512 batch kernel parity. Early-returns on hosts without AVX-512F.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cosine_batch_avx512_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        check_cosine_batch_kernel(super::f32::cosine_batch_avx512);
+    }
 }
