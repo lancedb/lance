@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import math
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -11,6 +10,7 @@ import pyarrow as pa
 
 from lance.indices.ivf import IvfModel
 from lance.indices.pq import PqModel
+from lance.util import _target_partition_size_to_num_partitions
 
 if TYPE_CHECKING:
     import torch
@@ -69,6 +69,7 @@ class IndicesBuilder:
         sample_rate: int = 256,
         max_iters: int = 50,
         fragment_ids: Optional[list[int]] = None,
+        target_partition_size: Optional[int] = None,
     ) -> IvfModel:
         """
         Train IVF centroids for the given vector column.
@@ -87,12 +88,14 @@ class IndicesBuilder:
         Parameters
         ----------
 
-        num_partitions: int
+        num_partitions: int, optional
+            Deprecated.  Use ``target_partition_size`` instead.
+
             The number of partitions to train.  Large values are more expensive to
             train and can lead to longer search times.  Smaller values could lead to
-            overtraining, reduced recall, and require large nprobes values.  If not
-            specified the default will be the integer nearest the square root of the
-            number of rows.
+            overtraining, reduced recall, and require large nprobes values.  If both
+            ``num_partitions`` and ``target_partition_size`` are specified,
+            ``num_partitions`` takes precedence.
         distance_type: "l2" | "dot" | "cosine" | "hamming"
             The distance type to used.  This is defined in more detail in the LanceDB
             documentation on creating indices.
@@ -111,9 +114,25 @@ class IndicesBuilder:
             max_iters parameter defines a cutoff at which we terminate training.
         fragment_ids: list[int], optional
             If provided, train using only the specified fragments from the dataset.
+        target_partition_size: int, optional
+            The target number of rows per partition.  The number of partitions is
+            computed as ``num_rows // target_partition_size``, clamped to [1, 4096].
+            If neither ``num_partitions`` nor ``target_partition_size`` is specified,
+            a default target partition size of 8192 is used.
         """
         num_rows = self._count_rows(fragment_ids)
-        num_partitions = self._determine_num_partitions(num_partitions, num_rows)
+        if num_partitions is None:
+            num_partitions = _target_partition_size_to_num_partitions(
+                num_rows, target_partition_size
+            )
+        elif target_partition_size is not None:
+            warnings.warn(
+                "Both num_partitions and target_partition_size are specified; "
+                "num_partitions takes precedence and target_partition_size is "
+                "ignored.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
         distance_type = self._normalize_distance_type(distance_type)
         self._verify_ivf_params(num_partitions)
@@ -474,11 +493,6 @@ class IndicesBuilder:
             )
         else:
             raise ValueError("filenames must be a list of strings")
-
-    def _determine_num_partitions(self, num_partitions: Optional[int], num_rows: int):
-        if num_partitions is None:
-            return round(math.sqrt(num_rows))
-        return num_partitions
 
     def _count_rows(self, fragment_ids: Optional[list[int]] = None) -> int:
         if fragment_ids is None:

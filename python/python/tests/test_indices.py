@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
-import math
 import os
 import pathlib
 
@@ -92,7 +91,9 @@ def make_multivector_dataset(tmpdir):
 
 
 def test_ivf_centroids(tmpdir, rand_dataset):
-    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        num_partitions=NUM_PARTITIONS, sample_rate=16
+    )
 
     assert ivf.distance_type == "l2"
     assert len(ivf.centroids) == NUM_PARTITIONS
@@ -115,12 +116,11 @@ def test_ivf_centroids_hamming(tmpdir):
     ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
 
     ivf = IndicesBuilder(ds, "vectors").train_ivf(
-        sample_rate=16, distance_type="hamming"
+        num_partitions=NUM_PARTITIONS, sample_rate=16, distance_type="hamming"
     )
 
     assert ivf.distance_type == "hamming"
-    expected_partitions = round(math.sqrt(num_rows))
-    assert len(ivf.centroids) == expected_partitions
+    assert len(ivf.centroids) == NUM_PARTITIONS
 
     ivf.save(str(tmpdir / "ivf_hamming"))
     reloaded = IvfModel.load(str(tmpdir / "ivf_hamming"))
@@ -131,7 +131,7 @@ def test_ivf_centroids_hamming(tmpdir):
 @pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
 def test_ivf_centroids_mostly_null(mostly_null_dataset, distance_type):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
-        sample_rate=16, distance_type=distance_type
+        num_partitions=NUM_PARTITIONS, sample_rate=16, distance_type=distance_type
     )
 
     assert ivf.distance_type == distance_type
@@ -141,20 +141,21 @@ def test_ivf_centroids_mostly_null(mostly_null_dataset, distance_type):
 @pytest.mark.cuda
 def test_ivf_centroids_cuda(rand_dataset):
     ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
-        sample_rate=16, accelerator="cuda"
+        num_partitions=NUM_PARTITIONS, sample_rate=16, accelerator="cuda"
     )
 
     assert ivf.distance_type == "l2"
-    # Can't use NUM_PARTITIONS here because
-    # CUDA uses math.ceil and CPU uses round to calc. num_partitions
-    assert len(ivf.centroids) == math.ceil(np.sqrt(NUM_ROWS))
+    assert len(ivf.centroids) == NUM_PARTITIONS
 
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
 def test_ivf_centroids_mostly_null_cuda(mostly_null_dataset, distance_type):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
-        sample_rate=16, accelerator="cuda", distance_type=distance_type
+        num_partitions=NUM_PARTITIONS,
+        sample_rate=16,
+        accelerator="cuda",
+        distance_type=distance_type,
     )
 
     assert ivf.distance_type == distance_type
@@ -181,6 +182,30 @@ def test_num_partitions(rand_dataset):
         sample_rate=16, num_partitions=10
     )
     assert ivf.num_partitions == 10
+
+
+def test_target_partition_size(rand_dataset):
+    # num_partitions is computed as num_rows // target_partition_size,
+    # clamped to [1, 4096].
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+        sample_rate=16, target_partition_size=5000
+    )
+    assert ivf.num_partitions == NUM_ROWS // 5000
+
+
+def test_target_partition_size_default(rand_dataset):
+    # When neither num_partitions nor target_partition_size is specified, the
+    # default target partition size of 8192 is used.
+    ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
+    assert ivf.num_partitions == NUM_ROWS // 8192
+
+
+def test_num_partitions_overrides_target(rand_dataset):
+    with pytest.warns(DeprecationWarning, match="num_partitions takes precedence"):
+        ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
+            sample_rate=16, num_partitions=5, target_partition_size=5000
+        )
+    assert ivf.num_partitions == 5
 
 
 @pytest.fixture
