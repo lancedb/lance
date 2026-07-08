@@ -35,6 +35,7 @@
 //! base/flushed Lance datasets, `MemTableScanner` for the active
 //! memtable) and requires no changes to `lance-index`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
@@ -49,10 +50,11 @@ use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use tracing::instrument;
+use uuid::Uuid;
 
-use super::block_list::compute_source_block_lists;
+use super::block_list::compute_source_block_lists_at;
 use super::collector::LsmDataSourceCollector;
-use super::data_source::LsmDataSource;
+use super::data_source::{FreshTierWatermark, LsmDataSource};
 use super::exec::PkBlockFilterExec;
 use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{project_to_canonical, validate_projection_names};
@@ -87,20 +89,79 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
 }
 
 fn active_source_can_execute_fts(source: &LsmDataSource, column: &str) -> bool {
+    active_source_can_execute_fts_at(source, column, None)
+}
+
+fn active_source_can_execute_fts_at(
+    source: &LsmDataSource,
+    column: &str,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> bool {
     match source {
         LsmDataSource::ActiveMemTable {
             batch_store,
             index_store,
             ..
         } => {
+            let Some(bound) = active_visibility_bound(source, watermarks) else {
+                return false;
+            };
+            let max_visible_batch_position =
+                bound.unwrap_or_else(|| index_store.max_visible_batch_position());
             index_store
                 .get_fts_by_column(column)
                 .is_some_and(|index| !index.is_empty())
                 && batch_store
-                    .max_visible_row(index_store.max_visible_batch_position())
+                    .max_visible_row(max_visible_batch_position)
                     .is_some()
         }
         _ => false,
+    }
+}
+
+fn active_visibility_bound(
+    source: &LsmDataSource,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> Option<Option<usize>> {
+    match source {
+        LsmDataSource::ActiveMemTable {
+            shard_id,
+            generation,
+            ..
+        } => match watermarks.and_then(|m| m.get(shard_id)) {
+            None => Some(None),
+            Some(watermark) => {
+                let g = generation.as_u64();
+                if g > watermark.active_generation {
+                    None
+                } else if g == watermark.active_generation {
+                    let last_batch = watermark.active_batch_count.checked_sub(1)?;
+                    Some(Some(usize::try_from(last_batch).unwrap_or(usize::MAX)))
+                } else {
+                    Some(None)
+                }
+            }
+        },
+        _ => Some(None),
+    }
+}
+
+fn source_visible_at(
+    source: &LsmDataSource,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> bool {
+    match source {
+        LsmDataSource::BaseTable { .. } => true,
+        LsmDataSource::ActiveMemTable { .. } => {
+            active_visibility_bound(source, watermarks).is_some()
+        }
+        LsmDataSource::FlushedMemTable {
+            shard_id,
+            generation,
+            ..
+        } => watermarks
+            .and_then(|m| m.get(shard_id))
+            .is_none_or(|watermark| generation.as_u64() < watermark.active_generation),
     }
 }
 
@@ -117,6 +178,9 @@ pub struct LsmFtsSearchPlanner {
     warmer: Option<Arc<dyn GenerationWarmer>>,
     /// Over-fetch multiple for blocked sources.
     overfetch_factor: f64,
+    /// Optional per-shard read watermark. When set, active memtable reads and
+    /// cross-generation block-lists are both bounded to the same cut.
+    watermarks: Option<HashMap<Uuid, FreshTierWatermark>>,
     /// Optional prefilter predicate applied to every source arm so FTS hits
     /// failing the predicate are dropped. Base/flushed arms use the dataset
     /// scanner's native filter; memtable arms filter the materialized hits.
@@ -138,6 +202,7 @@ impl LsmFtsSearchPlanner {
             flushed_cache: None,
             warmer: None,
             overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
+            watermarks: None,
             filter: None,
         }
     }
@@ -155,6 +220,12 @@ impl LsmFtsSearchPlanner {
     /// `1.0` are rejected by [`Self::plan_search`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = factor;
+        self
+    }
+
+    /// Bound this planner to a per-shard fresh-tier watermark.
+    pub fn with_watermarks(mut self, watermarks: HashMap<Uuid, FreshTierWatermark>) -> Self {
+        self.watermarks = Some(watermarks);
         self
     }
 
@@ -207,10 +278,9 @@ impl LsmFtsSearchPlanner {
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let sources = self.collector.collect()?;
-        if sources
-            .iter()
-            .any(|source| active_source_can_execute_fts(source, column))
-        {
+        if sources.iter().any(|source| {
+            active_source_can_execute_fts_at(source, column, self.watermarks.as_ref())
+        }) {
             validate_lsm_fts_query(&query)?;
         }
         validate_projection_names(projection, &self.base_schema, &[SCORE_COLUMN])?;
@@ -225,10 +295,11 @@ impl LsmFtsSearchPlanner {
         // shard; base = union of all gens). Query-type-agnostic — same call the
         // vector planner makes. `Box::pin` keeps the future off
         // `clippy::large_futures`.
-        let block_lists = Box::pin(compute_source_block_lists(
+        let block_lists = Box::pin(compute_source_block_lists_at(
             &sources,
             self.session.as_ref(),
             self.flushed_cache.as_ref(),
+            self.watermarks.as_ref(),
         ))
         .await?;
 
@@ -349,6 +420,9 @@ impl LsmFtsSearchPlanner {
         limit: Option<usize>,
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !source_visible_at(source, self.watermarks.as_ref()) {
+            return self.empty_plan(&self.canonical_fts_schema(projection));
+        }
         match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
@@ -408,6 +482,11 @@ impl LsmFtsSearchPlanner {
                 validate_lsm_fts_query(query)?;
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                if let Some(max_visible_batch_position) =
+                    active_visibility_bound(source, self.watermarks.as_ref()).flatten()
+                {
+                    scanner.with_max_visible_batch_position(max_visible_batch_position);
+                }
                 let cols = self.fts_scanner_projection(projection);
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 if let Some(ref filter) = self.filter {
@@ -2272,6 +2351,104 @@ mod tests {
         assert!(
             ids.contains(&2),
             "live pk=2 ('alpha foo', only in the frozen gen) must still match; got ids={ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watermarked_fts_does_not_let_later_active_append_block_frozen_hit() {
+        let schema = fts_schema();
+        let shard_id = uuid::Uuid::new_v4();
+
+        let frozen_store = Arc::new(BatchStore::with_capacity(16));
+        let mut frozen_idx = IndexStore::new();
+        frozen_idx.enable_pk_index(&[("id".to_string(), 0)]);
+        frozen_idx.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let frozen = make_batch(&schema, &[1], &["alpha frozen"]);
+        let (bp, off, _) = frozen_store.append(frozen.clone()).unwrap();
+        frozen_idx
+            .insert_with_batch_position(&frozen, off, Some(bp))
+            .unwrap();
+
+        let active_store = Arc::new(BatchStore::with_capacity(16));
+        let mut active_idx = IndexStore::new();
+        active_idx.enable_pk_index(&[("id".to_string(), 0)]);
+        active_idx.add_fts("text_fts".to_string(), 1, "text".to_string());
+        let visible_at_cut = make_batch(&schema, &[99], &["alpha visible"]);
+        let (bp, off, _) = active_store.append(visible_at_cut.clone()).unwrap();
+        active_idx
+            .insert_with_batch_position(&visible_at_cut, off, Some(bp))
+            .unwrap();
+        let after_cut = make_batch(&schema, &[1], &["beta after cut"]);
+        let (bp, off, _) = active_store.append(after_cut.clone()).unwrap();
+        active_idx
+            .insert_with_batch_position(&after_cut, off, Some(bp))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: active_store,
+                        index_store: Arc::new(active_idx),
+                        schema: schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![InMemoryMemTableRef {
+                        batch_store: frozen_store,
+                        index_store: Arc::new(frozen_idx),
+                        schema: schema.clone(),
+                        generation: 1,
+                    }],
+                },
+            );
+
+        let watermarks = HashMap::from([(
+            shard_id,
+            FreshTierWatermark {
+                active_generation: 2,
+                active_batch_count: 1,
+            },
+        )]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
+            .with_watermarks(watermarks);
+        let plan = planner
+            .plan_search(
+                "text",
+                FullTextSearchQuery::new("alpha".to_string()),
+                Some(10),
+                None,
+            )
+            .await
+            .expect("planner should produce a watermarked plan");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let mut ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let col = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids.sort_unstable();
+
+        assert!(
+            ids.contains(&1),
+            "post-cut active append for pk=1 must not block the frozen alpha hit; got ids={ids:?}"
+        );
+        assert!(
+            ids.contains(&99),
+            "visible active alpha row should still be returned; got ids={ids:?}"
         );
     }
 }

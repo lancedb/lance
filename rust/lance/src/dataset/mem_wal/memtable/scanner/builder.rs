@@ -512,6 +512,22 @@ impl MemTableScanner {
         self.max_visible_batch_position
     }
 
+    /// Cap this scanner to an earlier visible batch position.
+    ///
+    /// This is used by multi-part snapshot reads that first capture a
+    /// fresh-tier watermark and then need the active memtable arm to execute at
+    /// that same cut. The scanner may already have latched an older index
+    /// visibility, so keep the minimum of the two bounds.
+    pub fn with_max_visible_batch_position(
+        &mut self,
+        max_visible_batch_position: usize,
+    ) -> &mut Self {
+        self.max_visible_batch_position = self
+            .max_visible_batch_position
+            .min(max_visible_batch_position);
+        self
+    }
+
     /// Include the _rowaddr column in output.
     ///
     /// Same value as _rowid but named for compatibility with LSM scanner.

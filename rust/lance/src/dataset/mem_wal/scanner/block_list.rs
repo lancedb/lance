@@ -159,6 +159,18 @@ pub async fn compute_source_block_lists(
     session: Option<&Arc<Session>>,
     flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
+    compute_source_block_lists_at(sources, session, flushed_cache, None).await
+}
+
+/// As-of variant of [`compute_source_block_lists`]. Newer-generation
+/// membership is evaluated against `watermarks`, so rows appended after a
+/// read-arm cut cannot suppress older source rows that the same arm did see.
+pub async fn compute_source_block_lists_at(
+    sources: &[LsmDataSource],
+    session: Option<&Arc<Session>>,
+    flushed_cache: Option<&Arc<dyn DatasetCache>>,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
     // per-shard, so supersession is within-shard only).
     let mut by_shard: ShardGenSets = HashMap::new();
@@ -176,21 +188,35 @@ pub async fn compute_source_block_lists(
                 generation,
                 ..
             } => {
-                let membership = in_memory_membership(batch_store, index_store);
-                by_shard
-                    .entry(*shard_id)
-                    .or_default()
-                    .push((*generation, membership));
+                if let Some(membership) = in_memory_membership_at(
+                    batch_store,
+                    index_store,
+                    *shard_id,
+                    *generation,
+                    watermarks,
+                ) {
+                    by_shard
+                        .entry(*shard_id)
+                        .or_default()
+                        .push((*generation, membership));
+                }
             }
             LsmDataSource::FlushedMemTable {
                 path,
                 shard_id,
                 generation,
                 ..
-            } => flushed_loads.push(async move {
-                let index = open_pk_index(path, session, flushed_cache).await?;
-                Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
-            }),
+            } => {
+                let flushed_after_snapshot = watermarks
+                    .and_then(|m| m.get(shard_id))
+                    .is_some_and(|watermark| generation.as_u64() >= watermark.active_generation);
+                if !flushed_after_snapshot {
+                    flushed_loads.push(async move {
+                        let index = open_pk_index(path, session, flushed_cache).await?;
+                        Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
+                    });
+                }
+            }
         }
     }
     for (shard_id, generation, membership) in futures::future::try_join_all(flushed_loads).await? {
@@ -221,6 +247,32 @@ pub async fn compute_source_block_lists(
         blocked.insert((None, LsmGeneration::BASE_TABLE), base_blocked);
     }
     Ok(blocked)
+}
+
+fn in_memory_membership_at(
+    batch_store: &Arc<BatchStore>,
+    index_store: &Arc<IndexStore>,
+    shard_id: Uuid,
+    generation: LsmGeneration,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> Option<GenMembership> {
+    match watermarks.and_then(|m| m.get(&shard_id)) {
+        None => Some(in_memory_membership(batch_store, index_store)),
+        Some(watermark) => {
+            let g = generation.as_u64();
+            if g > watermark.active_generation {
+                None
+            } else if g == watermark.active_generation {
+                Some(bounded_in_memory_membership(
+                    batch_store,
+                    index_store,
+                    watermark.active_batch_count,
+                ))
+            } else {
+                Some(in_memory_membership(batch_store, index_store))
+            }
+        }
+    }
 }
 
 /// The fresh-tier block-list: one [`GenMembership`] per generation that shadows
