@@ -70,6 +70,7 @@ public class WriteDatasetBuilder {
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
+  private Map<String, String> tableProperties = new HashMap<>();
   private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private boolean ignoreNamespaceStorageOptions = false;
   private Optional<Integer> maxRowsPerFile = Optional.empty();
@@ -204,6 +205,21 @@ public class WriteDatasetBuilder {
    */
   public WriteDatasetBuilder storageOptions(Map<String, String> storageOptions) {
     this.storageOptions = new HashMap<>(storageOptions);
+    return this;
+  }
+
+  /**
+   * Sets user table properties to forward to the namespace on table creation.
+   *
+   * <p>Only used when a namespace client is configured via namespaceClient()+tableId() and the
+   * write creates the table (CREATE mode): the properties are attached to the underlying
+   * declareTable request. Ignored for direct-URI writes and for APPEND/OVERWRITE modes.
+   *
+   * @param tableProperties Table properties to forward on declareTable
+   * @return this builder instance
+   */
+  public WriteDatasetBuilder tableProperties(Map<String, String> tableProperties) {
+    this.tableProperties = new HashMap<>(tableProperties);
     return this;
   }
 
@@ -410,6 +426,9 @@ public class WriteDatasetBuilder {
     if (mode == WriteParams.WriteMode.CREATE) {
       DeclareTableRequest declareRequest = new DeclareTableRequest();
       declareRequest.setId(tableId);
+      if (tableProperties != null && !tableProperties.isEmpty()) {
+        declareRequest.setProperties(tableProperties);
+      }
       DeclareTableResponse declareResponse = namespaceClient.declareTable(declareRequest);
 
       tableUri = declareResponse.getLocation();
