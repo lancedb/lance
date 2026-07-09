@@ -418,7 +418,9 @@ pub struct PackedStructFixedPerValueEncoder {
 
 impl PackedStructFixedPerValueEncoder {
     pub fn new(fields: Vec<Field>) -> Self {
-        Self { field_len: fields.len() }
+        Self {
+            field_len: fields.len(),
+        }
     }
 }
 
