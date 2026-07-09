@@ -1892,7 +1892,7 @@ pub(crate) async fn remap_index_file(
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
 
-    let mut task_stream = stream::iter(tasks.into_iter())
+    let mut task_stream = stream::iter(tasks)
         .map(|task| task.load_and_remap(reader.clone(), index, mapping))
         .buffered(object_store.io_parallelism());
 

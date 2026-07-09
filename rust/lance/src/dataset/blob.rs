@@ -691,10 +691,8 @@ impl BlobPreprocessor {
 
         let mut new_columns = Vec::with_capacity(children.len());
         let mut new_fields = Vec::with_capacity(children.len());
-        for ((child_processor, child_array), child_field) in children
-            .iter()
-            .zip(child_columns.into_iter())
-            .zip(child_fields.iter())
+        for ((child_processor, child_array), child_field) in
+            children.iter().zip(child_columns).zip(child_fields.iter())
         {
             let (new_column, new_field) = self
                 .preprocess_field(child_processor, child_array, child_field)

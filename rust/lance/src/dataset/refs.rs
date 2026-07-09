@@ -475,7 +475,7 @@ impl Branches<'_> {
 
         if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
-                message: format!("Manifest file {} does not exist", &manifest_file.path),
+                message: format!("Manifest file {} does not exist", manifest_file.path),
             });
         };
 
