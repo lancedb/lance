@@ -20,6 +20,10 @@ pub enum SimdSupport {
     /// AVX + FMA but no AVX2.
     /// AMD Piledriver / Steamroller / FX-7500.
     AvxFma,
+    /// AVX2 + FMA. Intel Haswell / AMD Excavator and later.
+    ///
+    /// Selecting this tier asserts FMA is present: the kernels it dispatches to
+    /// are `#[target_feature(enable = "avx,fma")]`.
     Avx2,
     Avx512,
     Avx512FP16,
@@ -179,7 +183,12 @@ pub static SIMD_SUPPORT: LazyLock<SimdSupport> = LazyLock::new(|| {
             } else {
                 SimdSupport::Avx512
             }
-        } else if is_x86_feature_detected!("avx2") {
+        } else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // FMA is checked explicitly: every kernel selected for this tier is
+            // `#[target_feature(enable = "avx,fma")]`, and AVX2 does not imply
+            // FMA in the ISA. Every shipping AVX2 part has FMA, so this only
+            // guards against a host that would otherwise take an FMA kernel
+            // without FMA.
             SimdSupport::Avx2
         } else if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
             // AMD Piledriver / Steamroller / FX-7500: 256-bit float ops + FMA but no AVX2.
@@ -309,6 +318,23 @@ mod tests {
     fn simd_info_features_empty_off_x86_64() {
         let info = simd_info();
         assert!(info.host_features.is_empty());
+    }
+
+    /// The `Avx2` and `AvxFma` tiers both dispatch to kernels declared
+    /// `#[target_feature(enable = "avx,fma")]`, so neither may be selected on a
+    /// host without FMA. AVX2 does not imply FMA in the ISA, so the detection
+    /// checks it explicitly. (`Avx512*` is excluded: its kernels declare
+    /// `avx512f`, which is what `has_avx512` verifies.)
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx_fma_tiers_are_only_selected_when_fma_is_detected() {
+        if matches!(*SIMD_SUPPORT, SimdSupport::Avx2 | SimdSupport::AvxFma) {
+            assert!(
+                is_x86_feature_detected!("fma"),
+                "tier {} dispatches to avx,fma kernels but the host has no FMA",
+                *SIMD_SUPPORT
+            );
+        }
     }
 
     #[rstest]
