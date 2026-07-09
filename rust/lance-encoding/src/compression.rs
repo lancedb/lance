@@ -213,7 +213,7 @@ fn try_rle_for_mini_block(
         )
     };
 
-    let use_child_encodings = version.resolve() >= LanceFileVersion::V2_2;
+    let use_child_encodings = version.resolve() >= LanceFileVersion::V2_3;
     let child_compression = if use_child_encodings {
         rle_child_compression_config(params)
     } else {
@@ -2171,51 +2171,60 @@ mod tests {
 
     #[test]
     #[cfg(any(feature = "lz4", feature = "zstd"))]
-    fn test_rle_miniblock_v2_1_keeps_flat_children_when_compression_requested() {
-        let mut params = CompressionParams::new();
-        params.columns.insert(
-            "dict_indices".to_string(),
-            CompressionFieldParams {
-                compression: Some(if cfg!(feature = "lz4") { "lz4" } else { "zstd" }.to_string()),
-                rle_threshold: Some(1.0),
-                bss: Some(BssMode::Off),
-                ..Default::default()
-            },
-        );
-        let strategy =
-            DefaultCompressionStrategy::with_params(params).with_version(LanceFileVersion::V2_1);
-        let field = create_test_field("dict_indices", DataType::UInt32);
+    fn test_rle_miniblock_released_versions_keep_flat_children_when_compression_requested() {
+        for version in [LanceFileVersion::V2_1, LanceFileVersion::V2_2] {
+            let mut params = CompressionParams::new();
+            params.columns.insert(
+                "dict_indices".to_string(),
+                CompressionFieldParams {
+                    compression: Some(
+                        if cfg!(feature = "lz4") { "lz4" } else { "zstd" }.to_string(),
+                    ),
+                    rle_threshold: Some(1.0),
+                    bss: Some(BssMode::Off),
+                    ..Default::default()
+                },
+            );
+            let strategy = DefaultCompressionStrategy::with_params(params).with_version(version);
+            let field = create_test_field("dict_indices", DataType::UInt32);
 
-        let mut values = Vec::with_capacity(8192 * 4);
-        for value in 0..8192u32 {
-            values.extend(std::iter::repeat_n(value, 4));
+            let mut values = Vec::with_capacity(8192 * 4);
+            for value in 0..8192u32 {
+                values.extend(std::iter::repeat_n(value, 4));
+            }
+            let mut data = FixedWidthDataBlock {
+                bits_per_value: 32,
+                data: LanceBuffer::reinterpret_vec(values),
+                num_values: 8192 * 4,
+                block_info: BlockInfo::default(),
+            };
+            data.compute_stat();
+            let data = DataBlock::FixedWidth(data);
+
+            let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+            let (_compressed, encoding) = compressor.compress(data).unwrap();
+            let rle = expect_rle_encoding(&encoding);
+
+            assert!(
+                matches!(
+                    rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
+                    Compression::Flat(_)
+                ),
+                "version={version}"
+            );
+            assert!(
+                matches!(
+                    rle.run_lengths
+                        .as_ref()
+                        .unwrap()
+                        .compression
+                        .as_ref()
+                        .unwrap(),
+                    Compression::Flat(_)
+                ),
+                "version={version}"
+            );
         }
-        let mut data = FixedWidthDataBlock {
-            bits_per_value: 32,
-            data: LanceBuffer::reinterpret_vec(values),
-            num_values: 8192 * 4,
-            block_info: BlockInfo::default(),
-        };
-        data.compute_stat();
-        let data = DataBlock::FixedWidth(data);
-
-        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (_compressed, encoding) = compressor.compress(data).unwrap();
-        let rle = expect_rle_encoding(&encoding);
-
-        assert!(matches!(
-            rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
-            Compression::Flat(_)
-        ));
-        assert!(matches!(
-            rle.run_lengths
-                .as_ref()
-                .unwrap()
-                .compression
-                .as_ref()
-                .unwrap(),
-            Compression::Flat(_)
-        ));
     }
 
     #[test]
@@ -2283,7 +2292,7 @@ mod tests {
         data.compute_stat();
         let data = DataBlock::FixedWidth(data);
 
-        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
         let debug_str = format!("{compressor:?}");
         assert!(
