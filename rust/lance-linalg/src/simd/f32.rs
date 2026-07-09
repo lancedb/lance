@@ -735,8 +735,9 @@ impl SIMD<f32, 16> for f32x16 {
         unsafe {
             // _mm256_cmpeq_ps_mask requires AVX-512 (avx512f); use a scalar scan here
             // since we only require AVX2.
+            let arr = self.as_array();
             for i in 0..16 {
-                if self.as_array().get_unchecked(i) == &val {
+                if arr.get_unchecked(i) == &val {
                     return Some(i as i32);
                 }
             }

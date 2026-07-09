@@ -27,7 +27,7 @@ Currently Lance is implemented in Rust and comes with a Python wrapper. So you'l
 
 ## Building for legacy x86_64 hosts (pre-Haswell)
 
-The default workspace build targets `x86-64-haswell` (AVX2 + FMA + F16C), matching the published wheels. To build a binary that runs on pre-Haswell silicon (Sandy Bridge / Ivy Bridge / Westmere on Intel, Bulldozer / Piledriver / Steamroller on AMD — i.e. CPUs without AVX2), set the baseline yourself at build time:
+The default workspace build targets `haswell` (AVX2 + FMA + F16C), matching the published wheels. To build a binary that runs on pre-Haswell silicon (Sandy Bridge / Ivy Bridge / Westmere on Intel, Bulldozer / Piledriver / Steamroller on AMD — i.e. CPUs without AVX2), set the baseline yourself at build time:
 
 ```sh
 RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release

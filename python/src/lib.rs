@@ -361,6 +361,14 @@ fn iops_counter() -> PyResult<u64> {
 ///     "target_arch": str,               # e.g. "x86_64", "aarch64", "loongarch64"
 ///     "host_features": list[str],       # raw CPU feature flags (x86_64 only)
 ///   }
+///
+/// Examples:
+///   >>> import lance
+///   >>> info = lance.simd_info()
+///   >>> sorted(info)
+///   ['host_features', 'target_arch', 'tier']
+///   >>> isinstance(info["tier"], str)
+///   True
 #[pyfunction]
 pub fn simd_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
     let info = lance_core::utils::cpu::simd_info();

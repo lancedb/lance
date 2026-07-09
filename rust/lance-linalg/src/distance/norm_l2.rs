@@ -287,7 +287,9 @@ mod x86 {
     }
 
     /// Horizontal sum of an `__m256` register. Folds the upper 128-bit lane
-    /// into the lower, then sums lanes pairwise via two `vhaddps`.
+    /// into the lower, then sums lanes pairwise. Same shape as the helper in
+    /// the sibling `dot.rs` and `l2.rs` mod x86; kept local rather than
+    /// hoisted to a shared module to avoid a one-helper module file.
     #[inline]
     #[target_feature(enable = "avx")]
     unsafe fn hsum256_ps(v: __m256) -> f32 {

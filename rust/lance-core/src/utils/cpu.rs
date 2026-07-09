@@ -52,7 +52,7 @@ impl fmt::Display for SimdSupport {
 ///
 /// Mirrors the role of `pyarrow.runtime_info()`: a single, cheap call users can
 /// make to verify which SIMD tier the runtime selected and what underlying
-/// features the host advertises.
+/// features the host advertises. Obtain one with [`simd_info()`].
 #[derive(Debug, Clone)]
 pub struct SimdInfo {
     /// The SIMD tier lance dispatches to at runtime on this host.
@@ -69,7 +69,17 @@ pub struct SimdInfo {
 /// the raw CPU feature flags that drove the decision.
 ///
 /// Useful for performance debugging and giving users a way to verify which
-/// dispatch tier they are hitting without rebuilding lance.
+/// dispatch tier they are hitting without rebuilding lance. See [`SimdInfo`]
+/// for the meaning of each field and [`SimdSupport`] for the tier values.
+///
+/// # Examples
+///
+/// ```
+/// use lance_core::utils::cpu::simd_info;
+///
+/// let info = simd_info();
+/// println!("dispatching to {} on {}", info.tier, info.target_arch);
+/// ```
 pub fn simd_info() -> SimdInfo {
     SimdInfo {
         tier: *SIMD_SUPPORT,
@@ -83,7 +93,7 @@ fn detect_host_features() -> Vec<&'static str> {
     // Each call must be inline: `is_x86_feature_detected!` does its own custom
     // input parsing and rejects feature names received via a `macro_rules!`
     // `:literal` metavariable on some toolchains.
-    let mut features = Vec::new();
+    let mut features = Vec::with_capacity(17);
     if is_x86_feature_detected!("sse2") {
         features.push("sse2");
     }
@@ -275,6 +285,7 @@ mod aarch64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn simd_info_exposes_tier() {
@@ -300,17 +311,21 @@ mod tests {
         assert!(info.host_features.is_empty());
     }
 
-    #[test]
-    fn simd_support_display_matches_lowercase_convention() {
-        assert_eq!(SimdSupport::Avx2.to_string(), "avx2");
-        assert_eq!(SimdSupport::AvxFma.to_string(), "avx_fma");
-        assert_eq!(SimdSupport::Avx.to_string(), "avx");
-        assert_eq!(SimdSupport::Avx512.to_string(), "avx512");
-        assert_eq!(SimdSupport::Avx512FP16.to_string(), "avx512_fp16");
-        assert_eq!(SimdSupport::None.to_string(), "none");
-        assert_eq!(SimdSupport::Neon.to_string(), "neon");
-        assert_eq!(SimdSupport::Sse.to_string(), "sse");
-        assert_eq!(SimdSupport::Lsx.to_string(), "lsx");
-        assert_eq!(SimdSupport::Lasx.to_string(), "lasx");
+    #[rstest]
+    #[case::none(SimdSupport::None, "none")]
+    #[case::neon(SimdSupport::Neon, "neon")]
+    #[case::sse(SimdSupport::Sse, "sse")]
+    #[case::avx(SimdSupport::Avx, "avx")]
+    #[case::avx_fma(SimdSupport::AvxFma, "avx_fma")]
+    #[case::avx2(SimdSupport::Avx2, "avx2")]
+    #[case::avx512(SimdSupport::Avx512, "avx512")]
+    #[case::avx512_fp16(SimdSupport::Avx512FP16, "avx512_fp16")]
+    #[case::lsx(SimdSupport::Lsx, "lsx")]
+    #[case::lasx(SimdSupport::Lasx, "lasx")]
+    fn simd_support_display_matches_lowercase_convention(
+        #[case] tier: SimdSupport,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(tier.to_string(), expected);
     }
 }
