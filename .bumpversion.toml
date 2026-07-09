@@ -82,6 +82,11 @@ replace = 'lance-index = {{ version = "={new_version}"'
 
 [[tool.bumpversion.files]]
 filename = "Cargo.toml"
+search = 'lance-index-core = {{ version = "={current_version}"'
+replace = 'lance-index-core = {{ version = "={new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "Cargo.toml"
 search = 'lance-io = {{ version = "={current_version}"'
 replace = 'lance-io = {{ version = "={new_version}"'
 

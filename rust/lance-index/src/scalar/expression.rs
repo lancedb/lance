@@ -1662,12 +1662,16 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-impl From<SearchResult> for NullableIndexExprResult {
-    fn from(result: SearchResult) -> Self {
-        match result {
-            SearchResult::Exact(mask) => Self::exact(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtMost(mask) => Self::at_most(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtLeast(mask) => Self::at_least(NullableRowAddrMask::AllowList(mask)),
+fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
+    match result {
+        SearchResult::Exact(mask) => {
+            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
+        }
+        SearchResult::AtMost(mask) => {
+            NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(mask))
+        }
+        SearchResult::AtLeast(mask) => {
+            NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
         }
     }
 }
@@ -1707,7 +1711,7 @@ impl ScalarIndexExpr {
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
-                let result: NullableIndexExprResult = search_result.into();
+                let result = search_result_to_nullable(search_result);
                 if index.results_are_row_addresses() {
                     // Translate address-domain results to the row-id domain
                     // before combining or scanning; otherwise stable-row-id

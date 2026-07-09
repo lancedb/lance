@@ -4832,6 +4832,7 @@ dependencies = [
  "lance-encoding",
  "lance-file",
  "lance-geo",
+ "lance-index-core",
  "lance-io",
  "lance-linalg",
  "lance-select",
@@ -4862,6 +4863,28 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "lance-index-core"
+version = "9.0.0-beta.24"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "datafusion-common",
+ "datafusion-expr",
+ "futures",
+ "lance-core",
+ "lance-io",
+ "lance-select",
+ "prost-types",
+ "roaring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
