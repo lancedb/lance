@@ -467,6 +467,61 @@ mod test {
         assert_eq!(index.get(5), None);
     }
 
+    /// 100 sequential rows across 4 fragments with every third row deleted.
+    async fn deleted_thirds_dataset(enable_stable_row_ids: bool) -> Dataset {
+        let batch = sequence_batch(0..100);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids,
+            max_rows_per_file: 25,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        dataset.delete("id % 3 = 0").await.unwrap();
+        dataset
+    }
+
+    #[tokio::test]
+    async fn test_filter_deleted_ids_with_stable_row_ids() {
+        // Regression test for https://github.com/lance-format/lance/issues/7701:
+        // filter_deleted_ids must return exactly the live ids, in order.
+        // Sequential inserts, so stable row id == id column value, and the
+        // deleted ids sit at the front of each sorted query.
+        let dataset = deleted_thirds_dataset(true).await;
+
+        let all: Vec<u64> = (0..100).collect();
+        let live: Vec<u64> = (0..100).filter(|id| id % 3 != 0).collect();
+        let cases: [(&str, &[u64], &[u64]); 3] = [
+            ("interleaved", &all, &live),
+            ("all deleted", &[0, 3, 9], &[]),
+            ("all live", &[1, 2, 50, 98], &[1, 2, 50, 98]),
+        ];
+        for (name, ids, expected) in cases {
+            assert_eq!(
+                dataset.filter_deleted_ids(ids).await.unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_filter_deleted_ids_without_stable_row_ids() {
+        // Non-stable: ids are row addresses; only deleted rows drop out.
+        let dataset = deleted_thirds_dataset(false).await;
+
+        // Row addresses: fragment (id / 25) << 32 | offset (id % 25).
+        let addr = |id: u64| (id / 25) << 32 | (id % 25);
+        let ids = (0..100).map(addr).collect::<Vec<u64>>();
+        let expected = (0..100)
+            .filter(|id| id % 3 != 0)
+            .map(addr)
+            .collect::<Vec<u64>>();
+        assert_eq!(dataset.filter_deleted_ids(&ids).await.unwrap(), expected);
+    }
+
     fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {
         row_ids
             .values()
