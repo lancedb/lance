@@ -599,7 +599,7 @@ impl Dataset {
             return Ok(self.clone());
         }
 
-        let manifest = Self::load_manifest(
+        let manifest = Self::get_manifest(
             self.object_store.as_ref(),
             &manifest_location,
             &new_location.uri,
@@ -625,7 +625,7 @@ impl Dataset {
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
-            Arc::new(manifest),
+            manifest,
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -765,6 +765,11 @@ impl Dataset {
         uri: &str,
         session: &Session,
     ) -> Result<Arc<Manifest>> {
+        if manifest_location.size.is_none() {
+            return Ok(Arc::new(
+                Self::load_manifest(object_store, manifest_location, uri, session).await?,
+            ));
+        }
         let metadata_cache = session.metadata_cache.for_dataset(uri);
         let manifest_key = ManifestKey {
             version: manifest_location.version,
