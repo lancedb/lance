@@ -2702,16 +2702,17 @@ impl Dataset {
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
         let (ids, addresses) = if let Some(row_id_index) = get_row_id_index(self).await? {
             // Ids absent from the deletion-aware index are deleted; drop
-            // them from both lists to keep the zip aligned.
-            let (ids, addresses): (Vec<u64>, Vec<u64>) = ids
-                .iter()
-                .filter_map(|id| {
-                    row_id_index
-                        .get(*id)
-                        .map(|address| (*id, u64::from(address)))
-                })
-                .unzip();
-            (Cow::Owned(ids), Cow::Owned(addresses))
+            // them from both lists to keep the zip aligned. ids.len() is an
+            // upper bound on the output size, so allocate once up front.
+            let mut live_ids = Vec::with_capacity(ids.len());
+            let mut addresses = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(address) = row_id_index.get(*id) {
+                    live_ids.push(*id);
+                    addresses.push(u64::from(address));
+                }
+            }
+            (Cow::Owned(live_ids), Cow::Owned(addresses))
         } else {
             (Cow::Borrowed(ids), Cow::Borrowed(ids))
         };

@@ -483,28 +483,20 @@ mod test {
         dataset
     }
 
+    #[rstest::rstest]
+    #[case::interleaved((0..100).collect(), (0..100).filter(|id| id % 3 != 0).collect())]
+    #[case::all_deleted(vec![0, 3, 9], vec![])]
+    #[case::all_live(vec![1, 2, 50, 98], vec![1, 2, 50, 98])]
     #[tokio::test]
-    async fn test_filter_deleted_ids_with_stable_row_ids() {
+    async fn test_filter_deleted_ids_with_stable_row_ids(
+        #[case] ids: Vec<u64>,
+        #[case] expected: Vec<u64>,
+    ) {
         // Regression test for https://github.com/lance-format/lance/issues/7701:
         // filter_deleted_ids must return exactly the live ids, in order.
-        // Sequential inserts, so stable row id == id column value, and the
-        // deleted ids sit at the front of each sorted query.
+        // Sequential inserts, so stable row id == id column value.
         let dataset = deleted_thirds_dataset(true).await;
-
-        let all: Vec<u64> = (0..100).collect();
-        let live: Vec<u64> = (0..100).filter(|id| id % 3 != 0).collect();
-        let cases: [(&str, &[u64], &[u64]); 3] = [
-            ("interleaved", &all, &live),
-            ("all deleted", &[0, 3, 9], &[]),
-            ("all live", &[1, 2, 50, 98], &[1, 2, 50, 98]),
-        ];
-        for (name, ids, expected) in cases {
-            assert_eq!(
-                dataset.filter_deleted_ids(ids).await.unwrap(),
-                expected,
-                "{name}"
-            );
-        }
+        assert_eq!(dataset.filter_deleted_ids(&ids).await.unwrap(), expected);
     }
 
     #[tokio::test]
