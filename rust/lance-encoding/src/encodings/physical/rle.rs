@@ -1482,7 +1482,14 @@ impl RleDecompressor {
         // The pre-run-length-width decoder truncated the excess, so miniblock decoding
         // clamps rather than rejects to keep those files readable. Block payloads never
         // legitimately overflow, so they decode strictly.
-        let mut decoded: Vec<T> = Vec::with_capacity(expected_value_count);
+        let mut decoded: Vec<T> = Vec::new();
+        decoded
+            .try_reserve_exact(expected_value_count)
+            .map_err(|_| {
+                Error::invalid_input_source(
+                    format!("RLE decoding cannot allocate {expected_value_count} values").into(),
+                )
+            })?;
         for (value, length_bytes) in values.iter().zip(lengths.chunks_exact(length_size)) {
             let length = self.run_length_width.read_length(length_bytes);
             if length == 0 {
@@ -2181,10 +2188,11 @@ mod tests {
         payload.extend_from_slice(&values);
         payload.extend_from_slice(&lengths);
 
-        let result = BlockDecompressor::decompress(&decompressor, LanceBuffer::from(payload), 5);
+        let error = BlockDecompressor::decompress(&decompressor, LanceBuffer::from(payload), 5)
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
         assert!(
-            result
-                .unwrap_err()
+            error
                 .to_string()
                 .contains("overflowed expected value count")
         );
