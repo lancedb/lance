@@ -7,6 +7,10 @@
 //! to a scalar once, after the main loop. The fold is identical across
 //! `cosine`, `dot`, `l2` and `norm_l2`, so it lives here instead of being
 //! copied into each kernel's private `mod x86`.
+//!
+//! The module itself is `pub(crate)`, which is what keeps these helpers off the
+//! public API; the items are `pub` rather than `pub(crate)` only because
+//! `clippy::redundant_pub_crate` fires on the narrower visibility.
 
 use std::arch::x86_64::*;
 
@@ -27,6 +31,8 @@ pub unsafe fn hsum256_ps(v: __m256) -> f32 {
     let hi = _mm256_extractf128_ps(v, 1);
     let sum128 = _mm_add_ps(lo, hi);
     let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+    // 0x55 broadcasts lane 1 into lane 0, so the scalar add below lands the
+    // last of the four partial sums.
     let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
     _mm_cvtss_f32(sum32)
 }
@@ -53,44 +59,31 @@ pub unsafe fn hsum256_pd(v: __m256d) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
-    #[test]
-    fn hsum256_ps_sums_all_eight_lanes() {
+    #[rstest]
+    #[case::ascending([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 36.0)]
+    #[case::negative_lanes([-1.5, 2.0, -3.0, 4.5, 0.0, -0.5, 1.0, 2.5], 5.0)]
+    #[case::zeros([0.0; 8], 0.0)]
+    #[case::cancelling([1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0], 0.0)]
+    fn hsum256_ps_sums_every_lane(#[case] lanes: [f32; 8], #[case] expected: f32) {
         if !std::is_x86_feature_detected!("avx") {
             return;
         }
-        let v = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let sum = unsafe { hsum256_ps(_mm256_loadu_ps(v.as_ptr())) };
-        assert_eq!(sum, 36.0);
+        let sum = unsafe { hsum256_ps(_mm256_loadu_ps(lanes.as_ptr())) };
+        assert_eq!(sum, expected);
     }
 
-    #[test]
-    fn hsum256_ps_handles_negative_lanes() {
+    #[rstest]
+    #[case::ascending([1.0, 2.0, 3.0, 4.0], 10.0)]
+    #[case::negative_lanes([-1.5, 2.0, -3.0, 4.5], 2.0)]
+    #[case::zeros([0.0; 4], 0.0)]
+    #[case::cancelling([1.0, -1.0, 2.0, -2.0], 0.0)]
+    fn hsum256_pd_sums_every_lane(#[case] lanes: [f64; 4], #[case] expected: f64) {
         if !std::is_x86_feature_detected!("avx") {
             return;
         }
-        let v = [-1.5_f32, 2.0, -3.0, 4.5, 0.0, -0.5, 1.0, 2.5];
-        let sum = unsafe { hsum256_ps(_mm256_loadu_ps(v.as_ptr())) };
-        assert_eq!(sum, 5.0);
-    }
-
-    #[test]
-    fn hsum256_pd_sums_all_four_lanes() {
-        if !std::is_x86_feature_detected!("avx") {
-            return;
-        }
-        let v = [1.0_f64, 2.0, 3.0, 4.0];
-        let sum = unsafe { hsum256_pd(_mm256_loadu_pd(v.as_ptr())) };
-        assert_eq!(sum, 10.0);
-    }
-
-    #[test]
-    fn hsum256_pd_handles_negative_lanes() {
-        if !std::is_x86_feature_detected!("avx") {
-            return;
-        }
-        let v = [-1.5_f64, 2.0, -3.0, 4.5];
-        let sum = unsafe { hsum256_pd(_mm256_loadu_pd(v.as_ptr())) };
-        assert_eq!(sum, 2.0);
+        let sum = unsafe { hsum256_pd(_mm256_loadu_pd(lanes.as_ptr())) };
+        assert_eq!(sum, expected);
     }
 }
