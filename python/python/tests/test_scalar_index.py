@@ -807,7 +807,25 @@ def test_full_text_search(dataset, with_position, base_tokenizer):
         )
 
 
-def test_code_analyzer_full_text_search(tmp_path):
+def test_code_analyzer_does_not_split_identifiers_by_default(tmp_path):
+    table = pa.table({"code": ["GetUserName", "GetUserEmail", "user"]})
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code")
+
+    results = ds.to_table(
+        columns=["code"],
+        full_text_query=MatchQuery("user", "code"),
+    )
+    assert results["code"].to_pylist() == ["user"]
+
+    stats = ds.stats.index_stats("code_idx")["indices"][0]
+    params = stats["params"]
+    assert params["analyzer"] == "code"
+    assert params["base_tokenizer"] == "code"
+    assert params["split_identifiers"] is False
+
+
+def test_code_analyzer_full_text_search_with_identifier_splitting(tmp_path):
     table = pa.table(
         {
             "code": [
@@ -820,7 +838,12 @@ def test_code_analyzer_full_text_search(tmp_path):
         }
     )
     ds = lance.write_dataset(table, tmp_path)
-    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code")
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        split_identifiers=True,
+    )
 
     results = ds.to_table(
         columns=["code"],

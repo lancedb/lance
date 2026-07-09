@@ -39,8 +39,9 @@ pub struct InvertedIndexParams {
     ///
     /// This is the user-facing semantic preset. `text` keeps the existing
     /// natural-language defaults. `code` selects code-search defaults such as
-    /// code lexical tokenization, identifier splitting, preserving whole
-    /// identifiers, and disabling stemming / stop-word removal.
+    /// code lexical tokenization, optional identifier splitting, preserving
+    /// whole identifiers when splitting is enabled, and disabling stemming /
+    /// stop-word removal.
     pub(crate) analyzer: String,
 
     /// Document-level tokenizer.
@@ -518,7 +519,7 @@ impl InvertedIndexParams {
         self.analyzer = normalize_analyzer(analyzer)?.to_string();
         if self.analyzer == "code" {
             self.base_tokenizer = "code".to_string();
-            self.split_identifiers = true;
+            self.split_identifiers = false;
             self.split_on_numerics = true;
             self.preserve_original = true;
             self.lower_case = true;
@@ -925,7 +926,7 @@ mod tests {
         .unwrap();
         assert_eq!(params.analyzer, "code");
         assert_eq!(params.base_tokenizer, "code");
-        assert!(params.split_identifiers);
+        assert!(!params.split_identifiers);
         assert!(params.split_on_numerics);
         assert!(params.preserve_original);
         assert!(params.lower_case);
@@ -956,8 +957,33 @@ mod tests {
     }
 
     #[test]
-    fn test_build_code_tokenizer() {
+    fn test_build_code_tokenizer_does_not_split_identifiers_by_default() {
         let mut tokenizer = InvertedIndexParams::code().build().unwrap();
+        let mut stream = tokenizer.token_stream_for_doc(
+            "getUserName XMLHttpRequest parseHTML2JSON utf8_reader SCREAMING_SNAKE_CASE",
+        );
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| {
+            tokens.push((token.text.clone(), token.position, token.position_length))
+        });
+        assert_eq!(
+            tokens,
+            vec![
+                ("getusername".to_string(), 0, 1),
+                ("xmlhttprequest".to_string(), 1, 1),
+                ("parsehtml2json".to_string(), 2, 1),
+                ("utf8_reader".to_string(), 3, 1),
+                ("screaming_snake_case".to_string(), 4, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_code_tokenizer_with_identifier_splitting() {
+        let mut tokenizer = InvertedIndexParams::code()
+            .split_identifiers(true)
+            .build()
+            .unwrap();
         let mut stream = tokenizer.token_stream_for_doc(
             "getUserName XMLHttpRequest parseHTML2JSON utf8_reader SCREAMING_SNAKE_CASE",
         );
