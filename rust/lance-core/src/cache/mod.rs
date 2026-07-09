@@ -237,6 +237,22 @@ impl LanceCache {
         self.cache.invalidate_prefix(&full_prefix).await;
     }
 
+    /// Invalidate all entries under this cache's namespace whose `key`
+    /// (as produced by a [`CacheKey::key`]) equals `key_prefix` or starts
+    /// with `key_prefix` followed by `/`.
+    ///
+    /// Use this to evict every cached entry associated with a single
+    /// version or fragment id, regardless of any optional suffix (e.g. an
+    /// e-tag or filter hash) individual entries may carry. For example,
+    /// `invalidate_key_prefix("manifest/5")` removes both a `"manifest/5"`
+    /// entry and a `"manifest/5/{e_tag}"` entry, but leaves `"manifest/50"`
+    /// untouched.
+    pub async fn invalidate_key_prefix(&self, key_prefix: &str) {
+        self.cache
+            .invalidate_key_prefix(&self.prefix, key_prefix)
+            .await;
+    }
+
     pub async fn size(&self) -> usize {
         self.cache.num_entries().await
     }
@@ -892,6 +908,48 @@ mod tests {
 
         base.clear().await;
         assert_eq!(base.keys().await.unwrap().count(), 0);
+    }
+
+    /// `invalidate_key_prefix` matches on an entry's `key` (e.g. a version
+    /// number), not its namespace `prefix`, and must remove every key that
+    /// is exactly `key_prefix` or `key_prefix` followed by `/` -- covering
+    /// keys with optional suffixes like an e-tag -- while leaving unrelated
+    /// keys that merely share a numeric prefix (e.g. "50" vs "5") alone.
+    #[tokio::test]
+    async fn test_cache_invalidate_key_prefix() {
+        let cache = LanceCache::with_capacity(1000);
+
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("manifest/5"), Arc::new(vec![1]))
+            .await;
+        cache
+            .insert_with_key(
+                &TestKey::<Vec<i32>>::new("manifest/5/etag-abc"),
+                Arc::new(vec![2]),
+            )
+            .await;
+        // Must not be removed: shares the "5" prefix but is a different version.
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("manifest/50"), Arc::new(vec![3]))
+            .await;
+        // Must not be removed: unrelated key entirely.
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("txn/5"), Arc::new(vec![4]))
+            .await;
+        assert_eq!(cache.keys().await.unwrap().count(), 4);
+
+        cache.invalidate_key_prefix("manifest/5").await;
+
+        let remaining: BTreeSet<String> = cache
+            .keys()
+            .await
+            .unwrap()
+            .map(|k| k.key().to_string())
+            .collect();
+        assert_eq!(
+            remaining,
+            BTreeSet::from(["manifest/50".to_string(), "txn/5".to_string()])
+        );
     }
 
     #[tokio::test]

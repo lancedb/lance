@@ -129,6 +129,17 @@ impl CacheBackend for MokaCacheBackend {
             .expect("Cache configured correctly");
     }
 
+    async fn invalidate_key_prefix(&self, prefix: &str, key_prefix: &str) {
+        let prefix = prefix.to_owned();
+        let key_prefix = key_prefix.to_owned();
+        self.cache
+            .invalidate_entries_if(move |key, _value| {
+                key.prefix() == prefix
+                    && (key.key() == key_prefix || key.key().starts_with(&format!("{key_prefix}/")))
+            })
+            .expect("Cache configured correctly");
+    }
+
     async fn clear(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;

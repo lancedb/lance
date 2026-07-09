@@ -116,6 +116,26 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Remove all entries whose prefix starts with the given string.
     async fn invalidate_prefix(&self, prefix: &str);
 
+    /// Remove all entries within `prefix` whose `key` equals `key_prefix` or
+    /// starts with `key_prefix` followed by `/`.
+    ///
+    /// Unlike [`invalidate_prefix`](Self::invalidate_prefix), which matches
+    /// against an entry's namespace [`prefix`](InternalCacheKey::prefix)
+    /// (e.g. a dataset URI), this matches against the per-entry
+    /// [`key`](InternalCacheKey::key) (e.g. a version number or fragment id).
+    /// This lets callers evict every cached entry associated with one
+    /// version/fragment (a manifest, its transaction, its row address mask,
+    /// etc.) without needing to know every optional suffix (e-tag, filter
+    /// hash) a given key type may carry.
+    ///
+    /// The `/` boundary check prevents `key_prefix = "5"` from also matching
+    /// `"50"` or `"500"`.
+    ///
+    /// Backends that cannot support this cheaply may leave it as a no-op;
+    /// doing so only means those entries are evicted later by the normal
+    /// capacity-based eviction policy instead of immediately.
+    async fn invalidate_key_prefix(&self, _prefix: &str, _key_prefix: &str) {}
+
     /// Remove all entries.
     async fn clear(&self);
 
