@@ -11,7 +11,7 @@ use std::{ops::Range, sync::Arc};
 use arrow::compute::BatchCoalescer;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt32Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
@@ -32,7 +32,6 @@ use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::OnMissing;
-use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -1293,12 +1292,8 @@ pub struct FilteredReadOptions {
     pub scan_range_before_filter: Option<Range<u64>>,
     /// The range of rows to read after applying the filter.
     pub scan_range_after_filter: Option<Range<u64>>,
-    /// Include deleted rows in the scan
-    ///
-    /// In a scan, deleted rows are returned with a null row id.  In a
-    /// row-stream read (which must then be keyed by `_rowaddr`), deleted
-    /// addresses resolve and return their (still stored) data instead of
-    /// dropping like stale keys.
+    /// Include deleted rows in the scan; they are returned with a null row
+    /// id.  Not supported for row-stream reads.
     pub with_deleted_rows: bool,
     /// The maximum number of rows per batch
     ///
@@ -1727,10 +1722,13 @@ impl FilteredReadExec {
                 "scan ranges are not supported when taking rows from an input plan".into(),
             ));
         }
-        if options.only_indexed_fragments {
+        // with_deleted_rows: the reader reports deleted rows by nulling their
+        // row id, which is at odds with key-based alignment (see the design
+        // notes on PR #7672 for a reconstruction recipe if a consumer ever
+        // needs the physical view through a take)
+        if options.with_deleted_rows || options.only_indexed_fragments {
             return Err(Error::invalid_input_source(
-                "only_indexed_fragments is not supported when taking rows from an input plan"
-                    .into(),
+                "with_deleted_rows / only_indexed_fragments are not supported when taking rows from an input plan".into(),
             ));
         }
         let input_schema = input.schema();
@@ -1771,30 +1769,13 @@ impl FilteredReadExec {
         // Output = carried columns ⊕ fetched fields ⊕ synthesized identity
         // (`fields_to_read` retains the synthesis flags, and the calculated
         // schema materializes them as trailing columns)
-        let mut output_schema = Arc::new(arrow_schema::Schema::from(
+        let output_schema = Arc::new(arrow_schema::Schema::from(
             &super::TakeExec::calculate_output_schema(
                 dataset.schema(),
                 carried_schema.as_ref(),
                 &fields_to_read,
             ),
         ));
-        if options.with_deleted_rows {
-            // The output _rowid doubles as the tombstone marker (null for
-            // deleted rows), so the field must be nullable
-            output_schema = Arc::new(arrow_schema::Schema::new(
-                output_schema
-                    .fields()
-                    .iter()
-                    .map(|f| {
-                        if f.name() == ROW_ID {
-                            Arc::new(f.as_ref().clone().with_nullable(true))
-                        } else {
-                            f.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            ));
-        }
 
         // A row-stream read transforms its input in place, so partitioning
         // and emission behavior follow the input
@@ -1827,12 +1808,6 @@ impl FilteredReadExec {
         } else {
             fields_to_read.with_row_addr()
         };
-        if options.with_deleted_rows {
-            // The reader keeps deleted rows by nulling their row id (the
-            // deletedness marker), and the address is needed to reconstruct
-            // the real ids for alignment
-            read_options.projection = read_options.projection.with_row_id().with_row_addr();
-        }
 
         Ok(Self {
             dataset,
@@ -2289,26 +2264,16 @@ impl RowStreamRead {
         batch: &'a RecordBatch,
         producer: &str,
     ) -> DataFusionResult<&'a arrow_array::PrimitiveArray<UInt64Type>> {
-        self.key_array_named(batch, self.key_column, producer)
-    }
-
-    /// Extract a `u64` identity column from `batch` (produced by `producer`)
-    fn key_array_named<'a>(
-        &self,
-        batch: &'a RecordBatch,
-        column: &str,
-        producer: &str,
-    ) -> DataFusionResult<&'a arrow_array::PrimitiveArray<UInt64Type>> {
-        let keys = batch.column_by_name(column).ok_or_else(|| {
+        let keys = batch.column_by_name(self.key_column).ok_or_else(|| {
             DataFusionError::Internal(format!(
                 "the row-stream {} is missing the '{}' column",
-                producer, column
+                producer, self.key_column
             ))
         })?;
         keys.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
             DataFusionError::Internal(format!(
                 "expected the row-stream column '{}' to be UInt64 but it was {}",
-                column,
+                self.key_column,
                 keys.data_type()
             ))
         })
@@ -2421,70 +2386,6 @@ impl RowStreamRead {
         )?)
     }
 
-    /// Rebuild the read rows' ids from their addresses via the in-memory row
-    /// id sequences.
-    ///
-    /// The reader nulls the ids of deleted rows (its tombstone marker), but
-    /// the sequences retain deleted ids until compaction rewrites them, so
-    /// an id-keyed input can still align its deleted rows.
-    fn reconstruct_read_ids(
-        &self,
-        read_data: &RecordBatch,
-    ) -> DataFusionResult<arrow_array::PrimitiveArray<UInt64Type>> {
-        let addrs = self
-            .key_array_named(read_data, ROW_ADDR, "read")?
-            .values()
-            .iter();
-        let fragments = self.loaded_fragments.get().ok_or_else(|| {
-            DataFusionError::Internal("the round was read before its fragments loaded".into())
-        })?;
-        let sequences: HashMap<u32, &Arc<RowIdSequence>> = fragments
-            .iter()
-            .map(|fragment| (fragment.fragment.id() as u32, &fragment.row_id_sequence))
-            .collect();
-        let ids = addrs
-            .map(|addr| {
-                let addr = RowAddress::new_from_u64(*addr);
-                sequences
-                    .get(&addr.fragment_id())
-                    .and_then(|sequence| sequence.get(addr.row_offset() as usize))
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(format!(
-                            "no row id at fragment {} offset {}",
-                            addr.fragment_id(),
-                            addr.row_offset()
-                        ))
-                    })
-            })
-            .collect::<DataFusionResult<Vec<u64>>>()?;
-        Ok(arrow_array::PrimitiveArray::from(ids))
-    }
-
-    /// With deleted rows, restore the tombstone marker on the output: the
-    /// output `_rowid` becomes the reader's id column — null exactly for the
-    /// deleted rows — aligned to the output
-    fn mark_deleted_rows(
-        &self,
-        batch: RecordBatch,
-        aligned_reader_ids: Option<&ArrayRef>,
-    ) -> DataFusionResult<RecordBatch> {
-        if !self.read_options.with_deleted_rows {
-            return Ok(batch);
-        }
-        let Ok(row_id_index) = batch.schema().index_of(ROW_ID) else {
-            return Ok(batch);
-        };
-        let reader_ids = aligned_reader_ids.ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "the row-stream read is missing the '{}' column",
-                ROW_ID
-            ))
-        })?;
-        let mut columns = batch.columns().to_vec();
-        columns[row_id_index] = reader_ids.clone();
-        Ok(RecordBatch::try_new(batch.schema(), columns)?)
-    }
-
     /// Align the read rows back to the round's row order via the key column
     /// and merge the fetched columns onto the round's batch
     fn attach_columns(
@@ -2494,15 +2395,7 @@ impl RowStreamRead {
     ) -> DataFusionResult<RecordBatch> {
         let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
         let keys = self.key_array(&round, "input")?;
-        // With deleted rows and an id key, the reader nulled the deleted
-        // rows' ids — reconstruct the real ids for alignment
-        let reconstructed_ids;
-        let read_keys = if self.read_options.with_deleted_rows && self.key_column == ROW_ID {
-            reconstructed_ids = self.reconstruct_read_ids(&read_data)?;
-            &reconstructed_ids
-        } else {
-            self.key_array(&read_data, "read")?
-        };
+        let read_keys = self.key_array(&read_data, "read")?;
 
         // Fast path: the read produced exactly one row per input row with an
         // identical key sequence (typical when the input is already in
@@ -2514,8 +2407,7 @@ impl RowStreamRead {
         {
             let new_data = read_data.project_by_schema(self.new_fields_schema.as_ref())?;
             let carried = round.project_by_schema(self.carried_schema.as_ref())?;
-            let merged = carried.merge_with_schema(&new_data, self.output_schema.as_ref())?;
-            return self.mark_deleted_rows(merged, read_data.column_by_name(ROW_ID));
+            return Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?);
         }
 
         let key_to_index: HashMap<u64, u32> = read_keys
@@ -2553,12 +2445,12 @@ impl RowStreamRead {
             return Ok(RecordBatch::new_empty(self.output_schema.clone()));
         }
 
-        let taken = arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
+        let new_data =
+            arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
         // Drop the key column if it was only read for alignment
-        let new_data = taken.project_by_schema(self.new_fields_schema.as_ref())?;
+        let new_data = new_data.project_by_schema(self.new_fields_schema.as_ref())?;
         let carried = round.project_by_schema(self.carried_schema.as_ref())?;
-        let merged = carried.merge_with_schema(&new_data, self.output_schema.as_ref())?;
-        self.mark_deleted_rows(merged, taken.column_by_name(ROW_ID))
+        Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
     /// Execute one read round: plan the keys into ranges, read them, and
@@ -5458,79 +5350,40 @@ mod tests {
             assert_eq!(i_col.value(0), 16);
         }
 
-        /// with_deleted_rows: every input key that still maps to a storage
-        /// slot resolves — deleted rows return their (still stored) data with
-        /// a NULL output `_rowid` (the scan's tombstone marker), `_rowaddr`
-        /// stays real, and truly nonexistent keys still drop
+        /// with_deleted_rows is not supported for a row-stream read: the
+        /// reader reports deleted rows by nulling their row id, which cannot
+        /// be aligned back to input keys
         #[rstest]
-        #[case::by_row_addr(false, ROW_ADDR)]
-        #[case::by_row_id(false, ROW_ID)]
-        #[case::stable_by_row_addr(true, ROW_ADDR)]
-        #[case::stable_by_row_id(true, ROW_ID)]
+        #[case::unstable(false)]
+        #[case::stable(true)]
         #[tokio::test]
-        async fn take_with_deleted_rows(#[case] stable_row_ids: bool, #[case] key: &str) {
+        async fn take_rejects_with_deleted_rows(#[case] stable_row_ids: bool) {
             let fixture = take_fixture(stable_row_ids).await;
-            let mut dataset = fixture.dataset.as_ref().clone();
-            dataset.delete("i = 15").await.unwrap();
-            let dataset = Arc::new(dataset);
-
-            let addr = |frag: u64, off: u64| (frag << 32) | off;
-            // Rows 15 (now deleted) and 16, plus a nonexistent key
-            let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
-                vec![15, 16, 9999]
-            } else {
-                vec![addr(1, 5), addr(1, 6), addr(9, 0)]
-            };
-            // The output _rowid is the stable id on stable datasets and the
-            // address elsewhere, whatever the key type
-            let live_id: u64 = if stable_row_ids { 16 } else { addr(1, 6) };
             let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                key,
+                ROW_ADDR,
                 DataType::UInt64,
                 true,
             )]));
-            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
-                .unwrap();
-
-            // Request _rowid and _rowaddr so both marker semantics are
-            // observable
-            let projection = dataset
+            let batch =
+                RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(vec![0_u64]))])
+                    .unwrap();
+            let projection = fixture
+                .dataset
                 .empty_projection()
                 .union_columns(["i"], OnMissing::Error)
-                .unwrap()
-                .with_row_id()
-                .with_row_addr();
-            let plan = FilteredReadExec::try_new(
-                dataset.clone(),
-                FilteredReadOptions::new(projection)
-                    .with_deleted_rows()
-                    .unwrap(),
-                Some(rows_input(vec![batch])),
-            )
-            .unwrap();
-
-            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
-            assert_eq!(result.num_rows(), 2);
-            let i_col = result
-                .column_by_name("i")
-                .unwrap()
-                .as_primitive::<arrow::datatypes::Int32Type>();
-            assert_eq!(i_col.values(), &[15, 16]);
-            // The tombstone marker: _rowid is null for the deleted row and
-            // real for the live one
-            let id_col = result
-                .column_by_name(ROW_ID)
-                .unwrap()
-                .as_primitive::<arrow::datatypes::UInt64Type>();
-            assert!(id_col.is_null(0));
-            assert!(id_col.is_valid(1));
-            assert_eq!(id_col.value(1), live_id);
-            // Addresses stay real for both rows
-            let addr_col = result
-                .column_by_name(ROW_ADDR)
-                .unwrap()
-                .as_primitive::<arrow::datatypes::UInt64Type>();
-            assert_eq!(addr_col.values(), &[addr(1, 5), addr(1, 6)]);
+                .unwrap();
+            assert!(
+                FilteredReadExec::try_new(
+                    fixture.dataset,
+                    FilteredReadOptions::new(projection)
+                        .with_deleted_rows()
+                        .unwrap(),
+                    Some(rows_input(vec![batch])),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("with_deleted_rows")
+            );
         }
 
         /// Construction errors: no key column, nothing to read
