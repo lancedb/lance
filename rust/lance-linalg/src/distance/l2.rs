@@ -26,14 +26,32 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
+#[cfg(target_arch = "x86_64")]
+use crate::distance::BatchIter;
+
 /// Calculate the L2 distance between two vectors.
 ///
 pub trait L2: Num {
     /// Calculate the L2 distance between two vectors.
     fn l2(x: &[Self], y: &[Self]) -> f32;
 
-    fn l2_batch(x: &[Self], y: &[Self], dimension: usize) -> impl Iterator<Item = f32> {
-        y.chunks_exact(dimension).map(|v| Self::l2(x, v))
+    /// L2 distance from `x` to each `dimension`-sized vector in `y`.
+    ///
+    /// The default calls [`L2::l2`] per vector. `f32` overrides it so the SIMD
+    /// tier is chosen once for the whole batch instead of once per vector —
+    /// on a build whose baseline already implies AVX2, per-vector dispatch
+    /// costs more than the kernel it selects.
+    ///
+    /// Returns `impl Iterator` rather than a trait object: the k-means
+    /// assignment loop drives this one element at a time, so a
+    /// `Box<dyn Iterator>` would cost a virtual call per element and an
+    /// allocation per batch.
+    fn l2_batch<'a>(
+        x: &'a [Self],
+        y: &'a [Self],
+        dimension: usize,
+    ) -> impl Iterator<Item = f32> + 'a {
+        y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
     }
 }
 
@@ -265,6 +283,69 @@ impl L2 for f32 {
         // scalar fallback.
         l2_f32_dispatched(x, y)
     }
+
+    fn l2_batch<'a>(
+        x: &'a [Self],
+        y: &'a [Self],
+        dimension: usize,
+    ) -> impl Iterator<Item = Self> + 'a {
+        // Exactly one arm compiles; see `Dot::dot_batch` for f32.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            l2_batch_f32_avx2_baseline(x, y, dimension)
+        }
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+        {
+            l2_batch_f32_runtime_dispatch(x, y, dimension)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
+        }
+    }
+}
+
+/// AVX2-baseline builds: the scalar kernel here inlines and auto-vectorizes as
+/// it did before runtime dispatch existed, so per-vector dispatch would be pure
+/// overhead. Dispatch at most once, per batch. See `Dot::dot_batch` for f32.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn l2_batch_f32_avx2_baseline<'a>(
+    x: &'a [f32],
+    y: &'a [f32],
+    dimension: usize,
+) -> impl Iterator<Item = f32> + 'a {
+    // Only wide vectors benefit from AVX-512: at 16 lanes or fewer a masked
+    // 512-bit load loses to the plain AVX2 load, and the eager collect adds an
+    // allocation the baseline path does not need.
+    if dimension > 16 && matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
+        // SAFETY: guarded by the runtime AVX-512 detection above.
+        return BatchIter::Eager(unsafe { x86::l2_batch_f32_avx512(x, y, dimension) }.into_iter());
+    }
+    BatchIter::Lazy(y.chunks_exact(dimension).map(move |v| l2_f32_scalar(x, v)))
+}
+
+/// Sub-AVX2 builds: pick a `#[target_feature]` kernel once for the batch.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[inline]
+fn l2_batch_f32_runtime_dispatch<'a>(
+    x: &'a [f32],
+    y: &'a [f32],
+    dimension: usize,
+) -> impl Iterator<Item = f32> + 'a {
+    // SAFETY: each kernel is entered only under its matching runtime detection.
+    match *SIMD_SUPPORT {
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => {
+            BatchIter::Eager(unsafe { x86::l2_batch_f32_avx512(x, y, dimension) }.into_iter())
+        }
+        SimdSupport::Avx2 | SimdSupport::AvxFma => {
+            BatchIter::Eager(unsafe { x86::l2_batch_f32_avx_fma(x, y, dimension) }.into_iter())
+        }
+        SimdSupport::Avx => {
+            BatchIter::Eager(unsafe { x86::l2_batch_f32_avx(x, y, dimension) }.into_iter())
+        }
+        _ => BatchIter::Lazy(y.chunks_exact(dimension).map(move |v| l2_f32_scalar(x, v))),
+    }
 }
 
 /// L2 distance for f32, runtime-dispatched via `SIMD_SUPPORT` on x86_64
@@ -345,6 +426,52 @@ mod x86 {
     use crate::simd::f64::{f64x4, f64x8};
     use crate::simd::x86::hsum256_ps;
     use crate::simd::{FloatSimd, SIMD};
+
+    /// L2 distance from `x` to every `dimension`-sized vector in `batch`, with
+    /// the AVX-512 tier entered once for the whole batch rather than once per
+    /// vector.
+    ///
+    /// # Safety
+    /// The host must support AVX-512F.
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn l2_batch_f32_avx512(
+        x: &[f32],
+        batch: &[f32],
+        dimension: usize,
+    ) -> Vec<f32> {
+        batch
+            .chunks_exact(dimension)
+            .map(|y| unsafe { l2_f32_avx512(x, y) })
+            .collect()
+    }
+
+    /// As [`l2_batch_f32_avx512`], for the AVX+FMA and AVX2 tiers.
+    ///
+    /// # Safety
+    /// The host must support AVX and FMA.
+    #[target_feature(enable = "avx,fma")]
+    pub(super) unsafe fn l2_batch_f32_avx_fma(
+        x: &[f32],
+        batch: &[f32],
+        dimension: usize,
+    ) -> Vec<f32> {
+        batch
+            .chunks_exact(dimension)
+            .map(|y| unsafe { l2_f32_avx_fma(x, y) })
+            .collect()
+    }
+
+    /// As [`l2_batch_f32_avx512`], for the AVX-without-FMA tier.
+    ///
+    /// # Safety
+    /// The host must support AVX.
+    #[target_feature(enable = "avx")]
+    pub(super) unsafe fn l2_batch_f32_avx(x: &[f32], batch: &[f32], dimension: usize) -> Vec<f32> {
+        batch
+            .chunks_exact(dimension)
+            .map(|y| unsafe { l2_f32_avx(x, y) })
+            .collect()
+    }
 
     /// AVX-512 path for f64: 8-wide `__m512d` with `vsubpd` + `vfmadd231pd` per iteration.
     #[target_feature(enable = "avx512f")]
@@ -1170,5 +1297,87 @@ mod tests {
 
         assert_relative_eq!(d1[0], 0.0); // q1 == target[0]
         assert_relative_eq!(d2[1], 0.0); // q2 == target[1]
+    }
+
+    /// `l2_batch` must agree with the per-vector `l2` it replaced, on every
+    /// build: the AVX2-baseline path, the hoisted-dispatch path, and the
+    /// portable fallback all funnel through here.
+    #[rstest::rstest]
+    #[case::dim_8(8)]
+    #[case::dim_16(16)]
+    #[case::dim_32(32)]
+    #[case::dim_1024(1024)]
+    fn test_l2_batch_f32_matches_per_vector_l2(#[case] dimension: usize) {
+        let num_vectors = 5;
+        let x: Vec<f32> = (0..dimension)
+            .map(|i| ((i % 13) as f32) * 0.25 + 1.0)
+            .collect();
+        let batch: Vec<f32> = (0..dimension * num_vectors)
+            .map(|i| ((i % 11) as f32) * 0.5 - 2.0)
+            .collect();
+
+        let got: Vec<f32> = f32::l2_batch(&x, &batch, dimension).collect();
+        let want: Vec<f32> = batch
+            .chunks_exact(dimension)
+            .map(|y| f32::l2(&x, y))
+            .collect();
+
+        assert_eq!(got.len(), num_vectors);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!(
+                approx::relative_eq!(g, w, epsilon = 1e-4),
+                "dim {dimension}: batch {g} != per-vector {w}"
+            );
+        }
+    }
+
+    /// The per-batch `#[target_feature]` kernels are only reached on sub-AVX2
+    /// builds or AVX-512 hosts, so call them directly to cover them.
+    #[cfg(target_arch = "x86_64")]
+    fn check_l2_batch_kernel(kernel: unsafe fn(&[f32], &[f32], usize) -> Vec<f32>) {
+        for dimension in [8_usize, 16, 40] {
+            let num_vectors = 3;
+            let x: Vec<f32> = (0..dimension).map(|i| (i as f32) * 0.5 + 1.0).collect();
+            let batch: Vec<f32> = (0..dimension * num_vectors)
+                .map(|i| ((i % 7) as f32) + 1.0)
+                .collect();
+
+            let got = unsafe { kernel(&x, &batch, dimension) };
+            assert_eq!(got.len(), num_vectors);
+            for (chunk, &g) in batch.chunks_exact(dimension).zip(got.iter()) {
+                let want = l2_scalar::<f32, f32, 16>(&x, chunk);
+                assert!(
+                    approx::relative_eq!(g, want, epsilon = 1e-4),
+                    "dim {dimension}: kernel {g} != scalar {want}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_l2_batch_avx_fma_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
+            return;
+        }
+        check_l2_batch_kernel(x86::l2_batch_f32_avx_fma);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_l2_batch_avx_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx") {
+            return;
+        }
+        check_l2_batch_kernel(x86::l2_batch_f32_avx);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_l2_batch_avx512_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        check_l2_batch_kernel(x86::l2_batch_f32_avx512);
     }
 }

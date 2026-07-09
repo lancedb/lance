@@ -25,6 +25,46 @@ pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
 
+/// What a per-batch distance kernel yields.
+///
+/// The two batch paths produce different shapes: the build-baseline path maps
+/// lazily over the batch and allocates nothing, while a `#[target_feature]`
+/// kernel must collect eagerly because it cannot be inlined into a lazy
+/// closure. A concrete enum keeps both statically dispatched.
+///
+/// `Box<dyn Iterator>` would be simpler and is wrong here: hot consumers such
+/// as the k-means assignment loop drive these iterators one element at a time
+/// through [`crate::kernels::argmin_value_float`], so a trait object turns
+/// every `next()` into a virtual call and adds an allocation per batch.
+#[cfg(target_arch = "x86_64")]
+pub(crate) enum BatchIter<L> {
+    /// Lazy per-vector map. No allocation.
+    Lazy(L),
+    /// Eagerly collected by a `#[target_feature]` kernel.
+    Eager(std::vec::IntoIter<f32>),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<L: Iterator<Item = f32>> Iterator for BatchIter<L> {
+    type Item = f32;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Lazy(iter) => iter.next(),
+            Self::Eager(iter) => iter.next(),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Lazy(iter) => iter.size_hint(),
+            Self::Eager(iter) => iter.size_hint(),
+        }
+    }
+}
+
 pub use cosine::*;
 pub use dot::*;
 pub use hamming::{
