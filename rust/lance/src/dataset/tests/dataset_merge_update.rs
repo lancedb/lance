@@ -24,6 +24,7 @@ use mock_instant::thread_local::MockClock;
 use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
+use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
 use arrow_array::{Array, LargeBinaryArray, StructArray};
 use arrow_array::{
@@ -4301,10 +4302,10 @@ async fn test_merge_insert_target_all_bases() {
 /// ids -- the same treatment Append gives them. Regression test for
 /// https://github.com/lance-format/lance/issues/7702.
 #[rstest]
+#[case::no_stable_row_ids(false)]
+#[case::stable_row_ids(true)]
 #[tokio::test]
-async fn test_merge_commits_staged_new_fragments(#[values(false, true)] use_stable_row_id: bool) {
-    use arrow::datatypes::UInt64Type;
-
+async fn test_merge_commits_staged_new_fragments(#[case] use_stable_row_id: bool) {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "i",
         DataType::Int32,
@@ -4488,6 +4489,12 @@ async fn test_merge_staged_new_fragments_concurrent_append_conflicts() {
     assert!(
         matches!(err, Error::RetryableCommitConflict { .. }),
         "unexpected error: {}",
+        err
+    );
+    assert!(
+        err.to_string()
+            .contains("preempted by concurrent transaction"),
+        "unexpected message: {}",
         err
     );
 }

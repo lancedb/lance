@@ -981,6 +981,10 @@ def test_merge_commits_staged_new_fragments(
     new_frags = write_fragments(pa.table({"id": [5, 6], "v": [50, 60]}), tmp_path)
     assert all(f.id == 0 for f in new_frags)
 
+    if enable_stable_row_ids:
+        pre = ds.to_table(with_row_id=True)
+        pre_row_ids = dict(zip(pre["id"].to_pylist(), pre["_rowid"].to_pylist()))
+
     all_frags = [f.metadata for f in ds.get_fragments()] + list(new_frags)
     merge = lance.LanceOperation.Merge(all_frags, ds.lance_schema)
     ds = lance.LanceDataset.commit(tmp_path, merge, read_version=ds.version)
@@ -994,3 +998,6 @@ def test_merge_commits_staged_new_fragments(
     if enable_stable_row_ids:
         assert sorted(row_ids) == list(range(6))
         assert all(f.metadata.row_id_meta is not None for f in ds.get_fragments())
+        # Pre-existing rows keep their exact row ids through the merge.
+        post_row_ids = dict(zip(table["id"].to_pylist(), row_ids))
+        assert {i: post_row_ids[i] for i in pre_row_ids} == pre_row_ids

@@ -1139,9 +1139,10 @@ def write_fragments(
     enable_stable_row_ids: bool
         Has no effect. Row ids are not assigned by this function; they are
         assigned when the fragments are committed to a dataset (e.g. via
-        :class:`lance.LanceOperation.Append` and
-        :meth:`lance.LanceDataset.commit`), based on whether the target
-        dataset uses stable row ids.
+        :class:`lance.LanceOperation.Append`, or
+        :class:`lance.LanceOperation.Merge` when merging staged fragments
+        with existing ones, together with :meth:`lance.LanceDataset.commit`),
+        based on whether the target dataset uses stable row ids.
     target_bases : list of str, optional
         References to base paths where data should be written. Can be
         specified in all modes.
