@@ -362,50 +362,18 @@ impl FilteredReadStream {
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             .max(1);
 
-        let fragments = options
-            .fragments
-            .clone()
-            .unwrap_or_else(|| dataset.fragments().clone());
+        let loaded_fragments = Self::load_all_fragments(&dataset, &options).await?;
 
         log::debug!(
             "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
-            fragments.len(),
+            loaded_fragments.len(),
             fragment_readahead,
             io_parallelism
         );
 
-        // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
-        // not general enough" false positives from rustc
-        let frag_futs = fragments
-            .iter()
-            .map(|frag| {
-                Result::Ok(Self::load_fragment(
-                    dataset.clone(),
-                    frag.clone(),
-                    options.with_deleted_rows,
-                ))
-            })
-            .collect::<Vec<_>>();
-        let loaded_fragments = futures::stream::iter(frag_futs)
-            // Cannot use unordered because we need to populate logical_offset based on user-provided order
-            .try_buffered(io_parallelism)
-            .try_collect::<Vec<_>>()
-            .await?;
-
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
-        let obj_store = dataset.object_store.clone();
-        // Explicit options take precedence; otherwise fall back to the
-        // LANCE_DEFAULT_IO_BUFFER_SIZE env var if set; otherwise max_bandwidth.
-        let scheduler_config = if let Some(io_buffer_size_bytes) = options
-            .io_buffer_size_bytes
-            .or_else(get_default_io_buffer_size_override)
-        {
-            SchedulerConfig::new(io_buffer_size_bytes)
-        } else {
-            SchedulerConfig::max_bandwidth(obj_store.as_ref())
-        };
-        let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
+        let scan_scheduler = Self::make_scan_scheduler(&dataset, &options);
 
         // Get scan_range_after_filter from the plan
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
@@ -445,6 +413,53 @@ impl FilteredReadStream {
             threading_mode,
             scan_range_after_filter,
         })
+    }
+
+    /// Load the metadata of the scoped fragments (or every dataset fragment
+    /// when unscoped) — deletion vectors and row id sequences included,
+    /// unless `with_deleted_rows` is set
+    async fn load_all_fragments(
+        dataset: &Arc<Dataset>,
+        options: &FilteredReadOptions,
+    ) -> Result<Vec<LoadedFragment>> {
+        let io_parallelism = dataset.object_store.io_parallelism();
+        let fragments = options
+            .fragments
+            .clone()
+            .unwrap_or_else(|| dataset.fragments().clone());
+        // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
+        // not general enough" false positives from rustc
+        let frag_futs = fragments
+            .iter()
+            .map(|frag| {
+                Result::Ok(Self::load_fragment(
+                    dataset.clone(),
+                    frag.clone(),
+                    options.with_deleted_rows,
+                ))
+            })
+            .collect::<Vec<_>>();
+        futures::stream::iter(frag_futs)
+            // Cannot use unordered because we need to populate logical_offset based on user-provided order
+            .try_buffered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await
+    }
+
+    /// Create the I/O scheduler for a read.  Explicit options take
+    /// precedence; otherwise fall back to the LANCE_DEFAULT_IO_BUFFER_SIZE
+    /// env var if set; otherwise max_bandwidth.
+    fn make_scan_scheduler(dataset: &Dataset, options: &FilteredReadOptions) -> Arc<ScanScheduler> {
+        let obj_store = dataset.object_store.clone();
+        let scheduler_config = if let Some(io_buffer_size_bytes) = options
+            .io_buffer_size_bytes
+            .or_else(get_default_io_buffer_size_override)
+        {
+            SchedulerConfig::new(io_buffer_size_bytes)
+        } else {
+            SchedulerConfig::max_bandwidth(obj_store.as_ref())
+        };
+        ScanScheduler::new(obj_store, scheduler_config)
     }
 
     async fn load_fragment(
@@ -1586,9 +1601,6 @@ struct RowStreamSource {
     /// to read (the output fields the stream doesn't already carry) plus the
     /// key column, which is read for alignment and stripped before the merge.
     read_options: FilteredReadOptions,
-    /// The input columns that carry through to the output (identity columns
-    /// whose flag was not requested are stripped)
-    carried_schema: SchemaRef,
     /// Arrow schema of what the read contributes to the output: the fetched
     /// fields plus any synthesized identity columns, without the key column
     new_fields_schema: SchemaRef,
@@ -1667,6 +1679,25 @@ impl FilteredReadExec {
         ]
         .iter()
         .any(|format| schema.fields() == format.schema().fields())
+    }
+
+    /// The input columns that carry through to the output.
+    ///
+    /// The identity flags are authoritative: `_rowid`/`_rowaddr` appear in
+    /// the output iff requested, so carried identity columns that were not
+    /// requested are stripped; ordinary input columns always carry through.
+    fn carried_schema(input_schema: &arrow_schema::Schema, projection: &Projection) -> SchemaRef {
+        Arc::new(arrow_schema::Schema::new(
+            input_schema
+                .fields()
+                .iter()
+                .filter(|f| {
+                    (f.name() != ROW_ID || projection.with_row_id)
+                        && (f.name() != ROW_ADDR || projection.with_row_addr)
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        ))
     }
 
     /// Construct a read over a row-stream source: fetch `options.projection`
@@ -1748,22 +1779,7 @@ impl FilteredReadExec {
             ));
         }
 
-        // The identity flags are authoritative: `_rowid`/`_rowaddr` appear in
-        // the output iff requested.  Carried identity columns that were not
-        // requested are stripped; ordinary input columns always carry through.
-        let strip_row_id =
-            !options.projection.with_row_id && input_schema.column_with_name(ROW_ID).is_some();
-        let strip_row_addr = !options.projection.with_row_addr && has_row_addr;
-        let carried_schema = Arc::new(arrow_schema::Schema::new(
-            input_schema
-                .fields()
-                .iter()
-                .filter(|f| {
-                    !(strip_row_id && f.name() == ROW_ID || strip_row_addr && f.name() == ROW_ADDR)
-                })
-                .cloned()
-                .collect::<Vec<_>>(),
-        ));
+        let carried_schema = Self::carried_schema(input_schema.as_ref(), &options.projection);
 
         // Output = carried columns ⊕ fetched fields ⊕ synthesized identity
         // (`fields_to_read` retains the synthesis flags, and the calculated
@@ -1822,7 +1838,6 @@ impl FilteredReadExec {
                 plan: input,
                 key_column,
                 read_options,
-                carried_schema,
                 new_fields_schema,
             })),
             plan: Arc::new(OnceCell::new()),
@@ -2120,7 +2135,8 @@ impl FilteredReadExec {
         let dataset = self.dataset.clone();
         let read_options = source.read_options.clone();
         let key_column = source.key_column;
-        let carried_schema = source.carried_schema.clone();
+        let carried_schema =
+            Self::carried_schema(source.plan.schema().as_ref(), &self.options.projection);
         let new_fields_schema = source.new_fields_schema.clone();
         let output_schema = self.schema();
         let metrics = self.metrics.clone();
@@ -2201,16 +2217,7 @@ impl RowStreamRead {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Self {
-        let obj_store = dataset.object_store.clone();
-        let scheduler_config = if let Some(io_buffer_size_bytes) = read_options
-            .io_buffer_size_bytes
-            .or_else(get_default_io_buffer_size_override)
-        {
-            SchedulerConfig::new(io_buffer_size_bytes)
-        } else {
-            SchedulerConfig::max_bandwidth(obj_store.as_ref())
-        };
-        let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
+        let scan_scheduler = FilteredReadStream::make_scan_scheduler(&dataset, &read_options);
         Self {
             dataset,
             read_options,
@@ -2225,31 +2232,11 @@ impl RowStreamRead {
         }
     }
 
+    /// Fragment metadata, loaded on the first round and reused afterwards
     async fn load_fragments(&self) -> Result<&Vec<LoadedFragment>> {
         self.loaded_fragments
-            .get_or_try_init(|| async {
-                let io_parallelism = self.dataset.object_store.io_parallelism();
-                let fragments = self
-                    .read_options
-                    .fragments
-                    .clone()
-                    .unwrap_or_else(|| self.dataset.fragments().clone());
-                let frag_futs = fragments
-                    .iter()
-                    .map(|frag| {
-                        // With with_deleted_rows the deletion vectors are not
-                        // loaded, so deleted keys resolve like live ones
-                        Result::Ok(FilteredReadStream::load_fragment(
-                            self.dataset.clone(),
-                            frag.clone(),
-                            self.read_options.with_deleted_rows,
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                futures::stream::iter(frag_futs)
-                    .try_buffered(io_parallelism)
-                    .try_collect::<Vec<_>>()
-                    .await
+            .get_or_try_init(|| {
+                FilteredReadStream::load_all_fragments(&self.dataset, &self.read_options)
             })
             .await
     }
