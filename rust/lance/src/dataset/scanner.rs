@@ -4839,20 +4839,32 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
         output_projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fields_to_take = output_projection
+        // After the subtraction the identity flags mean "requested but not
+        // carried" (columns the take would have to synthesize)
+        let mut fields_to_take = output_projection
             .clone()
             .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if !fields_to_take.has_data_fields() {
+        if !fields_to_take.has_data_fields()
+            && !fields_to_take.with_row_id
+            && !fields_to_take.with_row_addr
+        {
             // No new columns needed
             return Ok(input);
         }
 
         let input_schema = input.schema();
-        let has_usable_key = input_schema.column_with_name(ROW_ID).is_some()
-            || input_schema.column_with_name(ROW_ADDR).is_some();
+        let has_row_id = input_schema.column_with_name(ROW_ID).is_some();
+        let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
         // TakeExec stays for legacy storage only: the v1 reader cannot serve
         // a FilteredReadExec.
-        if !self.dataset.is_legacy_storage() && has_usable_key {
+        if !self.dataset.is_legacy_storage() && (has_row_id || has_row_addr) {
+            // The node's identity flags are authoritative (present in the
+            // output iff set).  The scanner preserves whatever identity
+            // columns the input carries — downstream nodes may still key off
+            // them, and the final ProjectionExec trims for free — and passes
+            // synthesis requests through.
+            fields_to_take.with_row_id |= has_row_id;
+            fields_to_take.with_row_addr |= has_row_addr;
             let mut read_options = FilteredReadOptions::new(fields_to_take);
             // The node coalesces its input into read rounds itself; forward
             // the batch size only when the user set one explicitly, matching

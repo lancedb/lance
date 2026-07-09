@@ -35,7 +35,9 @@ use lance_core::datatypes::OnMissing;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, ROW_ADDR, ROW_ID, Result, datatypes::Projection};
+use lance_core::{
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result, datatypes::Projection,
+};
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
     ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
@@ -1584,7 +1586,11 @@ struct RowStreamSource {
     /// to read (the output fields the stream doesn't already carry) plus the
     /// key column, which is read for alignment and stripped before the merge.
     read_options: FilteredReadOptions,
-    /// Arrow schema of just the read fields, without the key column
+    /// The input columns that carry through to the output (identity columns
+    /// whose flag was not requested are stripped)
+    carried_schema: SchemaRef,
+    /// Arrow schema of what the read contributes to the output: the fetched
+    /// fields plus any synthesized identity columns, without the key column
     new_fields_schema: SchemaRef,
 }
 
@@ -1695,12 +1701,6 @@ impl FilteredReadExec {
                     .into(),
             ));
         }
-        if options.projection.with_row_id || options.projection.with_row_addr {
-            return Err(Error::invalid_input_source(
-                "a row-stream read cannot be used to insert the row id / row address; the input plan must provide them".into(),
-            ));
-        }
-
         let input_schema = input.schema();
         let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
         // Prefer the row id when both are present: ids survive compaction,
@@ -1732,24 +1732,50 @@ impl FilteredReadExec {
             ));
         };
 
+        // After the subtraction the projection's identity flags mean
+        // "requested but not carried by the input" — the columns to
+        // synthesize during the read
         let fields_to_read = options
             .projection
             .clone()
             .subtract_arrow_schema(input_schema.as_ref(), OnMissing::Ignore)?;
-        if !fields_to_read.has_data_fields() {
+        let synthesize_row_id = fields_to_read.with_row_id;
+        let synthesize_row_addr = fields_to_read.with_row_addr;
+        if !fields_to_read.has_data_fields() && !synthesize_row_id && !synthesize_row_addr {
             return Err(Error::invalid_input_source(
                 "the input plan already contains every projected field; there is nothing to read"
                     .into(),
             ));
         }
 
+        // The identity flags are authoritative: `_rowid`/`_rowaddr` appear in
+        // the output iff requested.  Carried identity columns that were not
+        // requested are stripped; ordinary input columns always carry through.
+        let strip_row_id =
+            !options.projection.with_row_id && input_schema.column_with_name(ROW_ID).is_some();
+        let strip_row_addr = !options.projection.with_row_addr && has_row_addr;
+        let carried_schema = Arc::new(arrow_schema::Schema::new(
+            input_schema
+                .fields()
+                .iter()
+                .filter(|f| {
+                    !(strip_row_id && f.name() == ROW_ID || strip_row_addr && f.name() == ROW_ADDR)
+                })
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+
+        // Output = carried columns ⊕ fetched fields ⊕ synthesized identity
+        // (`fields_to_read` retains the synthesis flags, and the calculated
+        // schema materializes them as trailing columns)
         let output_schema = Arc::new(arrow_schema::Schema::from(
             &super::TakeExec::calculate_output_schema(
                 dataset.schema(),
-                input_schema.as_ref(),
+                carried_schema.as_ref(),
                 &fields_to_read,
             ),
         ));
+
         // A row-stream read transforms its input in place, so partitioning
         // and emission behavior follow the input
         let properties = Arc::new(
@@ -1760,8 +1786,21 @@ impl FilteredReadExec {
                 .with_eq_properties(EquivalenceProperties::new(output_schema)),
         );
 
-        let new_fields_schema =
-            Arc::new(arrow_schema::Schema::from(&fields_to_read.to_bare_schema()));
+        // The schema of what the read contributes to the output: the fetched
+        // fields plus any synthesized identity columns (the key column, read
+        // only for alignment, is not part of it)
+        let bare_schema = arrow_schema::Schema::from(&fields_to_read.to_bare_schema());
+        let mut new_fields = bare_schema.fields().iter().cloned().collect::<Vec<_>>();
+        if synthesize_row_id {
+            new_fields.push(Arc::new(ROW_ID_FIELD.clone()));
+        }
+        if synthesize_row_addr {
+            new_fields.push(Arc::new(ROW_ADDR_FIELD.clone()));
+        }
+        let new_fields_schema = Arc::new(arrow_schema::Schema::new(new_fields));
+
+        // `fields_to_read` still carries the synthesis flags, so the read
+        // emits the synthesized columns; add the key column on top
         let mut read_options = options.clone();
         read_options.projection = if key_column == ROW_ID {
             fields_to_read.with_row_id()
@@ -1783,6 +1822,7 @@ impl FilteredReadExec {
                 plan: input,
                 key_column,
                 read_options,
+                carried_schema,
                 new_fields_schema,
             })),
             plan: Arc::new(OnceCell::new()),
@@ -2080,6 +2120,7 @@ impl FilteredReadExec {
         let dataset = self.dataset.clone();
         let read_options = source.read_options.clone();
         let key_column = source.key_column;
+        let carried_schema = source.carried_schema.clone();
         let new_fields_schema = source.new_fields_schema.clone();
         let output_schema = self.schema();
         let metrics = self.metrics.clone();
@@ -2092,6 +2133,7 @@ impl FilteredReadExec {
                 dataset,
                 read_options,
                 key_column,
+                carried_schema,
                 new_fields_schema,
                 output_schema,
                 &metrics,
@@ -2134,8 +2176,10 @@ struct RowStreamRead {
     read_options: FilteredReadOptions,
     /// The input column identifying rows: [`ROW_ID`] or [`ROW_ADDR`]
     key_column: &'static str,
-    /// Arrow schema of just the fields being read, used to strip the key
-    /// column from the read data before the merge
+    /// The input columns that carry through to the output
+    carried_schema: SchemaRef,
+    /// Arrow schema of what the read contributes to the output, used to
+    /// strip the key column from the read data before the merge
     new_fields_schema: SchemaRef,
     output_schema: SchemaRef,
     scan_scheduler: Arc<ScanScheduler>,
@@ -2146,10 +2190,12 @@ struct RowStreamRead {
 }
 
 impl RowStreamRead {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dataset: Arc<Dataset>,
         read_options: FilteredReadOptions,
         key_column: &'static str,
+        carried_schema: SchemaRef,
         new_fields_schema: SchemaRef,
         output_schema: SchemaRef,
         metrics: &ExecutionPlanMetricsSet,
@@ -2169,6 +2215,7 @@ impl RowStreamRead {
             dataset,
             read_options,
             key_column,
+            carried_schema,
             new_fields_schema,
             output_schema,
             scan_scheduler,
@@ -2392,7 +2439,8 @@ impl RowStreamRead {
             && read_keys.values() == keys.values()
         {
             let new_data = read_data.project_by_schema(self.new_fields_schema.as_ref())?;
-            return Ok(round.merge_with_schema(&new_data, self.output_schema.as_ref())?);
+            let carried = round.project_by_schema(self.carried_schema.as_ref())?;
+            return Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?);
         }
 
         let key_to_index: HashMap<u64, u32> = read_keys
@@ -2434,7 +2482,8 @@ impl RowStreamRead {
             arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
         // Drop the key column if it was only read for alignment
         let new_data = new_data.project_by_schema(self.new_fields_schema.as_ref())?;
-        Ok(round.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+        let carried = round.project_by_schema(self.carried_schema.as_ref())?;
+        Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
     /// Execute one read round: plan the keys into ranges, read them, and
@@ -4846,14 +4895,16 @@ mod tests {
 
             let plan = take_plan(&fixture.dataset, rows_input(batches), &["s", "i"]).unwrap();
             assert!(plan.row_stream_input().is_some());
-            // Output schema: input columns then new fields in dataset order
+            // Output schema: input columns then new fields in dataset order.
+            // The identity flags are authoritative — the key column was not
+            // requested, so it is stripped from the output.
             assert_eq!(
                 plan.schema()
                     .fields()
                     .iter()
                     .map(|f| f.name().clone())
                     .collect::<Vec<_>>(),
-                vec!["payload", key, "i", "s"]
+                vec!["payload", "i", "s"]
             );
 
             let result = run(&plan).await;
@@ -5018,6 +5069,167 @@ mod tests {
                 .unwrap()
                 .as_primitive::<arrow::datatypes::Int32Type>();
             assert_eq!(i_col.value(0), 12);
+        }
+
+        /// The identity flags are authoritative: requested identity columns
+        /// the input lacks are synthesized by the read, carried ones are
+        /// kept, and unrequested carried ones are stripped
+        #[rstest]
+        #[case::unstable(false)]
+        #[case::stable(true)]
+        #[tokio::test]
+        async fn take_identity_flags(#[case] stable_row_ids: bool) {
+            let fixture = take_fixture(stable_row_ids).await;
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+
+            // Row ids of rows i=21 and i=3 (sequentially assigned on write)
+            let ids: Vec<u64> = if stable_row_ids {
+                vec![21, 3]
+            } else {
+                vec![addr(2, 1), addr(0, 3)]
+            };
+            let expected_addrs: Vec<u64> = vec![addr(2, 1), addr(0, 3)];
+            let expected_i: Vec<i32> = vec![21, 3];
+            let id_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                true,
+            )]));
+            let id_batch =
+                RecordBatch::try_new(id_schema, vec![Arc::new(UInt64Array::from(ids.clone()))])
+                    .unwrap();
+
+            // Keep the carried _rowid and synthesize _rowaddr
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap()
+                .with_row_id()
+                .with_row_addr();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(rows_input(vec![id_batch.clone()])),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>(),
+                vec![ROW_ID, "i", ROW_ADDR]
+            );
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let id_col = result
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            assert_eq!(id_col.values(), &ids[..]);
+            let addr_col = result
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            assert_eq!(addr_col.values(), &expected_addrs[..]);
+            let i_col = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            assert_eq!(i_col.values(), &expected_i[..]);
+
+            // Synthesize _rowaddr but strip the unrequested carried _rowid
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap()
+                .with_row_addr();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(rows_input(vec![id_batch.clone()])),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>(),
+                vec!["i", ROW_ADDR]
+            );
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let addr_col = result
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            assert_eq!(addr_col.values(), &expected_addrs[..]);
+
+            // Address-keyed input, synthesize _rowid (the reverse direction)
+            let addr_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ADDR,
+                DataType::UInt64,
+                true,
+            )]));
+            let addr_batch = RecordBatch::try_new(
+                addr_schema,
+                vec![Arc::new(UInt64Array::from(expected_addrs.clone()))],
+            )
+            .unwrap();
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap()
+                .with_row_id();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(rows_input(vec![addr_batch])),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>(),
+                vec!["i", ROW_ID]
+            );
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let id_col = result
+                .column_by_name(ROW_ID)
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            assert_eq!(id_col.values(), &ids[..]);
+
+            // Fetch nothing, synthesize only (the AddRowAddrExec shape)
+            let projection = fixture
+                .dataset
+                .empty_projection()
+                .with_row_id()
+                .with_row_addr();
+            let plan = FilteredReadExec::try_new(
+                fixture.dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(rows_input(vec![id_batch])),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>(),
+                vec![ROW_ID, ROW_ADDR]
+            );
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let addr_col = result
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            assert_eq!(addr_col.values(), &expected_addrs[..]);
         }
 
         /// Take of new sub-fields into an existing struct column: the fields
