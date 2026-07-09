@@ -20,6 +20,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
+backtrace = ["lance/backtrace", "lance-core/backtrace"]
 
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait"] }
