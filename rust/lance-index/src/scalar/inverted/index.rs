@@ -9566,7 +9566,7 @@ mod tests {
                 index
                     .bm25_search(
                         Arc::new(Tokens::new(vec![term], DocType::Text)),
-                        Arc::new(FtsSearchParams::new().with_limit(Some(200))),
+                        Arc::new(FtsSearchParams::new().with_limit(Some(num_rare as usize))),
                         Operator::Or,
                         Arc::new(NoFilter),
                         Arc::new(NoOpMetricsCollector),
