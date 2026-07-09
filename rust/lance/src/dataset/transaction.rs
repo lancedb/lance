@@ -3724,6 +3724,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         }
         Operation::Merge { fragments, schema } => {
             merge_fragments_valid(manifest, fragments)?;
+            merge_schema_valid(manifest, schema)?;
             schema_fragments_valid(Some(manifest), schema, fragments)
         }
         Operation::Overwrite {
@@ -3878,16 +3879,61 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
     Ok(())
 }
 
+/// Validate that a Merge schema preserves the dataset's field id bindings.
+///
+/// Readers resolve columns by field id (name -> schema id -> DataFile::fields
+/// position), so renumbered ids silently rebind live columns to other columns'
+/// bytes. Shared ids must keep their field path; new ids must exceed the
+/// manifest's max so a dropped field's id is never reused. Omitting a field
+/// (dropping it) remains legal.
+fn merge_schema_valid(manifest: &Manifest, new_schema: &Schema) -> Result<()> {
+    let prior_schema = &manifest.schema;
+
+    // Remap errors first: a renumbered schema usually violates both clauses.
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_none() {
+            continue;
+        }
+        let prior_path = prior_schema.field_path(field.id)?;
+        let new_path = new_schema.field_path(field.id)?;
+        if prior_path != new_path {
+            return Err(Error::invalid_input(format!(
+                "Merge operation remaps field id {} from \"{}\" to \"{}\". \
+                 Merge must preserve the dataset's field ids: derive the new schema \
+                 from the dataset's current schema instead of renumbering fields.",
+                field.id, prior_path, new_path
+            )));
+        }
+    }
+
+    let max_field_id = manifest.max_field_id();
+    for field in new_schema.fields_pre_order() {
+        if prior_schema.field_by_id(field.id).is_none() && field.id <= max_field_id {
+            return Err(Error::invalid_input(format!(
+                "Merge operation assigns id {} to new field \"{}\", but ids up to {} are \
+                 already used by current or dropped fields. New fields must use ids of at \
+                 least {}.",
+                field.id,
+                new_schema.field_path(field.id)?,
+                max_field_id,
+                max_field_id + 1
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
+    use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::Utc;
     use futures::TryStreamExt;
-    use lance_core::datatypes::Schema as LanceSchema;
+    use lance_core::datatypes::{Field as LanceCoreField, Schema as LanceSchema};
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
@@ -3903,6 +3949,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::Dataset;
+    use crate::dataset::NewColumnTransform;
     use crate::dataset::write::WriteParams;
     use crate::session::Session;
 
@@ -4058,6 +4105,239 @@ mod tests {
         let same_fragments = vec![Fragment::new(1), Fragment::new(2), Fragment::new(3)];
         let result = merge_fragments_valid(&manifest, &same_fragments);
         assert!(result.is_ok());
+    }
+
+    /// Repro shape for issue 7700: write a, b, c; drop one column; add d. The
+    /// dropped id stays referenced by the data files and max_field_id stays 3.
+    async fn dataset_with_dropped_column(uri: &str, dropped: &str) -> Dataset {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+        dataset.drop_columns(&[dropped]).await.unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "CAST(5 AS INT)".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let dropped_id = ["a", "b", "c"].iter().position(|c| *c == dropped).unwrap() as i32;
+        let mut expected_ids: Vec<i32> = (0..3).filter(|id| *id != dropped_id).collect();
+        expected_ids.push(3);
+        assert_eq!(dataset.schema().field_ids(), expected_ids);
+        assert_eq!(dataset.manifest.max_field_id(), 3);
+        dataset
+    }
+
+    /// Expected values of every column surviving `dropped`, plus d.
+    fn surviving_columns(dropped: &str) -> Vec<(&'static str, [i32; 2])> {
+        [
+            ("a", [1, 2]),
+            ("b", [10, 20]),
+            ("c", [100, 200]),
+            ("d", [5, 5]),
+        ]
+        .into_iter()
+        .filter(|(name, _)| *name != dropped)
+        .collect()
+    }
+
+    fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
+        for (name, expected) in cols {
+            let col = batch.column_by_name(name).unwrap();
+            assert_eq!(
+                col.as_primitive::<Int32Type>().values(),
+                expected,
+                "column {}",
+                name
+            );
+        }
+    }
+
+    async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset> {
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        Dataset::commit(
+            dataset.uri(),
+            Operation::Merge { fragments, schema },
+            Some(dataset.manifest.version),
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_field_ids() {
+        // Which clause rejects the lossy round-trip depends on the hole's
+        // position: a hole before the last field remaps a shared id, while a
+        // hole at the end reuses the dropped id for the new field.
+        let cases = [
+            ("a", "remaps field id 1 from \"b\" to \"c\""),
+            ("b", "remaps field id 2 from \"c\" to \"d\""),
+            ("c", "assigns id 2 to new field \"d\""),
+        ];
+        for (dropped, expected) in cases {
+            let test_dir = TempStrDir::default();
+            let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+
+            let arrow_schema = ArrowSchema::from(dataset.schema());
+            let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+            assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+            let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains(expected),
+                "dropped {}: unexpected error: {}",
+                dropped,
+                message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_dropped_field_id_reuse() {
+        // Deliberate reuse of a tombstoned id, as opposed to the renumbering
+        // accident covered above.
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_dropped_column(test_dir.as_str(), "b").await;
+
+        let mut schema = dataset.schema().clone();
+        let mut field =
+            LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
+        field.id = 1;
+        schema.fields.push(field);
+
+        let err = commit_merge(&dataset, schema).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("assigns id 1 to new field \"e\"")
+                && message.contains("must use ids of at least 4"),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_rejects_renumbered_nested_field_ids() {
+        // A hole inside a struct shifts a nested leaf's id onto a field
+        // outside the struct on renumbering; the full-path comparison must
+        // catch the cross-parent remap.
+        use arrow_array::StructArray;
+        use arrow_schema::Fields;
+
+        let test_dir = TempStrDir::default();
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::Int32, true),
+            ArrowField::new("y", DataType::Int32, true),
+        ]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+            ArrowField::new("z", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![
+                        Arc::new(Int32Array::from(vec![1, 2])),
+                        Arc::new(Int32Array::from(vec![10, 20])),
+                    ],
+                    None,
+                )),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
+        let mut dataset = Dataset::write(reader, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        dataset.drop_columns(&["s.x"]).await.unwrap();
+        assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
+
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("remaps field id 2 from \"s.y\" to \"z\""),
+            "unexpected error: {}",
+            message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_allows_id_preserving_schema_change() {
+        for dropped in ["a", "b", "c"] {
+            let test_dir = TempStrDir::default();
+            let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+
+            let survivors = surviving_columns(dropped);
+            let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
+            let mut schema = dataset.schema().clone();
+            schema
+                .mut_field_by_id(first_id)
+                .unwrap()
+                .metadata
+                .insert("wm".into(), "42".into());
+
+            let dataset = commit_merge(&dataset, schema).await.unwrap();
+            assert_eq!(
+                dataset
+                    .schema()
+                    .field(survivors[0].0)
+                    .unwrap()
+                    .metadata
+                    .get("wm"),
+                Some(&"42".to_string())
+            );
+
+            let batch = dataset.scan().try_into_batch().await.unwrap();
+            assert_columns(&batch, &survivors);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_allows_dropping_field() {
+        for dropped in ["a", "b", "c"] {
+            let test_dir = TempStrDir::default();
+            let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+
+            let mut survivors = surviving_columns(dropped);
+            let omitted = survivors.remove(0);
+            let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
+            let schema = dataset.schema().project(&names).unwrap();
+
+            let dataset = commit_merge(&dataset, schema).await.unwrap();
+            assert!(dataset.schema().field(omitted.0).is_none());
+
+            let batch = dataset.scan().try_into_batch().await.unwrap();
+            assert_columns(&batch, &survivors);
+        }
     }
 
     #[test]
