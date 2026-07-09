@@ -558,12 +558,7 @@ mod tests {
             Some(empty),
         ]));
 
-        check_round_trip_encoding_of_data(
-            vec![array],
-            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
-            blob_metadata,
-        )
-        .await;
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
     }
 
     #[tokio::test]
