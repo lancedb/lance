@@ -57,13 +57,13 @@ message InvertedIndexDetails {
   // be persisted for query-time tokenizer reconstruction and segment checks.
   bool split_identifiers = 14;
   // Code analyzer flag. Split identifier subwords across letter/number
-  // boundaries, e.g. HTML2JSON -> html/2/json. This changes the indexed term
-  // space and must be persisted with the index.
-  bool split_on_numerics = 15;
+  // boundaries, e.g. HTML2JSON -> html/2/json. When absent, use the analyzer
+  // profile default; when present, persist the explicit index-time choice.
+  optional bool split_on_numerics = 15;
   // Code analyzer flag. Keep the complete lexical identifier in addition to
-  // subwords, e.g. user_name plus user/name. This affects BM25 term statistics
-  // and must be persisted with the index.
-  bool preserve_original = 16;
+  // subwords, e.g. user_name plus user/name. When absent, use the analyzer
+  // profile default; when present, persist the explicit index-time choice.
+  optional bool preserve_original = 16;
   // Code analyzer flag. Index operator tokens such as "::", "->", and "!=".
   // Disabled by default because operators are often high-frequency noise, but
   // when enabled it changes query semantics and must be persisted.

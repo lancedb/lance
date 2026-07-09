@@ -10,6 +10,20 @@ use crate::{Token, TokenStream, Tokenizer};
 /// Identifiers are Unicode alphanumeric characters plus `_`. Other characters
 /// are lexical boundaries. When operator indexing is enabled, contiguous
 /// operator characters are emitted as tokens too.
+///
+/// # Examples
+///
+/// ```
+/// use lance_tokenizer::{CodeLexTokenizer, TextAnalyzer, TokenStream};
+///
+/// let mut analyzer = TextAnalyzer::builder(CodeLexTokenizer::new(true)).build();
+/// let mut stream = analyzer.token_stream("a::b");
+///
+/// assert!(stream.advance());
+/// assert_eq!(stream.token().text, "a");
+/// assert!(stream.advance());
+/// assert_eq!(stream.token().text, "::");
+/// ```
 #[derive(Clone, Default)]
 pub struct CodeLexTokenizer {
     index_operators: bool,
@@ -25,6 +39,7 @@ impl CodeLexTokenizer {
     }
 }
 
+/// Token stream produced by [`CodeLexTokenizer`].
 pub struct CodeLexTokenStream<'a> {
     text: &'a str,
     chars: Peekable<CharIndices<'a>>,

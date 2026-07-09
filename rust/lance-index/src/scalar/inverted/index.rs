@@ -1955,13 +1955,10 @@ impl InvertedPartition {
                     .into_iter()
                     .map(|(_, _, posting)| posting)
                     .collect::<Vec<_>>();
-                let posting = Self::union_posting_lists(
-                    postings,
-                    docs_for_union
-                        .as_deref()
-                        .expect("union docs must be loaded for grouped query terms"),
-                    is_phrase_query,
-                )?;
+                let docs = docs_for_union.as_deref().ok_or_else(|| {
+                    Error::index("union docs were not loaded for grouped query terms".to_string())
+                })?;
+                let posting = Self::union_posting_lists(postings, docs, is_phrase_query)?;
                 if posting.is_empty() && (is_and_query || is_phrase_query) {
                     return Ok(LoadedPostings::empty());
                 }
@@ -6029,6 +6026,32 @@ pub async fn flat_bm25_search_stream_with_metrics(
 
 /// Same as [`flat_bm25_search_stream_with_metrics`] but applies the provided
 /// match operator when deciding whether a flat-scanned row is a hit.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example(
+/// #     input: datafusion::execution::SendableRecordBatchStream,
+/// # ) -> Result<(), Box<dyn std::error::Error>> {
+/// use lance_index::scalar::inverted::{
+///     flat_bm25_search_stream_with_metrics_and_operator, query::Operator, InvertedIndexParams,
+/// };
+///
+/// let tokenizer = InvertedIndexParams::code().build()?;
+/// let _stream = flat_bm25_search_stream_with_metrics_and_operator(
+///     input,
+///     "code".to_string(),
+///     "Result".to_string(),
+///     tokenizer,
+///     None,
+///     1024,
+///     Operator::And,
+///     None,
+/// )
+/// .await?;
+/// # Ok(())
+/// # }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn flat_bm25_search_stream_with_metrics_and_operator(
     input: SendableRecordBatchStream,

@@ -9,6 +9,21 @@ use crate::{Token, TokenFilter, TokenStream, Tokenizer};
 ///
 /// The original identifier can be preserved at the first subword position. If
 /// a token is not a compound identifier then it is passed through unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use lance_tokenizer::{CodeLexTokenizer, TextAnalyzer, TokenStream, WordDelimiterFilter};
+///
+/// let mut analyzer = TextAnalyzer::builder(CodeLexTokenizer::new(false))
+///     .filter(WordDelimiterFilter::new(true, true))
+///     .build();
+/// let mut stream = analyzer.token_stream("parseHTML2JSON");
+///
+/// let mut tokens = Vec::new();
+/// stream.process(&mut |token| tokens.push(token.text.clone()));
+/// assert_eq!(tokens, vec!["parseHTML2JSON", "parse", "HTML", "2", "JSON"]);
+/// ```
 #[derive(Clone)]
 pub struct WordDelimiterFilter {
     preserve_original: bool,
@@ -37,6 +52,7 @@ impl TokenFilter for WordDelimiterFilter {
 }
 
 #[derive(Clone)]
+/// Tokenizer wrapper produced by [`WordDelimiterFilter`].
 pub struct WordDelimiterFilterWrapper<T> {
     tokenizer: T,
     preserve_original: bool,
@@ -58,6 +74,7 @@ impl<T: Tokenizer> Tokenizer for WordDelimiterFilterWrapper<T> {
     }
 }
 
+/// Token stream produced by [`WordDelimiterFilterWrapper`].
 pub struct WordDelimiterTokenStream<T> {
     tail: T,
     current: Token,
@@ -197,10 +214,11 @@ impl<T: TokenStream> TokenStream for WordDelimiterTokenStream<T> {
         if !self.refill() {
             return false;
         }
-        self.current = self
-            .pending
-            .pop_front()
-            .expect("pending token should be available after refill");
+        let Some(token) = self.pending.pop_front() else {
+            debug_assert!(false, "pending token should be available after refill");
+            return false;
+        };
+        self.current = token;
         true
     }
 

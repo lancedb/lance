@@ -336,8 +336,8 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
             split_identifiers: params.split_identifiers,
-            split_on_numerics: params.split_on_numerics,
-            preserve_original: params.preserve_original,
+            split_on_numerics: Some(params.split_on_numerics),
+            preserve_original: Some(params.preserve_original),
             index_operators: params.index_operators,
         })
     }
@@ -390,8 +390,12 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
         params.max_ngram_length = details.max_ngram_length;
         params.prefix_only = details.prefix_only;
         params.split_identifiers = details.split_identifiers;
-        params.split_on_numerics = details.split_on_numerics;
-        params.preserve_original = details.preserve_original;
+        if let Some(split_on_numerics) = details.split_on_numerics {
+            params.split_on_numerics = split_on_numerics;
+        }
+        if let Some(preserve_original) = details.preserve_original {
+            params.preserve_original = preserve_original;
+        }
         params.index_operators = details.index_operators;
         params.validate()?;
         Ok(params)
@@ -507,26 +511,52 @@ impl InvertedIndexParams {
         }
     }
 
+    fn apply_code_defaults(&mut self) {
+        self.analyzer = "code".to_string();
+        self.base_tokenizer = "code".to_string();
+        self.split_identifiers = false;
+        self.split_on_numerics = true;
+        self.preserve_original = true;
+        self.lower_case = true;
+        self.ascii_folding = true;
+        self.stem = false;
+        self.remove_stop_words = false;
+        self.index_operators = false;
+    }
+
     /// Create parameters for the code analyzer profile.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let tokenizer = InvertedIndexParams::code().build();
+    /// assert!(tokenizer.is_ok());
+    /// ```
     pub fn code() -> Self {
-        Self::new("code".to_string(), Language::English)
-            .analyzer("code")
-            .expect("code analyzer should be valid")
+        let mut params = Self::new("code".to_string(), Language::English);
+        params.apply_code_defaults();
+        params
     }
 
     /// Set analyzer profile.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default()
+    ///     .analyzer("code")?
+    ///     .split_identifiers(true);
+    /// assert!(params.build().is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn analyzer(mut self, analyzer: &str) -> Result<Self> {
         self.analyzer = normalize_analyzer(analyzer)?.to_string();
         if self.analyzer == "code" {
-            self.base_tokenizer = "code".to_string();
-            self.split_identifiers = false;
-            self.split_on_numerics = true;
-            self.preserve_original = true;
-            self.lower_case = true;
-            self.ascii_folding = true;
-            self.stem = false;
-            self.remove_stop_words = false;
-            self.index_operators = false;
+            self.apply_code_defaults();
         }
         Ok(self)
     }
@@ -536,12 +566,24 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Set the tokenizer implementation used by the analyzer.
+    ///
+    /// Setting this to `"code"` selects the code analyzer defaults.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default()
+    ///     .base_tokenizer("code".to_string())
+    ///     .split_identifiers(true);
+    /// assert!(params.build().is_ok());
+    /// ```
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
         self.base_tokenizer = base_tokenizer;
         if self.base_tokenizer == "code" {
-            self = self
-                .analyzer("code")
-                .expect("code analyzer should be valid");
+            self.apply_code_defaults();
         }
         self
     }
@@ -598,21 +640,38 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Set whether code identifiers are split into subwords.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::code()
+    ///     .split_identifiers(true)
+    ///     .split_on_numerics(false)
+    ///     .preserve_original(false)
+    ///     .index_operators(true);
+    /// assert!(params.build().is_ok());
+    /// ```
     pub fn split_identifiers(mut self, split_identifiers: bool) -> Self {
         self.split_identifiers = split_identifiers;
         self
     }
 
+    /// Set whether identifier subwords are split at letter/number boundaries.
     pub fn split_on_numerics(mut self, split_on_numerics: bool) -> Self {
         self.split_on_numerics = split_on_numerics;
         self
     }
 
+    /// Set whether the complete identifier is indexed alongside subwords.
     pub fn preserve_original(mut self, preserve_original: bool) -> Self {
         self.preserve_original = preserve_original;
         self
     }
 
+    /// Set whether operator tokens such as `::`, `->`, and `!=` are indexed.
     pub fn index_operators(mut self, index_operators: bool) -> Self {
         self.index_operators = index_operators;
         self
@@ -1026,8 +1085,22 @@ mod tests {
             .index_operators(true)
             .preserve_original(false);
         let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        assert_eq!(details.split_on_numerics, Some(true));
+        assert_eq!(details.preserve_original, Some(false));
         let round_tripped = InvertedIndexParams::try_from(&details).unwrap();
         assert_eq!(round_tripped, params);
+    }
+
+    #[test]
+    fn test_inverted_details_uses_code_defaults_for_absent_flags() {
+        let mut details =
+            crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::code()).unwrap();
+        details.split_on_numerics = None;
+        details.preserve_original = None;
+
+        let params = InvertedIndexParams::try_from(&details).unwrap();
+        assert!(params.split_on_numerics);
+        assert!(params.preserve_original);
     }
 
     #[test]

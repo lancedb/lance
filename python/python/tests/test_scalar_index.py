@@ -866,6 +866,18 @@ def test_code_analyzer_full_text_search_with_identifier_splitting(tmp_path):
     assert params["remove_stop_words"] is False
 
 
+def test_code_analyzer_flags_require_code_analyzer(tmp_path):
+    table = pa.table({"text": ["getUserName"]})
+    ds = lance.write_dataset(table, tmp_path)
+
+    with pytest.raises(ValueError, match="code analyzer flags require analyzer='code'"):
+        ds.create_scalar_index(
+            "text",
+            index_type="INVERTED",
+            split_identifiers=True,
+        )
+
+
 def test_code_analyzer_complex_code_constructs(tmp_path):
     table = pa.table(
         {

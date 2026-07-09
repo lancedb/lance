@@ -2463,6 +2463,28 @@ impl Dataset {
                         _ => {}
                     }
 
+                    let uses_code_analyzer = match analyzer.as_deref() {
+                        Some("code") => true,
+                        Some("text") | None => base_tokenizer.as_deref() == Some("code"),
+                        Some(_) => true,
+                    };
+                    if !uses_code_analyzer {
+                        for flag in [
+                            "split_identifiers",
+                            "split_on_numerics",
+                            "preserve_original",
+                            "index_operators",
+                        ] {
+                            if let Some(value) = kwargs.get_item(flag)?
+                                && value.extract::<bool>()?
+                            {
+                                return Err(PyValueError::new_err(
+                                    "code analyzer flags require analyzer='code'",
+                                ));
+                            }
+                        }
+                    }
+
                     if let Some(analyzer) = analyzer {
                         params = params
                             .analyzer(&analyzer)
