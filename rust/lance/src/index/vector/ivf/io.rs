@@ -369,7 +369,11 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             tasks.push(Some(tokio::spawn(async move {
                 // Hold a guard clone so the scratch dir stays alive while this task writes.
                 let _tmp_part_dir_guard = tmp_part_dir_guard;
-                let _permit = sem.acquire().await.expect("semaphore error");
+                let _permit = sem.acquire().await.map_err(|err| {
+                    Error::io(format!(
+                        "failed to acquire HNSW partition build permit: {err}"
+                    ))
+                })?;
 
                 log::debug!("Building HNSW partition {}", part_id);
                 let result = build_hnsw_quantization_partition(
@@ -473,18 +477,26 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 /// Abort and await every still-outstanding partition-build task, returning the
 /// non-cancellation errors they surfaced.
 ///
-/// A dropped [`JoinHandle`] detaches its task, so each handle is aborted and
-/// awaited: awaiting resolves only once the task has actually stopped and is no
-/// longer writing into the scratch dir. Cancellation errors are the expected
-/// result of the abort and dropped; real failures and panics are returned so the
-/// caller can surface them.
+/// A dropped [`JoinHandle`] detaches its task, so every handle is aborted up front
+/// before any is awaited: otherwise a task slow to observe its own cancellation
+/// would keep running -- and keep writing into the scratch dir -- while an earlier
+/// handle is still being awaited. Awaiting then resolves only once each task has
+/// actually stopped. Cancellation errors are the expected result of the abort and
+/// dropped; failures and panics from tasks that had already finished before the
+/// abort are returned so the caller can surface them (a task still in flight is
+/// cancelled, so this best-effort drain only reports errors already produced).
 async fn drain_partition_tasks(tasks: &mut [Option<JoinHandle<Result<usize>>>]) -> Vec<Error> {
-    let mut errors = Vec::new();
+    for task in tasks.iter() {
+        if let Some(handle) = task.as_ref() {
+            handle.abort();
+        }
+    }
+
+    let mut errors = Vec::with_capacity(tasks.len());
     for task in tasks.iter_mut() {
         let Some(handle) = task.take() else {
             continue;
         };
-        handle.abort();
         match handle.await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => errors.push(e),
@@ -542,9 +554,16 @@ async fn build_hnsw_quantization_partition(
             ));
         }
         Quantizer::Product(pq) => {
-            build_and_write_pq_storage(metric_type, row_ids, code_array, pq, aux_writer.unwrap())
+            let aux_writer = aux_writer.ok_or_else(|| {
+                Error::index("IVF_HNSW_PQ requires an auxiliary writer for PQ storage".to_string())
+            })?;
+            build_and_write_pq_storage(metric_type, row_ids, code_array, pq, aux_writer)
         }
-        _ => unreachable!("IVF_HNSW_SQ has been moved to v2 index builder"),
+        _ => {
+            return Err(Error::index(
+                "IVF_HNSW_SQ is not supported in the legacy HNSW partition writer".to_string(),
+            ));
+        }
     };
 
     let (index_rows, ()) = futures::try_join!(build_hnsw, build_store)?;
@@ -587,6 +606,7 @@ async fn build_and_write_pq_storage(
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::Dataset;
@@ -597,6 +617,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
     use lance_testing::datagen::generate_random_array;
 
     #[tokio::test]
@@ -726,7 +748,7 @@ mod tests {
         }
 
         const NUM_SLOW: usize = 3;
-        let mut tasks: Vec<Option<JoinHandle<Result<usize>>>> = Vec::new();
+        let mut tasks: Vec<Option<JoinHandle<Result<usize>>>> = Vec::with_capacity(NUM_SLOW + 1);
 
         // Tasks that never resolve on their own: the drain's abort is the only thing
         // that can stop them, which is exactly what this test exercises.
@@ -746,9 +768,17 @@ mod tests {
         }
 
         // A task that fails; its error must be returned, not silently dropped.
-        tasks.push(Some(tokio::spawn(async move {
-            Err(Error::io("late partition failure".to_string()))
-        })));
+        // The drain aborts every handle up front, and an abort only preserves a
+        // task's output if the task has already finished -- an in-flight task is
+        // cancelled and its error lost. So wait until this task has actually
+        // completed before handing it to the drain; otherwise whether its error
+        // surfaces would depend on the scheduler and the test would be flaky.
+        let failing =
+            tokio::spawn(async move { Err(Error::io("late partition failure".to_string())) });
+        while !failing.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        tasks.push(Some(failing));
 
         // Ensure all slow tasks are actually running before draining, so the
         // drain has to await their cancellation rather than aborting them before
@@ -792,8 +822,6 @@ mod tests {
     /// `TMPDIR` pointed at an isolated dir we own, then assert nothing survives.
     #[test]
     fn test_hnsw_pq_scratch_dir_is_not_leaked() {
-        use std::path::PathBuf;
-
         // Isolated temp root for the child. Owned here so it -- and anything the
         // child leaks into it -- is removed when this guard drops at test end.
         let isolated_root = TempStdDir::default();
@@ -844,9 +872,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "spawned as a child process by test_hnsw_pq_scratch_dir_is_not_leaked"]
     async fn build_legacy_hnsw_pq_in_child_process() {
-        use lance_index::vector::ivf::IvfBuildParams;
-        use lance_index::vector::pq::PQBuildParams;
-
         // Only do work when spawned by the parent; a bare `--ignored` run leaves
         // the variable unset, so no-op rather than fail.
         let Ok(root) = std::env::var("LANCE_HNSW_LEAK_TEST_ROOT") else {
