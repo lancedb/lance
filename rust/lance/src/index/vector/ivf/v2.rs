@@ -4411,17 +4411,19 @@ mod tests {
         test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
     }
 
-    // RQ doesn't perform well for random data
-    // need to verify recall with real-world dataset (e.g. sift1m)
+    // These queries probe every partition, so recall here measures RaBitQ quantization
+    // error alone. At 1 bit per dimension it averages ~0.67 on this uniformly random,
+    // L2-normalized data, and each build draws a fresh random rotation, so no bar worth
+    // asserting sits clear of the spread. 5 bits lifts recall to ~0.97; its `ex_bits = 4`
+    // also covers a FastScan ex-code kernel that the multi-bit test below never reaches.
     #[rstest]
-    #[case(1, DistanceType::L2, 0.5)]
-    #[case(1, DistanceType::Cosine, 0.5)]
-    #[case(1, DistanceType::Dot, 0.5)]
-    #[case(4, DistanceType::L2, 0.5)]
-    #[case(4, DistanceType::Cosine, 0.5)]
-    #[case(4, DistanceType::Dot, 0.5)]
+    #[case(1, DistanceType::L2, 0.9)]
+    #[case(1, DistanceType::Cosine, 0.9)]
+    #[case(1, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
-    // #[ignore = "Temporarily skipping flaky 4-bit IVF_RQ tests"]
     async fn test_build_ivf_rq(
         #[case] nlist: usize,
         #[case] distance_type: DistanceType,
@@ -4430,7 +4432,7 @@ mod tests {
     ) {
         let _ = env_logger::try_init();
         let ivf_params = IvfBuildParams::new(nlist);
-        let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
+        let rq_params = RQBuildParams::with_rotation_type(5, rotation_type);
         let params = VectorIndexParams::with_ivf_rq_params(distance_type, ivf_params, rq_params);
         test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
