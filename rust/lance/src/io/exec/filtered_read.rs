@@ -1575,12 +1575,12 @@ struct RowStreamSource {
     /// Both work on any dataset: ids resolve through each fragment's row id
     /// sequence, addresses read directly by physical position.
     key_column: &'static str,
-    /// `options.projection` minus the fields already present in the stream's
-    /// schema — the fields this node actually reads
-    fields_to_read: Projection,
-    /// A copy of the node options whose projection is `fields_to_read` plus
-    /// the key column, used to plan and read the fragments
+    /// Options for the internal fragment read.  Its projection is the fields
+    /// to read (the output fields the stream doesn't already carry) plus the
+    /// key column, which is read for alignment and stripped before the merge.
     read_options: FilteredReadOptions,
+    /// Arrow schema of just the read fields, without the key column
+    new_fields_schema: SchemaRef,
 }
 
 /// Public plan for distributed execution - uses bitmap for flexibility
@@ -1638,14 +1638,12 @@ impl FilteredReadExec {
         options: FilteredReadOptions,
         input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
-        if let Some(input) = input {
-            if Self::is_index_query_schema(input.schema().as_ref()) {
-                Self::try_new_scan(dataset, options, RowSelector::RowSet(input))
-            } else {
-                Self::try_new_row_stream(dataset, options, input)
+        match input {
+            Some(input) if Self::is_index_query_schema(input.schema().as_ref()) => {
+                Self::try_new_scan(dataset, options, Some(input))
             }
-        } else {
-            Self::try_new_scan(dataset, options, RowSelector::AllRows)
+            Some(input) => Self::try_new_row_stream(dataset, options, input),
+            None => Self::try_new_scan(dataset, options, None),
         }
     }
 
@@ -1679,6 +1677,8 @@ impl FilteredReadExec {
                 "filters are not supported when taking rows from an input plan".into(),
             ));
         }
+        // For a streaming input, a limit is safer to apply upstream (on the
+        // cheap keyed rows, before columns are fetched)
         if options.scan_range_before_filter.is_some() || options.scan_range_after_filter.is_some() {
             return Err(Error::invalid_input_source(
                 "scan ranges are not supported when taking rows from an input plan".into(),
@@ -1696,13 +1696,11 @@ impl FilteredReadExec {
         }
 
         let input_schema = input.schema();
-        let has_row_id = input_schema.column_with_name(ROW_ID).is_some();
-        let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
         // Prefer the row id when both are present: ids survive compaction,
         // addresses are pinned to this dataset version
-        let key_column = if has_row_id {
+        let key_column = if input_schema.column_with_name(ROW_ID).is_some() {
             ROW_ID
-        } else if has_row_addr {
+        } else if input_schema.column_with_name(ROW_ADDR).is_some() {
             ROW_ADDR
         } else {
             return Err(Error::invalid_input_source(
@@ -1742,13 +1740,14 @@ impl FilteredReadExec {
                 .with_eq_properties(EquivalenceProperties::new(output_schema)),
         );
 
-        let read_projection = if key_column == ROW_ID {
-            fields_to_read.clone().with_row_id()
-        } else {
-            fields_to_read.clone().with_row_addr()
-        };
+        let new_fields_schema =
+            Arc::new(arrow_schema::Schema::from(&fields_to_read.to_bare_schema()));
         let mut read_options = options.clone();
-        read_options.projection = read_projection;
+        read_options.projection = if key_column == ROW_ID {
+            fields_to_read.with_row_id()
+        } else {
+            fields_to_read.with_row_addr()
+        };
 
         Ok(Self {
             dataset,
@@ -1758,8 +1757,8 @@ impl FilteredReadExec {
             input: RowSelector::RowStream(Box::new(RowStreamSource {
                 plan: input,
                 key_column,
-                fields_to_read,
                 read_options,
+                new_fields_schema,
             })),
             plan: Arc::new(OnceCell::new()),
             running_stream: Arc::new(AsyncMutex::new(None)),
@@ -1769,8 +1768,12 @@ impl FilteredReadExec {
     fn try_new_scan(
         dataset: Arc<Dataset>,
         mut options: FilteredReadOptions,
-        input: RowSelector,
+        index_input: Option<Arc<dyn ExecutionPlan>>,
     ) -> Result<Self> {
+        let input = match index_input {
+            Some(plan) => RowSelector::RowSet(plan),
+            None => RowSelector::AllRows,
+        };
         if options.with_deleted_rows {
             // Ensure we have the row id column if with_deleted_rows is set
             options.projection = options.projection.with_row_id();
@@ -2052,9 +2055,7 @@ impl FilteredReadExec {
         let dataset = self.dataset.clone();
         let read_options = source.read_options.clone();
         let key_column = source.key_column;
-        let new_fields_schema = Arc::new(arrow_schema::Schema::from(
-            &source.fields_to_read.to_bare_schema(),
-        ));
+        let new_fields_schema = source.new_fields_schema.clone();
         let output_schema = self.schema();
         let metrics = self.metrics.clone();
 
@@ -2216,31 +2217,35 @@ impl RowStreamRead {
         }
     }
 
-    async fn map_batch(
-        self: Arc<Self>,
-        batch: RecordBatch,
-        batch_index: u32,
-    ) -> DataFusionResult<RecordBatch> {
-        if batch.num_rows() == 0 {
-            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
-        }
-        let compute_timer = self.baseline_metrics.elapsed_compute().timer();
-        let keys_arr = batch.column_by_name(self.key_column).ok_or_else(|| {
+    /// Extract the round's key column from `batch` (produced by `producer`)
+    fn key_array<'a>(
+        &self,
+        batch: &'a RecordBatch,
+        producer: &str,
+    ) -> DataFusionResult<&'a arrow_array::PrimitiveArray<UInt64Type>> {
+        let keys = batch.column_by_name(self.key_column).ok_or_else(|| {
             DataFusionError::Internal(format!(
-                "the row-stream input lost its '{}' column",
-                self.key_column
+                "the row-stream {} is missing the '{}' column",
+                producer, self.key_column
             ))
         })?;
-        let keys = keys_arr.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+        keys.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
             DataFusionError::Internal(format!(
                 "expected the row-stream column '{}' to be UInt64 but it was {}",
                 self.key_column,
-                keys_arr.data_type()
+                keys.data_type()
             ))
-        })?;
+        })
+    }
 
+    /// Turn a round's keys into per-fragment read ranges
+    async fn plan_round(
+        &self,
+        keys: &arrow_array::PrimitiveArray<UInt64Type>,
+    ) -> DataFusionResult<FilteredReadInternalPlan> {
+        let compute_timer = self.baseline_metrics.elapsed_compute().timer();
         // Null keys identify rows that don't exist in the dataset; they are
-        // excluded here and the rows are dropped by the unmatched filter below
+        // excluded here and their rows are dropped by attach_columns
         let round_keys = if keys.null_count() == 0 {
             RowAddrTreeMap::from_iter(keys.values().iter().copied())
         } else {
@@ -2249,19 +2254,34 @@ impl RowStreamRead {
         drop(compute_timer);
 
         let fragments = self.load_fragments().await?;
-        let internal_plan = if self.key_column == ROW_ADDR {
+        if self.key_column == ROW_ADDR {
             // Addresses already encode (fragment, offset), so build the read
             // ranges directly.  The mask path below cannot be used here: on a
             // stable-row-id dataset it would translate the values through the
             // row-id sequence, misreading addresses as row ids.
-            Self::plan_round_from_addresses(&round_keys, fragments)
+            Ok(Self::plan_round_from_addresses(&round_keys, fragments))
         } else {
             let evaluated_index = Arc::new(EvaluatedIndex {
                 index_result: IndexExprResult::exact(RowAddrMask::from_allowed(round_keys)),
                 applicable_fragments: self.dataset.fragment_bitmap.as_ref().clone(),
             });
-            FilteredReadStream::plan_scan(fragments, &Some(evaluated_index), &self.read_options)
-        };
+            Ok(FilteredReadStream::plan_scan(
+                fragments,
+                &Some(evaluated_index),
+                &self.read_options,
+            ))
+        }
+    }
+
+    /// Read the round's planned ranges — open every touched fragment and
+    /// decode its rows, all in parallel — returning the read rows in storage
+    /// order, deduplicated, with the key column included
+    async fn read_round(
+        &self,
+        internal_plan: FilteredReadInternalPlan,
+        round_index: u32,
+    ) -> DataFusionResult<RecordBatch> {
+        let fragments = self.load_fragments().await?;
         let mut scoped_fragments = FilteredReadStream::plan_to_scoped_fragments(
             &internal_plan,
             fragments,
@@ -2279,7 +2299,7 @@ impl RowStreamRead {
             // not dense but the scheduler only compares them.
             scoped.priority = scoped
                 .priority
-                .saturating_add(batch_index.saturating_mul(num_fragments));
+                .saturating_add(round_index.saturating_mul(num_fragments));
             // Read each fragment's rows for this round as a single batch
             scoped.batch_size = u32::MAX;
         }
@@ -2318,32 +2338,34 @@ impl RowStreamRead {
             read_batches.push(decode_task.await.unwrap()?);
         }
 
-        let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
         let read_schema = Arc::new(self.read_options.projection.to_arrow_schema());
-        let read_data = arrow::compute::concat_batches(&read_schema, read_batches.iter())?;
+        Ok(arrow::compute::concat_batches(
+            &read_schema,
+            read_batches.iter(),
+        )?)
+    }
 
-        // Align the read rows (dataset order, deduplicated) back to the
-        // input's row order via the key column
-        let read_keys = read_data
-            .column_by_name(self.key_column)
-            .ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "the row-stream read did not produce the '{}' column",
-                    self.key_column
-                ))
-            })?
-            .as_primitive::<UInt64Type>();
+    /// Align the read rows back to the round's row order via the key column
+    /// and merge the fetched columns onto the round's batch
+    fn attach_columns(
+        &self,
+        round: RecordBatch,
+        read_data: RecordBatch,
+    ) -> DataFusionResult<RecordBatch> {
+        let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
+        let keys = self.key_array(&round, "input")?;
+        let read_keys = self.key_array(&read_data, "read")?;
 
         // Fast path: the read produced exactly one row per input row with an
         // identical key sequence (typical when the input is already in
         // storage order with no duplicates or stale keys), so the rows are
         // aligned as-is — skip the hash map and the permutation
         if keys.null_count() == 0
-            && read_data.num_rows() == batch.num_rows()
+            && read_data.num_rows() == round.num_rows()
             && read_keys.values() == keys.values()
         {
             let new_data = read_data.project_by_schema(self.new_fields_schema.as_ref())?;
-            return Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?);
+            return Ok(round.merge_with_schema(&new_data, self.output_schema.as_ref())?);
         }
 
         let key_to_index: HashMap<u64, u32> = read_keys
@@ -2353,8 +2375,8 @@ impl RowStreamRead {
             .map(|(index, key)| (*key, index as u32))
             .collect();
 
-        let mut indices = Vec::with_capacity(batch.num_rows());
-        let mut valid = Vec::with_capacity(batch.num_rows());
+        let mut indices = Vec::with_capacity(round.num_rows());
+        let mut valid = Vec::with_capacity(round.num_rows());
         for i in 0..keys.len() {
             let index = if keys.is_valid(i) {
                 key_to_index.get(&keys.value(i)).copied()
@@ -2372,12 +2394,12 @@ impl RowStreamRead {
 
         // Drop input rows whose key no longer exists in the dataset (e.g.
         // stale index results pointing at deleted rows)
-        let batch = if indices.len() < batch.num_rows() {
-            arrow::compute::filter_record_batch(&batch, &BooleanArray::from(valid))?
+        let round = if indices.len() < round.num_rows() {
+            arrow::compute::filter_record_batch(&round, &BooleanArray::from(valid))?
         } else {
-            batch
+            round
         };
-        if batch.num_rows() == 0 {
+        if round.num_rows() == 0 {
             return Ok(RecordBatch::new_empty(self.output_schema.clone()));
         }
 
@@ -2385,7 +2407,22 @@ impl RowStreamRead {
             arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
         // Drop the key column if it was only read for alignment
         let new_data = new_data.project_by_schema(self.new_fields_schema.as_ref())?;
-        Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+        Ok(round.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+    }
+
+    /// Execute one read round: plan the keys into ranges, read them, and
+    /// attach the fetched columns to the round's batch
+    async fn execute_round(
+        self: Arc<Self>,
+        round: RecordBatch,
+        round_index: u32,
+    ) -> DataFusionResult<RecordBatch> {
+        if round.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
+        }
+        let internal_plan = self.plan_round(self.key_array(&round, "input")?).await?;
+        let read_data = self.read_round(internal_plan, round_index).await?;
+        self.attach_columns(round, read_data)
     }
 
     /// The number of input rows gathered into each read round (and therefore
@@ -2460,11 +2497,11 @@ impl RowStreamRead {
         let final_baseline = self.baseline_metrics.clone();
         Self::coalesce_rounds(input, self.round_target_rows())
             .enumerate()
-            .map(move |(batch_index, batch)| {
-                let batch = batch?;
+            .map(move |(round_index, round)| {
+                let round = round?;
                 let this = self.clone();
                 DataFusionResult::Ok(
-                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
+                    tokio::task::spawn(this.execute_round(round, round_index as u32))
                         .map(|res| res.unwrap()),
                 )
             })
@@ -2488,11 +2525,10 @@ impl DisplayAs for FilteredReadExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         if let RowSelector::RowStream(source) = &self.input {
             let columns = source
-                .fields_to_read
-                .to_bare_schema()
+                .new_fields_schema
                 .fields
                 .iter()
-                .map(|f| f.name.as_str())
+                .map(|f| f.name().as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             return match t {
