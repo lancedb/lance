@@ -202,7 +202,12 @@ impl FixedPackedFieldData {
         let start = row_idx
             .checked_mul(bytes_per_value)
             .ok_or_else(|| Error::invalid_input("Packed struct row size overflow"))?;
-        let end = start + bytes_per_value;
+        let end = start.checked_add(bytes_per_value).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Packed struct fixed child range overflow: row_idx={row_idx}, \
+                 bytes_per_value={bytes_per_value}"
+            ))
+        })?;
         let data = self.block.data.as_ref();
         if end > data.len() {
             return Err(Error::invalid_input(
@@ -412,12 +417,12 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
 }
 
 #[derive(Debug)]
-pub struct PackedStructFixedPerValueEncoder {
+pub(crate) struct PackedStructFixedPerValueEncoder {
     field_len: usize,
 }
 
 impl PackedStructFixedPerValueEncoder {
-    pub fn new(fields: Vec<Field>) -> Self {
+    pub(crate) fn new(fields: Vec<Field>) -> Self {
         Self {
             field_len: fields.len(),
         }
@@ -445,7 +450,9 @@ impl PerValueCompressor for PackedStructFixedPerValueEncoder {
             let (compressed, ..) = compressor.compress(child_block)?;
             match compressed {
                 PerValueDataBlock::Fixed(block) => {
-                    bits_per_row += block.bits_per_value;
+                    bits_per_row = bits_per_row
+                        .checked_add(block.bits_per_value)
+                        .ok_or_else(|| Error::invalid_input("Packed struct row width overflow"))?;
                     field_bits_per_value.push(block.bits_per_value);
                     field_data.push(FixedPackedFieldData { block });
                 }
@@ -865,7 +872,7 @@ struct PackedStructFixedFieldDecoder {
 }
 
 #[derive(Debug)]
-pub struct PackedStructFixedPerValueDecompressor {
+pub(crate) struct PackedStructFixedPerValueDecompressor {
     decoders: Vec<PackedStructFixedFieldDecoder>,
 }
 
@@ -1555,6 +1562,7 @@ mod tests {
 
         let encoder = PackedStructFixedPerValueEncoder::new(struct_field.children);
         let err = encoder.compress(struct_block).unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
         assert!(
             err.to_string().contains("fixed-width"),
             "unexpected error: {err}"
