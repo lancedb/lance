@@ -3760,8 +3760,11 @@ mod tests {
     #[test]
     fn test_code_analyzer_and_query_uses_position_alternatives() {
         let schema = create_test_schema();
-        let index =
-            FtsMemIndex::with_params(1, "description".to_string(), InvertedIndexParams::code());
+        let index = FtsMemIndex::with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::code().split_identifiers(true),
+        );
         let batch = RecordBatch::try_new(
             schema,
             vec![
