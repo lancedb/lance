@@ -1450,8 +1450,16 @@ impl RleDecompressor {
                 format!("RLE num_values does not fit in usize: {num_values}").into(),
             )
         })?;
-        let mut decoded_value_count = 0usize;
-        for length_bytes in lengths.chunks_exact(length_size) {
+        // Legacy miniblock encoders rolled back to a power-of-2 checkpoint after a run
+        // had already crossed it, so a chunk's run lengths can sum past its declared
+        // value count (the excess values are re-encoded at the start of the next chunk).
+        // The pre-run-length-width decoder truncated the excess, so we must clamp
+        // rather than reject to keep those files readable.
+        let mut decoded: Vec<T> = Vec::with_capacity(expected_value_count);
+        for (value, length_bytes) in values.iter().zip(lengths.chunks_exact(length_size)) {
+            if decoded.len() == expected_value_count {
+                break;
+            }
             let length = self.run_length_width.read_length(length_bytes);
             if length == 0 {
                 return Err(Error::invalid_input_source(
@@ -1463,34 +1471,19 @@ impl RleDecompressor {
                     format!("RLE run length does not fit in usize: {length}").into(),
                 )
             })?;
-            decoded_value_count = decoded_value_count.checked_add(length).ok_or_else(|| {
-                Error::invalid_input_source("RLE run length sum overflowed usize".into())
-            })?;
-            if decoded_value_count > expected_value_count {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "RLE decoding overflowed expected value count: produced at least {}, expected {}",
-                        decoded_value_count, expected_value_count
-                    )
-                    .into(),
-                ));
-            }
+            let length = length.min(expected_value_count - decoded.len());
+            decoded.resize(decoded.len() + length, *value);
         }
 
-        if decoded_value_count != expected_value_count {
+        if decoded.len() != expected_value_count {
             return Err(Error::invalid_input_source(
                 format!(
                     "RLE decoding produced {} values, expected {}",
-                    decoded_value_count, expected_value_count
+                    decoded.len(),
+                    expected_value_count
                 )
                 .into(),
             ));
-        }
-
-        let mut decoded: Vec<T> = Vec::with_capacity(expected_value_count);
-        for (value, length_bytes) in values.iter().zip(lengths.chunks_exact(length_size)) {
-            let length = self.run_length_width.read_length(length_bytes) as usize;
-            decoded.resize(decoded.len() + length, *value);
         }
 
         trace!(
@@ -2096,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rle_rejects_underflow_overflow_and_zero_lengths() {
+    fn test_rle_rejects_underflow_and_zero_lengths_and_clamps_overflow() {
         let decompressor = RleDecompressor::with_run_length_width(32, RunLengthWidth::U16);
         let value = LanceBuffer::from(1i32.to_le_bytes().to_vec());
 
@@ -2119,12 +2112,15 @@ mod tests {
             ],
             5,
         )
-        .unwrap_err();
-        assert!(
-            overflow
-                .to_string()
-                .contains("overflowed expected value count")
-        );
+        .unwrap();
+        match overflow {
+            DataBlock::FixedWidth(block) => {
+                assert_eq!(block.num_values, 5);
+                let decoded = block.data.borrow_to_typed_slice::<i32>();
+                assert_eq!(decoded.as_ref(), &[1i32; 5]);
+            }
+            _ => panic!("Expected FixedWidth block"),
+        }
 
         let zero = MiniBlockDecompressor::decompress(
             &decompressor,
@@ -2133,6 +2129,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(zero.to_string().contains("zero run length"));
+    }
+
+    #[test]
+    fn test_rle_truncates_legacy_chunk_boundary_overflow() {
+        // Legacy encoders emitted chunks declaring 2048 values whose final run crossed
+        // the checkpoint boundary (e.g. run lengths summing to 2080); the excess values
+        // are duplicated at the start of the next chunk and must be ignored here.
+        let decompressor = RleDecompressor::with_run_length_width(32, RunLengthWidth::U16);
+        let mut values = Vec::new();
+        values.extend_from_slice(&7i32.to_le_bytes());
+        values.extend_from_slice(&8i32.to_le_bytes());
+        let mut lengths = Vec::new();
+        lengths.extend_from_slice(&2000u16.to_le_bytes());
+        lengths.extend_from_slice(&80u16.to_le_bytes());
+
+        let decoded = MiniBlockDecompressor::decompress(
+            &decompressor,
+            vec![LanceBuffer::from(values), LanceBuffer::from(lengths)],
+            2048,
+        )
+        .unwrap();
+        match decoded {
+            DataBlock::FixedWidth(block) => {
+                assert_eq!(block.num_values, 2048);
+                let decoded = block.data.borrow_to_typed_slice::<i32>();
+                let decoded = decoded.as_ref();
+                assert_eq!(decoded.len(), 2048);
+                assert!(decoded[..2000].iter().all(|&v| v == 7));
+                assert!(decoded[2000..].iter().all(|&v| v == 8));
+            }
+            _ => panic!("Expected FixedWidth block"),
+        }
     }
 
     #[test]
