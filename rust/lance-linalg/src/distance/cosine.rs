@@ -664,6 +664,7 @@ mod f64_x86 {
     use std::arch::x86_64::*;
 
     use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::x86::hsum256_pd;
     use crate::simd::{FloatSimd, SIMD};
 
     /// AVX-512 path for f64 fast cosine: 8-wide `__m512d` xy/yy with `vfmadd231pd` per iteration.
@@ -742,8 +743,8 @@ mod f64_x86 {
             acc_yy = _mm256_add_pd(acc_yy, _mm256_mul_pd(yv, yv));
         }
 
-        let xy_main = hsum256_pd_local(acc_xy);
-        let yy_main = hsum256_pd_local(acc_yy);
+        let xy_main = hsum256_pd(acc_xy);
+        let yy_main = hsum256_pd(acc_yy);
 
         let tail_y_norm: f64 = y[aligned_len..].iter().map(|&v| v * v).sum();
         let tail_xy: f64 = x[aligned_len..]
@@ -755,19 +756,6 @@ mod f64_x86 {
         let y_norm_sq = (yy_main + tail_y_norm) as f32;
         let xy = (xy_main + tail_xy) as f32;
         1.0 - xy / x_norm / y_norm_sq.sqrt()
-    }
-
-    /// Horizontal sum of an `__m256d` register. Local to this `f64_x86`
-    /// mod for cache locality with its inner kernels; matches the
-    /// per-mod hsum-helper pattern already used in `dot.rs`/`norm_l2.rs`.
-    #[inline]
-    #[target_feature(enable = "avx")]
-    unsafe fn hsum256_pd_local(v: __m256d) -> f64 {
-        let lo = _mm256_castpd256_pd128(v);
-        let hi = _mm256_extractf128_pd(v, 1);
-        let sum128 = _mm_add_pd(lo, hi);
-        let sum64 = _mm_add_pd(sum128, _mm_unpackhi_pd(sum128, sum128));
-        _mm_cvtsd_f64(sum64)
     }
 }
 
@@ -897,6 +885,7 @@ mod f32_x86 {
     use std::arch::x86_64::*;
 
     use super::{dot, f32x8, f32x16, norm_l2};
+    use crate::simd::x86::hsum256_ps;
     use crate::simd::{FloatSimd, SIMD};
 
     /// AVX + FMA path for f32 fast cosine. Covers both AvxFma and AVX2 dispatch (body uses no AVX2-specific intrinsics).
@@ -943,28 +932,12 @@ mod f32_x86 {
             acc_yy = _mm256_add_ps(acc_yy, _mm256_mul_ps(yv, yv));
         }
 
-        let xy_main = hsum256_ps_local(acc_xy);
-        let yy_main = hsum256_ps_local(acc_yy);
+        let xy_main = hsum256_ps(acc_xy);
+        let yy_main = hsum256_ps(acc_yy);
 
         let y_norm = yy_main + norm_l2(&other[aligned_len..]).powi(2);
         let xy = xy_main + dot(&x[aligned_len..], &other[aligned_len..]);
         1.0 - xy / x_norm / y_norm.sqrt()
-    }
-
-    /// Horizontal sum of an `__m256` register. Local to this `f32_x86` mod
-    /// because the sibling `mod x86` in `norm_l2.rs` keeps its own copy
-    /// for cache locality with its inner kernels; duplicating the helper
-    /// here avoids a cross-module unsafe re-export and matches the pattern
-    /// already used in `dot.rs::x86`.
-    #[inline]
-    #[target_feature(enable = "avx")]
-    unsafe fn hsum256_ps_local(v: __m256) -> f32 {
-        let lo = _mm256_castps256_ps128(v);
-        let hi = _mm256_extractf128_ps(v, 1);
-        let sum128 = _mm_add_ps(lo, hi);
-        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
-        _mm_cvtss_f32(sum32)
     }
 
     /// AVX-512 path for f32 fast cosine: 16-wide `__m512` xy/yy with `vfmadd231ps` per iteration.
@@ -1048,7 +1021,7 @@ mod f32_x86 {
             acc = _mm256_add_ps(acc, _mm256_mul_ps(xv, yv));
         }
 
-        let xy_main = hsum256_ps_local(acc);
+        let xy_main = hsum256_ps(acc);
         let xy = xy_main + dot(&x[aligned_len..], &y[aligned_len..]);
         1.0 - xy / x_norm / y_norm
     }

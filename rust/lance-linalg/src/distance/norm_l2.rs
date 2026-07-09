@@ -222,6 +222,7 @@ mod x86 {
     use std::arch::x86_64::*;
 
     use crate::simd::f64::{f64x4, f64x8};
+    use crate::simd::x86::hsum256_ps;
     use crate::simd::{FloatSimd, SIMD};
 
     /// AVX-512 path for f64: 8-wide `__m512d` with `vfmadd231pd` per iteration.
@@ -284,21 +285,6 @@ mod x86 {
 
         let tail: f64 = vector[unrolled_len..].iter().map(|&v| v * v).sum();
         (acc_sum + tail).sqrt() as f32
-    }
-
-    /// Horizontal sum of an `__m256` register. Folds the upper 128-bit lane
-    /// into the lower, then sums lanes pairwise. Same shape as the helper in
-    /// the sibling `dot.rs` and `l2.rs` mod x86; kept local rather than
-    /// hoisted to a shared module to avoid a one-helper module file.
-    #[inline]
-    #[target_feature(enable = "avx")]
-    unsafe fn hsum256_ps(v: __m256) -> f32 {
-        let lo = _mm256_castps256_ps128(v);
-        let hi = _mm256_extractf128_ps(v, 1);
-        let sum128 = _mm_add_ps(lo, hi);
-        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
-        _mm_cvtss_f32(sum32)
     }
 
     /// AVX-512 path for f32: 16-wide `__m512` with `vfmadd231ps` per iteration.

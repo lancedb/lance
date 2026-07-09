@@ -927,10 +927,11 @@ mod tests {
 
     #[test]
     fn test_basic_ops() {
-        // The `f32x8` constructor / load / store paths are AVX-only on x86_64
-        // after the baseline lowering; skip on hosts that don't support AVX2.
+        // Load / store / arithmetic on `f32x8` lower to AVX intrinsics, and
+        // `multiply_add` lowers to `_mm256_fmadd_ps`, which needs FMA. Both
+        // are present from the AvxFma tier up.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
             return;
         }
         let a = (0..8).map(|f| f as f32).collect::<Vec<_>>();
@@ -970,8 +971,9 @@ mod tests {
 
     #[test]
     fn test_f32x8_cmp_ops() {
+        // `min` / `reduce_min` are AVX intrinsics; `find` is a scalar scan.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") {
             return;
         }
         let a = [1.0_f32, 2.0, 5.0, 6.0, 7.0, 3.0, 2.0, 1.0];
@@ -998,8 +1000,9 @@ mod tests {
 
     #[test]
     fn test_basic_f32x16_ops() {
+        // `f32x16` is a pair of `__m256`; `multiply_add` needs FMA.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
             return;
         }
         let a = (0..16).map(|f| f as f32).collect::<Vec<_>>();
@@ -1036,8 +1039,9 @@ mod tests {
 
     #[test]
     fn test_f32x16_cmp_ops() {
+        // `min` / `reduce_min` are AVX intrinsics; `find` is a scalar scan.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") {
             return;
         }
         let a = [
@@ -1073,11 +1077,11 @@ mod tests {
 
     #[test]
     fn test_f32x8_gather() {
-        // `f32x8::gather` does its own runtime AVX2 detection, but the
-        // returned `f32x8` itself is `__m256`-backed on x86_64 and the
-        // `reduce_sum` helper requires AVX. Skip on pre-Haswell hosts.
+        // `f32x8::gather` does its own runtime AVX2 detection and falls back
+        // to a scalar gather, so this test only needs whatever reading the
+        // `__m256`-backed result costs: AVX, for `reduce_sum`.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") {
             return;
         }
         let a = (0..256).map(|f| f as f32).collect::<Vec<_>>();

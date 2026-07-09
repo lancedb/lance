@@ -736,10 +736,10 @@ mod tests {
 
     #[test]
     fn test_f64x4_basic_ops() {
-        // The `f64x4` constructor / load / store paths are AVX-only on x86_64
-        // after the baseline lowering; skip on hosts that don't support AVX2.
+        // The `f64x4` constructor / load / store / arithmetic paths all lower
+        // to AVX intrinsics on x86_64; none of them need AVX2.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") {
             return;
         }
         let a = [1.0_f64, 2.0, 3.0, 4.0];
@@ -763,8 +763,9 @@ mod tests {
 
     #[test]
     fn test_f64x4_fma() {
+        // `multiply_add` lowers to `_mm256_fmadd_pd`, which needs FMA.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
             return;
         }
         let a = [1.0_f64, 2.0, 3.0, 4.0];
@@ -779,8 +780,9 @@ mod tests {
 
     #[test]
     fn test_f64x4_min() {
+        // `min` / `reduce_min` are AVX intrinsics.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") {
             return;
         }
         let a = [1.0_f64, 5.0, 2.0, 8.0];
@@ -795,8 +797,9 @@ mod tests {
 
     #[test]
     fn test_f64x8_basic_ops() {
+        // `f64x8` is a pair of `__m256d`; add / reduce are AVX intrinsics.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") {
             return;
         }
         let a: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -817,8 +820,9 @@ mod tests {
 
     #[test]
     fn test_f64x8_fma() {
+        // `multiply_add` lowers to `_mm256_fmadd_pd`, which needs FMA.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
             return;
         }
         let a: [f64; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -834,8 +838,9 @@ mod tests {
 
     #[test]
     fn test_f64x8_min() {
+        // `min` / `reduce_min` are AVX intrinsics.
         #[cfg(target_arch = "x86_64")]
-        if !std::is_x86_feature_detected!("avx2") {
+        if !std::is_x86_feature_detected!("avx") {
             return;
         }
         let a: [f64; 8] = [5.0, 1.0, 8.0, 3.0, 9.0, 2.0, 7.0, 4.0];
