@@ -1276,6 +1276,11 @@ pub struct FilteredReadOptions {
     /// The range of rows to read after applying the filter.
     pub scan_range_after_filter: Option<Range<u64>>,
     /// Include deleted rows in the scan
+    ///
+    /// In a scan, deleted rows are returned with a null row id.  In a
+    /// row-stream read (which must then be keyed by `_rowaddr`), deleted
+    /// addresses resolve and return their (still stored) data instead of
+    /// dropping like stale keys.
     pub with_deleted_rows: bool,
     /// The maximum number of rows per batch
     ///
@@ -1684,9 +1689,10 @@ impl FilteredReadExec {
                 "scan ranges are not supported when taking rows from an input plan".into(),
             ));
         }
-        if options.with_deleted_rows || options.only_indexed_fragments {
+        if options.only_indexed_fragments {
             return Err(Error::invalid_input_source(
-                "with_deleted_rows / only_indexed_fragments are not supported when taking rows from an input plan".into(),
+                "only_indexed_fragments is not supported when taking rows from an input plan"
+                    .into(),
             ));
         }
         if options.projection.with_row_id || options.projection.with_row_addr {
@@ -1696,11 +1702,25 @@ impl FilteredReadExec {
         }
 
         let input_schema = input.schema();
+        let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
         // Prefer the row id when both are present: ids survive compaction,
-        // addresses are pinned to this dataset version
-        let key_column = if input_schema.column_with_name(ROW_ID).is_some() {
+        // addresses are pinned to this dataset version.  Deleted rows are the
+        // exception: the reader returns them with a null row id, so only an
+        // address key can align them.
+        let key_column = if options.with_deleted_rows {
+            if !has_row_addr {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "with_deleted_rows requires the input plan to provide '{}': deleted rows are read with a null row id and can only be matched by address",
+                        ROW_ADDR
+                    )
+                    .into(),
+                ));
+            }
+            ROW_ADDR
+        } else if input_schema.column_with_name(ROW_ID).is_some() {
             ROW_ID
-        } else if input_schema.column_with_name(ROW_ADDR).is_some() {
+        } else if has_row_addr {
             ROW_ADDR
         } else {
             return Err(Error::invalid_input_source(
@@ -1748,6 +1768,11 @@ impl FilteredReadExec {
         } else {
             fields_to_read.with_row_addr()
         };
+        if options.with_deleted_rows {
+            // The reader marks deleted rows by nulling the row id, so it
+            // requires the row id column in its output
+            read_options.projection = read_options.projection.with_row_id();
+        }
 
         Ok(Self {
             dataset,
@@ -2165,10 +2190,12 @@ impl RowStreamRead {
                 let frag_futs = fragments
                     .iter()
                     .map(|frag| {
+                        // With with_deleted_rows the deletion vectors are not
+                        // loaded, so deleted keys resolve like live ones
                         Result::Ok(FilteredReadStream::load_fragment(
                             self.dataset.clone(),
                             frag.clone(),
-                            /*include_deleted_rows=*/ false,
+                            self.read_options.with_deleted_rows,
                         ))
                     })
                     .collect::<Vec<_>>();
@@ -5097,6 +5124,77 @@ mod tests {
                 .unwrap()
                 .as_primitive::<arrow::datatypes::Int32Type>();
             assert_eq!(i_col.value(0), 16);
+        }
+
+        /// with_deleted_rows: deleted addresses resolve and return their
+        /// (still stored) data instead of dropping like stale keys.  Requires
+        /// an address key — deleted rows come back with a null row id, so an
+        /// id-keyed input is rejected at construction.
+        #[rstest]
+        #[case::unstable(false)]
+        #[case::stable(true)]
+        #[tokio::test]
+        async fn take_with_deleted_rows(#[case] stable_row_ids: bool) {
+            let fixture = take_fixture(stable_row_ids).await;
+            let mut dataset = fixture.dataset.as_ref().clone();
+            dataset.delete("i = 15").await.unwrap();
+            let dataset = Arc::new(dataset);
+
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            // Addresses of rows 15 (now deleted) and 16
+            let keys: Vec<u64> = vec![addr(1, 5), addr(1, 6)];
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ADDR,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
+                .unwrap();
+
+            let projection = dataset
+                .empty_projection()
+                .union_columns(["i"], OnMissing::Error)
+                .unwrap();
+            let plan = FilteredReadExec::try_new(
+                dataset.clone(),
+                FilteredReadOptions::new(projection.clone())
+                    .with_deleted_rows()
+                    .unwrap(),
+                Some(rows_input(vec![batch])),
+            )
+            .unwrap();
+
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(result.num_rows(), 2);
+            let i_col = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            assert_eq!(i_col.values(), &[15, 16]);
+
+            // An id-keyed input cannot align deleted rows: rejected
+            let id_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                true,
+            )]));
+            let id_batch = RecordBatch::try_new(
+                id_schema,
+                vec![Arc::new(UInt64Array::from(vec![15_u64, 16]))],
+            )
+            .unwrap();
+            assert!(
+                FilteredReadExec::try_new(
+                    dataset.clone(),
+                    FilteredReadOptions::new(projection)
+                        .with_deleted_rows()
+                        .unwrap(),
+                    Some(rows_input(vec![id_batch])),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("null row id")
+            );
         }
 
         /// Construction errors: no key column, nothing to read
