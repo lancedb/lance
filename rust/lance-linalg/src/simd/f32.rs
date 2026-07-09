@@ -118,23 +118,16 @@ unsafe fn gather_avx2(slice: &[f32], indices: &[i32; 8]) -> f32x8 {
 }
 
 /// Portable scalar gather for x86_64 hosts without AVX2.
+///
+/// Indexes the slice rather than offsetting a raw pointer: this is the slow
+/// path already, so an out-of-range index should panic instead of reading out
+/// of bounds.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn gather_scalar_x86(slice: &[f32], indices: &[i32; 8]) -> f32x8 {
-    let ptr = slice.as_ptr();
-    unsafe {
-        let values = [
-            *ptr.add(indices[0] as usize),
-            *ptr.add(indices[1] as usize),
-            *ptr.add(indices[2] as usize),
-            *ptr.add(indices[3] as usize),
-            *ptr.add(indices[4] as usize),
-            *ptr.add(indices[5] as usize),
-            *ptr.add(indices[6] as usize),
-            *ptr.add(indices[7] as usize),
-        ];
-        f32x8::load_unaligned(values.as_ptr())
-    }
+    let values = indices.map(|i| slice[i as usize]);
+    // SAFETY: `values` is eight contiguous, initialized `f32`.
+    unsafe { f32x8::load_unaligned(values.as_ptr()) }
 }
 
 impl From<&[f32]> for f32x8 {
@@ -1106,5 +1099,17 @@ mod tests {
         let v = gather_scalar_x86(&a, &idx);
         let expected = idx.map(|i| a[i as usize]);
         assert_eq!(v.as_array(), expected);
+    }
+
+    /// An index past the end of the slice panics rather than reading out of
+    /// bounds. The bounds check fires before any AVX instruction, so this
+    /// case runs on every x86_64 host.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn test_gather_scalar_x86_rejects_out_of_range_index() {
+        let a = (0..8).map(|f| f as f32).collect::<Vec<_>>();
+        let idx = [0_i32, 1, 2, 3, 4, 5, 6, 99];
+        let _ = gather_scalar_x86(&a, &idx);
     }
 }
