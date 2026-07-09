@@ -70,6 +70,26 @@ enum TaskState {
     },
 }
 
+impl TaskState {
+    fn backpressure_reservation(&self) -> Option<BackpressureReservation> {
+        match self {
+            Self::Reserved {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Running {
+                backpressure_reservation,
+                ..
+            }
+            | Self::Finished {
+                backpressure_reservation,
+                ..
+            } => Some(*backpressure_reservation),
+            Self::Initial { .. } | Self::Broken => None,
+        }
+    }
+}
+
 /// A custom error type that might have a backpressure reservation
 ///
 /// This is used instead of Lance's standard error type so we can ensure
@@ -88,25 +108,14 @@ impl BrokenTaskError {
     // This will capture any backpressure reservation the task has and put it into the
     // error so we make sure to release it when returning the error.
     fn new(task_state: TaskState, message: String) -> Self {
-        match task_state {
-            TaskState::Reserved {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Running {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Finished {
-                backpressure_reservation,
-                ..
-            } => Self {
-                message,
-                backpressure_reservation: Some(backpressure_reservation),
-            },
-            TaskState::Broken | TaskState::Initial { .. } => Self {
+        match task_state.backpressure_reservation() {
+            None => Self {
                 message,
                 backpressure_reservation: None,
+            },
+            Some(reservation) => Self {
+                message,
+                backpressure_reservation: Some(reservation),
             },
         }
     }
@@ -679,22 +688,8 @@ impl IoQueue {
             // Already consumed by `poll`; nothing to release.
             return;
         };
-        let reservation = match task.state {
-            TaskState::Reserved {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Running {
-                backpressure_reservation,
-                ..
-            }
-            | TaskState::Finished {
-                backpressure_reservation,
-                ..
-            } => Some(backpressure_reservation),
-            TaskState::Initial { .. } | TaskState::Broken => None,
-        };
-        if let Some(reservation) = reservation {
+
+        if let Some(reservation) = task.state.backpressure_reservation() {
             state.backpressure_throttle.release(reservation);
         }
         // Freed budget may make queued tasks runnable; there is no caller to surface
