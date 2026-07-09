@@ -4186,33 +4186,29 @@ mod tests {
         .await
     }
 
+    // Which clause rejects the lossy round-trip depends on the hole's
+    // position: a hole before the last field remaps a shared id, while a
+    // hole at the end reuses the dropped id for the new field.
+    #[rstest::rstest]
+    #[case::drop_a_remaps_shared_id("a", "remaps field id 1 from \"b\" to \"c\"")]
+    #[case::drop_b_remaps_shared_id("b", "remaps field id 2 from \"c\" to \"d\"")]
+    #[case::drop_c_reuses_dropped_id("c", "assigns id 2 to new field \"d\"")]
     #[tokio::test]
-    async fn test_merge_rejects_renumbered_field_ids() {
-        // Which clause rejects the lossy round-trip depends on the hole's
-        // position: a hole before the last field remaps a shared id, while a
-        // hole at the end reuses the dropped id for the new field.
-        let cases = [
-            ("a", "remaps field id 1 from \"b\" to \"c\""),
-            ("b", "remaps field id 2 from \"c\" to \"d\""),
-            ("c", "assigns id 2 to new field \"d\""),
-        ];
-        for (dropped, expected) in cases {
-            let test_dir = TempStrDir::default();
-            let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+    async fn test_merge_rejects_renumbered_field_ids(
+        #[case] dropped: &str,
+        #[case] expected: &str,
+    ) {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
 
-            let arrow_schema = ArrowSchema::from(dataset.schema());
-            let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
-            assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
+        let arrow_schema = ArrowSchema::from(dataset.schema());
+        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
+        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
 
-            let err = commit_merge(&dataset, renumbered).await.unwrap_err();
-            let message = err.to_string();
-            assert!(
-                message.contains(expected),
-                "dropped {}: unexpected error: {}",
-                dropped,
-                message
-            );
-        }
+        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
+        let message = err.to_string();
+        assert!(message.contains(expected), "unexpected error: {}", message);
     }
 
     #[tokio::test]
@@ -4229,6 +4225,7 @@ mod tests {
         schema.fields.push(field);
 
         let err = commit_merge(&dataset, schema).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
         let message = err.to_string();
         assert!(
             message.contains("assigns id 1 to new field \"e\"")
@@ -4282,6 +4279,7 @@ mod tests {
         assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
 
         let err = commit_merge(&dataset, renumbered).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
         let message = err.to_string();
         assert!(
             message.contains("remaps field id 2 from \"s.y\" to \"z\""),
@@ -4290,54 +4288,58 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
     #[tokio::test]
-    async fn test_merge_allows_id_preserving_schema_change() {
-        for dropped in ["a", "b", "c"] {
-            let test_dir = TempStrDir::default();
-            let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+    async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
 
-            let survivors = surviving_columns(dropped);
-            let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
-            let mut schema = dataset.schema().clone();
-            schema
-                .mut_field_by_id(first_id)
+        let survivors = surviving_columns(dropped);
+        let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
+        let mut schema = dataset.schema().clone();
+        schema
+            .mut_field_by_id(first_id)
+            .unwrap()
+            .metadata
+            .insert("wm".into(), "42".into());
+
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert_eq!(
+            dataset
+                .schema()
+                .field(survivors[0].0)
                 .unwrap()
                 .metadata
-                .insert("wm".into(), "42".into());
+                .get("wm"),
+            Some(&"42".to_string())
+        );
 
-            let dataset = commit_merge(&dataset, schema).await.unwrap();
-            assert_eq!(
-                dataset
-                    .schema()
-                    .field(survivors[0].0)
-                    .unwrap()
-                    .metadata
-                    .get("wm"),
-                Some(&"42".to_string())
-            );
-
-            let batch = dataset.scan().try_into_batch().await.unwrap();
-            assert_columns(&batch, &survivors);
-        }
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
     }
 
+    #[rstest::rstest]
+    #[case::drop_a("a")]
+    #[case::drop_b("b")]
+    #[case::drop_c("c")]
     #[tokio::test]
-    async fn test_merge_allows_dropping_field() {
-        for dropped in ["a", "b", "c"] {
-            let test_dir = TempStrDir::default();
-            let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
+    async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
+        let test_dir = TempStrDir::default();
+        let dataset = dataset_with_dropped_column(test_dir.as_str(), dropped).await;
 
-            let mut survivors = surviving_columns(dropped);
-            let omitted = survivors.remove(0);
-            let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
-            let schema = dataset.schema().project(&names).unwrap();
+        let mut survivors = surviving_columns(dropped);
+        let omitted = survivors.remove(0);
+        let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
+        let schema = dataset.schema().project(&names).unwrap();
 
-            let dataset = commit_merge(&dataset, schema).await.unwrap();
-            assert!(dataset.schema().field(omitted.0).is_none());
+        let dataset = commit_merge(&dataset, schema).await.unwrap();
+        assert!(dataset.schema().field(omitted.0).is_none());
 
-            let batch = dataset.scan().try_into_batch().await.unwrap();
-            assert_columns(&batch, &survivors);
-        }
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_columns(&batch, &survivors);
     }
 
     #[test]
