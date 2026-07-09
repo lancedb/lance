@@ -57,8 +57,24 @@ impl f32x8 {
     /// `multiversion` crate) was considered but doesn't fit here: the function
     /// returns `Self` and `_mm256_i32gather_ps::<4>` requires the const-generic
     /// stride to be a compile-time literal — neither composes with the macro.
+    ///
+    /// # Panics
+    ///
+    /// If any index is negative or lands outside `slice`.
     #[inline]
     pub fn gather(slice: &[f32], indices: &[i32; 8]) -> Self {
+        // Every backend below reads without bounds checking: `vgatherdps` does
+        // none, and the NEON / LASX arms offset a raw pointer. Check once here
+        // so an out-of-range index panics on every host rather than reading out
+        // of bounds on some and panicking on others.
+        for &i in indices {
+            assert!(
+                (i as usize) < slice.len(),
+                "gather index {i} is out of bounds for a slice of length {}",
+                slice.len()
+            );
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
@@ -917,6 +933,7 @@ impl SubAssign for f32x16 {
 mod tests {
 
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn test_basic_ops() {
@@ -1111,5 +1128,18 @@ mod tests {
         let a = (0..8).map(|f| f as f32).collect::<Vec<_>>();
         let idx = [0_i32, 1, 2, 3, 4, 5, 6, 99];
         let _ = gather_scalar_x86(&a, &idx);
+    }
+
+    /// `gather` validates before dispatching, so every backend — `vgatherdps`,
+    /// the x86 scalar fallback, and the NEON / LASX raw-pointer arms — rejects
+    /// a bad index identically instead of reading out of bounds.
+    #[rstest]
+    #[case::past_end(99)]
+    #[case::negative(-1)]
+    #[should_panic(expected = "out of bounds")]
+    fn test_gather_rejects_invalid_index(#[case] bad_index: i32) {
+        let a = (0..8).map(|f| f as f32).collect::<Vec<_>>();
+        let idx = [0_i32, 1, 2, 3, 4, 5, 6, bad_index];
+        let _ = f32x8::gather(&a, &idx);
     }
 }
