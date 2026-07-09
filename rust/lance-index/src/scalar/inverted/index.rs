@@ -9553,7 +9553,10 @@ mod tests {
             schema.clone(),
             stream::iter(vec![Ok(batch)]),
         ));
-        let tokenizer = InvertedIndexParams::code().build().unwrap();
+        let tokenizer = InvertedIndexParams::code()
+            .split_identifiers(true)
+            .build()
+            .unwrap();
 
         let result_stream = flat_bm25_search_stream_with_metrics_and_operator(
             input,
