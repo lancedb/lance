@@ -198,10 +198,20 @@ impl DisplayAs for DeleteOnlyMergeInsertExec {
             datafusion::physical_plan::DisplayFormatType::Default
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
                 let on_keys = self.params.on.join(", ");
+                let when_matched = match &self.params.when_matched {
+                    crate::dataset::WhenMatched::Delete => "Delete".to_string(),
+                    crate::dataset::WhenMatched::DeleteIf(condition) => {
+                        format!("DeleteIf({})", condition)
+                    }
+                    crate::dataset::WhenMatched::DeleteIfExpr(expr) => {
+                        format!("DeleteIf({})", expr.human_display())
+                    }
+                    other => format!("{:?}", other),
+                };
                 write!(
                     f,
-                    "DeleteOnlyMergeInsert: on=[{}], when_matched=Delete, when_not_matched=DoNothing",
-                    on_keys
+                    "DeleteOnlyMergeInsert: on=[{}], when_matched={}, when_not_matched=DoNothing",
+                    on_keys, when_matched
                 )
             }
             datafusion::physical_plan::DisplayFormatType::TreeRender => {

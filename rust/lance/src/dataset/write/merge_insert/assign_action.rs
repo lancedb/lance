@@ -54,6 +54,31 @@ impl Action {
     }
 }
 
+/// Parses a raw SQL condition string for a fast-path `WhenMatched` arm.
+///
+/// The condition is parsed with a relation-enabled planner so it can reference columns
+/// qualified with `source.` and `target.`, matching the join output schema used by the
+/// fast path CASE expression. `variant_name` is used to name the condition in the parse
+/// error message (e.g. "UpdateIf" or "DeleteIf").
+fn parse_when_matched_condition(
+    condition_str: &str,
+    schema: Option<&arrow_schema::Schema>,
+    variant_name: &str,
+) -> Result<Expr> {
+    let Some(dataset_schema) = schema else {
+        return Err(crate::Error::internal(format!(
+            "Schema required for {} parsing",
+            variant_name
+        )));
+    };
+    let planner =
+        lance_datafusion::planner::Planner::new(std::sync::Arc::new(dataset_schema.clone()))
+            .with_enable_relations(true);
+    planner.parse_filter(condition_str).map_err(|e| {
+        crate::Error::invalid_input(format!("Failed to parse {} condition: {}", variant_name, e))
+    })
+}
+
 fn qualify_unqualified_columns(expr: Expr, relation: &'static str) -> Result<Expr> {
     expr.transform(|expr| {
         Ok(if let Expr::Column(column) = expr {
@@ -105,25 +130,8 @@ pub fn merge_insert_action(
             cases.push((matched, Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::UpdateIf(condition_str) => {
-            // Parse the condition with qualified column references enabled for fast path
-            if let Some(dataset_schema) = schema {
-                let planner = lance_datafusion::planner::Planner::new(std::sync::Arc::new(
-                    dataset_schema.clone(),
-                ))
-                .with_enable_relations(true);
-                let condition = planner.parse_filter(condition_str).map_err(|e| {
-                    crate::Error::invalid_input(format!(
-                        "Failed to parse UpdateIf condition: {}",
-                        e
-                    ))
-                })?;
-                cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
-            } else {
-                // Fallback - this shouldn't happen in the fast path
-                return Err(crate::Error::internal(
-                    "Schema required for UpdateIf parsing",
-                ));
-            }
+            let condition = parse_when_matched_condition(condition_str, schema, "UpdateIf")?;
+            cases.push((matched.and(condition), Action::UpdateAll.as_literal_expr()));
         }
         WhenMatched::UpdateIfExpr(condition) => {
             cases.push((
@@ -137,6 +145,16 @@ pub fn merge_insert_action(
         }
         WhenMatched::Delete => {
             cases.push((matched, Action::Delete.as_literal_expr()));
+        }
+        WhenMatched::DeleteIf(condition_str) => {
+            let condition = parse_when_matched_condition(condition_str, schema, "DeleteIf")?;
+            cases.push((matched.and(condition), Action::Delete.as_literal_expr()));
+        }
+        WhenMatched::DeleteIfExpr(condition) => {
+            cases.push((
+                matched.and(condition.clone()),
+                Action::Delete.as_literal_expr(),
+            ));
         }
     }
 

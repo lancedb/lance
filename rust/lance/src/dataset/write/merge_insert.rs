@@ -178,6 +178,40 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
     .unwrap()
 }
 
+// Evaluates a "when matched" physical filter expression against `matched` and returns only
+// the rows where the condition is true.
+//
+// The expression is compiled against the "combined schema" (a `source` struct and a
+// `target` struct), so `matched` is first reshaped into that layout via `unzip_batch`. A
+// trailing row address column, present when the source uses a partial schema and row
+// addresses are tracked for the write, is not part of the combined schema. It is
+// projected off before unzipping and left in place in the returned batch, otherwise
+// `unzip_batch`'s odd-column-count invariant would be violated.
+fn filter_matched_by_condition(
+    matched: RecordBatch,
+    schema: &Schema,
+    match_filter: &Arc<dyn PhysicalExpr>,
+    row_addr_col: Option<usize>,
+) -> datafusion::common::Result<RecordBatch> {
+    let unzip_input = if let Some(row_addr_col) = row_addr_col {
+        let keep: Vec<usize> = (0..matched.num_columns())
+            .filter(|&i| i != row_addr_col)
+            .collect();
+        matched.project(&keep)?
+    } else {
+        matched.clone()
+    };
+    let unzipped = unzip_batch(&unzip_input, schema);
+    match match_filter.evaluate(&unzipped)? {
+        ColumnarValue::Array(mask) => Ok(arrow::compute::filter_record_batch(
+            &matched,
+            mask.as_boolean(),
+        )?),
+        ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => Ok(matched),
+        ColumnarValue::Scalar(_) => Ok(RecordBatch::new_empty(matched.schema())),
+    }
+}
+
 /// Format key values for error messages via extracting "on" column values from the given RecordBatch.
 pub fn format_key_values_on_columns(
     batch: &RecordBatch,
@@ -290,6 +324,19 @@ pub enum WhenMatched {
     /// This can be used for bulk deletion by matching on key columns.
     /// Unlike UpdateAll, no new row is inserted - the matched row is simply removed.
     Delete,
+    /// The matching row is deleted from the target table only for rows where the expression
+    /// evaluates to true
+    ///
+    /// The expression can reference columns with `source.` and `target.` prefixes. Matched
+    /// rows where the condition is false are left untouched.
+    DeleteIf(String),
+    /// The matching row is deleted from the target table only for rows where the expression
+    /// evaluates to true
+    ///
+    /// The expression can reference columns with `source.` and `target.` prefixes. Matched
+    /// rows where the condition is false are left untouched. See [`WhenMatched::delete_if_expr`]
+    /// for a caveat on how the expression's columns must be represented.
+    DeleteIfExpr(Expr),
 }
 
 impl WhenMatched {
@@ -300,6 +347,28 @@ impl WhenMatched {
 
     pub fn update_if_expr(expr: Expr) -> Self {
         Self::UpdateIfExpr(expr)
+    }
+
+    /// Create an instance of WhenMatched::DeleteIf from a SQL filter string
+    ///
+    /// Parsing is deferred until the execution path is known, since the fast path
+    /// parses with a relation-enabled planner (source./target. as table qualifiers)
+    /// while the slow path parses against the combined schema where source and
+    /// target are struct fields.
+    pub fn delete_if(_dataset: &Dataset, expr: &str) -> Result<Self> {
+        Ok(Self::DeleteIf(expr.to_string()))
+    }
+
+    /// Create an instance of WhenMatched::DeleteIfExpr from a pre-built expression
+    ///
+    /// Unlike `delete_if`, which stores a SQL string and defers parsing until the
+    /// execution path is known, this stores the `Expr` as given, so its column
+    /// representation must already match the path that consumes it. The standard plan
+    /// expects relation-qualified columns such as `col("source.value")`, while the
+    /// indexed (Merger) path expects combined-schema struct-field access such as
+    /// `col("source").field("value")`.
+    pub fn delete_if_expr(expr: Expr) -> Self {
+        Self::DeleteIfExpr(expr)
     }
 }
 
@@ -1889,7 +1958,10 @@ impl MergeInsertJob {
         // delete + insert directly.
         let is_partial_delete_with_insert = is_subset_schema
             && self.params.insert_not_matched
-            && matches!(self.params.when_matched, WhenMatched::Delete);
+            && matches!(
+                self.params.when_matched,
+                WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_)
+            );
 
         let would_use_scalar_index = if self.params.use_index
             && !is_partial_delete_with_insert
@@ -1910,7 +1982,10 @@ impl MergeInsertJob {
         // For delete-only, we don't need the full source schema, just key columns for matching
         let no_upsert = matches!(
             self.params.when_matched,
-            WhenMatched::Delete | WhenMatched::DoNothing
+            WhenMatched::Delete
+                | WhenMatched::DeleteIf(_)
+                | WhenMatched::DeleteIfExpr(_)
+                | WhenMatched::DoNothing
         ) && !self.params.insert_not_matched;
 
         // For delete-only, verify source has all key columns
@@ -1929,6 +2004,8 @@ impl MergeInsertJob {
                 | WhenMatched::UpdateIfExpr(_)
                 | WhenMatched::Fail
                 | WhenMatched::Delete
+                | WhenMatched::DeleteIf(_)
+                | WhenMatched::DeleteIfExpr(_)
                 | WhenMatched::DoNothing
         ) && !would_use_scalar_index
             && schema_ok
@@ -1992,7 +2069,10 @@ impl MergeInsertJob {
         // not both in one commit: the writer rejects subschema rows up front and
         // the delete cannot be folded into the write. Reject that combination.
         if !is_full_schema
-            && matches!(self.params.when_matched, WhenMatched::Delete)
+            && matches!(
+                self.params.when_matched,
+                WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_)
+            )
             && self.params.insert_not_matched
         {
             return Err(Error::not_supported_source("Combining when_matched(Delete) with inserts from a partial-schema source is not supported; provide the full target schema in the source".into()));
@@ -2002,8 +2082,10 @@ impl MergeInsertJob {
         // pure delete (no inserts) writes nothing: the merger emits no batches
         // and only records the matched row ids. This holds for any source schema
         // width, so it is keyed on the operation rather than `is_full_schema`.
-        let is_delete_only = matches!(self.params.when_matched, WhenMatched::Delete)
-            && !self.params.insert_not_matched;
+        let is_delete_only = matches!(
+            self.params.when_matched,
+            WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_)
+        ) && !self.params.insert_not_matched;
 
         let (operation, affected_rows) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
@@ -2457,7 +2539,8 @@ struct Merger {
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
     // User statistics for merging
     merge_stats: Arc<Mutex<MergeStats>>,
-    // Physical "when matched update if" expression, only set if params.when_matched is UpdateIf
+    // Physical "when matched" condition expression, only set if params.when_matched is
+    // UpdateIf, UpdateIfExpr, DeleteIf, or DeleteIfExpr
     match_filter_expr: Option<Arc<dyn PhysicalExpr>>,
     // The parameters controlling the merge
     params: MergeInsertParams,
@@ -2499,12 +2582,17 @@ impl Merger {
             None
         };
         let match_filter_expr = match &params.when_matched {
-            WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
+            WhenMatched::UpdateIf(_)
+            | WhenMatched::UpdateIfExpr(_)
+            | WhenMatched::DeleteIf(_)
+            | WhenMatched::DeleteIfExpr(_) => {
                 let combined_schema = Arc::new(combined_schema(&schema));
                 let planner = Planner::new(combined_schema.clone());
                 let expr = match &params.when_matched {
                     WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
                     WhenMatched::UpdateIfExpr(expr) => expr.clone(),
+                    WhenMatched::DeleteIf(expr_str) => planner.parse_filter(expr_str)?,
+                    WhenMatched::DeleteIfExpr(expr) => expr.clone(),
                     _ => unreachable!(),
                 };
                 let expr = planner.optimize_expr(expr)?;
@@ -2512,7 +2600,7 @@ impl Merger {
                 let data_type = match_expr.data_type(combined_schema.as_ref())?;
                 if data_type != DataType::Boolean {
                     return Err(Error::invalid_input(format!(
-                        "Merge insert conditions must be expressions that return a boolean value, received a 'when matched update if' expression ({}) which has data type {}",
+                        "Merge insert conditions must be expressions that return a boolean value, received a 'when matched' condition ({}) which has data type {}",
                         expr, data_type
                     )));
                 }
@@ -2622,6 +2710,16 @@ impl Merger {
     //
     // Returns 0, 1, or 2 batches
     // Potentially updates (as a side-effect) the deleted rows vec
+    //
+    // For `Delete`/`DeleteIf`/`DeleteIfExpr`, matched rows are removed, not rewritten:
+    // their row ids are recorded for the commit to delete and no replacement batch is
+    // emitted. A source with duplicate keys matches the same target row more than once.
+    // The same `source_dedupe_behavior` policy applies as for updates, so a duplicate
+    // either aborts (`Fail`) or is skipped and counted once (`FirstSeen`), and the commit
+    // deletes the row a single time regardless. For `DeleteIf`/`DeleteIfExpr`,
+    // `match_filter_expr` narrows the matched rows down to those where the condition is
+    // true before any of that accounting happens, so matched rows failing the condition
+    // are left untouched.
     async fn execute_batch(
         self,
         batch: RecordBatch,
@@ -2660,15 +2758,16 @@ impl Merger {
         let match_filter_expr = self.match_filter_expr;
         match &self.params.when_matched {
             WhenMatched::DoNothing => {}
-            WhenMatched::Delete => {
-                // Matched rows are removed, not rewritten: record their row ids
-                // for the commit to delete and emit no replacement batch. A
-                // source with duplicate keys matches the same target row more
-                // than once; apply the same `source_dedupe_behavior` policy as
-                // updates so a duplicate either aborts (`Fail`) or is skipped
-                // and counted once (`FirstSeen`) — the commit deletes the row a
-                // single time regardless.
-                let matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+            WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_) => {
+                let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
+                if let Some(match_filter) = &match_filter_expr {
+                    matched = filter_matched_by_condition(
+                        matched,
+                        &self.schema,
+                        match_filter,
+                        row_addr_col,
+                    )?;
+                }
                 let row_ids = matched.column(row_id_col).as_primitive::<UInt64Type>();
 
                 let mut processed_row_ids = self.processed_row_ids.lock().unwrap();
@@ -2704,24 +2803,13 @@ impl Merger {
             WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
                 let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
 
-                if let Some(match_filter) = match_filter_expr {
-                    let unzipped = unzip_batch(&matched, &self.schema);
-                    let filtered = match_filter.evaluate(&unzipped)?;
-                    match filtered {
-                        ColumnarValue::Array(mask) => {
-                            // Some rows matched, filter down and replace those rows
-                            matched =
-                                arrow::compute::filter_record_batch(&matched, mask.as_boolean())?;
-                        }
-                        ColumnarValue::Scalar(scalar) => {
-                            if let ScalarValue::Boolean(Some(true)) = scalar {
-                                // All rows matched, go ahead and replace the whole batch
-                            } else {
-                                // Nothing matched, replace nothing
-                                matched = RecordBatch::new_empty(matched.schema());
-                            }
-                        }
-                    }
+                if let Some(match_filter) = &match_filter_expr {
+                    matched = filter_matched_by_condition(
+                        matched,
+                        &self.schema,
+                        match_filter,
+                        row_addr_col,
+                    )?;
                 }
 
                 merge_statistics.num_updated_rows += matched.num_rows() as u64;
@@ -9930,6 +10018,614 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(remaining_keys, vec![1, 2, 3, 4, 5, 6]);
     }
 
+    /// Test WhenMatched::DeleteIf with full schema source data.
+    ///
+    /// Only matched rows where the condition evaluates to true are deleted. Matched rows
+    /// where the condition is false are left untouched. The dataset has keys 1-6 with
+    /// filterme cycling A, B, A, A, B, A. The source carries keys 4, 5, 6 (matching) and
+    /// 7, 8, 9 (unmatched, not inserted) with filterme A, B, C. Target filterme for keys
+    /// 4, 5, 6 is A, B, A, so only key 6 satisfies source.filterme != target.filterme and
+    /// is deleted. Keys 4 and 5 match but fail the condition, so their value must remain
+    /// the original (1), not the source's (2).
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_when_matched_delete_if_full_schema(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(true, false)] enable_stable_row_ids: bool,
+    ) {
+        let schema = create_test_schema();
+        let test_uri = "memory://test_delete_if_full.lance";
+
+        let ds = create_test_dataset(test_uri, version, enable_stable_row_ids).await;
+
+        let new_batch = create_new_batch(schema.clone());
+
+        let keys = vec!["key".to_string()];
+
+        let condition = WhenMatched::delete_if(&ds, "source.filterme != target.filterme").unwrap();
+
+        let plan_job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(condition.clone())
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+        let plan_stream = reader_to_stream(Box::new(RecordBatchIterator::new(
+            [Ok(new_batch.clone())],
+            schema.clone(),
+        )));
+        let plan = plan_job.create_plan(plan_stream).await.unwrap();
+        let plan_str = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_str.contains("DeleteIf(source.filterme != target.filterme)"),
+            "expected DeleteIf condition in plan, got:\n{}",
+            plan_str
+        );
+
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys)
+            .unwrap()
+            .when_matched(condition)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+
+        assert_eq!(merge_stats.num_deleted_rows, 1);
+        assert_eq!(merge_stats.num_inserted_rows, 0);
+        assert_eq!(merge_stats.num_updated_rows, 0);
+
+        let batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let merged = concat_batches(&schema, &batches).unwrap();
+        let mut remaining_keys: Vec<u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        remaining_keys.sort();
+        assert_eq!(remaining_keys, vec![1, 2, 3, 4, 5]);
+
+        let values_by_key: HashMap<u32, u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .zip(
+                merged
+                    .column(1)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter(),
+            )
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        assert_eq!(values_by_key[&4], 1, "key 4 must be unmodified");
+        assert_eq!(values_by_key[&5], 1, "key 5 must be unmodified");
+    }
+
+    /// Test WhenMatched::DeleteIf combined with WhenNotMatched::InsertAll.
+    ///
+    /// The source carries keys 4, 5, 6 (matching) and 7, 8, 9 (new, to be inserted). Only
+    /// key 6 satisfies source.filterme != target.filterme, so matched rows satisfying the
+    /// condition are deleted, unmatched rows are inserted, and matched rows failing the
+    /// condition survive unmodified.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_when_matched_delete_if_with_insert(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+    ) {
+        let schema = create_test_schema();
+        let test_uri = "memory://test_delete_if_with_insert.lance";
+
+        let ds = create_test_dataset(test_uri, version, false).await;
+
+        let new_batch = create_new_batch(schema.clone());
+
+        let keys = vec!["key".to_string()];
+
+        let condition = WhenMatched::delete_if(&ds, "source.filterme != target.filterme").unwrap();
+
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys)
+            .unwrap()
+            .when_matched(condition)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+
+        assert_eq!(
+            merge_stats.num_deleted_rows, 1,
+            "only key 6 satisfies the condition"
+        );
+        assert_eq!(merge_stats.num_inserted_rows, 3);
+        assert_eq!(merge_stats.num_updated_rows, 0);
+
+        let batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let merged = concat_batches(&schema, &batches).unwrap();
+        let mut remaining_keys: Vec<u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        remaining_keys.sort();
+        assert_eq!(remaining_keys, vec![1, 2, 3, 4, 5, 7, 8, 9]);
+
+        let values_by_key: HashMap<u32, u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .iter()
+            .zip(
+                merged
+                    .column(1)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter(),
+            )
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        for (key, value) in values_by_key {
+            if key <= 5 {
+                assert_eq!(value, 1, "key {} should be unmodified", key);
+            } else {
+                assert_eq!(value, 2, "key {} should carry the inserted value", key);
+            }
+        }
+    }
+
+    /// Test WhenMatched::DeleteIf when the condition is never true. This mirrors a plain
+    /// no-match delete: zero rows are deleted and the commit still succeeds.
+    ///
+    /// The source carries keys 4, 5, 6 (matching) and 7, 8, 9 (unmatched, not inserted).
+    /// The condition never holds because 'zzz' is not a valid filterme value.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_when_matched_delete_if_never_true(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+    ) {
+        let schema = create_test_schema();
+        let test_uri = "memory://test_delete_if_never_true.lance";
+
+        let ds = create_test_dataset(test_uri, version, false).await;
+
+        let new_batch = create_new_batch(schema.clone());
+        let keys = vec!["key".to_string()];
+
+        let condition = WhenMatched::delete_if(&ds, "source.filterme = 'zzz'").unwrap();
+
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys)
+            .unwrap()
+            .when_matched(condition)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+
+        assert_eq!(merge_stats.num_deleted_rows, 0);
+        assert_eq!(merge_stats.num_inserted_rows, 0);
+        assert_eq!(merge_stats.num_updated_rows, 0);
+
+        let batches = merged_dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let merged = concat_batches(&schema, &batches).unwrap();
+        let mut remaining_keys: Vec<u32> = merged
+            .column(0)
+            .as_primitive::<UInt32Type>()
+            .values()
+            .to_vec();
+        remaining_keys.sort();
+        assert_eq!(remaining_keys, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// Test WhenMatched::delete_if_expr with a manually-built, source/target-qualified
+    /// expression on the fast path.
+    #[tokio::test]
+    async fn test_when_matched_delete_if_expr_fast_path() {
+        let schema = create_test_schema();
+        let test_uri = "memory://test_delete_if_expr.lance";
+
+        let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
+        let new_batch = create_new_batch(schema.clone());
+        let keys = vec!["key".to_string()];
+
+        let condition =
+            logical_expr::col("source.filterme").not_eq(logical_expr::col("target.filterme"));
+        let when_matched = WhenMatched::delete_if_expr(condition);
+
+        let plan_job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(when_matched.clone())
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+        let plan_stream = reader_to_stream(Box::new(RecordBatchIterator::new(
+            [Ok(new_batch.clone())],
+            schema.clone(),
+        )));
+        let plan = plan_job.create_plan(plan_stream).await.unwrap();
+        let plan_str = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_str.contains("DeleteIf("),
+            "expected a DeleteIf condition in plan, got:\n{}",
+            plan_str
+        );
+
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys)
+            .unwrap()
+            .when_matched(when_matched)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+
+        let (_merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+
+        assert_eq!(
+            merge_stats.num_deleted_rows, 1,
+            "only key 6 satisfies the condition"
+        );
+        assert_eq!(merge_stats.num_inserted_rows, 0);
+        assert_eq!(merge_stats.num_updated_rows, 0);
+    }
+
+    /// Test WhenMatched::DeleteIf on the slow (Merger) path, forced by a scalar index on
+    /// the join key combined with the default `use_index(true)`.
+    ///
+    /// The source matches ids 2 and 4. Only id=4's source value (999) is greater than its
+    /// target value (40), so only id=4 is deleted. Id=2 matches but fails the condition,
+    /// so it must survive unmodified.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_when_matched_delete_if() {
+        let initial = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        ds.create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let ds = Arc::new(ds);
+
+        let source = record_batch!(("id", Int32, [2, 4]), ("value", Int32, [5, 999])).unwrap();
+
+        let condition = WhenMatched::delete_if(&ds, "source.value > target.value").unwrap();
+
+        let (updated_ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(condition)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.num_deleted_rows, 1,
+            "only id=4 satisfies the condition"
+        );
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 4".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "id=4 must be deleted"
+        );
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 2 AND value = 20".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "id=2 must survive with its original value"
+        );
+    }
+
+    /// Test WhenMatched::DeleteIf on the slow path with a partial-schema (key-only)
+    /// source. This forces `Merger::execute_batch` to run with `with_row_addr = true`,
+    /// exercising the row address projection guard in `filter_matched_by_condition`
+    /// (see its doc comment).
+    ///
+    /// The source carries only the join key, so the source schema is a strict subset of
+    /// the target schema. The condition only references `id`, which is present in both,
+    /// so it can still be evaluated on the narrower combined schema.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_when_matched_delete_if_partial_schema() {
+        let initial = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        ds.create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let ds = Arc::new(ds);
+
+        let source = record_batch!(("id", Int32, [1, 2, 3, 4])).unwrap();
+
+        let condition = WhenMatched::delete_if(&ds, "target.id > 2").unwrap();
+
+        let (updated_ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(condition)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.num_deleted_rows, 2,
+            "ids 3 and 4 satisfy target.id > 2"
+        );
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id > 2".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "ids 3 and 4 must be deleted"
+        );
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 1 AND value = 10".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "id=1 must survive with its original value"
+        );
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 2 AND value = 20".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "id=2 must survive with its original value"
+        );
+    }
+
+    /// Test WhenMatched::delete_if_expr on the slow (Merger) path, forced by a scalar
+    /// index on the join key. The Merger path compiles the pre-built expr against the
+    /// combined schema, where `source`/`target` are struct fields rather than relations,
+    /// so the expr must be built with struct-field access via
+    /// `datafusion_functions::core::expr_ext::FieldAccessor` (`col("source").field(...)`)
+    /// instead of the relation-qualified columns the fast path test uses. A
+    /// relation-qualified expr (`col("source.value")`) fails to resolve here with a
+    /// `FieldNotFound` error, since the combined schema only has `source` and `target` as
+    /// unqualified struct-typed columns.
+    ///
+    /// The source matches ids 2 and 4. Only id=4's source value (999) is greater than its
+    /// target value (40), so only id=4 is deleted. Id=2 matches but fails the condition,
+    /// so it must survive unmodified.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_when_matched_delete_if_expr_slow_path() {
+        use datafusion_functions::core::expr_ext::FieldAccessor;
+
+        let initial = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        ds.create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let ds = Arc::new(ds);
+
+        let source = record_batch!(("id", Int32, [2, 4]), ("value", Int32, [5, 999])).unwrap();
+
+        let condition = logical_expr::col("source")
+            .field("value")
+            .gt(logical_expr::col("target").field("value"));
+        let when_matched = WhenMatched::delete_if_expr(condition);
+
+        let (updated_ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(when_matched)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.num_deleted_rows, 1,
+            "only id=4 satisfies the condition"
+        );
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 4".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "id=4 must be deleted"
+        );
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 2 AND value = 20".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "id=2 must survive with its original value"
+        );
+    }
+
+    /// Test WhenMatched::DeleteIf error cases: an unparsable condition surfaces the
+    /// parse error on the fast path, and a non-boolean condition surfaces the
+    /// boolean-validation error on the indexed slow path.
+    ///
+    /// Parsing is deferred until the execution path is known, so `delete_if` itself
+    /// succeeds even for an unparsable condition, and the parse error only surfaces once
+    /// the fast path plan is built. The non-boolean condition is instead caught on the
+    /// indexed slow path.
+    #[tokio::test]
+    async fn test_when_matched_delete_if_errors() {
+        let schema = create_test_schema();
+        let test_uri = "memory://test_delete_if_errors.lance";
+        let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
+        let new_batch = create_new_batch(schema.clone());
+        let keys = vec!["key".to_string()];
+
+        let bad_condition = WhenMatched::delete_if(&ds, "((").unwrap();
+        let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
+            .unwrap()
+            .when_matched(bad_condition)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+        let new_reader = Box::new(RecordBatchIterator::new(
+            [Ok(new_batch.clone())],
+            schema.clone(),
+        ));
+        let new_stream = reader_to_stream(new_reader);
+        let err = job.execute(new_stream).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to parse DeleteIf condition"),
+            "got: {}",
+            err
+        );
+
+        let indexed_uri = "memory://test_delete_if_errors_indexed.lance";
+        let mut indexed_ds =
+            (*create_test_dataset(indexed_uri, LanceFileVersion::V2_0, false).await).clone();
+        indexed_ds
+            .create_index(
+                &["key"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let indexed_ds = Arc::new(indexed_ds);
+        let non_boolean_condition = WhenMatched::delete_if(&indexed_ds, "target.value").unwrap();
+        let job = MergeInsertBuilder::try_new(indexed_ds.clone(), keys)
+            .unwrap()
+            .when_matched(non_boolean_condition)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+        let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
+        let new_stream = reader_to_stream(new_reader);
+        let err = job.execute(new_stream).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must be expressions that return a boolean value"),
+            "got: {}",
+            err
+        );
+    }
+
     /// Test that MergeInsertPlanner::is_delete_only correctly identifies delete-only operations.
     ///
     /// Delete-only is true only when:
@@ -9939,6 +10635,9 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     ///
     /// This test iterates through all valid combinations of WhenMatched, WhenNotMatched,
     /// and WhenNotMatchedBySource to verify the is_delete_only logic.
+    ///
+    /// It also covers WhenMatched::DeleteIf, which mirrors Delete for is_delete_only: true
+    /// when combined with DoNothing/Keep, false when combined with inserts.
     #[tokio::test]
     async fn test_is_delete_only() {
         use itertools::iproduct;
@@ -10029,6 +10728,58 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 );
             }
         }
+
+        let delete_if_uri = "memory://test_is_delete_only_delete_if.lance";
+        let ds = create_test_dataset(delete_if_uri, LanceFileVersion::V2_0, false).await;
+        let condition = WhenMatched::delete_if(&ds, "source.filterme != target.filterme").unwrap();
+        let new_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![4, 5, 6])),
+                Arc::new(UInt32Array::from(vec![2, 2, 2])),
+                Arc::new(StringArray::from(vec!["A", "B", "C"])),
+            ],
+        )
+        .unwrap();
+        let keys = vec!["key".to_string()];
+
+        let mut builder = MergeInsertBuilder::try_new(ds.clone(), keys.clone()).unwrap();
+        builder
+            .when_matched(condition.clone())
+            .when_not_matched(WhenNotMatched::DoNothing);
+        let job = builder.try_build().unwrap();
+        let plan_stream = reader_to_stream(Box::new(RecordBatchIterator::new(
+            [Ok(new_batch.clone())],
+            schema.clone(),
+        )));
+        let plan = job.create_plan(plan_stream).await.unwrap();
+        let plan_str = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_str.contains("DeleteOnlyMergeInsert"),
+            "Expected DeleteOnlyMergeInsert for DeleteIf + DoNothing, but got:\n{}",
+            plan_str
+        );
+
+        let mut builder = MergeInsertBuilder::try_new(ds.clone(), keys).unwrap();
+        builder
+            .when_matched(condition)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        let job = builder.try_build().unwrap();
+        let plan_stream = reader_to_stream(Box::new(RecordBatchIterator::new(
+            [Ok(new_batch)],
+            schema.clone(),
+        )));
+        let plan = job.create_plan(plan_stream).await.unwrap();
+        let plan_str = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            plan_str.contains("MergeInsert:") && !plan_str.contains("DeleteOnlyMergeInsert"),
+            "Expected MergeInsert (not DeleteOnlyMergeInsert) for DeleteIf + InsertAll, but got:\n{}",
+            plan_str
+        );
     }
 
     /// Tests that apply_deletions correctly handles an error when applying the row deletions.

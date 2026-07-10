@@ -105,6 +105,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             crate::dataset::WhenMatched::UpdateIfExpr(_) => "UpdateIfExpr",
             crate::dataset::WhenMatched::Fail => "Fail",
             crate::dataset::WhenMatched::Delete => "Delete",
+            crate::dataset::WhenMatched::DeleteIf(_) => "DeleteIf",
+            crate::dataset::WhenMatched::DeleteIfExpr(_) => "DeleteIfExpr",
         };
         let when_not_matched = if self.params.insert_not_matched {
             "InsertAll"
@@ -160,6 +162,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
         let no_upsert = matches!(
             self.params.when_matched,
             crate::dataset::WhenMatched::Delete
+                | crate::dataset::WhenMatched::DeleteIf(_)
+                | crate::dataset::WhenMatched::DeleteIfExpr(_)
         ) && !self.params.insert_not_matched;
 
         for (i, (qualifier, field)) in input_schema.iter().enumerate() {
@@ -219,8 +223,10 @@ impl MergeInsertPlanner {
     /// - `insert_not_matched` is `false` (no inserts)
     /// - `delete_not_matched_by_source` is `Keep` (no additional deletes of unmatched target rows)
     fn is_delete_only(params: &MergeInsertParams) -> bool {
-        matches!(params.when_matched, WhenMatched::Delete)
-            && !params.insert_not_matched
+        matches!(
+            params.when_matched,
+            WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_)
+        ) && !params.insert_not_matched
             && matches!(
                 params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
