@@ -1939,7 +1939,7 @@ impl FileMetadataProvider {
                 .collect::<Vec<_>>();
             let metadata_bytes = io.submit_request(ranges, 0).await?;
             for ((result_index, column_index, _), bytes) in
-                missing_columns.into_iter().zip(metadata_bytes.into_iter())
+                missing_columns.into_iter().zip(metadata_bytes)
             {
                 let column_metadata = pbfile::ColumnMetadata::decode(bytes)?;
                 let column_info = FileReader::meta_to_col_info(

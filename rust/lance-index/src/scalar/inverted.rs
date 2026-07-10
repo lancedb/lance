@@ -91,7 +91,7 @@ pub async fn build_global_bm25_scorer(
     let (mut total_tokens, mut num_docs, first_token_docs) =
         first_index.bm25_stats_for_terms(&terms).await?;
     let mut token_docs = HashMap::with_capacity(terms.len());
-    for (term, count) in terms.iter().cloned().zip(first_token_docs.into_iter()) {
+    for (term, count) in terms.iter().cloned().zip(first_token_docs) {
         token_docs.insert(term, count);
     }
 
@@ -100,7 +100,7 @@ pub async fn build_global_bm25_scorer(
             index.bm25_stats_for_terms(&terms).await?;
         total_tokens += segment_total_tokens;
         num_docs += segment_num_docs;
-        for (term, count) in terms.iter().zip(segment_token_docs.into_iter()) {
+        for (term, count) in terms.iter().zip(segment_token_docs) {
             *token_docs
                 .get_mut(term)
                 .expect("global scorer terms should already be initialized") += count;

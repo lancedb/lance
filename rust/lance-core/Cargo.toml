@@ -55,6 +55,10 @@ proptest.workspace = true
 rstest.workspace = true
 
 [features]
+# Capture Rust backtraces in error types. When disabled (the default),
+# the backtrace field is zero-sized with no overhead. At runtime, capture
+# is still gated by RUST_BACKTRACE=1.
+backtrace = []
 datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
 
 [lints]

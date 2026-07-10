@@ -422,7 +422,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::InvalidInput { source, .. }
             if source.to_string().contains("Cannot write with an empty schema.")),
             "{:?}",
-            &result
+            result
         );
 
         // Writing empty reader produces an error
@@ -436,7 +436,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::InvalidInput { source, .. }
             if source.to_string().contains("Input data was empty.")),
             "{:?}",
-            &result
+            result
         );
 
         // Writing with incorrect schema produces an error.
@@ -454,7 +454,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::SchemaMismatch { difference, .. }
             if difference.contains("fields did not match")),
             "{:?}",
-            &result
+            result
         );
     }
 
@@ -513,7 +513,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::InvalidInput { source, .. }
             if source.to_string().contains("Cannot write with an empty schema.")),
             "{:?}",
-            &result
+            result
         );
 
         // Writing empty reader produces an error
@@ -540,7 +540,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::SchemaMismatch { difference, .. }
             if difference.contains("fields did not match")),
             "{:?}",
-            &result
+            result
         );
     }
 

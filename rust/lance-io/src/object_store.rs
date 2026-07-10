@@ -40,6 +40,8 @@ pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod providers;
 pub mod storage_options;
 #[cfg(test)]

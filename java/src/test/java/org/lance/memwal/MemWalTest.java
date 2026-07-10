@@ -97,6 +97,22 @@ public class MemWalTest {
     return root;
   }
 
+  /** Build a single-batch root carrying only the {@code id} primary key, for deletes. */
+  private static VectorSchemaRoot keysRoot(BufferAllocator allocator, long[] ids) {
+    VectorSchemaRoot root =
+        VectorSchemaRoot.create(
+            new Schema(
+                Collections.singletonList(Field.nullable("id", new ArrowType.Int(64, true)))),
+            allocator);
+    BigIntVector idVector = (BigIntVector) root.getVector("id");
+    idVector.allocateNew(ids.length);
+    for (int i = 0; i < ids.length; i++) {
+      idVector.set(i, ids[i]);
+    }
+    root.setRowCount(ids.length);
+    return root;
+  }
+
   /** Build a single-batch append-only root without primary-key metadata. */
   private static VectorSchemaRoot appendOnlyRoot(
       BufferAllocator allocator, long[] ids, String prefix) {
@@ -378,6 +394,52 @@ public class MemWalTest {
 
         MemTableStats memtableStats = writer.memtableStats();
         assertTrue(memtableStats.generation() >= 0);
+      }
+    }
+  }
+
+  @Test
+  void testShardWriterDeleteMasksBaseRow(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("base").toString();
+    String shardId = UUID.randomUUID().toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {1, 2, 3}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams());
+
+      ShardWriterConfig config =
+          new ShardWriterConfig()
+              .withDurableWrite(true)
+              .withSyncIndexedWrite(true)
+              .withMaxWalBufferSize(1)
+              .withMaxWalFlushIntervalMs(10);
+
+      try (ShardWriter writer = dataset.memWalWriter(shardId, config)) {
+        try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {4}, "writer");
+            ArrowReader reader = toReader(allocator, root)) {
+          writer.put(reader);
+        }
+        try (VectorSchemaRoot keys = keysRoot(allocator, new long[] {2});
+            ArrowReader reader = toReader(allocator, keys)) {
+          writer.delete(reader);
+        }
+
+        Map<Long, String> byId = Collections.emptyMap();
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+          try (LsmScanner scanner = writer.lsmScanner();
+              ArrowReader reader = scanner.scanBatches()) {
+            byId = readByName(reader);
+          }
+          if (!byId.containsKey(2L) && "writer_4".equals(byId.get(4L))) {
+            break;
+          }
+          Thread.sleep(50);
+        }
+
+        assertEquals("base_1", byId.get(1L));
+        assertFalse(byId.containsKey(2L), "deleted base row should be masked by the tombstone");
+        assertEquals("base_3", byId.get(3L));
+        assertEquals("writer_4", byId.get(4L));
       }
     }
   }
