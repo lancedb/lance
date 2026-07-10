@@ -268,32 +268,47 @@ impl<T: Eq + std::hash::Hash + Clone> Default for InternCache<T> {
 
 impl<T: Eq + std::hash::Hash + Clone> InternCache<T> {
     fn intern(&mut self, v: Vec<T>) -> Arc<[T]> {
+        if let Some(existing) = self.get(&v) {
+            return existing;
+        }
+        self.insert(Arc::from(v))
+    }
+
+    fn intern_slice(&mut self, value: &[T]) -> Arc<[T]> {
+        if let Some(existing) = self.get(value) {
+            return existing;
+        }
+        self.insert(Arc::from(value))
+    }
+
+    fn get(&self, value: &[T]) -> Option<Arc<[T]>> {
+        match self {
+            Self::Small(entries) => entries
+                .iter()
+                .find(|existing| existing.as_ref() == value)
+                .cloned(),
+            Self::Large(map) => map
+                .get_key_value(value)
+                .map(|(existing, _)| existing.clone()),
+        }
+    }
+
+    fn insert(&mut self, value: Arc<[T]>) -> Arc<[T]> {
         match self {
             Self::Small(entries) => {
-                for existing in entries.iter() {
-                    if existing.as_ref() == v.as_slice() {
-                        return existing.clone();
-                    }
-                }
-                let arc: Arc<[T]> = Arc::from(v);
-                entries.push(arc.clone());
+                entries.push(value.clone());
                 if entries.len() > INTERN_CACHE_UPGRADE_THRESHOLD {
                     let mut map = HashMap::with_capacity(entries.len());
-                    for e in entries.drain(..) {
-                        map.insert(e, ());
+                    for entry in entries.drain(..) {
+                        map.insert(entry, ());
                     }
                     *self = Self::Large(map);
                 }
-                arc
+                value
             }
             Self::Large(map) => {
-                if let Some((existing, _)) = map.get_key_value(v.as_slice()) {
-                    existing.clone()
-                } else {
-                    let arc: Arc<[T]> = Arc::from(v);
-                    map.insert(arc.clone(), ());
-                    arc
-                }
+                map.insert(value.clone(), ());
+                value
             }
         }
     }
@@ -351,6 +366,18 @@ impl DataFileFieldInterner {
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
         })
+    }
+
+    /// Intern Arrow-backed lists without materializing a temporary `Vec` per DataFile.
+    pub(crate) fn intern_data_file_fields(
+        &mut self,
+        fields: &[i32],
+        column_indices: &[i32],
+    ) -> (Arc<[i32]>, Arc<[i32]>) {
+        (
+            self.fields.intern_slice(fields),
+            self.column_indices.intern_slice(column_indices),
+        )
     }
 
     /// Convert a protobuf `DataFragment`, interning fields and version metadata.
@@ -837,5 +864,26 @@ mod tests {
         data_file
             .validate(&base_path)
             .expect("validation should allow extra columns without field ids");
+    }
+
+    #[test]
+    fn data_file_interner_shares_owned_and_borrowed_lists() {
+        let mut interner = DataFileFieldInterner::default();
+        let owned = interner
+            .intern_data_file(pb::DataFile {
+                path: "owned.lance".to_string(),
+                fields: vec![1, 2, 3],
+                column_indices: vec![4, 5, 6],
+                file_major_version: 2,
+                file_minor_version: 3,
+                file_size_bytes: 17,
+                base_id: Some(9),
+            })
+            .unwrap();
+        let (borrowed_fields, borrowed_column_indices) =
+            interner.intern_data_file_fields(&[1, 2, 3], &[4, 5, 6]);
+
+        assert!(Arc::ptr_eq(&owned.fields, &borrowed_fields));
+        assert!(Arc::ptr_eq(&owned.column_indices, &borrowed_column_indices));
     }
 }

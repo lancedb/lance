@@ -32,6 +32,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::object_writer::WriteResult;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::{ByteStream, Reader, Writer};
+use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::AsyncWrite;
@@ -1510,37 +1511,6 @@ fn decode_fragment_batch(
         .collect()
 }
 
-fn list_i32(array: &ListArray, row: usize, name: &str, path: &Path) -> Result<Vec<i32>> {
-    if array.is_null(row) {
-        return Err(corrupt(
-            path,
-            format!("manifest DataFile {name} is null at row {row}"),
-        ));
-    }
-    let values = array.value(row);
-    let values = values
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| {
-            corrupt(
-                path,
-                format!("manifest DataFile {name} values are not int32"),
-            )
-        })?;
-    values
-        .iter()
-        .enumerate()
-        .map(|(item, value)| {
-            value.ok_or_else(|| {
-                corrupt(
-                    path,
-                    format!("manifest DataFile {name}[{item}] is null at row {row}"),
-                )
-            })
-        })
-        .collect()
-}
-
 fn managed_file_path(id: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut path = String::with_capacity(56);
@@ -1557,60 +1527,169 @@ fn managed_file_path(id: &[u8]) -> String {
     path
 }
 
-fn decode_data_file(
-    array: &StructArray,
-    row: usize,
-    path: &Path,
-    interner: &mut DataFileFieldInterner,
-) -> Result<DataFile> {
-    if array.is_null(row) {
-        return Err(corrupt(
-            path,
-            format!("manifest DataFile row {row} is null"),
-        ));
-    }
-    let managed_ids = child_array::<FixedSizeBinaryArray>(array, "managed_file_id", path)?;
-    let explicit_paths = child_array::<StringArray>(array, "explicit_path", path)?;
-    let fields = child_array::<ListArray>(array, "fields", path)?;
-    let column_indices = child_array::<ListArray>(array, "column_indices", path)?;
-    let major_versions = child_array::<UInt32Array>(array, "file_major_version", path)?;
-    let minor_versions = child_array::<UInt32Array>(array, "file_minor_version", path)?;
-    let known_sizes = child_array::<UInt64Array>(array, "known_size_bytes", path)?;
-    let base_ids = child_array::<UInt32Array>(array, "base_id", path)?;
+/// Resolves DataFile child arrays once per batch instead of once per row.
+struct DataFileBatchDecoder<'a> {
+    array: &'a StructArray,
+    managed_ids: &'a FixedSizeBinaryArray,
+    explicit_paths: &'a StringArray,
+    fields: &'a ListArray,
+    field_values: &'a Int32Array,
+    column_indices: &'a ListArray,
+    column_index_values: &'a Int32Array,
+    major_versions: &'a UInt32Array,
+    minor_versions: &'a UInt32Array,
+    known_sizes: &'a UInt64Array,
+    base_ids: &'a UInt32Array,
+    path: &'a Path,
+}
 
-    let file_path = match (managed_ids.is_null(row), explicit_paths.is_null(row)) {
-        (false, true) => managed_file_path(managed_ids.value(row)),
-        (true, false) => explicit_paths.value(row).to_string(),
-        _ => {
+impl<'a> DataFileBatchDecoder<'a> {
+    fn new(array: &'a StructArray, path: &'a Path) -> Result<Self> {
+        let fields = child_array::<ListArray>(array, "fields", path)?;
+        let column_indices = child_array::<ListArray>(array, "column_indices", path)?;
+        let field_values = fields
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| corrupt(path, "manifest DataFile fields values are not int32"))?;
+        let column_index_values = column_indices
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| {
+                corrupt(
+                    path,
+                    "manifest DataFile column_indices values are not int32",
+                )
+            })?;
+        Ok(Self {
+            array,
+            managed_ids: child_array::<FixedSizeBinaryArray>(array, "managed_file_id", path)?,
+            explicit_paths: child_array::<StringArray>(array, "explicit_path", path)?,
+            fields,
+            field_values,
+            column_indices,
+            column_index_values,
+            major_versions: child_array::<UInt32Array>(array, "file_major_version", path)?,
+            minor_versions: child_array::<UInt32Array>(array, "file_minor_version", path)?,
+            known_sizes: child_array::<UInt64Array>(array, "known_size_bytes", path)?,
+            base_ids: child_array::<UInt32Array>(array, "base_id", path)?,
+            path,
+        })
+    }
+
+    fn list_values<'b>(
+        &self,
+        array: &'b ListArray,
+        values: &'b Int32Array,
+        row: usize,
+        name: &str,
+    ) -> Result<&'b [i32]> {
+        if array.is_null(row) {
             return Err(corrupt(
-                path,
+                self.path,
+                format!("manifest DataFile {name} is null at row {row}"),
+            ));
+        }
+        let offsets = array.value_offsets();
+        let start = usize::try_from(offsets[row]).map_err(|_| {
+            corrupt(
+                self.path,
+                format!("manifest DataFile {name} has a negative start offset at row {row}"),
+            )
+        })?;
+        let end = usize::try_from(offsets[row + 1]).map_err(|_| {
+            corrupt(
+                self.path,
+                format!("manifest DataFile {name} has a negative end offset at row {row}"),
+            )
+        })?;
+        if end < start || end > values.len() {
+            return Err(corrupt(
+                self.path,
                 format!(
-                    "manifest DataFile row {row} must set exactly one of managed_file_id and explicit_path"
+                    "manifest DataFile {name} range {start}..{end} is invalid for {} values at row {row}",
+                    values.len()
                 ),
             ));
         }
-    };
-    let known_size = if known_sizes.is_null(row) {
-        0
-    } else {
-        let size = known_sizes.value(row);
-        if size == 0 {
+        if values.null_count() != 0
+            && let Some(index) = (start..end).find(|index| values.is_null(*index))
+        {
             return Err(corrupt(
-                path,
-                format!("manifest DataFile row {row} has a zero known size"),
+                self.path,
+                format!(
+                    "manifest DataFile {name}[{}] is null at row {row}",
+                    index - start
+                ),
             ));
         }
-        size
-    };
-    interner.intern_data_file(pb::DataFile {
-        path: file_path,
-        fields: list_i32(fields, row, "fields", path)?,
-        column_indices: list_i32(column_indices, row, "column_indices", path)?,
-        file_major_version: required_u32(major_versions, row, "file_major_version", path)?,
-        file_minor_version: required_u32(minor_versions, row, "file_minor_version", path)?,
-        file_size_bytes: known_size,
-        base_id: (!base_ids.is_null(row)).then(|| base_ids.value(row)),
-    })
+        Ok(&values.values()[start..end])
+    }
+
+    fn decode(&self, row: usize, interner: &mut DataFileFieldInterner) -> Result<DataFile> {
+        if self.array.is_null(row) {
+            return Err(corrupt(
+                self.path,
+                format!("manifest DataFile row {row} is null"),
+            ));
+        }
+        let file_path = match (
+            self.managed_ids.is_null(row),
+            self.explicit_paths.is_null(row),
+        ) {
+            (false, true) => managed_file_path(self.managed_ids.value(row)),
+            (true, false) => self.explicit_paths.value(row).to_string(),
+            _ => {
+                return Err(corrupt(
+                    self.path,
+                    format!(
+                        "manifest DataFile row {row} must set exactly one of managed_file_id and explicit_path"
+                    ),
+                ));
+            }
+        };
+        let known_size = if self.known_sizes.is_null(row) {
+            0
+        } else {
+            let size = self.known_sizes.value(row);
+            if size == 0 {
+                return Err(corrupt(
+                    self.path,
+                    format!("manifest DataFile row {row} has a zero known size"),
+                ));
+            }
+            size
+        };
+        let (fields, column_indices) = interner.intern_data_file_fields(
+            self.list_values(self.fields, self.field_values, row, "fields")?,
+            self.list_values(
+                self.column_indices,
+                self.column_index_values,
+                row,
+                "column_indices",
+            )?,
+        );
+        Ok(DataFile {
+            path: file_path,
+            fields,
+            column_indices,
+            file_major_version: required_u32(
+                self.major_versions,
+                row,
+                "file_major_version",
+                self.path,
+            )?,
+            file_minor_version: required_u32(
+                self.minor_versions,
+                row,
+                "file_minor_version",
+                self.path,
+            )?,
+            file_size_bytes: CachedFileSize::new(known_size),
+            base_id: (!self.base_ids.is_null(row)).then(|| self.base_ids.value(row)),
+        })
+    }
 }
 
 fn section_projection(
@@ -2057,6 +2136,7 @@ pub(super) async fn read_with_prefetched_tail(
         .await?;
     while let Some(batch) = data_file_stream.try_next().await? {
         let section = struct_section(&batch, "data_files", &path)?;
+        let decoder = DataFileBatchDecoder::new(section, &path)?;
         for row in 0..section.len() {
             while next_fragment < fragments.len() && data_file_counts[next_fragment] == 0 {
                 next_fragment += 1;
@@ -2077,9 +2157,7 @@ pub(super) async fn read_with_prefetched_tail(
                     format!("manifest has an unclaimed DataFile row {decoded_data_files}"),
                 )
             })?;
-            fragment
-                .files
-                .push(decode_data_file(section, row, &path, &mut interner)?);
+            fragment.files.push(decoder.decode(row, &mut interner)?);
             decoded_data_files = decoded_data_files
                 .checked_add(1)
                 .ok_or_else(|| corrupt(&path, "decoded manifest DataFile count overflows u64"))?;
@@ -2610,6 +2688,58 @@ mod tests {
         assert_eq!(
             managed_file_path(&id),
             "1010010101011010111100000123456789abcdef1032547698.lance"
+        );
+    }
+
+    #[test]
+    fn decodes_data_file_lists_from_a_sliced_batch() {
+        let files = [
+            DataFile::new("first.lance", vec![1], vec![10], 2, 3, None, None),
+            DataFile::new(
+                "second.lance",
+                vec![2, 3],
+                vec![20, 30],
+                2,
+                3,
+                NonZero::new(7),
+                Some(4),
+            ),
+        ];
+        let array = data_file_array(&[&files[0], &files[1]]).unwrap();
+        let sliced = array.slice(1, 1);
+        let sliced = sliced.as_any().downcast_ref::<StructArray>().unwrap();
+        let path = Path::from("/sliced.manifest");
+        let decoder = DataFileBatchDecoder::new(sliced, &path).unwrap();
+
+        assert_eq!(
+            decoder
+                .decode(0, &mut DataFileFieldInterner::default())
+                .unwrap(),
+            files[1]
+        );
+    }
+
+    #[test]
+    fn rejects_null_data_file_list_values() {
+        let file = DataFile::new("null-list.lance", vec![1], vec![10], 2, 3, None, None);
+        let array = data_file_array(&[&file]).unwrap();
+        let mut columns = array.columns().to_vec();
+        let mut null_fields = ListBuilder::new(Int32Builder::new());
+        null_fields.values().append_null();
+        null_fields.append(true);
+        columns[2] = Arc::new(null_fields.finish());
+        let array = StructArray::try_new(data_file_fields(), columns, None).unwrap();
+        let path = Path::from("/null-list.manifest");
+        let decoder = DataFileBatchDecoder::new(&array, &path).unwrap();
+
+        let error = decoder
+            .decode(0, &mut DataFileFieldInterner::default())
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("DataFile fields[0] is null at row 0")
         );
     }
 }
