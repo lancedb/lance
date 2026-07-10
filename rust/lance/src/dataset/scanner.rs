@@ -4860,6 +4860,11 @@ impl Scanner {
             projection.with_row_id |= has_row_id;
             projection.with_row_addr |= has_row_addr;
             let mut read_options = FilteredReadOptions::new(projection);
+            if self.include_deleted_rows {
+                // Forwarded so the row-stream read rejects it: deleted rows
+                // carry a null row id, which the take would silently drop
+                read_options = read_options.with_deleted_rows()?;
+            }
             if let Some(batch_size) = self.batch_size {
                 read_options = read_options.with_batch_size(batch_size as u32);
             }
@@ -10019,6 +10024,30 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             starts_with_names,
             BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
         );
+    }
+
+    /// A physical deleted-row scan cannot late-materialize: the take would
+    /// silently drop the tombstone rows (null row id), so the row-stream
+    /// read must reject the forwarded flag at plan time
+    #[tokio::test]
+    async fn test_include_deleted_rows_rejects_late_materialization() {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col("payload", array::step::<Int64Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+        dataset.delete("i = 5").await.unwrap();
+
+        let mut scan = dataset.scan();
+        scan.project(&["payload"])
+            .unwrap()
+            .filter("i > 2")
+            .unwrap()
+            .with_row_id()
+            .include_deleted_rows()
+            .materialization_style(MaterializationStyle::AllLate);
+        let err = scan.create_plan().await.unwrap_err();
+        assert!(err.to_string().contains("with_deleted_rows"), "{err}");
     }
 
     #[rstest]
