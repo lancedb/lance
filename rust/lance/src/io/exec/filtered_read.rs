@@ -415,9 +415,8 @@ impl FilteredReadStream {
         })
     }
 
-    /// Load the metadata of the scoped fragments (or every dataset fragment
-    /// when unscoped) — deletion vectors and row id sequences included,
-    /// unless `with_deleted_rows` is set
+    /// Load the metadata of the scoped fragments, or every dataset fragment
+    /// when unscoped
     async fn load_all_fragments(
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
@@ -446,9 +445,8 @@ impl FilteredReadStream {
             .await
     }
 
-    /// Create the I/O scheduler for a read.  Explicit options take
-    /// precedence; otherwise fall back to the LANCE_DEFAULT_IO_BUFFER_SIZE
-    /// env var if set; otherwise max_bandwidth.
+    /// Create the I/O scheduler for a read (explicit option → env override →
+    /// max bandwidth)
     fn make_scan_scheduler(dataset: &Dataset, options: &FilteredReadOptions) -> Arc<ScanScheduler> {
         let obj_store = dataset.object_store.clone();
         let scheduler_config = if let Some(io_buffer_size_bytes) = options
@@ -1292,13 +1290,10 @@ pub struct FilteredReadOptions {
     pub scan_range_before_filter: Option<Range<u64>>,
     /// The range of rows to read after applying the filter.
     pub scan_range_after_filter: Option<Range<u64>>,
-    /// Include deleted rows in the scan; they are returned with a null row
-    /// id.  Not supported for row-stream reads.
+    /// Include deleted rows in the scan; they are returned with a null row id
     pub with_deleted_rows: bool,
-    /// The maximum number of rows per batch
-    ///
-    /// For a row-stream source this is also the number of input rows
-    /// coalesced into each read round (output batches mirror their round).
+    /// The maximum number of rows per batch (for a row-stream source: the
+    /// rows coalesced into each read round)
     pub batch_size: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
@@ -1427,8 +1422,7 @@ impl FilteredReadOptions {
     /// batches across fragments).
     ///
     /// A CoalesceBatchesExec can (and often should) be used to merge together tiny batches
-    /// from a scan.  A row-stream source coalesces its own input: this value is the number of
-    /// input rows gathered into each read round.
+    /// from a scan.  A row-stream source coalesces its own input to this value.
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size);
         self
@@ -1514,10 +1508,9 @@ impl FilteredReadOptions {
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
 ///
-/// This is a single, general I/O node: `output = read(row_source,
-/// fields_to_read) ⊕ carry_columns` (see [`RowSelector`]).  For set-shaped row
-/// sources it picks the best read strategy based on the expected query cost
-/// which is determined by:
+/// A single, general I/O node (see [`RowSelector`] for the possible row
+/// selections).  For set-shaped selections it picks the best read strategy
+/// based on the expected query cost which is determined by:
 ///  - Size of data in desired columns
 ///  - Number of rows matching the index search
 ///  - Filesystem parameters (e.g. block size)
@@ -1552,21 +1545,16 @@ pub struct FilteredReadExec {
 enum RowSelector {
     /// Every live row of the dataset (no input plan)
     AllRows,
-    /// A set of rows: one serialized [`IndexExprResult`] batch (the wire
-    /// layout emitted by e.g.
-    /// [`ScalarIndexExec`](super::scalar_index::ScalarIndexExec)).  Sets are
-    /// unordered and unique by nature, so the output is in storage order and
-    /// deduplicated.
+    /// A set of rows: one serialized [`IndexExprResult`] batch.  Output is in
+    /// storage order and deduplicated.
     RowSet(Arc<dyn ExecutionPlan>),
     /// A stream of rows: record batches with a `_rowid`/`_rowaddr` column.
-    /// Row order, duplicates, and the stream's own columns are all preserved
-    /// in the output, next to the newly read fields (the contract
-    /// [`TakeExec`](super::TakeExec) provides).
+    /// Row order, duplicates, and the stream's own columns are preserved in
+    /// the output ([`TakeExec`](super::TakeExec)'s contract).
     RowStream(Box<RowStreamSource>),
 }
 
 impl RowSelector {
-    /// The plan producing the serialized row set, if this source is a set
     fn row_set_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match self {
             Self::RowSet(plan) => Some(plan),
@@ -1574,7 +1562,6 @@ impl RowSelector {
         }
     }
 
-    /// The child plan, regardless of the source kind
     fn child(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match self {
             Self::AllRows => None,
@@ -1588,17 +1575,14 @@ impl RowSelector {
 #[derive(Debug)]
 struct RowStreamSource {
     plan: Arc<dyn ExecutionPlan>,
-    /// The stream column identifying rows: [`ROW_ID`] or [`ROW_ADDR`].
-    ///
-    /// Both work on any dataset: ids resolve through each fragment's row id
-    /// sequence, addresses read directly by physical position.
+    /// The stream column identifying rows: [`ROW_ID`] or [`ROW_ADDR`]
     key_column: &'static str,
-    /// Options for the internal fragment read.  Its projection is the fields
-    /// to read (the output fields the stream doesn't already carry) plus the
-    /// key column, which is read for alignment and stripped before the merge.
+    /// Options for the internal fragment read; its projection is the fields
+    /// to read plus the key column (read for alignment, stripped before the
+    /// merge)
     read_options: FilteredReadOptions,
-    /// Arrow schema of what the read contributes to the output: the fetched
-    /// fields plus any synthesized identity columns, without the key column
+    /// What the read contributes to the output: the fetched fields plus any
+    /// synthesized identity columns
     new_fields_schema: SchemaRef,
 }
 
@@ -1677,11 +1661,8 @@ impl FilteredReadExec {
         .any(|format| schema.fields() == format.schema().fields())
     }
 
-    /// The input columns that carry through to the output.
-    ///
-    /// The identity flags are authoritative: `_rowid`/`_rowaddr` appear in
-    /// the output iff requested, so carried identity columns that were not
-    /// requested are stripped; ordinary input columns always carry through.
+    /// The input columns that carry through to the output: identity columns
+    /// appear iff their flag is requested, ordinary columns always carry
     fn carried_schema(input_schema: &arrow_schema::Schema, projection: &Projection) -> SchemaRef {
         Arc::new(arrow_schema::Schema::new(
             input_schema
@@ -1715,25 +1696,21 @@ impl FilteredReadExec {
                 "filters are not supported when taking rows from an input plan".into(),
             ));
         }
-        // For a streaming input, a limit is safer to apply upstream (on the
-        // cheap keyed rows, before columns are fetched)
+        // A limit is safer to apply upstream, on the cheap keyed rows
         if options.scan_range_before_filter.is_some() || options.scan_range_after_filter.is_some() {
             return Err(Error::invalid_input_source(
                 "scan ranges are not supported when taking rows from an input plan".into(),
             ));
         }
-        // with_deleted_rows: the reader reports deleted rows by nulling their
-        // row id, which is at odds with key-based alignment (see the design
-        // notes on PR #7672 for a reconstruction recipe if a consumer ever
-        // needs the physical view through a take)
+        // The reader reports deleted rows by nulling their row id, which
+        // cannot be aligned back to input keys
         if options.with_deleted_rows || options.only_indexed_fragments {
             return Err(Error::invalid_input_source(
                 "with_deleted_rows / only_indexed_fragments are not supported when taking rows from an input plan".into(),
             ));
         }
         let input_schema = input.schema();
-        // Prefer the row id when both are present: ids survive compaction,
-        // addresses are pinned to this dataset version
+        // Prefer row ids: they survive compaction, addresses are version-pinned
         let key_column = if input_schema.column_with_name(ROW_ID).is_some() {
             ROW_ID
         } else if input_schema.column_with_name(ROW_ADDR).is_some() {
@@ -1748,9 +1725,8 @@ impl FilteredReadExec {
             ));
         };
 
-        // After the subtraction the projection's identity flags mean
-        // "requested but not carried by the input" — the columns to
-        // synthesize during the read
+        // Post-subtraction the identity flags mean "requested but not
+        // carried" — the columns the read must synthesize
         let fields_to_read = options
             .projection
             .clone()
@@ -1767,8 +1743,6 @@ impl FilteredReadExec {
         let carried_schema = Self::carried_schema(input_schema.as_ref(), &options.projection);
 
         // Output = carried columns ⊕ fetched fields ⊕ synthesized identity
-        // (`fields_to_read` retains the synthesis flags, and the calculated
-        // schema materializes them as trailing columns)
         let output_schema = Arc::new(arrow_schema::Schema::from(
             &super::TakeExec::calculate_output_schema(
                 dataset.schema(),
@@ -1777,8 +1751,7 @@ impl FilteredReadExec {
             ),
         ));
 
-        // A row-stream read transforms its input in place, so partitioning
-        // and emission behavior follow the input
+        // Partitioning and emission behavior follow the input
         let properties = Arc::new(
             input
                 .properties()
@@ -1787,9 +1760,6 @@ impl FilteredReadExec {
                 .with_eq_properties(EquivalenceProperties::new(output_schema)),
         );
 
-        // The schema of what the read contributes to the output: the fetched
-        // fields plus any synthesized identity columns (the key column, read
-        // only for alignment, is not part of it)
         let bare_schema = arrow_schema::Schema::from(&fields_to_read.to_bare_schema());
         let mut new_fields = bare_schema.fields().iter().cloned().collect::<Vec<_>>();
         if synthesize_row_id {
@@ -1800,8 +1770,7 @@ impl FilteredReadExec {
         }
         let new_fields_schema = Arc::new(arrow_schema::Schema::new(new_fields));
 
-        // `fields_to_read` still carries the synthesis flags, so the read
-        // emits the synthesized columns; add the key column on top
+        // fields_to_read keeps the synthesis flags; add the key column on top
         let mut read_options = options.clone();
         read_options.projection = if key_column == ROW_ID {
             fields_to_read.with_row_id()
@@ -2145,27 +2114,16 @@ impl FilteredReadExec {
     }
 }
 
-/// How many read rounds run ahead of the consumer.
-///
-/// This is a prefetch factor, not a CPU or I/O parallelism setting: rounds
-/// are I/O bound (their CPU work parallelizes via spawned tasks), and a deep
-/// window is what keeps the I/O scheduler saturated when a long input stream
-/// touches few fragments per round.  The cost is memory — output emits in
-/// round order, so a straggler round holds up to this many completed rounds
-/// buffered (~rounds × batch_size × fetched-row width).  If that becomes a
-/// problem the fix is a memory-pool reservation per round that pauses input
-/// consumption, not a smaller constant.
+/// How many read rounds run ahead of the consumer.  A prefetch factor, not a
+/// parallelism setting: it keeps the I/O scheduler saturated on long input
+/// streams, at a worst-case memory cost of this many buffered rounds (the
+/// long-term fix for that is a memory-pool reservation per round).
 const ROW_STREAM_PREFETCH_ROUNDS: usize = 64;
 
-/// Executes a [`FilteredReadExec`] over a row-stream source (see
-/// [`RowSelector::RowStream`]).
-///
-/// Each input batch is converted into an in-memory exact [`IndexExprResult`]
-/// and pushed through the same planning and read pipeline as an index-query
-/// scan (`plan_scan` → `plan_to_scoped_fragments` → `read_fragment`).  The
-/// freshly read columns are then aligned to the input's row order and merged
-/// into the batch, so row order, duplicates, and payload columns are all
-/// preserved.
+/// Executes a [`FilteredReadExec`] over a row-stream source: each round is
+/// planned and read through the same pipeline as an index-query scan, then
+/// the fetched columns are aligned back to the round's row order and merged
+/// in (preserving order, duplicates, and carried columns).
 struct RowStreamRead {
     dataset: Arc<Dataset>,
     /// Node options whose projection is the fields to read plus the key column
@@ -2212,7 +2170,6 @@ impl RowStreamRead {
         }
     }
 
-    /// Fragment metadata, loaded on the first round and reused afterwards
     async fn load_fragments(&self) -> Result<&Vec<LoadedFragment>> {
         self.loaded_fragments
             .get_or_try_init(|| {
@@ -2221,13 +2178,9 @@ impl RowStreamRead {
             .await
     }
 
-    /// Build a round's per-fragment read ranges directly from physical row
-    /// addresses.
-    ///
-    /// An address already encodes (fragment id, offset), so no row-id
-    /// sequence translation is needed — this works with and without stable
-    /// row ids.  Addresses pointing at deleted rows or unknown fragments
-    /// produce no ranges and their input rows drop like stale keys.
+    /// Build a round's read ranges directly from physical row addresses (an
+    /// address already encodes fragment and offset, so no row-id sequence
+    /// translation is needed)
     fn plan_round_from_addresses(
         addrs: &RowAddrTreeMap,
         fragments: &[LoadedFragment],
@@ -2251,14 +2204,11 @@ impl RowStreamRead {
         }
         FilteredReadInternalPlan {
             rows,
-            // A row-stream read has no filters or scan ranges (rejected at
-            // construction)
             filters: HashMap::new(),
             scan_range_after_filter: None,
         }
     }
 
-    /// Extract the round's key column from `batch` (produced by `producer`)
     fn key_array<'a>(
         &self,
         batch: &'a RecordBatch,
@@ -2279,14 +2229,12 @@ impl RowStreamRead {
         })
     }
 
-    /// Turn a round's keys into per-fragment read ranges
     async fn plan_round(
         &self,
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
     ) -> DataFusionResult<FilteredReadInternalPlan> {
         let compute_timer = self.baseline_metrics.elapsed_compute().timer();
-        // Null keys identify rows that don't exist in the dataset; they are
-        // excluded here and their rows are dropped by attach_columns
+        // Null keys are excluded; attach_columns drops their rows
         let round_keys = if keys.null_count() == 0 {
             RowAddrTreeMap::from_iter(keys.values().iter().copied())
         } else {
@@ -2296,10 +2244,8 @@ impl RowStreamRead {
 
         let fragments = self.load_fragments().await?;
         if self.key_column == ROW_ADDR {
-            // Addresses already encode (fragment, offset), so build the read
-            // ranges directly.  The mask path below cannot be used here: on a
-            // stable-row-id dataset it would translate the values through the
-            // row-id sequence, misreading addresses as row ids.
+            // The mask path would misread addresses as row ids on a
+            // stable-row-id dataset; addresses resolve directly instead
             Ok(Self::plan_round_from_addresses(&round_keys, fragments))
         } else {
             let evaluated_index = Arc::new(EvaluatedIndex {
@@ -2314,9 +2260,8 @@ impl RowStreamRead {
         }
     }
 
-    /// Read the round's planned ranges — open every touched fragment and
-    /// decode its rows, all in parallel — returning the read rows in storage
-    /// order, deduplicated, with the key column included
+    /// Read the round's planned ranges, returning the rows in storage order,
+    /// deduplicated, with the key column included
     async fn read_round(
         &self,
         internal_plan: FilteredReadInternalPlan,
@@ -2332,25 +2277,17 @@ impl RowStreamRead {
         );
         let num_fragments = fragments.len() as u32;
         for scoped in &mut scoped_fragments {
-            // Keep both levels of I/O ordering: earlier rounds strictly before
-            // later ones (output emits in round order, so the scheduler should
-            // finish rounds in the order the consumer drains them), fragments
-            // in dataset order within a round.  A stride is used instead of a
-            // running counter because rounds plan concurrently; the values are
-            // not dense but the scheduler only compares them.
+            // I/O priority: earlier rounds strictly first (output emits in
+            // round order), fragments keep dataset order within a round
             scoped.priority = scoped
                 .priority
                 .saturating_add(round_index.saturating_mul(num_fragments));
-            // Read each fragment's rows for this round as a single batch
             scoped.batch_size = u32::MAX;
         }
 
-        // Open all the fragments in parallel.  A random read touches many
-        // fragments (often one row per fragment) and the CPU-bound part of a
-        // fragment open serializes under plain future concurrency, so spawn
-        // one task per fragment like the scan path does (see
-        // FilteredReadStream::try_new).  Collecting into Vecs avoids
-        // "implementation of FnOnce is not general enough" false positives.
+        // Spawn per fragment: the CPU part of an open serializes under plain
+        // future concurrency (collecting into Vecs avoids FnOnce false
+        // positives from rustc)
         let open_tasks = scoped_fragments
             .into_iter()
             .map(|scoped| {
@@ -2392,8 +2329,8 @@ impl RowStreamRead {
         )?)
     }
 
-    /// Align the read rows back to the round's row order via the key column
-    /// and merge the fetched columns onto the round's batch
+    /// Align the read rows back to the round's row order and merge the
+    /// fetched columns on
     fn attach_columns(
         &self,
         round: RecordBatch,
@@ -2403,10 +2340,8 @@ impl RowStreamRead {
         let keys = self.key_array(&round, "input")?;
         let read_keys = self.key_array(&read_data, "read")?;
 
-        // Fast path: the read produced exactly one row per input row with an
-        // identical key sequence (typical when the input is already in
-        // storage order with no duplicates or stale keys), so the rows are
-        // aligned as-is — skip the hash map and the permutation
+        // Fast path: one read row per input row with an identical key
+        // sequence — already aligned, skip the hash map and the permutation
         if keys.null_count() == 0
             && read_data.num_rows() == round.num_rows()
             && read_keys.values() == keys.values()
@@ -2440,8 +2375,7 @@ impl RowStreamRead {
             }
         }
 
-        // Drop input rows whose key no longer exists in the dataset (e.g.
-        // stale index results pointing at deleted rows)
+        // Drop input rows whose key no longer exists (stale/deleted)
         let round = if indices.len() < round.num_rows() {
             arrow::compute::filter_record_batch(&round, &BooleanArray::from(valid))?
         } else {
@@ -2453,14 +2387,11 @@ impl RowStreamRead {
 
         let new_data =
             arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
-        // Drop the key column if it was only read for alignment
         let new_data = new_data.project_by_schema(self.new_fields_schema.as_ref())?;
         let carried = round.project_by_schema(self.carried_schema.as_ref())?;
         Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
-    /// Execute one read round: plan the keys into ranges, read them, and
-    /// attach the fetched columns to the round's batch
     async fn execute_round(
         self: Arc<Self>,
         round: RecordBatch,
@@ -2474,14 +2405,9 @@ impl RowStreamRead {
         self.attach_columns(round, read_data)
     }
 
-    /// Coalesce the input stream into read rounds of exactly `target` rows
-    /// (the final round holds the remainder).
-    ///
-    /// Merging small batches amortizes per-round planning overhead; slicing
-    /// oversized batches bounds each round's memory (the round holds all
-    /// fetched columns for its rows at once) and keeps output batches within
-    /// the documented `batch_size` maximum.  Order is preserved: rounds are
-    /// cut from the input in sequence.
+    /// Cut the input into rounds of exactly `target` rows (final round holds
+    /// the remainder): merging small batches amortizes per-round planning,
+    /// slicing oversized ones bounds a round's memory.  Order is preserved.
     fn coalesce_rounds(
         input: SendableRecordBatchStream,
         target: usize,
@@ -2522,11 +2448,8 @@ impl RowStreamRead {
         self: Arc<Self>,
         input: SendableRecordBatchStream,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        // Rows per round (and per output batch, which mirrors its round).
-        // Resolution matches the scan path except the final fallback: a flat
-        // BATCH_SIZE_FALLBACK instead of the scan's block-size heuristic — a
-        // round's per-batch cost is planning and fragment-open overhead,
-        // which row count amortizes directly.
+        // Rows per round; the flat fallback (instead of the scan's block-size
+        // heuristic) fits a round's cost, which is planning overhead
         let round_target_rows = self
             .read_options
             .batch_size
@@ -2540,8 +2463,8 @@ impl RowStreamRead {
                 let round = round?;
                 let this = self.clone();
                 DataFusionResult::Ok(
-                    // SpawnedTask aborts when dropped, so cancelling the
-                    // query also cancels the in-flight rounds
+                    // SpawnedTask aborts on drop: cancelling the query
+                    // cancels in-flight rounds
                     SpawnedTask::spawn(
                         this.execute_round(round, round_index as u32)
                             .in_current_span(),
@@ -2698,9 +2621,8 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        // A row-stream read is I/O bound and partitioning it would create
-        // multiple I/O schedulers, which could use a lot of RAM (same
-        // reasoning as TakeExec).  The other sources have no row input.
+        // Partitioning a row-stream read would create multiple I/O schedulers
+        // (RAM heavy); the other selectors have no row input
         vec![false; self.children().len()]
     }
 
@@ -2713,7 +2635,7 @@ impl ExecutionPlan for FilteredReadExec {
         partition: Option<usize>,
     ) -> datafusion::error::Result<Statistics> {
         if let RowSelector::RowStream(source) = &self.input {
-            // A row-stream read emits (at most) one output row per input row
+            // At most one output row per input row
             return Ok(Statistics {
                 num_rows: source.plan.partition_statistics(partition)?.num_rows,
                 ..Statistics::new_unknown(self.schema().as_ref())
@@ -2841,10 +2763,8 @@ impl ExecutionPlan for FilteredReadExec {
                 Error::internal("A FilteredReadExec cannot have two children".to_string()).into(),
             ))
         } else {
-            // Rebuild through try_new so the input encoding (index query vs
-            // take) is re-derived from the new child's schema and any derived
-            // state (output schema, properties) is recomputed.  This also
-            // clears the precomputed plan / running stream, as before.
+            // Rebuild via try_new so the selector and derived state are
+            // re-derived from the new child's schema
             let child = children.into_iter().next();
             let rebuilt = Self::try_new(self.dataset.clone(), self.options.clone(), child)
                 .map_err(|e| DataFusionError::External(e.into()))?;
@@ -2881,10 +2801,8 @@ impl ExecutionPlan for FilteredReadExec {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        // With a row-stream source the limit can be pushed through to the
-        // input plan (one output row per input row).  For the other sources
-        // the only upstream node is the index search and we can't push the
-        // limit to that node.
+        // A limit pushes through to a row-stream input (one output row per
+        // input row); the other selectors have no node to push it to
         self.row_stream_input().is_some()
     }
 
@@ -3574,17 +3492,14 @@ mod tests {
         assert_eq!(num_rows, 300);
     }
 
-    /// A scalar index that was not rebuilt after a delete still returns the
-    /// deleted row's id.  Without with_deleted_rows the deletion-aware
-    /// planning drops it; with the flag the tombstone returns, marked by a
-    /// null _rowid.
+    /// A stale (not rebuilt after a delete) index hit drops on the live view
+    /// and returns as a null-_rowid tombstone with with_deleted_rows
     #[test_log::test(tokio::test)]
     async fn test_with_deleted_rows_stale_index() {
         let fixture = Arc::new(TestFixture::new().await);
         let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
 
-        // Row 220 is deletion-vector-deleted (fragment 2 keeps live rows) but was indexed before
-        // the delete
+        // Row 220 is deletion-vector-deleted but still in the index
         let filter_plan = fixture.filter_plan("fully_indexed == 220", true).await;
 
         // Live view: the stale index hit drops
@@ -4748,10 +4663,7 @@ mod tests {
         assert_eq!(default_result.num_rows(), capped_result.num_rows());
     }
 
-    // ------------------------------------------------------------------------
-    // Row-stream sources (an input of ordinary record batches instead of a
-    // serialized index result)
-    // ------------------------------------------------------------------------
+    // Row-stream selector tests
 
     mod row_stream {
         use super::*;
@@ -4769,9 +4681,7 @@ mod tests {
             _tmp_dir: TempStrDir,
         }
 
-        /// 30 rows across 3 fragments (10 rows each) with columns
-        /// i (Int32), s (Utf8), and struct{x, y} (Int32s), mirroring the
-        /// TakeExec test fixture
+        /// 30 rows across 3 fragments with columns i, s, and struct{x, y}
         async fn take_fixture(stable_row_ids: bool) -> TakeFixture {
             let struct_fields = Fields::from(vec![
                 Arc::new(ArrowField::new("x", DataType::Int32, false)),
@@ -4870,9 +4780,7 @@ mod tests {
                 .unwrap()
         }
 
-        /// Take with shuffled, duplicated keys and a payload column: the
-        /// output must preserve the input's row order, duplicates, and the
-        /// payload (small input batches coalesce into a single read round)
+        /// Output preserves the input's row order, duplicates, and payload
         #[rstest]
         #[case::by_row_addr(false, ROW_ADDR)]
         #[case::by_row_id(false, ROW_ID)]
@@ -4885,9 +4793,8 @@ mod tests {
         ) {
             let fixture = take_fixture(stable_row_ids).await;
 
-            // Rows span all 3 fragments; 21 appears twice; order is shuffled.
-            // Row ids are assigned sequentially on write, so with stable row
-            // ids the id of row `i` is just `i`; without them id == address.
+            // Stable row ids are assigned sequentially on write, so the id of
+            // row `i` is `i`; without them id == address
             let addr = |frag: u64, off: u64| (frag << 32) | off;
             let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
                 vec![21, 3, 15, 21, 0]
@@ -4915,14 +4822,11 @@ mod tests {
                 ],
             )
             .unwrap();
-            // Two input batches: they coalesce into one read round
             let batches = vec![batch.slice(0, 3), batch.slice(3, 2)];
 
             let plan = take_plan(&fixture.dataset, rows_input(batches), &["s", "i"]).unwrap();
             assert!(plan.row_stream_input().is_some());
-            // Output schema: input columns then new fields in dataset order.
-            // The identity flags are authoritative — the key column was not
-            // requested, so it is stripped from the output.
+            // Input columns, then new fields; the unrequested key is stripped
             assert_eq!(
                 plan.schema()
                     .fields()
@@ -4953,9 +4857,8 @@ mod tests {
             assert_eq!(payload_col.values(), &payload[..]);
         }
 
-        /// The row-stream input coalesces to the batch_size target: tiny
-        /// batches merge into one round and an oversized batch is sliced into
-        /// exact target-sized rounds, preserving order across boundaries
+        /// Tiny input batches merge into rounds and oversized ones slice,
+        /// preserving order across the boundaries
         #[tokio::test]
         async fn take_coalesces_input_to_batch_size() {
             let fixture = take_fixture(false).await;
@@ -5006,9 +4909,7 @@ mod tests {
             assert_rounds(run(&plan).await, plan.schema());
         }
 
-        /// Storage-ordered input (strictly increasing keys, no duplicates or
-        /// stale rows) exercises the aligned fast path and must produce the
-        /// same exact output as the permuted path
+        /// Storage-ordered input exercises the aligned fast path
         #[rstest]
         #[case::by_row_addr(ROW_ADDR)]
         #[case::by_row_id(ROW_ID)]
@@ -5096,9 +4997,8 @@ mod tests {
             assert_eq!(i_col.value(0), 12);
         }
 
-        /// The identity flags are authoritative: requested identity columns
-        /// the input lacks are synthesized by the read, carried ones are
-        /// kept, and unrequested carried ones are stripped
+        /// Identity flags: requested-but-missing columns are synthesized,
+        /// carried ones kept, unrequested carried ones stripped
         #[rstest]
         #[case::unstable(false)]
         #[case::stable(true)]
@@ -5107,7 +5007,6 @@ mod tests {
             let fixture = take_fixture(stable_row_ids).await;
             let addr = |frag: u64, off: u64| (frag << 32) | off;
 
-            // Row ids of rows i=21 and i=3 (sequentially assigned on write)
             let ids: Vec<u64> = if stable_row_ids {
                 vec![21, 3]
             } else {
@@ -5257,8 +5156,7 @@ mod tests {
             assert_eq!(addr_col.values(), &expected_addrs[..]);
         }
 
-        /// Take of new sub-fields into an existing struct column: the fields
-        /// merge into the struct in dataset-schema order
+        /// New sub-fields merge into an existing struct column
         #[tokio::test]
         async fn take_merges_nested_struct() {
             let fixture = take_fixture(false).await;
@@ -5336,10 +5234,7 @@ mod tests {
             let dataset = Arc::new(dataset);
 
             let addr = |frag: u64, off: u64| (frag << 32) | off;
-            // Row ids are assigned sequentially on write, so with stable row
-            // ids the id of row `i` is just `i`; without them id == address.
-            // Either way these identify the pre-delete rows 15 (now deleted)
-            // and 16.
+            // The pre-delete identifiers of rows 15 (now deleted) and 16
             let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
                 vec![15, 16]
             } else {
@@ -5363,9 +5258,7 @@ mod tests {
             assert_eq!(i_col.value(0), 16);
         }
 
-        /// with_deleted_rows is not supported for a row-stream read: the
-        /// reader reports deleted rows by nulling their row id, which cannot
-        /// be aligned back to input keys
+        /// with_deleted_rows is rejected for a row-stream read
         #[rstest]
         #[case::unstable(false)]
         #[case::stable(true)]

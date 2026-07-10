@@ -726,15 +726,13 @@ impl MergeInsertJob {
             index_mapper_input,
         ));
 
-        // 4 - Take the mapped row ids.  TakeExec stays for legacy storage
-        //     only: the v1 reader cannot serve a FilteredReadExec.
+        // 4 - Take the mapped row ids (TakeExec stays for legacy storage:
+        //     the v1 reader cannot serve a FilteredReadExec)
         let projection = self
             .dataset
             .empty_projection()
             .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
         let mut target: Arc<dyn ExecutionPlan> = if self.dataset.is_legacy_storage() {
-            // If requested, add row addresses to the output (the v2 take
-            // synthesizes the column itself)
             if add_row_addr {
                 let pos = index_mapper.schema().fields().len(); // Add to end
                 index_mapper = Arc::new(AddRowAddrExec::try_new(
@@ -745,9 +743,8 @@ impl MergeInsertJob {
             }
             Arc::new(TakeExec::try_new(self.dataset.clone(), index_mapper, projection)?.unwrap())
         } else {
-            // The take's identity flags are authoritative: keep the mapped
-            // row ids and, if requested, synthesize the row addresses during
-            // the read (no AddRowAddrExec needed)
+            // Keep the mapped row ids; the read synthesizes the row addresses
+            // if requested (no AddRowAddrExec needed)
             let mut projection = projection.with_row_id();
             if add_row_addr {
                 projection = projection.with_row_addr();

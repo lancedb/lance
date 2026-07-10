@@ -4828,10 +4828,7 @@ impl Scanner {
 
     /// Take row indices produced by input plan from the dataset (with projection)
     ///
-    /// On the v2 storage format this plans the take as a [`FilteredReadExec`]
-    /// whose input is the upstream plan: each batch's row ids become a row-id
-    /// mask that is read through the planned range-read path (considerably
-    /// faster than [`TakeExec`]'s point-lookup path).  Legacy (v1) storage
+    /// Planned as a [`FilteredReadExec`] row-stream read; legacy (v1) storage
     /// keeps using [`TakeExec`].
     #[allow(deprecated)]
     fn take(
@@ -4839,8 +4836,6 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
         output_projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // After the subtraction the identity flags mean "requested but not
-        // carried" (columns the take would have to synthesize)
         let mut fields_to_take = output_projection
             .clone()
             .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
@@ -4855,27 +4850,17 @@ impl Scanner {
         let input_schema = input.schema();
         let has_row_id = input_schema.column_with_name(ROW_ID).is_some();
         let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
-        // TakeExec stays for legacy storage only: the v1 reader cannot serve
-        // a FilteredReadExec.
+        // The v1 reader cannot serve a FilteredReadExec
         if !self.dataset.is_legacy_storage() && (has_row_id || has_row_addr) {
-            // The node's identity flags are authoritative (present in the
-            // output iff set).  The scanner preserves whatever identity
-            // columns the input carries — downstream nodes may still key off
-            // them, and the final ProjectionExec trims for free — and passes
-            // synthesis requests through.
+            // Preserve carried identity columns (downstream nodes may key off
+            // them; the final ProjectionExec trims for free)
             fields_to_take.with_row_id |= has_row_id;
             fields_to_take.with_row_addr |= has_row_addr;
             let mut read_options = FilteredReadOptions::new(fields_to_take);
-            // The node coalesces its input into read rounds itself; forward
-            // the batch size only when the user set one explicitly, matching
-            // the scan path.
             if let Some(batch_size) = self.batch_size {
                 read_options = read_options.with_batch_size(batch_size as u32);
             }
             if let Some(fragments) = &self.fragments {
-                // The input plan is scoped to the same fragments, so its keys
-                // can only reference them; an out-of-scope key would be
-                // dropped like a stale row.
                 read_options = read_options.with_fragments(Arc::new(fragments.clone()));
             }
             return Ok(Arc::new(FilteredReadExec::try_new(
