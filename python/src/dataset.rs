@@ -396,6 +396,30 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    /// Set the memory pool limit, in bytes, for the join that matches
+    /// source rows against the target table. Default is 150MB (or the
+    /// `LANCE_MEM_POOL_SIZE` environment variable, if set). DataFusion
+    /// spills to disk once this limit is reached.
+    pub fn mem_pool_size(
+        mut slf: PyRefMut<'_, Self>,
+        mem_pool_size: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.mem_pool_size(mem_pool_size);
+        Ok(slf)
+    }
+
+    /// Set the maximum size, in bytes, of the temporary directory used when
+    /// the join in [`Self::mem_pool_size`] spills to disk. Default is 100GB
+    /// (or the `LANCE_MAX_TEMP_DIRECTORY_SIZE` environment variable, if
+    /// set).
+    pub fn max_temp_directory_size(
+        mut slf: PyRefMut<'_, Self>,
+        max_temp_directory_size: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.max_temp_directory_size(max_temp_directory_size);
+        Ok(slf)
+    }
+
     pub fn target_bases(
         mut slf: PyRefMut<'_, Self>,
         bases: Vec<String>,

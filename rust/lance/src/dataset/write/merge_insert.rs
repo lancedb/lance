@@ -363,6 +363,15 @@ struct MergeInsertParams {
     // Target all registered bases, mirroring WriteParams::target_all_bases.
     // Some(include_primary); resolved at execution time.
     target_all_bases: Option<bool>,
+    // Memory pool limit (in bytes) for the DataFusion join used to match
+    // source rows against the target table. `None` uses
+    // `LanceExecutionOptions`'s default (the `LANCE_MEM_POOL_SIZE` env var,
+    // or 150MB otherwise). See `MergeInsertBuilder::mem_pool_size`.
+    mem_pool_size: Option<u64>,
+    // Max on-disk spill directory size (in bytes) for the same join.
+    // `None` uses `LanceExecutionOptions`'s default (100GB). See
+    // `MergeInsertBuilder::max_temp_directory_size`.
+    max_temp_directory_size: Option<u64>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -486,6 +495,8 @@ impl MergeInsertBuilder {
                 target_bases: None,
                 target_base_names_or_paths: None,
                 target_all_bases: None,
+                mem_pool_size: None,
+                max_temp_directory_size: None,
             },
         })
     }
@@ -566,6 +577,30 @@ impl MergeInsertBuilder {
     /// sort the source data before passing it to the merge insert operation.
     pub fn source_dedupe_behavior(&mut self, behavior: SourceDedupeBehavior) -> &mut Self {
         self.params.source_dedupe_behavior = behavior;
+        self
+    }
+
+    /// Set the memory pool limit, in bytes, for the join that matches source
+    /// rows against the target table.
+    ///
+    /// Matching source rows against a large target table can require
+    /// significant memory. By default this is bounded by
+    /// `LanceExecutionOptions`'s default (the `LANCE_MEM_POOL_SIZE`
+    /// environment variable, or 150MB otherwise) and DataFusion spills to
+    /// disk once the limit is reached. Raise this if you have memory to
+    /// spare and want to avoid spilling; lower it to bound peak memory
+    /// usage more tightly in a memory-constrained environment.
+    pub fn mem_pool_size(&mut self, bytes: u64) -> &mut Self {
+        self.params.mem_pool_size = Some(bytes);
+        self
+    }
+
+    /// Set the maximum size, in bytes, of the temporary directory used when
+    /// the join in [`Self::mem_pool_size`] spills to disk.
+    ///
+    /// Default is `LanceExecutionOptions`'s default (100GB).
+    pub fn max_temp_directory_size(&mut self, bytes: u64) -> &mut Self {
+        self.params.max_temp_directory_size = Some(bytes);
         self
     }
 
@@ -947,13 +982,22 @@ impl MergeInsertJob {
             )
             .unwrap(),
         );
-        execute_plan(
-            joined,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
-        )
+        execute_plan(joined, self.join_execution_options())
+    }
+
+    /// Execution options for the DataFusion join that matches source rows
+    /// against the target table. Always spills to disk once the memory
+    /// pool limit is reached, using the caller-configured
+    /// [`MergeInsertBuilder::mem_pool_size`] /
+    /// [`MergeInsertBuilder::max_temp_directory_size`] when set, or
+    /// `LanceExecutionOptions`'s defaults otherwise.
+    fn join_execution_options(&self) -> LanceExecutionOptions {
+        LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: self.params.mem_pool_size,
+            max_temp_directory_size: self.params.max_temp_directory_size,
+            ..Default::default()
+        }
     }
 
     fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
@@ -993,8 +1037,14 @@ impl MergeInsertJob {
         &self,
         source: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
-        let session_config = SessionConfig::default().with_target_partitions(1);
-        let session_ctx = SessionContext::new_with_config(session_config);
+        // Bound this join's memory the same way the indexed-scan join path
+        // is (see `join_execution_options`): without this, matching source
+        // rows against a large target table via DataFusion's `DataFrame`
+        // join API had no memory limit or spilling at all.
+        let session_ctx = get_session_context(&LanceExecutionOptions {
+            target_partition: Some(1),
+            ..self.join_execution_options()
+        });
         let schema = source.schema();
         let new_data = session_ctx.read_one_shot(source)?;
         let join_cols = self
@@ -8668,6 +8718,123 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
         assert_eq!(updated_count, 3);
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/1983's
+    /// original ask: `merge_insert` should let callers configure a memory
+    /// limit for its DataFusion join instead of using an unbounded default.
+    ///
+    /// Verifies `MergeInsertBuilder::mem_pool_size` /
+    /// `max_temp_directory_size` are threaded through into the
+    /// `LanceExecutionOptions` used to build the join's execution context,
+    /// for both the indexed-scan join path and the full-table-scan join
+    /// path (`create_full_table_joined_stream`, which previously used a
+    /// bare, unconfigured `SessionContext` with no memory limit or spilling
+    /// at all).
+    #[tokio::test]
+    async fn test_merge_insert_mem_pool_size_is_configurable() {
+        let dataset = Arc::new(
+            Dataset::write(
+                lance_datagen::gen_batch()
+                    .col("id", array::step::<Int32Type>())
+                    .col("value", array::step::<UInt32Type>())
+                    .into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        const MEM_POOL_SIZE: u64 = 8 * 1024 * 1024;
+        const MAX_TEMP_DIR_SIZE: u64 = 1024 * 1024 * 1024;
+
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .mem_pool_size(MEM_POOL_SIZE)
+            .max_temp_directory_size(MAX_TEMP_DIR_SIZE)
+            .try_build()
+            .unwrap();
+
+        assert_eq!(job.params.mem_pool_size, Some(MEM_POOL_SIZE));
+        assert_eq!(job.params.max_temp_directory_size, Some(MAX_TEMP_DIR_SIZE));
+
+        let options = job.join_execution_options();
+        assert!(options.use_spilling);
+        assert_eq!(options.mem_pool_size, Some(MEM_POOL_SIZE));
+        assert_eq!(options.max_temp_directory_size, Some(MAX_TEMP_DIR_SIZE));
+    }
+
+    /// End-to-end smoke test: a merge_insert configured with a small
+    /// `mem_pool_size` on the full-table-scan join path (forced via
+    /// `use_index(false)`, matching the join used whenever the target
+    /// table has no index on the merge key) still completes successfully
+    /// and produces correct results. This exercises the actual
+    /// `create_full_table_joined_stream` code path this PR changed, not
+    /// just the config plumbing checked above.
+    #[tokio::test]
+    async fn test_merge_insert_full_table_join_with_small_mem_pool_size() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::UInt32, false),
+        ]));
+        let initial_data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..500)),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(0, 500))),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(initial_data)], schema.clone()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // 250 matches (ids 0..250, updated) + 50 new rows (ids 500..550).
+        let source_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values((0..250).chain(500..550))),
+                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(999, 300))),
+            ],
+        )
+        .unwrap();
+        let source = Box::new(RecordBatchIterator::new(
+            vec![Ok(source_batch)],
+            schema.clone(),
+        ));
+
+        let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(false)
+            // Deliberately tiny relative to the default (150MB): forces the
+            // join to lean on spilling rather than holding everything in
+            // memory, without requiring enough data to trigger a real OOM
+            // if spilling weren't wired up correctly.
+            .mem_pool_size(256 * 1024)
+            .max_temp_directory_size(64 * 1024 * 1024)
+            .try_build()
+            .unwrap();
+
+        let (result_ds, stats) = job.execute_reader(source).await.unwrap();
+        assert_eq!(stats.num_updated_rows, 250);
+        assert_eq!(stats.num_inserted_rows, 50);
+        assert_eq!(result_ds.count_rows(None).await.unwrap(), 550);
+        let updated_count = result_ds
+            .count_rows(Some("value = 999".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(updated_count, 300);
     }
 
     #[tokio::test]

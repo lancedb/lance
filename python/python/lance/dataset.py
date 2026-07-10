@@ -536,6 +536,54 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).use_index(use_index)
 
+    def mem_pool_size(self, mem_pool_size: int) -> "MergeInsertBuilder":
+        """
+        Set the memory pool limit, in bytes, for the join that matches
+        source rows against the target table.
+
+        Matching source rows against a large target table can require
+        significant memory. By default this is bounded to 150MB (or the
+        ``LANCE_MEM_POOL_SIZE`` environment variable, if set) and DataFusion
+        spills to disk once the limit is reached. Raise this if you have
+        memory to spare and want to avoid spilling; lower it to bound peak
+        memory usage more tightly in a memory-constrained environment.
+
+        Parameters
+        ----------
+        mem_pool_size : int
+            The memory pool limit, in bytes.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).mem_pool_size(mem_pool_size)
+
+    def max_temp_directory_size(
+        self, max_temp_directory_size: int
+    ) -> "MergeInsertBuilder":
+        """
+        Set the maximum size, in bytes, of the temporary directory used when
+        the join in :meth:`mem_pool_size` spills to disk.
+
+        Default is 100GB (or the ``LANCE_MAX_TEMP_DIRECTORY_SIZE``
+        environment variable, if set).
+
+        Parameters
+        ----------
+        max_temp_directory_size : int
+            The maximum temp directory size, in bytes.
+
+        Returns
+        -------
+        MergeInsertBuilder
+            The builder instance for method chaining.
+        """
+        return super(MergeInsertBuilder, self).max_temp_directory_size(
+            max_temp_directory_size
+        )
+
     def target_bases(self, bases: List[str]) -> "MergeInsertBuilder":
         """
         Write new fragments produced by this merge insert to these bases.
