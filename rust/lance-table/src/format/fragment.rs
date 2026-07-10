@@ -716,6 +716,10 @@ impl From<&Fragment> for pb::DataFragment {
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
+            // Overlay files are not produced by this version of the library; a
+            // dataset that uses them sets reader feature flag 64, which is
+            // rejected at the feature-flag layer (see lance-table feature_flags).
+            overlays: vec![],
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
