@@ -42,7 +42,7 @@ use crate::blob::{
 use arrow_array::StructArray;
 use lance_core::datatypes::{BlobKind, BlobVersion, Field as LanceField, Schema, parse_field_path};
 use lance_core::utils::blob::blob_path;
-use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, Result, utils::address::RowAddress};
+use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
 use lance_io::utils::CachedFileSize;
 
@@ -1904,6 +1904,27 @@ async fn execute_blob_read_plan(
         .collect())
 }
 
+async fn execute_blob_entries(
+    entries: Vec<BlobEntry>,
+    io_parallelism: usize,
+    io_buffer_size_bytes: Option<u64>,
+) -> Result<Vec<IndexedReadBlob>> {
+    let plans = plan_blob_read_plans(entries);
+    if plans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let execution = Arc::new(ReadBlobsExecution::new(io_buffer_size_bytes));
+    let batches = stream::iter(plans.into_iter().map(move |plan| {
+        let execution = execution.clone();
+        execute_blob_read_plan(plan, execution)
+    }))
+    .buffer_unordered(io_parallelism.max(1))
+    .try_collect::<Vec<_>>()
+    .await?;
+    Ok(batches.into_iter().flatten().collect())
+}
+
 pub(super) async fn take_blobs(
     dataset: &Arc<Dataset>,
     row_ids: &[u64],
@@ -2302,14 +2323,13 @@ pub fn blob_v2_descriptor_schema(schema: &Schema) -> Schema {
 /// Materialize blob v2 descriptor arrays in a decoded batch into binary arrays.
 ///
 /// The input batch must include `_rowaddr`, which is used to resolve packed,
-/// dedicated, inline, and external blob payload locations. The returned batch
-/// matches `output_schema` with blob v2 binary leaves exposed as plain
-/// `LargeBinary` fields.
+/// dedicated, inline, and external blob payload locations. `output_schema`
+/// defines the exact returned columns, including requested system columns, with
+/// blob v2 binary leaves exposed as plain `LargeBinary` fields.
 pub async fn materialize_blob_v2_binary_batch(
     dataset: &Arc<Dataset>,
     output_schema: &Schema,
     batch: RecordBatch,
-    keep_row_addr: bool,
 ) -> Result<RecordBatch> {
     let row_addr_idx = batch
         .schema()
@@ -2335,8 +2355,8 @@ pub async fn materialize_blob_v2_binary_batch(
         .collect::<Vec<_>>();
     let row_addrs: Arc<[u64]> = row_addrs.into();
 
-    let mut columns = Vec::with_capacity(output_schema.fields.len() + usize::from(keep_row_addr));
-    let mut fields = Vec::with_capacity(output_schema.fields.len() + usize::from(keep_row_addr));
+    let mut columns = Vec::with_capacity(output_schema.fields.len());
+    let mut fields = Vec::with_capacity(output_schema.fields.len());
 
     for field in &output_schema.fields {
         let input = batch
@@ -2353,11 +2373,6 @@ pub async fn materialize_blob_v2_binary_batch(
         columns.push(materialized);
         let output_field = public_blob_v2_binary_output_field(field.clone());
         fields.push(ArrowField::from(&output_field));
-    }
-
-    if keep_row_addr {
-        columns.push(batch.column(row_addr_idx).clone());
-        fields.push((*ROW_ADDR_FIELD).clone());
     }
 
     Ok(RecordBatch::try_new(
@@ -2513,11 +2528,11 @@ async fn materialize_blob_v2_descriptors(
 
     let columns = BlobV2DescriptorColumns::new(descriptions);
     let mut read_context = BlobV2ReadContext::new(dataset, blob_field_id);
-    let mut builder = LargeBinaryBuilder::with_capacity(descriptions.len(), 0);
+    let mut entries = Vec::with_capacity(descriptions.len());
+    let mut payloads = vec![None; descriptions.len()];
 
     for (idx, row_addr) in row_addrs.iter().copied().enumerate() {
         if descriptions.is_null(idx) || columns.kinds.is_null(idx) {
-            builder.append_null();
             continue;
         }
 
@@ -2526,18 +2541,50 @@ async fn materialize_blob_v2_descriptors(
             && columns.positions.value(idx) == 0
             && columns.sizes.value(idx) == 0
         {
-            builder.append_value([]);
+            payloads[idx] = Some(Bytes::new());
             continue;
         }
 
         let entry = read_context
             .collect_entry(&columns, idx, idx, row_addr)
-            .await?;
-        if let Some(entry) = entry {
-            let data = entry.file.read().await?;
-            builder.append_value(data.as_ref());
-        } else {
+            .await?
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "blob v2 descriptor at index {idx} unexpectedly resolved to null"
+                ))
+            })?;
+        entries.push(entry);
+    }
+
+    let blobs = execute_blob_entries(entries, dataset.object_store.io_parallelism(), None).await?;
+    for blob in blobs {
+        let payload = payloads.get_mut(blob.selection_index).ok_or_else(|| {
+            Error::internal(format!(
+                "blob result selection index {} exceeded descriptor count {}",
+                blob.selection_index,
+                descriptions.len()
+            ))
+        })?;
+        if payload.replace(blob.data).is_some() {
+            return Err(Error::internal(format!(
+                "blob result selection index {} was produced more than once",
+                blob.selection_index
+            )));
+        }
+    }
+
+    let payload_capacity = payloads.iter().flatten().map(Bytes::len).sum::<usize>();
+    let mut builder = LargeBinaryBuilder::with_capacity(descriptions.len(), payload_capacity);
+    for (idx, payload) in payloads.into_iter().enumerate() {
+        if descriptions.is_null(idx) || columns.kinds.is_null(idx) {
             builder.append_null();
+        } else {
+            let payload = payload.ok_or_else(|| {
+                Error::internal(format!(
+                    "blob v2 descriptor at index {idx} did not produce a payload"
+                ))
+            })?;
+            builder.append_value(payload);
         }
     }
 
@@ -2840,7 +2887,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::Utc;
-    use futures::{StreamExt, TryStreamExt, future::try_join_all};
+    use futures::{StreamExt, TryStreamExt};
     use lance_arrow::{
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
         BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
@@ -2864,7 +2911,7 @@ mod tests {
     use url::Url;
 
     use lance_core::{
-        Error, Result,
+        Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, Result,
         utils::tempfile::{TempDir, TempStrDir},
     };
     use lance_datagen::{BatchCount, RowCount, array};
@@ -2876,7 +2923,7 @@ mod tests {
 
     use super::{
         BlobEntry, BlobFile, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        ReadBlobsExecution, collect_blob_entries_v1, data_file_key_from_path,
+        ReadBlobsExecution, collect_blob_entries_v1, data_file_key_from_path, execute_blob_entries,
         execute_blob_read_plan, plan_blob_read_plans,
     };
     use crate::{
@@ -2884,6 +2931,7 @@ mod tests {
         blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, PackedBlobWriter, blob_field},
         dataset::{
             CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
+            scanner::MaterializationStyle,
             transaction::{DataReplacementGroup, Operation, Transaction},
         },
         utils::test::TestDatasetGenerator,
@@ -4429,12 +4477,15 @@ mod tests {
             .unwrap(),
         );
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "blobs",
-            DataType::List(item_field),
-            true,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![list_array]).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blobs", DataType::List(item_field), true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![list_array, Arc::new(Int32Array::from(vec![0, 1, 2, 3]))],
+        )
+        .unwrap();
         let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
 
         let dataset = Arc::new(
@@ -4443,6 +4494,7 @@ mod tests {
                 &test_dir,
                 Some(WriteParams {
                     data_storage_version: Some(LanceFileVersion::V2_2),
+                    enable_stable_row_ids: true,
                     ..Default::default()
                 }),
             )
@@ -4508,6 +4560,40 @@ mod tests {
         assert!(values.is_null(1));
         assert_eq!(values.value(2), packed_payload.as_slice());
         assert_eq!(values.value(3), b"tail");
+
+        for (filter, materialization_style) in [
+            (None, MaterializationStyle::Heuristic),
+            (Some("id >= 2"), MaterializationStyle::Heuristic),
+            (Some("id >= 2"), MaterializationStyle::AllEarly),
+        ] {
+            let mut scanner = dataset.scan();
+            scanner.blob_handling(BlobHandling::AllBinary);
+            scanner.materialization_style(materialization_style);
+            scanner
+                .project(&["blobs", ROW_LAST_UPDATED_AT_VERSION, ROW_CREATED_AT_VERSION])
+                .unwrap()
+                .with_row_id()
+                .with_row_address();
+            if let Some(filter) = filter {
+                scanner.filter(filter).unwrap();
+            }
+
+            let expected_schema = scanner.schema().await.unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            assert_eq!(batch.schema().as_ref(), expected_schema.as_ref());
+            assert_eq!(batch.num_rows(), if filter.is_some() { 2 } else { 4 });
+            for column in [
+                ROW_ID,
+                ROW_ADDR,
+                ROW_LAST_UPDATED_AT_VERSION,
+                ROW_CREATED_AT_VERSION,
+            ] {
+                assert!(
+                    batch.column_by_name(column).is_some(),
+                    "requested system column {column} was missing"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4720,7 +4806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_blobs_plan_preserves_order_and_coalesces() {
+    async fn test_execute_blob_entries_preserves_order_and_coalesces() {
         let (store, inner) = recording_range_store(Bytes::from_static(b"abcdefghij"));
         let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
         let entries = vec![
@@ -4735,15 +4821,7 @@ mod tests {
                 file: BlobFile::with_source(source, 1, 3, BlobKind::Packed, None),
             },
         ];
-        let execution = Arc::new(ReadBlobsExecution::new(None));
-        let blobs = try_join_all(
-            plan_blob_read_plans(entries)
-                .into_iter()
-                .map(|plan| execute_blob_read_plan(plan, execution.clone())),
-        )
-        .await
-        .unwrap();
-        let mut blobs = blobs.into_iter().flatten().collect::<Vec<_>>();
+        let mut blobs = execute_blob_entries(entries, 2, None).await.unwrap();
         blobs.sort_by_key(|blob| blob.selection_index);
 
         assert_eq!(blobs.len(), 2);

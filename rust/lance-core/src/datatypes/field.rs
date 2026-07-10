@@ -58,6 +58,8 @@ pub const LANCE_UNENFORCED_CLUSTERING_KEY_POSITION: &str =
 /// The value should be non-negative i32 value. Any negative value will be seen as -1.
 pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
 
+const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
+
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
     field
         .metadata()
@@ -600,13 +602,15 @@ impl Field {
         }
         let is_blob_v2 = self.is_blob_v2();
 
-        self.logical_type = LogicalType::try_from(&DataType::LargeBinary).unwrap();
+        self.logical_type = LogicalType::try_from(&DataType::LargeBinary)
+            .expect("LargeBinary is always a valid logical type");
         self.children.clear();
         self.encoding = Some(Encoding::VarBinary);
         if is_blob_v2 {
             self.metadata.remove(BLOB_META_KEY);
-            self.metadata.remove("packed");
-            self.metadata.remove("lance-encoding:packed");
+            for key in PACKED_KEYS {
+                self.metadata.remove(key);
+            }
             self.metadata
                 .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
         }
@@ -1082,7 +1086,6 @@ impl Field {
 
     // Check if field has metadata `packed` set to true, this check is case insensitive.
     pub fn is_packed_struct(&self) -> bool {
-        const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
         PACKED_KEYS.iter().any(|key| {
             self.metadata
                 .get(*key)

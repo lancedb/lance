@@ -1107,19 +1107,19 @@ impl FilteredReadStream {
             }
         }
 
-        let output_read_schema = Arc::new(fragment_read_task.projection.to_bare_schema());
+        let output_read_schema = Arc::new(fragment_read_task.projection.to_schema());
+        let bare_read_schema = fragment_read_task.projection.to_bare_schema();
         let materialize_blob_v2_binary =
-            crate::dataset::blob::schema_has_blob_v2_binary_view(output_read_schema.as_ref());
+            crate::dataset::blob::schema_has_blob_v2_binary_view(&bare_read_schema);
         let read_schema = if materialize_blob_v2_binary {
-            crate::dataset::blob::blob_v2_descriptor_schema(output_read_schema.as_ref())
+            crate::dataset::blob::blob_v2_descriptor_schema(&bare_read_schema)
         } else {
-            output_read_schema.as_ref().clone()
+            bare_read_schema
         };
         let mut frag_read_config = fragment_read_task.frag_read_config();
         if materialize_blob_v2_binary {
             frag_read_config = frag_read_config.with_row_address(true);
         }
-        let keep_materialized_row_addr = fragment_read_task.projection.with_row_addr;
         let mut fragment_reader = fragment_read_task
             .fragment
             .open(&read_schema, frag_read_config)
@@ -1181,18 +1181,13 @@ impl FilteredReadStream {
                     let dataset = dataset.clone();
                     let output_read_schema = output_read_schema.clone();
                     batch_fut
-                        .and_then(move |batch| {
-                            let dataset = dataset.clone();
-                            let output_read_schema = output_read_schema.clone();
-                            async move {
-                                crate::dataset::blob::materialize_blob_v2_binary_batch(
-                                    &dataset,
-                                    output_read_schema.as_ref(),
-                                    batch,
-                                    keep_materialized_row_addr,
-                                )
-                                .await
-                            }
+                        .and_then(move |batch| async move {
+                            crate::dataset::blob::materialize_blob_v2_binary_batch(
+                                &dataset,
+                                output_read_schema.as_ref(),
+                                batch,
+                            )
+                            .await
                         })
                         .boxed()
                 } else {

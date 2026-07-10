@@ -26,7 +26,10 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{
+    Error, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
+};
 use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
@@ -202,7 +205,26 @@ impl LanceStream {
             projection.clone()
         };
         let project_schema = read_projection;
-        let output_projection = projection.clone();
+        let output_projection = if materialize_blob_v2_binary {
+            let mut output_projection = projection.as_ref().clone();
+            let mut system_fields = Vec::with_capacity(4);
+            if config.with_row_id {
+                system_fields.push(ROW_ID_FIELD.clone());
+            }
+            if config.with_row_address {
+                system_fields.push(ROW_ADDR_FIELD.clone());
+            }
+            if config.with_row_last_updated_at_version {
+                system_fields.push(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone());
+            }
+            if config.with_row_created_at_version {
+                system_fields.push(ROW_CREATED_AT_VERSION_FIELD.clone());
+            }
+            output_projection.extend(&system_fields)?;
+            Arc::new(output_projection)
+        } else {
+            projection.clone()
+        };
         let io_parallelism = dataset.object_store.io_parallelism();
         // First, use the value specified by the user in the call
         // Second, use the default from the environment variable, if specified
@@ -286,7 +308,6 @@ impl LanceStream {
         let scan_scheduler_clone = scan_scheduler.clone();
 
         let materialize_dataset = dataset;
-        let keep_materialized_row_addr = config.with_row_address;
         let config_for_stream = config.clone();
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
@@ -372,7 +393,6 @@ impl LanceStream {
                             &dataset,
                             output_projection.as_ref(),
                             batch,
-                            keep_materialized_row_addr,
                         )
                         .await
                         .map_err(DataFusionError::from)
