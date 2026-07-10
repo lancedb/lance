@@ -1244,7 +1244,7 @@ const PREWARM_MIN_CHUNK_TOKENS: usize = 1;
 /// scanning posting lengths or requiring index rebuilds.
 static LANCE_FTS_POSTING_GROUP_MAX_TOKENS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
-        .unwrap_or_else(|_| "256".to_string())
+        .unwrap_or_else(|_| "128".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_POSTING_GROUP_MAX_TOKENS")
 });
