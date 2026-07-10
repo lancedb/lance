@@ -119,17 +119,28 @@ impl TryFrom<OverlayCoverageBytes> for OverlayCoverage {
 }
 
 impl DeepSizeOf for OverlayCoverage {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        // RoaringBitmap does not expose its allocation size; its serialized size
-        // is a cheap, close proxy for the heap it holds.
-        let bitmap_heap = |bitmap: &RoaringBitmap| {
-            std::mem::size_of::<RoaringBitmap>() + bitmap.serialized_size()
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // The same `Arc<RoaringBitmap>` is shared across every clone of a
+        // fragment, so mark each Arc's pointer and count its heap only the first
+        // time it is seen — otherwise walking many fragments double-counts the
+        // shared bitmaps. RoaringBitmap does not expose its allocation size; its
+        // serialized size is a cheap, close proxy for the heap it holds.
+        let bitmap_heap = |bitmap: &Arc<RoaringBitmap>,
+                           context: &mut lance_core::deepsize::Context| {
+            if context.mark_seen(Arc::as_ptr(bitmap) as usize) {
+                std::mem::size_of::<RoaringBitmap>() + bitmap.serialized_size()
+            } else {
+                0
+            }
         };
         match self {
-            Self::Shared(bitmap) => bitmap_heap(bitmap),
+            Self::Shared(bitmap) => bitmap_heap(bitmap, context),
             Self::PerField(bitmaps) => {
                 bitmaps.capacity() * std::mem::size_of::<Arc<RoaringBitmap>>()
-                    + bitmaps.iter().map(|b| bitmap_heap(b)).sum::<usize>()
+                    + bitmaps
+                        .iter()
+                        .map(|b| bitmap_heap(b, context))
+                        .sum::<usize>()
             }
         }
     }
@@ -191,6 +202,25 @@ impl DataOverlayFile {
 /// documentation](self) for the ordering invariant.
 pub fn sort_overlays_newest_last(overlays: &mut [DataOverlayFile]) {
     overlays.sort_by_key(|overlay| overlay.committed_version);
+}
+
+/// Verify a fragment's overlays are stored newest-last (non-decreasing
+/// `committed_version`), the ordering invariant readers rely on for
+/// resolution. Returns an error identifying the first out-of-order pair.
+///
+/// [`sort_overlays_newest_last`] normalizes on load; this is the write-side
+/// guard that rejects any commit path that assembled overlays out of order. See
+/// the [module documentation](self) for the ordering invariant.
+pub fn verify_overlays_newest_last(overlays: &[DataOverlayFile]) -> Result<()> {
+    for pair in overlays.windows(2) {
+        if pair[0].committed_version > pair[1].committed_version {
+            return Err(Error::invalid_input(format!(
+                "overlay files must be stored newest-last, but committed_version {} precedes {}",
+                pair[0].committed_version, pair[1].committed_version
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Tombstone `fields` across a fragment's `overlays`, dropping any overlay left
@@ -365,6 +395,21 @@ mod tests {
         );
         // The untouched overlay keeps its field.
         assert_eq!(overlays[1].data_file.fields.as_ref(), &[7]);
+    }
+
+    #[test]
+    fn test_verify_overlays_newest_last() {
+        let mk = |version: u64| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![3], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: version,
+        };
+        // Non-decreasing (including equal versions) is accepted.
+        assert!(verify_overlays_newest_last(&[]).is_ok());
+        assert!(verify_overlays_newest_last(&[mk(1), mk(2), mk(2), mk(5)]).is_ok());
+        // A newer version before an older one is rejected.
+        let err = verify_overlays_newest_last(&[mk(2), mk(1)]).unwrap_err();
+        assert!(err.to_string().contains("newest-last"), "{err}");
     }
 
     #[test]

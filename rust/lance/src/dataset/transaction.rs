@@ -2363,9 +2363,13 @@ impl Transaction {
                         .extend(group.overlays.iter());
                 }
 
-                // Every group must target an existing fragment.
+                // Every group must target an existing fragment. Build a set of
+                // existing ids once so this is O(groups + fragments) rather than
+                // O(groups * fragments).
+                let existing_fragment_ids: HashSet<u64> =
+                    existing_fragments.iter().map(|f| f.id).collect();
                 for fragment_id in overlays_by_fragment.keys() {
-                    if !existing_fragments.iter().any(|f| f.id == *fragment_id) {
+                    if !existing_fragment_ids.contains(fragment_id) {
                         return Err(Error::invalid_input(format!(
                             "DataOverlay targets fragment {fragment_id}, which does not exist"
                         )));
@@ -2407,6 +2411,15 @@ impl Transaction {
 
         // Clean up data files that only contain tombstoned fields
         Self::remove_tombstoned_data_files(&mut final_fragments);
+
+        // Enforce the newest-last overlay ordering invariant at the write
+        // boundary. Load normalizes with a sort; this rejects any commit path
+        // that assembled a fragment's overlays out of order.
+        for fragment in &final_fragments {
+            if !fragment.overlays.is_empty() {
+                lance_table::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
+            }
+        }
 
         let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
             (Some(storage_format), _) => Some(storage_format.lance_file_version()?),

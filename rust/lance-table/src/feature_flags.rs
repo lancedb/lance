@@ -109,14 +109,25 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
+/// Clear `flag` from `flags` when its gating feature is not enabled in this
+/// build; leave it set otherwise. One call per unstable flag, so support for
+/// several unstable features chains cleanly.
+fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
+    if !feature_enabled {
+        *flags &= !flag;
+    }
+}
+
 /// The feature-flag bits this build understands, given whether overlay support
 /// is enabled. Split out from [`supported_flags`] so the policy is testable
 /// without toggling the build profile or environment.
 fn supported_flags_when(overlay_enabled: bool) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
-    if !overlay_enabled {
-        supported &= !FLAG_UNSTABLE_DATA_OVERLAY_FILES;
-    }
+    mark_supported(
+        &mut supported,
+        FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+        overlay_enabled,
+    );
     supported
 }
 
