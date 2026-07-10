@@ -1258,7 +1258,9 @@ fn runtime_posting_group_tokens() -> usize {
 /// persisted grouping metadata or index rebuilds.
 #[derive(Debug, Clone, DeepSizeOf)]
 enum PostingGrouping {
+    /// Leaves legacy or empty partitions ungrouped.
     None,
+    /// Uses a fixed runtime cache group size measured in token rows, not posting bytes.
     SyntheticFixed { group_size: u32 },
 }
 
