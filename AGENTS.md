@@ -134,6 +134,11 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Indent content under MkDocs admonition directives (`!!! note`, etc.) with 4 spaces.
 - Proofread comments and docs for typos before committing.
 
+## Filing Issues
+
+- When opening an issue with `gh issue create` or the API, classify it and pass the matching label: `--label bug`, `--label feature`, or `--label performance`. These paths bypass the `.github/ISSUE_TEMPLATE` forms, so the label is not applied automatically.
+- Prefix the title to match, e.g. `bug: ...`, `feature: ...`, or `perf: ...`. A content-based labeler (`.github/workflows/issue-labeler.yml`) uses this as a fallback signal, but an explicit `--label` is the reliable path.
+
 ## Pull Requests
 
 - PR titles must follow the Conventional Commits specification because `.github/workflows/pr-title.yml` validates the PR title and body with commitlint. Use prefixes like `feat:`, `fix:`, `docs:`, `perf:`, `ci:`, `test:`, `build:`, `style:`, or `chore:`; add a scope when useful.
