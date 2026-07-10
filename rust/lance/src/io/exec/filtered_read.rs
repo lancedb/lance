@@ -450,8 +450,6 @@ impl FilteredReadStream {
             .await
     }
 
-    /// Load the metadata of the scoped fragments, or every dataset fragment
-    /// when unscoped
     async fn load_all_fragments(
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
@@ -1327,8 +1325,7 @@ pub struct FilteredReadOptions {
     pub scan_range_after_filter: Option<Range<u64>>,
     /// Include deleted rows in the scan; they are returned with a null row id
     pub with_deleted_rows: bool,
-    /// The maximum number of rows per batch (for a row-stream source: the
-    /// rows coalesced into each read round)
+    /// The maximum number of rows per batch
     pub batch_size: Option<u32>,
     /// File reader options to use when reading data files.
     pub file_reader_options: Option<FileReaderOptions>,
@@ -1457,7 +1454,6 @@ impl FilteredReadOptions {
     /// batches across fragments).
     ///
     /// A CoalesceBatchesExec can (and often should) be used to merge together tiny batches
-    /// from a scan.  A row-stream source coalesces its own input to this value.
     pub fn with_batch_size(mut self, batch_size: u32) -> Self {
         self.batch_size = Some(batch_size);
         self
@@ -1543,9 +1539,8 @@ impl FilteredReadOptions {
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
 ///
-/// A single, general I/O node (see `RowSelector` for the possible row
-/// selections).  For set-shaped selections it picks the best read strategy
-/// based on the expected query cost which is determined by:
+/// This node may execute a scan or it may execute a take.  By default, it picks the best
+/// approach based the expected query cost which is determined by:
 ///  - Size of data in desired columns
 ///  - Number of rows matching the index search
 ///  - Filesystem parameters (e.g. block size)
@@ -1571,11 +1566,6 @@ pub struct FilteredReadExec {
 }
 
 /// Describes which rows a [`FilteredReadExec`] should read
-///
-/// This can be all rows, a specific set of rows, or the read can be a
-/// "take" which reads new columns into an existing stream of rows using
-/// the `_rowid` or `_rowaddr`.  The kind is derived from the input plan's
-/// schema, never configured.
 #[derive(Debug)]
 enum RowSelector {
     /// Every live row of the dataset (no input plan)
@@ -1583,9 +1573,8 @@ enum RowSelector {
     /// A set of rows: one serialized [`IndexExprResult`] batch.  Output is in
     /// storage order and deduplicated.
     RowSet(Arc<dyn ExecutionPlan>),
-    /// A stream of rows: record batches with a `_rowid`/`_rowaddr` column.
-    /// Row order, duplicates, and the stream's own columns are preserved in
-    /// the output ([`TakeExec`](super::TakeExec)'s contract).
+    /// A stream of rows: record batches with a `_rowid`/`_rowaddr` column
+    /// and other payload columns (just carried)
     RowStream(Arc<RowStreamSource>),
 }
 
@@ -1612,12 +1601,10 @@ struct RowStreamSource {
     plan: Arc<dyn ExecutionPlan>,
     /// The stream column identifying rows: [`ROW_ID`] or [`ROW_ADDR`]
     key_column: &'static str,
-    /// Options for the internal fragment read; its projection is the fields
-    /// to read plus the key column (read for alignment, stripped before the
-    /// merge)
+    /// Options for the internal fragment read; carries the projection that
+    /// reflects the actual columns to read (plus the alignment key column)
     read_options: FilteredReadOptions,
-    /// What the read contributes to the output: the fetched fields plus any
-    /// synthesized identity columns
+    /// The schema for newly read columns
     new_fields_schema: SchemaRef,
 }
 
@@ -1668,9 +1655,6 @@ impl FilteredReadInternalPlan {
 
 impl FilteredReadExec {
     /// Create a new filtered read
-    ///
-    /// `input` identifies which rows to read.  It is parsed into a
-    /// `RowSelector` based on its schema.
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -1712,8 +1696,7 @@ impl FilteredReadExec {
         ))
     }
 
-    /// Construct a read over a row-stream source: fetch `options.projection`
-    /// for the rows produced by `input` and merge the columns into its batches
+    /// Construct a read over a row-stream source
     fn try_new_row_stream(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -1737,15 +1720,14 @@ impl FilteredReadExec {
                 "scan ranges are not supported when taking rows from an input plan".into(),
             ));
         }
-        // The reader reports deleted rows by nulling their row id, which
-        // cannot be aligned back to input keys
+        // Row-stream reads do not support deleted rows yet; deleted rows are
+        // excluded from the output by default
         if options.with_deleted_rows || options.only_indexed_fragments {
             return Err(Error::invalid_input_source(
                 "with_deleted_rows / only_indexed_fragments are not supported when taking rows from an input plan".into(),
             ));
         }
         let input_schema = input.schema();
-        // Prefer row ids: they survive compaction, addresses are version-pinned
         let key_column = if input_schema.column_with_name(ROW_ID).is_some() {
             ROW_ID
         } else if input_schema.column_with_name(ROW_ADDR).is_some() {
@@ -1760,8 +1742,6 @@ impl FilteredReadExec {
             ));
         };
 
-        // Post-subtraction the identity flags mean "requested but not
-        // carried" — the columns the read must synthesize
         let fields_to_read = options
             .projection
             .clone()
@@ -2089,14 +2069,10 @@ impl FilteredReadExec {
         &self.options
     }
 
-    /// The plan producing the serialized index-query result, if this node is
-    /// an index-query scan
     pub fn index_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         self.input.row_set_plan()
     }
 
-    /// The plan whose rows this node reads for (carrying its columns
-    /// through), if the row selector is a stream (see [`Self::try_new`])
     pub fn row_stream_input(&self) -> Option<&Arc<dyn ExecutionPlan>> {
         match &self.input {
             RowSelector::RowStream(source) => Some(&source.plan),
@@ -2142,16 +2118,11 @@ impl FilteredReadExec {
     }
 }
 
-/// How many read rounds run ahead of the consumer.  A prefetch factor, not a
-/// parallelism setting: it keeps the I/O scheduler saturated on long input
-/// streams, at a worst-case memory cost of this many buffered rounds (the
-/// long-term fix for that is a memory-pool reservation per round).
-const ROW_STREAM_PREFETCH_ROUNDS: usize = 64;
+/// How many batches run ahead of the consumer (a prefetch depth, not a
+/// parallelism setting)
+const ROW_STREAM_PREFETCH_BATCHES: usize = 64;
 
-/// Executes a [`FilteredReadExec`] over a row-stream source: each round is
-/// planned and read through the same pipeline as an index-query scan, then
-/// the fetched columns are aligned back to the round's row order and merged
-/// in (preserving order, duplicates, and carried columns).
+/// Executes a [`FilteredReadExec`] over a row-stream source
 struct RowStreamRead {
     dataset: Arc<Dataset>,
     source: Arc<RowStreamSource>,
@@ -2196,10 +2167,8 @@ impl RowStreamRead {
             .await
     }
 
-    /// Build a round's read ranges directly from physical row addresses (an
-    /// address already encodes fragment and offset, so no row-id sequence
-    /// translation is needed)
-    fn plan_round_from_addresses(
+    /// Build a batch's read ranges directly from physical row addresses
+    fn plan_batch_from_addresses(
         addrs: &RowAddrTreeMap,
         fragments: &[LoadedFragment],
     ) -> FilteredReadInternalPlan {
@@ -2249,13 +2218,13 @@ impl RowStreamRead {
         })
     }
 
-    async fn plan_round(
+    async fn plan_batch(
         &self,
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
     ) -> DataFusionResult<FilteredReadInternalPlan> {
         let compute_timer = self.baseline_metrics.elapsed_compute().timer();
         // Null keys are excluded; attach_columns drops their rows
-        let round_keys = if keys.null_count() == 0 {
+        let batch_keys = if keys.null_count() == 0 {
             RowAddrTreeMap::from_iter(keys.values().iter().copied())
         } else {
             RowAddrTreeMap::from_iter(keys.iter().flatten())
@@ -2266,10 +2235,10 @@ impl RowStreamRead {
         if self.source.key_column == ROW_ADDR {
             // The mask path would misread addresses as row ids on a
             // stable-row-id dataset; addresses resolve directly instead
-            Ok(Self::plan_round_from_addresses(&round_keys, fragments))
+            Ok(Self::plan_batch_from_addresses(&batch_keys, fragments))
         } else {
             let evaluated_index = Arc::new(EvaluatedIndex {
-                index_result: IndexExprResult::exact(RowAddrMask::from_allowed(round_keys)),
+                index_result: IndexExprResult::exact(RowAddrMask::from_allowed(batch_keys)),
                 applicable_fragments: self.dataset.fragment_bitmap.as_ref().clone(),
             });
             Ok(FilteredReadStream::plan_scan(
@@ -2280,18 +2249,18 @@ impl RowStreamRead {
         }
     }
 
-    /// Read the round's planned ranges through the same executor as a scan,
+    /// Read the batch's planned ranges through the same executor as a scan,
     /// returning the rows in storage order, deduplicated, with the key
     /// column included
-    async fn read_round(
+    async fn read_batch(
         &self,
         internal_plan: FilteredReadInternalPlan,
-        round_index: u32,
+        batch_index: u32,
     ) -> DataFusionResult<RecordBatch> {
         let fragments = self.load_fragments().await?;
-        // I/O priority: earlier rounds strictly first (output emits in round
-        // order), fragments keep dataset order within a round
-        let priority_offset = round_index.saturating_mul(fragments.len() as u32);
+        // I/O priority: earlier batches strictly first (output emits in batch
+        // order), fragments keep dataset order within a batch
+        let priority_offset = batch_index.saturating_mul(fragments.len() as u32);
         let read = FilteredReadStream::new_shared(
             self.dataset.clone(),
             self.source.read_options.clone(),
@@ -2312,25 +2281,25 @@ impl RowStreamRead {
         )?)
     }
 
-    /// Align the read rows back to the round's row order and merge the
+    /// Align the read rows back to the batch's row order and merge the
     /// fetched columns on
     fn attach_columns(
         &self,
-        round: RecordBatch,
+        batch: RecordBatch,
         read_data: RecordBatch,
     ) -> DataFusionResult<RecordBatch> {
         let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
-        let keys = self.key_array(&round, "input")?;
+        let keys = self.key_array(&batch, "input")?;
         let read_keys = self.key_array(&read_data, "read")?;
 
         // Fast path: one read row per input row with an identical key
         // sequence — already aligned, skip the hash map and the permutation
         if keys.null_count() == 0
-            && read_data.num_rows() == round.num_rows()
+            && read_data.num_rows() == batch.num_rows()
             && read_keys.values() == keys.values()
         {
             let new_data = read_data.project_by_schema(self.source.new_fields_schema.as_ref())?;
-            let carried = round.project_by_schema(self.carried_schema.as_ref())?;
+            let carried = batch.project_by_schema(self.carried_schema.as_ref())?;
             return Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?);
         }
 
@@ -2341,8 +2310,8 @@ impl RowStreamRead {
             .map(|(index, key)| (*key, index as u32))
             .collect();
 
-        let mut indices = Vec::with_capacity(round.num_rows());
-        let mut valid = Vec::with_capacity(round.num_rows());
+        let mut indices = Vec::with_capacity(batch.num_rows());
+        let mut valid = Vec::with_capacity(batch.num_rows());
         for i in 0..keys.len() {
             let index = if keys.is_valid(i) {
                 key_to_index.get(&keys.value(i)).copied()
@@ -2359,39 +2328,39 @@ impl RowStreamRead {
         }
 
         // Drop input rows whose key no longer exists (stale/deleted)
-        let round = if indices.len() < round.num_rows() {
-            arrow::compute::filter_record_batch(&round, &BooleanArray::from(valid))?
+        let batch = if indices.len() < batch.num_rows() {
+            arrow::compute::filter_record_batch(&batch, &BooleanArray::from(valid))?
         } else {
-            round
+            batch
         };
-        if round.num_rows() == 0 {
+        if batch.num_rows() == 0 {
             return Ok(RecordBatch::new_empty(self.output_schema.clone()));
         }
 
         let new_data =
             arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
         let new_data = new_data.project_by_schema(self.source.new_fields_schema.as_ref())?;
-        let carried = round.project_by_schema(self.carried_schema.as_ref())?;
+        let carried = batch.project_by_schema(self.carried_schema.as_ref())?;
         Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
-    async fn execute_round(
+    async fn execute_batch(
         self: Arc<Self>,
-        round: RecordBatch,
-        round_index: u32,
+        batch: RecordBatch,
+        batch_index: u32,
     ) -> DataFusionResult<RecordBatch> {
-        if round.num_rows() == 0 {
+        if batch.num_rows() == 0 {
             return Ok(RecordBatch::new_empty(self.output_schema.clone()));
         }
-        let internal_plan = self.plan_round(self.key_array(&round, "input")?).await?;
-        let read_data = self.read_round(internal_plan, round_index).await?;
-        self.attach_columns(round, read_data)
+        let internal_plan = self.plan_batch(self.key_array(&batch, "input")?).await?;
+        let read_data = self.read_batch(internal_plan, batch_index).await?;
+        self.attach_columns(batch, read_data)
     }
 
-    /// Cut the input into rounds of exactly `target` rows (final round holds
-    /// the remainder): merging small batches amortizes per-round planning,
-    /// slicing oversized ones bounds a round's memory.  Order is preserved.
-    fn coalesce_rounds(
+    /// Cut the input into batches of exactly `target` rows (final batch holds
+    /// the remainder): merging small batches amortizes per-batch planning,
+    /// slicing oversized ones bounds a batch's memory.  Order is preserved.
+    fn coalesce_batches(
         input: SendableRecordBatchStream,
         target: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
@@ -2409,8 +2378,8 @@ impl RowStreamRead {
             },
             |mut state| async move {
                 loop {
-                    if let Some(round) = state.coalescer.next_completed_batch() {
-                        return Ok(Some((round, state)));
+                    if let Some(batch) = state.coalescer.next_completed_batch() {
+                        return Ok(Some((batch, state)));
                     }
                     if state.exhausted {
                         return Ok(None);
@@ -2431,9 +2400,9 @@ impl RowStreamRead {
         self: Arc<Self>,
         input: SendableRecordBatchStream,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        // Rows per round; the flat fallback (instead of the scan's block-size
-        // heuristic) fits a round's cost, which is planning overhead
-        let round_target_rows = self
+        // Rows per batch; the flat fallback (instead of the scan's block-size
+        // heuristic) fits a batch's cost, which is planning overhead
+        let batch_target_rows = self
             .source
             .read_options
             .batch_size
@@ -2441,16 +2410,16 @@ impl RowStreamRead {
             .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
         let on_result = self.clone();
         let on_done = self.clone();
-        Self::coalesce_rounds(input, round_target_rows)
+        Self::coalesce_batches(input, batch_target_rows)
             .enumerate()
-            .map(move |(round_index, round)| {
-                let round = round?;
+            .map(move |(batch_index, batch)| {
+                let batch = batch?;
                 let this = self.clone();
                 DataFusionResult::Ok(
                     // SpawnedTask aborts on drop: cancelling the query
-                    // cancels in-flight rounds
+                    // cancels in-flight batches
                     SpawnedTask::spawn(
-                        this.execute_round(round, round_index as u32)
+                        this.execute_batch(batch, batch_index as u32)
                             .in_current_span(),
                     )
                     .map(|res| match res {
@@ -2460,7 +2429,7 @@ impl RowStreamRead {
                 )
             })
             .boxed()
-            .try_buffered(ROW_STREAM_PREFETCH_ROUNDS)
+            .try_buffered(ROW_STREAM_PREFETCH_BATCHES)
             .map(move |result| {
                 on_result
                     .global_metrics
@@ -3087,7 +3056,7 @@ mod tests {
         ))
     }
 
-    /// Round-trip every interval shape through the arrow wire format and
+    /// Batch-trip every interval shape through the arrow wire format and
     /// confirm the endpoints survive. Exercises both
     /// `IndexExprResult::serialize` and `EvaluatedIndex::try_from_arrow`
     /// so the schema names stay in sync.
@@ -3121,15 +3090,15 @@ mod tests {
             // robust, but the canonical builders preserve representation.
             assert_eq!(
                 decoded.index_result.lower, original.lower,
-                "{name}: lower endpoint changed across round-trip",
+                "{name}: lower endpoint changed across batch-trip",
             );
             assert_eq!(
                 decoded.index_result.upper, original.upper,
-                "{name}: upper endpoint changed across round-trip",
+                "{name}: upper endpoint changed across batch-trip",
             );
             assert_eq!(
                 decoded.applicable_fragments, frags,
-                "{name}: applicable fragments changed across round-trip",
+                "{name}: applicable fragments changed across batch-trip",
             );
         }
     }
@@ -4533,7 +4502,7 @@ mod tests {
 
     /// Test that direct execution gives the same result as get_plan + execute_with_plan
     #[test_log::test(tokio::test)]
-    async fn test_plan_round_trip() {
+    async fn test_plan_batch_trip() {
         let fixture = TestFixture::new().await;
         let ctx = Arc::new(TaskContext::default());
 
@@ -4841,7 +4810,7 @@ mod tests {
             assert_eq!(payload_col.values(), &payload[..]);
         }
 
-        /// Tiny input batches merge into rounds and oversized ones slice,
+        /// Tiny input batches merge into batches and oversized ones slice,
         /// preserving order across the boundaries
         #[tokio::test]
         async fn take_coalesces_input_to_batch_size() {
@@ -4869,7 +4838,7 @@ mod tests {
             )
             .unwrap();
 
-            let assert_rounds = |result: Vec<RecordBatch>, schema: SchemaRef| {
+            let assert_batches = |result: Vec<RecordBatch>, schema: SchemaRef| {
                 assert_eq!(
                     result.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
                     vec![3, 3, 1]
@@ -4882,15 +4851,15 @@ mod tests {
                 );
             };
 
-            // Seven one-row batches merge into rounds of exactly 3, 3, 1
+            // Seven one-row batches merge into batches of exactly 3, 3, 1
             let tiny = (0..7).map(|i| batch.slice(i, 1)).collect::<Vec<_>>();
             let plan = take_plan_sized(&fixture.dataset, rows_input(tiny), &["i"], 3).unwrap();
-            assert_rounds(run(&plan).await, plan.schema());
+            assert_batches(run(&plan).await, plan.schema());
 
-            // One oversized batch is sliced into the same rounds
+            // One oversized batch is sliced into the same batches
             let plan =
                 take_plan_sized(&fixture.dataset, rows_input(vec![batch]), &["i"], 3).unwrap();
-            assert_rounds(run(&plan).await, plan.schema());
+            assert_batches(run(&plan).await, plan.schema());
         }
 
         /// Storage-ordered input exercises the aligned fast path
