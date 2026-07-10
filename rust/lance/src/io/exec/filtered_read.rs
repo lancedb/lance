@@ -2233,8 +2233,6 @@ impl RowStreamRead {
 
         let fragments = self.load_fragments().await?;
         if self.source.key_column == ROW_ADDR {
-            // The mask path would misread addresses as row ids on a
-            // stable-row-id dataset; addresses resolve directly instead
             Ok(Self::plan_batch_from_addresses(&batch_keys, fragments))
         } else {
             let evaluated_index = Arc::new(EvaluatedIndex {
@@ -2310,26 +2308,14 @@ impl RowStreamRead {
             .map(|(index, key)| (*key, index as u32))
             .collect();
 
-        let mut indices = Vec::with_capacity(batch.num_rows());
-        let mut valid = Vec::with_capacity(batch.num_rows());
-        for i in 0..keys.len() {
-            let index = if keys.is_valid(i) {
-                key_to_index.get(&keys.value(i)).copied()
-            } else {
-                None
-            };
-            match index {
-                Some(index) => {
-                    indices.push(index);
-                    valid.push(true);
-                }
-                None => valid.push(false),
-            }
-        }
-
-        // Drop input rows whose key no longer exists (stale/deleted)
-        let batch = if indices.len() < batch.num_rows() {
-            arrow::compute::filter_record_batch(&batch, &BooleanArray::from(valid))?
+        // Sizes differ only when some input keys have no live row (null or
+        // stale keys): drop those input rows first
+        let batch = if read_data.num_rows() != batch.num_rows() {
+            let matched: BooleanArray = keys
+                .iter()
+                .map(|key| key.map(|key| key_to_index.contains_key(&key)))
+                .collect();
+            arrow::compute::filter_record_batch(&batch, &matched)?
         } else {
             batch
         };
@@ -2337,8 +2323,11 @@ impl RowStreamRead {
             return Ok(RecordBatch::new_empty(self.output_schema.clone()));
         }
 
-        let new_data =
-            arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
+        // Gather the read rows into input order — every remaining key hits
+        let keys = self.key_array(&batch, "input")?;
+        let indices =
+            UInt32Array::from_iter_values(keys.values().iter().map(|key| key_to_index[key]));
+        let new_data = arrow_select::take::take_record_batch(&read_data, &indices)?;
         let new_data = new_data.project_by_schema(self.source.new_fields_schema.as_ref())?;
         let carried = batch.project_by_schema(self.carried_schema.as_ref())?;
         Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?)
@@ -2400,8 +2389,6 @@ impl RowStreamRead {
         self: Arc<Self>,
         input: SendableRecordBatchStream,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        // Rows per batch; the flat fallback (instead of the scan's block-size
-        // heuristic) fits a batch's cost, which is planning overhead
         let batch_target_rows = self
             .source
             .read_options
