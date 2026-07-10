@@ -4978,18 +4978,25 @@ mod tests {
 
         /// A fragment-scoped take reads from the scoped fragments only; keys
         /// pointing outside the scope drop like stale rows
+        #[rstest]
+        #[case::by_row_addr(false, ROW_ADDR)]
+        #[case::by_row_id(false, ROW_ID)]
+        #[case::stable_by_row_addr(true, ROW_ADDR)]
+        #[case::stable_by_row_id(true, ROW_ID)]
         #[tokio::test]
-        async fn take_scoped_to_fragments() {
-            let fixture = take_fixture(false).await;
+        async fn take_scoped_to_fragments(#[case] stable_row_ids: bool, #[case] key: &str) {
+            let fixture = take_fixture(stable_row_ids).await;
             let subset = Arc::new(vec![fixture.dataset.fragments()[1].clone()]);
 
             let addr = |frag: u64, off: u64| (frag << 32) | off;
-            let keys: Vec<u64> = vec![
-                addr(1, 2), // i = 12, inside the scoped fragment
-                addr(0, 3), // i = 3, outside the scope
-            ];
+            // i = 12 inside the scoped fragment, i = 3 outside the scope
+            let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
+                vec![12, 3]
+            } else {
+                vec![addr(1, 2), addr(0, 3)]
+            };
             let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                ROW_ADDR,
+                key,
                 DataType::UInt64,
                 true,
             )]));
@@ -5015,6 +5022,31 @@ mod tests {
                 .unwrap()
                 .as_primitive::<arrow::datatypes::Int32Type>();
             assert_eq!(i_col.value(0), 12);
+        }
+
+        /// A batch whose keys span the whole id range but hit only two rows:
+        /// the span prefilter must not misread coverage as membership
+        #[tokio::test]
+        async fn take_stable_ids_wide_key_span() {
+            let fixture = take_fixture(true).await;
+            // Last row of the last fragment, first row of the first: every
+            // fragment's span overlaps, only two rows match
+            let keys: Vec<u64> = vec![29, 0];
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
+                .unwrap();
+
+            let plan = take_plan(&fixture.dataset, rows_input(vec![batch]), &["i"]).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let i_col = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            assert_eq!(i_col.values(), &[29, 0]);
         }
 
         /// Identity flags: requested-but-missing columns are synthesized,
