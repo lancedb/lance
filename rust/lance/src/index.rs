@@ -1373,6 +1373,77 @@ impl DatasetIndexExt for Dataset {
         }
     }
 
+    async fn plan_index_segment_merge(
+        &self,
+        index_name: &str,
+        segments_per_task: usize,
+        max_segments_to_merge: Option<usize>,
+    ) -> Result<Vec<Vec<IndexMetadata>>> {
+        if segments_per_task < 2 {
+            return Err(Error::invalid_input(format!(
+                "plan_index_segment_merge requires segments_per_task >= 2, got {}",
+                segments_per_task
+            )));
+        }
+
+        let segments = self.load_indices_by_name(index_name).await?;
+        if segments.is_empty() {
+            return Err(Error::index_not_found(format!("name={}", index_name)));
+        }
+        let mut segments: Vec<IndexMetadata> = segments
+            .into_iter()
+            .filter(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| !bitmap.is_empty())
+            })
+            .collect();
+        if let Some(max_segments) = max_segments_to_merge {
+            segments = segments.split_off(segments.len().saturating_sub(max_segments));
+        }
+        if segments.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        let first = &segments[0];
+        let first_type_url = first
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.as_str());
+        for segment in &segments[1..] {
+            if segment.fields != first.fields {
+                return Err(Error::invalid_input(format!(
+                    "plan_index_segment_merge: segment {} covers fields {:?} but segment {} covers fields {:?}",
+                    first.uuid, first.fields, segment.uuid, segment.fields
+                )));
+            }
+            let type_url = segment
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.as_str());
+            if type_url != first_type_url {
+                return Err(Error::invalid_input(format!(
+                    "plan_index_segment_merge: segment {} has index details {:?} but segment {} has {:?}",
+                    first.uuid, first_type_url, segment.uuid, type_url
+                )));
+            }
+        }
+
+        let mut tasks: Vec<Vec<IndexMetadata>> = segments
+            .chunks(segments_per_task)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        if tasks.len() > 1 && tasks.last().is_some_and(|task| task.len() == 1) {
+            let leftover = tasks.pop().expect("tasks checked non-empty");
+            tasks
+                .last_mut()
+                .expect("tasks still non-empty after popping the leftover")
+                .extend(leftover);
+        }
+        Ok(tasks)
+    }
+
     async fn merge_existing_index_segments(
         &self,
         source_segments: Vec<IndexMetadata>,
@@ -6912,6 +6983,137 @@ mod tests {
                 .iter()
                 .all(|idx| idx.files.as_ref().is_some_and(|files| !files.is_empty())),
             "committed segment metadata should capture on-disk file info"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_groups_segments() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(50), BatchCount::from(5));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let mut segments = Vec::new();
+        for fragment_id in 0..5_u32 {
+            segments.push(
+                write_vector_segment_metadata(
+                    &dataset,
+                    "vector_idx",
+                    field_id,
+                    Uuid::new_v4(),
+                    [fragment_id],
+                    format!("seg{}", fragment_id).as_bytes(),
+                )
+                .await,
+            );
+        }
+        // Two commits so the last two segments are unambiguously the newest.
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                segments[..3]
+                    .iter()
+                    .map(segment_from_metadata)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                segments[3..]
+                    .iter()
+                    .map(segment_from_metadata)
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        let tasks = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            tasks.iter().map(|task| task.len()).collect::<Vec<_>>(),
+            vec![2, 3],
+            "a leftover group of one segment should fold into the previous task"
+        );
+        let planned_uuids = tasks
+            .iter()
+            .flatten()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            planned_uuids,
+            segments
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            "a full plan should cover every segment exactly once"
+        );
+
+        let newest_two = dataset
+            .plan_index_segment_merge("vector_idx", 2, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(newest_two.len(), 1);
+        assert_eq!(
+            newest_two[0]
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            segments[3..]
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            "max_segments_to_merge should take the newest segments"
+        );
+
+        assert!(
+            dataset
+                .plan_index_segment_merge("vector_idx", 2, Some(1))
+                .await
+                .unwrap()
+                .is_empty(),
+            "fewer than two qualifying segments should produce an empty plan"
+        );
+
+        assert!(
+            dataset
+                .plan_index_segment_merge("vector_idx", 1, None)
+                .await
+                .is_err(),
+            "segments_per_task below 2 should be rejected"
+        );
+        assert!(
+            dataset
+                .plan_index_segment_merge("missing_idx", 2, None)
+                .await
+                .is_err(),
+            "unknown index name should be rejected"
         );
     }
 

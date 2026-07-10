@@ -504,6 +504,12 @@ class _Dataset:
         batch_readhead: Optional[int] = None,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
     ): ...
+    def plan_index_segment_merge(
+        self,
+        index_name: str,
+        segments_per_task: int,
+        max_segments_to_merge: Optional[int] = None,
+    ) -> List[List[Index]]: ...
     def merge_existing_index_segments(self, segments: List[Index]) -> Index: ...
     def commit_existing_index_segments(
         self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]

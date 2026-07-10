@@ -3,6 +3,7 @@
 
 import logging
 import os
+import pickle
 import platform
 import random
 import shutil
@@ -3168,6 +3169,65 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
 
     merged = ds.merge_existing_index_segments([first, second])
     ds = ds.commit_existing_index_segments("vector_idx", "vector", [merged])
+
+    q = np.random.rand(dim).astype(np.float32)
+    results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert 0 < len(results) <= 5
+
+
+def test_plan_index_segment_merge_ivf_rq(tmp_path):
+    """The coordinator plans disjoint merge tasks, workers merge each task, and
+    the coordinator commits every merged segment at once. Tasks are pickled to
+    mimic the Spark driver to executor boundary, and the second round consumes
+    the packed outputs of the first, which requires composable IVF_RQ merges."""
+    from lance.lance import indices
+
+    dim = 32
+    ds = _make_sample_dataset_base(
+        tmp_path, "plan_segment_merge", n_rows=1024, dim=dim, max_rows_per_file=256
+    )
+    frags = ds.get_fragments()
+    assert len(frags) == 4
+
+    ivf_model = IndicesBuilder(ds, "vector").train_ivf(
+        num_partitions=2,
+        distance_type="l2",
+        sample_rate=8,
+    )
+    rabitq_model = indices.build_rq_model(dimension=dim, num_bits=1)
+    base_kwargs = {
+        "column": "vector",
+        "index_type": "IVF_RQ",
+        "num_partitions": 2,
+        "num_bits": 1,
+        "ivf_centroids": ivf_model.centroids,
+        "rabitq_model": rabitq_model,
+    }
+    segments = [
+        ds.create_index_uncommitted(**base_kwargs, fragment_ids=[frag.fragment_id])
+        for frag in frags
+    ]
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", segments)
+
+    with pytest.raises(ValueError, match="segments_per_task"):
+        ds.plan_index_segment_merge("vector_idx", 1)
+
+    tasks = ds.plan_index_segment_merge("vector_idx", 2)
+    assert [len(task) for task in tasks] == [2, 2]
+
+    newest = ds.plan_index_segment_merge("vector_idx", 2, max_segments_to_merge=2)
+    assert [len(task) for task in newest] == [2]
+
+    tasks = pickle.loads(pickle.dumps(tasks))
+
+    merged = [ds.merge_existing_index_segments(task) for task in tasks]
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", merged)
+
+    second_round = ds.plan_index_segment_merge("vector_idx", 2)
+    assert [len(task) for task in second_round] == [2]
+    final = ds.merge_existing_index_segments(second_round[0])
+    ds = ds.commit_existing_index_segments("vector_idx", "vector", [final])
+    assert ds.plan_index_segment_merge("vector_idx", 2) == []
 
     q = np.random.rand(dim).astype(np.float32)
     results = ds.to_table(nearest={"column": "vector", "q": q, "k": 5})

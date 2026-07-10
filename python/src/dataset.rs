@@ -2560,6 +2560,29 @@ impl Dataset {
         Ok(PyLance(index_metadata))
     }
 
+    #[pyo3(signature = (index_name, segments_per_task, max_segments_to_merge = None))]
+    fn plan_index_segment_merge(
+        &self,
+        index_name: &str,
+        segments_per_task: usize,
+        max_segments_to_merge: Option<usize>,
+    ) -> PyResult<Vec<Vec<PyLance<IndexMetadata>>>> {
+        let tasks = rt()
+            .block_on(
+                None,
+                self.ds.plan_index_segment_merge(
+                    index_name,
+                    segments_per_task,
+                    max_segments_to_merge,
+                ),
+            )?
+            .infer_error()?;
+        Ok(tasks
+            .into_iter()
+            .map(|task| task.into_iter().map(PyLance).collect())
+            .collect())
+    }
+
     fn merge_existing_index_segments(
         &self,
         segments: Vec<PyLance<IndexMetadata>>,

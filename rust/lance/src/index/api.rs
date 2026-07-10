@@ -252,6 +252,55 @@ pub trait DatasetIndexExt {
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
 
+    /// Plan a distributed merge of an index's segments.
+    ///
+    /// Partitions the segments of the index named `index_name` into groups of
+    /// `segments_per_task` (at least 2). Each group is one independent unit of
+    /// work: a worker merges it with [Self::merge_existing_index_segments] and
+    /// the resulting segments are committed together on the coordinator with
+    /// [Self::commit_existing_index_segments]. Groups cover disjoint fragment
+    /// sets, so workers never contend and the commit replaces exactly the
+    /// planned segments.
+    ///
+    /// `max_segments_to_merge` bounds how many segments are planned, taking
+    /// the newest ones first, mirroring
+    /// [OptimizeOptions::merge](lance_index::optimize::OptimizeOptions::merge).
+    /// `None` plans every segment, which consolidates the full index and
+    /// rewrites the oldest (typically largest) segment as well. Segments with
+    /// an empty fragment bitmap (deferred builds) are skipped. A trailing
+    /// leftover group of one segment is folded into the previous task so every
+    /// task merges at least two segments. Returns an empty plan when fewer
+    /// than two segments qualify.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::index::DatasetIndexExt;
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// // Coordinator: fold the newest 1000 delta segments, 32 per worker.
+    /// let tasks = dataset
+    ///     .plan_index_segment_merge("vec_idx", 32, Some(1000))
+    ///     .await?;
+    /// // Workers: one merge per task (fanned out by the scheduler).
+    /// let mut merged = Vec::with_capacity(tasks.len());
+    /// for task in tasks {
+    ///     merged.push(dataset.merge_existing_index_segments(task).await?);
+    /// }
+    /// // Coordinator: one atomic commit for all merged segments.
+    /// dataset
+    ///     .commit_existing_index_segments("vec_idx", "vector", merged)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn plan_index_segment_merge(
+        &self,
+        index_name: &str,
+        segments_per_task: usize,
+        max_segments_to_merge: Option<usize>,
+    ) -> Result<Vec<Vec<IndexMetadata>>>;
+
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(
         &self,

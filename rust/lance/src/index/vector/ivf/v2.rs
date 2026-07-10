@@ -3543,12 +3543,75 @@ mod tests {
         meta.packed
     }
 
+    /// Read the `transposed` flag from a PQ segment's auxiliary storage file.
+    /// Distributed shards store row-major codes (`transposed = false`); any
+    /// merged segment stores column-major codes (`transposed = true`).
+    async fn read_pq_segment_transposed(dataset: &Dataset, uuid: &Uuid) -> bool {
+        let aux_path = dataset
+            .indices_dir()
+            .join(uuid.to_string().as_str())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(dataset.object_store.as_ref()),
+        );
+        let reader = FileReader::try_open(
+            scheduler
+                .open_file(&aux_path, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let storage_meta = reader
+            .schema()
+            .metadata
+            .get(STORAGE_METADATA_KEY)
+            .expect("PQ auxiliary file must carry storage metadata");
+        let entries: Vec<String> = serde_json::from_str(storage_meta).unwrap();
+        let meta: ProductQuantizationMetadata = serde_json::from_str(&entries[0]).unwrap();
+        meta.transposed
+    }
+
+    /// Build index params for a distributed segment build of `index_type`,
+    /// with globally shared models (IVF centroids, PQ codebook, pinned RQ
+    /// rotation) so independently built segments are merge compatible.
+    async fn shared_model_params(dataset: &Dataset, index_type: IndexType) -> VectorIndexParams {
+        match index_type {
+            IndexType::IvfFlat => {
+                let ivf_params = prepare_global_ivf(dataset, "vector").await;
+                VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params)
+            }
+            IndexType::IvfPq => {
+                let (ivf_params, pq_params) = prepare_global_ivf_pq(dataset, "vector").await;
+                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfSq => {
+                let ivf_params = prepare_global_ivf(dataset, "vector").await;
+                VectorIndexParams::with_ivf_sq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    SQBuildParams::default(),
+                )
+            }
+            IndexType::IvfRq => {
+                let ivf_params = prepare_global_ivf(dataset, "vector").await;
+                ivf_rq_params(ivf_params, 1)
+            }
+            other => panic!("unsupported test index type: {}", other),
+        }
+    }
+
     /// Assert mean recall@K of the committed index against brute-force ground
     /// truth, averaged over a deterministic query set drawn from the data.
-    async fn ivf_rq_recall(dataset: &Dataset, column: &str) -> f32 {
-        // Mirrors the single-node RQ recall measurement (`test_recall`): k=100,
-        // all partitions probed. RQ on random data is coarse, so recall is
-        // measured at k=100 rather than a tiny k.
+    async fn merged_index_recall(dataset: &Dataset, column: &str) -> f32 {
+        // Mirrors the single-node recall measurement (`test_recall`): k=100,
+        // all partitions probed. Quantized codes on random data are coarse, so
+        // recall is measured at k=100 rather than a tiny k.
         const K: usize = 100;
         const NUM_QUERIES: usize = 10;
         let query_batch = dataset
@@ -3587,11 +3650,11 @@ mod tests {
         total / vectors.len() as f32
     }
 
-    async fn assert_ivf_rq_recall(dataset: &Dataset, column: &str, min_recall: f32) {
-        let recall = ivf_rq_recall(dataset, column).await;
+    async fn assert_merged_index_recall(dataset: &Dataset, column: &str, min_recall: f32) {
+        let recall = merged_index_recall(dataset, column).await;
         assert!(
             recall >= min_recall,
-            "merged IVF_RQ index recall {recall} < {min_recall}; codes are likely corrupt",
+            "merged index recall {recall} < {min_recall}; codes are likely corrupt",
         );
     }
 
@@ -3679,7 +3742,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ivf_rq_recall(&dataset, "vector", 0.4).await;
+        assert_merged_index_recall(&dataset, "vector", 0.4).await;
     }
 
     /// A merge whose inputs mix an already-packed segment with a row-major shard
@@ -3726,7 +3789,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ivf_rq_recall(&dataset, "vector", 0.4).await;
+        assert_merged_index_recall(&dataset, "vector", 0.4).await;
     }
 
     /// Composing merges to 3+ levels feeds a packed-of-packed segment into the
@@ -3799,7 +3862,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ivf_rq_recall(&dataset, "vector", 0.4).await;
+        assert_merged_index_recall(&dataset, "vector", 0.4).await;
     }
 
     /// NULL vectors are filtered at index build, so they never reach the merge.
@@ -3862,7 +3925,186 @@ mod tests {
             .await
             .unwrap();
 
-        assert_ivf_rq_recall(&dataset, "vector", 0.4).await;
+        assert_merged_index_recall(&dataset, "vector", 0.4).await;
+    }
+
+    /// Merging segments must support already-merged inputs for every IVF
+    /// storage layout so the merge can be composed into a tree. PQ merged
+    /// segments store column-major codes and must be transposed back on
+    /// re-read (the analog of the packed RQ case); SQ and FLAT layouts need no
+    /// transform and are covered for regression. IVF_RQ has its own compose
+    /// tests above.
+    ///
+    /// PQ recall on this uniform random data is inherently low (~0.24, the
+    /// same as a single-node build). The 0.2 threshold separates a correct
+    /// merge from the double-transpose corruption signature (~0.07).
+    #[rstest]
+    #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
+    #[case::ivf_pq(IndexType::IvfPq, 0.2)]
+    #[case::ivf_sq(IndexType::IvfSq, 0.7)]
+    #[tokio::test]
+    async fn test_merge_existing_ivf_segments_compose(
+        #[case] index_type: IndexType,
+        #[case] min_recall: f32,
+    ) {
+        const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let mut dataset = write_dataset_from_batches(test_dir.as_str(), schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() >= 4,
+            "expected >=4 fragments for a tree merge, got {}",
+            fragments.len()
+        );
+
+        let params = shared_model_params(&dataset, index_type).await;
+
+        // One row-major shard per fragment (the distributed-build layout).
+        let fragment_groups = fragments
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let shards =
+            build_segments_for_fragment_groups(&mut dataset, fragment_groups, &params, INDEX_NAME)
+                .await;
+        assert_eq!(shards.len(), 4);
+        if index_type == IndexType::IvfPq {
+            for shard in &shards {
+                assert!(
+                    !read_pq_segment_transposed(&dataset, &shard.uuid).await,
+                    "distributed shards must store row-major (transposed=false) codes",
+                );
+            }
+        }
+
+        // Level 1: merge disjoint shard pairs.
+        let merged_a = dataset
+            .merge_existing_index_segments(vec![shards[0].clone(), shards[1].clone()])
+            .await
+            .unwrap();
+        let merged_b = dataset
+            .merge_existing_index_segments(vec![shards[2].clone(), shards[3].clone()])
+            .await
+            .unwrap();
+        if index_type == IndexType::IvfPq {
+            assert!(
+                read_pq_segment_transposed(&dataset, &merged_a.uuid).await
+                    && read_pq_segment_transposed(&dataset, &merged_b.uuid).await,
+                "merged PQ segments are expected to be transposed (the level-2 input)",
+            );
+        }
+
+        // Level 2: merge the two merged segments. For PQ this is the case that
+        // double-transposed (and corrupted) the codes before the fix.
+        let final_segment = dataset
+            .merge_existing_index_segments(vec![merged_a, merged_b])
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![final_segment])
+            .await
+            .unwrap();
+
+        assert_merged_index_recall(&dataset, "vector", min_recall).await;
+    }
+
+    /// Distributed optimize round trip: the coordinator plans disjoint merge
+    /// tasks, workers merge each task independently, and the coordinator
+    /// commits every merged segment at once. The second round consumes the
+    /// merged outputs of the first, which requires composable merges for
+    /// every IVF storage layout.
+    ///
+    /// The PQ threshold is 0.2 for the same reason as in
+    /// `test_merge_existing_ivf_segments_compose`.
+    #[rstest]
+    #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
+    #[case::ivf_pq(IndexType::IvfPq, 0.2)]
+    #[case::ivf_sq(IndexType::IvfSq, 0.7)]
+    #[case::ivf_rq(IndexType::IvfRq, 0.4)]
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_two_rounds(
+        #[case] index_type: IndexType,
+        #[case] min_recall: f32,
+    ) {
+        const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let (schema, batches) = make_two_fragment_batches();
+        let mut dataset = write_dataset_from_batches(test_dir.as_str(), schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(
+            fragments.len() >= 4,
+            "expected >=4 fragments for two merge rounds, got {}",
+            fragments.len()
+        );
+
+        let params = shared_model_params(&dataset, index_type).await;
+
+        let fragment_groups = fragments
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let shards =
+            build_segments_for_fragment_groups(&mut dataset, fragment_groups, &params, INDEX_NAME)
+                .await;
+        assert_eq!(shards.len(), 4);
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", shards)
+            .await
+            .unwrap();
+
+        // Round 1: plan on the coordinator, merge each task as a worker would.
+        let tasks = dataset
+            .plan_index_segment_merge(INDEX_NAME, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 2);
+        let mut merged = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            assert_eq!(task.len(), 2);
+            merged.push(dataset.merge_existing_index_segments(task).await.unwrap());
+        }
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", merged)
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name(INDEX_NAME)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Round 2: the plan now covers the packed outputs of round 1.
+        let tasks = dataset
+            .plan_index_segment_merge(INDEX_NAME, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        let final_segment = dataset
+            .merge_existing_index_segments(tasks.into_iter().next().unwrap())
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![final_segment])
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name(INDEX_NAME)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_merged_index_recall(&dataset, "vector", min_recall).await;
     }
 
     #[rstest]

@@ -4391,6 +4391,59 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.merge_index_metadata(index_uuid, t, batch_readhead, progress_callback)
         return None
 
+    def plan_index_segment_merge(
+        self,
+        index_name: str,
+        segments_per_task: int,
+        max_segments_to_merge: Optional[int] = None,
+    ) -> List[List[Index]]:
+        """
+        Plan a distributed merge of an index's segments.
+
+        Partitions the segments of ``index_name`` into groups of
+        ``segments_per_task`` (at least 2). Each group is one independent unit
+        of work. The returned :class:`Index` objects are picklable, so a
+        coordinator (for example a Spark driver) can ship each group to a
+        worker, the worker merges it with
+        :meth:`merge_existing_index_segments`, and the coordinator publishes
+        every merged segment at once with
+        :meth:`commit_existing_index_segments`. Groups cover disjoint fragment
+        sets, so workers never contend.
+
+        Parameters
+        ----------
+        index_name: str
+            Name of the index whose segments should be merged.
+        segments_per_task: int
+            Number of segments each worker merges. Must be at least 2. A
+            trailing leftover group of one segment is folded into the previous
+            group.
+        max_segments_to_merge: int, optional
+            Plan at most this many segments, taking the newest ones first,
+            mirroring ``num_indices_to_merge`` in optimize. The default plans
+            every segment, which consolidates the full index and rewrites the
+            oldest (typically largest) segment as well.
+
+        Returns
+        -------
+        List[List[Index]]
+            One inner list per merge task. Empty when fewer than two segments
+            qualify.
+
+        Examples
+        --------
+        >>> tasks = dataset.plan_index_segment_merge("vec_idx", 32)  # doctest: +SKIP
+        >>> merged = [
+        ...     dataset.merge_existing_index_segments(task) for task in tasks
+        ... ]  # doctest: +SKIP
+        >>> dataset.commit_existing_index_segments(
+        ...     "vec_idx", "vector", merged
+        ... )  # doctest: +SKIP
+        """
+        return self._ds.plan_index_segment_merge(
+            index_name, segments_per_task, max_segments_to_merge
+        )
+
     def merge_existing_index_segments(self, segments: List[Index]) -> Index:
         """
         Merge one caller-defined group of existing uncommitted segments.
