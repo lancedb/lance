@@ -1508,7 +1508,7 @@ impl FilteredReadOptions {
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
 ///
-/// A single, general I/O node (see [`RowSelector`] for the possible row
+/// A single, general I/O node (see `RowSelector` for the possible row
 /// selections).  For set-shaped selections it picks the best read strategy
 /// based on the expected query cost which is determined by:
 ///  - Size of data in desired columns
@@ -1635,7 +1635,7 @@ impl FilteredReadExec {
     /// Create a new filtered read
     ///
     /// `input` identifies which rows to read.  It is parsed into a
-    /// [`RowSelector`] based on its schema.
+    /// `RowSelector` based on its schema.
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
