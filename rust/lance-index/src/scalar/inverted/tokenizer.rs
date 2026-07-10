@@ -33,7 +33,13 @@ use lance_tokenizer::{
     WhitespaceTokenizer,
 };
 
+/// Posting block size for indexes whose metadata predates configurable block sizes.
+///
+/// This must remain 128 so that legacy on-disk data is decoded correctly.
 pub const LEGACY_BLOCK_SIZE: usize = 128;
+/// Default posting block size for newly created indexes when none is configured.
+///
+/// This intentionally matches [`LEGACY_BLOCK_SIZE`] today but may evolve independently.
 pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 
@@ -263,12 +269,12 @@ where
             .map(Some)
             .map_err(serde::de::Error::custom),
         serde_json::Value::Number(value) => {
-            let Some(value) = value.as_u64() else {
-                return Err(serde::de::Error::custom(
-                    "FTS format_version must be 1, 2, or 3",
-                ));
+            let Some(format_version) = value.as_u64() else {
+                return Err(serde::de::Error::custom(format!(
+                    "FTS format_version must be 1, 2, or 3, got {value}"
+                )));
             };
-            resolve_fts_format_version(Some(&value.to_string()))
+            resolve_fts_format_version(Some(&format_version.to_string()))
                 .map(Some)
                 .map_err(serde::de::Error::custom)
         }
@@ -734,6 +740,13 @@ mod tests {
     }
 
     #[test]
+    fn test_training_json_invalid_numeric_format_version_includes_value() {
+        let err = InvertedIndexParams::from_training_json(r#"{"format_version": -1}"#).unwrap_err();
+        assert!(matches!(&err, lance_core::Error::Arrow { .. }));
+        assert!(err.to_string().contains("got -1"));
+    }
+
+    #[test]
     fn test_block_size_default_serializes() {
         let params = InvertedIndexParams::default();
         assert_eq!(params.block_size, 128);
@@ -774,18 +787,18 @@ mod tests {
         assert_eq!(params.block_size, 128);
     }
 
-    #[test]
-    fn test_block_size_accepts_supported_values() {
-        for block_size in [128, 256] {
-            let params = InvertedIndexParams::default()
-                .block_size(block_size)
-                .unwrap();
-            assert_eq!(params.block_size, block_size);
+    #[rstest]
+    #[case::block_size_128(128)]
+    #[case::block_size_256(256)]
+    fn test_block_size_accepts_supported_values(#[case] block_size: usize) {
+        let params = InvertedIndexParams::default()
+            .block_size(block_size)
+            .unwrap();
+        assert_eq!(params.block_size, block_size);
 
-            let roundtrip: InvertedIndexParams =
-                serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
-            assert_eq!(roundtrip.block_size, block_size);
-        }
+        let roundtrip: InvertedIndexParams =
+            serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
+        assert_eq!(roundtrip.block_size, block_size);
     }
 
     #[test]
