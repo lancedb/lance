@@ -3175,7 +3175,7 @@ def test_distributed_ivf_rq_shared_rotation(tmp_path):
     assert 0 < len(results) <= 5
 
 
-def test_plan_index_segment_merge_ivf_rq(tmp_path):
+def test_plan_index_segment_merge_ivf_rq(tmp_path: Path) -> None:
     """The coordinator plans disjoint merge tasks, workers merge each task, and
     the coordinator commits every merged segment at once. Tasks are pickled to
     mimic the Spark driver to executor boundary, and the second round consumes
