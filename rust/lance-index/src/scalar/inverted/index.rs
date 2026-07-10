@@ -5936,7 +5936,7 @@ fn flat_bm25_score(
         }
         let doc_norm = K1 * (1.0 - B + B * num_tokens_in_doc as f32 / scorer.avg_doc_length());
         let mut score = 0.0;
-        for (token, freq) in query_tokens.into_iter().zip(query_token_counts.into_iter()) {
+        for (token, freq) in query_tokens.into_iter().zip(query_token_counts) {
             let freq = freq as f32;
             let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
             score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));

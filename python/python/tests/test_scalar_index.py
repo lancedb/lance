@@ -820,7 +820,7 @@ def test_code_analyzer_does_not_split_identifiers_by_default(tmp_path):
 
     stats = ds.stats.index_stats("code_idx")["indices"][0]
     params = stats["params"]
-    assert params["analyzer"] == "code"
+    assert "analyzer" not in params
     assert params["base_tokenizer"] == "code"
     assert params["split_identifiers"] is False
 
@@ -857,7 +857,7 @@ def test_code_analyzer_full_text_search_with_identifier_splitting(tmp_path):
 
     stats = ds.stats.index_stats("code_idx")["indices"][0]
     params = stats["params"]
-    assert params["analyzer"] == "code"
+    assert "analyzer" not in params
     assert params["base_tokenizer"] == "code"
     assert params["split_identifiers"] is True
     assert params["split_on_numerics"] is True
