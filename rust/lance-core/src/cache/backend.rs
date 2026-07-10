@@ -136,8 +136,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// capacity-based eviction policy instead of immediately.
     ///
     /// Defaults to a single-element call to
-    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes); backends
-    /// only need to implement one of the two.
+    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes). Overriding
+    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes) is
+    /// therefore the one to implement: it gives you both methods for free.
+    /// Overriding only this method does *not* work the other way around --
+    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes)'s own
+    /// default (a no-op) is unaffected, so any caller that invokes it
+    /// directly (as [`LanceCache::invalidate_key_prefixes`](super::LanceCache::invalidate_key_prefixes)
+    /// does) would silently evict nothing.
     async fn invalidate_key_prefix(&self, prefix: &str, key_prefix: &str) {
         self.invalidate_key_prefixes(prefix, std::slice::from_ref(&key_prefix.to_owned()))
             .await;

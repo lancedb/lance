@@ -1611,6 +1611,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
+    use lance_index::optimize::OptimizeOptions;
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
@@ -4406,10 +4407,15 @@ mod tests {
     /// leak from the outside, even though every individual entry was a
     /// legitimately "live" (referenced) cache object.
     ///
-    /// This test writes many versions under one shared `Session`, runs
-    /// cleanup to retain only the latest version, and asserts that (a) the
-    /// cache actually shrinks and (b) no cached key still references a
-    /// version whose files cleanup just deleted.
+    /// This test writes many versions under one shared `Session` -- including
+    /// a real vector index build and a later `optimize_indices()` call, so
+    /// the index cache (not just the metadata cache) actually accumulates
+    /// version-keyed entries the same way production code populates them,
+    /// rather than only exercising a code path that happens to have nothing
+    /// to invalidate -- runs cleanup to retain only the latest version, and
+    /// asserts that (a) both caches actually shrink and (b) no cached key in
+    /// either one still references a version whose files cleanup just
+    /// deleted.
     #[tokio::test]
     async fn cleanup_evicts_stale_version_caches() {
         let tmpdir = TempStrDir::default();
@@ -4419,6 +4425,7 @@ mod tests {
         // cleanup's explicit invalidation, not incidental LRU eviction.
         let session = Arc::new(Session::new(1 << 30, 1 << 30, Default::default()));
 
+        // v1: create the dataset.
         Dataset::write(
             some_batch(),
             &dataset_path,
@@ -4431,8 +4438,31 @@ mod tests {
         .await
         .unwrap();
 
-        const NUM_APPENDS: usize = 10;
-        for _ in 0..NUM_APPENDS {
+        // v2: build a vector index -- this is a real, separate commit whose
+        // transaction carries non-empty index metadata, so it inserts a
+        // genuine `IndexMetadataKey` entry into the index cache (see
+        // `commit_transaction` in `rust/lance/src/io/commit.rs`).
+        let mut dataset = DatasetBuilder::from_uri(&dataset_path)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 5);
+        dataset
+            .create_index(
+                &["indexable"],
+                IndexType::Vector,
+                Some("some_index".to_owned()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // v3-v5: appends. These don't touch the index, so they only add
+        // metadata-cache entries (matching most of production traffic).
+        const NUM_APPENDS_BEFORE_OPTIMIZE: usize = 3;
+        for _ in 0..NUM_APPENDS_BEFORE_OPTIMIZE {
             Dataset::write(
                 some_batch(),
                 &dataset_path,
@@ -4446,7 +4476,38 @@ mod tests {
             .unwrap();
         }
 
-        let before = session.metadata_cache_stats().await;
+        // v6: fold the newly-appended, unindexed fragments into the index.
+        // Another real commit with non-empty index metadata -- a second,
+        // distinct `IndexMetadataKey` entry, at a version that will itself
+        // become stale once more commits follow.
+        let mut dataset = DatasetBuilder::from_uri(&dataset_path)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        // v7-v11: more appends, so v1-v6 are all old by the time cleanup runs.
+        const NUM_APPENDS_AFTER_OPTIMIZE: usize = 5;
+        for _ in 0..NUM_APPENDS_AFTER_OPTIMIZE {
+            Dataset::write(
+                some_batch(),
+                &dataset_path,
+                Some(WriteParams {
+                    session: Some(session.clone()),
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let metadata_before = session.metadata_cache_stats().await;
+        let index_before = session.index_cache_stats().await;
 
         let dataset = DatasetBuilder::from_uri(&dataset_path)
             .with_session(session.clone())
@@ -4454,6 +4515,12 @@ mod tests {
             .await
             .unwrap();
         let latest_version = dataset.version().version;
+        let total_versions = 1 // create
+            + 1 // create_index
+            + NUM_APPENDS_BEFORE_OPTIMIZE as u64
+            + 1 // optimize_indices
+            + NUM_APPENDS_AFTER_OPTIMIZE as u64;
+        assert_eq!(latest_version, total_versions);
 
         // Retain only the latest version (the default policy has no
         // before_timestamp/before_version restriction, and process_manifest_file
@@ -4465,14 +4532,20 @@ mod tests {
         };
         let removed = cleanup_old_versions(&dataset, policy).await.unwrap();
         assert_eq!(
-            removed.old_versions, NUM_APPENDS as u64,
+            removed.old_versions,
+            total_versions - 1,
             "expected every version except the latest to be cleaned up"
         );
 
-        let after = session.metadata_cache_stats().await;
+        let metadata_after = session.metadata_cache_stats().await;
         assert!(
-            after.num_entries < before.num_entries,
-            "expected cleanup to evict stale version cache entries: before={before:?} after={after:?}"
+            metadata_after.num_entries < metadata_before.num_entries,
+            "expected cleanup to evict stale version cache entries: before={metadata_before:?} after={metadata_after:?}"
+        );
+        let index_after = session.index_cache_stats().await;
+        assert!(
+            index_after.num_entries < index_before.num_entries,
+            "expected cleanup to evict stale index cache entries: before={index_before:?} after={index_after:?}"
         );
 
         // No cached manifest/txn/row_addr_mask/row_id_index entry should
@@ -4480,7 +4553,7 @@ mod tests {
         // those versions' files are gone from disk, so their cache entries
         // are unreachable dead weight that would otherwise sit in the cache
         // until it hit its configured byte-capacity ceiling.
-        let stale_entries: Vec<String> = session
+        let stale_metadata_entries: Vec<String> = session
             .metadata_cache_keys()
             .await
             .expect("moka backend supports key inventory")
@@ -4498,8 +4571,27 @@ mod tests {
             })
             .collect();
         assert!(
-            stale_entries.is_empty(),
-            "cache still holds entries for cleaned-up versions: {stale_entries:?}"
+            stale_metadata_entries.is_empty(),
+            "cache still holds entries for cleaned-up versions: {stale_metadata_entries:?}"
+        );
+
+        // Same check for the index cache's `IndexMetadataKey` entries (whose
+        // key is the bare version number, with no other index-cache entry
+        // format sharing that shape -- see `IndexMetadataKey::key` in
+        // `rust/lance/src/session/index_caches.rs`).
+        let stale_index_entries: Vec<String> = session
+            .index_cache_keys()
+            .await
+            .expect("moka backend supports key inventory")
+            .filter_map(|k| {
+                let key = k.key().to_string();
+                let version: u64 = key.parse().ok()?;
+                (version < latest_version).then_some(key)
+            })
+            .collect();
+        assert!(
+            stale_index_entries.is_empty(),
+            "index cache still holds entries for cleaned-up versions: {stale_index_entries:?}"
         );
     }
 }
