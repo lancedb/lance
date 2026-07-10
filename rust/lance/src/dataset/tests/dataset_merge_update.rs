@@ -25,12 +25,12 @@ use crate::dataset::write::{InsertBuilder, WriteMode, WriteParams};
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
-use arrow_array::RecordBatch;
 use arrow_array::{Array, LargeBinaryArray, StructArray};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, ListArray, RecordBatchIterator, StringArray,
     types::Int32Type,
 };
+use arrow_array::{RecordBatch, record_batch};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use lance_arrow::BLOB_META_KEY;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
@@ -4306,16 +4306,8 @@ async fn test_merge_insert_target_all_bases() {
 #[case::stable_row_ids(true)]
 #[tokio::test]
 async fn test_merge_commits_staged_new_fragments(#[case] use_stable_row_id: bool) {
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "i",
-        DataType::Int32,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
-    )
-    .unwrap();
+    let batch = record_batch!(("i", Int32, [1, 2, 3, 4])).unwrap();
+    let schema = batch.schema();
     let test_uri = TempStrDir::default();
     let dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
@@ -4333,8 +4325,7 @@ async fn test_merge_commits_staged_new_fragments(#[case] use_stable_row_id: bool
     let existing: Vec<Fragment> = dataset.fragments().as_ref().clone();
 
     // Stage new fragments without committing, like Python's write_fragments.
-    let batch2 =
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![5, 6]))]).unwrap();
+    let batch2 = record_batch!(("i", Int32, [5, 6])).unwrap();
     let transaction = InsertBuilder::new(WriteDestination::Dataset(Arc::new(dataset.clone())))
         .with_params(&WriteParams {
             mode: WriteMode::Append,

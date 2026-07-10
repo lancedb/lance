@@ -370,8 +370,9 @@ pub enum Operation {
     /// Merge a new column in
     /// 'fragments' is the final fragment list: the merged version of every existing
     /// fragment (aligned with the old one at rows) and, optionally, brand-new fragments
-    /// listed after them. New fragments use id 0 (a fresh id and, on stable row id
-    /// datasets, row ids are assigned at commit time, like Append) or a pre-reserved id.
+    /// listed after them. New fragments use id 0 (assigned a fresh id at commit time) or
+    /// a pre-reserved id; either way, on stable row id datasets they are also assigned
+    /// row ids at commit time, like Append.
     /// 'schema' is not forced to include existed columns, which means we could use Merge to drop column data
     Merge {
         fragments: Vec<Fragment>,
@@ -5666,57 +5667,49 @@ mod tests {
         Ok(out)
     }
 
-    #[test]
-    fn merge_build_manifest_assigns_ids_and_row_ids_to_staged_fragments() {
+    #[rstest::rstest]
+    #[case::placeholder_id_0(0, vec![0, 1, 2], 2)]
+    #[case::pre_reserved_id_7(7, vec![0, 1, 7], 7)]
+    fn merge_build_manifest_assigns_ids_and_row_ids_to_staged_fragments(
+        #[case] staged_id: u64,
+        #[case] expected_ids: Vec<u64>,
+        #[case] new_id: u64,
+    ) {
         // A placeholder id 0 gets a fresh fragment id; a pre-reserved id is
         // kept. Either way the staged fragment's row ids come from
         // next_row_id at commit time.
-        let cases = [
-            ("placeholder id 0", 0, vec![0, 1, 2], 2u64),
-            ("pre-reserved id 7", 7, vec![0, 1, 7], 7u64),
+        let existing = vec![
+            frag_with_row_ids(0, "frag0.lance", &[0, 1, 2]),
+            frag_with_row_ids(1, "frag1.lance", &[3, 4]),
         ];
-        for (name, staged_id, expected_ids, new_id) in cases {
-            let existing = vec![
-                frag_with_row_ids(0, "frag0.lance", &[0, 1, 2]),
-                frag_with_row_ids(1, "frag1.lance", &[3, 4]),
-            ];
-            let (manifest, schema) = merge_test_manifest(existing.clone(), true);
+        let (manifest, schema) = merge_test_manifest(existing.clone(), true);
 
-            let mut merge_list = existing.clone();
-            merge_list.push(frag_without_row_ids(staged_id, "staged.lance", 4));
-            let out = build_merge(&manifest, schema, merge_list).unwrap();
+        let mut merge_list = existing.clone();
+        merge_list.push(frag_without_row_ids(staged_id, "staged.lance", 4));
+        let out = build_merge(&manifest, schema, merge_list).unwrap();
 
-            let ids: Vec<u64> = out.fragments.iter().map(|f| f.id).collect();
-            assert_eq!(ids, expected_ids, "{name}");
-            assert_eq!(out.max_fragment_id, Some(new_id.max(1) as u32), "{name}");
+        let ids: Vec<u64> = out.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, expected_ids);
+        assert_eq!(out.max_fragment_id, Some(new_id.max(1) as u32));
 
-            // Existing fragments keep their row id sequences byte-identical.
-            for prev in &existing {
-                let frag = out.fragments.iter().find(|f| f.id == prev.id).unwrap();
-                assert_eq!(frag.row_id_meta, prev.row_id_meta, "{name}");
-            }
-
-            // The staged fragment was allocated row ids from next_row_id.
-            let new_frag = out.fragments.iter().find(|f| f.id == new_id).unwrap();
-            let Some(RowIdMeta::Inline(data)) = &new_frag.row_id_meta else {
-                panic!("{name}: staged fragment must have inline row id metadata");
-            };
-            let row_ids: Vec<u64> = read_row_ids(data).unwrap().iter().collect();
-            assert_eq!(row_ids, vec![100, 101, 102, 103], "{name}");
-            assert_eq!(out.next_row_id, 104, "{name}");
-
-            // Version metadata is stamped like Append.
-            assert_eq!(
-                created_at_versions(&out, new_id),
-                vec![2, 2, 2, 2],
-                "{name}"
-            );
-            assert_eq!(
-                last_updated_at_versions(&out, new_id),
-                vec![2, 2, 2, 2],
-                "{name}"
-            );
+        // Existing fragments keep their row id sequences byte-identical.
+        for prev in &existing {
+            let frag = out.fragments.iter().find(|f| f.id == prev.id).unwrap();
+            assert_eq!(frag.row_id_meta, prev.row_id_meta);
         }
+
+        // The staged fragment was allocated row ids from next_row_id.
+        let new_frag = out.fragments.iter().find(|f| f.id == new_id).unwrap();
+        let Some(RowIdMeta::Inline(data)) = &new_frag.row_id_meta else {
+            panic!("staged fragment must have inline row id metadata");
+        };
+        let row_ids: Vec<u64> = read_row_ids(data).unwrap().iter().collect();
+        assert_eq!(row_ids, vec![100, 101, 102, 103]);
+        assert_eq!(out.next_row_id, 104);
+
+        // Version metadata is stamped like Append.
+        assert_eq!(created_at_versions(&out, new_id), vec![2, 2, 2, 2]);
+        assert_eq!(last_updated_at_versions(&out, new_id), vec![2, 2, 2, 2]);
     }
 
     #[test]
@@ -5746,6 +5739,11 @@ mod tests {
         let mut merge_list = existing;
         merge_list.push(frag_without_row_ids(1, "other.lance", 2));
         let err = build_merge(&manifest, schema, merge_list).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
         assert!(
             err.to_string().contains("duplicate fragment id 1"),
             "unexpected error: {}",
@@ -5789,6 +5787,11 @@ mod tests {
 
         let staged = frag_without_row_ids(0, "staged.lance", 2);
         let err = build_merge(&manifest, schema, vec![staged, existing]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
         assert!(
             err.to_string()
                 .contains("dropped row id metadata for existing fragment 0"),
