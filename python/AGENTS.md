@@ -20,6 +20,16 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 * Lint: `uv run make lint`
 * Format: `uv run make format`
 
+## Beta Releases
+
+- Python RC and beta preview wheels are published on fury.io, not only PyPI. When a task needs a beta version such as `7.2.0b4`, use a disposable venv and install with `--pre` and the Lance fury indices:
+  ```shell
+  uv venv /path/to/venv
+  uv pip install --python /path/to/venv/bin/python --pre \
+      --extra-index-url https://pypi.fury.io/lance-format/ \
+      "pylance==7.2.0b4"
+  ```
+
 ## API Design
 
 - Keep bindings as thin wrappers — centralize validation and logic in Rust core.

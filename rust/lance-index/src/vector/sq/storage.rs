@@ -12,12 +12,14 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
+use lance_arrow::ArrowFloatType;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{DistanceType, dot_distance, l2_u8::l2_u8};
+use lance_linalg::distance::{DistanceType, dot_u8::dot_u8, l2_u8::l2_u8};
 use lance_table::format::SelfDescribingFileReader;
+use num_traits::AsPrimitive;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -29,7 +31,7 @@ use crate::{
     vector::{
         SQ_CODE_COLUMN,
         quantizer::{QuantizerMetadata, QuantizerStorage},
-        storage::{DistCalculator, VectorStore},
+        storage::{DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore},
         transform::Transformer,
     },
 };
@@ -370,28 +372,116 @@ impl VectorStore for ScalarQuantizationStorage {
         SQDistCalculator::new(query, self, self.quantizer.bounds())
     }
 
+    fn dist_calculator_with_scratch<'a>(
+        &'a self,
+        query: ArrayRef,
+        _dist_q_c: f32,
+        _residual: Option<QueryResidual<'a>>,
+        f32_scratch: &'a mut Vec<f32>,
+        _options: DistanceCalculatorOptions,
+    ) -> Self::DistanceCalculator<'a> {
+        SQDistCalculator::new_with_scratch(query, self, self.quantizer.bounds(), f32_scratch)
+    }
+
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let (offset, chunk) = self.chunk(id);
         let query_sq_code = chunk.sq_code_slice(id - offset);
         let bounds = self.quantizer.bounds();
+        let lower_bound = bounds.start as f32;
+        let value_scale = sq_value_scale(&bounds);
+        let query_dot = match self.distance_type {
+            DistanceType::Dot => Some(SQDotQuery::from_sq_code(query_sq_code)),
+            _ => None,
+        };
         SQDistCalculator {
             query_sq_code: SQQueryCode::Borrowed(query_sq_code),
+            query_dot,
             scale: sq_distance_scale(&bounds),
+            lower_bound,
+            value_scale,
             storage: self,
         }
     }
 }
 
 #[inline]
+fn sq_value_scale(bounds: &Range<f64>) -> f32 {
+    (bounds.end - bounds.start) as f32 / 255.0_f32
+}
+
+#[inline]
 fn sq_distance_scale(bounds: &Range<f64>) -> f32 {
-    let range = (bounds.end - bounds.start) as f32;
-    (range * range) / (255.0_f32 * 255.0_f32)
+    let scale = sq_value_scale(bounds);
+    scale * scale
 }
 
 pub struct SQDistCalculator<'a> {
     query_sq_code: SQQueryCode<'a>,
+    query_dot: Option<SQDotQuery<'a>>,
     scale: f32,
+    lower_bound: f32,
+    value_scale: f32,
     storage: &'a ScalarQuantizationStorage,
+}
+
+enum SQDotQuery<'a> {
+    Values { values: SQFloatQuery<'a>, sum: f32 },
+    SqCode { code: &'a [u8], sum: f32 },
+}
+
+enum SQFloatQuery<'a> {
+    Borrowed(&'a [f32]),
+    Owned(Vec<f32>),
+}
+
+impl SQFloatQuery<'_> {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Borrowed(values) => values,
+            Self::Owned(values) => values,
+        }
+    }
+}
+
+impl<'a> SQDotQuery<'a> {
+    fn from_values<T: ArrowFloatType>(values: &[T::Native]) -> Self
+    where
+        T::Native: AsPrimitive<f32>,
+    {
+        let values: Vec<_> = values.iter().map(|v| v.as_()).collect();
+        let sum = values.iter().sum();
+        Self::Values {
+            values: SQFloatQuery::Owned(values),
+            sum,
+        }
+    }
+
+    fn from_values_with_scratch<T: ArrowFloatType>(
+        values: &[T::Native],
+        scratch: &'a mut Vec<f32>,
+    ) -> Self
+    where
+        T::Native: AsPrimitive<f32>,
+    {
+        scratch.clear();
+        scratch.extend(values.iter().map(|v| v.as_()));
+        let sum = scratch.iter().sum();
+        Self::Values {
+            values: SQFloatQuery::Borrowed(scratch.as_slice()),
+            sum,
+        }
+    }
+
+    fn from_sq_code(sq_code: &'a [u8]) -> Self {
+        Self::SqCode {
+            code: sq_code,
+            sum: sq_code_sum(sq_code),
+        }
+    }
+}
+
+fn sq_code_sum(sq_code: &[u8]) -> f32 {
+    sq_code.iter().map(|code| *code as u32).sum::<u32>() as f32
 }
 
 enum SQQueryCode<'a> {
@@ -415,25 +505,126 @@ impl<'a> SQDistCalculator<'a> {
         // since we search 10s-100s of partitions, we can afford the overhead
         // this could be annoying at indexing time for HNSW, which requires constructing the
         // dist calculator frequently. However, HNSW isn't first-class citizen in Lance yet. so be it.
-        let query_sq_code = match query.data_type() {
-            DataType::Float16 => {
-                scale_to_u8::<Float16Type>(query.as_primitive::<Float16Type>().values(), &bounds)
+        let (query_sq_code, query_dot) = match storage.distance_type {
+            DistanceType::Dot => {
+                let query_dot = match query.data_type() {
+                    DataType::Float16 => SQDotQuery::from_values::<Float16Type>(
+                        query.as_primitive::<Float16Type>().values(),
+                    ),
+                    DataType::Float32 => SQDotQuery::from_values::<Float32Type>(
+                        query.as_primitive::<Float32Type>().values(),
+                    ),
+                    DataType::Float64 => SQDotQuery::from_values::<Float64Type>(
+                        query.as_primitive::<Float64Type>().values(),
+                    ),
+                    _ => {
+                        panic!("Unsupported data type for ScalarQuantizationStorage");
+                    }
+                };
+                (SQQueryCode::Owned(Vec::new()), Some(query_dot))
             }
-            DataType::Float32 => {
-                scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds)
+            DistanceType::L2 | DistanceType::Cosine => {
+                let query_sq_code = match query.data_type() {
+                    DataType::Float16 => scale_to_u8::<Float16Type>(
+                        query.as_primitive::<Float16Type>().values(),
+                        &bounds,
+                    ),
+                    DataType::Float32 => scale_to_u8::<Float32Type>(
+                        query.as_primitive::<Float32Type>().values(),
+                        &bounds,
+                    ),
+                    DataType::Float64 => scale_to_u8::<Float64Type>(
+                        query.as_primitive::<Float64Type>().values(),
+                        &bounds,
+                    ),
+                    _ => {
+                        panic!("Unsupported data type for ScalarQuantizationStorage");
+                    }
+                };
+                (SQQueryCode::Owned(query_sq_code), None)
             }
-            DataType::Float64 => {
-                scale_to_u8::<Float64Type>(query.as_primitive::<Float64Type>().values(), &bounds)
-            }
+            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
+        };
+        let lower_bound = bounds.start as f32;
+        let value_scale = sq_value_scale(&bounds);
+        Self {
+            query_sq_code,
+            query_dot,
+            scale: sq_distance_scale(&bounds),
+            lower_bound,
+            value_scale,
+            storage,
+        }
+    }
+
+    fn new_with_scratch(
+        query: ArrayRef,
+        storage: &'a ScalarQuantizationStorage,
+        bounds: Range<f64>,
+        f32_scratch: &'a mut Vec<f32>,
+    ) -> Self {
+        if storage.distance_type != DistanceType::Dot {
+            return Self::new(query, storage, bounds);
+        }
+
+        let query_dot = match query.data_type() {
+            DataType::Float16 => SQDotQuery::from_values_with_scratch::<Float16Type>(
+                query.as_primitive::<Float16Type>().values(),
+                f32_scratch,
+            ),
+            DataType::Float32 => SQDotQuery::from_values_with_scratch::<Float32Type>(
+                query.as_primitive::<Float32Type>().values(),
+                f32_scratch,
+            ),
+            DataType::Float64 => SQDotQuery::from_values_with_scratch::<Float64Type>(
+                query.as_primitive::<Float64Type>().values(),
+                f32_scratch,
+            ),
             _ => {
                 panic!("Unsupported data type for ScalarQuantizationStorage");
             }
         };
+        let lower_bound = bounds.start as f32;
+        let value_scale = sq_value_scale(&bounds);
         Self {
-            query_sq_code: SQQueryCode::Owned(query_sq_code),
+            query_sq_code: SQQueryCode::Owned(Vec::new()),
+            query_dot: Some(query_dot),
             scale: sq_distance_scale(&bounds),
+            lower_bound,
+            value_scale,
             storage,
         }
+    }
+
+    fn dot_distance(&self, sq_code: &[u8]) -> f32 {
+        let query = self
+            .query_dot
+            .as_ref()
+            .expect("SQ dot distance requires a dot query");
+        let dot = match query {
+            SQDotQuery::Values { values, sum } => {
+                let values = values.as_slice();
+                self.lower_bound * *sum
+                    + self.value_scale
+                        * sq_code
+                            .iter()
+                            .zip(values.iter())
+                            .map(|(code, query_value)| *code as f32 * *query_value)
+                            .sum::<f32>()
+            }
+            SQDotQuery::SqCode {
+                code: query_sq_code,
+                sum: query_code_sum,
+            } => {
+                let dim = sq_code.len() as f32;
+                let code_dot = dot_u8(sq_code, query_sq_code) as f32;
+                let code_sum = sq_code_sum(sq_code);
+                dim * self.lower_bound * self.lower_bound
+                    + self.lower_bound * self.value_scale * (code_sum + *query_code_sum)
+                    + self.scale * code_dot
+            }
+        };
+        1.0 - dot
     }
 }
 
@@ -442,12 +633,13 @@ impl DistCalculator for SQDistCalculator<'_> {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
         let query_sq_code = self.query_sq_code.as_slice();
-        let dist = match self.storage.distance_type {
-            DistanceType::L2 | DistanceType::Cosine => l2_u8(sq_code, query_sq_code) as f32,
-            DistanceType::Dot => dot_distance(sq_code, query_sq_code),
+        match self.storage.distance_type {
+            DistanceType::L2 | DistanceType::Cosine => {
+                l2_u8(sq_code, query_sq_code) as f32 * self.scale
+            }
+            DistanceType::Dot => self.dot_distance(sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
-        };
-        dist * self.scale
+        }
     }
 
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
@@ -473,9 +665,8 @@ impl DistCalculator for SQDistCalculator<'_> {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
-                        .map(|sq_codes| dot_distance(sq_codes, query_sq_code))
+                        .map(|sq_codes| self.dot_distance(sq_codes))
                 })
-                .map(|dist| dist * self.scale)
                 .collect(),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         }
@@ -511,7 +702,7 @@ mod tests {
     use std::iter::repeat_with;
     use std::sync::Arc;
 
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_testing::datagen::generate_random_array;
@@ -534,6 +725,31 @@ mod tests {
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::UInt8, true)),
                     DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(code_arr)]).unwrap()
+    }
+
+    fn create_record_batch_with_sq_codes(
+        row_ids: Vec<u64>,
+        sq_codes: Vec<u8>,
+        dim: usize,
+    ) -> RecordBatch {
+        assert_eq!(sq_codes.len(), row_ids.len() * dim);
+
+        let row_ids = UInt64Array::from_iter_values(row_ids);
+        let sq_code = UInt8Array::from_iter_values(sq_codes);
+        let code_arr = FixedSizeListArray::try_new_from_values(sq_code, dim as i32).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                SQ_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    dim as i32,
                 ),
                 false,
             ),
@@ -591,5 +807,54 @@ mod tests {
         let (offset, chunk) = storage.chunk(432);
         assert_eq!(offset, 400);
         assert_eq!(chunk.row_id(5), 105);
+    }
+
+    #[test]
+    fn test_dot_distance_accounts_for_sq_offset() {
+        const DIM: usize = 2;
+
+        let storage = ScalarQuantizationStorage::try_new(
+            8,
+            DistanceType::Dot,
+            -1.0..1.0,
+            [create_record_batch_with_sq_codes(
+                vec![0, 1],
+                vec![
+                    255, 255, // [1.0, 1.0]
+                    0, 191, // [-1.0, 0.498]
+                ],
+                DIM,
+            )],
+            None,
+        )
+        .unwrap();
+
+        let query = Arc::new(Float32Array::from(vec![-1.0, 1.0])) as ArrayRef;
+        let calculator = storage.dist_calculator(query.clone(), 0.0);
+        let distances = calculator.distance_all(2);
+
+        assert!(
+            distances[1] < distances[0],
+            "expected [-1.0, 0.498] to rank before [1.0, 1.0], got {distances:?}"
+        );
+        assert!((calculator.distance(0) - 1.0).abs() < 1e-6);
+        assert!((calculator.distance(1) - -0.49803925).abs() < 1e-6);
+
+        let mut scratch = Vec::new();
+        let scratch_distances = {
+            let scratch_calculator = storage.dist_calculator_with_scratch(
+                query,
+                0.0,
+                None,
+                &mut scratch,
+                DistanceCalculatorOptions::default(),
+            );
+            scratch_calculator.distance_all(2)
+        };
+        assert_eq!(scratch_distances, distances);
+        assert_eq!(scratch.len(), DIM);
+
+        let stored_query_calculator = storage.dist_calculator_from_id(0);
+        assert!((stored_query_calculator.distance(1) - 1.5019608).abs() < 1e-6);
     }
 }

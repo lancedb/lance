@@ -1743,7 +1743,11 @@ impl RepDefUnraveler {
             }
             let num_new_lists = offsets.len() - old_offsets_len;
             offsets.push(to_offset(curlen)?);
-            rep_levels.truncate(offsets.len() - 1);
+            // Truncate to the number of lists THIS unraveler produced (write_idx),
+            // not `offsets.len() - 1` — the latter includes offsets contributed by
+            // earlier unravelers in a multi-page read, which would leave too many
+            // rep levels for the next (outer) layer and over-count its lists.
+            rep_levels.truncate(write_idx);
             if let Some(validity) = validity {
                 // Even though we don't have validity it is possible another unraveler did and so we need
                 // to push all valids
@@ -2957,6 +2961,40 @@ mod tests {
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 2, 3, 5]).inner());
         assert_eq!(val, None);
+    }
+
+    #[test]
+    fn test_repdef_nested_list_multibatch_matches_single() {
+        // Single builder: List<List<i32>>, 3 rows.
+        //   outer [0,2,3,5] -> rows have 2,1,2 inner lists
+        //   inner [0,1,3,5,7,9] -> 5 inner lists, lengths 1,2,2,2,2 (9 leaf)
+        let mut single = RepDefBuilder::default();
+        single.add_offsets(offsets_64(&[0, 2, 3, 5]), None);
+        single.add_offsets(offsets_64(&[0, 1, 3, 5, 7, 9]), None);
+        single.add_no_null(9);
+        let single_rep = RepDefBuilder::serialize(vec![single])
+            .repetition_levels
+            .unwrap();
+
+        // Same logical data split into two batches:
+        //   batch0 = rows 0,1 : outer [0,2,3], inner [0,1,3,5] (3 inner, 5 leaf)
+        //   batch1 = row 2    : outer [0,2],   inner [0,2,4]   (2 inner, 4 leaf)
+        let mut b0 = RepDefBuilder::default();
+        b0.add_offsets(offsets_64(&[0, 2, 3]), None);
+        b0.add_offsets(offsets_64(&[0, 1, 3, 5]), None);
+        b0.add_no_null(5);
+        let mut b1 = RepDefBuilder::default();
+        b1.add_offsets(offsets_64(&[0, 2]), None);
+        b1.add_offsets(offsets_64(&[0, 2, 4]), None);
+        b1.add_no_null(4);
+        let multi_rep = RepDefBuilder::serialize(vec![b0, b1])
+            .repetition_levels
+            .unwrap();
+
+        assert_eq!(
+            *single_rep, *multi_rep,
+            "multi-batch nested-list rep levels must equal single-batch"
+        );
     }
 
     #[test]

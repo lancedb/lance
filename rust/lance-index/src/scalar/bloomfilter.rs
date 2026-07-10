@@ -9,7 +9,7 @@
 
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
@@ -20,16 +20,19 @@ use arrow_schema::{DataType, Field};
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use datafusion::execution::SendableRecordBatchStream;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use crate::scalar::FragReuseIndex;
-use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::vector::VectorIndex;
+use crate::scalar::{
+    AnyQuery, IndexStore, MetricsCollector, RowIdRemapper, ScalarIndex, SearchResult,
+};
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -43,6 +46,7 @@ use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
+const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
 
@@ -79,18 +83,20 @@ pub struct BloomFilterIndex {
     number_of_items: u64,
     // Probability of false positives, fraction between 0 and 1
     probability: f64,
+    // Exact set of null row addresses; None for older indices without this bitmap.
+    null_rows: Option<RowAddrTreeMap>,
 }
 
 impl DeepSizeOf for BloomFilterIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.zones.deep_size_of_children(context)
+        self.zones.deep_size_of_children(context) + self.null_rows.deep_size_of_children(context)
     }
 }
 
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<FragReuseIndex>>,
+        _fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
@@ -111,10 +117,21 @@ impl BloomFilterIndex {
             .and_then(|bs| bs.parse().ok())
             .unwrap_or(*DEFAULT_PROBABILITY);
 
+        let null_rows = if let Some(idx_str) = file_schema.metadata.get(NULL_BITMAP_META_KEY) {
+            let idx = idx_str.parse::<u32>().map_err(|e| {
+                Error::invalid_input(format!("invalid null bitmap buffer index: {e}"))
+            })?;
+            let bytes = index_file.read_global_buffer(idx).await?;
+            Some(RowAddrTreeMap::deserialize_from(bytes.as_ref())?)
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self::try_from_serialized(
             bloom_data,
             number_of_items,
             probability,
+            null_rows,
         )?))
     }
 
@@ -122,13 +139,14 @@ impl BloomFilterIndex {
         data: RecordBatch,
         number_of_items: u64,
         probability: f64,
+        null_rows: Option<RowAddrTreeMap>,
     ) -> Result<Self> {
         if data.num_rows() == 0 {
-            // Return empty index for empty data
             return Ok(Self {
                 zones: Vec::new(),
                 number_of_items,
                 probability,
+                null_rows,
             });
         }
 
@@ -209,6 +227,7 @@ impl BloomFilterIndex {
             zones: blocks,
             number_of_items,
             probability,
+            null_rows,
         })
     }
 
@@ -377,12 +396,6 @@ impl Index for BloomFilterIndex {
         self
     }
 
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::invalid_input_source(
-            "BloomFilter is not a vector index".into(),
-        ))
-    }
-
     async fn prewarm(&self) -> Result<()> {
         Ok(())
     }
@@ -420,9 +433,19 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
+        if let BloomFilterQuery::IsNull() = query
+            && let Some(null_rows) = &self.null_rows
+        {
+            return Ok(SearchResult::exact(null_rows.clone()));
+        }
+
         search_zones(&self.zones, metrics, |block| {
             self.evaluate_block_against_query(block, query)
         })
+    }
+
+    fn results_are_row_addresses(&self) -> bool {
+        true
     }
 
     fn can_remap(&self) -> bool {
@@ -431,7 +454,7 @@ impl ScalarIndex for BloomFilterIndex {
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input_source(
@@ -453,18 +476,29 @@ impl ScalarIndex for BloomFilterIndex {
 
         let processor = BloomFilterProcessor::new(params.clone())?;
         let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
-        let updated_blocks = rebuild_zones(&self.zones, trainer, new_data).await?;
+        let (updated_blocks, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
+
+        // Merge existing and new null rows.  If the existing index had no null bitmap
+        // (legacy format — null positions unknown), preserve that None: updating cannot
+        // recover the missing information, and claiming the result has zero nulls would
+        // be a false negative.  Only a full retrain produces a fresh, complete bitmap.
+        let merged_null_rows = self.null_rows.as_ref().map(|existing| {
+            let mut merged = existing.clone();
+            merged |= &new_null_rows;
+            merged
+        });
 
         // Write the combined zones back to storage
         let mut builder = BloomFilterIndexBuilder::try_new(params)?;
         builder.blocks = updated_blocks;
-        let file = builder.write_index(dest_store).await?;
+        builder.null_rows = merged_null_rows;
+        let files = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: vec![file],
+            files,
         })
     }
 
@@ -547,6 +581,10 @@ impl BloomFilterIndexBuilderParams {
 pub struct BloomFilterIndexBuilder {
     params: BloomFilterIndexBuilderParams,
     blocks: Vec<BloomFilterStatistics>,
+    // None means "legacy index — null positions unknown"; Some means a complete bitmap.
+    // write_index omits the null-bitmap global buffer when this is None, preserving the
+    // legacy format so that downstream searches remain conservative.
+    null_rows: Option<RowAddrTreeMap>,
 }
 
 impl BloomFilterIndexBuilder {
@@ -554,6 +592,7 @@ impl BloomFilterIndexBuilder {
         Ok(Self {
             params,
             blocks: Vec::new(),
+            null_rows: None,
         })
     }
 
@@ -563,7 +602,9 @@ impl BloomFilterIndexBuilder {
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
         let processor = BloomFilterProcessor::new(self.params.clone())?;
         let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
-        self.blocks = trainer.train(batches_source).await?;
+        let (blocks, null_rows) = trainer.train(batches_source).await?;
+        self.blocks = blocks;
+        self.null_rows = Some(null_rows);
         Ok(())
     }
 
@@ -620,7 +661,7 @@ impl BloomFilterIndexBuilder {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
-    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<IndexFile> {
+    pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
         let record_batch = self.bloomfilter_stats_as_batch()?;
 
         let mut file_schema = record_batch.schema().as_ref().clone();
@@ -628,7 +669,6 @@ impl BloomFilterIndexBuilder {
             BLOOMFILTER_ITEM_META_KEY.to_string(),
             self.params.number_of_items.to_string(),
         );
-
         file_schema.metadata.insert(
             BLOOMFILTER_PROBABILITY_META_KEY.to_string(),
             self.params.probability.to_string(),
@@ -638,7 +678,24 @@ impl BloomFilterIndexBuilder {
             .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
             .await?;
         index_file.write_record_batch(record_batch).await?;
-        index_file.finish().await
+
+        let bloomfilter_file = if let Some(null_rows) = self.null_rows {
+            let mut null_bitmap_bytes = Vec::with_capacity(null_rows.serialized_size());
+            null_rows.serialize_into(&mut null_bitmap_bytes)?;
+            let null_bitmap_idx = index_file
+                .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
+                .await?;
+            index_file
+                .finish_with_metadata(HashMap::from([(
+                    NULL_BITMAP_META_KEY.to_string(),
+                    null_bitmap_idx.to_string(),
+                )]))
+                .await?
+        } else {
+            index_file.finish_with_metadata(HashMap::new()).await?
+        };
+
+        Ok(vec![bloomfilter_file])
     }
 }
 
@@ -985,7 +1042,7 @@ impl BloomFilterIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<BloomFilterIndexBuilderParams>,
-    ) -> Result<IndexFile> {
+    ) -> Result<Vec<IndexFile>> {
         let mut builder = BloomFilterIndexBuilder::try_new(options.unwrap_or_default())?;
 
         builder.train(batches_source).await?;
@@ -995,11 +1052,7 @@ impl BloomFilterIndexPlugin {
 }
 
 #[async_trait]
-impl ScalarIndexPlugin for BloomFilterIndexPlugin {
-    fn name(&self) -> &str {
-        "BloomFilter"
-    }
-
+impl BasicTrainer for BloomFilterIndexPlugin {
     fn new_training_request(
         &self,
         params: &str,
@@ -1074,13 +1127,20 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
                     "must provide training request created by new_training_request".into(),
                 )
             })?;
-        let file = Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
+        let files = Self::train_bloomfilter_index(data, index_store, Some(request.params)).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
                 .unwrap(),
             index_version: BLOOMFILTER_INDEX_VERSION,
-            files: vec![file],
+            files,
         })
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -1089,6 +1149,10 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
 
     fn version(&self) -> u32 {
         BLOOMFILTER_INDEX_VERSION
+    }
+
+    fn name(&self) -> &str {
+        "BloomFilter"
     }
 
     fn new_query_parser(
@@ -1107,7 +1171,7 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
@@ -1167,7 +1231,7 @@ mod tests {
     use lance_select::RowAddrTreeMap;
 
     use crate::scalar::{
-        BloomFilterQuery, ScalarIndex, SearchResult,
+        BloomFilterQuery, IndexStore, ScalarIndex, SearchResult,
         bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams},
         lance_format::LanceIndexStore,
     };
@@ -2035,10 +2099,10 @@ mod tests {
         expected.insert_range(500..750); // Should match the zone containing 500
         assert_eq!(result, SearchResult::at_most(expected));
 
-        // Test IsNull query
+        // Test IsNull query (no nulls in data, should return exact empty set)
         let query = BloomFilterQuery::IsNull();
         let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
-        assert_eq!(result, SearchResult::at_most(RowAddrTreeMap::new())); // No nulls in the data
+        assert_eq!(result, SearchResult::exact(RowAddrTreeMap::new()));
 
         // Test IsIn query
         let query = BloomFilterQuery::IsIn(vec![
@@ -2130,5 +2194,153 @@ mod tests {
             }
             _ => panic!("Expected AtMost search result from bloomfilter"),
         }
+    }
+
+    // Writes a bloomfilter file in the legacy format (no null bitmap global buffer),
+    // simulating an index created before the null bitmap feature was added.
+    async fn write_legacy_bloomfilter(store: &dyn IndexStore, has_null: bool) {
+        use crate::scalar::bloomfilter::{
+            BLOOMFILTER_FILENAME, BLOOMFILTER_ITEM_META_KEY, BLOOMFILTER_PROBABILITY_META_KEY,
+        };
+        use arrow_array::BooleanArray;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("fragment_id", DataType::UInt64, false),
+            Field::new("zone_start", DataType::UInt64, false),
+            Field::new("zone_length", DataType::UInt64, false),
+            Field::new("has_null", DataType::Boolean, false),
+            Field::new("bloom_filter_data", DataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![0u64])) as _,
+                Arc::new(UInt64Array::from(vec![3u64])) as _,
+                Arc::new(BooleanArray::from(vec![has_null])) as _,
+                Arc::new(arrow_array::BinaryArray::from_vec(vec![b"".as_ref()])) as _,
+            ],
+        )
+        .unwrap();
+        let mut file_schema = schema.as_ref().clone();
+        file_schema
+            .metadata
+            .insert(BLOOMFILTER_ITEM_META_KEY.to_string(), "1000".to_string());
+        file_schema.metadata.insert(
+            BLOOMFILTER_PROBABILITY_META_KEY.to_string(),
+            "0.01".to_string(),
+        );
+        let mut writer = store
+            .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
+            .await
+            .unwrap();
+        writer.write_record_batch(batch).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    // Updating a legacy (null_rows = None) index must not silently treat None as
+    // "no nulls".  The bug: `self.null_rows.clone().unwrap_or_default()` collapses
+    // None into an empty RowAddrTreeMap; after the merge the updated index has
+    // `null_rows = Some(empty)`, so an IsNull search returns `exact(empty)` — a
+    // false negative even though the legacy zone recorded has_null = true.
+    #[tokio::test]
+    async fn test_update_legacy_none_null_rows_not_treated_as_no_nulls() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Write a legacy-format index (no null bitmap) with has_null=true in its zone.
+        write_legacy_bloomfilter(store.as_ref(), true).await;
+
+        let index = BloomFilterIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(
+            index.null_rows.is_none(),
+            "precondition: legacy null_rows is None"
+        );
+
+        // Update with new data from fragment 1 (no nulls).  The destination is the
+        // same store so we can reload from it afterwards.
+        let new_schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let new_batch = RecordBatch::try_new(
+            new_schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int32Array::from(vec![
+                    Some(10i32),
+                    Some(20),
+                    Some(30),
+                ])) as _,
+                Arc::new(UInt64Array::from_iter_values(
+                    (0u64..3).map(|i| (1u64 << 32) | i),
+                )) as _,
+            ],
+        )
+        .unwrap();
+        let new_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            new_schema,
+            stream::once(std::future::ready(Ok(new_batch))),
+        ));
+
+        index
+            .update(new_stream, store.as_ref(), None)
+            .await
+            .unwrap();
+
+        let updated_index = BloomFilterIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        // The legacy zone had has_null=true, so there ARE nulls at unknown positions.
+        // An IsNull search on the updated index must NOT claim "no nulls" (exact empty).
+        // It must be conservative and return AtMost, falling back to the has_null scan.
+        let result = updated_index
+            .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        // With the bug: null_rows = Some(empty) → returns exact(empty) ← FALSE NEGATIVE
+        // With the fix: null_rows = None        → falls through to has_null scan → AtMost
+        assert!(
+            !result.is_exact(),
+            "IsNull on an updated legacy index must not return exact(empty); \
+             the legacy zone had has_null=true so nulls exist at unknown positions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_bloomfilter_no_null_bitmap() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        write_legacy_bloomfilter(store.as_ref(), true).await;
+
+        let index = BloomFilterIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .expect("failed to load legacy bloomfilter");
+
+        assert!(
+            index.null_rows.is_none(),
+            "legacy index should have no null bitmap"
+        );
+
+        // IS NULL should fall back to the has_null zone scan and return AtMost, not Exact.
+        let result = index
+            .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            !result.is_exact(),
+            "IS NULL on a legacy index should not be exact"
+        );
     }
 }

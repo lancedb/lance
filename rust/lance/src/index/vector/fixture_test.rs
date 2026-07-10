@@ -5,10 +5,10 @@
 
 #[cfg(test)]
 mod test {
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::{
         any::Any,
         cell::OnceCell,
-        collections::HashMap,
         sync::{Arc, Mutex},
     };
 
@@ -69,10 +69,6 @@ mod test {
         /// Cast to [Index]
         fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
             self
-        }
-
-        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-            Ok(self)
         }
 
         async fn prewarm(&self) -> Result<()> {
@@ -153,7 +149,7 @@ mod test {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 

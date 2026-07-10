@@ -18,8 +18,9 @@ comparison is skipped rather than failed (uninformative, not a regression). FTS 
 "ignore the index" mode to diff against, so its oracle reconstructs ground truth from a
 full scan: tokenize every live row, then require an FTS search for a spread of sampled
 terms to return exactly the rows that contain them. The FTS scenarios run under both
-on-disk format versions (LANCE_FTS_FORMAT_VERSION 1 and 2), which take different merge
-paths.
+on-disk format versions (1 and 2), which take different merge paths. New Lance versions
+pin this with the create-index `format_version` parameter; old Lance versions still use
+`LANCE_FTS_FORMAT_VERSION`.
 
 The op vocabulary and bounds are deliberately small so the search is runnable; this is
 exhaustive over the maintenance-lifecycle grammar up to the configured lengths, not over
@@ -63,11 +64,12 @@ ALL_KINDS = ["INVERTED", *SCALAR_KINDS]
 class IndexScenario:
     """A picklable, kind-parameterized scenario run across a version split."""
 
-    def __init__(self, kind, path, setup_ops, exercise_ops):
+    def __init__(self, kind, path, setup_ops, exercise_ops, fts_version=None):
         self.kind = kind
         self.path = str(path)
         self.setup_ops = list(setup_ops)
         self.exercise_ops = list(exercise_ops)
+        self.fts_version = fts_version
         self.next_idx = 0
 
     # --- in-venv helpers (only lance + pyarrow available) ---
@@ -123,6 +125,8 @@ class IndexScenario:
 
     def _op_I(self):
         kwargs = {"with_position": True} if self.kind == "INVERTED" else {}
+        if self.kind == "INVERTED" and self.fts_version is not None:
+            kwargs["format_version"] = int(self.fts_version)
         self._open().create_scalar_index("key", self._index_type(), **kwargs)
 
     def _op_D(self):
@@ -234,9 +238,10 @@ def search(
     """Search index-maintenance sequences up to `max_length` ops for one `kind`, across
     (from_ref -> to_ref). Runs only scenarios in this shard (i % num_shards == shard) so
     the space can be split across parallel workers. For INVERTED, `fts_version` ("1" or
-    "2") pins the on-disk FTS format (LANCE_FTS_FORMAT_VERSION) on both sides; both are
-    Fst token sets and exercise distinct merge paths. Returns failures; stops on the
-    first when `stop_on_first`."""
+    "2") pins the on-disk FTS format on both sides. New Lance versions receive this
+    through the create-index parameter and old Lance versions receive it through
+    LANCE_FTS_FORMAT_VERSION. Both are Fst token sets and exercise distinct merge paths.
+    Returns failures; stops on the first when `stop_on_first`."""
     from_venv = venv_factory.get_venv(from_ref)
     to_venv = venv_factory.get_venv(to_ref)
     env = {}
@@ -256,7 +261,7 @@ def search(
             if key not in snapshots:
                 snap = base / f"snap_{kind}_{len(snapshots)}"
                 shutil.rmtree(snap, ignore_errors=True)
-                builder = IndexScenario(kind, snap, setup_tail, [])
+                builder = IndexScenario(kind, snap, setup_tail, [], fts_version)
                 try:
                     next_idx = from_venv.execute_method(builder, "setup", env)
                     snapshots[key] = (snap, next_idx)
@@ -277,7 +282,7 @@ def search(
             ex_path = base / f"ex_{kind}_{i}"
             shutil.rmtree(ex_path, ignore_errors=True)
             shutil.copytree(snap, ex_path)
-            scenario = IndexScenario(kind, ex_path, setup_tail, exercise)
+            scenario = IndexScenario(kind, ex_path, setup_tail, exercise, fts_version)
             scenario.next_idx = next_idx
             label = describe(kind, from_ref, to_ref, setup_tail, exercise, fts_version)
             try:

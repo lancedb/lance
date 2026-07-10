@@ -41,6 +41,9 @@ Key technical traits: async-first (tokio), Arrow-native, versioned writes with m
 * Coverage: `cargo +nightly llvm-cov -q -p <crate> --branch`
 * Coverage HTML: `cargo +nightly llvm-cov -q -p <crate> --branch --html`
 * Coverage for file: `python ci/coverage.py -p <crate> -f <file_path>`
+* Use repository-defined Cargo profiles instead of ad hoc LTO overrides.
+* Use `release-with-debug` for benchmarks and profiling so optimized builds keep debug symbols without a rebuild.
+* Use `release-no-lto` only for local debugging, IO-bound benchmarks, or compile-time-sensitive performance investigation where LTO would not affect the measured bottleneck.
 
 ### Python / Java
 
@@ -97,6 +100,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 
 - Prefer implementing functionality with the standard library or existing workspace dependencies before adding new external crates.
 - Keep `Cargo.lock` changes intentional; revert unrelated dependency bumps. Pin broken deps with a comment linking the upstream issue.
+- The repo has three lockfiles: the root `Cargo.lock`, `python/Cargo.lock`, and `java/lance-jni/Cargo.lock` (the latter two are excluded from the workspace). A `workspace.dependencies` change must be reflected in all three — refresh the excluded ones with `cargo check --manifest-path python/Cargo.toml` and `cargo check --manifest-path java/lance-jni/Cargo.toml`, then commit the updated lockfiles. The `cargo-lock-sync` pre-commit hook catches a miss offline.
 - Gate optional/domain-specific deps behind Cargo feature flags. Prefer separate crates for domain functionality (geo, NLP).
 
 ## Testing Standards

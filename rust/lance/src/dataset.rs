@@ -42,7 +42,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
+    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -100,6 +101,7 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
+use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
 use crate::dataset::branch_location::BranchLocation;
@@ -453,6 +455,12 @@ impl Dataset {
         self.refs.tags()
     }
 
+    /// A handle for cheap, index-derived statistics about this dataset (e.g. a
+    /// column's global value range) that never scan data.
+    pub fn statistics(&self) -> DatasetStatistics<'_> {
+        DatasetStatistics::new(self)
+    }
+
     pub fn branches(&self) -> Branches<'_> {
         self.refs.branches()
     }
@@ -591,7 +599,7 @@ impl Dataset {
             return Ok(self.clone());
         }
 
-        let manifest = Self::load_manifest(
+        let manifest = Self::get_manifest(
             self.object_store.as_ref(),
             &manifest_location,
             &new_location.uri,
@@ -617,7 +625,7 @@ impl Dataset {
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
-            Arc::new(manifest),
+            manifest,
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -654,6 +662,24 @@ impl Dataset {
                     }
                     _ => Error::io_source(err.into()),
                 })?;
+
+        // A stale cached size yields a bogus footer offset. Detect it (the block
+        // lacks the trailing magic) and retry with the true size, like
+        // read_manifest.
+        if manifest_location.size.is_some() && !last_block.ends_with(MAGIC) {
+            let manifest_location = ManifestLocation {
+                size: None,
+                ..manifest_location.clone()
+            };
+            return Box::pin(Self::load_manifest(
+                object_store,
+                &manifest_location,
+                uri,
+                session,
+            ))
+            .await;
+        }
+
         let offset = read_metadata_offset(&last_block)?;
 
         // If manifest is in the last block, we can decode directly from memory.
@@ -731,6 +757,35 @@ impl Dataset {
         Ok(manifest)
     }
 
+    /// Fetch the manifest for `manifest_location` from the session metadata
+    /// cache, loading and caching it on a miss.
+    pub(crate) async fn get_manifest(
+        object_store: &ObjectStore,
+        manifest_location: &ManifestLocation,
+        uri: &str,
+        session: &Session,
+    ) -> Result<Arc<Manifest>> {
+        if manifest_location.size.is_none() {
+            return Ok(Arc::new(
+                Self::load_manifest(object_store, manifest_location, uri, session).await?,
+            ));
+        }
+        let metadata_cache = session.metadata_cache.for_dataset(uri);
+        let manifest_key = ManifestKey {
+            version: manifest_location.version,
+            e_tag: manifest_location.e_tag.as_deref(),
+        };
+        if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+            return Ok(cached);
+        }
+        let loaded =
+            Arc::new(Self::load_manifest(object_store, manifest_location, uri, session).await?);
+        metadata_cache
+            .insert_with_key(&manifest_key, loaded.clone())
+            .await;
+        Ok(loaded)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn checkout_manifest(
         object_store: Arc<ObjectStore>,
@@ -756,6 +811,11 @@ impl Dataset {
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
+        write::log_unregistered_base_scoped_options(
+            store_params.as_ref(),
+            &manifest.base_paths,
+            log::Level::Debug,
+        );
         Ok(Self {
             object_store,
             base: base_path,
@@ -1836,21 +1896,26 @@ impl Dataset {
         store_params
     }
 
-    fn store_params_for_base(
+    pub(crate) fn store_params_for_base(
         &self,
         base_path: Option<&lance_table::format::BasePath>,
     ) -> ObjectStoreParams {
         // Base-specific bindings are exact ObjectStoreParams keyed by
-        // `BasePath.path`. If a base has no explicit binding then reads fall back
-        // to the dataset-level default store params.
-        base_path
-            .and_then(|base_path| {
-                self.base_store_params
-                    .as_ref()
-                    .and_then(|params| params.get(&base_path.path))
-            })
-            .cloned()
-            .unwrap_or_else(|| self.store_params.as_deref().cloned().unwrap_or_default())
+        // `BasePath.path` and are used as-is. Otherwise the dataset-level
+        // default params are resolved for the base scope: `base_<id>.<key>`
+        // storage options overlay the shared defaults for that base.
+        if let Some(params) = base_path.and_then(|base_path| {
+            self.base_store_params
+                .as_ref()
+                .and_then(|params| params.get(&base_path.path))
+        }) {
+            return params.clone();
+        }
+        let default_params = self.store_params.as_deref().cloned().unwrap_or_default();
+        match default_params.scoped_to_base(base_path.map(|base_path| base_path.id)) {
+            Cow::Owned(scoped_params) => scoped_params,
+            Cow::Borrowed(_) => default_params,
+        }
     }
 
     /// Returns the initial storage options used when opening this dataset, if any.
@@ -1974,58 +2039,215 @@ impl Dataset {
             file_metadata.minor_version as u32,
         )?;
 
-        // Get top-level column names from file schema in file order
-        let column_names: Vec<&str> = file_metadata
-            .file_schema
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect();
-
-        // Project dataset schema by file column names to get dataset field IDs
-        let projected_ds_schema = self.schema().project(&column_names)?;
-
-        // Walk both schemas in parallel to build fields and column_indices
         let is_structural = file_version >= LanceFileVersion::V2_1;
-        let ds_fields: Vec<_> = projected_ds_schema.fields_pre_order().collect();
-        let file_fields: Vec<_> = file_metadata.file_schema.fields_pre_order().collect();
+        let physical_columns = file_metadata.column_metadatas.len();
+        let has_footer_orphans = file_metadata.file_schema.fields.len() > physical_columns;
+        let dataset_schema = self.schema();
+        let mut represented_columns = 0usize;
+        let mut column_names = Vec::new();
+        let mut consumed_top_level_fields = 0usize;
 
-        if ds_fields.len() != file_fields.len() {
+        fn physical_column_count(
+            field: &lance_core::datatypes::Field,
+            is_structural: bool,
+        ) -> usize {
+            if !is_structural {
+                return 1 + field
+                    .children
+                    .iter()
+                    .map(|child| physical_column_count(child, is_structural))
+                    .sum::<usize>();
+            }
+
+            if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
+                1
+            } else {
+                field
+                    .children
+                    .iter()
+                    .map(|child| physical_column_count(child, is_structural))
+                    .sum()
+            }
+        }
+
+        fn field_contains_blob(field: &lance_core::datatypes::Field) -> bool {
+            field.is_blob() || field.children.iter().any(field_contains_blob)
+        }
+
+        fn field_names_match(
+            fields: &[lance_core::datatypes::Field],
+            start: usize,
+            names: &[&str],
+        ) -> bool {
+            fields
+                .get(start..start + names.len())
+                .is_some_and(|candidate| {
+                    candidate
+                        .iter()
+                        .zip(names)
+                        .all(|(field, name)| field.name == *name)
+                })
+        }
+
+        fn blob_descriptor_orphan_len(
+            fields: &[lance_core::datatypes::Field],
+            start: usize,
+        ) -> usize {
+            const BLOB_V2_DESCRIPTOR_FIELDS: &[&str] =
+                &["kind", "position", "size", "blob_id", "blob_uri"];
+            const BLOB_V1_DESCRIPTOR_FIELDS: &[&str] = &["position", "size"];
+
+            if field_names_match(fields, start, BLOB_V2_DESCRIPTOR_FIELDS) {
+                BLOB_V2_DESCRIPTOR_FIELDS.len()
+            } else if field_names_match(fields, start, BLOB_V1_DESCRIPTOR_FIELDS) {
+                BLOB_V1_DESCRIPTOR_FIELDS.len()
+            } else {
+                0
+            }
+        }
+
+        fn collect_columns(
+            field: &lance_core::datatypes::Field,
+            is_structural: bool,
+            fields: &mut Vec<i32>,
+            column_indices: &mut Vec<i32>,
+            curr_column_idx: &mut i32,
+        ) {
+            let contributes = !is_structural
+                || field.children.is_empty()
+                || field.is_blob()
+                || field.is_packed_struct();
+            let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
+
+            if contributes {
+                fields.push(field.id);
+                column_indices.push(*curr_column_idx);
+                *curr_column_idx += 1;
+            }
+
+            if recurse {
+                for child in &field.children {
+                    collect_columns(
+                        child,
+                        is_structural,
+                        fields,
+                        column_indices,
+                        curr_column_idx,
+                    );
+                }
+            }
+        }
+
+        fn validate_file_field_matches_dataset(
+            dataset_field: &lance_core::datatypes::Field,
+            file_field: &lance_core::datatypes::Field,
+            path: &str,
+        ) -> Result<()> {
+            if dataset_field.name != file_field.name {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: expected field '{}' but file has '{}'",
+                    path, file_field.name
+                )));
+            }
+
+            if dataset_field.is_blob() && file_field.is_blob() {
+                return Ok(());
+            }
+
+            if dataset_field.children.len() != file_field.children.len() {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: field '{}' has {} children in dataset schema but {} children in file schema",
+                    path,
+                    dataset_field.children.len(),
+                    file_field.children.len()
+                )));
+            }
+
+            for (dataset_child, file_child) in
+                dataset_field.children.iter().zip(&file_field.children)
+            {
+                let child_path = format!("{}.{}", path, dataset_child.name);
+                validate_file_field_matches_dataset(dataset_child, file_child, &child_path)?;
+            }
+
+            Ok(())
+        }
+
+        let file_schema_fields = &file_metadata.file_schema.fields;
+        let mut idx = 0usize;
+        while represented_columns < physical_columns {
+            let Some(field) = file_schema_fields.get(idx) else {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: file schema ended after representing {} physical columns but file has {} columns",
+                    represented_columns, physical_columns
+                )));
+            };
+
+            let Some(dataset_field) = dataset_schema.field(&field.name) else {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: file has extra field '{}'",
+                    field.name
+                )));
+            };
+            validate_file_field_matches_dataset(dataset_field, field, &field.name)?;
+
+            represented_columns += physical_column_count(field, is_structural);
+            column_names.push(field.name.as_str());
+            consumed_top_level_fields = idx + 1;
+            idx += 1;
+
+            if has_footer_orphans && field_contains_blob(field) {
+                loop {
+                    let skipped = blob_descriptor_orphan_len(file_schema_fields, idx);
+                    if skipped == 0 {
+                        break;
+                    }
+                    consumed_top_level_fields = idx + skipped;
+                    idx += skipped;
+                }
+            }
+        }
+
+        if represented_columns != physical_columns {
             return Err(Error::invalid_input(format!(
-                "Schema mismatch: dataset projection has {} fields but file has {} fields",
-                ds_fields.len(),
-                file_fields.len()
+                "Schema mismatch: file schema represents {} physical columns but file has {} columns",
+                represented_columns, physical_columns
             )));
         }
+
+        if let Some(field) = file_schema_fields.get(consumed_top_level_fields) {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: file has extra field '{}'",
+                field.name
+            )));
+        }
+
+        let projected_ds_schema = self.schema().project(&column_names)?;
 
         let mut fields = Vec::new();
         let mut column_indices = Vec::new();
         let mut curr_column_idx: i32 = 0;
-        let mut packed_struct_fields_num: usize = 0;
+        for field in &projected_ds_schema.fields {
+            collect_columns(
+                field,
+                is_structural,
+                &mut fields,
+                &mut column_indices,
+                &mut curr_column_idx,
+            );
+        }
 
-        for (ds_field, file_field) in ds_fields.iter().zip(file_fields.iter()) {
-            if ds_field.name != file_field.name {
-                return Err(Error::invalid_input(format!(
-                    "Schema mismatch: expected field '{}' but file has '{}'",
-                    ds_field.name, file_field.name
-                )));
-            }
+        if curr_column_idx as usize != physical_columns {
+            return Err(Error::invalid_input(format!(
+                "Schema mismatch: dataset projection maps to {} physical columns but file has {} columns",
+                curr_column_idx, physical_columns
+            )));
+        }
 
-            if packed_struct_fields_num > 0 {
-                packed_struct_fields_num -= 1;
-                continue;
-            }
-
-            if file_field.is_packed_struct() {
-                fields.push(ds_field.id);
-                column_indices.push(curr_column_idx);
-                curr_column_idx += 1;
-                packed_struct_fields_num = file_field.children.len();
-            } else if file_field.children.is_empty() || !is_structural {
-                fields.push(ds_field.id);
-                column_indices.push(curr_column_idx);
-                curr_column_idx += 1;
-            }
+        if fields.is_empty() && physical_columns > 0 {
+            return Err(Error::invalid_input(
+                "Schema mismatch: file has columns but none matched the dataset schema",
+            ));
         }
 
         let file_size_nz = NonZero::new(file_size);
@@ -2043,7 +2265,7 @@ impl Dataset {
     /// Resolve the data directory for a given base_id.
     ///
     /// If `base_id` is `None`, returns the default data directory.
-    fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
+    pub(crate) fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
         match base_id {
             Some(base_id) => {
                 let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
@@ -2557,7 +2779,7 @@ impl Dataset {
                     self.manifest_location.path.clone(),
                     format!(
                         "Duplicate index id {} found in dataset {:?}",
-                        &index.uuid, self.base
+                        index.uuid, self.base
                     ),
                 ));
             }
@@ -2904,30 +3126,13 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let manifest_key = ManifestKey {
-                    version: location.version,
-                    e_tag: location.e_tag.as_deref(),
-                };
-                let manifest = if let Some(cached) =
-                    dataset.metadata_cache.get_with_key(&manifest_key).await
-                {
-                    cached
-                } else {
-                    let loaded = Arc::new(
-                        Dataset::load_manifest(
-                            dataset.object_store.as_ref(),
-                            &location,
-                            &dataset.uri,
-                            dataset.session.as_ref(),
-                        )
-                        .await?,
-                    );
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&manifest_key, loaded.clone())
-                        .await;
-                    loaded
-                };
+                let manifest = Dataset::get_manifest(
+                    dataset.object_store.as_ref(),
+                    &location,
+                    &dataset.uri,
+                    dataset.session.as_ref(),
+                )
+                .await?;
 
                 if let Some(latest_tx) = latest_tx {
                     // We ignore the error, since we don't care if the receiver is dropped.

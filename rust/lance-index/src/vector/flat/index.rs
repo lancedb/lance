@@ -4,7 +4,8 @@
 //! Flat Vector Index.
 //!
 
-use std::collections::{BinaryHeap, HashMap};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -312,7 +313,7 @@ impl IvfSubIndex for FlatIndex {
         Ok(Self {})
     }
 
-    fn remap(&self, _: &HashMap<u64, Option<u64>>, _: &impl VectorStore) -> Result<Self> {
+    fn remap(&self, _: &RowAddrRemap, _: &impl VectorStore) -> Result<Self> {
         Ok(self.clone())
     }
 
@@ -569,7 +570,7 @@ mod tests {
             .zip(dists.values().iter())
             .map(|(row_id, dist)| (*row_id, *dist))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 
@@ -578,7 +579,7 @@ mod tests {
             .into_iter()
             .map(|node| (node.id, node.dist.0))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 

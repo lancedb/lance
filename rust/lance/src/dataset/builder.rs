@@ -305,6 +305,14 @@ impl DatasetBuilder {
     /// - [Azure options](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfigKey.html#variants)
     /// - [S3 options](https://docs.rs/object_store/latest/object_store/aws/enum.AmazonS3ConfigKey.html#variants)
     /// - [Google options](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html#variants)
+    ///
+    /// For datasets with additional registered base paths, a key of the form
+    /// `base_<id>.<key>` applies `<key>` only to the base path with that
+    /// manifest id, overriding the unscoped options that every base inherits.
+    /// For example `base_1.account_key = abc` makes base 1 use
+    /// `account_key = abc` while all other options are shared. Exact per-base
+    /// bindings set via [`Self::with_base_store_params`] take precedence over
+    /// base-scoped keys.
     pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
         // Merge with existing options if accessor exists, otherwise create new static accessor
         if let Some(existing) = self.options.storage_options_accessor.take() {
@@ -459,8 +467,9 @@ impl DatasetBuilder {
     ///
     /// These params are not persisted in the manifest. They are used as-is
     /// whenever the dataset resolves an object store for the given
-    /// `BasePath.path`. Dataset-level store params remain the fallback for bases
-    /// without an explicit binding.
+    /// `BasePath.path`, taking precedence over `base_<id>.<key>` storage
+    /// options (see [`Self::with_storage_options`]). Dataset-level store params
+    /// remain the fallback for bases without an explicit binding.
     pub fn with_base_store_params(
         mut self,
         base_path: impl AsRef<str>,
@@ -833,7 +842,7 @@ impl DatasetBuilder {
                 let reader = object_store.open(&location.path).await?;
                 populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }
-            (manifest, location)
+            (Arc::new(manifest), location)
         } else {
             let manifest_location = match version_number {
                 Some(version) => {
@@ -866,7 +875,8 @@ impl DatasetBuilder {
                         _ => e,
                     })?,
             };
-            let manifest = Dataset::load_manifest(
+
+            let manifest = Dataset::get_manifest(
                 &object_store,
                 &manifest_location,
                 &table_uri,
@@ -880,7 +890,7 @@ impl DatasetBuilder {
             object_store,
             base_path,
             table_uri,
-            Arc::new(manifest),
+            manifest,
             location,
             session,
             commit_handler,

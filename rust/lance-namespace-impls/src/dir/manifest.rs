@@ -31,7 +31,7 @@ use lance::session::Session;
 use lance::{Dataset, dataset::scanner::Scanner};
 use lance_core::Error as LanceError;
 use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION;
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ID, Result, box_error};
 use lance_index::progress::noop_progress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -42,6 +42,8 @@ use lance_io::stream::RecordBatchStream as LanceRecordBatchStream;
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{
+    AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
+    AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest, CreateTableResponse,
     DeclareTableRequest, DeclareTableResponse, DeregisterTableRequest, DeregisterTableResponse,
     DescribeNamespaceRequest, DescribeNamespaceResponse, DescribeTableRequest,
@@ -850,7 +852,60 @@ impl ManifestNamespace {
             Self::ensure_manifest_table_up_to_date(&root, &storage_options, session.clone())
                 .await?;
 
-        Ok(Self {
+        Ok(Self::new(
+            root,
+            storage_options,
+            session,
+            object_store,
+            base_path,
+            manifest_dataset,
+            dir_listing_enabled,
+            inline_optimization_enabled,
+            commit_retries,
+        ))
+    }
+
+    /// Open an existing manifest dataset without creating or migrating it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_from_directory(
+        root: String,
+        storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        dir_listing_enabled: bool,
+        inline_optimization_enabled: bool,
+        commit_retries: Option<u32>,
+    ) -> Result<Self> {
+        let manifest_dataset =
+            Self::open_manifest_table(&root, &storage_options, session.clone()).await?;
+
+        Ok(Self::new(
+            root,
+            storage_options,
+            session,
+            object_store,
+            base_path,
+            manifest_dataset,
+            dir_listing_enabled,
+            inline_optimization_enabled,
+            commit_retries,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        root: String,
+        storage_options: Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        manifest_dataset: DatasetConsistencyWrapper,
+        dir_listing_enabled: bool,
+        inline_optimization_enabled: bool,
+        commit_retries: Option<u32>,
+    ) -> Self {
+        Self {
             root,
             storage_options,
             session,
@@ -861,7 +916,7 @@ impl ManifestNamespace {
             inline_optimization_enabled,
             commit_retries,
             manifest_mutation_lock: Arc::new(Mutex::new(())),
-        })
+        }
     }
 
     /// Build object ID from namespace path and name
@@ -1177,10 +1232,21 @@ impl ManifestNamespace {
         index_uuid: Uuid,
     ) -> Result<ManifestTrainedIndex> {
         let index_store = LanceIndexStore::from_dataset_for_new(dataset, &index_uuid)?;
-        let plugin = registry.get_plugin_by_name(&input.params.index_type)?;
-        let training_request = plugin
+        let trainer = registry
+            .get_plugin_by_name(&input.params.index_type)?
+            .basic_trainer()
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input_source(
+                    format!(
+                        "The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.",
+                        input.params.index_type
+                    )
+                    .into(),
+                )
+            })?;
+        let training_request = trainer
             .new_training_request(input.params.params.as_deref().unwrap_or("{}"), &input.field)?;
-        let created_index = plugin
+        let created_index = trainer
             .train_index(
                 input.stream,
                 &index_store,
@@ -2398,6 +2464,37 @@ impl ManifestNamespace {
         Ok(found_result)
     }
 
+    /// Load an existing manifest dataset without creating or migrating it.
+    async fn open_manifest_table(
+        root: &str,
+        storage_options: &Option<HashMap<String, String>>,
+        session: Option<Arc<Session>>,
+    ) -> Result<DatasetConsistencyWrapper> {
+        let manifest_path = format!("{}/{}", root, MANIFEST_TABLE_NAME);
+        log::debug!("Attempting to load manifest from {}", manifest_path);
+        let store_options = ObjectStoreParams {
+            storage_options_accessor: storage_options.as_ref().map(|opts| {
+                Arc::new(
+                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                        opts.clone(),
+                    ),
+                )
+            }),
+            ..Default::default()
+        };
+        let read_params = ReadParams {
+            session,
+            store_options: Some(store_options),
+            ..Default::default()
+        };
+        let dataset = DatasetBuilder::from_uri(&manifest_path)
+            .with_read_params(read_params)
+            .load()
+            .await?;
+        ensure_readable(dataset.metadata())?;
+        Ok(DatasetConsistencyWrapper::new(dataset))
+    }
+
     /// Create or load the manifest dataset, ensuring it has the latest schema setup.
     ///
     /// This function will:
@@ -2430,129 +2527,135 @@ impl ManifestNamespace {
             .with_read_params(read_params)
             .load()
             .await;
-        if let Ok(mut dataset) = dataset_result {
-            // Reject a manifest written with a reader feature flag this build
-            // does not understand before touching it.
-            ensure_readable(dataset.metadata())?;
+        match dataset_result {
+            Ok(mut dataset) => {
+                // Reject a manifest written with a reader feature flag this build
+                // does not understand before touching it.
+                ensure_readable(dataset.metadata())?;
 
-            // Check if the object_id field has primary key metadata, migrate if not
-            let needs_pk_migration = dataset
-                .schema()
-                .field("object_id")
-                .map(|f| {
-                    !f.metadata
-                        .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
-                })
-                .unwrap_or(false);
+                // Check if the object_id field has primary key metadata, migrate if not
+                let needs_pk_migration = dataset
+                    .schema()
+                    .field("object_id")
+                    .map(|f| {
+                        !f.metadata
+                            .contains_key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+                    })
+                    .unwrap_or(false);
 
-            if needs_pk_migration {
-                // This legacy migration writes to the manifest, so confirm this
-                // build is allowed to write the current format first.
-                ensure_writable(dataset.metadata())?;
-                log::info!("Migrating __manifest table to add primary key metadata on object_id");
-                dataset
-                    .update_field_metadata()
-                    .update("object_id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
-                    .map_err(|e| {
-                        lance_core::Error::from(NamespaceError::Internal {
-                            message: format!(
-                                "Failed to find object_id field for migration: {:?}",
-                                e
-                            ),
-                        })
-                    })?
-                    .await
-                    .map_err(|e| {
-                        lance_core::Error::from(NamespaceError::Internal {
-                            message: format!("Failed to migrate primary key metadata: {:?}", e),
-                        })
-                    })?;
-            }
-
-            Ok(DatasetConsistencyWrapper::new(dataset))
-        } else {
-            log::info!("Creating new manifest table at {}", manifest_path);
-            let schema = Self::manifest_schema();
-            let empty_batch = RecordBatch::new_empty(schema.clone());
-            let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
-
-            let store_params = ObjectStoreParams {
-                storage_options_accessor: storage_options.as_ref().map(|opts| {
-                    Arc::new(
-                        lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                            opts.clone(),
-                        ),
-                    )
-                }),
-                ..Default::default()
-            };
-            let write_params = WriteParams {
-                session: session.clone(),
-                store_params: Some(store_params),
-                ..Default::default()
-            };
-
-            let dataset =
-                Dataset::write(Box::new(reader), &manifest_path, Some(write_params)).await;
-
-            // Handle race condition where another process created the manifest concurrently
-            match dataset {
-                Ok(dataset) => {
+                if needs_pk_migration {
+                    // This legacy migration writes to the manifest, so confirm this
+                    // build is allowed to write the current format first.
+                    ensure_writable(dataset.metadata())?;
                     log::info!(
-                        "Successfully created manifest table at {}, version={}, uri={}",
-                        manifest_path,
-                        dataset.version().version,
-                        dataset.uri()
+                        "Migrating __manifest table to add primary key metadata on object_id"
                     );
-                    Ok(DatasetConsistencyWrapper::new(dataset))
-                }
-                Err(ref e)
-                    if matches!(
-                        e,
-                        LanceError::DatasetAlreadyExists { .. }
-                            | LanceError::CommitConflict { .. }
-                            | LanceError::IncompatibleTransaction { .. }
-                            | LanceError::RetryableCommitConflict { .. }
-                    ) =>
-                {
-                    // Another process created the manifest concurrently, try to load it
-                    log::info!(
-                        "Manifest table was created by another process, loading it: {}",
-                        manifest_path
-                    );
-                    let recovery_store_options = ObjectStoreParams {
-                        storage_options_accessor: storage_options.as_ref().map(|opts| {
-                            Arc::new(
-                                lance_io::object_store::StorageOptionsAccessor::with_static_options(
-                                    opts.clone(),
-                                ),
-                            )
-                        }),
-                        ..Default::default()
-                    };
-                    let recovery_read_params = ReadParams {
-                        session,
-                        store_options: Some(recovery_store_options),
-                        ..Default::default()
-                    };
-                    let dataset = DatasetBuilder::from_uri(&manifest_path)
-                        .with_read_params(recovery_read_params)
-                        .load()
-                        .await
+                    dataset
+                        .update_field_metadata()
+                        .update("object_id", [(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "0")])
                         .map_err(|e| {
                             lance_core::Error::from(NamespaceError::Internal {
                                 message: format!(
-                                    "Failed to load manifest dataset after creation conflict: {}",
+                                    "Failed to find object_id field for migration: {:?}",
                                     e
                                 ),
                             })
+                        })?
+                        .await
+                        .map_err(|e| {
+                            lance_core::Error::from(NamespaceError::Internal {
+                                message: format!("Failed to migrate primary key metadata: {:?}", e),
+                            })
                         })?;
-                    Ok(DatasetConsistencyWrapper::new(dataset))
                 }
-                Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
-                    message: format!("Failed to create manifest dataset: {:?}", e),
-                })),
+
+                Ok(DatasetConsistencyWrapper::new(dataset))
             }
+            Err(err) if Self::is_not_found_load_error(&err) => {
+                log::info!("Creating new manifest table at {}", manifest_path);
+                let schema = Self::manifest_schema();
+                let empty_batch = RecordBatch::new_empty(schema.clone());
+                let reader = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+
+                let store_params = ObjectStoreParams {
+                    storage_options_accessor: storage_options.as_ref().map(|opts| {
+                        Arc::new(
+                            lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                opts.clone(),
+                            ),
+                        )
+                    }),
+                    ..Default::default()
+                };
+                let write_params = WriteParams {
+                    session: session.clone(),
+                    store_params: Some(store_params),
+                    ..Default::default()
+                };
+
+                let dataset =
+                    Dataset::write(Box::new(reader), &manifest_path, Some(write_params)).await;
+
+                // Handle race condition where another process created the manifest concurrently
+                match dataset {
+                    Ok(dataset) => {
+                        log::info!(
+                            "Successfully created manifest table at {}, version={}, uri={}",
+                            manifest_path,
+                            dataset.version().version,
+                            dataset.uri()
+                        );
+                        Ok(DatasetConsistencyWrapper::new(dataset))
+                    }
+                    Err(ref e)
+                        if matches!(
+                            e,
+                            LanceError::DatasetAlreadyExists { .. }
+                                | LanceError::CommitConflict { .. }
+                                | LanceError::IncompatibleTransaction { .. }
+                                | LanceError::RetryableCommitConflict { .. }
+                        ) =>
+                    {
+                        // Another process created the manifest concurrently, try to load it
+                        log::info!(
+                            "Manifest table was created by another process, loading it: {}",
+                            manifest_path
+                        );
+                        let recovery_store_options = ObjectStoreParams {
+                            storage_options_accessor: storage_options.as_ref().map(|opts| {
+                                Arc::new(
+                                    lance_io::object_store::StorageOptionsAccessor::with_static_options(
+                                        opts.clone(),
+                                    ),
+                                )
+                            }),
+                            ..Default::default()
+                        };
+                        let recovery_read_params = ReadParams {
+                            session,
+                            store_options: Some(recovery_store_options),
+                            ..Default::default()
+                        };
+                        let dataset = DatasetBuilder::from_uri(&manifest_path)
+                            .with_read_params(recovery_read_params)
+                            .load()
+                            .await
+                            .map_err(|e| {
+                                lance_core::Error::from(NamespaceError::Internal {
+                                    message: format!(
+                                        "Failed to load manifest dataset after creation conflict: {}",
+                                        e
+                                    ),
+                                })
+                            })?;
+                        Ok(DatasetConsistencyWrapper::new(dataset))
+                    }
+                    Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
+                        message: format!("Failed to create manifest dataset: {:?}", e),
+                    })),
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -3563,6 +3666,174 @@ impl LanceNamespace for ManifestNamespace {
             location: Some(table_uri),
             ..Default::default()
         })
+    }
+
+    /// Add columns to a table.
+    ///
+    /// Converts the API `AddColumnsEntry` (SQL expressions) into Lance's
+    /// `NewColumnTransform::SqlExpressions` and delegates to `Dataset::add_columns`.
+    async fn alter_table_add_columns(
+        &self,
+        request: AlterTableAddColumnsRequest,
+    ) -> Result<AlterTableAddColumnsResponse> {
+        let table_id = request
+            .id
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input_source("Table ID is required".into()))?;
+
+        if table_id.is_empty() {
+            return Err(Error::invalid_input_source(
+                "Table ID cannot be empty".into(),
+            ));
+        }
+
+        let object_id = Self::str_object_id(table_id);
+        let table_info = self.query_manifest_for_table(&object_id).boxed().await?;
+
+        match table_info {
+            Some(info) => {
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                // Use DatasetBuilder with storage options to align with describe_table
+                // and to support custom storage backends (e.g. S3 with custom endpoints).
+                let mut builder = DatasetBuilder::from_uri(&table_uri);
+                if let Some(opts) = &self.storage_options {
+                    builder = builder.with_storage_options(opts.clone());
+                }
+                if let Some(session) = &self.session {
+                    builder = builder.with_session(session.clone());
+                }
+                let mut dataset = builder.load().await.map_err(|e| {
+                    Error::io_source(box_error(std::io::Error::other(format!(
+                        "Failed to open dataset: {}",
+                        e
+                    ))))
+                })?;
+
+                // Use shared helper to build SQL expressions, ensuring a clear error when expression is missing
+                let sql_expressions = super::build_sql_expressions(&request.new_columns)?;
+
+                dataset
+                    .add_columns(
+                        lance::dataset::NewColumnTransform::SqlExpressions(sql_expressions),
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        // Surface specific commit/conflict errors (CommitConflict,
+                        // RetryableCommitConflict, IncompatibleTransaction, ...) rather than
+                        // collapsing every failure into a generic IO error.
+                        convert_lance_commit_error(&e, "add_columns", Some(&object_id))
+                    })?;
+
+                let version = dataset.version().version as i64;
+                Ok(AlterTableAddColumnsResponse::new(version))
+            }
+            None => Err(NamespaceError::TableNotFound { message: object_id }.into()),
+        }
+    }
+
+    /// Alter columns in a table (rename, change type, change nullability).
+    ///
+    /// Converts the API `AlterColumnsEntry` into Lance's `ColumnAlteration`
+    /// and delegates to `Dataset::alter_columns`.
+    async fn alter_table_alter_columns(
+        &self,
+        request: AlterTableAlterColumnsRequest,
+    ) -> Result<AlterTableAlterColumnsResponse> {
+        let table_id = request
+            .id
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input_source("Table ID is required".into()))?;
+
+        if table_id.is_empty() {
+            return Err(Error::invalid_input_source(
+                "Table ID cannot be empty".into(),
+            ));
+        }
+
+        let object_id = Self::str_object_id(table_id);
+        let table_info = self.query_manifest_for_table(&object_id).boxed().await?;
+
+        match table_info {
+            Some(info) => {
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                let mut builder = DatasetBuilder::from_uri(&table_uri);
+                if let Some(opts) = &self.storage_options {
+                    builder = builder.with_storage_options(opts.clone());
+                }
+                if let Some(session) = &self.session {
+                    builder = builder.with_session(session.clone());
+                }
+                let mut dataset = builder.load().await.map_err(|e| {
+                    Error::io_source(box_error(std::io::Error::other(format!(
+                        "Failed to open dataset: {}",
+                        e
+                    ))))
+                })?;
+
+                // Use shared helper to build column alterations, ensuring a clear error when data_type conversion fails
+                let alterations = super::build_column_alterations(&request.alterations)?;
+
+                dataset.alter_columns(&alterations).await.map_err(|e| {
+                    convert_lance_commit_error(&e, "alter_columns", Some(&object_id))
+                })?;
+
+                let version = dataset.version().version as i64;
+                Ok(AlterTableAlterColumnsResponse::new(version))
+            }
+            None => Err(NamespaceError::TableNotFound { message: object_id }.into()),
+        }
+    }
+
+    /// Drop columns from a table.
+    ///
+    /// Delegates to `Dataset::drop_columns` with the column names from the request.
+    async fn alter_table_drop_columns(
+        &self,
+        request: AlterTableDropColumnsRequest,
+    ) -> Result<AlterTableDropColumnsResponse> {
+        let table_id = request
+            .id
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input_source("Table ID is required".into()))?;
+
+        if table_id.is_empty() {
+            return Err(Error::invalid_input_source(
+                "Table ID cannot be empty".into(),
+            ));
+        }
+
+        let object_id = Self::str_object_id(table_id);
+        let table_info = self.query_manifest_for_table(&object_id).boxed().await?;
+
+        match table_info {
+            Some(info) => {
+                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+                let mut builder = DatasetBuilder::from_uri(&table_uri);
+                if let Some(opts) = &self.storage_options {
+                    builder = builder.with_storage_options(opts.clone());
+                }
+                if let Some(session) = &self.session {
+                    builder = builder.with_session(session.clone());
+                }
+                let mut dataset = builder.load().await.map_err(|e| {
+                    Error::io_source(box_error(std::io::Error::other(format!(
+                        "Failed to open dataset: {}",
+                        e
+                    ))))
+                })?;
+
+                let columns: Vec<&str> = request.columns.iter().map(|s| s.as_str()).collect();
+                dataset.drop_columns(&columns).await.map_err(|e| {
+                    convert_lance_commit_error(&e, "drop_columns", Some(&object_id))
+                })?;
+
+                let version = dataset.version().version as i64;
+                Ok(AlterTableDropColumnsResponse::new(version))
+            }
+            None => Err(NamespaceError::TableNotFound { message: object_id }.into()),
+        }
     }
 }
 
@@ -5553,5 +5824,298 @@ mod tests {
         let next = ManifestNamespace::apply_pagination(&mut n, Some("b".to_string()), Some(2));
         assert_eq!(n, names(&["c", "d"]));
         assert_eq!(next, Some("d".to_string()));
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_add_columns(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{
+            AddColumnsEntry, AlterTableAddColumnsRequest, DescribeTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table with id and name columns
+        let buffer = create_test_ipc_data();
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["test_table".to_string()]);
+        dir_namespace
+            .create_table(create_request, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        // Add a new column using SQL expression
+        let mut new_col = AddColumnsEntry::new("doubled_id".to_string());
+        new_col.expression = Some(Some("id * 2".to_string()));
+        let mut add_request = AlterTableAddColumnsRequest::new(vec![new_col]);
+        add_request.id = Some(vec!["test_table".to_string()]);
+
+        let response = dir_namespace
+            .alter_table_add_columns(add_request)
+            .await
+            .unwrap();
+        // Version should have incremented
+        assert!(response.version > 1);
+
+        // Verify the column was added by describing the table with detailed metadata
+        let mut describe_request = DescribeTableRequest::new();
+        describe_request.id = Some(vec!["test_table".to_string()]);
+        describe_request.load_detailed_metadata = Some(true);
+        let describe_response = dir_namespace
+            .describe_table(describe_request)
+            .await
+            .unwrap();
+        assert!(describe_response.schema.is_some());
+
+        let schema = describe_response.schema.unwrap();
+        let field_names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            field_names.contains(&"doubled_id"),
+            "Column 'doubled_id' should exist after add_columns, got: {:?}",
+            field_names
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_add_columns_missing_id(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{AddColumnsEntry, AlterTableAddColumnsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Request without ID should fail
+        let new_col = AddColumnsEntry::new("col".to_string());
+        let request = AlterTableAddColumnsRequest::new(vec![new_col]);
+        let result = dir_namespace.alter_table_add_columns(request).await;
+        assert!(result.is_err(), "Should fail when table ID is missing");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_add_columns_nonexistent_table(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{AddColumnsEntry, AlterTableAddColumnsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Request with non-existent table should fail
+        let new_col = AddColumnsEntry::new("col".to_string());
+        let mut request = AlterTableAddColumnsRequest::new(vec![new_col]);
+        request.id = Some(vec!["nonexistent".to_string()]);
+        let result = dir_namespace.alter_table_add_columns(request).await;
+        assert!(result.is_err(), "Should fail when table does not exist");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_alter_columns_rename(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{
+            AlterColumnsEntry, AlterTableAlterColumnsRequest, DescribeTableRequest,
+        };
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table
+        let buffer = create_test_ipc_data();
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["test_table".to_string()]);
+        dir_namespace
+            .create_table(create_request, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        // Rename the "name" column to "full_name"
+        let mut entry = AlterColumnsEntry::new("name".to_string());
+        entry.rename = Some(Some("full_name".to_string()));
+        let mut alter_request = AlterTableAlterColumnsRequest::new(vec![entry]);
+        alter_request.id = Some(vec!["test_table".to_string()]);
+
+        let response = dir_namespace
+            .alter_table_alter_columns(alter_request)
+            .await
+            .unwrap();
+        assert!(response.version > 1);
+
+        // Verify the column was renamed
+        let mut describe_request = DescribeTableRequest::new();
+        describe_request.id = Some(vec!["test_table".to_string()]);
+        describe_request.load_detailed_metadata = Some(true);
+        let describe_response = dir_namespace
+            .describe_table(describe_request)
+            .await
+            .unwrap();
+        assert!(describe_response.schema.is_some());
+
+        let schema = describe_response.schema.unwrap();
+        let field_names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            field_names.contains(&"full_name"),
+            "Column should be renamed to 'full_name', got: {:?}",
+            field_names
+        );
+        assert!(
+            !field_names.contains(&"name"),
+            "Old column name 'name' should no longer exist, got: {:?}",
+            field_names
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_alter_columns_missing_id(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{AlterColumnsEntry, AlterTableAlterColumnsRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let entry = AlterColumnsEntry::new("name".to_string());
+        let request = AlterTableAlterColumnsRequest::new(vec![entry]);
+        let result = dir_namespace.alter_table_alter_columns(request).await;
+        assert!(result.is_err(), "Should fail when table ID is missing");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_drop_columns(#[case] inline_optimization: bool) {
+        use lance_namespace::models::{AlterTableDropColumnsRequest, DescribeTableRequest};
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        // Create a table with id and name columns
+        let buffer = create_test_ipc_data();
+        let mut create_request = CreateTableRequest::new();
+        create_request.id = Some(vec!["test_table".to_string()]);
+        dir_namespace
+            .create_table(create_request, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        // Drop the "name" column
+        let mut drop_request = AlterTableDropColumnsRequest::new(vec!["name".to_string()]);
+        drop_request.id = Some(vec!["test_table".to_string()]);
+
+        let response = dir_namespace
+            .alter_table_drop_columns(drop_request)
+            .await
+            .unwrap();
+        assert!(response.version > 1);
+
+        // Verify the column was dropped
+        let mut describe_request = DescribeTableRequest::new();
+        describe_request.id = Some(vec!["test_table".to_string()]);
+        describe_request.load_detailed_metadata = Some(true);
+        let describe_response = dir_namespace
+            .describe_table(describe_request)
+            .await
+            .unwrap();
+        assert!(describe_response.schema.is_some());
+
+        let schema = describe_response.schema.unwrap();
+        let field_names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(
+            !field_names.contains(&"name"),
+            "Column 'name' should have been dropped, got: {:?}",
+            field_names
+        );
+        assert!(
+            field_names.contains(&"id"),
+            "Column 'id' should still exist, got: {:?}",
+            field_names
+        );
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_drop_columns_missing_id(#[case] inline_optimization: bool) {
+        use lance_namespace::models::AlterTableDropColumnsRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let request = AlterTableDropColumnsRequest::new(vec!["col".to_string()]);
+        let result = dir_namespace.alter_table_drop_columns(request).await;
+        assert!(result.is_err(), "Should fail when table ID is missing");
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_alter_table_drop_columns_nonexistent_table(#[case] inline_optimization: bool) {
+        use lance_namespace::models::AlterTableDropColumnsRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .build()
+            .await
+            .unwrap();
+
+        let mut request = AlterTableDropColumnsRequest::new(vec!["col".to_string()]);
+        request.id = Some(vec!["nonexistent".to_string()]);
+        let result = dir_namespace.alter_table_drop_columns(request).await;
+        assert!(result.is_err(), "Should fail when table does not exist");
     }
 }

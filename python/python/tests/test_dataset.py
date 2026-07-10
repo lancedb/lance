@@ -964,6 +964,49 @@ def test_take_with_projection(tmp_path: Path):
     assert table3 == table2
 
 
+def test_take_with_json_column(tmp_path: Path):
+    """Test that take/take_rows return JSON columns in Arrow JSON format (Utf8).
+
+    Previously, take would return lance.json (LargeBinary) instead of
+    arrow.json (Utf8), which is the user-facing format.
+    """
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array(range(10), type=pa.int64()),
+            "meta": pa.array(
+                [f'{{"val":{i}}}' for i in range(10)],
+                type=json_type,
+            ),
+        }
+    )
+    base_dir = tmp_path / "test_take_json"
+    lance.write_dataset(data, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    # Dataset.take should return arrow.json type
+    result = dataset.take([2, 5, 8])
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":2}'
+    assert metas[1] == '{"val":5}'
+    assert metas[2] == '{"val":8}'
+
+    # Dataset._take_rows should also return arrow.json type
+    result = dataset._take_rows([0, 3, 9])
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":0}'
+    assert metas[1] == '{"val":3}'
+    assert metas[2] == '{"val":9}'
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1405,6 +1448,45 @@ def test_cleanup_old_versions(tmp_path):
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
+
+
+def test_explain_cleanup_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    before_versions = len(dataset.versions())
+
+    explanation = dataset.explain_cleanup_old_versions(
+        older_than=(datetime.now() - moment),
+        include_files=True,
+        max_files=1000,
+    )
+
+    assert explanation.read_version == dataset.version
+    assert explanation.stats.bytes_removed > 0
+    assert explanation.stats.old_versions == 1
+    assert explanation.candidate_files
+    assert not explanation.candidate_files_truncated
+    assert len(dataset.versions()) == before_versions
+
+    summary = dataset.explain_cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert summary.stats.old_versions == explanation.stats.old_versions
+    assert summary.candidate_files == []
+
+    with pytest.raises(ValueError, match="max_files must be positive"):
+        dataset.explain_cleanup_old_versions(
+            older_than=(datetime.now() - moment),
+            max_files=0,
+        )
+
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed == explanation.stats.bytes_removed
+    assert stats.old_versions == explanation.stats.old_versions
 
 
 def test_cleanup_error_when_tagged_old_versions(tmp_path):
@@ -2402,6 +2484,146 @@ def test_merge_insert_subcols(tmp_path: Path):
         }
     )
     assert dataset.to_table().sort_by("a") == expected
+
+
+def test_merge_insert_full_fragment_rewrite_json_e2e(tmp_path: Path):
+    """End-to-end test: merge_insert with JSON columns where ALL rows are updated.
+
+    This exercises the "all rows updated" fast path in handle_fragment which
+    bypasses the Updater and writes directly. Without proper JSON conversion,
+    Utf8 data (i32 offsets) is written with a LargeBinary schema (i64 offsets),
+    causing a decoder panic on subsequent reads:
+        "the offset of the new Buffer cannot exceed the existing Length:
+         slice offset=0 Length=N selfLen=N/2"
+
+    Conditions to trigger the fast path:
+    1. Subschema update (not all columns provided)
+    2. ALL rows in a fragment are matched/updated
+    3. data_storage_version = 2.2
+    """
+    import json
+
+    json_type = pa.json_()
+
+    # Create dataset with v2.2 storage format
+    initial_data = pa.table(
+        {
+            "unique_id": pa.array([f"id_{i}" for i in range(5)], type=pa.utf8()),
+            "coarse": pa.array(
+                [f'{{"original":{i}}}' for i in range(5)],
+                type=json_type,
+            ),
+            "score": pa.array(range(5), type=pa.int64()),
+        }
+    )
+    dataset = lance.write_dataset(
+        initial_data,
+        tmp_path / "e2e_json_rewrite",
+        data_storage_version="2.2",
+    )
+    assert dataset.count_rows() == 5
+    assert len(dataset.get_fragments()) == 1
+
+    # Subschema merge_insert: only provide [unique_id, coarse], update ALL rows
+    # This triggers: subschema → v1 path → all rows matched → fast path
+    update_data = pa.table(
+        {
+            "unique_id": pa.array([f"id_{i}" for i in range(5)], type=pa.utf8()),
+            "coarse": pa.array(
+                [f'{{"updated":true,"id":{i}}}' for i in range(5)],
+                type=json_type,
+            ),
+        }
+    )
+    dataset.merge_insert("unique_id").when_matched_update_all().execute(update_data)
+
+    # Critical: read back should NOT panic
+    result = dataset.to_table().sort_by("unique_id")
+    assert result.num_rows == 5
+
+    # Verify score column (not in update) is preserved
+    scores = result.column("score").to_pylist()
+    assert scores == [0, 1, 2, 3, 4]
+
+    # Verify JSON column was updated correctly
+    coarse_values = result.column("coarse").to_pylist()
+    for i, val in enumerate(coarse_values):
+        parsed = json.loads(val) if isinstance(val, str) else val
+        assert parsed.get("updated") is True, (
+            f"Row {i} should have updated coarse, got {val}"
+        )
+
+    # Verify take also works (different read path)
+    take_result = dataset.take([0, 2, 4])
+    assert take_result.num_rows == 3
+    take_coarse = take_result.column("coarse").to_pylist()
+    for val in take_coarse:
+        parsed = json.loads(val) if isinstance(val, str) else val
+        assert parsed.get("updated") is True
+
+    # Verify sample also works
+    sample_result = dataset.sample(3)
+    assert sample_result.num_rows == 3
+
+
+def test_merge_insert_subcols_with_json_column(tmp_path: Path):
+    """Test merge_insert with subschema update on a JSON extension type column.
+
+    Previously this would fail with:
+    'Incorrect datatype for StructArray field, expected Utf8 got LargeBinary'
+    because the update_fragments path didn't handle the Arrow JSON ↔ Lance JSON
+    type mismatch during interleave.
+    """
+    import json
+
+    json_type = pa.json_()
+    initial_data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4, 5], type=pa.int64()),
+            "name": pa.array(["a", "b", "c", "d", "e"], type=pa.utf8()),
+            "score": pa.array([10, 20, 30, 40, 50], type=pa.int64()),
+            "meta": pa.array(
+                ['{"x":1}', '{"x":2}', '{"x":3}', '{"x":4}', '{"x":5}'],
+                type=json_type,
+            ),
+        }
+    )
+    dataset = lance.write_dataset(initial_data, tmp_path / "merge_json_subcols")
+
+    # Subschema update: only provide id (key) + meta (JSON column to update)
+    new_values = pa.table(
+        {
+            "id": pa.array([2, 4], type=pa.int64()),
+            "meta": pa.array(
+                ['{"updated":true,"id":2}', '{"updated":true,"id":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    # This should NOT raise a type mismatch error
+    dataset.merge_insert("id").when_matched_update_all().execute(new_values)
+
+    # Verify results
+    result = dataset.to_table().sort_by("id")
+    ids = result.column("id").to_pylist()
+    scores = result.column("score").to_pylist()
+    metas = result.column("meta").to_pylist()
+
+    # Score column (not in update) should be preserved
+    assert scores == [10, 20, 30, 40, 50]
+
+    # Meta column should be updated for id=2 and id=4
+    for id_val, meta_val in zip(ids, metas):
+        parsed = json.loads(meta_val) if isinstance(meta_val, str) else meta_val
+        if id_val in (2, 4):
+            assert parsed.get("updated") is True, (
+                f"id={id_val} should have updated meta, got {meta_val}"
+            )
+        else:
+            assert "x" in str(parsed), (
+                f"id={id_val} should have original meta, got {meta_val}"
+            )
 
 
 def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):

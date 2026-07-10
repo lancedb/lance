@@ -7,8 +7,9 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{BooleanArray, Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::ScalarValue;
 use datafusion::common::stats::Precision;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
@@ -19,12 +20,14 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream, Statistics,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 use lance_core::{Error, Result};
 
 use super::super::builder::{FtsQuery, FtsQueryType};
+use super::newest_pk_positions;
 use crate::dataset::mem_wal::index::{FtsQueryExpr, SearchOptions};
+use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Score column name in output.
@@ -37,6 +40,8 @@ struct BatchRange {
     end: usize,
     batch_id: usize,
 }
+
+type MaterializedFtsRows = (Vec<Arc<dyn arrow_array::Array>>, Vec<f32>, Vec<u64>);
 
 /// ExecutionPlan node that queries FTS index with MVCC visibility.
 pub struct FtsIndexExec {
@@ -54,6 +59,13 @@ pub struct FtsIndexExec {
     max_visible_row: Option<u64>,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
+    /// Optional prefilter predicate, compiled against the memtable schema.
+    /// Applied to the materialized full-schema hits before projection so the
+    /// FTS arm only returns rows matching the predicate.
+    filter: Option<PhysicalExprRef>,
+    /// Primary-key columns. When set, materialized hits are kept only if their
+    /// row position is the newest visible version of that PK.
+    pk_columns: Option<Vec<String>>,
 }
 
 impl Debug for FtsIndexExec {
@@ -162,7 +174,22 @@ impl FtsIndexExec {
             batch_ranges,
             max_visible_row,
             with_row_id,
+            filter: None,
+            pk_columns: None,
         })
+    }
+
+    /// Attach an optional prefilter predicate (compiled against the memtable
+    /// schema). Hits that fail the predicate are dropped before projection.
+    pub fn with_filter(mut self, filter: Option<PhysicalExprRef>) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    /// Provide primary-key columns for newest-version filtering.
+    pub fn with_pk_columns(mut self, pk_columns: Option<Vec<String>>) -> Self {
+        self.pk_columns = pk_columns;
+        self
     }
 
     /// Find batch for a row position using binary search. O(log n).
@@ -183,7 +210,11 @@ impl FtsIndexExec {
 
         // Convert FtsQueryType to FtsQueryExpr
         let query_expr = match &self.query.query_type {
-            FtsQueryType::Match { query } => FtsQueryExpr::match_query(query),
+            FtsQueryType::Match {
+                query,
+                operator,
+                boost,
+            } => FtsQueryExpr::match_query_with_operator(query, *operator).with_boost(*boost),
             FtsQueryType::Phrase { query, slop } => FtsQueryExpr::phrase_with_slop(query, *slop),
             FtsQueryType::Boolean {
                 must,
@@ -205,15 +236,33 @@ impl FtsIndexExec {
             FtsQueryType::Fuzzy {
                 query,
                 fuzziness,
+                prefix_length,
                 max_expansions,
-            } => FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *max_expansions),
+                boost,
+            } => {
+                FtsQueryExpr::fuzzy_with_options(query, *fuzziness, *prefix_length, *max_expansions)
+                    .with_boost(*boost)
+            }
         };
 
-        // Search the index using the query expression. `include_tail` selects
-        // read-your-writes vs immutable-only; `wand_factor` adds pruning.
-        let options = SearchOptions::new()
-            .with_wand_factor(self.query.wand_factor)
-            .with_include_tail(self.query.include_tail);
+        let all_rows_visible = self.batch_ranges.last().is_none_or(|last| {
+            self.max_visible_row
+                .map(|max_visible| max_visible + 1 >= last.end as u64)
+                .unwrap_or(last.end == 0)
+        });
+        let pk_recency_is_noop = self.pk_columns.is_none()
+            || (self.indexes.has_pk_index() && !self.indexes.pk_has_overrides());
+        let can_prune_in_index = self.filter.is_none() && pk_recency_is_noop && all_rows_visible;
+
+        // Search the index using the query expression. WAND pruning is only
+        // safe when the index search itself sees the final candidate set.
+        let mut options = SearchOptions::new().with_include_tail(self.query.include_tail);
+        if can_prune_in_index {
+            options = options.with_wand_factor(self.query.wand_factor);
+            if let Some(limit) = self.query.limit {
+                options = options.with_limit(limit);
+            }
+        }
         let entries = index.search_with_options(&query_expr, options);
 
         // Convert to (row_position, score) pairs
@@ -298,6 +347,66 @@ impl FtsIndexExec {
             }
         }
 
+        // Prefilter: evaluate the predicate against the full-schema hits and drop
+        // non-matching rows before applying the query limit and projection (a
+        // NULL result excludes the row, matching SQL). When a predicate exists,
+        // query_index deliberately avoids pushing the limit into the index so
+        // this remains an exact prefilter, not a lossy post-filter.
+        let (final_columns, all_scores, all_row_positions) =
+            if let Some(ref predicate) = self.filter {
+                let Some(first) = self.batch_store.get(0) else {
+                    return Ok(vec![]);
+                };
+                let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
+                let mask = predicate
+                    .evaluate(&data_batch)?
+                    .into_array(data_batch.num_rows())?;
+                let mask = mask
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        datafusion::error::DataFusionError::Internal(
+                            "FTS prefilter predicate did not evaluate to boolean".to_string(),
+                        )
+                    })?;
+                let filtered_columns = data_batch
+                    .columns()
+                    .iter()
+                    .map(|c| arrow_select::filter::filter(c.as_ref(), mask))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let filtered_scores: Vec<f32> = all_scores
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(s, keep)| keep.unwrap_or(false).then_some(*s))
+                    .collect();
+                let filtered_positions: Vec<u64> = all_row_positions
+                    .iter()
+                    .zip(mask.iter())
+                    .filter_map(|(p, keep)| keep.unwrap_or(false).then_some(*p))
+                    .collect();
+                (filtered_columns, filtered_scores, filtered_positions)
+            } else {
+                (final_columns, all_scores, all_row_positions)
+            };
+
+        let (mut final_columns, mut all_scores, mut all_row_positions) =
+            self.filter_to_newest_pk(final_columns, all_scores, all_row_positions)?;
+
+        if all_scores.is_empty() {
+            return Ok(vec![]);
+        }
+
+        if let Some(limit) = self.query.limit
+            && all_scores.len() > limit
+        {
+            final_columns = final_columns
+                .into_iter()
+                .map(|column| column.slice(0, limit))
+                .collect();
+            all_scores.truncate(limit);
+            all_row_positions.truncate(limit);
+        }
+
         // Add score column
         final_columns.push(Arc::new(Float32Array::from(all_scores)));
 
@@ -321,6 +430,76 @@ impl FtsIndexExec {
 
         let batch = RecordBatch::try_new(self.output_schema.clone(), projected_columns)?;
         Ok(vec![batch])
+    }
+
+    fn filter_to_newest_pk(
+        &self,
+        final_columns: Vec<Arc<dyn arrow_array::Array>>,
+        all_scores: Vec<f32>,
+        all_row_positions: Vec<u64>,
+    ) -> DataFusionResult<MaterializedFtsRows> {
+        let Some(pk_columns) = &self.pk_columns else {
+            return Ok((final_columns, all_scores, all_row_positions));
+        };
+        if pk_columns.is_empty() || all_scores.is_empty() {
+            return Ok((final_columns, all_scores, all_row_positions));
+        }
+        let Some(max_visible_row) = self.max_visible_row else {
+            return Ok((final_columns, all_scores, all_row_positions));
+        };
+        if self.indexes.has_pk_index() && !self.indexes.pk_has_overrides() {
+            return Ok((final_columns, all_scores, all_row_positions));
+        }
+        let Some(first) = self.batch_store.get(0) else {
+            return Ok((final_columns, all_scores, all_row_positions));
+        };
+        let newest_positions = if self.indexes.has_pk_index() {
+            None
+        } else {
+            Some(newest_pk_positions(
+                &self.batch_store,
+                pk_columns,
+                self.max_visible_batch_position,
+                max_visible_row,
+            )?)
+        };
+
+        let data_batch = RecordBatch::try_new(first.data.schema(), final_columns)?;
+        let pk_indices = resolve_pk_indices(&data_batch, pk_columns)?;
+        let keep = (0..data_batch.num_rows())
+            .map(|row| {
+                Ok(match &newest_positions {
+                    Some(newest) => newest.contains(&all_row_positions[row]),
+                    None => {
+                        let values: Vec<ScalarValue> = pk_indices
+                            .iter()
+                            .map(|&col| ScalarValue::try_from_array(data_batch.column(col), row))
+                            .collect::<DataFusionResult<_>>()?;
+                        self.indexes
+                            .pk_is_newest(&values, all_row_positions[row], max_visible_row)
+                    }
+                })
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+
+        let mask = BooleanArray::from_iter(keep.iter().copied());
+        let filtered_columns = data_batch
+            .columns()
+            .iter()
+            .map(|c| arrow_select::filter::filter(c.as_ref(), &mask))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let filtered_scores = all_scores
+            .into_iter()
+            .zip(keep.iter())
+            .filter_map(|(s, keep)| keep.then_some(s))
+            .collect();
+        let filtered_positions = all_row_positions
+            .into_iter()
+            .zip(keep.iter())
+            .filter_map(|(p, keep)| keep.then_some(p))
+            .collect();
+
+        Ok((filtered_columns, filtered_scores, filtered_positions))
     }
 }
 

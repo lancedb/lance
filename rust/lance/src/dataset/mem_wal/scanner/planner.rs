@@ -9,9 +9,11 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
-use datafusion::prelude::Expr;
+use datafusion::prelude::{Expr, col};
 use lance_core::Result;
 use tracing::instrument;
+
+use crate::dataset::mem_wal::TOMBSTONE;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
@@ -19,8 +21,20 @@ use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, RO
 use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
+    validate_projection_names,
 };
 use crate::session::Session;
+
+/// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
+/// dropped from a WAL-arm scan. Used only for sources whose schema carries the
+/// column (active / flushed generations written since deletes existed).
+fn fold_not_tombstone(filter: Option<&Expr>) -> Expr {
+    let live = !col(TOMBSTONE);
+    match filter {
+        Some(expr) => expr.clone().and(live),
+        None => live,
+    }
+}
 
 /// Plans scan queries over LSM data.
 pub struct LsmScanPlanner {
@@ -39,6 +53,15 @@ pub struct LsmScanPlanner {
     /// Over-fetch multiple for the per-source limit pushdown: block-listed
     /// sources scan `(offset + limit) * factor` rows so cross-gen dedup drops
     /// still leave enough live rows. Clamped to `>= 1.0`.
+    ///
+    /// This headroom must also absorb deletes: a tombstone shadows the older
+    /// real row without emitting a replacement (shadow-without-replace), so it
+    /// is pure subtraction from a block-listed source. If delete density inside
+    /// a source's fetch window exceeds `factor - 1`, that source can deliver
+    /// `< k` live rows (a recall shortfall, not wrong content — see the
+    /// under-fetch `warn!` in `PkBlockFilterExec`). Steady-state this is
+    /// self-limiting because L0→base compaction drains tombstones from the
+    /// fresh tier; the exposure is a delete-heavy burst between compactions.
     overfetch_factor: f64,
 }
 
@@ -81,7 +104,8 @@ impl LsmScanPlanner {
     }
 
     /// Set the over-fetch multiple for the per-source limit pushdown
-    /// (see the field docs). Clamped to `>= 1.0` at use.
+    /// (see the field docs). Values below `1.0` are rejected by
+    /// [`Self::plan_scan`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = factor;
         self
@@ -126,9 +150,11 @@ impl LsmScanPlanner {
             .map(|p| p.iter().any(|c| c == ROW_ADDRESS_COLUMN))
             .unwrap_or(false);
         let keep_row_address = keep_row_address || user_wants_rowaddr;
+        validate_projection_names(projection, &self.base_schema, &[])?;
 
         // 1. Collect all data sources
         let sources = self.collector.collect()?;
+        let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
             // Return empty plan
@@ -160,7 +186,6 @@ impl LsmScanPlanner {
         // is in-memory and within-gen append duplicates are resolved by its
         // own dedup, so it is never capped here.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
-        let overfetch = self.overfetch_factor.max(1.0);
 
         let mut source_plans = Vec::new();
         for source in sources {
@@ -170,7 +195,7 @@ impl LsmScanPlanner {
                 .get(&(source.shard_id(), source.generation()))
                 .cloned();
             let fetch = match (n_needed, is_active) {
-                (Some(n), false) => Some(if blocked.is_some() {
+                (Some(n), false) => Some(if blocked.is_some() && !self.pk_columns.is_empty() {
                     ((n as f64) * overfetch).ceil() as usize
                 } else {
                     n
@@ -185,13 +210,14 @@ impl LsmScanPlanner {
             // With a limit, `k = n_needed` arms the under-fetch warning; with
             // no limit `k = 0` keeps it silent.
             let scan = match blocked {
-                Some(set) => Arc::new(PkBlockFilterExec::new(
+                Some(set) if !self.pk_columns.is_empty() => Arc::new(PkBlockFilterExec::new(
                     scan,
                     self.pk_columns.clone(),
                     set,
                     n_needed.unwrap_or(0),
-                )) as Arc<dyn ExecutionPlan>,
-                None => scan,
+                ))
+                    as Arc<dyn ExecutionPlan>,
+                _ => scan,
             };
 
             // Post-block-list cap: each source contributes at most `n_needed`
@@ -239,9 +265,9 @@ impl LsmScanPlanner {
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address),
         )?;
 
-        // 6. Add limit if specified
-        if let Some(limit) = limit {
-            plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), Some(limit)));
+        // 6. Add limit / offset if specified
+        if limit.is_some() || offset.unwrap_or(0) > 0 {
+            plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), limit));
         }
 
         Ok(plan)
@@ -327,7 +353,19 @@ impl LsmScanPlanner {
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
-                if let Some(expr) = filter {
+                // Drop tombstones: fold `NOT _tombstone` into the predicate so
+                // it runs before the pushdown limit (counting only live rows).
+                // The older real row a tombstone supersedes is dropped by the
+                // cross-gen block-list, not by this filter. Gen written before
+                // deletes existed lack the column → no fold, nothing to drop.
+                let folded;
+                let effective: Option<&Expr> = if dataset.schema().field(TOMBSTONE).is_some() {
+                    folded = fold_not_tombstone(filter);
+                    Some(&folded)
+                } else {
+                    filter
+                };
+                if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
                 // Per-source limit pushdown: flushed generations are
@@ -352,13 +390,24 @@ impl LsmScanPlanner {
 
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
-                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.with_row_address();
 
                 // The dedup scan applies the filter post-dedup; pushing it
                 // into the raw scan would resurrect older versions of PKs
-                // whose newest version fails the predicate.
-                if let Some(expr) = filter {
+                // whose newest version fails the predicate. Folding
+                // `NOT _tombstone` here is correct: a tombstone wins the
+                // position-based dedup (suppressing the older real row) and is
+                // then dropped by this predicate. A memtable without the column
+                // (legacy / test) gets no fold.
+                let folded;
+                let effective: Option<&Expr> = if schema.column_with_name(TOMBSTONE).is_some() {
+                    folded = fold_not_tombstone(filter);
+                    Some(&folded)
+                } else {
+                    filter
+                };
+                if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
 
@@ -894,8 +943,9 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         // Create scanner with projection (only id column)
-        let mut scanner =
-            LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&["id"]);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -925,7 +975,9 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         // Create scanner with limit
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).limit(3, None);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .limit(Some(3), None)
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -942,6 +994,35 @@ mod integration_tests {
         // Count total rows
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows due to limit");
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_with_offset_without_limit() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .limit(Some(3), None)
+            .unwrap()
+            .limit(None, Some(2))
+            .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 5,
+            "offset-only scan should skip 2 rows from the 7-row deduped result"
+        );
     }
 
     #[tokio::test]
@@ -1697,13 +1778,9 @@ mod integration_tests {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
-        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns).project(&[
-            "id",
-            "_rowoffset",
-            "name",
-            "_rowaddr",
-            "_rowid",
-        ]);
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .project(&["id", "_rowoffset", "name", "_rowaddr", "_rowid"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -1793,7 +1870,8 @@ mod integration_tests {
             setup_multi_level_lsm().await;
 
         let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
-            .project(&["id", "_rowid", "name"]);
+            .project(&["id", "_rowid", "name"])
+            .unwrap();
         if let Some((shard_id, memtable)) = active_memtable {
             scanner = scanner.with_in_memory_memtables(shard_id, memtable);
         }
@@ -1856,7 +1934,8 @@ mod integration_tests {
 
         let scanner =
             LsmScanner::without_base_table(schema, base_uri, vec![], vec!["id".to_string()])
-                .project(&["id", "_rowaddr", "name", "_rowid"]);
+                .project(&["id", "_rowaddr", "name", "_rowid"])
+                .unwrap();
         let plan = scanner.create_plan().await.unwrap();
 
         let names: Vec<String> = plan
@@ -1898,6 +1977,209 @@ mod integration_tests {
         assert!(
             msg.contains("_rowaddr"),
             "rejection message should mention the offending column, got: {msg}",
+        );
+    }
+
+    // ----- tombstone (delete) filtered-read tests -----
+
+    /// Memtable / generation schema: base (`id`, `name`) + `_tombstone`.
+    fn ts_pk_schema() -> Arc<ArrowSchema> {
+        let mut id_metadata = HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id = Field::new("id", DataType::Int32, false).with_metadata(id_metadata);
+        Arc::new(ArrowSchema::new(vec![
+            id,
+            Field::new("name", DataType::Utf8, true),
+            Field::new(crate::dataset::mem_wal::TOMBSTONE, DataType::Boolean, false),
+        ]))
+    }
+
+    /// Build a `_tombstone`-bearing batch from `(id, name, tombstone)` rows.
+    fn ts_batch(schema: &Arc<ArrowSchema>, rows: &[(i32, Option<&str>, bool)]) -> RecordBatch {
+        let ids: Vec<i32> = rows.iter().map(|(i, _, _)| *i).collect();
+        let names: Vec<Option<String>> = rows
+            .iter()
+            .map(|(_, n, _)| n.map(|s| s.to_string()))
+            .collect();
+        let ts: Vec<bool> = rows.iter().map(|(_, _, t)| *t).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(arrow_array::BooleanArray::from(ts)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn collect_sorted_ids(batches: &[RecordBatch]) -> Vec<i32> {
+        let mut ids: Vec<i32> = Vec::new();
+        for b in batches {
+            let arr = b
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.extend((0..arr.len()).map(|i| arr.value(i)));
+        }
+        ids.sort_unstable();
+        ids
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_active_tombstone_masks_base() {
+        // Active gen tombstones id=2 (present in base) and adds real id=4. The
+        // result drops id=2 (block-list masks the base row; the active arm's
+        // folded `NOT _tombstone` drops the tombstone itself) and never
+        // surfaces the tombstone row.
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2, 3], "base")],
+            )
+            .await,
+        );
+
+        let active_batch = ts_batch(
+            &mem_schema,
+            &[(4, Some("active_4"), false), (2, None, true)],
+        );
+        let (bs, ix) = pk_indexed(&[active_batch]);
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: bs,
+                        index_store: ix,
+                        schema: mem_schema,
+                        generation: 2,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_sorted_ids(&batches),
+            vec![1, 3, 4],
+            "id=2 deleted; tombstone row not surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_flushed_tombstone_masks_base() {
+        // A tombstone living in a flushed generation masks the older base row by
+        // PK presence (block-list) and is itself dropped by the folded predicate.
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_path = temp.path().to_str().unwrap();
+        let base_uri = format!("{}/base", base_path);
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2, 3], "base")],
+            )
+            .await,
+        );
+
+        // Flushed gen 1 holds only a tombstone for id=2 (written with the
+        // `_tombstone` schema, so the flushed arm folds `NOT _tombstone`).
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![ts_batch(&mem_schema, &[(2, None, true)])]).await;
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let scanner = LsmScanner::new(base, vec![shard_snapshot], vec!["id".to_string()]);
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_sorted_ids(&batches),
+            vec![1, 3],
+            "id=2 deleted via flushed-generation tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_tombstone_does_not_consume_limit() {
+        // A single (newest) flushed generation holds both tombstones and live
+        // rows. With LIMIT 2 the folded `NOT _tombstone` runs *before* the
+        // per-source pushdown limit, so the limit counts only live rows — we get
+        // 2 live rows, not 0 (which is what a post-limit tombstone filter, or a
+        // limit that counted the tombstones, would yield).
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+
+        // gen_1 file order: two tombstones first, then two live rows.
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(
+            &gen1_uri,
+            vec![ts_batch(
+                &mem_schema,
+                &[
+                    (1, None, true),
+                    (2, None, true),
+                    (3, Some("live_3"), false),
+                    (4, Some("live_4"), false),
+                ],
+            )],
+        )
+        .await;
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_flushed_generation(1, "gen_1".to_string());
+
+        let scanner = LsmScanner::without_base_table(
+            base_schema,
+            base_uri,
+            vec![shard_snapshot],
+            vec!["id".to_string()],
+        )
+        .limit(Some(2), None)
+        .unwrap();
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ids = collect_sorted_ids(&batches);
+        assert_eq!(
+            ids.len(),
+            2,
+            "limit honored with live rows only, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&1) && !ids.contains(&2),
+            "deleted ids must not appear, got {:?}",
+            ids
         );
     }
 }

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
-    collections::HashMap,
     fmt::{Debug, Formatter},
     sync::Arc,
 };
@@ -117,11 +117,6 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
     /// Cast to [Index]
     fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
         self
-    }
-
-    /// Cast to [VectorIndex]
-    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
-        Ok(self)
     }
 
     /// Retrieve index statistics as a JSON Value
@@ -312,7 +307,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         Box::new(self.storage.as_ref().unwrap().row_ids())
     }
 
-    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
         Err(Error::index(
             "Remapping HNSW in this way not supported".to_string(),
         ))

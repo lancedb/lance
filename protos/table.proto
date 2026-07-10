@@ -109,10 +109,12 @@ message Manifest {
   // should not attempt to read the dataset.
   //
   // Known flags:
-  // * 1: deletion files are present
-  // * 2: row ids are stable and stored as part of the fragment metadata.
-  // * 4: use v2 format (deprecated)
-  // * 8: table config is present
+  // * 1 << 0: deletion files are present
+  // * 1 << 1: row ids are stable and stored as part of the fragment metadata.
+  // * 1 << 2: use v2 format (deprecated)
+  // * 1 << 3: table config is present
+  // * 1 << 4: dataset uses multiple base paths
+  // * 1 << 5: transaction file writes are disabled
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -521,6 +523,16 @@ message FragmentReuseIndexDetails {
 // MemWAL Index Types
 // ============================================================================
 
+// Lifecycle status of a WAL shard. Drives drop-table two-phase commit:
+// a SEALED shard refuses new writer claims (reversible) until the drop
+// commits (the shard dir is deleted) or rolls back (status -> ACTIVE).
+enum ShardStatus {
+  // Normal: the shard accepts writer claims.
+  ACTIVE = 0;
+  // A drop is in flight: claims are refused. Reversible to ACTIVE.
+  SEALED = 1;
+}
+
 // Shard manifest containing epoch-based fencing and WAL state.
 // Each shard has exactly one active writer at any time.
 message ShardManifest {
@@ -566,6 +578,10 @@ message ShardManifest {
 
   // List of flushed MemTable generations and their directory paths.
   repeated FlushedGeneration flushed_generations = 8;
+
+  // Lifecycle status. Default ACTIVE; SEALED marks an in-flight drop
+  // (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
+  ShardStatus status = 15;
 }
 
 // A shard field value stored as raw Arrow scalar bytes.
