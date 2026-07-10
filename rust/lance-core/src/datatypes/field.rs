@@ -271,24 +271,15 @@ impl Field {
     }
 
     pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
-        // Map fields encode their physical layout as a single child entries
-        // struct (`Struct<key, value>`) whose presence is required for the
-        // parent to be readable — we never want to filter into that subtree.
-        // But the parent field itself is still subject to selection: if the
-        // caller didn't ask for this Map column, drop it like any other
-        // non-selected leaf. Without this early return the unconditional
-        // children clone would keep `children.is_empty() == false` forever
-        // and every Map column in the schema would survive every projection,
-        // pulling tens-of-bytes-per-row of unrelated data through downstream
-        // operators (notably `SortExec` in scalar-index training, where it
-        // was responsible for >100 GiB external-sort spills on real-world
-        // tables).
-        if self.logical_type.is_map() && !projection.contains_field_id(self.id) {
+        // Maps and blob descriptors are atomic physical layouts. Map children
+        // must remain together, while projected blob descriptor children may
+        // have synthetic IDs that cannot be selected independently.
+        let is_atomic_layout = self.logical_type.is_map() || self.is_blob();
+        if is_atomic_layout && !projection.contains_field_id(self.id) {
             return None;
         }
 
-        let children = if self.logical_type.is_map() {
-            // Map field is selected: keep all children intact.
+        let children = if is_atomic_layout {
             self.children.clone()
         } else {
             self.children
@@ -2010,5 +2001,44 @@ mod tests {
             .project_by_field(&field, OnTypeMismatch::Error)
             .unwrap();
         assert_eq!(unloaded_projected, unloaded);
+    }
+
+    #[test]
+    fn blob_descriptor_projection_preserves_synthetic_children() {
+        let metadata =
+            HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]);
+        let mut blob: Field = ArrowField::new(
+            "blob",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("data", DataType::LargeBinary, true),
+                    ArrowField::new("uri", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(metadata)
+        .try_into()
+        .unwrap();
+        let mut next_id = 0;
+        blob.set_id(-1, &mut next_id);
+
+        let schema = Arc::new(crate::datatypes::Schema {
+            fields: vec![blob],
+            metadata: HashMap::new(),
+        });
+        let descriptor_schema = Projection::full(schema)
+            .with_blob_handling(crate::datatypes::BlobHandling::BlobsDescriptions)
+            .to_bare_schema();
+        assert!(
+            descriptor_schema.fields[0]
+                .children
+                .iter()
+                .all(|child| child.id == -1)
+        );
+
+        let projected = Projection::full(Arc::new(descriptor_schema)).to_bare_schema();
+        assert_eq!(projected.fields[0].children.len(), 5);
     }
 }

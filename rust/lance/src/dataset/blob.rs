@@ -4448,6 +4448,17 @@ mod tests {
             .await
             .unwrap();
         assert!(null_blobs.is_empty());
+
+        let filtered = dataset
+            .scan()
+            .project(&["info"])
+            .unwrap()
+            .filter("info.blob IS NOT NULL")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 2);
     }
 
     #[tokio::test]
@@ -4535,6 +4546,17 @@ mod tests {
         assert_eq!(kinds.value(0), BlobKind::Inline as u8);
         assert_eq!(kinds.value(2), BlobKind::Packed as u8);
         assert_eq!(kinds.value(3), BlobKind::Inline as u8);
+
+        let filtered = dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .filter("blobs IS NOT NULL")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 3);
 
         let mut scanner = dataset.scan();
         scanner.blob_handling(BlobHandling::AllBinary);
