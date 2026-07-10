@@ -461,8 +461,10 @@ impl InvertedIndexParams {
     /// Resolve the requested FTS format version, falling back to the default for
     /// the configured block size.
     pub fn resolved_format_version(&self) -> InvertedListFormatVersion {
-        self.format_version
-            .unwrap_or_else(|| default_fts_format_version_for_block_size(self.block_size).unwrap())
+        self.format_version.unwrap_or_else(|| {
+            default_fts_format_version_for_block_size(self.block_size)
+                .expect("InvertedIndexParams block_size must be validated before use")
+        })
     }
 
     /// Validate that the requested FTS format version can safely encode the
