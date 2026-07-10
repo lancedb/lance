@@ -4142,6 +4142,9 @@ impl Scanner {
     /// - There is no aggregate (the limit applies after aggregation).
     /// - The index result is used as is, with no refine filter and no recheck. Either of
     ///   those re-filters rows later and could drop matches.
+    /// - The index query is a single lookup, not a combination. A limit only stops a lone
+    ///   `Query` early. `And`/`Or`/`Not` always compute the full result, so a pushed limit
+    ///   has no effect there.
     /// - Every fragment the index covers is in the scanned set and has no deletion file.
     ///   The index returns row addresses for every fragment it covers, and any that do not
     ///   survive into the result are pruned after the search. An early stop would then spend
@@ -4177,6 +4180,14 @@ impl Scanner {
             return Ok(None);
         };
         if index_query.needs_recheck() {
+            return Ok(None);
+        }
+        // Only a single top-level index lookup stops early. `evaluate_nullable` drops the limit for
+        // And/Or/Not, so those always compute the full result. Pushing a limit there would have no
+        // effect and would rely on fragment coverage that is unsound for Or, since an Or can read
+        // the union of both sides' fragments while coverage intersects them. Restrict the pushdown
+        // to a lone `Query`, whose coverage is just that one index's fragment bitmap.
+        if !matches!(index_query, ScalarIndexExpr::Query(_)) {
             return Ok(None);
         }
         // Every row address the index covers must survive into the result, otherwise an early
@@ -6391,6 +6402,97 @@ mod test {
         assert!(
             ids.iter().all(|&id| id >= 10_000),
             "retired rows must not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_not_pushed_for_compound_index_query() {
+        // A limit only stops a single top-level index lookup early, since `evaluate_nullable`
+        // drops it for And/Or/Not. So `index_search_limit` must refuse to push a limit for a
+        // compound (here `Or`) index query even when every covered fragment is scanned and
+        // undeleted, while a lone `Query` on the same data must still push. This pins the gate
+        // decision directly, since a compound query returns identical rows either way and no
+        // black-box scan could tell the two apart.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]));
+        let num_rows = 1_000i32;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..num_rows)),
+                Arc::new(Int32Array::from_iter_values(0..num_rows)),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        for col in ["a", "b"] {
+            dataset
+                .create_index(
+                    &[col],
+                    IndexType::BTree,
+                    None,
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let scanned = dataset.fragments().as_ref().clone();
+
+        // A compound `Or` over two indexed columns, both covering the single clean fragment.
+        let mut or_scan = dataset.scan();
+        or_scan
+            .filter("a >= 500 OR b >= 500")
+            .unwrap()
+            .scan_in_order(false)
+            .limit(Some(100), None)
+            .unwrap();
+        let or_plan = or_scan.create_filter_plan(true).await.unwrap();
+        assert!(
+            matches!(
+                or_plan.expr_filter_plan.index_query,
+                Some(ScalarIndexExpr::Or(..))
+            ),
+            "test precondition: the filter must plan to an Or index query, got {:?}",
+            or_plan.expr_filter_plan.index_query
+        );
+        let pushed = or_scan
+            .index_search_limit(&or_plan.expr_filter_plan, &scanned)
+            .await
+            .unwrap();
+        assert_eq!(
+            pushed, None,
+            "a compound Or index query must not push a limit"
+        );
+
+        // A lone `Query` on the same data still pushes, so the guard is not over-broad.
+        let mut single_scan = dataset.scan();
+        single_scan
+            .filter("a >= 500")
+            .unwrap()
+            .scan_in_order(false)
+            .limit(Some(100), None)
+            .unwrap();
+        let single_plan = single_scan.create_filter_plan(true).await.unwrap();
+        assert!(
+            matches!(
+                single_plan.expr_filter_plan.index_query,
+                Some(ScalarIndexExpr::Query(_))
+            ),
+            "test precondition: the filter must plan to a single Query index query, got {:?}",
+            single_plan.expr_filter_plan.index_query
+        );
+        let pushed = single_scan
+            .index_search_limit(&single_plan.expr_filter_plan, &scanned)
+            .await
+            .unwrap();
+        assert_eq!(
+            pushed,
+            Some(100),
+            "a lone Query index lookup must still push the limit"
         );
     }
 
