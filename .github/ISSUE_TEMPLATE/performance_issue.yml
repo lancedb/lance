@@ -1,0 +1,77 @@
+name: Performance issue
+description: Report slow operations, high memory use, or a performance regression.
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Concrete numbers and a reproducible benchmark
+        help us a lot. Please search
+        [existing issues](https://github.com/lance-format/lance/issues) first to
+        avoid filing a duplicate.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: >-
+        What operation is slow or memory-hungry? Include the observed cost
+        (wall-clock time, throughput, peak memory) and what you expected.
+      placeholder: >-
+        Scanning a 10M-row dataset with a vector index takes 30s; I expected
+        a few seconds.
+    validations:
+      required: true
+  - type: textarea
+    id: benchmark
+    attributes:
+      label: Reproduction / benchmark
+      description: >-
+        A minimal script that reproduces the measurement, ideally with timing.
+        Note the dataset shape (rows, columns, dtypes, index type) and how it
+        was written.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements
+      description: >-
+        Timings, memory profiles, flamegraphs, or `tracing` output. Include
+        numbers for any baseline you're comparing against (e.g. a previous Lance
+        version).
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: lance-version
+    attributes:
+      label: Lance version
+      description: >-
+        If this is a regression, note the last version that performed well
+        (e.g. "slow since 0.40.0, was fast in 0.39.0").
+      placeholder: "e.g. 0.40.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language binding
+      multiple: true
+      options:
+        - Python
+        - Rust
+        - Java
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        OS, architecture, CPU/RAM, and storage backend (local NVMe, S3, ...).
+        Storage matters a lot for I/O-bound workloads.
+      placeholder: "e.g. Ubuntu 22.04, x86_64, 16 cores / 64GB, local NVMe"
+    validations:
+      required: false
