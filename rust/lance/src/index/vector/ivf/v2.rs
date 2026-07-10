@@ -4835,10 +4835,7 @@ mod tests {
             .as_primitive::<Float32Type>()
             .values()
             .to_vec();
-        let results = dists
-            .into_iter()
-            .zip(row_ids.clone().into_iter())
-            .collect::<Vec<_>>();
+        let results = dists.into_iter().zip(row_ids.clone()).collect::<Vec<_>>();
         let row_ids = row_ids.into_iter().collect::<HashSet<_>>();
 
         let gt = multivec_ground_truth(&vectors, &query, k, params.metric_type);
@@ -5231,10 +5228,7 @@ mod tests {
             .as_primitive::<Float32Type>()
             .values()
             .to_vec();
-        let results = dists
-            .into_iter()
-            .zip(row_ids.into_iter())
-            .collect::<Vec<_>>();
+        let results = dists.into_iter().zip(row_ids).collect::<Vec<_>>();
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
         assert!(row_ids.len() == k);
 

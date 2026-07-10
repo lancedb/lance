@@ -70,7 +70,7 @@ public class WriteDatasetBuilder {
   private WriteParams.WriteMode mode = WriteParams.WriteMode.CREATE;
   private Schema schema;
   private Map<String, String> storageOptions = new HashMap<>();
-  private Map<String, String> tableProperties = new HashMap<>();
+  private Map<String, String> properties = new HashMap<>();
   private Map<String, Map<String, String>> baseStoreParams = new HashMap<>();
   private boolean ignoreNamespaceStorageOptions = false;
   private Optional<Integer> maxRowsPerFile = Optional.empty();
@@ -209,17 +209,23 @@ public class WriteDatasetBuilder {
   }
 
   /**
-   * Sets user table properties to forward to the namespace on table creation.
+   * Sets the table properties to forward to the namespace on table creation.
+   *
+   * <p>These are Lance-namespace <b>properties</b>: catalog-level key-value metadata stored by the
+   * namespace outside the Lance table (available even if the table manifest does not exist), as
+   * distinct from the manifest-stored {@code config} (read/write behavior) and {@code metadata}
+   * (business metadata), and from non-persisted {@code storageOptions}. They are attached to the
+   * underlying declareTable request via its {@code properties} field.
    *
    * <p>Only used when a namespace client is configured via namespaceClient()+tableId() and the
-   * write creates the table (CREATE mode): the properties are attached to the underlying
-   * declareTable request. Ignored for direct-URI writes and for APPEND/OVERWRITE modes.
+   * write creates the table (CREATE mode). Ignored for direct-URI writes and for APPEND/OVERWRITE
+   * modes.
    *
-   * @param tableProperties Table properties to forward on declareTable
+   * @param properties Table properties to forward on declareTable
    * @return this builder instance
    */
-  public WriteDatasetBuilder tableProperties(Map<String, String> tableProperties) {
-    this.tableProperties = new HashMap<>(tableProperties);
+  public WriteDatasetBuilder properties(Map<String, String> properties) {
+    this.properties = new HashMap<>(properties);
     return this;
   }
 
@@ -426,8 +432,8 @@ public class WriteDatasetBuilder {
     if (mode == WriteParams.WriteMode.CREATE) {
       DeclareTableRequest declareRequest = new DeclareTableRequest();
       declareRequest.setId(tableId);
-      if (tableProperties != null && !tableProperties.isEmpty()) {
-        declareRequest.setProperties(tableProperties);
+      if (properties != null && !properties.isEmpty()) {
+        declareRequest.setProperties(properties);
       }
       DeclareTableResponse declareResponse = namespaceClient.declareTable(declareRequest);
 

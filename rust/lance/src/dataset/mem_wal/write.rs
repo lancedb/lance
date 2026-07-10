@@ -2935,11 +2935,7 @@ impl WriteStatsSnapshot {
 
     /// Get average WAL flush size in bytes.
     pub fn avg_wal_flush_bytes(&self) -> Option<u64> {
-        if self.wal_flush_count > 0 {
-            Some(self.wal_flush_bytes / self.wal_flush_count)
-        } else {
-            None
-        }
+        self.wal_flush_bytes.checked_div(self.wal_flush_count)
     }
 
     /// Get WAL write throughput (bytes per second based on WAL flush time).
@@ -2971,11 +2967,7 @@ impl WriteStatsSnapshot {
 
     /// Get average rows per index update.
     pub fn avg_index_update_rows(&self) -> Option<u64> {
-        if self.index_update_count > 0 {
-            Some(self.index_update_rows / self.index_update_count)
-        } else {
-            None
-        }
+        self.index_update_rows.checked_div(self.index_update_count)
     }
 
     /// Get average MemTable flush latency.
@@ -2989,11 +2981,8 @@ impl WriteStatsSnapshot {
 
     /// Get average MemTable flush size in rows.
     pub fn avg_memtable_flush_rows(&self) -> Option<u64> {
-        if self.memtable_flush_count > 0 {
-            Some(self.memtable_flush_rows / self.memtable_flush_count)
-        } else {
-            None
-        }
+        self.memtable_flush_rows
+            .checked_div(self.memtable_flush_count)
     }
 
     /// Log stats summary using tracing (for structured telemetry).

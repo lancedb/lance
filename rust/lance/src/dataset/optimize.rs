@@ -840,7 +840,7 @@ pub async fn compact_files_with_planner(
 
     let dataset_ref = &dataset.clone();
 
-    let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
+    let result_stream = futures::stream::iter(compaction_plan.tasks)
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
         .buffer_unordered(
             compaction_plan
@@ -1941,8 +1941,8 @@ async fn recalc_versions_for_rewritten_fragments(
     // Set both version metadata on new fragments
     for ((fragment, last_updated_seq), created_at_seq) in new_fragments
         .iter_mut()
-        .zip(new_last_updated_sequences.into_iter())
-        .zip(new_created_at_sequences.into_iter())
+        .zip(new_last_updated_sequences)
+        .zip(new_created_at_sequences)
     {
         fragment.last_updated_at_version_meta = Some(
             lance_table::format::RowDatasetVersionMeta::from_sequence(&last_updated_seq).unwrap(),

@@ -2978,10 +2978,8 @@ mod tests {
     async fn cleanup_before_ts_and_retain_n_recent_versions() {
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
-        let mut time = 1i64;
-        for _ in 0..4 {
+        for time in (1i64..).take(4) {
             MockClock::set_system_time(TimeDelta::try_days(time).unwrap().to_std().unwrap());
-            time += 1i64;
             fixture.overwrite_some_data().await.unwrap();
         }
 

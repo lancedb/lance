@@ -265,10 +265,8 @@ impl ZoneMapIndex {
                                     return Ok(zone.nan_count > 0);
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(zone.nan_count > 0);
                             }
                             _ => {}
                         }
@@ -295,10 +293,8 @@ impl ZoneMapIndex {
                                     return Ok(false); // Nothing is greater than NaN
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(false); // Nothing is greater than NaN
                             }
                             _ => {}
                         }
@@ -322,10 +318,8 @@ impl ZoneMapIndex {
                                     return Ok(zone.nan_count > 0 || zone_min <= e);
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(zone.nan_count > 0 || zone_min <= e);
                             }
                             _ => {}
                         }
@@ -345,10 +339,8 @@ impl ZoneMapIndex {
                                     return Ok(true);
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(true);
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(true);
                             }
                             _ => {}
                         }

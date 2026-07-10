@@ -380,7 +380,8 @@ fn strip_row_preserving_wrappers(plan: &Arc<dyn ExecutionPlan>) -> Option<&Filte
                 inner.input()
             } else if let Some(inner) = current.as_any().downcast_ref::<CoalescePartitionsExec>() {
                 inner.input()
-            } else if let Some(proj) = current.as_any().downcast_ref::<ProjectionExec>() {
+            } else {
+                let proj = current.as_any().downcast_ref::<ProjectionExec>()?;
                 // Only walk through projections that are row-preserving: every
                 // output expression is a direct column reference back to the
                 // input. (Empty projections trivially qualify — DataFusion uses
@@ -398,8 +399,6 @@ fn strip_row_preserving_wrappers(plan: &Arc<dyn ExecutionPlan>) -> Option<&Filte
                     return None;
                 }
                 proj.input()
-            } else {
-                return None;
             };
         current = next.as_ref();
     }
