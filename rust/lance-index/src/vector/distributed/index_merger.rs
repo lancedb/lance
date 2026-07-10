@@ -21,7 +21,7 @@ use crate::IndexMetadata as IndexMetaSchema;
 use crate::pb;
 use crate::vector::bq::storage::{
     RABIT_CODE_COLUMN, RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQueryEstimator,
-    pack_codes, rabit_binary_code_field, rabit_ex_code_field, unpack_codes,
+    pack_codes, rabit_binary_code_field, rabit_ex_code_field,
 };
 use crate::vector::bq::transform::{
     ADD_FACTORS_FIELD, ERROR_FACTORS_FIELD, EX_ADD_FACTORS_FIELD, EX_SCALE_FACTORS_FIELD,
@@ -708,79 +708,20 @@ async fn read_shard_window_partitions(
         )));
     }
 
-    // When this shard stores already-packed RaBitQ binary codes, unpack them
-    // back to row-major here, per partition. Each partition is packed as an
-    // independent unit, so its rows must first be reassembled (a partition can
-    // span multiple stream batches) before `unpack_codes` can invert the
-    // SIMD-block layout. This must happen per shard, before the merge stage
-    // concatenates partitions across shards and re-packs them: packed codes
-    // from different shards cannot be concatenated, and packing already-packed
-    // codes corrupts them.
+    // A merged shard stores its codes in the query-optimized layout. Restore
+    // row-major per shard here, before the merge stage concatenates partitions
+    // across shards and applies the layout once (see the `layout` module docs).
     if shard_job.unpack_rq_codes {
-        for batches in per_partition_batches.iter_mut() {
-            if batches.is_empty() {
-                continue;
-            }
-            let schema = batches[0].schema();
-            let merged = concat_batches(&schema, batches.iter())?;
-            let rq_col = merged.column_by_name(RABIT_CODE_COLUMN).ok_or_else(|| {
-                Error::index(format!(
-                    "RQ column {} missing in packed shard",
-                    RABIT_CODE_COLUMN
-                ))
-            })?;
-            let rq_fsl = rq_col.as_fixed_size_list_opt().ok_or_else(|| {
-                Error::index(format!(
-                    "RQ column {} is not a FixedSizeList in packed shard, got {}",
-                    RABIT_CODE_COLUMN,
-                    rq_col.data_type(),
-                ))
-            })?;
-            let unpacked = unpack_codes(rq_fsl);
-            *batches = vec![merged.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(unpacked))?];
-        }
+        super::layout::restore_partition_layout(
+            &mut per_partition_batches,
+            super::layout::unpack_rq_partition,
+        )?;
     }
-
-    // When this shard stores already-transposed PQ codes (the output of a
-    // prior merge), transpose them back to row-major here, per partition. The
-    // transpose unit is the whole partition, so its rows must first be
-    // reassembled before the layout can be inverted. This must happen per
-    // shard, before the merge stage concatenates partitions across shards and
-    // re-transposes them: column-major codes from different shards cannot be
-    // concatenated, and transposing already-transposed codes corrupts them.
     if shard_job.untranspose_pq_codes {
-        for batches in per_partition_batches.iter_mut() {
-            if batches.is_empty() {
-                continue;
-            }
-            let schema = batches[0].schema();
-            let merged = concat_batches(&schema, batches.iter())?;
-            let num_rows = merged.num_rows();
-            if num_rows == 0 {
-                continue;
-            }
-            let pq_col = merged.column_by_name(PQ_CODE_COLUMN).ok_or_else(|| {
-                Error::index(format!(
-                    "PQ column {} missing in transposed shard",
-                    PQ_CODE_COLUMN
-                ))
-            })?;
-            let pq_fsl = pq_col.as_fixed_size_list_opt().ok_or_else(|| {
-                Error::index(format!(
-                    "PQ column {} is not a FixedSizeList in transposed shard, got {}",
-                    PQ_CODE_COLUMN,
-                    pq_col.data_type(),
-                ))
-            })?;
-            let num_bytes = pq_fsl.value_length() as usize;
-            let values = pq_fsl.values().as_primitive::<UInt8Type>();
-            let row_major_codes = transpose(values, num_bytes, num_rows);
-            let row_major_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
-                row_major_codes,
-                num_bytes as i32,
-            )?);
-            *batches = vec![merged.replace_column_by_name(PQ_CODE_COLUMN, row_major_fsl)?];
-        }
+        super::layout::restore_partition_layout(
+            &mut per_partition_batches,
+            super::layout::untranspose_pq_partition,
+        )?;
     }
 
     Ok(per_partition_batches)
@@ -2108,7 +2049,8 @@ mod tests {
         // Distance type metadata for this shard.
         v2w.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
 
-        // PQ metadata with codebook stored in a global buffer.
+        // PQ metadata with codebook stored in a global buffer. The codes
+        // below are written row-major, so the layout flag must say so.
         let mut pq_meta = ProductQuantizationMetadata {
             codebook_position: 0,
             nbits,
@@ -2116,7 +2058,7 @@ mod tests {
             dimension,
             codebook: Some(codebook.clone()),
             codebook_tensor: Vec::new(),
-            transposed: true,
+            transposed: false,
         };
 
         let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;
