@@ -10255,8 +10255,8 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .indent(true)
             .to_string();
         assert!(
-            plan_str.contains("DeleteIf("),
-            "expected a DeleteIf condition in plan, got:\n{}",
+            plan_str.contains("DeleteIfExpr("),
+            "expected a DeleteIfExpr condition in plan, got:\n{}",
             plan_str
         );
 

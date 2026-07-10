@@ -204,7 +204,7 @@ impl DisplayAs for DeleteOnlyMergeInsertExec {
                         format!("DeleteIf({})", condition)
                     }
                     crate::dataset::WhenMatched::DeleteIfExpr(expr) => {
-                        format!("DeleteIf({})", expr.human_display())
+                        format!("DeleteIfExpr({})", expr.human_display())
                     }
                     other => format!("{:?}", other),
                 };

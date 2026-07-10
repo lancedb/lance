@@ -771,7 +771,7 @@ impl DisplayAs for FullSchemaMergeInsertExec {
                         format!("DeleteIf({})", condition)
                     }
                     crate::dataset::WhenMatched::DeleteIfExpr(expr) => {
-                        format!("DeleteIf({})", expr.human_display())
+                        format!("DeleteIfExpr({})", expr.human_display())
                     }
                 };
                 let when_not_matched = if self.params.insert_not_matched {
