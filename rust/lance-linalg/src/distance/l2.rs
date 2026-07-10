@@ -26,7 +26,10 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
 use crate::distance::BatchIter;
 
 /// Calculate the L2 distance between two vectors.
@@ -291,7 +294,11 @@ impl L2 for f32 {
     ) -> impl Iterator<Item = Self> + 'a {
         // Exactly one arm compiles; see `Dot::dot_batch` for f32.
         // See `Dot::dot_batch` for f32.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "fma"
+        ))]
         {
             // SAFETY: the build baseline enables avx2+fma, which imply avx+fma,
             // so the kernel's `#[target_feature]` contract is met statically and
@@ -300,7 +307,10 @@ impl L2 for f32 {
             y.chunks_exact(dimension)
                 .map(move |v| unsafe { x86::l2_f32_avx_fma(x, v) })
         }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(all(target_feature = "avx2", target_feature = "fma"))
+        ))]
         {
             l2_batch_f32_runtime_dispatch(x, y, dimension)
         }
@@ -312,7 +322,10 @@ impl L2 for f32 {
 }
 
 /// Sub-AVX2 builds: pick a `#[target_feature]` kernel once for the batch.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
 #[inline]
 fn l2_batch_f32_runtime_dispatch<'a>(
     x: &'a [f32],

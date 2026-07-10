@@ -19,7 +19,10 @@ use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
 use crate::distance::BatchIter;
 
 /// Default implementation of dot product.
@@ -273,7 +276,11 @@ impl Dot for f32 {
         // The iterator is a bare `Map`: `Map<ChunksExact, _>` is `TrustedLen`,
         // so `.collect()` preallocates, and `Map::fold` drives `ChunksExact` in
         // one inlined loop. Any wrapper — trait object or enum — loses both.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "fma"
+        ))]
         {
             // SAFETY: avx2+fma are enabled for the whole crate by the build
             // baseline, so the kernel's `#[target_feature]` contract holds
@@ -282,7 +289,10 @@ impl Dot for f32 {
                 .chunks_exact(dimension)
                 .map(move |y| unsafe { x86::dot_f32_avx_fma(x, y) })
         }
-        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(all(target_feature = "avx2", target_feature = "fma"))
+        ))]
         {
             dot_batch_f32_runtime_dispatch(x, batch, dimension)
         }
@@ -295,7 +305,10 @@ impl Dot for f32 {
 
 /// Sub-AVX2 builds: the scalar kernel cannot reach the wide registers, so pick
 /// a `#[target_feature]` kernel — once for the batch, not once per vector.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
 #[inline]
 fn dot_batch_f32_runtime_dispatch<'a>(
     x: &'a [f32],

@@ -37,7 +37,10 @@ pub mod norm_l2;
 /// loses `TrustedLen` (so `.collect()` stops preallocating) and loses
 /// `Map::fold`'s inlined loop. Benchmarks showed that costing 2.5x on the dim-8
 /// batch, far more than the per-vector dispatch it was meant to remove.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
 pub(crate) enum BatchIter<L> {
     /// Lazy per-vector map. No allocation.
     Lazy(L),
@@ -45,7 +48,10 @@ pub(crate) enum BatchIter<L> {
     Eager(std::vec::IntoIter<f32>),
 }
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
 impl<L: Iterator<Item = f32>> Iterator for BatchIter<L> {
     type Item = f32;
 
@@ -95,7 +101,10 @@ impl<L: Iterator<Item = f32>> Iterator for BatchIter<L> {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
 impl<L: ExactSizeIterator<Item = f32>> ExactSizeIterator for BatchIter<L> {
     #[inline]
     fn len(&self) -> usize {
