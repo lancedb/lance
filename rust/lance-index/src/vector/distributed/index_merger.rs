@@ -465,6 +465,11 @@ struct ShardInfo {
     /// merge re-packs the concatenated partition. Row-major shards leave this
     /// false and are untouched.
     unpack_rq_codes: bool,
+    /// PQ-backed only: this shard stores its PQ codes column-major (the output
+    /// of a prior merge), so they must be transposed back to row-major before
+    /// the merge re-transposes the concatenated partition. Row-major shards
+    /// leave this false and are untouched.
+    untranspose_pq_codes: bool,
 }
 
 #[derive(Debug)]
@@ -475,6 +480,7 @@ struct ShardWindowReadJob {
     start_offset: usize,
     end_offset: usize,
     unpack_rq_codes: bool,
+    untranspose_pq_codes: bool,
 }
 
 #[derive(Debug)]
@@ -594,6 +600,7 @@ async fn read_partition_window(
                 start_offset,
                 end_offset,
                 unpack_rq_codes: shard.unpack_rq_codes,
+                untranspose_pq_codes: shard.untranspose_pq_codes,
             }
         })
         .collect();
@@ -731,6 +738,48 @@ async fn read_shard_window_partitions(
             })?;
             let unpacked = unpack_codes(rq_fsl);
             *batches = vec![merged.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(unpacked))?];
+        }
+    }
+
+    // When this shard stores already-transposed PQ codes (the output of a
+    // prior merge), transpose them back to row-major here, per partition. The
+    // transpose unit is the whole partition, so its rows must first be
+    // reassembled before the layout can be inverted. This must happen per
+    // shard, before the merge stage concatenates partitions across shards and
+    // re-transposes them: column-major codes from different shards cannot be
+    // concatenated, and transposing already-transposed codes corrupts them.
+    if shard_job.untranspose_pq_codes {
+        for batches in per_partition_batches.iter_mut() {
+            if batches.is_empty() {
+                continue;
+            }
+            let schema = batches[0].schema();
+            let merged = concat_batches(&schema, batches.iter())?;
+            let num_rows = merged.num_rows();
+            if num_rows == 0 {
+                continue;
+            }
+            let pq_col = merged.column_by_name(PQ_CODE_COLUMN).ok_or_else(|| {
+                Error::index(format!(
+                    "PQ column {} missing in transposed shard",
+                    PQ_CODE_COLUMN
+                ))
+            })?;
+            let pq_fsl = pq_col.as_fixed_size_list_opt().ok_or_else(|| {
+                Error::index(format!(
+                    "PQ column {} is not a FixedSizeList in transposed shard, got {}",
+                    PQ_CODE_COLUMN,
+                    pq_col.data_type(),
+                ))
+            })?;
+            let num_bytes = pq_fsl.value_length() as usize;
+            let values = pq_fsl.values().as_primitive::<UInt8Type>();
+            let row_major_codes = transpose(values, num_bytes, num_rows);
+            let row_major_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                row_major_codes,
+                num_bytes as i32,
+            )?);
+            *batches = vec![merged.replace_column_by_name(PQ_CODE_COLUMN, row_major_fsl)?];
         }
     }
 
@@ -925,6 +974,9 @@ pub async fn merge_partial_vector_auxiliary_files(
         // shard (not from the shared first-shard metadata) so a mix of packed
         // and row-major shards merges correctly.
         let mut shard_unpack_rq_codes = false;
+        // PQ-backed: whether THIS shard's PQ codes are transposed, captured per
+        // shard for the same reason.
+        let mut shard_untranspose_pq_codes = false;
 
         match idx_type {
             SupportedIvfIndexType::IvfSq => {
@@ -1159,6 +1211,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         }
                     }
                 }
+                shard_untranspose_pq_codes = pm.transposed;
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
                 }
@@ -1319,6 +1372,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                         }
                     }
                 }
+                shard_untranspose_pq_codes = pm.transposed;
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
                 }
@@ -1404,6 +1458,7 @@ pub async fn merge_partial_vector_auxiliary_files(
             partition_offsets,
             total_rows: running_offset,
             unpack_rq_codes: shard_unpack_rq_codes,
+            untranspose_pq_codes: shard_untranspose_pq_codes,
         });
         progress
             .stage_progress("read_shard_metadata", idx as u64 + 1)
