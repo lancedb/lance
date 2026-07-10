@@ -463,6 +463,49 @@ async fn test_inline_transaction(
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_eq!(stats.read_iops, 0);
         assert_eq!(stats.read_bytes, 0);
+
+        // A serialized V2.3 manifest does not carry section presence. Cache an
+        // authoritative absent projection so repeated calls remain lazy.
+        let serialized_manifest = dataset.manifest.serialized();
+        let serialized_dataset = DatasetBuilder::from_uri(dataset.uri.clone())
+            .with_version(location.version)
+            .with_session(Arc::new(Session::default()))
+            .with_serialized_manifest(&serialized_manifest)
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+        let _ = serialized_dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
+        assert!(
+            serialized_dataset
+                .read_transaction()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let first_stats = serialized_dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
+        assert!(first_stats.read_iops > 0);
+        assert!(first_stats.read_bytes > 0);
+
+        assert!(
+            serialized_dataset
+                .read_transaction()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let cached_stats = serialized_dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
+        assert_eq!(cached_stats.read_iops, 0);
+        assert_eq!(cached_stats.read_bytes, 0);
     }
 }
 

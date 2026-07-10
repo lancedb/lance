@@ -17,7 +17,7 @@ use lance_core::deepsize::DeepSizeOf;
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
 use crate::index::DatasetIndexExt;
-use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
+use crate::session::caches::{CachedTransaction, DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
@@ -781,7 +781,10 @@ impl Dataset {
                 version: manifest_location.version,
             };
             metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
+                .insert_with_key(
+                    &metadata_key,
+                    Arc::new(CachedTransaction(Some(transaction))),
+                )
                 .await;
         }
 
@@ -1218,7 +1221,7 @@ impl Dataset {
             version: self.manifest.version,
         };
         if let Some(transaction) = self.metadata_cache.get_with_key(&transaction_key).await {
-            return Ok(Some((*transaction).clone()));
+            return Ok(transaction.0.clone());
         }
 
         // Prefer an inline transaction from either manifest container. The
@@ -1244,11 +1247,12 @@ impl Dataset {
             None
         };
 
-        if let Some(tx) = transaction.as_ref() {
-            self.metadata_cache
-                .insert_with_key(&transaction_key, Arc::new(tx.clone()))
-                .await;
-        }
+        self.metadata_cache
+            .insert_with_key(
+                &transaction_key,
+                Arc::new(CachedTransaction(transaction.clone())),
+            )
+            .await;
         Ok(transaction)
     }
 
@@ -3187,7 +3191,12 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
             };
             let transaction =
                 if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
-                    cached
+                    Arc::new(cached.0.clone().ok_or_else(|| {
+                        Error::internal(format!(
+                            "Dataset version {} does not have a transaction file",
+                            manifest_copy.version
+                        ))
+                    })?)
                 } else {
                     let dataset_version = Dataset::checkout_manifest(
                         dataset.object_store.clone(),
@@ -3201,18 +3210,12 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.store_params.as_deref().cloned(),
                         dataset.base_store_params.clone(),
                     )?;
-                    let loaded =
-                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::internal(format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ))
-                        })?);
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&tx_key, loaded.clone())
-                        .await;
-                    loaded
+                    Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
+                        Error::internal(format!(
+                            "Dataset version {} does not have a transaction file",
+                            manifest_copy.version
+                        ))
+                    })?)
                 };
             Ok((manifest.version, transaction))
         })

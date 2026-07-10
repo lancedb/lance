@@ -261,7 +261,12 @@ async fn do_commit_new_dataset(
                 version: manifest.version,
             };
             metadata_cache
-                .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                .insert_with_key(
+                    &tx_key,
+                    Arc::new(crate::session::caches::CachedTransaction(Some(
+                        transaction.clone(),
+                    ))),
+                )
                 .await;
 
             let manifest_key = crate::session::caches::ManifestKey {
@@ -1046,7 +1051,12 @@ pub(crate) async fn commit_transaction(
                 };
                 dataset
                     .metadata_cache
-                    .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+                    .insert_with_key(
+                        &tx_key,
+                        Arc::new(crate::session::caches::CachedTransaction(Some(
+                            transaction.clone(),
+                        ))),
+                    )
                     .await;
 
                 let manifest_key = crate::session::caches::ManifestKey {

@@ -87,13 +87,17 @@ pub struct TransactionKey {
     pub version: u64,
 }
 
+/// A cached transaction lookup, including an authoritative absent result.
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct CachedTransaction(pub Option<Transaction>);
+
 impl CacheKey for TransactionKey {
-    type ValueType = Transaction;
+    type ValueType = CachedTransaction;
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!("txn/{}", self.version))
     }
     fn type_name() -> &'static str {
-        "Transaction"
+        "CachedTransaction"
     }
 }
 
