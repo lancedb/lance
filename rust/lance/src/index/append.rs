@@ -1111,15 +1111,12 @@ mod tests {
         scanner
             .nearest("VECTOR", query.as_primitive::<Float32Type>(), 10)
             .unwrap();
-        let results = scanner
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let result_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
-        assert!(result_rows > 0);
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            results.num_rows(),
+            10,
+            "expected the requested k=10 nearest-neighbor results"
+        );
     }
 
     /// Regression: a second `OptimizeOptions::append()` call on a steady-state
