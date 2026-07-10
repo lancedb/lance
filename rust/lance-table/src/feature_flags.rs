@@ -20,8 +20,44 @@ pub const FLAG_TABLE_CONFIG: u64 = 8;
 pub const FLAG_BASE_PATHS: u64 = 16;
 /// Disable writing transaction file under _transaction/, this flag is set when we only want to write inline transaction in manifest
 pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
-/// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 64;
+/// The dataset relies on one or more experimental features, named in the
+/// manifest's `experimental_reader_features` / `experimental_writer_features`.
+///
+/// This bit is the fail-closed anchor for the experimental-feature mechanism.
+/// It is set whenever the corresponding experimental feature list is non-empty.
+/// Libraries built before a given experiment existed treat bit 64 as unknown
+/// (it was previously `FLAG_UNKNOWN`) and reject the dataset without needing to
+/// parse the feature names. Libraries that understand the mechanism defer to the
+/// name lists via [`can_read_dataset`] / [`can_write_dataset`]. See
+/// `rust/lance-table/design/experimental_feature_flags.md`.
+pub const FLAG_EXPERIMENTAL: u64 = 64;
+/// The first bit that is unknown as a feature flag.
+pub const FLAG_UNKNOWN: u64 = 128;
+
+// The experimental bit must be a *known* bit so admission is gated by the name
+// lists, not the bitmap boundary.
+const _: () = assert!(FLAG_EXPERIMENTAL < FLAG_UNKNOWN);
+
+/// The experimental feature names this build understands.
+///
+/// Each name is registered here only when the Cargo feature that implements it
+/// is enabled, so a default build understands none and therefore rejects any
+/// dataset that declares an experimental feature. When an experiment graduates,
+/// its name moves out of this list and onto a dedicated feature-flag bit.
+pub fn known_experimental_features() -> &'static [&'static str] {
+    &[
+        // Register experimental feature names here, gated by their Cargo feature:
+        //   #[cfg(feature = "unstable-action-transactions")] "action-transactions",
+    ]
+}
+
+/// Whether every name in `experimental_features` is understood by this build.
+fn understands_experimental_features(experimental_features: &[String]) -> bool {
+    let known = known_experimental_features();
+    experimental_features
+        .iter()
+        .all(|feature| known.contains(&feature.as_str()))
+}
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -74,15 +110,38 @@ pub fn apply_feature_flags(
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
     }
+
+    // The experimental bit is the fail-closed anchor for the named experimental
+    // feature lists; keep it in sync with them.
+    if !manifest.experimental_reader_features.is_empty() {
+        manifest.reader_feature_flags |= FLAG_EXPERIMENTAL;
+    }
+    if !manifest.experimental_writer_features.is_empty() {
+        manifest.writer_feature_flags |= FLAG_EXPERIMENTAL;
+    }
     Ok(())
 }
 
-pub fn can_read_dataset(reader_flags: u64) -> bool {
-    reader_flags < FLAG_UNKNOWN
+/// Whether this build can read a dataset with the given reader feature flags and
+/// declared experimental reader features.
+///
+/// Rejects if any non-experimental unknown bit is set, or if any declared
+/// experimental feature is not understood by this build.
+pub fn can_read_dataset(reader_flags: u64, experimental_reader_features: &[String]) -> bool {
+    if reader_flags & !(FLAG_UNKNOWN - 1) != 0 {
+        // A bit at or above FLAG_UNKNOWN is set — a feature we don't know about.
+        return false;
+    }
+    understands_experimental_features(experimental_reader_features)
 }
 
-pub fn can_write_dataset(writer_flags: u64) -> bool {
-    writer_flags < FLAG_UNKNOWN
+/// Whether this build can write to a dataset with the given writer feature flags
+/// and declared experimental writer features. See [`can_read_dataset`].
+pub fn can_write_dataset(writer_flags: u64, experimental_writer_features: &[String]) -> bool {
+    if writer_flags & !(FLAG_UNKNOWN - 1) != 0 {
+        return false;
+    }
+    understands_experimental_features(experimental_writer_features)
 }
 
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
@@ -94,40 +153,99 @@ mod tests {
     use super::*;
     use crate::format::BasePath;
 
+    const NO_FEATURES: &[String] = &[];
+
     #[test]
     fn test_read_check() {
-        assert!(can_read_dataset(0));
-        assert!(can_read_dataset(super::FLAG_DELETION_FILES));
-        assert!(can_read_dataset(super::FLAG_STABLE_ROW_IDS));
-        assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
-        assert!(can_read_dataset(super::FLAG_TABLE_CONFIG));
-        assert!(can_read_dataset(super::FLAG_BASE_PATHS));
-        assert!(can_read_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_read_dataset(0, NO_FEATURES));
+        assert!(can_read_dataset(super::FLAG_DELETION_FILES, NO_FEATURES));
+        assert!(can_read_dataset(super::FLAG_STABLE_ROW_IDS, NO_FEATURES));
+        assert!(can_read_dataset(
+            super::FLAG_USE_V2_FORMAT_DEPRECATED,
+            NO_FEATURES
+        ));
+        assert!(can_read_dataset(super::FLAG_TABLE_CONFIG, NO_FEATURES));
+        assert!(can_read_dataset(super::FLAG_BASE_PATHS, NO_FEATURES));
+        assert!(can_read_dataset(
+            super::FLAG_DISABLE_TRANSACTION_FILE,
+            NO_FEATURES
+        ));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
-                | super::FLAG_USE_V2_FORMAT_DEPRECATED
+                | super::FLAG_USE_V2_FORMAT_DEPRECATED,
+            NO_FEATURES
         ));
-        assert!(!can_read_dataset(super::FLAG_UNKNOWN));
+        assert!(!can_read_dataset(super::FLAG_UNKNOWN, NO_FEATURES));
     }
 
     #[test]
     fn test_write_check() {
-        assert!(can_write_dataset(0));
-        assert!(can_write_dataset(super::FLAG_DELETION_FILES));
-        assert!(can_write_dataset(super::FLAG_STABLE_ROW_IDS));
-        assert!(can_write_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
-        assert!(can_write_dataset(super::FLAG_TABLE_CONFIG));
-        assert!(can_write_dataset(super::FLAG_BASE_PATHS));
-        assert!(can_write_dataset(super::FLAG_DISABLE_TRANSACTION_FILE));
+        assert!(can_write_dataset(0, NO_FEATURES));
+        assert!(can_write_dataset(super::FLAG_DELETION_FILES, NO_FEATURES));
+        assert!(can_write_dataset(super::FLAG_STABLE_ROW_IDS, NO_FEATURES));
+        assert!(can_write_dataset(
+            super::FLAG_USE_V2_FORMAT_DEPRECATED,
+            NO_FEATURES
+        ));
+        assert!(can_write_dataset(super::FLAG_TABLE_CONFIG, NO_FEATURES));
+        assert!(can_write_dataset(super::FLAG_BASE_PATHS, NO_FEATURES));
+        assert!(can_write_dataset(
+            super::FLAG_DISABLE_TRANSACTION_FILE,
+            NO_FEATURES
+        ));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
                 | super::FLAG_TABLE_CONFIG
-                | super::FLAG_BASE_PATHS
+                | super::FLAG_BASE_PATHS,
+            NO_FEATURES
         ));
-        assert!(!can_write_dataset(super::FLAG_UNKNOWN));
+        assert!(!can_write_dataset(super::FLAG_UNKNOWN, NO_FEATURES));
+    }
+
+    #[test]
+    fn test_experimental_feature_admission() {
+        // A default build understands no experimental features, so any declared
+        // experimental feature is rejected on both read and write paths.
+        let declared = vec!["some-experiment".to_string()];
+        assert!(!can_read_dataset(FLAG_EXPERIMENTAL, &declared));
+        assert!(!can_write_dataset(FLAG_EXPERIMENTAL, &declared));
+
+        // The experimental bit with no declared features is harmless — there is
+        // nothing the reader could fail to understand. (Pre-mechanism libraries
+        // still reject bit 64, since their FLAG_UNKNOWN was 64.)
+        assert!(can_read_dataset(FLAG_EXPERIMENTAL, NO_FEATURES));
+        assert!(can_write_dataset(FLAG_EXPERIMENTAL, NO_FEATURES));
+    }
+
+    #[test]
+    fn test_apply_sets_experimental_flag() {
+        use crate::format::{DataStorageFormat, Manifest};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.experimental_writer_features = vec!["some-experiment".to_string()];
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_ne!(manifest.writer_feature_flags & FLAG_EXPERIMENTAL, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_EXPERIMENTAL, 0);
     }
 
     #[test]

@@ -115,6 +115,11 @@ message Manifest {
   // * 1 << 3: table config is present
   // * 1 << 4: dataset uses multiple base paths
   // * 1 << 5: transaction file writes are disabled
+  // * 1 << 6: dataset uses one or more experimental features, named in
+  //           experimental_reader_features / experimental_writer_features. This
+  //           bit is the fail-closed anchor: implementations that predate a
+  //           given experiment reject the dataset on this bit alone, without
+  //           needing to parse the feature names.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -207,6 +212,24 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Names of experimental features this dataset relies on for reading.
+  //
+  // EXPERIMENTAL: this is the forward-looking capability list that pairs with
+  // the `1 << 6` reader feature-flag bit. A reader that does not recognize
+  // every name listed here must refuse to read the dataset. Feature names are
+  // stable, lowercase-kebab identifiers (e.g. "action-transactions"). A name
+  // is removed from this list once its feature graduates to a dedicated
+  // feature-flag bit, or when the experiment is abandoned and its data is no
+  // longer written. Empty for datasets that use no experimental features.
+  repeated string experimental_reader_features = 22;
+
+  // Names of experimental features this dataset relies on for writing.
+  //
+  // EXPERIMENTAL: the writer-side counterpart of experimental_reader_features,
+  // pairing with the `1 << 6` writer feature-flag bit. A writer that does not
+  // recognize every name listed here must refuse to commit to the dataset.
+  repeated string experimental_writer_features = 23;
 } // Manifest
 
 // external dataset base path

@@ -343,7 +343,10 @@ impl<'a> InsertBuilder<'a> {
 
         // Feature flags
         if let WriteDestination::Dataset(dataset) = &context.dest
-            && !can_write_dataset(dataset.manifest.writer_feature_flags)
+            && !can_write_dataset(
+                dataset.manifest.writer_feature_flags,
+                &dataset.manifest.experimental_writer_features,
+            )
         {
             let message = format!(
                 "This dataset cannot be written by this version of Lance. \
