@@ -290,11 +290,15 @@ impl L2 for f32 {
         dimension: usize,
     ) -> impl Iterator<Item = Self> + 'a {
         // Exactly one arm compiles; see `Dot::dot_batch` for f32.
-        // See `Dot::dot_batch` for f32: on an AVX2-baseline build this is exactly
-        // the pre-dispatch iterator, wrapper-free.
+        // See `Dot::dot_batch` for f32.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            y.chunks_exact(dimension).map(move |v| l2_f32_scalar(x, v))
+            // SAFETY: the build baseline enables avx2+fma, which imply avx+fma,
+            // so the kernel's `#[target_feature]` contract is met statically and
+            // it inlines into this loop. No runtime check, and no falling back
+            // to the scalar kernel — at small dimensions that costs ~4x.
+            y.chunks_exact(dimension)
+                .map(move |v| unsafe { x86::l2_f32_avx_fma(x, v) })
         }
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
         {

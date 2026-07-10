@@ -263,17 +263,24 @@ impl Dot for f32 {
         // Exactly one arm compiles. Keeping each a tail expression (rather than
         // an early `return` guarded by `cfg`) mirrors `dot_f32_dispatched` and
         // avoids an unreachable tail on AVX2-baseline builds.
-        // AVX2-baseline build (the default `haswell` wheel): return exactly what
-        // the code returned before runtime dispatch existed — a lazy `Map` over
-        // the inlined, auto-vectorized scalar kernel. Wrapping it in anything
-        // (a trait object, or an enum) costs more than the dispatch it removes:
-        // `Map<ChunksExact, _>` is `TrustedLen`, so `.collect()` preallocates,
-        // and `Map::fold` drives `ChunksExact` in one inlined loop.
+        // AVX2-baseline build (the default `haswell` wheel). Hoist the tier
+        // choice out of the loop, but keep the SIMD kernel: the baseline already
+        // guarantees avx2+fma, so call the AVX+FMA kernel directly rather than
+        // re-checking per vector. Falling back to the scalar kernel here would
+        // lose ~4x at small dimensions, which is where batch calls live (PQ
+        // sub-vectors are 8 wide).
+        //
+        // The iterator is a bare `Map`: `Map<ChunksExact, _>` is `TrustedLen`,
+        // so `.collect()` preallocates, and `Map::fold` drives `ChunksExact` in
+        // one inlined loop. Any wrapper — trait object or enum — loses both.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
+            // SAFETY: avx2+fma are enabled for the whole crate by the build
+            // baseline, so the kernel's `#[target_feature]` contract holds
+            // statically and it inlines here.
             batch
                 .chunks_exact(dimension)
-                .map(move |y| dot_f32_scalar(x, y))
+                .map(move |y| unsafe { x86::dot_f32_avx_fma(x, y) })
         }
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
         {
