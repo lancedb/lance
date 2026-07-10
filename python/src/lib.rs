@@ -74,6 +74,7 @@ pub(crate) mod fragment;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
+pub(crate) mod otel;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
@@ -318,6 +319,12 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
+    // OpenTelemetry metrics bridge
+    m.add_class::<otel::PyMetricPoint>()?;
+    m.add_class::<otel::PyMetricDescription>()?;
+    m.add_wrapped(wrap_pyfunction!(otel::register_lance_metrics_recorder))?;
+    m.add_wrapped(wrap_pyfunction!(otel::lance_metrics_catalog))?;
+    m.add_wrapped(wrap_pyfunction!(otel::snapshot_lance_metrics))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;

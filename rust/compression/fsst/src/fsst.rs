@@ -57,6 +57,12 @@ use std::ptr;
 
 #[inline]
 fn fsst_unaligned_load_unchecked(v: *const u8) -> u64 {
+    // SAFETY: the caller must guarantee that `v` points to at least 8 readable bytes. All callers
+    // uphold this: `compress_bulk` loads from a 520-byte stack buffer at an offset < 511 (leaving
+    // >= 8 bytes), `build_symbol_table` guards the load with `word.len() > 7 && curr < word.len() - 7`,
+    // `find_longest_symbol_from_char_slice` copies into a stack `[u8; 8]` before loading, and
+    // `FsstDecoder::init` reads symbols from a `symbol_table` buffer already validated to be
+    // exactly `FSST_SYMBOL_TABLE_SIZE` bytes.
     unsafe { ptr::read_unaligned(v as *const u64) }
 }
 
@@ -812,12 +818,31 @@ fn decompress_bulk<T: OffsetSizeTrait>(
 ) -> io::Result<()> {
     let symbols = decoder.symbols;
     let lens = decoder.lens;
+    // SAFETY invariant shared by every `unsafe` block in this closure:
+    // - `out` is sized to at least 8x `compressed_strs` (checked in `FsstDecoder::init`, which the
+    //   sole public entry point always runs before reaching this function). Each code advances
+    //   `out_curr` by `lens[code]`, which is 1..=8 for a well-formed symbol table, and each
+    //   consumed input byte yields at most 8 output bytes, so `out_curr + 8 <= out.len()` at every
+    //   8-byte write, including the final one. This is why we can `write_unaligned` a full 8-byte
+    //   word per code and advance by only the length.
+    //   NOTE: `lens` is loaded verbatim from the (untrusted) symbol table and is NOT re-validated
+    //   to be <= 8 on decode, and offsets (below) are likewise trusted. A corrupted table or
+    //   offset buffer can violate these bounds; callers must supply structures produced by
+    //   `compress` (or otherwise trusted). Hardening the decoder against corrupt input is a
+    //   separate concern, not addressed here.
+    // - The only unchecked read is `read_unaligned::<u32>`, gated by `in_curr + 4 <= in_end`; the
+    //   scalar paths use bounds-checked indexing. `in_end` is a caller-provided offset into
+    //   `compressed_strs`; the read is sound only if `in_end <= compressed_strs.len()`, which is a
+    //   trusted precondition (holds for encoder-produced offsets; not validated here).
     let mut decompress = |mut in_curr: usize, in_end: usize, out_curr: &mut usize| {
         // Do SIMD operation here by 4 bytes
         while in_curr + 4 <= in_end {
             let next_block;
             let mut code;
             let mut len;
+            // SAFETY: the loop guard proves `in_curr + 4 <= in_end`. Per the closure-level
+            // invariant, `in_end <= compressed_strs.len()` is a trusted precondition (not checked
+            // here), so the 4-byte read is in bounds for well-formed input.
             unsafe {
                 next_block =
                     ptr::read_unaligned(compressed_strs.as_ptr().add(in_curr) as *const u32);
@@ -983,6 +1008,10 @@ fn decompress_bulk<T: OffsetSizeTrait>(
         if in_curr < in_end {
             // last code cannot be an escape code
             let code = compressed_strs[in_curr] as usize;
+            // SAFETY: see the closure-level invariant. This is the final write and has no
+            // subsequent write to cover its slack, so it is the tightest case: `out_curr` is at
+            // most 8*(consumed_input_bytes - 1), and the 8-byte store lands within `out.len()`
+            // precisely because the caller sized `out` to 8x the input.
             unsafe {
                 let src = symbols[code];
                 ptr::write_unaligned(out.as_mut_ptr().add(*out_curr) as *mut u64, src);
@@ -1188,8 +1217,19 @@ impl<T: OffsetSizeTrait> FsstDecoder<T> {
         }
 
         self.decoder_switch_on = (st_info & (1 << 24)) != 0;
-        // when decoder_switch_on is true, we make sure the out_buf is at least 3 times the size of the in_buf,
-        if self.decoder_switch_on && in_buf.len() * 3 > out_buf.len() {
+        // A single 1-byte code can decode to a symbol of up to MAX_SYMBOL_LENGTH (8) bytes, so the
+        // decoded output can be up to 8x the input. `decompress_bulk` also relies on this bound: it
+        // writes a full 8-byte word per code (advancing only by the symbol length), so the output
+        // buffer must be large enough that even the final write stays in bounds. Require out_buf to
+        // be at least 8x in_buf. `checked_mul` guards against `in_buf.len() * 8` wrapping on 32-bit
+        // targets (an input >= 512 MiB would otherwise bypass the check); treat overflow as too
+        // small.
+        if self.decoder_switch_on
+            && in_buf
+                .len()
+                .checked_mul(8)
+                .is_none_or(|needed| needed > out_buf.len())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "output buffer too small for FSST decoder",
@@ -1288,8 +1328,10 @@ pub fn compress<T: OffsetSizeTrait>(
 // the following 32 bits after FSST_MAGIC contains information about FSST encoding, such as decoder_switch_on, suffix_lim, terminator, n_symbols
 // when the decoder_switch_on is off in the in_buf header, `decompress` first make sure the out_buf is at least the same size as the in_buf, then simply copy the
 // input data to the output
-// when the decoder_switch_on is on, `decompress` first make sure the out_buf is at least 3 times the size of the in_buf, then start decoding the
-// data using the symbol table
+// when the decoder_switch_on is on, `decompress` first make sure the out_buf is at least 8 times the size of the in_buf, then start decoding the
+// data using the symbol table. The 8x bound is required for correctness: a 1-byte code can expand to
+// an 8-byte symbol, and the decode loop writes a full 8-byte word per code, so a smaller buffer can
+// be written out of bounds.
 // the out_offsets_buf should be at least the same size as the in_offsets_buf, otherwise an error is returned
 // the symbol_table is the same symbol table created by `compression`
 pub fn decompress<T: OffsetSizeTrait>(
@@ -1643,5 +1685,60 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
                 std::str::from_utf8(original)
             );
         }
+    }
+
+    // Build a genuinely FSST-compressed (decoder_switch_on) buffer to exercise the decode-side
+    // output-buffer size contract. Returns (symbol_table, compressed_bytes, compressed_offsets).
+    fn compress_paragraph() -> ([u8; FSST_SYMBOL_TABLE_SIZE], Vec<u8>, Vec<i32>) {
+        let test_input = TEST_PARAGRAPH.repeat((1024 * 1024) / TEST_PARAGRAPH.len());
+        let lines_vec = test_input.lines().collect::<Vec<&str>>();
+        let string_array = StringArray::from(lines_vec);
+        let mut compress_output_buf: Vec<u8> = vec![0; string_array.value_data().len()];
+        let mut compress_offset_buf: Vec<i32> = vec![0; string_array.value_offsets().len()];
+        let mut symbol_table = [0; FSST_SYMBOL_TABLE_SIZE];
+        compress(
+            symbol_table.as_mut(),
+            string_array.value_data(),
+            string_array.value_offsets(),
+            &mut compress_output_buf,
+            &mut compress_offset_buf,
+        )
+        .unwrap();
+        (symbol_table, compress_output_buf, compress_offset_buf)
+    }
+
+    // The decoder writes a full 8-byte word per code, so the output buffer must be at least 8x the
+    // compressed input. A buffer sized below 8x must be rejected rather than written out of bounds.
+    #[test_log::test(tokio::test)]
+    async fn test_decompress_rejects_undersized_output_buffer() {
+        let (symbol_table, compressed, compressed_offsets) = compress_paragraph();
+        // Sanity check: this input actually engaged FSST compression (decoder_switch_on).
+        let st_info = u64::from_ne_bytes(symbol_table[..8].try_into().unwrap());
+        assert!(st_info & (1 << 24) != 0, "expected decoder_switch_on input");
+
+        // One byte short of the 8x requirement must be rejected.
+        let mut too_small = vec![0u8; compressed.len() * 8 - 1];
+        let mut out_offsets = vec![0i32; compressed_offsets.len()];
+        let err = decompress(
+            &symbol_table,
+            &compressed,
+            &compressed_offsets,
+            &mut too_small,
+            &mut out_offsets,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // Exactly 8x is the tight bound and must succeed.
+        let mut exact = vec![0u8; compressed.len() * 8];
+        let mut out_offsets = vec![0i32; compressed_offsets.len()];
+        decompress(
+            &symbol_table,
+            &compressed,
+            &compressed_offsets,
+            &mut exact,
+            &mut out_offsets,
+        )
+        .unwrap();
     }
 }

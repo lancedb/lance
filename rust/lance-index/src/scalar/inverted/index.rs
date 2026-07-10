@@ -51,7 +51,7 @@ use lance_select::{RowAddrMask, RowAddrTreeMap};
 use roaring::RoaringBitmap;
 use std::sync::LazyLock;
 use tokio::{sync::OnceCell, task::spawn_blocking};
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use super::encoding::{PositionBlockBuilder, decode_group_starts};
 use super::iter::PostingListIterator;
@@ -1318,16 +1318,65 @@ impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         let with_position = options.with_position;
         let chunk_concurrency = self.store.io_parallelism().max(1);
+        let prewarm_started = Instant::now();
+        info!(
+            partition_count = self.partitions.len(),
+            with_position, chunk_concurrency, "fts index prewarm started"
+        );
         for part in &self.partitions {
-            part.inverted_list
+            let partition_started = Instant::now();
+            info!(
+                partition_id = part.id(),
+                token_count = part.tokens.len(),
+                with_position,
+                chunk_concurrency,
+                "fts partition prewarm started"
+            );
+            if let Err(err) = part
+                .inverted_list
                 .prewarm_posting_lists(with_position, chunk_concurrency)
-                .await?;
+                .await
+            {
+                warn!(
+                    partition_id = part.id(),
+                    error = %err,
+                    elapsed_ms = partition_started.elapsed().as_millis() as u64,
+                    "fts partition posting list prewarm failed"
+                );
+                return Err(err);
+            }
+            info!(
+                partition_id = part.id(),
+                elapsed_ms = partition_started.elapsed().as_millis() as u64,
+                "fts partition posting lists prewarmed"
+            );
             // Materialize the deferred DocSet too: prewarm's contract is
             // that subsequent queries do no IO, so the per-doc row_ids /
             // num_tokens must be resident, not lazily faulted in at query
             // time. `ensure_loaded` opens, reads, and drops the reader.
-            part.docs.ensure_loaded().await?;
+            let docs_started = Instant::now();
+            if let Err(err) = part.docs.ensure_loaded().await {
+                warn!(
+                    partition_id = part.id(),
+                    error = %err,
+                    elapsed_ms = docs_started.elapsed().as_millis() as u64,
+                    total_elapsed_ms = partition_started.elapsed().as_millis() as u64,
+                    "fts partition docset prewarm failed"
+                );
+                return Err(err);
+            }
+            info!(
+                partition_id = part.id(),
+                docset_elapsed_ms = docs_started.elapsed().as_millis() as u64,
+                elapsed_ms = partition_started.elapsed().as_millis() as u64,
+                "fts partition prewarm finished"
+            );
         }
+        info!(
+            partition_count = self.partitions.len(),
+            elapsed_ms = prewarm_started.elapsed().as_millis() as u64,
+            "fts index prewarm finished"
+        );
         Ok(())
     }
     /// Search docs match the input text.

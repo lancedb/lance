@@ -265,6 +265,14 @@ impl ObjectStoreRegistry {
 
         store.inner = store.inner.traced();
 
+        #[cfg(feature = "metrics")]
+        {
+            // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
+            // `az$container@account`) so multiple stores on one cloud differ.
+            use crate::object_store::metrics::ObjectStoreMetricsExt;
+            store.inner = store.inner.metered(cache_path.clone());
+        }
+
         if let Some(wrapper) = &params.object_store_wrapper {
             store.inner = wrapper.wrap(&cache_path, store.inner);
         }

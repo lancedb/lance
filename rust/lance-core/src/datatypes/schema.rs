@@ -1097,6 +1097,15 @@ impl BlobHandling {
         }
     }
 
+    /// Whether `field` will be projected as a lightweight blob *description*
+    /// (offset + size) rather than its full binary value under this handling.
+    ///
+    /// A description is tiny and cheap to read eagerly; the full binary value is
+    /// not. Materialization heuristics use this to decide early vs late loading.
+    pub fn returns_description(&self, field: &Field) -> bool {
+        self.should_unload(field)
+    }
+
     /// Apply this blob handling policy to a projected field tree.
     ///
     /// Blob descriptor modes convert blob leaves to descriptor views. Binary

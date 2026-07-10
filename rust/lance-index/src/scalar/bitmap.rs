@@ -891,8 +891,7 @@ impl BitmapBatchWriter {
             return Ok(());
         }
         let keys_array =
-            ScalarValue::iter_to_array(self.keys.drain(..).collect::<Vec<_>>().into_iter())
-                .unwrap();
+            ScalarValue::iter_to_array(self.keys.drain(..).collect::<Vec<_>>()).unwrap();
         let total_size: usize = self.serialized.iter().map(|b| b.len()).sum();
         let mut binary_builder = BinaryBuilder::with_capacity(self.serialized.len(), total_size);
         for b in self.serialized.drain(..) {
@@ -1123,10 +1122,7 @@ async fn drain_same_key_bitmaps(
     let merged_key = OrderableScalarValue(key);
     advance_cursor_and_push(cursors, heap, item.shard_idx).await?;
 
-    loop {
-        let Some(Reverse(next_item)) = heap.peek() else {
-            break;
-        };
+    while let Some(Reverse(next_item)) = heap.peek() {
         if next_item.key != merged_key {
             break;
         }
@@ -1280,7 +1276,7 @@ impl BitmapIndexPlugin {
             let bitmap_size = bytes.len();
 
             if cur_bytes + bitmap_size > MAX_BITMAP_ARRAY_LENGTH {
-                let keys_array = ScalarValue::iter_to_array(cur_keys.clone().into_iter()).unwrap();
+                let keys_array = ScalarValue::iter_to_array(cur_keys.clone()).unwrap();
                 let mut binary_builder = BinaryBuilder::new();
                 for b in &cur_bitmaps {
                     binary_builder.append_value(b);

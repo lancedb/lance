@@ -3,7 +3,7 @@ nav:
   - Apache DataFusion: datafusion.md
   - PostgreSQL: https://github.com/lancedb/pglance
   - PyTorch: pytorch.md
-  - Tensorflow: tensorflow.md
+  - TensorFlow: tensorflow.md
   - Apache Spark: spark
   - Ray: ray
   - Trino: trino

@@ -219,6 +219,37 @@ use cases. For example, S3 can typically get up to 5000
 req/s and with these settings we should get there in about
 10 seconds.
 
+## Fragment Sizing
+
+A Lance table is a collection of fragments tracked by a manifest. How you size those fragments
+trades off two classes of work:
+
+- **Manifest-level operations** scale with the *number* of fragments. Every dataset mutation
+  (appends, metadata updates, schema changes, compactions, etc.) rewrites the manifest, so a
+  larger fragment list makes every write slower. Reads pay a similar cost up front: opening a
+  dataset, listing fragments, planning a scan, and resolving transaction conflicts at the
+  dataset level all walk the manifest.
+- **Fragment-level operations** scale with the *size* of a fragment. These include scans
+  against a matching fragment, compaction, updates, deletes, and `merge_insert`. Conflict
+  detection for these operations is also done at the fragment level.
+
+Fewer, larger fragments make manifest-level operations cheap but make each fragment-level
+operation heavier and increase the chance of conflicts when many writers target the same
+fragment. More, smaller fragments do the reverse.
+
+Practical guidance:
+
+- The default of 1M rows per fragment works well up to ~1B rows. Past that, bumping toward
+  ~100M rows per fragment is reasonable, though fragment-count limits are rarely the bottleneck
+  in practice.
+- Tens of thousands of fragments per table is generally fine.
+- Keep individual fragments well under object-store object-size limits (S3 caps at 5 TB, and
+  stores tend to misbehave well before that). 10 GB–100 GB per fragment is a reasonable upper
+  range; 1 TB is a hard ceiling.
+- If you run many concurrent updates, deletes, or `merge_insert` operations, err toward more
+  fragments — conflict detection is per-fragment, so too few fragments leads to excess
+  retries.
+
 ## Conflict Handling
 
 Lance supports concurrent operations on the same table using optimistic concurrency control. When two

@@ -1402,6 +1402,20 @@ pub trait ScalarIndexLoader: Send + Sync {
         index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Translate an address-domain index result into the row-id domain
+    ///
+    /// Address-domain indices (see [`ScalarIndex::results_are_row_addresses`])
+    /// report matches as physical row addresses. The default returns `result`
+    /// unchanged, which is correct when addresses and row ids coincide (no
+    /// stable row ids). A dataset with stable row ids overrides this to remap
+    /// addresses to stable row ids via its per-fragment row-id sequences.
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        Ok(result)
+    }
 }
 
 /// This represents a search into a scalar index
@@ -1693,7 +1707,15 @@ impl ScalarIndexExpr {
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
-                Ok(search_result.into())
+                let result: NullableIndexExprResult = search_result.into();
+                if index.results_are_row_addresses() {
+                    // Translate address-domain results to the row-id domain
+                    // before combining or scanning; otherwise stable-row-id
+                    // datasets silently drop matches (issue #7434).
+                    index_loader.row_addr_result_to_row_ids(result).await
+                } else {
+                    Ok(result)
+                }
             }
         }
     }
