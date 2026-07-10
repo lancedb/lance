@@ -4049,16 +4049,20 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     );
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_manifest_read_recovers_from_stale_size() {
+async fn test_manifest_read_recovers_from_stale_size(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+    data_storage_version: LanceFileVersion,
+) {
     // A cached `ManifestLocation.size` can lag the real object: a reader may pick
     // up a size from a stale listing/hint while another writer is committing
-    // concurrently. Reading the manifest (or its index section) with that stale
-    // size must not fail with a spurious "file size is too small" error. The
-    // reader should drop the cached size, fetch the true size, and succeed.
+    // concurrently. Reading the manifest or either auxiliary section with that
+    // stale size must not fail with a spurious "file size is too small" error.
+    // The reader should drop the cached size, fetch the true size, and succeed.
     use crate::session::Session;
     use lance_table::io::commit::ManifestLocation;
-    use lance_table::io::manifest::read_manifest_indexes;
+    use lance_table::io::manifest::{read_manifest_indexes, read_manifest_transaction};
 
     let test_uri = TempStrDir::default();
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -4073,7 +4077,16 @@ async fn test_manifest_read_recovers_from_stale_size() {
     .unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
     dataset
         .create_index(
             &["id"],
@@ -4089,7 +4102,7 @@ async fn test_manifest_read_recovers_from_stale_size() {
     assert!(real_location.size.is_some());
 
     // A deliberately-too-small size stands in for a stale cached size. Without the
-    // retry, both reads below decode a bogus footer offset and fail with
+    // retry, the reads below decode a bogus footer offset and fail with
     // "file size is too small".
     let stale_location = ManifestLocation {
         size: Some(1),
@@ -4112,4 +4125,10 @@ async fn test_manifest_read_recovers_from_stale_size() {
         .expect("read_manifest_indexes should recover from a stale manifest size");
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
+
+    let transaction =
+        read_manifest_transaction(dataset.object_store.as_ref(), &stale_location, &manifest)
+            .await
+            .expect("read_manifest_transaction should recover from a stale manifest size");
+    assert!(transaction.is_some());
 }

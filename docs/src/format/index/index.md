@@ -133,16 +133,17 @@ fragments that would have been covered by that segment.
 
 When loading an index:
 
-1. Get the offset to the index section from the `index_section` field in the [manifest](../table/index.md#manifest).
-2. Read the index section from the manifest file. This is a protobuf message of type `IndexSection`, which
-   contains a list of `IndexMetadata` messages, each describing an index segment.
+1. Inspect the manifest footer to select the manifest container. Protobuf manifests use the
+   byte offset in `index_section`; columnar manifests use the top-level `indices` section.
+2. For a protobuf manifest, decode the `IndexSection` message at that offset. For a columnar
+   manifest, project only the `indices` section and decode each `IndexMetadata` payload.
 3. Read the index files from the `_indices/{UUID}` directory under the dataset directory,
    where `{UUID}` is the UUID of the index segment.
 
 !!! tip "Optimizing manifest loading"
 
-    When the manifest file is small, you can read and cache the index section eagerly. This avoids
-    an extra file read when loading indices.
+    Cache decoded index metadata after the first request. Columnar manifest readers can project
+    the `indices` section without decoding fragment or data-file sections.
 
 The `IndexMetadata` message contains important information about the index segment:
 

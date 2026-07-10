@@ -373,6 +373,36 @@ def test_checkout(tmp_path: Path):
     assert ds2.checkout_version(ds2.latest_version).version == ds1.version
 
 
+def test_columnar_manifest_history(tmp_path: Path):
+    base_dir = tmp_path / "columnar-manifest-history"
+    dataset = lance.write_dataset(
+        pa.table({"value": [0, 1]}),
+        base_dir,
+        data_storage_version="2.3",
+    )
+    dataset = lance.write_dataset(
+        pa.table({"value": [2, 3]}),
+        dataset,
+        mode="append",
+    )
+    dataset.delete("value >= 2")
+
+    assert dataset.version == 3
+    assert dataset.count_rows() == 2
+    assert dataset.checkout_version(1).count_rows() == 2
+    assert dataset.checkout_version(2).count_rows() == 4
+
+    restored = dataset.checkout_version(2)
+    restored.restore()
+    assert restored.version == 4
+    assert restored.count_rows() == 4
+
+    for version in range(1, 5):
+        manifest = base_dir / "_versions" / f"{2**64 - 1 - version}.manifest"
+        footer = manifest.read_bytes()[-8:]
+        assert footer == b"\x02\x00\x01\x00LANC"
+
+
 def test_asof_checkout(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"

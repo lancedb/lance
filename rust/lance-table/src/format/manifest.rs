@@ -31,7 +31,7 @@ use lance_io::utils::read_struct;
 ///  * Version
 ///  * Fragments.
 ///  * Indices.
-#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
@@ -54,7 +54,10 @@ pub struct Manifest {
     /// The file position of the version aux data.
     pub version_aux_data: usize,
 
-    /// The file position of the index metadata.
+    /// The byte offset of protobuf index metadata in legacy manifest containers.
+    ///
+    /// Columnar manifests always store `None`; their top-level section source is
+    /// resolved internally from the storage version.
     pub index_section: Option<usize>,
 
     /// The creation timestamp with nanosecond resolution as 128-bit integer
@@ -76,7 +79,10 @@ pub struct Manifest {
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
 
-    /// The file position of the inline transaction content inside the manifest
+    /// The byte offset of an inline protobuf transaction in legacy manifest containers.
+    ///
+    /// Columnar manifests always store `None`; their top-level section source is
+    /// resolved internally from the storage version.
     pub transaction_section: Option<usize>,
 
     /// Precomputed logic offset of each fragment
@@ -101,6 +107,153 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Runtime-only section presence learned from the manifest container.
+    section_hints: ManifestSectionHints,
+}
+
+/// The container-specific source used to read a manifest section on demand.
+///
+/// Protobuf manifests address auxiliary messages by byte offset. Columnar manifests
+/// always expose top-level Lance columns; an empty projection represents an absent
+/// logical section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestSectionSource {
+    /// A length-prefixed protobuf message beginning at this byte offset.
+    ProtobufOffset(usize),
+    /// A top-level section in the columnar Lance manifest container.
+    ColumnarProjection,
+    /// A top-level columnar section whose row presence has not been loaded yet.
+    UnknownProjection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+enum ManifestSectionHint {
+    Absent,
+    ProtobufOffset(usize),
+    ColumnarProjection,
+    UnknownProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+struct ManifestSectionHints {
+    index: ManifestSectionHint,
+    transaction: ManifestSectionHint,
+}
+
+impl ManifestSectionHints {
+    fn absent() -> Self {
+        Self {
+            index: ManifestSectionHint::Absent,
+            transaction: ManifestSectionHint::Absent,
+        }
+    }
+
+    fn from_protobuf_offsets(index: Option<usize>, transaction: Option<usize>) -> Self {
+        Self {
+            index: index.map_or(
+                ManifestSectionHint::Absent,
+                ManifestSectionHint::ProtobufOffset,
+            ),
+            transaction: transaction.map_or(
+                ManifestSectionHint::Absent,
+                ManifestSectionHint::ProtobufOffset,
+            ),
+        }
+    }
+
+    fn unknown_columnar() -> Self {
+        Self {
+            index: ManifestSectionHint::UnknownProjection,
+            transaction: ManifestSectionHint::UnknownProjection,
+        }
+    }
+
+    fn columnar(index_is_present: bool, transaction_is_present: bool) -> Self {
+        let source = |is_present| {
+            if is_present {
+                ManifestSectionHint::ColumnarProjection
+            } else {
+                ManifestSectionHint::Absent
+            }
+        };
+        Self {
+            index: source(index_is_present),
+            transaction: source(transaction_is_present),
+        }
+    }
+}
+
+impl PartialEq for Manifest {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            schema,
+            version,
+            branch,
+            writer_version,
+            fragments,
+            version_aux_data,
+            index_section,
+            timestamp_nanos,
+            tag,
+            reader_feature_flags,
+            writer_feature_flags,
+            max_fragment_id,
+            transaction_file,
+            transaction_section,
+            fragment_offsets,
+            next_row_id,
+            data_storage_format,
+            config,
+            table_metadata,
+            base_paths,
+            section_hints: _,
+        } = self;
+        let Self {
+            schema: other_schema,
+            version: other_version,
+            branch: other_branch,
+            writer_version: other_writer_version,
+            fragments: other_fragments,
+            version_aux_data: other_version_aux_data,
+            index_section: other_index_section,
+            timestamp_nanos: other_timestamp_nanos,
+            tag: other_tag,
+            reader_feature_flags: other_reader_feature_flags,
+            writer_feature_flags: other_writer_feature_flags,
+            max_fragment_id: other_max_fragment_id,
+            transaction_file: other_transaction_file,
+            transaction_section: other_transaction_section,
+            fragment_offsets: other_fragment_offsets,
+            next_row_id: other_next_row_id,
+            data_storage_format: other_data_storage_format,
+            config: other_config,
+            table_metadata: other_table_metadata,
+            base_paths: other_base_paths,
+            section_hints: _,
+        } = other;
+
+        schema == other_schema
+            && version == other_version
+            && branch == other_branch
+            && writer_version == other_writer_version
+            && fragments == other_fragments
+            && version_aux_data == other_version_aux_data
+            && index_section == other_index_section
+            && timestamp_nanos == other_timestamp_nanos
+            && tag == other_tag
+            && reader_feature_flags == other_reader_feature_flags
+            && writer_feature_flags == other_writer_feature_flags
+            && max_fragment_id == other_max_fragment_id
+            && transaction_file == other_transaction_file
+            && transaction_section == other_transaction_section
+            && fragment_offsets == other_fragment_offsets
+            && next_row_id == other_next_row_id
+            && data_storage_format == other_data_storage_format
+            && config == other_config
+            && table_metadata == other_table_metadata
+            && base_paths == other_base_paths
+    }
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -196,7 +349,33 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            section_hints: ManifestSectionHints::absent(),
         }
+    }
+
+    /// Replaces the fully materialized fragment list and rebuilds its derived offsets.
+    ///
+    /// This is used by alternate manifest containers that decode the version-level
+    /// metadata separately from the fragment section.
+    pub(crate) fn replace_fragments(
+        &mut self,
+        fragments: Arc<Vec<Fragment>>,
+        manifest_path: &Path,
+    ) -> Result<()> {
+        if self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+            && !fragments
+                .iter()
+                .all(|fragment| fragment.row_id_meta.is_some())
+        {
+            return Err(Error::corrupt_file(
+                manifest_path.clone(),
+                "stable row IDs are enabled but at least one fragment has no row ID metadata"
+                    .to_string(),
+            ));
+        }
+        self.fragment_offsets = compute_fragment_offsets(&fragments);
+        self.fragments = fragments;
+        Ok(())
     }
 
     pub fn new_from_previous(
@@ -227,6 +406,7 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            section_hints: ManifestSectionHints::absent(),
         }
     }
 
@@ -289,6 +469,7 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            section_hints: ManifestSectionHints::absent(),
         }
     }
 
@@ -494,8 +675,76 @@ impl Manifest {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
     }
 
-    /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
-    /// and can be used to create a dataset
+    /// Returns the container-specific source for index metadata.
+    pub(crate) fn index_section_source(&self) -> Result<Option<ManifestSectionSource>> {
+        self.section_source(self.index_section, self.section_hints.index, "index")
+    }
+
+    /// Returns the container-specific source for an inline transaction.
+    pub(crate) fn transaction_section_source(&self) -> Result<Option<ManifestSectionSource>> {
+        self.section_source(
+            self.transaction_section,
+            self.section_hints.transaction,
+            "transaction",
+        )
+    }
+
+    fn section_source(
+        &self,
+        protobuf_offset: Option<usize>,
+        hint: ManifestSectionHint,
+        section_name: &str,
+    ) -> Result<Option<ManifestSectionSource>> {
+        if self.data_storage_format.lance_file_version()?.resolve() == LanceFileVersion::V2_3 {
+            if let Some(offset) = protobuf_offset {
+                return Err(Error::invalid_input(format!(
+                    "storage version 2.3 manifest has legacy protobuf {section_name} offset {offset}"
+                )));
+            }
+            match hint {
+                ManifestSectionHint::Absent => Ok(None),
+                ManifestSectionHint::ColumnarProjection => {
+                    Ok(Some(ManifestSectionSource::ColumnarProjection))
+                }
+                ManifestSectionHint::UnknownProjection => {
+                    Ok(Some(ManifestSectionSource::UnknownProjection))
+                }
+                ManifestSectionHint::ProtobufOffset(offset) => Err(Error::internal(format!(
+                    "storage version 2.3 manifest has runtime protobuf {section_name} offset {offset}"
+                ))),
+            }
+        } else {
+            Ok(protobuf_offset.map(ManifestSectionSource::ProtobufOffset))
+        }
+    }
+
+    pub(crate) fn set_columnar_section_presence(
+        &mut self,
+        has_indices: bool,
+        has_transaction: bool,
+    ) {
+        self.index_section = None;
+        self.transaction_section = None;
+        self.section_hints = ManifestSectionHints::columnar(has_indices, has_transaction);
+    }
+
+    pub(crate) fn clear_section_locations(&mut self) {
+        self.index_section = None;
+        self.transaction_section = None;
+        self.section_hints = ManifestSectionHints::absent();
+    }
+
+    pub(crate) fn set_protobuf_section_offsets(&mut self) {
+        self.section_hints = ManifestSectionHints::from_protobuf_offsets(
+            self.index_section,
+            self.transaction_section,
+        );
+    }
+
+    /// Serializes the protobuf manifest header and fragments for IPC or temporary storage.
+    ///
+    /// Columnar auxiliary section contents are not embedded in these bytes. Their
+    /// projected source remains internally derivable from storage version 2.3.
     pub fn serialized(&self) -> Vec<u8> {
         let pb_manifest: pb::Manifest = self.into();
         pb_manifest.encode_to_vec()
@@ -901,6 +1150,14 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::from(fields_with_meta);
+        let index_section = p.index_section.map(|i| i as usize);
+        let transaction_section = p.transaction_section.map(|i| i as usize);
+        let section_hints =
+            if data_storage_format.lance_file_version()?.resolve() == LanceFileVersion::V2_3 {
+                ManifestSectionHints::unknown_columnar()
+            } else {
+                ManifestSectionHints::from_protobuf_offsets(index_section, transaction_section)
+            };
 
         Ok(Self {
             schema,
@@ -908,7 +1165,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             branch: p.branch,
             writer_version,
             version_aux_data: p.version_aux_data as usize,
-            index_section: p.index_section.map(|i| i as usize),
+            index_section,
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
             tag: if p.tag.is_empty() { None } else { Some(p.tag) },
             reader_feature_flags: p.reader_feature_flags,
@@ -920,7 +1177,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             } else {
                 Some(p.transaction_file)
             },
-            transaction_section: p.transaction_section.map(|i| i as usize),
+            transaction_section,
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -931,12 +1188,14 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            section_hints,
         })
     }
 }
 
-impl From<&Manifest> for pb::Manifest {
-    fn from(m: &Manifest) -> Self {
+impl Manifest {
+    fn to_protobuf_with_fragments(&self, fragments: Vec<pb::DataFragment>) -> pb::Manifest {
+        let m = self;
         let timestamp_nanos = if m.timestamp_nanos == 0 {
             None
         } else {
@@ -948,7 +1207,7 @@ impl From<&Manifest> for pb::Manifest {
             })
         };
         let fields_with_meta: FieldsWithMeta = (&m.schema).into();
-        Self {
+        pb::Manifest {
             fields: fields_with_meta.fields.0,
             schema_metadata: m
                 .schema
@@ -967,7 +1226,7 @@ impl From<&Manifest> for pb::Manifest {
                     prerelease: wv.prerelease.clone(),
                     build_metadata: wv.build_metadata.clone(),
                 }),
-            fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragments,
             table_metadata: m.table_metadata.clone(),
             version_aux_data: m.version_aux_data as u64,
             index_section: m.index_section.map(|i| i as u64),
@@ -995,6 +1254,21 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             transaction_section: m.transaction_section.map(|i| i as u64),
         }
+    }
+
+    /// Serializes only version-level manifest state for the columnar header.
+    ///
+    /// Fragments live in their own top-level Lance section, so constructing this
+    /// payload must not first materialize the protobuf fragment tree.
+    pub(crate) fn to_protobuf_header(&self) -> pb::Manifest {
+        self.to_protobuf_with_fragments(Vec::new())
+    }
+}
+
+impl From<&Manifest> for pb::Manifest {
+    fn from(m: &Manifest) -> Self {
+        let fragments = m.fragments.iter().map(pb::DataFragment::from).collect();
+        m.to_protobuf_with_fragments(fragments)
     }
 }
 
@@ -1067,6 +1341,75 @@ mod tests {
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+
+    #[test]
+    fn section_sources_follow_storage_container() {
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(Vec::new()),
+            DataStorageFormat::new(LanceFileVersion::V2_2),
+            HashMap::new(),
+        );
+        assert_eq!(manifest.index_section_source().unwrap(), None);
+        manifest.index_section = Some(17);
+        assert_eq!(
+            manifest.index_section_source().unwrap(),
+            Some(ManifestSectionSource::ProtobufOffset(17))
+        );
+
+        manifest.data_storage_format = DataStorageFormat::new(LanceFileVersion::V2_3);
+        manifest.index_section = None;
+        assert_eq!(manifest.index_section_source().unwrap(), None);
+        assert_eq!(manifest.transaction_section_source().unwrap(), None);
+
+        let serialized = Manifest::try_from(pb::Manifest::from(&manifest)).unwrap();
+        assert_eq!(
+            serialized.index_section_source().unwrap(),
+            Some(ManifestSectionSource::UnknownProjection)
+        );
+        assert_eq!(
+            serialized.transaction_section_source().unwrap(),
+            Some(ManifestSectionSource::UnknownProjection)
+        );
+
+        manifest.set_columnar_section_presence(true, false);
+        assert_eq!(
+            manifest.index_section_source().unwrap(),
+            Some(ManifestSectionSource::ColumnarProjection)
+        );
+        assert_eq!(manifest.transaction_section_source().unwrap(), None);
+
+        manifest.index_section = Some(17);
+        let error = manifest.index_section_source().unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("legacy protobuf index offset 17")
+        );
+    }
+
+    #[test]
+    fn protobuf_header_omits_fragments_without_changing_version_state() {
+        let mut fragment = Fragment::new(42);
+        fragment.physical_rows = Some(7);
+        let mut manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(LanceFileVersion::V2_3),
+            HashMap::new(),
+        );
+        manifest.version = 9;
+        manifest.config.insert("key".into(), "value".into());
+
+        let header = manifest.to_protobuf_header();
+        assert!(header.fragments.is_empty());
+
+        let mut full = pb::Manifest::from(&manifest);
+        assert_eq!(full.fragments.len(), 1);
+        full.fragments.clear();
+        assert_eq!(header, full);
+    }
 
     #[test]
     fn test_writer_version() {

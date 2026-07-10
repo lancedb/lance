@@ -1662,6 +1662,15 @@ mod tests {
             data: impl RecordBatchReader + Send + 'static,
             mode: WriteMode,
         ) -> Result<()> {
+            self.write_data_with_storage_impl(data, mode, None).await
+        }
+
+        async fn write_data_with_storage_impl(
+            &self,
+            data: impl RecordBatchReader + Send + 'static,
+            mode: WriteMode,
+            data_storage_version: Option<lance_file::version::LanceFileVersion>,
+        ) -> Result<()> {
             Dataset::write(
                 data,
                 &self.dataset_path,
@@ -1669,6 +1678,7 @@ mod tests {
                     store_params: Some(self.os_params()),
                     commit_handler: Some(Arc::new(RenameCommitHandler)),
                     mode,
+                    data_storage_version,
                     ..Default::default()
                 }),
             )
@@ -1683,6 +1693,18 @@ mod tests {
 
         async fn create_some_data(&self) -> Result<()> {
             self.write_some_data_impl(WriteMode::Create).await
+        }
+
+        async fn create_some_data_with_storage_version(
+            &self,
+            data_storage_version: lance_file::version::LanceFileVersion,
+        ) -> Result<()> {
+            self.write_data_with_storage_impl(
+                some_batch(),
+                WriteMode::Create,
+                Some(data_storage_version),
+            )
+            .await
         }
 
         // Auto-cleanup is disabled by default; this helper creates a dataset
@@ -2646,25 +2668,46 @@ mod tests {
         assert_gt!(removed.deletion_files_removed, 0);
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn dont_clean_index_data_files() {
+    async fn dont_clean_index_data_files(
+        #[values(
+            lance_file::version::LanceFileVersion::V2_2,
+            lance_file::version::LanceFileVersion::V2_3
+        )]
+        data_storage_version: lance_file::version::LanceFileVersion,
+    ) {
         // Indexes have .lance files in them that are not referenced
         // by any fragment.  We need to make sure the cleanup routine
         // doesn't over-zealously delete these
         let fixture = MockDatasetFixture::try_new().unwrap();
-        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-        fixture.create_some_data().await.unwrap();
+        fixture
+            .create_some_data_with_storage_version(data_storage_version)
+            .await
+            .unwrap();
         fixture.create_some_index().await.unwrap();
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        fixture.append_some_data().await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
         let before = utc_now() - TimeDelta::try_days(8).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
-        assert_eq!(removed.old_versions, 0);
-        assert_eq!(removed.bytes_removed, 0);
+        assert_gt!(removed.old_versions, 0);
 
         let after_count = fixture.count_files().await.unwrap();
-
-        assert_eq!(before_count, after_count);
+        assert_gt!(after_count.num_index_files, 0);
+        assert_eq!(after_count.num_index_files, before_count.num_index_files);
+        assert_eq!(
+            fixture
+                .open()
+                .await
+                .unwrap()
+                .load_indices()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

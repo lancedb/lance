@@ -7,6 +7,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::Bytes;
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -37,13 +38,10 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::{
-    CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
-};
+use lance_io::utils::{CachedFileSize, read_last_block, read_metadata_offset, read_struct};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -52,7 +50,11 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
+use lance_table::io::manifest::{
+    decode_prefetched_manifest_sections, is_columnar_manifest_footer,
+    read_columnar_manifest_with_prefetched_tail, read_manifest, read_manifest_indexes,
+    read_manifest_transaction,
+};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
@@ -422,6 +424,45 @@ impl From<Schema> for ProjectionRequest {
     }
 }
 
+fn message_data_from_last_block<'a>(
+    last_block: &'a Bytes,
+    file_size: usize,
+    offset: usize,
+    path: &Path,
+    section: &str,
+) -> Result<Option<&'a [u8]>> {
+    let remaining = file_size.checked_sub(offset).ok_or_else(|| {
+        Error::corrupt_file(
+            path.clone(),
+            format!("{section} offset {offset} is beyond file size {file_size}"),
+        )
+    })?;
+    if remaining > last_block.len() {
+        return Ok(None);
+    }
+    let start = last_block.len() - remaining;
+    let payload_start = start.checked_add(4).ok_or_else(|| {
+        Error::corrupt_file(path.clone(), format!("{section} length offset overflows"))
+    })?;
+    if payload_start > last_block.len() {
+        return Err(Error::corrupt_file(
+            path.clone(),
+            format!("{section} length prefix is truncated"),
+        ));
+    }
+    let message_len = LittleEndian::read_u32(&last_block[start..payload_start]) as usize;
+    let payload_end = payload_start.checked_add(message_len).ok_or_else(|| {
+        Error::corrupt_file(path.clone(), format!("{section} payload length overflows"))
+    })?;
+    if payload_end > last_block.len() {
+        return Err(Error::corrupt_file(
+            path.clone(),
+            format!("{section} payload is truncated"),
+        ));
+    }
+    Ok(Some(&last_block[payload_start..payload_end]))
+}
+
 impl Dataset {
     /// Open an existing dataset.
     ///
@@ -648,10 +689,12 @@ impl Dataset {
         } else {
             object_store.open(&manifest_location.path).await
         };
-        let object_reader = object_reader.map_err(|e| match &e {
-            Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
-            _ => e,
-        })?;
+        let object_reader: Arc<dyn lance_io::traits::Reader> = object_reader
+            .map_err(|e| match &e {
+                Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
+                _ => e,
+            })?
+            .into();
 
         let last_block =
             read_last_block(object_reader.as_ref())
@@ -680,19 +723,28 @@ impl Dataset {
             .await;
         }
 
-        let offset = read_metadata_offset(&last_block)?;
-
         // If manifest is in the last block, we can decode directly from memory.
         let manifest_size = object_reader.size().await?;
-        let mut manifest = if manifest_size - offset <= last_block.len() {
-            let manifest_len = manifest_size - offset;
-            let offset_in_block = last_block.len() - manifest_len;
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
+        let mut manifest = if is_columnar_manifest_footer(&last_block)? {
+            read_columnar_manifest_with_prefetched_tail(
+                object_store,
+                object_reader.clone(),
+                last_block.clone(),
+            )
+            .await
         } else {
-            read_struct(object_reader.as_ref(), offset).await
+            let offset = read_metadata_offset(&last_block)?;
+            if let Some(message_data) = message_data_from_last_block(
+                &last_block,
+                manifest_size,
+                offset,
+                &manifest_location.path,
+                "manifest",
+            )? {
+                Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
+            } else {
+                read_struct(object_reader.as_ref(), offset).await
+            }
         }?;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
@@ -704,21 +756,14 @@ impl Dataset {
             return Err(Error::not_supported_source(message.into()));
         }
 
-        // If indices were also in the last block, we can take the opportunity to
-        // decode them now and cache them.
-        if let Some(index_offset) = manifest.index_section
-            && manifest_size - index_offset <= last_block.len()
-        {
-            let offset_in_block = last_block.len() - (manifest_size - index_offset);
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let section = lance_table::format::pb::IndexSection::decode(message_data)?;
-            let mut indices: Vec<IndexMetadata> = section
-                .indices
-                .into_iter()
-                .map(IndexMetadata::try_from)
-                .collect::<Result<Vec<_>>>()?;
+        let prefetched_sections = decode_prefetched_manifest_sections(
+            &manifest,
+            &last_block,
+            manifest_size,
+            &manifest_location.path,
+        )?;
+
+        if let Some(mut indices) = prefetched_sections.indices {
             retain_supported_indices(&mut indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
@@ -729,18 +774,8 @@ impl Dataset {
                 .await;
         }
 
-        // If transaction is also in the last block, we can take the opportunity to
-        // decode them now and cache them.
-        if let Some(transaction_offset) = manifest.transaction_section
-            && manifest_size - transaction_offset <= last_block.len()
-        {
-            let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
+        if let Some(transaction) = prefetched_sections.transaction {
+            let transaction = Transaction::try_from(transaction.inner)?;
             let metadata_cache = session.metadata_cache.for_dataset(uri);
             let metadata_key = TransactionKey {
                 version: manifest_location.version,
@@ -1186,18 +1221,19 @@ impl Dataset {
             return Ok(Some((*transaction).clone()));
         }
 
-        // Prefer inline transaction from manifest when available
-        let transaction = if let Some(pos) = self.manifest.transaction_section {
-            let reader = if let Some(size) = self.manifest_location.size {
-                self.object_store
-                    .open_with_size(&self.manifest_location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&self.manifest_location.path).await?
-            };
-
-            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
-            Transaction::try_from(tx).map(Some)?
+        // Prefer an inline transaction from either manifest container. The
+        // section reader dispatches by its typed location and retries stale
+        // known-size views without exposing byte offsets here.
+        let inline_transaction = read_manifest_transaction(
+            self.object_store.as_ref(),
+            &self.manifest_location,
+            &self.manifest,
+        )
+        .await?
+        .map(|transaction| Transaction::try_from(transaction.inner))
+        .transpose()?;
+        let transaction = if inline_transaction.is_some() {
+            inline_transaction
         } else if let Some(path) = &self.manifest.transaction_file {
             // Fallback: read external transaction file if present
             let path = self.transactions_dir().join(path.as_str());
@@ -3706,6 +3742,35 @@ pub(crate) async fn write_manifest_file(
 impl Projectable for Dataset {
     fn schema(&self) -> &Schema {
         self.schema()
+    }
+}
+
+#[cfg(test)]
+mod manifest_message_tests {
+    use super::*;
+
+    #[test]
+    fn validates_last_block_message_bounds() {
+        let path = Path::from("manifest");
+        let valid = Bytes::from_static(&[3, 0, 0, 0, 1, 2, 3]);
+        assert_eq!(
+            message_data_from_last_block(&valid, valid.len(), 0, &path, "section").unwrap(),
+            Some(&[1, 2, 3][..])
+        );
+
+        let truncated = Bytes::from_static(&[10, 0, 0, 0, 1, 2, 3]);
+        assert!(
+            message_data_from_last_block(&truncated, truncated.len(), 0, &path, "section")
+                .unwrap_err()
+                .to_string()
+                .contains("truncated")
+        );
+        assert!(
+            message_data_from_last_block(&valid, valid.len(), 8, &path, "section")
+                .unwrap_err()
+                .to_string()
+                .contains("beyond file size")
+        );
     }
 }
 

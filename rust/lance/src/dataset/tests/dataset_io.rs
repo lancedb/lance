@@ -2,14 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::vec;
 
 use super::dataset_common::{create_file, require_send};
 
+use crate::dataset::ReadParams;
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
@@ -32,6 +35,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::{
@@ -40,7 +44,7 @@ use lance_file::{
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
-use lance_table::format::BasePath;
+use lance_table::format::{BasePath, DataFile, DeletionFile, DeletionFileType, Fragment};
 use object_store::ObjectStoreExt;
 
 use crate::index::DatasetIndexExt;
@@ -51,7 +55,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
-use lance_table::io::manifest::read_manifest;
+use lance_table::io::manifest::{is_columnar_manifest_footer, read_manifest};
 use object_store::path::Path;
 use rstest::rstest;
 
@@ -59,6 +63,226 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ManifestRegressionScenario {
+    S1,
+    S2,
+}
+
+fn manifest_regression_sample(fragment_id: u64, stream: u64) -> u64 {
+    let mut value =
+        0x4c41_4e43_455f_4d46 ^ fragment_id.wrapping_mul(0xd6e8_feb8_6659_fd93) ^ stream;
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn manifest_regression_file(
+    fragment_id: u64,
+    ordinal: usize,
+    num_fields: usize,
+    storage_version: LanceFileVersion,
+    is_long_path: bool,
+    entropy: u64,
+) -> DataFile {
+    let fields = (0..num_fields as i32).collect::<Vec<_>>();
+    let (major, minor) = storage_version.to_numbers();
+    let path = if is_long_path {
+        format!(
+            "imports/customer-{fragment_id:016x}/partition-{entropy:016x}/part-{ordinal:02}.lance"
+        )
+    } else {
+        let value = fragment_id * 2 + ordinal as u64;
+        format!("data/{value:032x}.lance")
+    };
+    DataFile::new(
+        path,
+        fields.clone(),
+        fields,
+        major,
+        minor,
+        NonZeroU64::new(1_048_576 + entropy % 65_536),
+        None,
+    )
+}
+
+fn manifest_regression_fragments(
+    scenario: ManifestRegressionScenario,
+    storage_version: LanceFileVersion,
+) -> Vec<Fragment> {
+    (0..1_000_u64)
+        .map(|id| {
+            let layout = manifest_regression_sample(id, 0);
+            let mut fragment = Fragment::new(id);
+            match scenario {
+                ManifestRegressionScenario::S1 => {
+                    fragment.files.push(manifest_regression_file(
+                        id,
+                        0,
+                        8,
+                        storage_version,
+                        false,
+                        layout,
+                    ));
+                    fragment.physical_rows = Some(1_024);
+                }
+                ManifestRegressionScenario::S2 => {
+                    let num_fields = if layout & 1 == 0 { 8 } else { 32 };
+                    fragment.files.push(manifest_regression_file(
+                        id,
+                        0,
+                        num_fields,
+                        storage_version,
+                        layout & 2 != 0,
+                        layout,
+                    ));
+                    if manifest_regression_sample(id, 1).is_multiple_of(20) {
+                        fragment.files.push(manifest_regression_file(
+                            id,
+                            1,
+                            32,
+                            storage_version,
+                            manifest_regression_sample(id, 2) & 1 != 0,
+                            manifest_regression_sample(id, 3),
+                        ));
+                    }
+                    if manifest_regression_sample(id, 4).is_multiple_of(5) {
+                        fragment.deletion_file = Some(DeletionFile {
+                            read_version: 1,
+                            id,
+                            file_type: if layout & 4 == 0 {
+                                DeletionFileType::Array
+                            } else {
+                                DeletionFileType::Bitmap
+                            },
+                            num_deleted_rows: Some(1 + layout as usize % 31),
+                            base_id: None,
+                        });
+                    }
+                    fragment.physical_rows = Some(1_024 + layout as usize % 17);
+                }
+            }
+            fragment
+        })
+        .collect()
+}
+
+async fn manifest_size_and_cold_open_io(
+    scenario: ManifestRegressionScenario,
+    storage_version: LanceFileVersion,
+) -> (u64, lance_io::utils::tracking_store::IoStats) {
+    let temporary = tempfile::tempdir().unwrap();
+    let uri = temporary
+        .path()
+        .join("dataset")
+        .to_string_lossy()
+        .into_owned();
+    let num_fields = match scenario {
+        ManifestRegressionScenario::S1 => 8,
+        ManifestRegressionScenario::S2 => 32,
+    };
+    let schema = LanceSchema::try_from(&ArrowSchema::new(
+        (0..num_fields)
+            .map(|field_id| ArrowField::new(format!("field_{field_id}"), DataType::Int64, true))
+            .collect::<Vec<_>>(),
+    ))
+    .unwrap();
+    let dataset = CommitBuilder::new(uri.as_str())
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(IOTracker::default())),
+            ..Default::default()
+        })
+        .with_storage_format(storage_version)
+        .with_skip_auto_cleanup(true)
+        .execute(Transaction::new(
+            0,
+            Operation::Overwrite {
+                fragments: manifest_regression_fragments(scenario, storage_version),
+                schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(dataset.count_fragments(), 1_000);
+    assert_eq!(
+        dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_version()
+            .unwrap()
+            .resolve(),
+        storage_version
+    );
+
+    let reader = dataset
+        .object_store
+        .open(&dataset.manifest_location().path)
+        .await
+        .unwrap();
+    let manifest_size = u64::try_from(reader.size().await.unwrap()).unwrap();
+    let tail_start = usize::try_from(manifest_size.saturating_sub(64 * 1024)).unwrap();
+    let tail = reader
+        .get_range(tail_start..usize::try_from(manifest_size).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        is_columnar_manifest_footer(&tail).unwrap(),
+        storage_version == LanceFileVersion::V2_3
+    );
+    drop(dataset);
+
+    let cold_tracker = Arc::new(IOTracker::default());
+    let cold = DatasetBuilder::from_uri(&uri)
+        .with_index_cache_size_bytes(0)
+        .with_metadata_cache_size_bytes(0)
+        .with_read_params(ReadParams {
+            store_options: Some(ObjectStoreParams {
+                object_store_wrapper: Some(cold_tracker),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(cold.count_fragments(), 1_000);
+    let io = cold.object_store.as_ref().io_stats_incremental();
+    (manifest_size, io)
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_columnar_manifest_size_and_cold_open_default_features() {
+    for scenario in [
+        ManifestRegressionScenario::S1,
+        ManifestRegressionScenario::S2,
+    ] {
+        let (protobuf_size, protobuf_io) =
+            manifest_size_and_cold_open_io(scenario, LanceFileVersion::V2_2).await;
+        let (columnar_size, columnar_io) =
+            manifest_size_and_cold_open_io(scenario, LanceFileVersion::V2_3).await;
+
+        assert!(
+            columnar_size < protobuf_size,
+            "{scenario:?}: columnar manifest size {columnar_size} must be smaller than protobuf {protobuf_size}"
+        );
+        assert_eq!(
+            columnar_io.read_bytes, columnar_size,
+            "{scenario:?}: cold open must read the columnar manifest exactly once"
+        );
+        assert!(
+            columnar_io.read_iops <= protobuf_io.read_iops,
+            "{scenario:?}: columnar cold open used {} reads, protobuf used {}",
+            columnar_io.read_iops,
+            protobuf_io.read_iops
+        );
+    }
 }
 
 #[tokio::test]
@@ -499,8 +723,12 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
     );
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_shallow_clone_base_artifacts_use_base_object_store() {
+async fn test_shallow_clone_base_artifacts_use_base_object_store(
+    #[values(LanceFileVersion::Stable, LanceFileVersion::V2_3)]
+    data_storage_version: LanceFileVersion,
+) {
     let source_dir = tempfile::tempdir().unwrap();
     let clone_dir = tempfile::tempdir().unwrap();
     let source_uri = file_object_store_uri(source_dir.path());
@@ -513,7 +741,10 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let mut source = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
         &source_uri,
-        None,
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
@@ -1378,7 +1609,11 @@ async fn append_dataset(
 #[rstest]
 #[tokio::test]
 async fn test_deep_clone(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    #[values(
+        LanceFileVersion::Legacy,
+        LanceFileVersion::Stable,
+        LanceFileVersion::V2_3
+    )]
     data_storage_version: LanceFileVersion,
 ) {
     // Setup source and target dirs

@@ -26,10 +26,21 @@ Lance can commit directly to object storage, but deployments may also coordinate
 
 A manifest describes a single version of the dataset.
 It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
-a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.
+a monotonically increasing version number, index metadata, and optional transaction metadata.
+
+The manifest container is selected by the storage version and identified by its footer:
+
+- Storage versions through 2.2 use a protobuf manifest. Optional index and inline-transaction
+  messages are addressed by byte offsets in the manifest header.
+- Storage version 2.3 uses one Lance file with top-level `header`, `fragments`, `data_files`,
+  `indices`, and `transaction` sections. Index and transaction data are stored only in those
+  sections; no protobuf compatibility copy is written.
+
+Readers load fragments while opening the manifest, but project `indices` and `transaction` only
+when requested. Decoded auxiliary metadata is cached by the dataset session.
 
 <details>
-<summary>Manifest protobuf message</summary>
+<summary>Legacy manifest protobuf message</summary>
 
 ```protobuf
 %%% proto.message.Manifest %%%

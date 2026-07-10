@@ -92,9 +92,12 @@ mod tests {
     use arrow_array::RecordBatchIterator;
     use arrow_array::types::UInt32Type;
     use lance_datagen::{array, gen_batch};
+    use lance_file::version::LanceFileVersion;
     use std::collections::HashMap;
 
-    async fn make_test_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
+    async fn make_test_dataset(
+        data_storage_version: LanceFileVersion,
+    ) -> (Arc<Dataset>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let batch = gen_batch()
             .col("x", array::step::<UInt32Type>())
@@ -105,7 +108,10 @@ mod tests {
         let ds = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
             path.to_str().unwrap(),
-            None,
+            Some(crate::dataset::write::WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
@@ -149,7 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_identifier_from_dataset_roundtrip() {
-        let (dataset, _dir) = make_test_dataset().await;
+        let (dataset, _dir) = make_test_dataset(LanceFileVersion::Stable).await;
 
         let id = table_identifier_from_dataset(&dataset).await.unwrap();
         assert_eq!(id.uri, dataset.uri());
@@ -164,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_identifier_with_manifest_roundtrip() {
-        let (dataset, _dir) = make_test_dataset().await;
+        let (dataset, _dir) = make_test_dataset(LanceFileVersion::Stable).await;
 
         let id = table_identifier_from_dataset_with_manifest(&dataset)
             .await
@@ -182,5 +188,30 @@ mod tests {
         let back = open_dataset_from_table_identifier(&id).await.unwrap();
         assert_eq!(back.uri(), dataset.uri());
         assert_eq!(back.manifest.version, dataset.manifest.version);
+    }
+
+    #[tokio::test]
+    async fn test_columnar_manifest_serialization_preserves_lazy_sections() {
+        let (dataset, _dir) = make_test_dataset(LanceFileVersion::V2_3).await;
+        assert!(dataset.manifest.transaction_section.is_none());
+
+        let id = table_identifier_from_dataset_with_manifest(&dataset)
+            .await
+            .unwrap();
+        let serialized = id.serialized_manifest.as_ref().unwrap();
+        let serialized = lance_table::format::pb::Manifest::decode(serialized.as_slice()).unwrap();
+        assert!(serialized.transaction_section.is_none());
+        let back = open_dataset_from_table_identifier(&id).await.unwrap();
+        let _ = back.object_store.as_ref().io_stats_incremental();
+        assert!(back.manifest.transaction_section.is_none());
+        assert!(back.read_transaction().await.unwrap().is_some());
+        let stats = back.object_store.as_ref().io_stats_incremental();
+        assert!(stats.read_iops > 0);
+        assert!(stats.read_bytes > 0);
+
+        assert!(back.read_transaction().await.unwrap().is_some());
+        let stats = back.object_store.as_ref().io_stats_incremental();
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
     }
 }

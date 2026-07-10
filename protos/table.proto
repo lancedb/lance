@@ -93,7 +93,9 @@ message Manifest {
   // associated with that writer.
   WriterVersion writer_version = 13;
 
-  // If present, the file position of the index metadata.
+  // In legacy protobuf manifest containers, the byte offset of the index metadata.
+  // Columnar manifest containers for storage version 2.3 leave this unset and store
+  // index metadata in the top-level `indices` Lance section.
   optional uint64 index_section = 6;
 
   // Version creation Timestamp, UTC timezone
@@ -146,9 +148,10 @@ message Manifest {
   // and {uuid} is a hyphen-separated UUID.
   string transaction_file = 12;
 
-  // The file position of the transaction content. None if transaction is empty
-  // This transaction content begins with the transaction content length as u32
-  // If the transaction proto message has a length of `len`, the message ends at `len` + 4
+  // In legacy protobuf manifest containers, the byte offset of the inline transaction.
+  // The transaction begins with its length as u32 and occupies `len + 4` bytes.
+  // Columnar manifest containers for storage version 2.3 leave this unset and store
+  // inline transaction content in the top-level `transaction` Lance section.
   optional uint64 transaction_section = 21;
 
   // The next unused row id. If zero, then the table does not have any rows.

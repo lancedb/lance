@@ -127,6 +127,7 @@ tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
+metrics-util = { workspace = true }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
@@ -314,6 +315,17 @@ harness = false
 [[bench]]
 name = "manifest_commit"
 harness = false
+
+[[bench]]
+name = "manifest_e2e"
+path = "../../benchmarks/manifest/e2e.rs"
+harness = false
+required-features = ["metrics"]
+
+[[test]]
+name = "manifest_e2e_tests"
+path = "../../benchmarks/manifest/e2e.rs"
+required-features = ["metrics"]
 
 [[bench]]
 name = "concurrent_append"

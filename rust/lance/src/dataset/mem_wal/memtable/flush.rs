@@ -346,10 +346,6 @@ impl MemTableFlusher {
             }
         }
 
-        // Clear stale section offsets from the v1 manifest since the rewritten
-        // file has a different layout (added index/deletion metadata).
-        manifest.index_section = None;
-        manifest.transaction_section = None;
         manifest.transaction_file = None;
         write_manifest_file_to_path(
             &self.object_store,

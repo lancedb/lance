@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
-use super::manifest::write_manifest;
+use super::{manifest::write_manifest, manifest_lance};
 use futures::Stream;
 use futures::future::Either;
 use futures::{
@@ -37,6 +37,7 @@ use futures::{
     stream::BoxStream,
 };
 use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use lance_file::version::LanceFileVersion;
 use lance_io::object_writer::{ObjectWriter, WriteResult, get_etag};
 use log::warn;
 use object_store::ObjectStoreExt as OSObjectStoreExt;
@@ -207,9 +208,7 @@ pub type ManifestWriter = for<'a> fn(
     transaction: Option<Transaction>,
 ) -> BoxFuture<'a, Result<WriteResult>>;
 
-/// Canonical manifest writer; its function item type exactly matches `ManifestWriter`.
-/// Rationale: keep a crate-local writer implementation so call sites can pass this function
-/// directly without non-primitive casts or lifetime coercions.
+/// Canonical manifest writer; storage version 2.3 requires the columnar container.
 pub fn write_manifest_file_to_path<'a>(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
@@ -218,14 +217,30 @@ pub fn write_manifest_file_to_path<'a>(
     transaction: Option<Transaction>,
 ) -> BoxFuture<'a, Result<WriteResult>> {
     Box::pin(async move {
+        let use_columnar =
+            manifest.data_storage_format.lance_file_version()?.resolve() == LanceFileVersion::V2_3;
+        if use_columnar {
+            if !manifest_lance::can_write(manifest)? {
+                return Err(Error::invalid_input(
+                    "storage version 2.3 requires normalized physical row and deletion statistics for the columnar manifest",
+                ));
+            }
+            let object_writer = ObjectWriter::new(object_store, path).await?;
+            let result =
+                manifest_lance::write(Box::new(object_writer), manifest, indices, transaction)
+                    .await?;
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
+            return Ok(result);
+        }
+
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices, transaction).await?;
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
-        let res = Writer::shutdown(&mut object_writer).await?;
+        let result = Writer::shutdown(&mut object_writer).await?;
         info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = path.to_string());
-        Ok(res)
+        Ok(result)
     })
 }
 
@@ -1555,11 +1570,76 @@ impl Default for CommitConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
 
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_core::datatypes::Schema;
     use lance_core::utils::tempfile::TempObjDir;
 
+    use crate::format::{DataStorageFormat, Fragment};
+    use crate::io::manifest::{is_columnar_manifest_footer, read_manifest};
+
     use super::*;
+
+    #[tokio::test]
+    #[rstest::rstest]
+    async fn test_round_trip_manifest_format(#[values(false, true)] columnar: bool) {
+        let object_store = ObjectStore::memory();
+        let path = Path::from("round-trip.manifest");
+        let schema = Schema::try_from(&ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap();
+        let fragment = Fragment::with_file_legacy(3, "data/fragment.lance", &schema, Some(10));
+        let mut expected = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(if columnar {
+                LanceFileVersion::V2_3
+            } else {
+                LanceFileVersion::V2_2
+            }),
+            HashMap::new(),
+        );
+
+        write_manifest_file_to_path(&object_store, &mut expected, None, &path, None)
+            .await
+            .unwrap();
+        let bytes = object_store.read_one_all(&path).await.unwrap();
+        assert_eq!(is_columnar_manifest_footer(&bytes).unwrap(), columnar);
+        let actual = read_manifest(&object_store, &path, Some(bytes.len() as u64))
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_storage_v2_3_rejects_missing_row_statistics() {
+        let object_store = ObjectStore::memory();
+        let path = Path::from("fallback.manifest");
+        let schema = Schema::try_from(&ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]))
+        .unwrap();
+        let fragment = Fragment::with_file_legacy(3, "data/fragment.lance", &schema, None);
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(LanceFileVersion::V2_3),
+            HashMap::new(),
+        );
+
+        let error = write_manifest_file_to_path(&object_store, &mut manifest, None, &path, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires normalized"));
+        assert!(object_store.read_one_all(&path).await.is_err());
+    }
 
     #[test]
     fn test_manifest_naming_scheme() {

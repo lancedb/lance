@@ -4287,12 +4287,14 @@ mod tests {
         assert_eq!(index.index_type(), IndexType::Bitmap);
     }
 
-    // #[tokio::test]
-    #[lance_test_macros::test(tokio::test)]
-    async fn test_load_indices() {
+    async fn check_load_indices(
+        data_storage_version: lance_file::version::LanceFileVersion,
+        use_serialized_manifest: bool,
+    ) {
         let session = Arc::new(Session::default());
         let write_params = WriteParams {
             session: Some(session.clone()),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
 
@@ -4333,21 +4335,61 @@ mod tests {
         session.index_cache.clear().await;
         session.file_metadata_cache().clear().await;
 
-        let dataset2 = DatasetBuilder::from_uri(test_uri)
-            .with_session(session.clone())
-            .load()
-            .await
-            .unwrap();
-        let stats = dataset2.object_store.as_ref().io_stats_incremental(); // Reset
-        assert_io_lt!(stats, read_bytes, 64 * 1024);
+        let mut builder = DatasetBuilder::from_uri(test_uri).with_session(session.clone());
+        if use_serialized_manifest {
+            let mut serialized_manifest = dataset.manifest.as_ref().clone();
+            serialized_manifest
+                .table_metadata
+                .insert("serialized_fast_path".to_string(), "true".to_string());
+            builder = builder
+                .with_serialized_manifest(&serialized_manifest.serialized())
+                .unwrap();
+        }
+        let dataset2 = builder.load().await.unwrap();
+        let open_stats = dataset2.object_store.as_ref().io_stats_incremental();
+        if use_serialized_manifest {
+            assert_eq!(
+                dataset2
+                    .manifest
+                    .table_metadata
+                    .get("serialized_fast_path")
+                    .map(String::as_str),
+                Some("true")
+            );
+        } else {
+            assert_io_lt!(open_stats, read_bytes, 64 * 1024);
+        }
 
-        // Because the manifest is so small, we should have opportunistically
-        // cached the indices in memory already.
         let indices2 = dataset2.load_indices().await.unwrap();
+        let stats = dataset2.object_store.as_ref().io_stats_incremental();
+        if use_serialized_manifest {
+            // Serialized columnar manifests do not carry section presence, so
+            // the first access projects the section from the real container.
+            assert!(stats.read_iops > 0);
+            assert!(stats.read_bytes > 0);
+        } else {
+            // V2.2 keeps the original opportunistic tail-cache behavior.
+            assert_io_eq!(stats, read_iops, 0);
+            assert_io_eq!(stats, read_bytes, 0);
+        }
+        assert_eq!(indices2.len(), 1);
+
+        let _ = dataset2.object_store.as_ref().io_stats_incremental();
+        assert_eq!(dataset2.load_indices().await.unwrap().len(), 1);
         let stats = dataset2.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0);
         assert_io_eq!(stats, read_bytes, 0);
-        assert_eq!(indices2.len(), 1);
+    }
+
+    // #[tokio::test]
+    #[lance_test_macros::test(tokio::test)]
+    async fn test_load_indices() {
+        check_load_indices(lance_file::version::LanceFileVersion::V2_2, false).await;
+    }
+
+    #[lance_test_macros::test(tokio::test)]
+    async fn test_load_indices_columnar_serialized() {
+        check_load_indices(lance_file::version::LanceFileVersion::V2_3, true).await;
     }
 
     #[tokio::test]

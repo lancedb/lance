@@ -37,6 +37,7 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
+use lance_table::io::manifest::read_manifest_indexes;
 use rand::{Rng, rng};
 
 use super::ObjectStore;
@@ -191,22 +192,15 @@ async fn do_commit_new_dataset(
                 transaction_file.clone(),
             );
 
-            let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = object_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                section
-                    .indices
+            let updated_indices =
+                read_manifest_indexes(object_store, &source_manifest_location, &source_manifest)
+                    .await?
                     .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
+                    .map(|mut index| {
                         index.base_id = Some(new_base_id);
                         Ok(index)
                     })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                vec![]
-            };
+                    .collect::<Result<Vec<_>>>()?;
             (new_manifest, updated_indices)
         } else {
             // Deep clone: build a manifest that references local files (no external bases)
@@ -214,7 +208,6 @@ async fn do_commit_new_dataset(
             new_manifest.base_paths.clear();
             new_manifest.branch = None;
             new_manifest.tag = None;
-            new_manifest.index_section = None; // will be rewritten below
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
                 for df in &mut f.files {
@@ -227,21 +220,15 @@ async fn do_commit_new_dataset(
             new_manifest.fragments = Arc::new(new_frags);
 
             // Indices: keep metadata but normalize base to local
-            let mut updated_indices = Vec::new();
-            if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = object_store.open(&source_manifest_location.path).await?;
-                let section: pb::IndexSection =
-                    lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
-                updated_indices = section
-                    .indices
+            let updated_indices =
+                read_manifest_indexes(object_store, &source_manifest_location, &source_manifest)
+                    .await?
                     .into_iter()
-                    .map(|index_pb| {
-                        let mut index = IndexMetadata::try_from(index_pb)?;
+                    .map(|mut index| {
                         index.base_id = None;
                         Ok(index)
                     })
                     .collect::<Result<Vec<_>>>()?;
-            }
             (new_manifest, updated_indices)
         }
     } else {

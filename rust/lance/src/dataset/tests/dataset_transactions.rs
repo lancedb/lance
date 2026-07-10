@@ -26,6 +26,7 @@ use crate::datafusion::LanceTableProvider;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance_datafusion::udf::register_functions;
+use lance_file::version::LanceFileVersion;
 use object_store::ObjectStoreExt;
 
 #[tokio::test]
@@ -272,13 +273,20 @@ pub(super) fn assert_results<T: Array + PartialEq + 'static>(
     )
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn test_inline_transaction() {
+async fn test_inline_transaction(
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)]
+    data_storage_version: LanceFileVersion,
+) {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
-    async fn create_dataset(rows: i32) -> Arc<Dataset> {
+    async fn create_dataset(
+        rows: i32,
+        data_storage_version: LanceFileVersion,
+    ) -> (Arc<Dataset>, TempDir) {
         let dir = TempDir::default();
         let uri = dir.path_str();
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -294,11 +302,14 @@ async fn test_inline_transaction() {
         let ds = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
             uri.as_str(),
-            None,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
-        Arc::new(ds)
+        (Arc::new(ds), dir)
     }
 
     fn make_tx(read_version: u64) -> Transaction {
@@ -319,7 +330,7 @@ async fn test_inline_transaction() {
     let session = Arc::new(Session::default());
 
     // Case 1: Default write_flag=true, delete external transaction file, read should use inline transaction
-    let ds = create_dataset(5).await;
+    let (ds, _dir) = create_dataset(5, data_storage_version).await;
     let read_version = ds.manifest().version;
     let tx = make_tx(read_version);
     let ds2 = CommitBuilder::new(ds.clone())
@@ -330,24 +341,52 @@ async fn test_inline_transaction() {
     let read_tx = ds2.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx.clone());
 
-    // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
-    let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
-        .with_session(session.clone())
-        .load()
-        .await
-        .unwrap();
+    // Case 2: protobuf manifests may cache a tail-resident transaction while
+    // opening. Columnar manifests project it lazily on first use. Both cache the
+    // decoded transaction for subsequent reads.
+    let mut builder = DatasetBuilder::from_uri(ds2.uri.clone()).with_session(session.clone());
+    if data_storage_version == LanceFileVersion::V2_3 {
+        let mut serialized_manifest = ds2.manifest.as_ref().clone();
+        serialized_manifest
+            .table_metadata
+            .insert("serialized_fast_path".to_string(), "true".to_string());
+        builder = builder
+            .with_serialized_manifest(&serialized_manifest.serialized())
+            .unwrap();
+    }
+    let read_ds2 = builder.load().await.unwrap();
     let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
-    assert!(stats.read_bytes < 64 * 1024);
-    // Because the manifest is so small, we should have opportunistically
-    // cached the transaction in memory already.
+    if data_storage_version == LanceFileVersion::V2_3 {
+        assert_eq!(
+            read_ds2
+                .manifest
+                .table_metadata
+                .get("serialized_fast_path")
+                .map(String::as_str),
+            Some("true")
+        );
+    } else {
+        assert!(stats.read_bytes < 64 * 1024);
+    }
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
+    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
+    if data_storage_version == LanceFileVersion::V2_3 {
+        assert!(stats.read_iops > 0);
+        assert!(stats.read_bytes > 0);
+    } else {
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+    }
+    assert_eq!(inline_tx, tx);
+
+    let _ = read_ds2.object_store.as_ref().io_stats_incremental();
+    assert_eq!(read_ds2.read_transaction().await.unwrap().unwrap(), tx);
     let stats = read_ds2.object_store.as_ref().io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
-    assert_eq!(inline_tx, tx);
 
     // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
-    let ds = create_dataset(2).await;
+    let (ds, _dir) = create_dataset(2, data_storage_version).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file =
         crate::io::commit::write_transaction_file(ds.object_store.as_ref(), &ds.base, &tx)
@@ -382,6 +421,49 @@ async fn test_inline_transaction() {
     assert!(ds_new.manifest.transaction_file.is_some());
     let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx);
+
+    // Case 4: a fully decoded columnar manifest records absent auxiliary
+    // sections, so checking them must not reopen the manifest.
+    if data_storage_version == LanceFileVersion::V2_3 {
+        let tx = make_tx(ds_new.manifest.version);
+        let (mut manifest, indices) = tx
+            .build_manifest(
+                Some(ds_new.manifest.as_ref()),
+                ds_new.load_indices().await.unwrap().as_ref().clone(),
+                "",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+        assert!(indices.is_empty());
+        let location = write_manifest_file(
+            ds_new.object_store.as_ref(),
+            ds_new.commit_handler.as_ref(),
+            &ds_new.base,
+            &mut manifest,
+            None,
+            &ManifestWriteConfig::default(),
+            ds_new.manifest_location.naming_scheme,
+            None,
+        )
+        .await
+        .unwrap();
+        let dataset = DatasetBuilder::from_uri(ds_new.uri.clone())
+            .with_version(location.version)
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        assert!(dataset.manifest.index_section.is_none());
+        assert!(dataset.manifest.transaction_section.is_none());
+        assert!(dataset.manifest.transaction_file.is_none());
+
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        assert!(dataset.read_transaction().await.unwrap().is_none());
+        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_eq!(stats.read_iops, 0);
+        assert_eq!(stats.read_bytes, 0);
+    }
 }
 
 #[tokio::test]

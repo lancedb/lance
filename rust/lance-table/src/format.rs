@@ -15,6 +15,7 @@ pub use crate::rowids::version::{
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
+pub(crate) use manifest::ManifestSectionSource;
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, is_detached_version,
