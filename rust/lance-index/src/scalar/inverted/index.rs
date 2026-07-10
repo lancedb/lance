@@ -59,8 +59,8 @@ use super::lazy_docset::LazyDocSet;
 use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema_for_version,
-        posting_file_path, token_file_path,
+        BLOCK_SIZE, ScoredDoc, doc_file_path, inverted_list_schema_for_version, posting_file_path,
+        token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
@@ -1290,22 +1290,15 @@ impl PostingGrouping {
         }
     }
 
-    fn aligned_chunk_end(
-        &self,
-        token_count: usize,
-        tok_start: usize,
-        desired_end: usize,
-    ) -> usize {
+    fn aligned_chunk_end(&self, token_count: usize, tok_start: usize, desired_end: usize) -> usize {
         match self {
             Self::None => desired_end,
-            Self::SyntheticFixed { group_size } => {
-                synthetic_group_aligned_chunk_end(
-                    usize::try_from(*group_size).unwrap_or(usize::MAX).max(1),
-                    token_count,
-                    tok_start,
-                    desired_end,
-                )
-            }
+            Self::SyntheticFixed { group_size } => synthetic_group_aligned_chunk_end(
+                usize::try_from(*group_size).unwrap_or(usize::MAX).max(1),
+                token_count,
+                tok_start,
+                desired_end,
+            ),
         }
     }
 
@@ -1317,14 +1310,12 @@ impl PostingGrouping {
     ) -> Vec<(u32, u32)> {
         match self {
             Self::None => Vec::new(),
-            Self::SyntheticFixed { group_size } => {
-                synthetic_group_ranges_for_chunk(
-                    usize::try_from(*group_size).unwrap_or(usize::MAX).max(1),
-                    tok_start,
-                    tok_end,
-                    token_count,
-                )
-            }
+            Self::SyntheticFixed { group_size } => synthetic_group_ranges_for_chunk(
+                usize::try_from(*group_size).unwrap_or(usize::MAX).max(1),
+                tok_start,
+                tok_end,
+                token_count,
+            ),
         }
     }
 }
@@ -2804,15 +2795,19 @@ impl PostingListReader {
                         self.load_posting_list_group(start, end).await
                     })
                     .await?;
+                let (max_score, length) = if group.needs_external_metadata() {
+                    self.posting_metadata_for_token(token_id).await?
+                } else {
+                    (None, None)
+                };
                 let slot = (token_id - start) as usize;
                 group
-                    .get(slot)
+                    .posting_list(slot, max_score, length)?
                     .ok_or_else(|| {
                         Error::index(format!(
                             "token {token_id} maps to slot {slot} outside posting group [{start}, {end})"
                         ))
                     })?
-                    .clone()
             }
             // Fallback for layouts that cannot use row-based groups: one cache
             // entry per token.
@@ -2853,9 +2848,9 @@ impl PostingListReader {
         self.grouping.range_for_token(token_id, self.len())
     }
 
-    /// Read rows `[start, end)` of the posting file and decode them into a
-    /// [`PostingListGroup`] cache value (issue #7040). Positions are excluded;
-    /// phrase queries load them on demand via [`Self::read_positions`].
+    /// Read rows `[start, end)` into one compact Arrow-backed cache value.
+    /// Positions are excluded; phrase queries load them on demand via
+    /// [`Self::read_positions`].
     async fn load_posting_list_group(&self, start: u32, end: u32) -> Result<PostingListGroup> {
         let batch = self
             .reader
@@ -2864,19 +2859,7 @@ impl PostingListReader {
                 Some(&[POSTING_COL, MAX_SCORE_COL, LENGTH_COL]),
             )
             .await?;
-        let max_scores = batch[MAX_SCORE_COL].as_primitive::<Float32Type>();
-        let lengths = batch[LENGTH_COL].as_primitive::<UInt32Type>();
-        let mut posting_lists = Vec::with_capacity(batch.num_rows());
-        for i in 0..batch.num_rows() {
-            let row = batch.slice(i, 1);
-            let posting = self.posting_list_from_batch(
-                &row,
-                Some(max_scores.value(i)),
-                Some(lengths.value(i)),
-            )?;
-            posting_lists.push(posting);
-        }
-        Ok(PostingListGroup::new(posting_lists))
+        PostingListGroup::new_packed(batch.shrink_to_fit()?, self.posting_tail_codec)
     }
 
     fn posting_list_from_batch_parts(
@@ -3000,16 +2983,19 @@ impl PostingListReader {
             ));
         }
 
-        // Make sure max_scores/lengths are populated before we clone them into
-        // the blocking task; otherwise the v2 branch would unwrap empty
-        // OnceCells.
+        // Make max_scores/lengths available for query-local packed views. The
+        // materialized fallback also clones them into its blocking build task.
         self.ensure_metadata_loaded().await?;
 
-        let state = self.chunk_build_state();
         // With grouping the cache stores one entry per group, so a group's
         // posting lists must all be resident at once: align chunk boundaries to
         // whole groups. Without grouping, chunks are plain token ranges.
         let grouping = self.grouping.clone();
+        let use_packed_groups = grouping.is_grouped() && !with_position;
+        // Packed groups reuse the reader's bulk metadata at query time, so they
+        // do not need the temporary full-partition metadata clones used by the
+        // materialized fallback.
+        let state = (!use_packed_groups).then(|| self.chunk_build_state());
         let token_count = self.len();
         let posting_data_size_bytes = self.posting_data_size_bytes();
         let chunk_tokens = chunk_tokens_override
@@ -3022,21 +3008,38 @@ impl PostingListReader {
         let read_build_start = Instant::now();
         stream::iter(chunk_ranges)
             .map(|(tok_start, tok_end)| {
-                let state = &state;
+                let state = state.as_ref();
                 let grouping = &grouping;
                 async move {
-                    let posting_lists = self
-                        .build_chunk_postings(tok_start, tok_end, with_position, state)
-                        .await?;
-                    self.publish_chunk_postings(
-                        posting_lists,
-                        grouping,
-                        tok_start,
-                        tok_end,
-                        token_count,
-                        with_position,
-                    )
-                    .await;
+                    if use_packed_groups {
+                        let groups = self
+                            .build_packed_chunk_groups(tok_start, tok_end, token_count, grouping)
+                            .await?;
+                        for (start, end, group) in groups {
+                            self.index_cache
+                                .insert_with_key(
+                                    &PostingListGroupKey { start, end },
+                                    Arc::new(group),
+                                )
+                                .await;
+                        }
+                    } else {
+                        let state = state.expect(
+                            "materialized prewarm must initialize posting-list build state",
+                        );
+                        let posting_lists = self
+                            .build_chunk_postings(tok_start, tok_end, with_position, state)
+                            .await?;
+                        self.publish_chunk_postings(
+                            posting_lists,
+                            grouping,
+                            tok_start,
+                            tok_end,
+                            token_count,
+                            with_position,
+                        )
+                        .await;
+                    }
                     Result::Ok(())
                 }
             })
@@ -3144,6 +3147,47 @@ impl PostingListReader {
                 .all(|(i, (token_id, _))| *token_id as usize == tok_start + i)
         );
         Ok(posting_lists)
+    }
+
+    /// Build compact v2 groups directly from one posting-row chunk. Each group
+    /// slice is deep-copied once, so it owns only its Arrow buffers without
+    /// materializing a `Vec<PostingList>` or retaining the full chunk.
+    async fn build_packed_chunk_groups(
+        &self,
+        tok_start: usize,
+        tok_end: usize,
+        token_count: usize,
+        grouping: &PostingGrouping,
+    ) -> Result<Vec<(u32, u32, PostingListGroup)>> {
+        debug_assert!(grouping.is_grouped());
+        debug_assert!(!self.is_legacy_layout());
+
+        let chunk_batch = self.read_chunk_batch(tok_start, tok_end, false).await?;
+        let ranges = grouping.ranges_for_chunk(tok_start, tok_end, token_count);
+        let posting_tail_codec = self.posting_tail_codec;
+
+        spawn_blocking(move || {
+            let mut groups = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges {
+                let start_usize = start as usize;
+                let end_usize = end as usize;
+                let local_start = start_usize - tok_start;
+                let group_len = end_usize - start_usize;
+                let group_batch = chunk_batch.slice(local_start, group_len).shrink_to_fit()?;
+                groups.push((
+                    start,
+                    end,
+                    PostingListGroup::new_packed(group_batch, posting_tail_codec)?,
+                ));
+            }
+            Result::Ok(groups)
+        })
+        .await
+        .map_err(|err| {
+            Error::internal(format!(
+                "Failed to build packed prewarm posting groups in blocking task: {err}"
+            ))
+        })?
     }
 
     /// Strip positions into their own per-token cache entries (the posting cache
@@ -3608,22 +3652,194 @@ impl SharedPositionStream {
 }
 
 /// A group of consecutive posting lists held in a single cache entry, in row
-/// order (issue #7040). `posting_lists[i]` corresponds to row `start + i`,
-/// where `start` is the group's first row from [`PostingListGroupKey`].
-#[derive(Debug, Clone, DeepSizeOf)]
+/// order (issue #7040). Prewarmed v2 groups without positions retain only the
+/// compact Arrow posting rows read from `invert.lance`; max-score/length
+/// metadata stays in the reader and is injected when a query creates a
+/// posting-list view. Cold-loaded groups may keep inline metadata to preserve
+/// one-read query loading. Legacy and position-bearing prewarm paths use the
+/// materialized fallback.
+#[derive(Debug, Clone)]
 pub struct PostingListGroup {
-    pub(super) posting_lists: Vec<PostingList>,
+    pub(super) storage: PostingListGroupStorage,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum PostingListGroupStorage {
+    Packed(PackedPostingListGroup),
+    Materialized(Vec<PostingList>),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PackedPostingListGroup {
+    pub(super) batch: RecordBatch,
+    pub(super) posting_tail_codec: PostingTailCodec,
+}
+
+impl DeepSizeOf for PostingListGroup {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        match &self.storage {
+            PostingListGroupStorage::Packed(group) => group
+                .batch
+                .columns()
+                .iter()
+                .map(|column| sliced_cache_bytes(column.as_ref()))
+                .sum(),
+            PostingListGroupStorage::Materialized(posting_lists) => {
+                posting_lists.deep_size_of_children(context)
+            }
+        }
+    }
 }
 
 impl PostingListGroup {
     pub(super) fn new(posting_lists: Vec<PostingList>) -> Self {
-        Self { posting_lists }
+        Self {
+            storage: PostingListGroupStorage::Materialized(posting_lists),
+        }
     }
 
-    /// Borrow the posting list at offset `slot` within the group (i.e.
-    /// `token_id - start`).
-    pub(super) fn get(&self, slot: usize) -> Option<&PostingList> {
-        self.posting_lists.get(slot)
+    pub(super) fn new_packed(
+        batch: RecordBatch,
+        posting_tail_codec: PostingTailCodec,
+    ) -> Result<Self> {
+        let postings = batch
+            .column_by_name(POSTING_COL)
+            .and_then(|column| column.as_list_opt::<i32>())
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "packed posting group column {POSTING_COL} must be List<LargeBinary>"
+                ))
+            })?;
+        if postings.values().data_type() != &DataType::LargeBinary {
+            return Err(Error::index(format!(
+                "packed posting group column {POSTING_COL} must contain LargeBinary values, got {}",
+                postings.values().data_type()
+            )));
+        }
+        if postings.null_count() != 0 {
+            return Err(Error::index(
+                "packed posting group column must not contain nulls".to_string(),
+            ));
+        }
+        match (
+            batch.column_by_name(MAX_SCORE_COL),
+            batch.column_by_name(LENGTH_COL),
+        ) {
+            (None, None) => {}
+            (Some(max_scores), Some(lengths)) => {
+                let max_scores = max_scores
+                    .as_primitive_opt::<Float32Type>()
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "packed posting group column {MAX_SCORE_COL} must be Float32"
+                        ))
+                    })?;
+                let lengths = lengths.as_primitive_opt::<UInt32Type>().ok_or_else(|| {
+                    Error::index(format!(
+                        "packed posting group column {LENGTH_COL} must be UInt32"
+                    ))
+                })?;
+                if max_scores.null_count() != 0 || lengths.null_count() != 0 {
+                    return Err(Error::index(
+                        "packed posting group metadata columns must not contain nulls".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::index(format!(
+                    "packed posting group must contain both {MAX_SCORE_COL} and {LENGTH_COL}, or neither"
+                )));
+            }
+        }
+
+        Ok(Self {
+            storage: PostingListGroupStorage::Packed(PackedPostingListGroup {
+                batch,
+                posting_tail_codec,
+            }),
+        })
+    }
+
+    pub(super) fn len(&self) -> usize {
+        match &self.storage {
+            PostingListGroupStorage::Packed(group) => group.batch.num_rows(),
+            PostingListGroupStorage::Materialized(posting_lists) => posting_lists.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_packed(&self) -> bool {
+        matches!(&self.storage, PostingListGroupStorage::Packed(_))
+    }
+
+    fn needs_external_metadata(&self) -> bool {
+        match &self.storage {
+            PostingListGroupStorage::Packed(group) => {
+                group.batch.column_by_name(MAX_SCORE_COL).is_none()
+            }
+            PostingListGroupStorage::Materialized(_) => false,
+        }
+    }
+
+    /// Build an owned posting-list view for `slot`. Packed groups clone only
+    /// Arrow array metadata; the compressed posting bytes remain shared with
+    /// the group's `List<LargeBinary>` child buffers.
+    pub(super) fn posting_list(
+        &self,
+        slot: usize,
+        max_score: Option<f32>,
+        length: Option<u32>,
+    ) -> Result<Option<PostingList>> {
+        match &self.storage {
+            PostingListGroupStorage::Materialized(posting_lists) => {
+                Ok(posting_lists.get(slot).cloned())
+            }
+            PostingListGroupStorage::Packed(group) => {
+                if slot >= group.batch.num_rows() {
+                    return Ok(None);
+                }
+                let postings = group
+                    .batch
+                    .column_by_name(POSTING_COL)
+                    .and_then(|column| column.as_list_opt::<i32>())
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "packed posting group column {POSTING_COL} must be List<LargeBinary>"
+                        ))
+                    })?;
+                let blocks = postings.value(slot);
+                let blocks = blocks.as_binary_opt::<i64>().ok_or_else(|| {
+                    Error::index(format!(
+                        "packed posting group slot {slot} is not LargeBinary"
+                    ))
+                })?;
+                let max_score = match group.batch.column_by_name(MAX_SCORE_COL) {
+                    Some(column) => column
+                        .as_primitive_opt::<Float32Type>()
+                        .expect("packed group metadata was validated at construction")
+                        .value(slot),
+                    None => max_score.ok_or_else(|| {
+                        Error::index("packed posting group requires max-score metadata".to_string())
+                    })?,
+                };
+                let length = match group.batch.column_by_name(LENGTH_COL) {
+                    Some(column) => column
+                        .as_primitive_opt::<UInt32Type>()
+                        .expect("packed group metadata was validated at construction")
+                        .value(slot),
+                    None => length.ok_or_else(|| {
+                        Error::index("packed posting group requires length metadata".to_string())
+                    })?,
+                };
+                Ok(Some(PostingList::Compressed(CompressedPostingList::new(
+                    blocks.clone(),
+                    max_score,
+                    length,
+                    group.posting_tail_codec,
+                    None,
+                ))))
+            }
+        }
     }
 }
 
@@ -6754,7 +6970,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_modern_prewarm_shrinks_cached_posting_buffers() {
+    async fn test_modern_prewarm_packs_group_with_shared_posting_buffer() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -6818,17 +7034,115 @@ mod tests {
             .await
             .unwrap();
 
-        let PostingList::Compressed(alpha) = group.get(0).unwrap() else {
+        assert!(
+            group.is_packed(),
+            "no-position prewarm should pack v2 groups"
+        );
+        assert!(
+            group.needs_external_metadata(),
+            "prewarmed packed groups must not duplicate reader score/length metadata"
+        );
+        let (alpha_score, alpha_len) = inverted_list.bulk_metadata_for_token(0);
+        let PostingList::Compressed(alpha) = group
+            .posting_list(0, alpha_score, alpha_len)
+            .unwrap()
+            .unwrap()
+        else {
             panic!("expected compressed posting list for token 0");
         };
-        let PostingList::Compressed(beta) = group.get(1).unwrap() else {
+        let (beta_score, beta_len) = inverted_list.bulk_metadata_for_token(1);
+        let PostingList::Compressed(beta) = group
+            .posting_list(1, beta_score, beta_len)
+            .unwrap()
+            .unwrap()
+        else {
             panic!("expected compressed posting list for token 1");
         };
 
-        assert_ne!(
+        assert_eq!(
             alpha.blocks.values().as_ptr(),
             beta.blocks.values().as_ptr(),
-            "prewarm should not leave cached posting lists sharing the same values buffer"
+            "packed posting views should share the group's values buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_packed_prewarm_groups_do_not_retain_the_full_chunk() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        for token_id in 0..4u32 {
+            builder.tokens.add(format!("t{token_id}"));
+            let mut posting = PostingListBuilder::new(false);
+            posting.add(token_id, PositionRecorder::Count(1));
+            builder.posting_lists.push(posting);
+            builder.docs.append(1000 + token_id as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let cache = LanceCache::with_capacity(1 << 20);
+        let mut posting_reader = PostingListReader::try_new(reader, &cache).await.unwrap();
+        posting_reader.grouping = PostingGrouping::SyntheticFixed { group_size: 2 };
+
+        assert_eq!(
+            posting_reader
+                .prewarm_posting_lists_chunked(false, Some(4), 1)
+                .await
+                .unwrap(),
+            1,
+            "the test must read both groups in one prewarm chunk"
+        );
+
+        let first_group = posting_reader
+            .index_cache
+            .get_with_key(&PostingListGroupKey { start: 0, end: 2 })
+            .await
+            .unwrap();
+        let second_group = posting_reader
+            .index_cache
+            .get_with_key(&PostingListGroupKey { start: 2, end: 4 })
+            .await
+            .unwrap();
+        let (first_score, first_len) = posting_reader.bulk_metadata_for_token(0);
+        let PostingList::Compressed(first) = first_group
+            .posting_list(0, first_score, first_len)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected compressed posting list in first group");
+        };
+        let (neighbor_score, neighbor_len) = posting_reader.bulk_metadata_for_token(1);
+        let PostingList::Compressed(first_neighbor) = first_group
+            .posting_list(1, neighbor_score, neighbor_len)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected compressed posting list in first group");
+        };
+        let (second_score, second_len) = posting_reader.bulk_metadata_for_token(2);
+        let PostingList::Compressed(second) = second_group
+            .posting_list(0, second_score, second_len)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected compressed posting list in second group");
+        };
+
+        assert_eq!(
+            first.blocks.values().as_ptr(),
+            first_neighbor.blocks.values().as_ptr(),
+            "postings in one group should share the group's values buffer"
+        );
+        assert_ne!(
+            first.blocks.values().as_ptr(),
+            second.blocks.values().as_ptr(),
+            "each group must own a compact buffer instead of retaining the full chunk"
         );
     }
 
@@ -6837,8 +7151,8 @@ mod tests {
         let grouping = PostingGrouping::SyntheticFixed { group_size: 4 };
         assert_eq!(
             prewarm_chunk_ranges(&grouping, 13, 5),
-            vec![(0, 4), (4, 8), (8, 12), (12, 13)],
-            "grouped chunk ranges must never split a posting cache group"
+            vec![(0, 4), (4, 8), (8, 13)],
+            "grouped chunks may contain multiple groups but must never split one"
         );
         assert_eq!(
             prewarm_chunk_ranges(&PostingGrouping::None, 13, 5),
@@ -6862,8 +7176,8 @@ mod tests {
         );
         assert_eq!(
             prewarm_chunk_ranges(&grouping, 10, 6),
-            vec![(0, 4), (4, 8), (8, 10)],
-            "prewarm chunks must not split synthetic groups"
+            vec![(0, 4), (4, 10)],
+            "prewarm chunks may contain multiple synthetic groups but must not split one"
         );
         assert_eq!(
             grouping.ranges_for_chunk(4, 10, 10),
@@ -7088,7 +7402,15 @@ mod tests {
                 .unwrap();
             let slot = (token_id - start) as usize;
             assert!(
-                !group.get(slot).unwrap().has_position(),
+                !group.is_packed(),
+                "with-position prewarm should retain the materialized fallback"
+            );
+            assert!(
+                !group
+                    .posting_list(slot, None, None)
+                    .unwrap()
+                    .unwrap()
+                    .has_position(),
                 "token {token_id} posting cache entry must be positions-free after prewarm"
             );
 
@@ -7536,21 +7858,11 @@ mod tests {
         (index, cache)
     }
 
-    /// The read path decodes a posting-list group by slicing one buffer read for
-    /// the whole `[start, end)` row range, so every posting list in a cached
-    /// group shares a single `blocks` buffer. `DeepSizeOf` must count each
-    /// posting's slice of that buffer, not the whole buffer once per posting —
-    /// otherwise a group of N postings reports ~N times its real footprint.
-    #[rstest::rstest]
-    #[case::single_doc_terms(512, 1)]
-    #[case::small_terms(512, 4)]
-    #[case::medium_terms(256, 32)]
+    /// Packed groups charge their Arrow buffers and contiguous metadata once,
+    /// avoiding the per-member enum/array object graph of a materialized group.
     #[tokio::test]
-    async fn test_read_path_group_size_counts_slices_not_shared_buffer(
-        #[case] num_tokens: usize,
-        #[case] docs_per_token: usize,
-    ) {
-        let (index, _cache) = load_v2_index_with_grouped_postings(num_tokens, docs_per_token).await;
+    async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
+        let (index, _cache) = load_v2_index_with_grouped_postings(512, 1).await;
         let inverted_list = index.partitions[0].inverted_list.clone();
         assert!(!inverted_list.is_legacy_layout(), "expected v2 layout");
         assert!(
@@ -7572,19 +7884,24 @@ mod tests {
             .get_with_key(&PostingListGroupKey { start, end })
             .await
             .unwrap();
+        assert!(group.is_packed(), "cold v2 group should use packed storage");
+        inverted_list.ensure_metadata_loaded().await.unwrap();
 
-        // Sum what counting the full backing buffer once per posting list would
-        // charge, and confirm the postings really do share a single buffer.
         let mut distinct_buffers = std::collections::HashSet::new();
-        let mut charged_if_counted_per_posting = 0usize;
-        for posting in &group.posting_lists {
+        let mut materialized = Vec::with_capacity(group.len());
+        for slot in 0..group.len() {
+            let (max_score, length) = inverted_list.bulk_metadata_for_token(start + slot as u32);
+            let posting = group
+                .posting_list(slot, max_score, length)
+                .unwrap()
+                .unwrap();
             let PostingList::Compressed(compressed) = posting else {
                 panic!("expected compressed posting lists");
             };
-            charged_if_counted_per_posting += compressed.blocks.get_buffer_memory_size();
             distinct_buffers.insert(compressed.blocks.values().as_ptr());
+            materialized.push(PostingList::Compressed(compressed));
         }
-        let posting_count = group.posting_lists.len();
+        let posting_count = materialized.len();
 
         assert!(
             posting_count > 1,
@@ -7595,13 +7912,12 @@ mod tests {
             1,
             "read-path postings in a group should share one backing buffer"
         );
-        // With slice-aware accounting the shared buffer is counted ~once, so the
-        // whole group costs far less than counting it once per posting list.
-        let reported = group.deep_size_of();
+        let packed_size = group.deep_size_of();
+        let materialized_size = PostingListGroup::new(materialized).deep_size_of();
         assert!(
-            reported < charged_if_counted_per_posting / 2,
-            "group deep_size_of {reported}B should not scale with the {posting_count}x-counted \
-             shared buffer ({charged_if_counted_per_posting}B)"
+            packed_size * 2 < materialized_size,
+            "packed group deep_size_of {packed_size}B should be less than half of the \
+             {materialized_size}B materialized graph for {posting_count} postings"
         );
     }
 
@@ -7807,7 +8123,15 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !group.get(0).unwrap().has_position(),
+            !group.is_packed(),
+            "with-position prewarm should retain the materialized fallback"
+        );
+        assert!(
+            !group
+                .posting_list(0, None, None)
+                .unwrap()
+                .unwrap()
+                .has_position(),
             "posting cache should remain positions-free after prewarm"
         );
 
@@ -9276,9 +9600,7 @@ mod tests {
 
         let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
         let cache = LanceCache::no_cache();
-        let posting_reader = PostingListReader::try_new(reader, &cache)
-            .await
-            .unwrap();
+        let posting_reader = PostingListReader::try_new(reader, &cache).await.unwrap();
         assert!(
             matches!(
                 &posting_reader.grouping,
@@ -9404,7 +9726,7 @@ mod tests {
         ));
 
         let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-        let big_docs = 30u32;
+        let big_docs = (BLOCK_SIZE * 3 + 5) as u32;
         builder.tokens.add("big".to_owned());
         let mut big = PostingListBuilder::new(false);
         for d in 0..big_docs {
@@ -9484,13 +9806,18 @@ mod tests {
 
         for token_id in 0..num_tokens {
             let (start, end) = posting_reader.group_range_for_token(token_id).unwrap();
+            let group = posting_reader
+                .index_cache
+                .get_with_key(&PostingListGroupKey { start, end })
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "synthetic prewarm should populate group [{start}, {end}) for token {token_id}"
+                    )
+                });
             assert!(
-                posting_reader
-                    .index_cache
-                    .get_with_key(&PostingListGroupKey { start, end })
-                    .await
-                    .is_some(),
-                "synthetic prewarm should populate group [{start}, {end}) for token {token_id}",
+                group.is_packed(),
+                "no-position synthetic prewarm should insert a packed group"
             );
             assert!(
                 posting_reader
