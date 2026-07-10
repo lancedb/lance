@@ -4187,9 +4187,9 @@ impl Scanner {
         // effect and would rely on fragment coverage that is unsound for Or, since an Or can read
         // the union of both sides' fragments while coverage intersects them. Restrict the pushdown
         // to a lone `Query`, whose coverage is just that one index's fragment bitmap.
-        if !matches!(index_query, ScalarIndexExpr::Query(_)) {
+        let ScalarIndexExpr::Query(search) = index_query else {
             return Ok(None);
-        }
+        };
         // Every row address the index covers must survive into the result, otherwise an early
         // stop could leave fewer than `limit` live rows. That requires every index-covered
         // fragment to be both scanned and free of deletions. Fragments that are scanned but not
@@ -4200,7 +4200,16 @@ impl Scanner {
             .filter(|fragment| fragment.deletion_file.is_none())
             .map(|fragment| fragment.id as u32)
             .collect();
-        let covered_frags = self.fragments_covered_by_index_query(index_query).await?;
+        // A legacy or unsupported index reports no fragment bitmap, so its coverage is unknown and
+        // an early stop cannot be proven safe. Treat unknown coverage as "do not push" rather than
+        // an error: this is only an optimization and must never turn an otherwise valid scan into a
+        // failure.
+        let Some(covered_frags) =
+            scalar_index_fragment_bitmap(self.dataset.as_ref(), &search.column, &search.index_name)
+                .await?
+        else {
+            return Ok(None);
+        };
         if !covered_frags.is_subset(&live_undeleted) {
             return Ok(None);
         }
@@ -6493,6 +6502,58 @@ mod test {
             pushed,
             Some(100),
             "a lone Query index lookup must still push the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_limit_pushdown_tolerates_unknown_index_coverage() {
+        // When an index reports no fragment coverage (a legacy or unsupported index with no
+        // fragment bitmap, or no segments for the name), `scalar_index_fragment_bitmap` returns
+        // `None`. `index_search_limit` must treat that as "do not push" and return `Ok(None)`, not
+        // propagate an error: the pushdown is only an optimization and must never turn an otherwise
+        // valid scan into a failure. A missing index name reproduces the same `None` coverage.
+        use lance_index::scalar::SargableQuery;
+        use lance_index::scalar::expression::ScalarIndexSearch;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1_000))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let scanned = dataset.fragments().as_ref().clone();
+
+        // A single `Query` leaf that names an index with no committed segments, so its coverage
+        // resolves to `None`. `fragment_bitmap` is `None` for the same reason a legacy index's is.
+        let plan = ExprFilterPlan {
+            index_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "id".to_string(),
+                index_name: "does_not_exist_idx".to_string(),
+                index_type: "BTree".to_string(),
+                query: Arc::new(SargableQuery::Range(
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Unbounded,
+                )),
+                needs_recheck: false,
+                fragment_bitmap: None,
+            })),
+            skip_recheck: true,
+            refine_expr: None,
+            full_expr: None,
+        };
+
+        let mut scan = dataset.scan();
+        scan.scan_in_order(false).limit(Some(100), None).unwrap();
+        let pushed = scan.index_search_limit(&plan, &scanned).await.unwrap();
+        assert_eq!(
+            pushed, None,
+            "unknown index coverage must disable the pushdown, not error"
         );
     }
 
