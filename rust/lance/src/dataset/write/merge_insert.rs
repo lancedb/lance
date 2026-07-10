@@ -10028,10 +10028,14 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     /// is deleted. Keys 4 and 5 match but fail the condition, so their value must remain
     /// the original (1), not the source's (2).
     #[rstest::rstest]
+    #[case::legacy_stable_ids(LanceFileVersion::Legacy, true)]
+    #[case::legacy_no_stable_ids(LanceFileVersion::Legacy, false)]
+    #[case::v2_stable_ids(LanceFileVersion::V2_0, true)]
+    #[case::v2_no_stable_ids(LanceFileVersion::V2_0, false)]
     #[tokio::test]
     async fn test_when_matched_delete_if_full_schema(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-        #[values(true, false)] enable_stable_row_ids: bool,
+        #[case] version: LanceFileVersion,
+        #[case] enable_stable_row_ids: bool,
     ) {
         let schema = create_test_schema();
         let test_uri = "memory://test_delete_if_full.lance";
@@ -10123,10 +10127,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     /// condition are deleted, unmatched rows are inserted, and matched rows failing the
     /// condition survive unmodified.
     #[rstest::rstest]
+    #[case::legacy(LanceFileVersion::Legacy)]
+    #[case::v2_0(LanceFileVersion::V2_0)]
     #[tokio::test]
-    async fn test_when_matched_delete_if_with_insert(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-    ) {
+    async fn test_when_matched_delete_if_with_insert(#[case] version: LanceFileVersion) {
         let schema = create_test_schema();
         let test_uri = "memory://test_delete_if_with_insert.lance";
 
@@ -10204,10 +10208,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     /// The source carries keys 4, 5, 6 (matching) and 7, 8, 9 (unmatched, not inserted).
     /// The condition never holds because 'zzz' is not a valid filterme value.
     #[rstest::rstest]
+    #[case::legacy(LanceFileVersion::Legacy)]
+    #[case::v2_0(LanceFileVersion::V2_0)]
     #[tokio::test]
-    async fn test_when_matched_delete_if_never_true(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
-    ) {
+    async fn test_when_matched_delete_if_never_true(#[case] version: LanceFileVersion) {
         let schema = create_test_schema();
         let test_uri = "memory://test_delete_if_never_true.lance";
 
@@ -10588,9 +10592,9 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let new_stream = reader_to_stream(new_reader);
         let err = job.execute(new_stream).await.unwrap_err();
         assert!(
-            err.to_string()
-                .contains("Failed to parse DeleteIf condition"),
-            "got: {}",
+            matches!(&err, Error::InvalidInput { source, .. }
+                if source.to_string().contains("Failed to parse DeleteIf condition")),
+            "expected InvalidInput with a DeleteIf parse error, got: {:?}",
             err
         );
 
@@ -10619,9 +10623,9 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let new_stream = reader_to_stream(new_reader);
         let err = job.execute(new_stream).await.unwrap_err();
         assert!(
-            err.to_string()
-                .contains("must be expressions that return a boolean value"),
-            "got: {}",
+            matches!(&err, Error::InvalidInput { source, .. }
+                if source.to_string().contains("must be expressions that return a boolean value")),
+            "expected InvalidInput with a boolean-validation error, got: {:?}",
             err
         );
     }

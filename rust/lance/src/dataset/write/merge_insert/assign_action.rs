@@ -59,7 +59,8 @@ impl Action {
 /// The condition is parsed with a relation-enabled planner so it can reference columns
 /// qualified with `source.` and `target.`, matching the join output schema used by the
 /// fast path CASE expression. `variant_name` is used to name the condition in the parse
-/// error message (e.g. "UpdateIf" or "DeleteIf").
+/// error message (e.g. "UpdateIf" or "DeleteIf"), and the failing condition string is
+/// included so it can be identified when several conditions are present.
 fn parse_when_matched_condition(
     condition_str: &str,
     schema: Option<&arrow_schema::Schema>,
@@ -75,7 +76,10 @@ fn parse_when_matched_condition(
         lance_datafusion::planner::Planner::new(std::sync::Arc::new(dataset_schema.clone()))
             .with_enable_relations(true);
     planner.parse_filter(condition_str).map_err(|e| {
-        crate::Error::invalid_input(format!("Failed to parse {} condition: {}", variant_name, e))
+        crate::Error::invalid_input(format!(
+            "Failed to parse {} condition '{}': {}",
+            variant_name, condition_str, e
+        ))
     })
 }
 

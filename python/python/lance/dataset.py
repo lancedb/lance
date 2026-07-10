@@ -485,6 +485,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
            a  b
         0  1  x
         1  3  z
+
+        See Also
+        --------
+        LanceDataset.merge_insert : Start building a merge insert operation
+        when_matched_update_all : Update matched rows instead of deleting them
+        when_not_matched_insert_all : Insert source rows that have no match
         """
         return super(MergeInsertBuilder, self).when_matched_delete(condition)
 
