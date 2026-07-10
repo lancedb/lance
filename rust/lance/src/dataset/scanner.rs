@@ -2891,9 +2891,23 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let ordered_output = if self.ordering.is_some() || self.nearest.is_some() {
+            // If a later plan node sorts the results then the scan does not need
+            // to preserve fragment order.
+            false
+        } else if projection.with_row_last_updated_at_version
+            || projection.with_row_created_at_version
+        {
+            // Version columns require ordered scanning because version metadata
+            // is indexed by position within each fragment.
+            true
+        } else {
+            self.ordered
+        };
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
-            .with_projection(projection);
+            .with_projection(projection)
+            .with_ordered_output(ordered_output);
 
         if let Some(fragments) = fragments {
             read_options = read_options.with_fragments(fragments);
@@ -12580,6 +12594,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             "Schema should include _row_created_at_version"
         );
 
+        scanner.scan_in_order(false);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert!(filtered.options().ordered_output);
+
         // Actually read the data to ensure version columns are materialized
         let batches = scanner
             .try_into_stream()
@@ -12709,6 +12729,28 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert_eq!(filtered.options().io_buffer_size_bytes, Some(7777));
+    }
+
+    #[tokio::test]
+    async fn test_scan_in_order_propagated_to_filtered_read() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_scan_in_order_propagated", None)
+            .await
+            .unwrap();
+
+        let plan = dataset.scan().create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert!(filtered.options().ordered_output);
+
+        let mut scanner = dataset.scan();
+        scanner.scan_in_order(false);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert!(!filtered.options().ordered_output);
     }
 
     // The env var key scopes serial_test's lock so this test only blocks others
