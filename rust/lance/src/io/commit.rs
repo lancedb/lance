@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
+use lance_core::utils::tracing::{AUDIT_MODE_DELETE, AUDIT_TYPE_TRANSACTION, TRACE_FILE_AUDIT};
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
@@ -37,6 +38,7 @@ use lance_table::format::{
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
 };
+use lance_table::io::manifest::read_manifest;
 use rand::{Rng, rng};
 
 use super::ObjectStore;
@@ -97,6 +99,11 @@ pub(crate) async fn read_transaction_file(
 /// Logs a warning on failure rather than propagating the error, since the
 /// primary operation has already failed and the orphaned file will eventually
 /// be removed by GC.
+///
+/// Callers must only invoke this for attempts whose commit is confirmed to
+/// have NOT landed (see [`verify_commit_outcome`]): a landed manifest
+/// references its transaction file by path, so deleting it would corrupt the
+/// version.
 async fn cleanup_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
@@ -109,12 +116,117 @@ async fn cleanup_transaction_file(
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(transaction_file);
-    if let Err(e) = object_store.delete(&path).await {
-        log::warn!(
-            "Failed to clean up orphaned transaction file '{}': {}",
-            transaction_file,
-            e
-        );
+    match object_store.delete(&path).await {
+        Ok(()) => {
+            tracing::info!(
+                target: TRACE_FILE_AUDIT,
+                mode = AUDIT_MODE_DELETE,
+                r#type = AUDIT_TYPE_TRANSACTION,
+                path = transaction_file,
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "Failed to clean up orphaned transaction file '{}': {}",
+                transaction_file,
+                e
+            );
+        }
+    }
+}
+
+/// Who owns the manifest at a version, checked after a failed commit attempt.
+#[derive(Debug)]
+enum CommitOutcome {
+    /// The manifest at the version is the one this attempt wrote: the commit
+    /// actually landed even though the store reported a failure (e.g. the
+    /// response to a successful conditional PUT was lost and an internal
+    /// retry surfaced "already exists").
+    Ours {
+        manifest: Box<Manifest>,
+        location: ManifestLocation,
+    },
+    /// A manifest exists at the version and records a different transaction
+    /// file: another writer definitely won the version.
+    Foreign,
+    /// No manifest exists at the version: this attempt definitely did not
+    /// land.
+    Absent,
+    /// The verification reads themselves kept failing; whether the commit
+    /// landed cannot be determined. Callers must not run destructive cleanup
+    /// in this state.
+    Unknown,
+}
+
+/// Maximum verification read attempts in [`verify_commit_outcome`].
+const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
+
+/// Determine whether a failed commit attempt actually landed, by comparing
+/// the transaction file recorded in the manifest at `version` against the one
+/// this attempt wrote. Transaction file names embed a per-attempt UUID, so
+/// equality is an exact identity check.
+///
+/// Never returns an error: transient read failures are retried briefly and
+/// then collapse to [`CommitOutcome::Unknown`].
+async fn verify_commit_outcome(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    version: u64,
+    transaction_file: &str,
+) -> CommitOutcome {
+    debug_assert!(!transaction_file.is_empty());
+    let mut backoff = Backoff::default();
+    loop {
+        match try_read_manifest_at(object_store, commit_handler, base_path, version).await {
+            Ok(Some((manifest, location))) => {
+                return if manifest.transaction_file.as_deref() == Some(transaction_file) {
+                    CommitOutcome::Ours {
+                        manifest: Box::new(manifest),
+                        location,
+                    }
+                } else {
+                    CommitOutcome::Foreign
+                };
+            }
+            Ok(None) => return CommitOutcome::Absent,
+            Err(e) => {
+                if backoff.attempt() + 1 >= COMMIT_VERIFICATION_ATTEMPTS {
+                    log::warn!(
+                        "Could not verify the outcome of the commit attempt for version {} \
+                         after {} tries; treating the commit status as unknown: {}",
+                        version,
+                        COMMIT_VERIFICATION_ATTEMPTS,
+                        e
+                    );
+                    return CommitOutcome::Unknown;
+                }
+                tokio::time::sleep(backoff.next_backoff()).await;
+            }
+        }
+    }
+}
+
+/// Read the manifest at `version`, distinguishing "no such version"
+/// (`Ok(None)`) from transient read failures (`Err`).
+async fn try_read_manifest_at(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    version: u64,
+) -> Result<Option<(Manifest, ManifestLocation)>> {
+    let location = match commit_handler
+        .resolve_version_location(base_path, version, &object_store.inner)
+        .await
+    {
+        Ok(location) => location,
+        Err(Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    match read_manifest(object_store, &location.path, location.size).await {
+        Ok(manifest) => Ok(Some((manifest, location))),
+        Err(Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -270,31 +382,116 @@ async fn do_commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            let tx_key = crate::session::caches::TransactionKey {
-                version: manifest.version,
-            };
-            metadata_cache
-                .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-                .await;
-
-            let manifest_key = crate::session::caches::ManifestKey {
-                version: manifest_location.version,
-                e_tag: manifest_location.e_tag.as_deref(),
-            };
-            metadata_cache
-                .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+            record_new_dataset_commit(metadata_cache, transaction, &manifest, &manifest_location)
                 .await;
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
+            // The dataset may "already exist" because this attempt's own
+            // manifest write landed but returned an ambiguous error. Verify
+            // before reporting a conflict (and before deleting the
+            // transaction file a landed manifest would reference).
+            if !transaction_file.is_empty() {
+                match verify_commit_outcome(
+                    object_store,
+                    commit_handler,
+                    base_path,
+                    manifest.version,
+                    &transaction_file,
+                )
+                .await
+                {
+                    CommitOutcome::Ours {
+                        manifest: committed_manifest,
+                        location,
+                    } => {
+                        let committed_manifest = *committed_manifest;
+                        record_new_dataset_commit(
+                            metadata_cache,
+                            transaction,
+                            &committed_manifest,
+                            &location,
+                        )
+                        .await;
+                        return Ok((committed_manifest, location));
+                    }
+                    CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                    CommitOutcome::Unknown => {
+                        return Err(Error::commit_status_unknown_source(
+                            manifest.version,
+                            "dataset creation reported a conflict but the manifest could not \
+                             be read back for verification"
+                                .to_string()
+                                .into(),
+                        ));
+                    }
+                }
+            }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
         Err(CommitError::OtherError(err)) => {
+            if !transaction_file.is_empty() {
+                match verify_commit_outcome(
+                    object_store,
+                    commit_handler,
+                    base_path,
+                    manifest.version,
+                    &transaction_file,
+                )
+                .await
+                {
+                    CommitOutcome::Ours {
+                        manifest: committed_manifest,
+                        location,
+                    } => {
+                        let committed_manifest = *committed_manifest;
+                        record_new_dataset_commit(
+                            metadata_cache,
+                            transaction,
+                            &committed_manifest,
+                            &location,
+                        )
+                        .await;
+                        return Ok((committed_manifest, location));
+                    }
+                    CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                    CommitOutcome::Unknown => {
+                        return Err(Error::commit_status_unknown_source(
+                            manifest.version,
+                            Box::new(err),
+                        ));
+                    }
+                }
+            }
             cleanup_transaction_file(object_store, base_path, &transaction_file).await;
             Err(err)
         }
     }
+}
+
+/// Cache bookkeeping for a successful new-dataset commit, shared by the
+/// direct-success and verified-own-commit paths of `do_commit_new_dataset`.
+async fn record_new_dataset_commit(
+    metadata_cache: &DSMetadataCache,
+    transaction: &Transaction,
+    manifest: &Manifest,
+    location: &ManifestLocation,
+) {
+    let tx_key = crate::session::caches::TransactionKey {
+        version: manifest.version,
+    };
+    metadata_cache
+        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+        .await;
+
+    let manifest_key = crate::session::caches::ManifestKey {
+        version: location.version,
+        e_tag: location.e_tag.as_deref(),
+    };
+    metadata_cache
+        .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -851,12 +1048,65 @@ pub(crate) async fn do_commit_detached_transaction(
                 return Ok((manifest, location));
             }
             Err(CommitError::CommitConflict) => {
-                // We pick a random u64 for the version, so it's possible (though extremely unlikely)
-                // that we have a conflict. In that case, we just try again.
+                // Either an (extremely unlikely) random-version collision, or
+                // our own write landed but returned an ambiguous error.
+                // Verify before retrying with a new random version.
+                if !transaction_file.is_empty() {
+                    match verify_commit_outcome(
+                        object_store,
+                        commit_handler,
+                        &dataset.base,
+                        manifest.version,
+                        &transaction_file,
+                    )
+                    .await
+                    {
+                        CommitOutcome::Ours {
+                            manifest: committed_manifest,
+                            location,
+                        } => {
+                            return Ok((*committed_manifest, location));
+                        }
+                        CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                        CommitOutcome::Unknown => {
+                            return Err(Error::commit_status_unknown_source(
+                                manifest.version,
+                                "detached commit reported a conflict but the manifest could \
+                                 not be read back for verification"
+                                    .to_string()
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
                 tokio::time::sleep(backoff.next_backoff()).await;
             }
             Err(CommitError::OtherError(err)) => {
-                // If other error, return
+                if !transaction_file.is_empty() {
+                    match verify_commit_outcome(
+                        object_store,
+                        commit_handler,
+                        &dataset.base,
+                        manifest.version,
+                        &transaction_file,
+                    )
+                    .await
+                    {
+                        CommitOutcome::Ours {
+                            manifest: committed_manifest,
+                            location,
+                        } => {
+                            return Ok((*committed_manifest, location));
+                        }
+                        CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                        CommitOutcome::Unknown => {
+                            return Err(Error::commit_status_unknown_source(
+                                manifest.version,
+                                Box::new(err),
+                            ));
+                        }
+                    }
+                }
                 cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
                 return Err(err);
             }
@@ -907,6 +1157,55 @@ async fn load_and_sort_new_transactions(
     let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
     txns.sort_by_key(|(version, _)| *version);
     Ok((new_ds, txns))
+}
+
+/// Success-path bookkeeping shared by the direct-success and
+/// verified-own-commit paths of [`commit_transaction`]: populate the session
+/// caches and run the auto-cleanup hook.
+async fn record_successful_commit(
+    dataset: &Dataset,
+    transaction: &Transaction,
+    manifest: &Manifest,
+    location: &ManifestLocation,
+    indices: Vec<IndexMetadata>,
+    skip_auto_cleanup: bool,
+) {
+    let tx_key = crate::session::caches::TransactionKey {
+        version: manifest.version,
+    };
+    dataset
+        .metadata_cache
+        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+        .await;
+
+    let manifest_key = crate::session::caches::ManifestKey {
+        version: location.version,
+        e_tag: location.e_tag.as_deref(),
+    };
+    dataset
+        .metadata_cache
+        .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
+        .await;
+    if !indices.is_empty() {
+        let key = IndexMetadataKey {
+            version: manifest.version,
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&key, Arc::new(indices))
+            .await;
+    }
+
+    if !skip_auto_cleanup {
+        // Note: We're using the old dataset here (before the new manifest is committed).
+        // This means cleanup runs based on the previous version's state, which may affect
+        // which versions are available for cleanup.
+        match auto_cleanup_hook(dataset, manifest).await {
+            Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
+            Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
+            _ => {}
+        };
+    }
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
@@ -1053,46 +1352,66 @@ pub(crate) async fn commit_transaction(
 
         match result {
             Ok(manifest_location) => {
-                // Cache both the transaction file and manifest
-                let tx_key = crate::session::caches::TransactionKey {
-                    version: target_version,
-                };
-                dataset
-                    .metadata_cache
-                    .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-                    .await;
-
-                let manifest_key = crate::session::caches::ManifestKey {
-                    version: manifest_location.version,
-                    e_tag: manifest_location.e_tag.as_deref(),
-                };
-                dataset
-                    .metadata_cache
-                    .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
-                    .await;
-                if !indices.is_empty() {
-                    let key = IndexMetadataKey {
-                        version: target_version,
-                    };
-                    dataset
-                        .index_cache
-                        .insert_with_key(&key, Arc::new(indices))
-                        .await;
-                }
-
-                if !commit_config.skip_auto_cleanup {
-                    // Note: We're using the old dataset here (before the new manifest is committed).
-                    // This means cleanup runs based on the previous version's state, which may affect
-                    // which versions are available for cleanup.
-                    match auto_cleanup_hook(&dataset, &manifest).await {
-                        Ok(Some(stats)) => log::info!("Auto cleanup triggered: {:?}", stats),
-                        Err(e) => log::error!("Error encountered during auto_cleanup_hook: {}", e),
-                        _ => {}
-                    };
-                }
+                record_successful_commit(
+                    &dataset,
+                    &transaction,
+                    &manifest,
+                    &manifest_location,
+                    indices,
+                    commit_config.skip_auto_cleanup,
+                )
+                .await;
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {
+                // The store may have applied this attempt's write and still
+                // reported a conflict (e.g. the response to a successful
+                // conditional PUT was lost and an internal retry saw
+                // "already exists"). Verify who owns the version before
+                // treating the attempt as lost: deleting the artifacts of a
+                // commit that actually landed corrupts the version.
+                if !current_transaction_file.is_empty() {
+                    match verify_commit_outcome(
+                        object_store,
+                        commit_handler,
+                        &dataset.base,
+                        target_version,
+                        &current_transaction_file,
+                    )
+                    .await
+                    {
+                        CommitOutcome::Ours {
+                            manifest: committed_manifest,
+                            location,
+                        } => {
+                            let committed_manifest = *committed_manifest;
+                            record_successful_commit(
+                                &dataset,
+                                &transaction,
+                                &committed_manifest,
+                                &location,
+                                indices,
+                                commit_config.skip_auto_cleanup,
+                            )
+                            .await;
+                            return Ok((committed_manifest, location));
+                        }
+                        // Confirmed loss: another writer owns the version (or,
+                        // for handlers that detect conflicts before writing,
+                        // the attempt never landed). Proceed with the normal
+                        // rebase-and-retry path.
+                        CommitOutcome::Foreign | CommitOutcome::Absent => {}
+                        CommitOutcome::Unknown => {
+                            return Err(Error::commit_status_unknown_source(
+                                target_version,
+                                "commit reported a conflict but the manifest at the target \
+                                 version could not be read back for verification"
+                                    .to_string()
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
                 let next_attempt_i = backoff.attempt() + 1;
 
                 if backoff.attempt() == 0 {
@@ -1119,6 +1438,51 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
+                if !current_transaction_file.is_empty() {
+                    match verify_commit_outcome(
+                        object_store,
+                        commit_handler,
+                        &dataset.base,
+                        target_version,
+                        &current_transaction_file,
+                    )
+                    .await
+                    {
+                        CommitOutcome::Ours {
+                            manifest: committed_manifest,
+                            location,
+                        } => {
+                            let committed_manifest = *committed_manifest;
+                            record_successful_commit(
+                                &dataset,
+                                &transaction,
+                                &committed_manifest,
+                                &location,
+                                indices,
+                                commit_config.skip_auto_cleanup,
+                            )
+                            .await;
+                            return Ok((committed_manifest, location));
+                        }
+                        CommitOutcome::Foreign | CommitOutcome::Absent => {
+                            // The attempt certainly did not land; its
+                            // transaction file is orphaned.
+                            cleanup_transaction_file(
+                                object_store,
+                                &dataset.base,
+                                &current_transaction_file,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                        CommitOutcome::Unknown => {
+                            return Err(Error::commit_status_unknown_source(
+                                target_version,
+                                Box::new(err),
+                            ));
+                        }
+                    }
+                }
                 cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
                     .await;
                 return Err(err);
@@ -1832,6 +2196,256 @@ mod tests {
             extra = txn_files_after.saturating_sub(txn_files_before),
         );
     }
+    fn simple_batch(schema: &Arc<ArrowSchema>, values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
+    }
+
+    fn simple_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]))
+    }
+
+    /// A commit whose manifest lands but is reported as a conflict (the
+    /// incident shape: successful conditional PUT, response lost, internal
+    /// retry sees "already exists") must be recognized as our own commit and
+    /// returned as success — with the rows appearing exactly once and the
+    /// transaction file left in place.
+    #[tokio::test]
+    async fn test_commit_succeeds_when_conflict_is_own_commit() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![1, 2, 3]))],
+            schema.clone(),
+        );
+        Dataset::write(reader, uri, Some(params)).await.unwrap();
+        assert_eq!(
+            handler.resolve_calls(),
+            0,
+            "an uncontended commit must not perform verification reads"
+        );
+        let txn_files_before = count_txn_files(uri);
+
+        handler.fail_next(AmbiguousFailure::LandAndConflict);
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![4, 5, 6]))],
+            schema.clone(),
+        );
+        let ds = Dataset::write(reader, uri, Some(params))
+            .await
+            .expect("a conflict with our own landed commit must be reported as success");
+
+        assert_eq!(ds.version().version, 2);
+        assert_eq!(
+            ds.count_rows(None).await.unwrap(),
+            6,
+            "rows must appear exactly once (no duplicate re-commit)"
+        );
+        assert_eq!(
+            count_txn_files(uri),
+            txn_files_before + 1,
+            "the landed commit's transaction file is referenced by the manifest and must survive"
+        );
+
+        // A fresh reader sees the committed version.
+        let ds2 = Dataset::open(uri).await.unwrap();
+        assert_eq!(ds2.version().version, 2);
+        assert_eq!(ds2.count_rows(None).await.unwrap(), 6);
+    }
+
+    /// Same as above, but the landed commit is reported as a plain I/O error
+    /// (e.g. the store's retries all returned 5xx while the first attempt had
+    /// landed). Verification must still recognize the commit as ours.
+    #[tokio::test]
+    async fn test_commit_succeeds_when_landed_with_other_error() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![1, 2, 3]))],
+            schema.clone(),
+        );
+        Dataset::write(reader, uri, Some(params)).await.unwrap();
+        let txn_files_before = count_txn_files(uri);
+
+        handler.fail_next(AmbiguousFailure::LandAndError);
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![4, 5, 6]))],
+            schema.clone(),
+        );
+        let ds = Dataset::write(reader, uri, Some(params))
+            .await
+            .expect("an errored commit that actually landed must be reported as success");
+
+        assert_eq!(ds.version().version, 2);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 6);
+        assert_eq!(count_txn_files(uri), txn_files_before + 1);
+    }
+
+    /// A commit that errors without landing keeps today's behavior:
+    /// verification finds no manifest at the target version, the original
+    /// error propagates (not status-unknown), and the orphaned transaction
+    /// file is cleaned up.
+    #[tokio::test]
+    async fn test_commit_definite_failure_cleans_up_and_keeps_error() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![1, 2, 3]))],
+            schema.clone(),
+        );
+        Dataset::write(reader, uri, Some(params)).await.unwrap();
+        let txn_files_before = count_txn_files(uri);
+
+        handler.fail_next(AmbiguousFailure::FailOutright);
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![4, 5, 6]))],
+            schema.clone(),
+        );
+        let result = Dataset::write(reader, uri, Some(params)).await;
+        let err = result.expect_err("commit that did not land must fail");
+        assert!(
+            !matches!(err, Error::CommitStatusUnknown { .. }),
+            "a verified-absent commit is a definite failure, got: {:?}",
+            err
+        );
+        assert_eq!(
+            count_txn_files(uri),
+            txn_files_before,
+            "orphaned transaction file of a definitely-failed commit must be cleaned up"
+        );
+    }
+
+    /// When the commit errors AND verification itself is unavailable, the
+    /// commit status is unknown: surface `CommitStatusUnknown` and delete
+    /// nothing.
+    #[tokio::test]
+    async fn test_commit_status_unknown_when_verification_unavailable() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![1, 2, 3]))],
+            schema.clone(),
+        );
+        Dataset::write(reader, uri, Some(params)).await.unwrap();
+        let txn_files_before = count_txn_files(uri);
+
+        // The commit lands but errors, and verification reads fail too.
+        handler.fail_next(AmbiguousFailure::LandAndError);
+        handler
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![4, 5, 6]))],
+            schema.clone(),
+        );
+        let result = Dataset::write(reader, uri, Some(params)).await;
+        let err = result.expect_err("unknown status must not be reported as success");
+        assert!(
+            matches!(err, Error::CommitStatusUnknown { .. }),
+            "expected CommitStatusUnknown, got: {:?}",
+            err
+        );
+        assert_eq!(
+            count_txn_files(uri),
+            txn_files_before + 1,
+            "nothing may be deleted while the commit status is unknown"
+        );
+
+        // The commit did land: a fresh reader must see a consistent v2.
+        handler
+            .fail_resolve
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let ds = Dataset::open(uri).await.unwrap();
+        assert_eq!(ds.version().version, 2);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 6);
+    }
+
+    /// Dataset creation whose manifest lands but is reported as a conflict
+    /// must succeed instead of returning "dataset already exists".
+    #[tokio::test]
+    async fn test_create_dataset_succeeds_when_conflict_is_own_commit() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let schema = simple_schema();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+        handler.fail_next(AmbiguousFailure::LandAndConflict);
+
+        let params = WriteParams {
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(
+            vec![Ok(simple_batch(&schema, vec![1, 2, 3]))],
+            schema.clone(),
+        );
+        let ds = Dataset::write(reader, uri, Some(params))
+            .await
+            .expect("creation whose commit landed must succeed");
+        assert_eq!(ds.version().version, 1);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+    }
+
     /// Helper to build a simple manifest for check_column_indices tests.
     fn make_manifest_with_file(
         schema: Schema,

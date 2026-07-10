@@ -729,3 +729,155 @@ mod tests {
         }
     }
 }
+
+/// How [`AmbiguousCommitHandler`] should treat the next commit.
+#[derive(Debug, Clone, Copy)]
+pub enum AmbiguousFailure {
+    /// Apply the commit (the manifest lands), then report a conflict — the
+    /// store equivalent of a successful conditional PUT whose response was
+    /// lost and whose internal retry saw "already exists".
+    LandAndConflict,
+    /// Apply the commit, then report an I/O error.
+    LandAndError,
+    /// Do not apply the commit; report an I/O error.
+    FailOutright,
+}
+
+/// A commit handler for tests that can make a commit physically land while
+/// reporting a failure, and can make commit-outcome verification unavailable.
+///
+/// Delegates real work to [`ConditionalPutCommitHandler`].
+#[derive(Debug, Default)]
+pub struct AmbiguousCommitHandler {
+    /// Failure to inject into the next commit; taken (reset to `None`) when
+    /// the commit runs.
+    pub fail_next_commit: std::sync::Mutex<Option<AmbiguousFailure>>,
+    /// When set, the armed failure only applies to Rewrite commits; other
+    /// commits (e.g. compaction's ReserveFragments) pass through untouched.
+    pub only_rewrite: std::sync::atomic::AtomicBool,
+    /// When set, version resolution fails, making commit-outcome verification
+    /// impossible.
+    pub fail_resolve: std::sync::atomic::AtomicBool,
+    /// Number of version resolutions requested (a proxy for how often commit
+    /// verification ran).
+    pub resolve_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl AmbiguousCommitHandler {
+    pub fn fail_next(&self, failure: AmbiguousFailure) {
+        *self.fail_next_commit.lock().unwrap() = Some(failure);
+    }
+
+    /// Arm the failure for the next Rewrite commit only.
+    pub fn fail_next_rewrite(&self, failure: AmbiguousFailure) {
+        self.only_rewrite
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.fail_next(failure);
+    }
+
+    pub fn resolve_calls(&self) -> usize {
+        self.resolve_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl lance_table::io::commit::CommitHandler for AmbiguousCommitHandler {
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        base_path: &object_store::path::Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: lance_table::io::commit::ManifestWriter,
+        naming_scheme: lance_table::io::commit::ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<
+        lance_table::io::commit::ManifestLocation,
+        lance_table::io::commit::CommitError,
+    > {
+        use lance_table::io::commit::{CommitError, ConditionalPutCommitHandler};
+        let is_rewrite = transaction
+            .as_ref()
+            .and_then(|t| t.as_pb().operation.as_ref())
+            .map(|op| {
+                matches!(
+                    op,
+                    lance_table::format::pb::transaction::Operation::Rewrite(_)
+                )
+            })
+            .unwrap_or(false);
+        let failure = if self.only_rewrite.load(std::sync::atomic::Ordering::SeqCst) && !is_rewrite
+        {
+            None
+        } else {
+            self.fail_next_commit.lock().unwrap().take()
+        };
+        match failure {
+            None => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await
+            }
+            Some(AmbiguousFailure::LandAndConflict) => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await?;
+                Err(CommitError::CommitConflict)
+            }
+            Some(AmbiguousFailure::LandAndError) => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await?;
+                Err(CommitError::OtherError(lance_core::Error::io(
+                    "simulated ambiguous commit failure",
+                )))
+            }
+            Some(AmbiguousFailure::FailOutright) => {
+                Err(lance_table::io::commit::CommitError::OtherError(
+                    lance_core::Error::io("simulated outright commit failure"),
+                ))
+            }
+        }
+    }
+
+    async fn resolve_version_location(
+        &self,
+        base_path: &object_store::path::Path,
+        version: u64,
+        object_store: &dyn object_store::ObjectStore,
+    ) -> lance_core::Result<lance_table::io::commit::ManifestLocation> {
+        use lance_table::io::commit::ConditionalPutCommitHandler;
+        self.resolve_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_resolve.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(lance_core::Error::io("simulated verification outage"));
+        }
+        ConditionalPutCommitHandler
+            .resolve_version_location(base_path, version, object_store)
+            .await
+    }
+}

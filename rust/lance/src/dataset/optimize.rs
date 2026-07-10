@@ -1995,6 +1995,15 @@ pub async fn commit_compaction(
 
     let mut completed_tasks = completed_tasks;
 
+    // Collect the rewritten fragments' file paths up front so every failure
+    // path below can clean them up (or deliberately keep them). Fragment ids
+    // may still be reassigned by reserve_fragment_ids; cleanup only needs the
+    // file paths, which never change.
+    let all_new_fragments: Vec<Fragment> = completed_tasks
+        .iter()
+        .flat_map(|t| t.new_fragments.iter().cloned())
+        .collect();
+
     // Single reserve_fragment_ids for all address-style tasks
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     if has_address_style {
@@ -2003,7 +2012,10 @@ pub async fn commit_compaction(
             .filter(|t| t.row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
-        reserve_fragment_ids(dataset, frags.into_iter()).await?;
+        if let Err(e) = reserve_fragment_ids(dataset, frags.into_iter()).await {
+            handle_compaction_commit_failure(dataset, &e, &all_new_fragments).await;
+            return Err(e);
+        }
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -2122,13 +2134,6 @@ pub async fn commit_compaction(
         None
     };
 
-    // Collect new fragment paths before moving rewrite_groups into the transaction,
-    // so we can clean them up if the commit fails.
-    let all_new_fragments: Vec<Fragment> = rewrite_groups
-        .iter()
-        .flat_map(|g| g.new_fragments.iter().cloned())
-        .collect();
-
     let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
@@ -2151,17 +2156,43 @@ pub async fn commit_compaction(
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
     {
-        cleanup_data_fragments(
-            &dataset.object_store,
-            &dataset.base,
-            None,
-            &all_new_fragments,
-        )
-        .await;
+        handle_compaction_commit_failure(dataset, &e, &all_new_fragments).await;
         return Err(e);
     }
 
     Ok(metrics)
+}
+
+/// Decide what happens to the rewritten files when a compaction commit
+/// (ReserveFragments or Rewrite) fails.
+///
+/// If the commit definitely did not land, the files are provably uncommitted
+/// and are cleaned up (a conflict is only surfaced after verifying the
+/// winning manifest belongs to another writer). If the commit status is
+/// unknown, the manifest at the new version may reference the files and
+/// deleting them would corrupt the version — leave them in place: if the
+/// commit did not land they are orphans that GC will collect.
+async fn handle_compaction_commit_failure(
+    dataset: &Dataset,
+    error: &Error,
+    all_new_fragments: &[Fragment],
+) {
+    if matches!(error, Error::CommitStatusUnknown { .. }) {
+        log::warn!(
+            "Compaction commit status is unknown; leaving {} rewritten fragment(s) in \
+             place for GC instead of cleaning them up: {}",
+            all_new_fragments.len(),
+            error
+        );
+    } else {
+        cleanup_data_fragments(
+            &dataset.object_store,
+            &dataset.base,
+            None,
+            all_new_fragments,
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -2445,6 +2476,129 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    fn count_data_files(uri: &str) -> usize {
+        list_data_files(uri).len()
+    }
+
+    fn list_data_files(uri: &str) -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(std::path::Path::new(uri).join("data"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// When the compaction commit's status is unknown (the commit errored and
+    /// verification was unavailable), the rewritten files must NOT be deleted:
+    /// if the commit landed they are referenced by the new version, and
+    /// deleting them would corrupt the table.
+    #[tokio::test]
+    async fn test_compaction_preserves_files_when_commit_status_unknown() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let data = sample_data();
+        let num_rows = data.num_rows();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 3_000,
+            // Stable row ids keep compaction to a single Rewrite commit (no
+            // ReserveFragments), so the injected failure hits it precisely.
+            enable_stable_row_ids: true,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let files_before = count_data_files(test_uri);
+
+        // The compaction's Rewrite commit lands but reports an error, and
+        // verification reads fail as well: commit status unknown. (Targeted at
+        // the Rewrite so a preceding ReserveFragments commit passes through.)
+        handler.fail_next_rewrite(AmbiguousFailure::LandAndError);
+        handler
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .expect_err("unknown commit status must surface as an error");
+        assert!(
+            matches!(err, Error::CommitStatusUnknown { .. }),
+            "expected CommitStatusUnknown, got: {:?}",
+            err
+        );
+
+        // The rewritten file(s) must still exist.
+        assert!(
+            count_data_files(test_uri) > files_before,
+            "rewritten files must not be deleted while the commit status is unknown"
+        );
+
+        // The commit did land: a fresh reader sees the compacted dataset and
+        // every referenced file exists.
+        handler
+            .fail_resolve
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
+        let scanned = ds.scan().try_into_batch().await.unwrap();
+        assert_eq!(scanned.num_rows(), num_rows);
+    }
+
+    /// A compaction commit that definitely did not land keeps today's
+    /// behavior: the rewritten files are cleaned up and the dataset stays at
+    /// the old version.
+    #[tokio::test]
+    async fn test_compaction_cleans_up_files_on_definite_commit_failure() {
+        use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let data = sample_data();
+        let num_rows = data.num_rows();
+        let handler = Arc::new(AmbiguousCommitHandler::default());
+
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 3_000,
+            enable_stable_row_ids: true,
+            commit_handler: Some(handler.clone()),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let files_before = list_data_files(test_uri);
+
+        handler.fail_next_rewrite(AmbiguousFailure::FailOutright);
+        let err = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .expect_err("commit that did not land must fail");
+        assert!(
+            !matches!(err, Error::CommitStatusUnknown { .. }),
+            "a verified-absent commit is a definite failure, got: {:?}",
+            err
+        );
+
+        let files_after = list_data_files(test_uri);
+        let leftover: Vec<_> = files_after.difference(&files_before).collect();
+        assert!(
+            leftover.is_empty(),
+            "rewritten files of a definitely-failed commit must be cleaned up; leftover: {:?}",
+            leftover
+        );
+        // A ReserveFragments commit may legitimately have landed before the
+        // failed Rewrite; the data is unchanged either way.
+        let ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), num_rows);
     }
 
     #[tokio::test]

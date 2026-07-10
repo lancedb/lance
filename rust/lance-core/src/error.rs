@@ -198,6 +198,18 @@ pub enum Error {
         #[snafu(implicit)]
         backtrace: MaybeBacktrace,
     },
+    #[snafu(display(
+        "Commit result for version {version} is unknown: the commit may or may not have \
+         been applied; check the table state before retrying: {source}, {location}"
+    ))]
+    CommitStatusUnknown {
+        version: u64,
+        source: BoxedError,
+        #[snafu(implicit)]
+        location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
+    },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention {
         message: String,
@@ -392,6 +404,7 @@ impl Error {
             | Self::CommitConflict { backtrace, .. }
             | Self::IncompatibleTransaction { backtrace, .. }
             | Self::RetryableCommitConflict { backtrace, .. }
+            | Self::CommitStatusUnknown { backtrace, .. }
             | Self::TooMuchWriteContention { backtrace, .. }
             | Self::Internal { backtrace, .. }
             | Self::PrerequisiteFailed { backtrace, .. }
@@ -648,6 +661,11 @@ impl Error {
     #[track_caller]
     pub fn retryable_commit_conflict_source(version: u64, source: BoxedError) -> Self {
         RetryableCommitConflictSnafu { version }.into_error(source)
+    }
+
+    #[track_caller]
+    pub fn commit_status_unknown_source(version: u64, source: BoxedError) -> Self {
+        CommitStatusUnknownSnafu { version }.into_error(source)
     }
 
     #[track_caller]
