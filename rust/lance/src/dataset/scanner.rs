@@ -4836,7 +4836,7 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
         output_projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut fields_to_take = output_projection
+        let fields_to_take = output_projection
             .clone()
             .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
         if !fields_to_take.has_data_fields()
@@ -4852,11 +4852,14 @@ impl Scanner {
         let has_row_addr = input_schema.column_with_name(ROW_ADDR).is_some();
         // The v1 reader cannot serve a FilteredReadExec
         if !self.dataset.is_legacy_storage() && (has_row_id || has_row_addr) {
-            // Preserve carried identity columns (downstream nodes may key off
-            // them; the final ProjectionExec trims for free)
-            fields_to_take.with_row_id |= has_row_id;
-            fields_to_take.with_row_addr |= has_row_addr;
-            let mut read_options = FilteredReadOptions::new(fields_to_take);
+            // Pass the full (un-subtracted) target so a rebuild against a
+            // different child re-derives what to fetch, and preserve carried
+            // identity columns (downstream nodes may key off them; the final
+            // ProjectionExec trims for free)
+            let mut projection = output_projection;
+            projection.with_row_id |= has_row_id;
+            projection.with_row_addr |= has_row_addr;
+            let mut read_options = FilteredReadOptions::new(projection);
             if let Some(batch_size) = self.batch_size {
                 read_options = read_options.with_batch_size(batch_size as u32);
             }
