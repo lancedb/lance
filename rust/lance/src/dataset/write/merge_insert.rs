@@ -326,14 +326,17 @@ pub enum WhenMatched {
     /// evaluates to true
     ///
     /// The expression can reference columns with `source.` and `target.` prefixes. Matched
-    /// rows where the condition is false are left untouched.
+    /// rows where the condition is false are left untouched. Construct this with
+    /// [`WhenMatched::delete_if`], use [`WhenMatched::DeleteIfExpr`] for a pre-built
+    /// expression, or [`WhenMatched::Delete`] for the unconditional form.
     DeleteIf(String),
     /// The matching row is deleted from the target table only for rows where the expression
     /// evaluates to true
     ///
     /// The expression can reference columns with `source.` and `target.` prefixes. Matched
-    /// rows where the condition is false are left untouched. See [`WhenMatched::delete_if_expr`]
-    /// for a caveat on how the expression's columns must be represented.
+    /// rows where the condition is false are left untouched. Construct this with
+    /// [`WhenMatched::delete_if_expr`], which documents a caveat on how the expression's
+    /// columns must be represented. Prefer [`WhenMatched::DeleteIf`] to pass a SQL string.
     DeleteIfExpr(Expr),
 }
 
@@ -347,24 +350,31 @@ impl WhenMatched {
         Self::UpdateIfExpr(expr)
     }
 
-    /// Create an instance of WhenMatched::DeleteIf from a SQL filter string
+    /// Create an instance of [`WhenMatched::DeleteIf`] from a SQL filter string
     ///
     /// Parsing is deferred until the execution path is known, since the fast path
     /// parses with a relation-enabled planner (source./target. as table qualifiers)
     /// while the slow path parses against the combined schema where source and
     /// target are struct fields.
+    ///
+    /// Pass the result to [`MergeInsertBuilder::when_matched`]. See
+    /// [`WhenMatched::delete_if_expr`] for the pre-built expression form and
+    /// [`WhenMatched::update_if`] for the conditional update analogue.
     pub fn delete_if(_dataset: &Dataset, expr: &str) -> Result<Self> {
         Ok(Self::DeleteIf(expr.to_string()))
     }
 
-    /// Create an instance of WhenMatched::DeleteIfExpr from a pre-built expression
+    /// Create an instance of [`WhenMatched::DeleteIfExpr`] from a pre-built expression
     ///
-    /// Unlike `delete_if`, which stores a SQL string and defers parsing until the
-    /// execution path is known, this stores the `Expr` as given, so its column
+    /// Unlike [`WhenMatched::delete_if`], which stores a SQL string and defers parsing until
+    /// the execution path is known, this stores the `Expr` as given, so its column
     /// representation must already match the path that consumes it. The standard plan
     /// expects relation-qualified columns such as `col("source.value")`, while the
     /// indexed (Merger) path expects combined-schema struct-field access such as
     /// `col("source").field("value")`.
+    ///
+    /// Pass the result to [`MergeInsertBuilder::when_matched`]. See
+    /// [`WhenMatched::update_if_expr`] for the conditional update analogue.
     pub fn delete_if_expr(expr: Expr) -> Self {
         Self::DeleteIfExpr(expr)
     }
