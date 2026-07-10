@@ -3602,6 +3602,15 @@ mod tests {
                 let ivf_params = prepare_global_ivf(dataset, "vector").await;
                 ivf_rq_params(ivf_params, 1)
             }
+            IndexType::IvfHnswPq => {
+                let (ivf_params, pq_params) = prepare_global_ivf_pq(dataset, "vector").await;
+                VectorIndexParams::with_ivf_hnsw_pq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    HnswBuildParams::default(),
+                    pq_params,
+                )
+            }
             other => panic!("unsupported test index type: {}", other),
         }
     }
@@ -3929,19 +3938,24 @@ mod tests {
     }
 
     /// Merging segments must support already-merged inputs for every IVF
-    /// storage layout so the merge can be composed into a tree. PQ merged
-    /// segments store column-major codes and must be transposed back on
-    /// re-read (the analog of the packed RQ case); SQ and FLAT layouts need no
-    /// transform and are covered for regression. IVF_RQ has its own compose
-    /// tests above.
+    /// storage layout so the merge can be composed into a tree. PQ backed
+    /// merged segments (IVF_PQ and IVF_HNSW_PQ) store column-major codes and
+    /// must be transposed back on re-read (the analog of the packed RQ case).
+    /// SQ and FLAT layouts need no transform and are covered for regression.
+    /// IVF_RQ has its own compose tests above. The final heterogeneous merge
+    /// mixes one merged input with row-major shards in a single call, which
+    /// exercises the per-shard layout flags.
     ///
     /// PQ recall on this uniform random data is inherently low (~0.24, the
-    /// same as a single-node build). The 0.2 threshold separates a correct
-    /// merge from the double-transpose corruption signature (~0.07).
+    /// same as a single-node build) and the PQ codebook is trained with an
+    /// unseeded RNG. The 0.15 threshold sits in the middle of the band
+    /// between a correct merge (~0.24) and the double-transpose corruption
+    /// signature (~0.07) to keep the assertion stable across runs.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
-    #[case::ivf_pq(IndexType::IvfPq, 0.2)]
+    #[case::ivf_pq(IndexType::IvfPq, 0.15)]
     #[case::ivf_sq(IndexType::IvfSq, 0.7)]
+    #[case::ivf_hnsw_pq(IndexType::IvfHnswPq, 0.15)]
     #[tokio::test]
     async fn test_merge_existing_ivf_segments_compose(
         #[case] index_type: IndexType,
@@ -3971,7 +3985,8 @@ mod tests {
             build_segments_for_fragment_groups(&mut dataset, fragment_groups, &params, INDEX_NAME)
                 .await;
         assert_eq!(shards.len(), 4);
-        if index_type == IndexType::IvfPq {
+        let is_pq_backed = matches!(index_type, IndexType::IvfPq | IndexType::IvfHnswPq);
+        if is_pq_backed {
             for shard in &shards {
                 assert!(
                     !read_pq_segment_transposed(&dataset, &shard.uuid).await,
@@ -3989,7 +4004,7 @@ mod tests {
             .merge_existing_index_segments(vec![shards[2].clone(), shards[3].clone()])
             .await
             .unwrap();
-        if index_type == IndexType::IvfPq {
+        if is_pq_backed {
             assert!(
                 read_pq_segment_transposed(&dataset, &merged_a.uuid).await
                     && read_pq_segment_transposed(&dataset, &merged_b.uuid).await,
@@ -4000,11 +4015,24 @@ mod tests {
         // Level 2: merge the two merged segments. For PQ this is the case that
         // double-transposed (and corrupted) the codes before the fix.
         let final_segment = dataset
-            .merge_existing_index_segments(vec![merged_a, merged_b])
+            .merge_existing_index_segments(vec![merged_a.clone(), merged_b])
             .await
             .unwrap();
         dataset
             .commit_existing_index_segments(INDEX_NAME, "vector", vec![final_segment])
+            .await
+            .unwrap();
+
+        assert_merged_index_recall(&dataset, "vector", min_recall).await;
+
+        // Heterogeneous: one merged (query-optimized layout) input mixed with
+        // row-major shards in a single merge call.
+        let heterogeneous = dataset
+            .merge_existing_index_segments(vec![merged_a, shards[2].clone(), shards[3].clone()])
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![heterogeneous])
             .await
             .unwrap();
 
@@ -4017,11 +4045,11 @@ mod tests {
     /// merged outputs of the first, which requires composable merges for
     /// every IVF storage layout.
     ///
-    /// The PQ threshold is 0.2 for the same reason as in
+    /// The PQ threshold is 0.15 for the same reason as in
     /// `test_merge_existing_ivf_segments_compose`.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
-    #[case::ivf_pq(IndexType::IvfPq, 0.2)]
+    #[case::ivf_pq(IndexType::IvfPq, 0.15)]
     #[case::ivf_sq(IndexType::IvfSq, 0.7)]
     #[case::ivf_rq(IndexType::IvfRq, 0.4)]
     #[tokio::test]
