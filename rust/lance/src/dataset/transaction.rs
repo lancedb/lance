@@ -3876,6 +3876,28 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
         new_fragment_map.entry(fragment.id).or_insert(fragment);
     }
 
+    // build_manifest treats the FIRST occurrence of each previous id as the
+    // merged existing fragment, so a staged id-0 fragment listed before the
+    // fragment it collides with would silently take that fragment's place.
+    // The row-count and row-id-metadata checks below only catch that swap
+    // when the two fragments differ; enforce the order structurally instead:
+    // every fragment classified as existing must precede every new one.
+    let previous_ids: HashSet<u64> = original_fragments.iter().map(|f| f.id).collect();
+    let mut seen_previous: HashSet<u64> = HashSet::new();
+    let mut first_new_id: Option<u64> = None;
+    for fragment in new_fragments {
+        let is_existing = previous_ids.contains(&fragment.id) && seen_previous.insert(fragment.id);
+        if !is_existing {
+            first_new_id.get_or_insert(fragment.id);
+        } else if let Some(new_id) = first_new_id {
+            return Err(Error::invalid_input(format!(
+                "Merge operation lists existing fragment {} after a new fragment \
+                 (id {}). New fragments must be listed after every existing fragment.",
+                fragment.id, new_id
+            )));
+        }
+    }
+
     // Check that all original fragments are preserved in the new fragments list
     // Validate that each original fragment's metadata is preserved
     let mut missing_fragments: Vec<u64> = Vec::new();
@@ -5726,6 +5748,33 @@ mod tests {
         let err = build_merge(&manifest, schema, merge_list).unwrap_err();
         assert!(
             err.to_string().contains("duplicate fragment id 1"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn merge_validate_rejects_staged_fragment_listed_before_existing_non_stable() {
+        // With equal row counts and no row id metadata, a misordered staged
+        // fragment is indistinguishable by content from the fragment whose id
+        // it collides with; the order check must reject it on non-stable
+        // datasets too.
+        let existing = vec![
+            frag_without_row_ids(0, "frag0.lance", 2),
+            frag_without_row_ids(1, "frag1.lance", 2),
+        ];
+        let (manifest, schema) = merge_test_manifest(existing.clone(), false);
+
+        let mut merge_list = vec![frag_without_row_ids(0, "staged.lance", 2)];
+        merge_list.extend(existing);
+        let err = build_merge(&manifest, schema, merge_list).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "unexpected error variant: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("after a new fragment"),
             "unexpected error: {}",
             err
         );
