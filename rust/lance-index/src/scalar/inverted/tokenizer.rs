@@ -35,15 +35,6 @@ use lance_tokenizer::{
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InvertedIndexParams {
-    /// High-level analyzer profile.
-    ///
-    /// This is the user-facing semantic preset. `text` keeps the existing
-    /// natural-language defaults. `code` selects code-search defaults such as
-    /// code lexical tokenization, optional identifier splitting, preserving
-    /// whole identifiers when splitting is enabled, and disabling stemming /
-    /// stop-word removal.
-    pub(crate) analyzer: String,
-
     /// Document-level tokenizer.
     ///
     /// This decides how Lance extracts searchable text from the stored value:
@@ -54,12 +45,10 @@ pub struct InvertedIndexParams {
     /// The extracted text is then passed to `base_tokenizer`.
     pub(crate) lance_tokenizer: Option<String>,
 
-    /// Lexical tokenizer used inside the selected analyzer profile.
+    /// Lexical tokenizer used after document-level text extraction.
     ///
-    /// This is a lower-level implementation component, not the product-level
-    /// search mode. For code search, prefer `analyzer = "code"`;
-    /// `base_tokenizer = "code"` is accepted as a compatibility alias and
-    /// resolves to the code analyzer profile.
+    /// Client-facing analyzer profiles are resolved into this field and the
+    /// concrete filter options before params are persisted.
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
@@ -164,6 +153,7 @@ pub struct InvertedIndexParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInvertedIndexParams {
+    // Input-only preset expanded before constructing normalized params.
     analyzer: Option<String>,
     lance_tokenizer: Option<String>,
     base_tokenizer: Option<String>,
@@ -257,7 +247,6 @@ impl RawInvertedIndexParams {
             _ => unreachable!("analyzer is normalized above"),
         };
 
-        params.analyzer = analyzer.to_string();
         if let Some(lance_tokenizer) = self.lance_tokenizer {
             params.lance_tokenizer = Some(lance_tokenizer);
         }
@@ -322,7 +311,6 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
 
     fn try_from(params: &InvertedIndexParams) -> Result<Self> {
         Ok(Self {
-            analyzer: Some(params.analyzer.clone()),
             lance_tokenizer: params.lance_tokenizer.clone(),
             base_tokenizer: Some(params.base_tokenizer.clone()),
             language: serde_json::to_string(&params.language)?,
@@ -351,24 +339,10 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             return Ok(Self::default());
         }
 
-        let analyzer = details
-            .analyzer
-            .as_deref()
-            .map(normalize_analyzer)
-            .transpose()?
-            .unwrap_or_else(|| {
-                if details.base_tokenizer.as_deref() == Some("code") {
-                    "code"
-                } else {
-                    "text"
-                }
-            });
-        let mut params = match analyzer {
-            "code" => Self::code(),
-            "text" => Self::default(),
-            _ => unreachable!("analyzer is normalized above"),
+        let mut params = match details.base_tokenizer.as_deref() {
+            Some("code") => Self::code(),
+            _ => Self::default(),
         };
-        params.analyzer = analyzer.to_string();
         params.lance_tokenizer = details.lance_tokenizer.clone();
         params.base_tokenizer = details
             .base_tokenizer
@@ -486,8 +460,7 @@ impl InvertedIndexParams {
     /// this is not used for `lindera/*` and `jieba/*` tokenizers.
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: Language) -> Self {
-        Self {
-            analyzer: "text".to_string(),
+        let mut params = Self {
             lance_tokenizer: None,
             base_tokenizer,
             language,
@@ -508,11 +481,26 @@ impl InvertedIndexParams {
             memory_limit_mb: None,
             num_workers: None,
             format_version: None,
+        };
+        if params.base_tokenizer == "code" {
+            params.apply_code_defaults();
         }
+        params
+    }
+
+    fn apply_text_defaults(&mut self) {
+        self.base_tokenizer = "simple".to_string();
+        self.split_identifiers = false;
+        self.split_on_numerics = false;
+        self.preserve_original = false;
+        self.lower_case = true;
+        self.ascii_folding = true;
+        self.stem = true;
+        self.remove_stop_words = true;
+        self.index_operators = false;
     }
 
     fn apply_code_defaults(&mut self) {
-        self.analyzer = "code".to_string();
         self.base_tokenizer = "code".to_string();
         self.split_identifiers = false;
         self.split_on_numerics = true;
@@ -535,12 +523,13 @@ impl InvertedIndexParams {
     /// assert!(tokenizer.is_ok());
     /// ```
     pub fn code() -> Self {
-        let mut params = Self::new("code".to_string(), Language::English);
-        params.apply_code_defaults();
-        params
+        Self::new("code".to_string(), Language::English)
     }
 
-    /// Set analyzer profile.
+    /// Apply an analyzer profile to the concrete tokenizer parameters.
+    ///
+    /// The profile name is an input-time preset and is not persisted. Explicit
+    /// options applied after this method override the profile defaults.
     ///
     /// # Examples
     ///
@@ -554,9 +543,10 @@ impl InvertedIndexParams {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn analyzer(mut self, analyzer: &str) -> Result<Self> {
-        self.analyzer = normalize_analyzer(analyzer)?.to_string();
-        if self.analyzer == "code" {
-            self.apply_code_defaults();
+        match normalize_analyzer(analyzer)? {
+            "text" => self.apply_text_defaults(),
+            "code" => self.apply_code_defaults(),
+            _ => unreachable!("analyzer is normalized above"),
         }
         Ok(self)
     }
@@ -566,7 +556,7 @@ impl InvertedIndexParams {
         self
     }
 
-    /// Set the tokenizer implementation used by the analyzer.
+    /// Set the lexical tokenizer implementation.
     ///
     /// Setting this to `"code"` selects the code analyzer defaults.
     ///
@@ -803,27 +793,17 @@ impl InvertedIndexParams {
     }
 
     fn validate(&self) -> Result<()> {
-        normalize_analyzer(&self.analyzer)?;
-        match self.analyzer.as_str() {
-            "code" if self.base_tokenizer != "code" => Err(Error::invalid_input(format!(
-                "analyzer='code' requires base_tokenizer='code', got '{}'",
-                self.base_tokenizer
-            ))),
-            "text" if self.base_tokenizer == "code" => Err(Error::invalid_input(
-                "base_tokenizer='code' requires analyzer='code'".to_string(),
-            )),
-            "text"
-                if self.split_identifiers
-                    || self.split_on_numerics
-                    || self.preserve_original
-                    || self.index_operators =>
-            {
-                Err(Error::invalid_input(
-                    "code analyzer flags require analyzer='code'".to_string(),
-                ))
-            }
-            _ => Ok(()),
+        if self.base_tokenizer != "code"
+            && (self.split_identifiers
+                || self.split_on_numerics
+                || self.preserve_original
+                || self.index_operators)
+        {
+            return Err(Error::invalid_input(
+                "code analyzer flags require base_tokenizer='code'".to_string(),
+            ));
         }
+        Ok(())
     }
 
     fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
@@ -897,7 +877,7 @@ pub fn language_model_home() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvertedIndexParams, InvertedListFormatVersion};
+    use super::{InvertedIndexParams, InvertedListFormatVersion, Language};
     use lance_tokenizer::TokenStream;
     use rstest::rstest;
     use serde_json::json;
@@ -983,7 +963,6 @@ mod tests {
             "analyzer": "code"
         }))
         .unwrap();
-        assert_eq!(params.analyzer, "code");
         assert_eq!(params.base_tokenizer, "code");
         assert!(!params.split_identifiers);
         assert!(params.split_on_numerics);
@@ -996,13 +975,38 @@ mod tests {
     }
 
     #[test]
-    fn test_code_base_tokenizer_alias_resolves_analyzer() {
-        let params: InvertedIndexParams = serde_json::from_value(json!({
-            "base_tokenizer": "code"
+    fn test_analyzer_profile_resolves_to_persisted_params() {
+        let from_profile: InvertedIndexParams = serde_json::from_value(json!({
+            "analyzer": "code",
+            "split_identifiers": true,
+            "preserve_original": false
         }))
         .unwrap();
-        assert_eq!(params.analyzer, "code");
-        assert_eq!(params.base_tokenizer, "code");
+        let from_base_tokenizer: InvertedIndexParams = serde_json::from_value(json!({
+            "base_tokenizer": "code",
+            "split_identifiers": true,
+            "preserve_original": false
+        }))
+        .unwrap();
+        let from_constructor = InvertedIndexParams::new("code".to_string(), Language::English)
+            .split_identifiers(true)
+            .preserve_original(false);
+
+        assert_eq!(from_profile, from_base_tokenizer);
+        assert_eq!(from_profile, from_constructor);
+
+        let persisted = serde_json::to_value(&from_profile).unwrap();
+        assert!(persisted.get("analyzer").is_none());
+        assert_eq!(
+            serde_json::from_value::<InvertedIndexParams>(persisted).unwrap(),
+            from_profile
+        );
+    }
+
+    #[test]
+    fn test_text_analyzer_replaces_code_defaults() {
+        let params = InvertedIndexParams::code().analyzer("text").unwrap();
+        assert_eq!(params, InvertedIndexParams::default());
     }
 
     #[test]

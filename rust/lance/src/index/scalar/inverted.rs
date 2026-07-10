@@ -185,12 +185,11 @@ pub async fn load_segments(dataset: &Dataset, column: &str) -> Result<Option<Vec
 /// segments returned by [`load_segments`].
 ///
 /// All segments are required to agree on their semantic `InvertedIndexDetails`
-/// payload (analyzer, tokenizer, position settings, etc.); inconsistent
+/// payload (tokenizer, position settings, etc.); inconsistent
 /// segments return an error. Details are canonicalized before comparison so
-/// legacy segments that omit default fields (for example, missing
-/// `analyzer = "text"`) remain compatible with newly written text FTS
-/// segments. Returns the canonical details that may be used when constructing a
-/// tokenizer or running a query against the index.
+/// legacy segments that omit default fields remain compatible with newly
+/// written text FTS segments. Returns the canonical details that may be used
+/// when constructing a tokenizer or running a query against the index.
 pub async fn load_segment_details(
     dataset: &Dataset,
     column: &str,
@@ -273,19 +272,6 @@ mod tests {
 
         let decoded = InvertedIndexDetails::decode(details_any.value.as_slice()).unwrap();
         assert_eq!(decoded, InvertedIndexDetails::default());
-    }
-
-    #[test]
-    fn canonicalize_inverted_details_accepts_legacy_missing_analyzer() {
-        let current = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
-        let mut legacy = current.clone();
-        legacy.analyzer = None;
-
-        assert_ne!(legacy, current);
-        assert_eq!(
-            canonicalize_inverted_index_details_for_field(&text_field(), legacy).unwrap(),
-            canonicalize_inverted_index_details_for_field(&text_field(), current).unwrap()
-        );
     }
 
     #[test]

@@ -26,19 +26,17 @@ message LabelListIndexDetails {}
 message NGramIndexDetails {}
 message ZoneMapIndexDetails {}
 message InvertedIndexDetails {
-  // High-level analyzer profile. It selects the semantic defaults for the FTS
-  // pipeline, e.g. "text" for natural-language text or "code" for code search.
-  // Absent is a legacy "text" profile unless base_tokenizer is the legacy
-  // "code" alias. Readers must canonicalize this before comparing details.
-  optional string analyzer = 12;
+  // Analyzer profiles are input-only and are not part of persisted details.
+  reserved 12;
   // Document-level tokenizer. It extracts searchable text from the stored value,
   // e.g. "text" for a plain string or "json" for JSON content. The extracted
   // text is then passed to base_tokenizer. Absent means text / auto-inferred
   // legacy behavior.
   optional string lance_tokenizer = 13;
-  // Lexical tokenizer used after the analyzer/document layer has selected the
-  // text to tokenize. This is an implementation component such as "simple",
-  // "icu", "ngram", or "code"; analyzer="code" owns the code-search defaults.
+  // Lexical tokenizer used after document-level text extraction. This is an
+  // implementation component such as "simple", "icu", "ngram", or "code".
+  // Input-time analyzer profiles are expanded into this field and the concrete
+  // options below before these details are persisted.
   // Marking this field as optional as old versions of the index store blank details and we
   // need to make sure we have a proper optional field to detect this.
   optional string base_tokenizer = 1;
@@ -52,19 +50,19 @@ message InvertedIndexDetails {
   uint32 min_ngram_length = 9;
   uint32 max_ngram_length = 10;
   bool prefix_only = 11;
-  // Code analyzer flag. Split one lexical identifier into subwords, e.g.
+  // Code tokenizer option. Split one lexical identifier into subwords, e.g.
   // getUserName -> get/user/name. This changes the indexed term space and must
   // be persisted for query-time tokenizer reconstruction and segment checks.
   bool split_identifiers = 14;
-  // Code analyzer flag. Split identifier subwords across letter/number
-  // boundaries, e.g. HTML2JSON -> html/2/json. When absent, use the analyzer
-  // profile default; when present, persist the explicit index-time choice.
+  // Code tokenizer option. Split identifier subwords across letter/number
+  // boundaries, e.g. HTML2JSON -> html/2/json. When absent, use the default for
+  // base_tokenizer; when present, persist the explicit index-time choice.
   optional bool split_on_numerics = 15;
-  // Code analyzer flag. Keep the complete lexical identifier in addition to
-  // subwords, e.g. user_name plus user/name. When absent, use the analyzer
-  // profile default; when present, persist the explicit index-time choice.
+  // Code tokenizer option. Keep the complete lexical identifier in addition to
+  // subwords, e.g. user_name plus user/name. When absent, use the default for
+  // base_tokenizer; when present, persist the explicit index-time choice.
   optional bool preserve_original = 16;
-  // Code analyzer flag. Index operator tokens such as "::", "->", and "!=".
+  // Code tokenizer option. Index operator tokens such as "::", "->", and "!=".
   // Disabled by default because operators are often high-frequency noise, but
   // when enabled it changes query semantics and must be persisted.
   bool index_operators = 17;
