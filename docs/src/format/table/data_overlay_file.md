@@ -175,9 +175,12 @@ file to open, and additional work to interleave values. Compaction bounds that c
 - **Overlay → overlay.** Merge several overlays into fewer, computing the
   post-image per `(offset, field)` by walking the merged overlays newest-first.
   The merged overlay takes the **maximum** `committed_version` of its inputs, so
-  the exclusion semantics are preserved. Indexes can still be re-used, but they
-  may now need to exclude more rows. This is cheap to write and does not touch
-  the base.
+  the exclusion semantics are preserved. The merged overlays must be **contiguous
+  in `committed_version`** — with overlays at v10, v30, and v50 you cannot merge
+  just v10 and v50, because stamping the result v50 would incorrectly promote
+  v10's values above the intervening v30 for any cell v30 also covers. Indexes can
+  still be re-used, but they may now need to exclude more rows. This is cheap to
+  write and does not touch the base.
 - **Overlay → base.** Fold overlays into a fresh base data file, computing the
   post-image for every covered cell, then clear the overlays. The base is
   complete, so every post-image is well defined. Overlay offsets are physical, so
@@ -237,28 +240,31 @@ A BTree scalar index on `age` is built at version 1, covering fragment `0`
 ### Step 1 — write an overlay
 
 ```sql
-UPDATE users SET age = 26 WHERE id = 2;   -- Bob, offset 1
+UPDATE users SET age = age + 1 WHERE id IN (2, 4);   -- Bob (offset 1), Dave (offset 3)
 ```
 
-This touches one field (`age`) for one row, so the writer emits a dense overlay
-and commits it as version 2. Fragment `0` gains:
+This touches one field (`age`) for two rows, so the writer emits a dense overlay —
+one shared bitmap covering both offsets — and commits it as version 2. Fragment
+`0` gains:
 
 ```text
 DataOverlayFile {
   data_file: { path: "data/overlay-<uuid>.lance", fields: [3], column_indices: [0] }
-  coverage:  shared_offset_bitmap = {1}
+  coverage:  shared_offset_bitmap = {1, 3}
   committed_version: 2
 }
 ```
 
-The overlay file stores a single `age` column with one value, `[26]`, at
-rank `{1}.rank(1) = 0`. `last_updated_at_version[1]` is set to 2.
+The overlay file stores a single `age` column with two values, `[26, 23]`, at
+ranks `{1,3}.rank(1) = 0` and `{1,3}.rank(3) = 1`. `last_updated_at_version` is
+set to 2 for offsets 1 and 3.
 
 ### Step 2 — read
 
 `SELECT id, age FROM users` reads base ages `[30, 25, 40, 22]`. For `age`
-(field 3), the overlay covers offset 1, so `age[1]` is replaced with the overlay
-value at position `{1}.rank(1) = 0` → `26`. Result ages: `[30, 26, 40, 22]`.
+(field 3), the overlay covers offsets 1 and 3, so `age[1]` is replaced with the
+overlay value at rank `{1,3}.rank(1) = 0` → `26`, and `age[3]` with the value at
+rank `{1,3}.rank(3) = 1` → `23`. Result ages: `[30, 26, 40, 23]`.
 
 ### Step 3 — index query
 
@@ -267,13 +273,14 @@ SELECT * FROM users WHERE age = 26;
 ```
 
 The `age` index was built at `dataset_version = 1`; the overlay's
-`committed_version` is 2. Since `2 > 1`, the overlay's coverage for `age`, `{1}`,
+`committed_version` is 2. Since `2 > 1`, the overlay's coverage for `age`, `{1, 3}`,
 is the exclusion set for this query.
 
 - The index (built at v1) holds Bob's *old* `age = 25`, so a lookup for `26`
   returns nothing from the index.
-- Offset 1 is in the exclusion set, so it is re-evaluated on the flat path. Its
-  current `age` (26, via the overlay) matches `age = 26`, so Bob is returned.
+- The whole exclusion set is re-evaluated on the flat path, not just the rows the
+  index returned. Offset 1's current `age` (26, via the overlay) matches, so Bob
+  is returned; offset 3's current `age` (23) does not match and is dropped.
 
 The mirror case `WHERE age = 25` shows exclusion preventing a stale hit: the index
 returns offset 1 (stale `25`), but offset 1 is excluded, re-evaluated to `26`, and
@@ -310,7 +317,7 @@ newest overlay first:
 
 - `name`: the v3 overlay covers `{2,3}` → `["Alice", "Bob", "Caroline", "David"]`.
 - `age`: the v3 overlay does not cover `age`; the v2 overlay still applies at
-  offset 1 → `[30, 26, 40, 22]`.
+  offsets 1 and 3 → `[30, 26, 40, 23]`.
 - `embedding`: the v3 overlay covers `{1}` → Bob's vector is the new one, others
   from base.
 
@@ -325,8 +332,8 @@ marked with a tombstone (`-2`); field 1 (`id`) remains. The fragment's `overlays
 cleared. Row addresses are preserved (a column rewrite, not a row rewrite), so
 stable row IDs and the deletion vector are untouched.
 
-Because the fold removed the overlay that was excluding offset 1 from the `age`
-index, the commit must drop fragment `0` from its coverage so `age` queries
+Because the fold removed the overlay that was excluding offsets 1 and 3 from the
+`age` index, the commit must drop fragment `0` from its coverage so `age` queries
 fall to the flat path.
 
 ## Guidance
