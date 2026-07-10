@@ -33,8 +33,6 @@ from typing import (
     TypedDict,
     Union,
     cast,
-    get_args,
-    get_origin,
 )
 
 import pyarrow as pa
@@ -370,57 +368,6 @@ def _resolve_blob_selection(
     if indices is not None:
         return "indices", indices
     raise ValueError("Either ids, addresses, or indices must be specified")
-
-
-_PYDANTIC_TYPE_TO_ARROW = {
-    str: pa.string(),
-    int: pa.int64(),
-    float: pa.float64(),
-    bool: pa.bool_(),
-    bytes: pa.binary(),
-}
-
-
-def _is_optional_annotation(annotation: Any) -> bool:
-    return get_origin(annotation) is Union and type(None) in get_args(annotation)
-
-
-def _pydantic_annotation_to_arrow_type(annotation: Any) -> pa.DataType:
-    origin = get_origin(annotation)
-    if origin is Union:
-        args = [a for a in get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            return _pydantic_annotation_to_arrow_type(args[0])
-        raise TypeError(
-            f"Unsupported union type for pydantic schema inference: {annotation}"
-        )
-    if origin in (list, List):
-        (item_annotation,) = get_args(annotation) or (Any,)
-        return pa.list_(_pydantic_annotation_to_arrow_type(item_annotation))
-    if annotation in _PYDANTIC_TYPE_TO_ARROW:
-        return _PYDANTIC_TYPE_TO_ARROW[annotation]
-    raise TypeError(
-        f"Unsupported pydantic field type for schema inference: {annotation}"
-    )
-
-
-def _pydantic_model_to_schema(model_class) -> pa.Schema:
-    fields = []
-    if hasattr(model_class, "model_fields"):
-        # Pydantic v2
-        for name, field_info in model_class.model_fields.items():
-            nullable = not field_info.is_required() or _is_optional_annotation(
-                field_info.annotation
-            )
-            arrow_type = _pydantic_annotation_to_arrow_type(field_info.annotation)
-            fields.append(pa.field(name, arrow_type, nullable=nullable))
-    else:
-        # Pydantic v1
-        for name, model_field in model_class.__fields__.items():
-            nullable = model_field.allow_none or not model_field.required
-            arrow_type = _pydantic_annotation_to_arrow_type(model_field.outer_type_)
-            fields.append(pa.field(name, arrow_type, nullable=nullable))
-    return pa.schema(fields)
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -937,8 +884,10 @@ class LanceDataset(pa.dataset.Dataset):
             )
         if uri is None:
             uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
+        from .pydantic import pydantic_to_schema
+
         dicts = [model_to_dict(item) for item in data]
-        schema = _pydantic_model_to_schema(model_class)
+        schema = pydantic_to_schema(model_class)
         table = pa.Table.from_pylist(dicts, schema=schema)
         return write_dataset(table, uri, mode=mode, **kwargs)
 
