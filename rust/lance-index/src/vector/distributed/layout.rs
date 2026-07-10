@@ -59,6 +59,13 @@ pub(super) fn unpack_rq_partition(partition: RecordBatch) -> Result<RecordBatch>
             rq_col.data_type(),
         ))
     })?;
+    if rq_fsl.values().as_primitive_opt::<UInt8Type>().is_none() {
+        return Err(Error::index(format!(
+            "RQ column {} values are not u8 in packed shard, got {}",
+            RABIT_CODE_COLUMN,
+            rq_fsl.values().data_type(),
+        )));
+    }
     let unpacked = unpack_codes(rq_fsl);
     Ok(partition.replace_column_by_name(RABIT_CODE_COLUMN, Arc::new(unpacked))?)
 }
@@ -181,6 +188,17 @@ mod tests {
             FixedSizeListArray::try_new_from_values(Int32Array::from(vec![0, 1, 2, 3]), 2).unwrap();
 
         let result = untranspose_pq_partition(code_batch(PQ_CODE_COLUMN, codes));
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not u8"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_unpack_rq_partition_rejects_non_u8_codes() {
+        let codes =
+            FixedSizeListArray::try_new_from_values(Int32Array::from(vec![0, 1, 2, 3]), 2).unwrap();
+
+        let result = unpack_rq_partition(code_batch(RABIT_CODE_COLUMN, codes));
 
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not u8"), "unexpected error: {err}");

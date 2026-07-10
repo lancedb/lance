@@ -1393,10 +1393,17 @@ impl DatasetIndexExt for Dataset {
         let mut segments: Vec<IndexMetadata> = segments
             .into_iter()
             .filter(|segment| {
-                segment
+                let keep = segment
                     .fragment_bitmap
                     .as_ref()
-                    .is_none_or(|bitmap| !bitmap.is_empty())
+                    .is_none_or(|bitmap| !bitmap.is_empty());
+                if !keep {
+                    log::debug!(
+                        "plan_index_segment_merge: skipping deferred segment {} (empty fragment bitmap)",
+                        segment.uuid
+                    );
+                }
+                keep
             })
             .collect();
         if let Some(max_segments) = max_segments_to_merge {
