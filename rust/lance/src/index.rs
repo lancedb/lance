@@ -1405,6 +1405,16 @@ impl DatasetIndexExt for Dataset {
         if segments.len() < 2 {
             return Ok(Vec::new());
         }
+        if let Some(legacy) = segments
+            .iter()
+            .find(|segment| segment.fragment_bitmap.is_none())
+        {
+            return Err(Error::invalid_input(format!(
+                "plan_index_segment_merge: segment {} of index {} has no fragment coverage \
+                 (legacy index format); merging requires fragment coverage, rebuild the index first",
+                legacy.uuid, index_name
+            )));
+        }
 
         let first = &segments[0];
         let first_type_url = first
@@ -7114,6 +7124,96 @@ mod tests {
                 .await
                 .is_err(),
             "unknown index name should be rejected"
+        );
+    }
+
+    /// Deferred build placeholders (empty fragment bitmap) are skipped by the
+    /// planner. The companion rejection of legacy segments without any
+    /// fragment bitmap cannot be constructed here: `migrate_indices` in the
+    /// commit path backfills missing bitmaps, so a `None` bitmap only occurs
+    /// in manifests written by very old Lance versions.
+    #[tokio::test]
+    async fn test_plan_index_segment_merge_coverage_edge_cases() {
+        use crate::dataset::transaction::{Operation, Transaction};
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(30), BatchCount::from(3));
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"seg1",
+        )
+        .await;
+        let deferred = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [],
+            b"deferred",
+        )
+        .await;
+
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![seg0.clone(), seg1.clone(), deferred],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let tasks = dataset
+            .plan_index_segment_merge("vector_idx", 2, None)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0]
+                .iter()
+                .map(|segment| segment.uuid)
+                .collect::<HashSet<_>>(),
+            HashSet::from([seg0.uuid, seg1.uuid]),
+            "deferred (empty coverage) segments should be skipped"
         );
     }
 

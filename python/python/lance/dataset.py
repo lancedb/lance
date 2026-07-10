@@ -4408,7 +4408,9 @@ class LanceDataset(pa.dataset.Dataset):
         :meth:`merge_existing_index_segments`, and the coordinator publishes
         every merged segment at once with
         :meth:`commit_existing_index_segments`. Groups cover disjoint fragment
-        sets, so workers never contend.
+        sets, so workers never contend. Segments with an empty fragment bitmap
+        (deferred builds) are skipped, and a legacy segment without fragment
+        coverage is rejected with an error.
 
         Parameters
         ----------
