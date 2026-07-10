@@ -1184,7 +1184,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
         }
     }
 }
-fn create_rle_decompressor(
+pub(crate) fn create_rle_decompressor(
     rle: &crate::format::pb21::Rle,
     decompression_strategy: &dyn DecompressionStrategy,
 ) -> Result<RleDecompressor> {

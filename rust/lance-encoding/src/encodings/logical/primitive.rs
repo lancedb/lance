@@ -39,11 +39,12 @@ use lance_core::{
 use log::trace;
 
 use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
-use crate::encodings::physical::rle::decode_rle_u16_runs;
+use crate::encodings::physical::rle::{RleDecompressor, RleRuns};
 use crate::utils::bytepack::ByteUnpacker;
 use crate::{
     compression::{
         BlockDecompressor, CompressionStrategy, DecompressionStrategy, MiniBlockDecompressor,
+        create_rle_decompressor,
     },
     data::{AllNullDataBlock, DataBlock, VariableWidthBlock},
     utils::bytepack::BytepackedIntegerEncoder,
@@ -751,63 +752,397 @@ impl StructuralPageDecoder for MiniBlockDecoder {
 pub(crate) enum LevelCodec {
     /// Raw little-endian u16 levels (no block compression).
     Uncompressed,
-    /// RLE-compressed levels; decoded lazily into [`LazyLevels::Rle`].
-    Rle,
+    /// RLE-compressed levels; the validated physical runs select their cached representation.
+    Rle(Arc<RleDecompressor>),
     /// Any other block compression; decoded eagerly into [`LazyLevels::Dense`]
     /// (these encodings don't expand, so laziness buys nothing).
     Block(Arc<dyn BlockDecompressor>),
 }
 
+impl LevelCodec {
+    fn try_new(
+        encoding: Option<&CompressiveEncoding>,
+        decompression_strategy: &dyn DecompressionStrategy,
+    ) -> Result<Self> {
+        match encoding {
+            None => Ok(Self::Uncompressed),
+            Some(encoding) => match encoding.compression.as_ref() {
+                Some(Compression::Rle(rle)) => Ok(Self::Rle(Arc::new(create_rle_decompressor(
+                    rle,
+                    decompression_strategy,
+                )?))),
+                _ => Ok(Self::Block(Arc::from(
+                    decompression_strategy.create_block_decompressor(encoding)?,
+                ))),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RunEnds {
+    U16(Box<[u16]>),
+    U32(Box<[u32]>),
+    U64(Box<[u64]>),
+}
+
+impl RunEnds {
+    fn width_for(num_values: usize) -> usize {
+        if u16::try_from(num_values).is_ok() {
+            std::mem::size_of::<u16>()
+        } else if u32::try_from(num_values).is_ok() {
+            std::mem::size_of::<u32>()
+        } else {
+            std::mem::size_of::<u64>()
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::U16(ends) => ends.len(),
+            Self::U32(ends) => ends.len(),
+            Self::U64(ends) => ends.len(),
+        }
+    }
+
+    fn get(&self, run: usize) -> usize {
+        match self {
+            Self::U16(ends) => ends[run] as usize,
+            Self::U32(ends) => ends[run] as usize,
+            Self::U64(ends) => ends[run] as usize,
+        }
+    }
+
+    fn partition_point(&self, logical_index: usize) -> usize {
+        match self {
+            Self::U16(ends) => ends.partition_point(|&end| end as usize <= logical_index),
+            Self::U32(ends) => ends.partition_point(|&end| end as usize <= logical_index),
+            Self::U64(ends) => ends.partition_point(|&end| end as usize <= logical_index),
+        }
+    }
+
+    fn deep_size(&self) -> usize {
+        match self {
+            Self::U16(ends) => std::mem::size_of_val(ends.as_ref()),
+            Self::U32(ends) => std::mem::size_of_val(ends.as_ref()),
+            Self::U64(ends) => std::mem::size_of_val(ends.as_ref()),
+        }
+    }
+}
+
+enum RunEndsBuilder {
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl RunEndsBuilder {
+    fn with_capacity(num_values: usize, capacity: usize) -> Self {
+        if u16::try_from(num_values).is_ok() {
+            Self::U16(Vec::with_capacity(capacity))
+        } else if u32::try_from(num_values).is_ok() {
+            Self::U32(Vec::with_capacity(capacity))
+        } else {
+            Self::U64(Vec::with_capacity(capacity))
+        }
+    }
+
+    fn push(&mut self, end: usize) -> Result<()> {
+        match self {
+            Self::U16(ends) => ends.push(
+                u16::try_from(end)
+                    .map_err(|_| Error::internal(format!("Run end {end} does not fit in u16")))?,
+            ),
+            Self::U32(ends) => ends.push(
+                u32::try_from(end)
+                    .map_err(|_| Error::internal(format!("Run end {end} does not fit in u32")))?,
+            ),
+            Self::U64(ends) => ends.push(end as u64),
+        }
+        Ok(())
+    }
+
+    fn set_last(&mut self, end: usize) -> Result<()> {
+        match self {
+            Self::U16(ends) => {
+                let last = ends.last_mut().ok_or_else(|| {
+                    Error::internal("Cannot extend an empty coalesced run buffer")
+                })?;
+                *last = u16::try_from(end)
+                    .map_err(|_| Error::internal(format!("Run end {end} does not fit in u16")))?;
+            }
+            Self::U32(ends) => {
+                let last = ends.last_mut().ok_or_else(|| {
+                    Error::internal("Cannot extend an empty coalesced run buffer")
+                })?;
+                *last = u32::try_from(end)
+                    .map_err(|_| Error::internal(format!("Run end {end} does not fit in u32")))?;
+            }
+            Self::U64(ends) => {
+                let last = ends.last_mut().ok_or_else(|| {
+                    Error::internal("Cannot extend an empty coalesced run buffer")
+                })?;
+                *last = end as u64;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> RunEnds {
+        match self {
+            Self::U16(ends) => RunEnds::U16(ends.into_boxed_slice()),
+            Self::U32(ends) => RunEnds::U32(ends.into_boxed_slice()),
+            Self::U64(ends) => RunEnds::U64(ends.into_boxed_slice()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RunStorage {
+    Physical(RleRuns),
+    Coalesced { values: Box<[u16]>, ends: RunEnds },
+}
+
+impl RunStorage {
+    fn len(&self) -> usize {
+        match self {
+            Self::Physical(runs) => runs.num_values(),
+            Self::Coalesced { ends, .. } => ends.get(ends.len() - 1),
+        }
+    }
+
+    fn num_runs(&self) -> usize {
+        match self {
+            Self::Physical(runs) => runs.num_runs(),
+            Self::Coalesced { values, .. } => values.len(),
+        }
+    }
+
+    fn value(&self, run: usize) -> u16 {
+        match self {
+            Self::Physical(runs) => runs.value(run),
+            Self::Coalesced { values, .. } => values[run],
+        }
+    }
+
+    fn first_value_above(&self, max: u16) -> Option<(usize, u16)> {
+        (0..self.num_runs()).find_map(|run| {
+            let value = self.value(run);
+            (value > max).then_some((run, value))
+        })
+    }
+
+    fn seek(&self, position: &mut RunPosition, logical_index: usize) {
+        if logical_index >= self.len() {
+            *position = RunPosition {
+                run: self.num_runs(),
+                start: self.len(),
+                end: self.len(),
+            };
+            return;
+        }
+
+        match self {
+            Self::Physical(runs) => {
+                if position.run >= runs.num_runs()
+                    || position.end == 0
+                    || logical_index < position.start
+                {
+                    *position = RunPosition {
+                        run: 0,
+                        start: 0,
+                        end: runs.length(0),
+                    };
+                }
+                while position.end <= logical_index {
+                    self.advance(position);
+                }
+            }
+            Self::Coalesced { ends, .. } => {
+                if logical_index < position.start || logical_index >= position.end {
+                    let run = ends.partition_point(logical_index);
+                    *position = RunPosition {
+                        run,
+                        start: if run == 0 { 0 } else { ends.get(run - 1) },
+                        end: ends.get(run),
+                    };
+                }
+            }
+        }
+    }
+
+    fn advance(&self, position: &mut RunPosition) {
+        let next_run = position.run + 1;
+        if next_run >= self.num_runs() {
+            *position = RunPosition {
+                run: self.num_runs(),
+                start: self.len(),
+                end: self.len(),
+            };
+            return;
+        }
+
+        let start = position.end;
+        position.run = next_run;
+        position.start = start;
+        position.end = match self {
+            Self::Physical(runs) => start + runs.length(next_run),
+            Self::Coalesced { ends, .. } => ends.get(next_run),
+        };
+    }
+
+    fn deep_size(&self) -> usize {
+        match self {
+            Self::Physical(runs) => runs.deep_size(),
+            Self::Coalesced { values, ends } => {
+                std::mem::size_of_val(values.as_ref()) + ends.deep_size()
+            }
+        }
+    }
+}
+
 /// Rep/def levels for a complex-all-null page.
 ///
-/// All-null pages have near-constant levels that RLE-compress to a handful of
-/// runs but expand to `num_values` u16s. `Rle` keeps the runs un-expanded so a
-/// cached page costs O(runs) instead of O(num_values); the decoder materializes
-/// only the per-drain slices it touches. `Dense` is the eager fallback for
-/// non-RLE encodings.
+/// RLE pages retain the smallest of their validated physical runs, coalesced
+/// runs, and dense values. The decoder materializes only the per-drain slices
+/// it touches.
 #[derive(Debug, Clone)]
 enum LazyLevels {
     Dense(ScalarBuffer<u16>),
-    /// `values[r]` is the level for run `r`, covering logical indices
-    /// `offsets[r]..offsets[r + 1]`. Adjacent runs always have distinct values
-    /// (`decode_rle_u16_runs` coalesces equal-valued runs), so `values.len()` is
-    /// the number of logical level changes, not the number of on-disk RLE runs.
-    /// Invariants: `offsets.len() == values.len() + 1`, `offsets[0] == 0`,
-    /// `offsets` strictly increasing, `offsets[last] == len`.
-    Rle {
-        values: ScalarBuffer<u16>,
-        offsets: Arc<[u64]>,
-    },
+    Runs(Arc<RunStorage>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevelPlan {
+    Physical,
+    Coalesced,
+    Dense,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RunPosition {
+    run: usize,
+    start: usize,
+    end: usize,
 }
 
 /// Monotonic forward cursor into a [`LazyLevels`] sequence.
 ///
 /// Drains seek to strictly increasing rows, so each [`LazyLevels::seek_row_start`]
 /// resumes from the last position instead of rescanning — every run is visited at
-/// most once per page, keeping a full decode O(runs), not O(rows).
+/// most once per page while locating and counting level ranges.
 #[derive(Debug, Default, Clone, Copy)]
 struct LevelCursor {
     /// Logical level index where the current row begins.
     level: usize,
     /// Row index at `level` (the number of `max_rep` occurrences before it).
     row: u64,
-    /// Run index containing `level`. Unused for [`LazyLevels::Dense`].
-    run: usize,
+    /// Run containing `level`. Unused for [`LazyLevels::Dense`].
+    run: RunPosition,
 }
 
 impl LazyLevels {
-    fn len(&self) -> usize {
-        match self {
-            Self::Dense(buf) => buf.len(),
-            Self::Rle { offsets, .. } => offsets[offsets.len() - 1] as usize,
+    fn from_rle_runs(runs: RleRuns) -> Result<Self> {
+        let plan = Self::select_plan(&runs);
+        match plan {
+            LevelPlan::Physical => Ok(Self::Runs(Arc::new(RunStorage::Physical(
+                runs.into_owned(),
+            )))),
+            LevelPlan::Coalesced => Self::build_coalesced(runs),
+            LevelPlan::Dense => Self::build_dense(runs),
         }
     }
 
-    /// Run index containing logical position `i`. Caller guarantees `i < len()`.
-    #[inline]
-    fn run_of(offsets: &[u64], i: usize) -> usize {
-        // `offsets[0] == 0 <= i`, so `partition_point >= 1` and never underflows.
-        offsets.partition_point(|&o| o <= i as u64) - 1
+    /// Minimize retained payload bytes first, then expected traversal work.
+    /// If both are equal, keep the physical runs and avoid another allocation.
+    fn select_plan(runs: &RleRuns) -> LevelPlan {
+        if runs.num_values() == 0 {
+            return LevelPlan::Dense;
+        }
+
+        let run_storage_size = std::mem::size_of::<RunStorage>() as u128;
+        let physical_size = run_storage_size + runs.owned_size() as u128;
+        let coalesced_size = run_storage_size
+            + (runs.coalesced_runs() as u128)
+                * (std::mem::size_of::<u16>() + RunEnds::width_for(runs.num_values())) as u128;
+        let dense_size = (runs.num_values() as u128) * std::mem::size_of::<u16>() as u128;
+        [
+            (physical_size, runs.num_runs(), 0usize, LevelPlan::Physical),
+            (
+                coalesced_size,
+                runs.coalesced_runs(),
+                1usize,
+                LevelPlan::Coalesced,
+            ),
+            (dense_size, runs.num_values(), 2usize, LevelPlan::Dense),
+        ]
+        .into_iter()
+        .min_by_key(|(size, traversal, priority, _)| (*size, *traversal, *priority))
+        .map(|(_, _, _, plan)| plan)
+        .unwrap_or(LevelPlan::Dense)
+    }
+
+    fn build_coalesced(runs: RleRuns) -> Result<Self> {
+        let mut values = Vec::with_capacity(runs.coalesced_runs());
+        let mut ends = RunEndsBuilder::with_capacity(runs.num_values(), runs.coalesced_runs());
+        let mut logical_end = 0usize;
+        for (value, length) in runs.iter() {
+            logical_end = logical_end
+                .checked_add(length)
+                .ok_or_else(|| Error::internal("Validated RLE run length sum overflowed usize"))?;
+            if values.last().copied() == Some(value) {
+                ends.set_last(logical_end)?;
+            } else {
+                values.push(value);
+                ends.push(logical_end)?;
+            }
+        }
+        Ok(Self::Runs(Arc::new(RunStorage::Coalesced {
+            values: values.into_boxed_slice(),
+            ends: ends.finish(),
+        })))
+    }
+
+    fn build_dense(runs: RleRuns) -> Result<Self> {
+        let mut values = Vec::new();
+        values.try_reserve_exact(runs.num_values()).map_err(|_| {
+            Error::internal(format!(
+                "Cannot allocate {} dense repetition/definition levels",
+                runs.num_values()
+            ))
+        })?;
+        for (value, length) in runs.iter() {
+            values.resize(values.len() + length, value);
+        }
+        Ok(Self::Dense(ScalarBuffer::from(values)))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(buf) => buf.len(),
+            Self::Runs(runs) => runs.len(),
+        }
+    }
+
+    fn validate_max(&self, level_type: &str, max: u16) -> Result<()> {
+        let invalid = match self {
+            Self::Dense(levels) => levels
+                .iter()
+                .enumerate()
+                .find_map(|(index, &value)| (value > max).then_some(("index", index, value))),
+            Self::Runs(runs) => runs
+                .first_value_above(max)
+                .map(|(run, value)| ("run", run, value)),
+        };
+        if let Some((position_type, position, value)) = invalid {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Invalid {level_type} level {value} at {position_type} {position}: maximum is {max}"
+                )
+                .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Advance `cursor` to the start of row `target_row`, returning that row's
@@ -822,8 +1157,12 @@ impl LazyLevels {
         target_row: u64,
         max_rep: u16,
     ) -> Result<usize> {
-        debug_assert!(target_row >= cursor.row);
-        let mut need = target_row - cursor.row;
+        let mut need = target_row.checked_sub(cursor.row).ok_or_else(|| {
+            Error::internal(format!(
+                "Complex all-null row ranges are not sorted: target row {target_row} follows {}",
+                cursor.row
+            ))
+        })?;
         if need == 0 {
             return Ok(cursor.level);
         }
@@ -851,22 +1190,22 @@ impl LazyLevels {
                 cursor.row = target_row;
                 Ok(level)
             }
-            Self::Rle { values, offsets } => {
+            Self::Runs(runs) => {
                 let mut level = cursor.level;
                 let mut run = cursor.run;
+                runs.seek(&mut run, level);
                 while need > 0 {
-                    if run >= values.len() {
+                    if run.run >= runs.num_runs() {
                         return Err(Error::internal(
                             "Invalid complex all-null layout: repetition buffer too short",
                         ));
                     }
-                    if values[run] != max_rep {
+                    if runs.value(run.run) != max_rep {
                         return Err(Error::internal(
                             "Invalid complex all-null layout: row did not start at max repetition level",
                         ));
                     }
-                    let run_end = offsets[run + 1] as usize;
-                    let avail = (run_end - level) as u64;
+                    let avail = (run.end - level) as u64;
                     if need < avail {
                         // Target lands inside this max-rep run.
                         level += need as usize;
@@ -875,12 +1214,12 @@ impl LazyLevels {
                         // Consume every row start in this run, then skip the
                         // trailing non-max-rep runs to reach the next row start.
                         need -= avail;
-                        run += 1;
-                        while run < values.len() && values[run] != max_rep {
-                            run += 1;
+                        runs.advance(&mut run);
+                        while run.run < runs.num_runs() && runs.value(run.run) != max_rep {
+                            runs.advance(&mut run);
                         }
-                        level = if run < values.len() {
-                            offsets[run] as usize
+                        level = if run.run < runs.num_runs() {
+                            run.start
                         } else {
                             self.len()
                         };
@@ -899,62 +1238,165 @@ impl LazyLevels {
     ///
     /// Successive calls must pass ascending, non-overlapping ranges (`range.start
     /// >=` the previous `range.end`) so runs are swept at most once per page.
-    fn count_le_cursor(&self, run_cursor: &mut usize, range: Range<usize>, max: u16) -> u64 {
+    fn count_le_cursor(
+        &self,
+        run_cursor: &mut RunPosition,
+        range: Range<usize>,
+        max: u16,
+    ) -> (u64, RunPosition) {
         if range.is_empty() {
-            return 0;
+            return (0, *run_cursor);
         }
         match self {
-            Self::Dense(buf) => buf[range].iter().filter(|&&d| d <= max).count() as u64,
-            Self::Rle { values, offsets } => {
-                let mut r = *run_cursor;
+            Self::Dense(buf) => (
+                buf[range].iter().filter(|&&d| d <= max).count() as u64,
+                RunPosition::default(),
+            ),
+            Self::Runs(runs) => {
                 // Advance to the first run overlapping the range.
-                while r < values.len() && (offsets[r + 1] as usize) <= range.start {
-                    r += 1;
-                }
+                runs.seek(run_cursor, range.start);
+                let start = *run_cursor;
                 let mut count = 0u64;
-                let mut cur = r;
-                while cur < values.len() && (offsets[cur] as usize) < range.end {
-                    if values[cur] <= max {
-                        let lo = (offsets[cur] as usize).max(range.start);
-                        let hi = (offsets[cur + 1] as usize).min(range.end);
+                let mut current = *run_cursor;
+                while current.run < runs.num_runs() && current.start < range.end {
+                    if runs.value(current.run) <= max {
+                        let lo = current.start.max(range.start);
+                        let hi = current.end.min(range.end);
                         count += (hi - lo) as u64;
                     }
-                    cur += 1;
+                    if current.end >= range.end {
+                        break;
+                    }
+                    runs.advance(&mut current);
                 }
                 // Resume the next (ascending) range from the last overlapping run;
-                // `cur > r` because `range` is non-empty.
-                *run_cursor = cur - 1;
-                count
+                // `current` remains valid because `range` is non-empty.
+                *run_cursor = current;
+                (count, start)
             }
         }
     }
 
-    fn extend_into(&self, range: Range<usize>, out: &mut Vec<u16>) {
+    fn extend_into(&self, range: Range<usize>, run: RunPosition, out: &mut Vec<u16>) {
         if range.is_empty() {
             return;
         }
         match self {
             Self::Dense(buf) => out.extend_from_slice(&buf[range]),
-            Self::Rle { values, offsets } => {
-                let mut r = Self::run_of(offsets, range.start);
-                while r < values.len() && (offsets[r] as usize) < range.end {
-                    let lo = (offsets[r] as usize).max(range.start);
-                    let hi = (offsets[r + 1] as usize).min(range.end);
+            Self::Runs(runs) => {
+                let mut current = run;
+                runs.seek(&mut current, range.start);
+                while current.run < runs.num_runs() && current.start < range.end {
+                    let lo = current.start.max(range.start);
+                    let hi = current.end.min(range.end);
                     if hi > lo {
-                        out.resize(out.len() + (hi - lo), values[r]);
+                        out.resize(out.len() + (hi - lo), runs.value(current.run));
                     }
-                    r += 1;
+                    runs.advance(&mut current);
                 }
             }
         }
     }
 
+    #[cfg(test)]
     fn deep_size(&self) -> usize {
+        self.deep_size_of_children(&mut Context::new())
+    }
+}
+
+impl DeepSizeOf for LazyLevels {
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
         match self {
-            Self::Dense(buf) => buf.len() * 2,
-            Self::Rle { values, offsets } => values.len() * 2 + offsets.len() * 8,
+            Self::Dense(buf) => buf.deep_size_of_children(ctx),
+            Self::Runs(runs) => {
+                let pointer = Arc::as_ptr(runs) as *const () as usize;
+                if ctx.mark_seen(pointer) {
+                    std::mem::size_of_val(runs.as_ref()) + runs.deep_size()
+                } else {
+                    0
+                }
+            }
         }
     }
+}
+
+fn validate_complex_all_null_levels(
+    rep: &Option<LazyLevels>,
+    def: &Option<LazyLevels>,
+    max_rep: u16,
+    max_def: u16,
+) -> Result<()> {
+    if let Some(rep) = rep {
+        rep.validate_max("repetition", max_rep)?;
+    }
+    if let Some(def) = def {
+        def.validate_max("definition", max_def)?;
+    }
+    if let (Some(rep), Some(def)) = (rep, def)
+        && rep.len() != def.len()
+    {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Mismatched complex all-null level counts: repetition has {}, definition has {}",
+                rep.len(),
+                def.len()
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn expected_level_bytes(num_values: u64, level_type: &str) -> Result<usize> {
+    usize::try_from(num_values)
+        .ok()
+        .and_then(|num_values| num_values.checked_mul(std::mem::size_of::<u16>()))
+        .ok_or_else(|| {
+            Error::invalid_input_source(
+                format!("{level_type} level count {num_values} does not fit in memory").into(),
+            )
+        })
+}
+
+fn dense_levels_from_block(
+    decompressed: DataBlock,
+    num_values: u64,
+    level_type: &str,
+) -> Result<LazyLevels> {
+    let DataBlock::FixedWidth(block) = decompressed else {
+        return Err(Error::invalid_input_source(
+            format!("Expected fixed-width data block for {level_type} levels").into(),
+        ));
+    };
+    if block.num_values != num_values {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Unexpected {level_type} level count after decompression: expected {num_values}, got {}",
+                block.num_values
+            )
+            .into(),
+        ));
+    }
+    if block.bits_per_value != 16 {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Unexpected {level_type} level bit width after decompression: expected 16, got {}",
+                block.bits_per_value
+            )
+            .into(),
+        ));
+    }
+    let expected_bytes = expected_level_bytes(num_values, level_type)?;
+    if block.data.len() != expected_bytes {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Unexpected decompressed {level_type} level size: expected {expected_bytes} bytes for {num_values} values, got {}",
+                block.data.len()
+            )
+            .into(),
+        ));
+    }
+    Ok(LazyLevels::Dense(block.data.borrow_to_typed_slice::<u16>()))
 }
 
 #[derive(Debug)]
@@ -964,9 +1406,8 @@ struct CachedComplexAllNullState {
 }
 
 impl DeepSizeOf for CachedComplexAllNullState {
-    fn deep_size_of_children(&self, _ctx: &mut Context) -> usize {
-        self.rep.as_ref().map(|l| l.deep_size()).unwrap_or(0)
-            + self.def.as_ref().map(|l| l.deep_size()).unwrap_or(0)
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+        self.rep.deep_size_of_children(ctx) + self.def.deep_size_of_children(ctx)
     }
 }
 
@@ -991,6 +1432,7 @@ pub struct ComplexAllNullScheduler {
     def_meaning: Arc<[DefinitionInterpretation]>,
     repdef: Option<Arc<CachedComplexAllNullState>>,
     max_rep: u16,
+    max_def: u16,
     max_visible_level: u16,
     rep_codec: LevelCodec,
     def_codec: LevelCodec,
@@ -1008,6 +1450,10 @@ impl ComplexAllNullScheduler {
         num_def_values: u64,
     ) -> Self {
         let max_rep = def_meaning.iter().filter(|l| l.is_list()).count() as u16;
+        let max_def = def_meaning
+            .iter()
+            .map(|meaning| meaning.num_def_levels())
+            .sum::<u16>();
         let max_visible_level = def_meaning
             .iter()
             .take_while(|l| !l.is_list())
@@ -1018,6 +1464,7 @@ impl ComplexAllNullScheduler {
             def_meaning,
             repdef: None,
             max_rep,
+            max_def,
             max_visible_level,
             rep_codec,
             def_codec,
@@ -1051,13 +1498,15 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
         let def_codec = self.def_codec.clone();
         let num_rep_values = self.num_rep_values;
         let num_def_values = self.num_def_values;
+        let max_rep = self.max_rep;
+        let max_def = self.max_def;
 
         async move {
             let data = data.await?;
             let mut data_iter = data.into_iter();
 
-            // RLE levels are kept in run form (`LazyLevels::Rle`); everything else
-            // expands eagerly to `LazyLevels::Dense`, exactly as before.
+            // RLE levels select the smallest validated cache representation;
+            // everything else expands eagerly to `LazyLevels::Dense`.
             let build_levels = |compressed_bytes: Bytes,
                                 codec: &LevelCodec,
                                 num_values: u64,
@@ -1065,41 +1514,44 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
              -> Result<LazyLevels> {
                 match codec {
                     LevelCodec::Uncompressed => {
+                        if num_values == 0 {
+                            if !compressed_bytes
+                                .len()
+                                .is_multiple_of(std::mem::size_of::<u16>())
+                            {
+                                return Err(Error::invalid_input_source(
+                                    format!(
+                                        "Unexpected uncompressed {level_type} level size: {} bytes is not divisible by {}",
+                                        compressed_bytes.len(),
+                                        std::mem::size_of::<u16>()
+                                    )
+                                    .into(),
+                                ));
+                            }
+                        } else {
+                            let expected_bytes = expected_level_bytes(num_values, level_type)?;
+                            if compressed_bytes.len() != expected_bytes {
+                                return Err(Error::invalid_input_source(
+                                    format!(
+                                        "Unexpected uncompressed {level_type} level size: expected {expected_bytes} bytes for {num_values} values, got {}",
+                                        compressed_bytes.len()
+                                    )
+                                    .into(),
+                                ));
+                            }
+                        }
                         let buffer = LanceBuffer::from_bytes(compressed_bytes, 2);
                         Ok(LazyLevels::Dense(buffer.borrow_to_typed_slice::<u16>()))
                     }
-                    LevelCodec::Rle => {
+                    LevelCodec::Rle(decompressor) => {
                         let frame = LanceBuffer::from_bytes(compressed_bytes, 1);
-                        let (values, offsets) = decode_rle_u16_runs(frame, num_values)?;
-                        Ok(LazyLevels::Rle { values, offsets })
+                        let runs = decompressor.decode_u16_runs(frame, num_values)?;
+                        LazyLevels::from_rle_runs(runs)
                     }
                     LevelCodec::Block(decompressor) => {
                         let frame = LanceBuffer::from_bytes(compressed_bytes, 1);
                         let decompressed = decompressor.decompress(frame, num_values)?;
-                        match decompressed {
-                            DataBlock::FixedWidth(block) => {
-                                if block.num_values != num_values {
-                                    return Err(Error::invalid_input_source(format!(
-                                        "Unexpected {} level count after decompression: expected {}, got {}",
-                                        level_type, num_values, block.num_values
-                                    )
-                                    .into()));
-                                }
-                                if block.bits_per_value != 16 {
-                                    return Err(Error::invalid_input_source(format!(
-                                        "Unexpected {} level bit width after decompression: expected 16, got {}",
-                                        level_type, block.bits_per_value
-                                    )
-                                    .into()));
-                                }
-                                Ok(LazyLevels::Dense(block.data.borrow_to_typed_slice::<u16>()))
-                            }
-                            _ => Err(Error::invalid_input_source(format!(
-                                "Expected fixed-width data block for {} levels",
-                                level_type
-                            )
-                            .into())),
-                        }
+                        dense_levels_from_block(decompressed, num_values, level_type)
                     }
                 }
             };
@@ -1118,6 +1570,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                 None
             };
 
+            validate_complex_all_null_levels(&rep, &def, max_rep, max_def)?;
             let repdef = Arc::new(CachedComplexAllNullState { rep, def });
 
             self.repdef = Some(repdef.clone());
@@ -1152,7 +1605,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             max_rep: self.max_rep,
             max_visible_level: self.max_visible_level,
             rep_cursor: LevelCursor::default(),
-            def_run_cursor: 0,
+            def_run_cursor: RunPosition::default(),
         }) as Box<dyn StructuralPageDecoder>;
         let page_load_task = PageLoadTask {
             decoder_fut: std::future::ready(Ok(decoder)).boxed(),
@@ -1174,7 +1627,7 @@ pub struct ComplexAllNullPageDecoder {
     /// Monotonic cursor into `rep` tracking the current row's level start.
     rep_cursor: LevelCursor,
     /// Monotonic run cursor into `def` for `count_le_cursor`.
-    def_run_cursor: usize,
+    def_run_cursor: RunPosition,
 }
 
 impl ComplexAllNullPageDecoder {
@@ -1212,7 +1665,7 @@ impl ComplexAllNullPageDecoder {
 
     /// Number of visible items in the level range `levels` (definition levels
     /// `<= max_visible_level`), advancing the monotonic definition cursor.
-    fn count_visible(&mut self, levels: Range<usize>) -> Result<u64> {
+    fn count_visible(&mut self, levels: Range<usize>) -> Result<(u64, RunPosition)> {
         match &self.def {
             Some(def) => {
                 if levels.end > def.len() {
@@ -1222,7 +1675,7 @@ impl ComplexAllNullPageDecoder {
                 }
                 Ok(def.count_le_cursor(&mut self.def_run_cursor, levels, self.max_visible_level))
             }
-            None => Ok((levels.end - levels.start) as u64),
+            None => Ok(((levels.end - levels.start) as u64, RunPosition::default())),
         }
     }
 }
@@ -1230,23 +1683,29 @@ impl ComplexAllNullPageDecoder {
 impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
-        let mut level_slices: Vec<Range<usize>> = Vec::with_capacity(drained_ranges.len());
+        let mut level_slices: Vec<LevelSlice> = Vec::with_capacity(drained_ranges.len());
         let mut visible_items_total = 0;
 
         // Each row range is one contiguous level slice `[start_row_level,
         // end_row_level)`, so we seek both boundaries and count its visibility at
-        // once rather than per row. The cursors only move forward, keeping a full
-        // page decode O(runs), not O(rows).
+        // once rather than per row. The cursors only move forward, so locating and
+        // counting all requested ranges visits each intervening run at most once.
         for range in drained_ranges {
             let level_start = self.seek_row_start(range.start)?;
+            let rep_run = self.rep_cursor.run;
             let level_end = self.seek_row_start(range.end)?;
-            visible_items_total += self.count_visible(level_start..level_end)?;
+            let (visible_items, def_run) = self.count_visible(level_start..level_end)?;
+            visible_items_total += visible_items;
             if let Some(last) = level_slices.last_mut()
-                && last.end == level_start
+                && last.range.end == level_start
             {
-                last.end = level_end;
+                last.range.end = level_end;
             } else {
-                level_slices.push(level_start..level_end);
+                level_slices.push(LevelSlice {
+                    range: level_start..level_end,
+                    rep_run,
+                    def_run,
+                });
             }
         }
 
@@ -1267,9 +1726,31 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
 
 /// We use `level_slices` to slice into `rep` and `def` and create rep/def buffers
 /// for the null data.
+#[derive(Debug, Clone)]
+struct LevelSlice {
+    range: Range<usize>,
+    rep_run: RunPosition,
+    def_run: RunPosition,
+}
+
+#[derive(Clone, Copy)]
+enum LevelKind {
+    Repetition,
+    Definition,
+}
+
+impl LevelSlice {
+    fn run(&self, kind: LevelKind) -> RunPosition {
+        match kind {
+            LevelKind::Repetition => self.rep_run,
+            LevelKind::Definition => self.def_run,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DecodeComplexAllNullTask {
-    level_slices: Vec<Range<usize>>,
+    level_slices: Vec<LevelSlice>,
     visible_items_total: u64,
     rep: Option<LazyLevels>,
     def: Option<LazyLevels>,
@@ -1278,16 +1759,16 @@ pub struct DecodeComplexAllNullTask {
 }
 
 impl DecodeComplexAllNullTask {
-    fn decode_level(&self, levels: &Option<LazyLevels>) -> Option<Vec<u16>> {
+    fn decode_level(&self, levels: &Option<LazyLevels>, kind: LevelKind) -> Option<Vec<u16>> {
         levels.as_ref().map(|levels| {
             let num_levels = self
                 .level_slices
                 .iter()
-                .map(|range| range.end - range.start)
+                .map(|slice| slice.range.end - slice.range.start)
                 .sum();
             let mut referenced_levels = Vec::with_capacity(num_levels);
-            for range in &self.level_slices {
-                levels.extend_into(range.clone(), &mut referenced_levels);
+            for slice in &self.level_slices {
+                levels.extend_into(slice.range.clone(), slice.run(kind), &mut referenced_levels);
             }
             referenced_levels
         })
@@ -1296,8 +1777,8 @@ impl DecodeComplexAllNullTask {
 
 impl DecodePageTask for DecodeComplexAllNullTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        let rep = self.decode_level(&self.rep);
-        let def = self.decode_level(&self.def);
+        let rep = self.decode_level(&self.rep, LevelKind::Repetition);
+        let def = self.decode_level(&self.def, LevelKind::Definition);
 
         // If there are definition levels there may be empty / null lists which are not visible
         // in the items array.  We need to account for that here to figure out how many values
@@ -3574,27 +4055,16 @@ impl StructuralPrimitiveFieldScheduler {
                 {
                     Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
                 } else {
-                    // RLE levels are kept lazily in run form; other block
-                    // compressions keep flowing through the eager decompressor.
-                    let level_codec =
-                        |encoding: Option<&CompressiveEncoding>| -> Result<LevelCodec> {
-                            match encoding {
-                                None => Ok(LevelCodec::Uncompressed),
-                                Some(enc)
-                                    if matches!(
-                                        enc.compression.as_ref(),
-                                        Some(Compression::Rle(_))
-                                    ) =>
-                                {
-                                    Ok(LevelCodec::Rle)
-                                }
-                                Some(enc) => Ok(LevelCodec::Block(Arc::from(
-                                    decompressors.create_block_decompressor(enc)?,
-                                ))),
-                            }
-                        };
-                    let rep_codec = level_codec(constant_layout.rep_compression.as_ref())?;
-                    let def_codec = level_codec(constant_layout.def_compression.as_ref())?;
+                    // RLE levels select a validated cache representation; other
+                    // block compressions keep flowing through the eager decompressor.
+                    let rep_codec = LevelCodec::try_new(
+                        constant_layout.rep_compression.as_ref(),
+                        decompressors,
+                    )?;
+                    let def_codec = LevelCodec::try_new(
+                        constant_layout.def_compression.as_ref(),
+                        decompressors,
+                    )?;
 
                     Box::new(ComplexAllNullScheduler::new(
                         page_info.buffer_offsets_and_sizes.clone(),
@@ -5994,12 +6464,13 @@ mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
         FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, MiniBlockChunk, MiniBlockCompressed,
-        MiniBlockRepIndex, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
-        VariableFullZipDecoder,
+        FullZipRepIndexDetails, FullZipScheduler, LazyLevels, LevelCodec, LevelCursor, LevelPlan,
+        MiniBlockChunk, MiniBlockCompressed, MiniBlockRepIndex, PerValueDecompressor,
+        PreambleAction, RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler,
+        VariableFullZipDecoder, dense_levels_from_block, validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
-    use crate::compression::DefaultDecompressionStrategy;
+    use crate::compression::{BlockCompressor, DefaultDecompressionStrategy};
     use crate::constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
         DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
@@ -6010,6 +6481,7 @@ mod tests {
     use crate::encodings::logical::primitive::{
         ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
     };
+    use crate::encodings::physical::rle::{RleDecompressor, RleEncoder, RleRuns, RunLengthWidth};
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
@@ -6017,6 +6489,7 @@ mod tests {
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
@@ -8214,22 +8687,58 @@ mod tests {
             .await;
     }
 
+    fn encoded_u16_frame(levels: &[u16], run_length_width: RunLengthWidth) -> LanceBuffer {
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_slice(Arc::from(levels)),
+            bits_per_value: 16,
+            num_values: levels.len() as u64,
+            block_info: BlockInfo::new(),
+        });
+        BlockCompressor::compress(&RleEncoder::with_run_length_width(run_length_width), block)
+            .unwrap()
+    }
+
+    fn encoded_u16_runs(levels: &[u16], run_length_width: RunLengthWidth) -> RleRuns {
+        let frame = encoded_u16_frame(levels, run_length_width);
+        RleDecompressor::with_run_length_width(16, run_length_width)
+            .decode_u16_runs(frame, levels.len() as u64)
+            .unwrap()
+    }
+
+    fn physical_levels(levels: &[u16]) -> LazyLevels {
+        LazyLevels::Runs(Arc::new(RunStorage::Physical(
+            encoded_u16_runs(levels, RunLengthWidth::U8).into_owned(),
+        )))
+    }
+
+    fn coalesced_levels(levels: &[u16]) -> LazyLevels {
+        let mut values = Vec::new();
+        let mut ends = RunEndsBuilder::with_capacity(levels.len(), levels.len());
+        for (index, &value) in levels.iter().enumerate() {
+            if values.last() == Some(&value) {
+                ends.set_last(index + 1).unwrap();
+            } else {
+                values.push(value);
+                ends.push(index + 1).unwrap();
+            }
+        }
+        LazyLevels::Runs(Arc::new(RunStorage::Coalesced {
+            values: values.into_boxed_slice(),
+            ends: ends.finish(),
+        }))
+    }
+
     #[test]
-    fn lazy_levels_rle_matches_dense() {
-        use arrow_buffer::ScalarBuffer;
-
-        use super::{LazyLevels, LevelCursor};
-
+    fn lazy_levels_runs_match_dense() {
         // Runs: 3x2, 1x1, 3x3, 0x2  =>  [3,3,1,3,3,3,0,0]
-        let rle = LazyLevels::Rle {
-            values: ScalarBuffer::<u16>::from(vec![3u16, 1, 3, 0]),
-            offsets: Arc::from(vec![0u64, 2, 3, 6, 8]),
-        };
         let expanded: Vec<u16> = vec![3, 3, 1, 3, 3, 3, 0, 0];
+        let coalesced = coalesced_levels(&expanded);
+        let physical = physical_levels(&expanded);
         let dense = LazyLevels::Dense(ScalarBuffer::<u16>::from(expanded.clone()));
         let n = expanded.len();
 
-        assert_eq!(rle.len(), n);
+        assert_eq!(coalesced.len(), n);
+        assert_eq!(physical.len(), n);
         assert_eq!(dense.len(), n);
 
         // Rows begin at each `max_rep` (3) position; row `num_rows` maps to `len`.
@@ -8237,12 +8746,15 @@ mod tests {
         let row_starts: Vec<usize> = (0..n).filter(|&i| expanded[i] == max_rep).collect();
         for target in 0..=row_starts.len() as u64 {
             let want = row_starts.get(target as usize).copied().unwrap_or(n);
-            let (mut c_rle, mut c_dense) = (LevelCursor::default(), LevelCursor::default());
-            assert_eq!(
-                rle.seek_row_start(&mut c_rle, target, max_rep).unwrap(),
-                want,
-                "seek_row_start({target})"
-            );
+            for runs in [&coalesced, &physical] {
+                let mut cursor = LevelCursor::default();
+                assert_eq!(
+                    runs.seek_row_start(&mut cursor, target, max_rep).unwrap(),
+                    want,
+                    "seek_row_start({target})"
+                );
+            }
+            let mut c_dense = LevelCursor::default();
             assert_eq!(
                 dense.seek_row_start(&mut c_dense, target, max_rep).unwrap(),
                 want
@@ -8255,38 +8767,65 @@ mod tests {
             for end in start..=n {
                 for max in [0u16, 1, 2, 3] {
                     let want = expanded[start..end].iter().filter(|&&d| d <= max).count() as u64;
-                    let (mut r_cur, mut d_cur) = (0usize, 0usize);
-                    assert_eq!(
-                        rle.count_le_cursor(&mut r_cur, start..end, max),
-                        want,
-                        "count_le_cursor({start}..{end}, {max})"
-                    );
-                    assert_eq!(dense.count_le_cursor(&mut d_cur, start..end, max), want);
+                    for runs in [&coalesced, &physical] {
+                        let mut cursor = RunPosition::default();
+                        assert_eq!(
+                            runs.count_le_cursor(&mut cursor, start..end, max).0,
+                            want,
+                            "count_le_cursor({start}..{end}, {max})"
+                        );
+                    }
+                    let mut d_cur = RunPosition::default();
+                    assert_eq!(dense.count_le_cursor(&mut d_cur, start..end, max).0, want);
                 }
-                let (mut got_rle, mut got_dense) = (Vec::new(), Vec::new());
-                rle.extend_into(start..end, &mut got_rle);
-                dense.extend_into(start..end, &mut got_dense);
-                assert_eq!(
-                    got_rle,
-                    expanded[start..end].to_vec(),
-                    "extend_into({start}..{end})"
-                );
+                for runs in [&coalesced, &physical] {
+                    let mut got = Vec::new();
+                    runs.extend_into(start..end, RunPosition::default(), &mut got);
+                    assert_eq!(
+                        got,
+                        expanded[start..end].to_vec(),
+                        "extend_into({start}..{end})"
+                    );
+                }
+                let mut got_dense = Vec::new();
+                dense.extend_into(start..end, RunPosition::default(), &mut got_dense);
                 assert_eq!(got_dense, expanded[start..end].to_vec());
             }
         }
     }
 
+    #[test]
+    fn physical_run_hints_support_deferred_materialization() {
+        let expanded: Vec<u16> = vec![3, 3, 1, 1, 2, 2, 0, 0];
+        let physical = physical_levels(&expanded);
+        let LazyLevels::Runs(runs) = &physical else {
+            panic!("expected physical runs");
+        };
+        let mut first_hint = RunPosition::default();
+        runs.seek(&mut first_hint, 2);
+        let mut second_hint = RunPosition::default();
+        runs.seek(&mut second_hint, 6);
+
+        let mut second = Vec::new();
+        physical.extend_into(6..8, second_hint, &mut second);
+        let mut first = Vec::new();
+        physical.extend_into(2..4, first_hint, &mut first);
+        assert_eq!(second, expanded[6..8]);
+        assert_eq!(first, expanded[2..4]);
+    }
+
     /// Fuzz parity for the run-oriented complex-all-null drain: the cursor walk
-    /// over `LazyLevels` must yield the exact coalesced level slices and visible
+    /// over `LazyLevels` must yield the exact level slices and visible
     /// count that a brute-force reference over the fully expanded levels does, for
-    /// both `Dense` and `Rle` forms and arbitrarily shaped range requests.
+    /// dense, physical-run, and coalesced-run forms and arbitrarily shaped range requests.
     mod complex_all_null_drain_parity {
-        use std::{ops::Range, sync::Arc};
+        use std::ops::Range;
 
         use arrow_buffer::ScalarBuffer;
         use proptest::prelude::*;
 
-        use super::super::{LazyLevels, LevelCursor};
+        use super::super::{LazyLevels, LevelCursor, RunPosition};
+        use super::{coalesced_levels, physical_levels};
         use crate::Result;
 
         #[derive(Debug, Clone)]
@@ -8302,23 +8841,8 @@ mod tests {
             LazyLevels::Dense(ScalarBuffer::from(levels.to_vec()))
         }
 
-        /// Build the coalesced run form (adjacent equal values merged), matching
-        /// the invariant `decode_rle_u16_runs` produces.
         fn rle_levels(levels: &[u16]) -> LazyLevels {
-            let mut values: Vec<u16> = Vec::new();
-            let mut offsets: Vec<u64> = vec![0];
-            for (i, &v) in levels.iter().enumerate() {
-                if values.last() == Some(&v) {
-                    *offsets.last_mut().unwrap() = (i + 1) as u64;
-                } else {
-                    values.push(v);
-                    offsets.push((i + 1) as u64);
-                }
-            }
-            LazyLevels::Rle {
-                values: ScalarBuffer::from(values),
-                offsets: Arc::from(offsets),
-            }
+            coalesced_levels(levels)
         }
 
         fn seek(
@@ -8347,18 +8871,21 @@ mod tests {
             ranges: &[Range<u64>],
         ) -> Result<(Vec<Range<usize>>, u64)> {
             let mut rep_cursor = LevelCursor::default();
-            let mut def_run_cursor = 0usize;
+            let mut def_run_cursor = RunPosition::default();
             let mut slices: Vec<Range<usize>> = Vec::new();
             let mut visible = 0u64;
             for range in ranges {
                 let level_start = seek(rep, &mut rep_cursor, range.start, max_rep)?;
                 let level_end = seek(rep, &mut rep_cursor, range.end, max_rep)?;
                 visible += match def {
-                    Some(def) => def.count_le_cursor(
-                        &mut def_run_cursor,
-                        level_start..level_end,
-                        max_visible,
-                    ),
+                    Some(def) => {
+                        def.count_le_cursor(
+                            &mut def_run_cursor,
+                            level_start..level_end,
+                            max_visible,
+                        )
+                        .0
+                    }
                     None => (level_end - level_start) as u64,
                 };
                 match slices.last_mut() {
@@ -8504,31 +9031,145 @@ mod tests {
                     simulate_drain(rep_rle.as_ref(), def_rle.as_ref(), max_rep, max_visible, &ranges)
                         .unwrap();
                 prop_assert_eq!(&got_rle, &reference, "rle form diverged from reference");
+
+                let rep_physical = rep.as_deref().map(physical_levels);
+                let def_physical = def.as_deref().map(physical_levels);
+                let got_physical =
+                    simulate_drain(rep_physical.as_ref(), def_physical.as_ref(), max_rep, max_visible, &ranges)
+                        .unwrap();
+                prop_assert_eq!(&got_physical, &reference, "physical form diverged from reference");
             }
         }
     }
 
     #[test]
-    fn lazy_levels_rle_is_compact() {
-        use arrow_buffer::ScalarBuffer;
-
-        use super::LazyLevels;
-
-        let single_run = |n: u64| LazyLevels::Rle {
-            values: ScalarBuffer::<u16>::from(vec![1u16]),
-            offsets: Arc::from(vec![0u64, n]),
+    fn lazy_levels_runs_are_compact() {
+        let single_run = |n: usize| {
+            let mut ends = RunEndsBuilder::with_capacity(n, 1);
+            ends.push(n).unwrap();
+            LazyLevels::Runs(Arc::new(RunStorage::Coalesced {
+                values: vec![1u16].into_boxed_slice(),
+                ends: ends.finish(),
+            }))
         };
-        // Run-form footprint is independent of the logical length...
-        assert_eq!(
-            single_run(100).deep_size(),
-            single_run(10_000_000).deep_size()
-        );
+        // Run-form footprint is independent of the logical length within an end width...
+        assert_eq!(single_run(100).deep_size(), single_run(10_000).deep_size());
         assert!(single_run(10_000_000).deep_size() < 100);
         assert_eq!(single_run(10_000_000).len(), 10_000_000);
         // ...while Dense pays 2 bytes per value.
         assert_eq!(
             LazyLevels::Dense(ScalarBuffer::<u16>::from(vec![1u16; 1000])).deep_size(),
             2000
+        );
+    }
+
+    #[test]
+    fn lazy_levels_selects_smallest_representation() {
+        let runs = encoded_u16_runs(&[7u16; 10], RunLengthWidth::U8);
+        assert_eq!(LazyLevels::select_plan(&runs), LevelPlan::Dense);
+
+        let equal_size: Vec<u16> = std::iter::repeat_n(0, 256)
+            .chain(std::iter::repeat_n(1, 100))
+            .chain(std::iter::repeat_n(2, 100))
+            .collect();
+        let runs = encoded_u16_runs(&equal_size, RunLengthWidth::U8);
+        assert_eq!(LazyLevels::select_plan(&runs), LevelPlan::Coalesced);
+
+        let moderate_runs: Vec<u16> = (0..250)
+            .flat_map(|run| std::iter::repeat_n((run % 2) as u16, 4))
+            .collect();
+        let runs = encoded_u16_runs(&moderate_runs, RunLengthWidth::U8);
+        assert_eq!(LazyLevels::select_plan(&runs), LevelPlan::Physical);
+
+        let split_constant = vec![7u16; 5000];
+        let runs = encoded_u16_runs(&split_constant, RunLengthWidth::U8);
+        assert_eq!(LazyLevels::select_plan(&runs), LevelPlan::Coalesced);
+
+        let high_density: Vec<u16> = (0..70_000).map(|index| (index % 2) as u16).collect();
+        let runs = encoded_u16_runs(&high_density, RunLengthWidth::U32);
+        assert_eq!(LazyLevels::select_plan(&runs), LevelPlan::Dense);
+    }
+
+    #[test]
+    fn physical_runs_detach_from_large_encoded_frame() {
+        let levels: Vec<u16> = (0..250)
+            .flat_map(|run| std::iter::repeat_n((run % 2) as u16, 4))
+            .collect();
+        let frame = encoded_u16_frame(&levels, RunLengthWidth::U8);
+        let frame_offset = 4096;
+        let mut allocation = vec![0; frame_offset + frame.len() + 1_000_000];
+        allocation[frame_offset..frame_offset + frame.len()].copy_from_slice(frame.as_ref());
+        let frame = LanceBuffer::from(allocation).slice_with_length(frame_offset, frame.len());
+        let runs = RleDecompressor::with_run_length_width(16, RunLengthWidth::U8)
+            .decode_u16_runs(frame, levels.len() as u64)
+            .unwrap();
+
+        assert_eq!(LazyLevels::select_plan(&runs), LevelPlan::Physical);
+        let cached = LazyLevels::from_rle_runs(runs).unwrap();
+        assert!(
+            matches!(cached, LazyLevels::Runs(ref runs) if matches!(runs.as_ref(), RunStorage::Physical(_)))
+        );
+        assert_eq!(cached.len(), levels.len());
+        assert!(cached.deep_size() < 4096);
+    }
+
+    #[test]
+    fn complex_all_null_levels_reject_invalid_values_and_lengths() {
+        let invalid_levels = vec![0u16, 3];
+        for levels in [
+            LazyLevels::Dense(ScalarBuffer::from(invalid_levels.clone())),
+            physical_levels(&invalid_levels),
+            coalesced_levels(&invalid_levels),
+        ] {
+            let error = validate_complex_all_null_levels(&None, &Some(levels), 0, 2).unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("Invalid definition level 3"));
+        }
+
+        let rep = Some(LazyLevels::Dense(ScalarBuffer::from(vec![0u16; 2])));
+        let def = Some(LazyLevels::Dense(ScalarBuffer::from(vec![0u16])));
+        let error = validate_complex_all_null_levels(&rep, &def, 0, 0).unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("repetition has 2, definition has 1")
+        );
+    }
+
+    #[test]
+    fn block_levels_reject_malformed_payload_size() {
+        let block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0]),
+            bits_per_value: 16,
+            num_values: 1,
+            block_info: BlockInfo::new(),
+        });
+        let error = dense_levels_from_block(block, 1, "definition").unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("expected 2 bytes for 1 values, got 1")
+        );
+    }
+
+    #[test]
+    fn complex_all_null_level_codec_validates_rle_metadata() {
+        let encoding = pb21::CompressiveEncoding {
+            compression: Some(Compression::Rle(Box::new(pb21::Rle {
+                values: None,
+                run_lengths: Some(Box::new(ProtobufUtils21::flat(8, None))),
+            }))),
+        };
+
+        let error = LevelCodec::try_new(Some(&encoding), &DefaultDecompressionStrategy::default())
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("RLE compression missing values encoding")
         );
     }
 
