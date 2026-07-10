@@ -178,15 +178,13 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
     .unwrap()
 }
 
-// Evaluates a "when matched" physical filter expression against `matched` and returns only
-// the rows where the condition is true.
+// Evaluates a "when matched" physical filter against `matched` and returns only the rows
+// where the condition is true.
 //
-// The expression is compiled against the "combined schema" (a `source` struct and a
-// `target` struct), so `matched` is first reshaped into that layout via `unzip_batch`. A
-// trailing row address column, present when the source uses a partial schema and row
-// addresses are tracked for the write, is not part of the combined schema. It is
-// projected off before unzipping and left in place in the returned batch, otherwise
-// `unzip_batch`'s odd-column-count invariant would be violated.
+// The filter is compiled against the combined schema, so `matched` is reshaped via
+// `unzip_batch` first. A trailing row address column (present for partial-schema sources
+// that track row addresses) is projected off before unzipping to satisfy `unzip_batch`'s
+// odd-column-count invariant, and left in place in the returned batch.
 fn filter_matched_by_condition(
     matched: RecordBatch,
     schema: &Schema,
@@ -2711,15 +2709,12 @@ impl Merger {
     // Returns 0, 1, or 2 batches
     // Potentially updates (as a side-effect) the deleted rows vec
     //
-    // For `Delete`/`DeleteIf`/`DeleteIfExpr`, matched rows are removed, not rewritten:
-    // their row ids are recorded for the commit to delete and no replacement batch is
-    // emitted. A source with duplicate keys matches the same target row more than once.
-    // The same `source_dedupe_behavior` policy applies as for updates, so a duplicate
-    // either aborts (`Fail`) or is skipped and counted once (`FirstSeen`), and the commit
-    // deletes the row a single time regardless. For `DeleteIf`/`DeleteIfExpr`,
-    // `match_filter_expr` narrows the matched rows down to those where the condition is
-    // true before any of that accounting happens, so matched rows failing the condition
-    // are left untouched.
+    // For `Delete`/`DeleteIf`/`DeleteIfExpr`, matched rows are removed rather than
+    // rewritten: their row ids are recorded for the commit and no replacement batch is
+    // emitted. The same `source_dedupe_behavior` policy as for updates applies to
+    // duplicate source keys. For the conditional variants, `match_filter_expr` narrows
+    // matched rows to those where the condition is true before this accounting, so rows
+    // failing the condition are left untouched.
     async fn execute_batch(
         self,
         batch: RecordBatch,
@@ -10020,13 +10015,8 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
     /// Test WhenMatched::DeleteIf with full schema source data.
     ///
-    /// Only matched rows where the condition evaluates to true are deleted. Matched rows
-    /// where the condition is false are left untouched. The dataset has keys 1-6 with
-    /// filterme cycling A, B, A, A, B, A. The source carries keys 4, 5, 6 (matching) and
-    /// 7, 8, 9 (unmatched, not inserted) with filterme A, B, C. Target filterme for keys
-    /// 4, 5, 6 is A, B, A, so only key 6 satisfies source.filterme != target.filterme and
-    /// is deleted. Keys 4 and 5 match but fail the condition, so their value must remain
-    /// the original (1), not the source's (2).
+    /// Only matched rows where the condition is true are deleted. Matched rows that fail
+    /// the condition survive unmodified.
     #[rstest::rstest]
     #[case::legacy_stable_ids(LanceFileVersion::Legacy, true)]
     #[case::legacy_no_stable_ids(LanceFileVersion::Legacy, false)]
@@ -10122,10 +10112,8 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
     /// Test WhenMatched::DeleteIf combined with WhenNotMatched::InsertAll.
     ///
-    /// The source carries keys 4, 5, 6 (matching) and 7, 8, 9 (new, to be inserted). Only
-    /// key 6 satisfies source.filterme != target.filterme, so matched rows satisfying the
-    /// condition are deleted, unmatched rows are inserted, and matched rows failing the
-    /// condition survive unmodified.
+    /// Matched rows satisfying the condition are deleted, unmatched rows are inserted, and
+    /// matched rows failing the condition survive unmodified.
     #[rstest::rstest]
     #[case::legacy(LanceFileVersion::Legacy)]
     #[case::v2_0(LanceFileVersion::V2_0)]
@@ -10204,9 +10192,6 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
 
     /// Test WhenMatched::DeleteIf when the condition is never true. This mirrors a plain
     /// no-match delete: zero rows are deleted and the commit still succeeds.
-    ///
-    /// The source carries keys 4, 5, 6 (matching) and 7, 8, 9 (unmatched, not inserted).
-    /// The condition never holds because 'zzz' is not a valid filterme value.
     #[rstest::rstest]
     #[case::legacy(LanceFileVersion::Legacy)]
     #[case::v2_0(LanceFileVersion::V2_0)]
@@ -10313,11 +10298,8 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     }
 
     /// Test WhenMatched::DeleteIf on the slow (Merger) path, forced by a scalar index on
-    /// the join key combined with the default `use_index(true)`.
-    ///
-    /// The source matches ids 2 and 4. Only id=4's source value (999) is greater than its
-    /// target value (40), so only id=4 is deleted. Id=2 matches but fails the condition,
-    /// so it must survive unmodified.
+    /// the join key combined with the default `use_index(true)`. Only matched rows that
+    /// satisfy the condition are deleted.
     #[tokio::test]
     async fn test_indexed_merge_insert_when_matched_delete_if() {
         let initial = record_batch!(
@@ -10391,11 +10373,8 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     /// Test WhenMatched::DeleteIf on the slow path with a partial-schema (key-only)
     /// source. This forces `Merger::execute_batch` to run with `with_row_addr = true`,
     /// exercising the row address projection guard in `filter_matched_by_condition`
-    /// (see its doc comment).
-    ///
-    /// The source carries only the join key, so the source schema is a strict subset of
-    /// the target schema. The condition only references `id`, which is present in both,
-    /// so it can still be evaluated on the narrower combined schema.
+    /// (see its doc comment). The condition only references the join key, which is
+    /// present in both schemas.
     #[tokio::test]
     async fn test_indexed_merge_insert_when_matched_delete_if_partial_schema() {
         let initial = record_batch!(
@@ -10475,18 +10454,11 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     }
 
     /// Test WhenMatched::delete_if_expr on the slow (Merger) path, forced by a scalar
-    /// index on the join key. The Merger path compiles the pre-built expr against the
-    /// combined schema, where `source`/`target` are struct fields rather than relations,
-    /// so the expr must be built with struct-field access via
-    /// `datafusion_functions::core::expr_ext::FieldAccessor` (`col("source").field(...)`)
-    /// instead of the relation-qualified columns the fast path test uses. A
-    /// relation-qualified expr (`col("source.value")`) fails to resolve here with a
-    /// `FieldNotFound` error, since the combined schema only has `source` and `target` as
-    /// unqualified struct-typed columns.
-    ///
-    /// The source matches ids 2 and 4. Only id=4's source value (999) is greater than its
-    /// target value (40), so only id=4 is deleted. Id=2 matches but fails the condition,
-    /// so it must survive unmodified.
+    /// index on the join key. The Merger compiles the pre-built expr against the combined
+    /// schema where `source`/`target` are struct fields rather than relations, so the expr
+    /// must use struct-field access (`col("source").field(...)`) instead of the
+    /// relation-qualified columns the fast path uses. A relation-qualified expr fails to
+    /// resolve here with a `FieldNotFound` error.
     #[tokio::test]
     async fn test_indexed_merge_insert_when_matched_delete_if_expr_slow_path() {
         use datafusion_functions::core::expr_ext::FieldAccessor;
@@ -10562,14 +10534,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
-    /// Test WhenMatched::DeleteIf error cases: an unparsable condition surfaces the
-    /// parse error on the fast path, and a non-boolean condition surfaces the
-    /// boolean-validation error on the indexed slow path.
-    ///
-    /// Parsing is deferred until the execution path is known, so `delete_if` itself
-    /// succeeds even for an unparsable condition, and the parse error only surfaces once
-    /// the fast path plan is built. The non-boolean condition is instead caught on the
-    /// indexed slow path.
+    /// Test WhenMatched::DeleteIf error cases. Parsing is deferred until the execution
+    /// path is known, so `delete_if` succeeds even for an unparsable condition and the
+    /// parse error only surfaces when the fast path plan is built. A non-boolean condition
+    /// is caught by boolean validation on the indexed slow path.
     #[tokio::test]
     async fn test_when_matched_delete_if_errors() {
         let schema = create_test_schema();
