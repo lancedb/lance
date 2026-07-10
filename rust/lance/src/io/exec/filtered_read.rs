@@ -2365,7 +2365,9 @@ impl RowStreamRead {
             .collect::<Vec<_>>();
         let mut read_tasks = Vec::new();
         for open_task in open_tasks {
-            let mut stream = open_task.await.unwrap()?;
+            let mut stream = open_task
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))??;
             while let Some(task) = stream.try_next().await? {
                 read_tasks.push(task);
             }
@@ -2376,7 +2378,11 @@ impl RowStreamRead {
             .collect::<Vec<_>>();
         let mut read_batches = Vec::with_capacity(decode_tasks.len());
         for decode_task in decode_tasks {
-            read_batches.push(decode_task.await.unwrap()?);
+            read_batches.push(
+                decode_task
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
+            );
         }
 
         let read_schema = Arc::new(self.read_options.projection.to_arrow_schema());
@@ -2468,22 +2474,6 @@ impl RowStreamRead {
         self.attach_columns(round, read_data)
     }
 
-    /// The number of input rows gathered into each read round (and therefore
-    /// the size of each output batch, which mirrors its round).
-    ///
-    /// Resolution matches the scan path (explicit option, then the
-    /// `LANCE_DEFAULT_BATCH_SIZE` env var) except for the final fallback: a
-    /// flat [`BATCH_SIZE_FALLBACK`] instead of the scan's block-size
-    /// heuristic.  The scan heuristic sizes I/O transfers for full-column
-    /// scans; a round's per-batch cost is planning and fragment-open
-    /// overhead, which row count amortizes directly.
-    fn round_target_rows(&self) -> usize {
-        self.read_options
-            .batch_size
-            .map(|batch_size| batch_size as usize)
-            .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK))
-    }
-
     /// Coalesce the input stream into read rounds of exactly `target` rows
     /// (the final round holds the remainder).
     ///
@@ -2532,34 +2522,57 @@ impl RowStreamRead {
         self: Arc<Self>,
         input: SendableRecordBatchStream,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        let result_scheduler = self.scan_scheduler.clone();
-        let final_scheduler = self.scan_scheduler.clone();
-        let result_metrics = self.global_metrics.clone();
-        let final_metrics = self.global_metrics.clone();
-        let result_baseline = self.baseline_metrics.clone();
-        let final_baseline = self.baseline_metrics.clone();
-        Self::coalesce_rounds(input, self.round_target_rows())
+        // Rows per round (and per output batch, which mirrors its round).
+        // Resolution matches the scan path except the final fallback: a flat
+        // BATCH_SIZE_FALLBACK instead of the scan's block-size heuristic — a
+        // round's per-batch cost is planning and fragment-open overhead,
+        // which row count amortizes directly.
+        let round_target_rows = self
+            .read_options
+            .batch_size
+            .map(|batch_size| batch_size as usize)
+            .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
+        let on_result = self.clone();
+        let on_done = self.clone();
+        Self::coalesce_rounds(input, round_target_rows)
             .enumerate()
             .map(move |(round_index, round)| {
                 let round = round?;
                 let this = self.clone();
                 DataFusionResult::Ok(
-                    tokio::task::spawn(this.execute_round(round, round_index as u32))
-                        .map(|res| res.unwrap()),
+                    // SpawnedTask aborts when dropped, so cancelling the
+                    // query also cancels the in-flight rounds
+                    SpawnedTask::spawn(
+                        this.execute_round(round, round_index as u32)
+                            .in_current_span(),
+                    )
+                    .map(|res| match res {
+                        Ok(result) => result,
+                        Err(join_error) => Err(DataFusionError::External(Box::new(join_error))),
+                    }),
                 )
             })
             .boxed()
             .try_buffered(ROW_STREAM_PREFETCH_ROUNDS)
             .map(move |result| {
-                result_metrics.io_metrics.record(&result_scheduler);
-                match result_baseline.record_poll(Poll::Ready(Some(result))) {
+                on_result
+                    .global_metrics
+                    .io_metrics
+                    .record(&on_result.scan_scheduler);
+                match on_result
+                    .baseline_metrics
+                    .record_poll(Poll::Ready(Some(result)))
+                {
                     Poll::Ready(Some(result)) => result,
                     _ => unreachable!("record_poll returned a different poll state"),
                 }
             })
             .finally(move || {
-                final_baseline.done();
-                final_metrics.io_metrics.record(&final_scheduler);
+                on_done.baseline_metrics.done();
+                on_done
+                    .global_metrics
+                    .io_metrics
+                    .record(&on_done.scan_scheduler);
             })
     }
 }
@@ -5372,18 +5385,16 @@ mod tests {
                 .empty_projection()
                 .union_columns(["i"], OnMissing::Error)
                 .unwrap();
-            assert!(
-                FilteredReadExec::try_new(
-                    fixture.dataset,
-                    FilteredReadOptions::new(projection)
-                        .with_deleted_rows()
-                        .unwrap(),
-                    Some(rows_input(vec![batch])),
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("with_deleted_rows")
-            );
+            let err = FilteredReadExec::try_new(
+                fixture.dataset,
+                FilteredReadOptions::new(projection)
+                    .with_deleted_rows()
+                    .unwrap(),
+                Some(rows_input(vec![batch])),
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("with_deleted_rows"));
         }
 
         /// Construction errors: no key column, nothing to read
@@ -5400,12 +5411,9 @@ mod tests {
                 vec![Arc::new(UInt64Array::from(vec![0_u64]))],
             )
             .unwrap();
-            assert!(
-                take_plan(&fixture.dataset, rows_input(vec![batch]), &["s"])
-                    .unwrap_err()
-                    .to_string()
-                    .contains("must have a column")
-            );
+            let err = take_plan(&fixture.dataset, rows_input(vec![batch]), &["s"]).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("must have a column"));
 
             // Taking fields the input already has: nothing to read
             let with_s_schema = Arc::new(ArrowSchema::new(vec![
@@ -5420,12 +5428,10 @@ mod tests {
                 ],
             )
             .unwrap();
-            assert!(
-                take_plan(&fixture.dataset, rows_input(vec![with_s_batch]), &["s"])
-                    .unwrap_err()
-                    .to_string()
-                    .contains("nothing to read")
-            );
+            let err =
+                take_plan(&fixture.dataset, rows_input(vec![with_s_batch]), &["s"]).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains("nothing to read"));
         }
 
         /// with_new_children re-derives the row-stream source and preserves the schema
