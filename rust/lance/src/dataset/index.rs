@@ -3,7 +3,8 @@
 
 pub mod frag_reuse;
 
-use std::collections::{HashMap, HashSet};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Dataset;
@@ -47,7 +48,7 @@ impl DatasetIndexRemapper {
     async fn remap_index(
         &self,
         index: &IndexMetadata,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> Result<RemapResult> {
         remap_index(&self.dataset, &index.uuid, mapping).await
     }
@@ -57,7 +58,7 @@ impl DatasetIndexRemapper {
 impl IndexRemapper for DatasetIndexRemapper {
     async fn remap_indices(
         &self,
-        mapping: HashMap<u64, Option<u64>>,
+        mapping: RowAddrRemap,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
@@ -175,8 +176,6 @@ impl LanceIndexStoreExt for LanceIndexStore {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::dataset::WriteParams;
     use crate::index::DatasetIndexExt;
@@ -299,7 +298,7 @@ mod tests {
             .create_remapper(&dataset)
             .unwrap();
         let remapped = remapper
-            .remap_indices(HashMap::new(), &[target_fragments[0].id() as u64])
+            .remap_indices(RowAddrRemap::empty(), &[target_fragments[0].id() as u64])
             .await
             .unwrap();
 

@@ -238,6 +238,14 @@ struct ClosedShardWriterState {
     memtable_stats: MemTableStats,
 }
 
+fn collect_record_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+    reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+}
+
 #[pymethods]
 impl PyShardWriter {
     /// Write data batches to the MemWAL.
@@ -245,11 +253,7 @@ impl PyShardWriter {
     /// Accepts any PyArrow-compatible data source (RecordBatch, Table,
     /// or an Arrow stream reader).
     pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
-            .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
-        let batches: Vec<RecordBatch> = reader
-            .collect::<Result<_, _>>()
-            .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))?;
+        let batches = collect_record_batches(data)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -260,6 +264,31 @@ impl PyShardWriter {
             let guard = inner.lock().await;
             match guard.as_ref() {
                 Some(writer) => writer.put(batches).await.map(|_| ()),
+                None => Err(lance_core::Error::invalid_input(
+                    "ShardWriter is already closed",
+                )),
+            }
+        })?
+        .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))
+    }
+
+    /// Delete rows from the MemWAL by primary key.
+    ///
+    /// Accepts any PyArrow-compatible data source carrying the shard's primary
+    /// key column(s). Rust core validates that primary keys exist and builds the
+    /// tombstone rows.
+    pub fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = collect_record_batches(keys)?;
+
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let inner = self.inner.clone();
+        rt().block_on(Some(py), async move {
+            let guard = inner.lock().await;
+            match guard.as_ref() {
+                Some(writer) => writer.delete(batches).await.map(|_| ()),
                 None => Err(lance_core::Error::invalid_input(
                     "ShardWriter is already closed",
                 )),

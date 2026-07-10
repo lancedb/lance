@@ -492,6 +492,7 @@ async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments
     cleanup_data_fragments(
         &first_fragment.dataset().object_store,
         &first_fragment.dataset().base,
+        None,
         &fragments_to_cleanup,
     )
     .await;

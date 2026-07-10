@@ -13,6 +13,7 @@ use datafusion::functions::string::contains::ContainsFunc;
 use datafusion::functions_nested::array_has;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::{Column, scalar::ScalarValue};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::pin::Pin;
@@ -1102,13 +1103,26 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
 
+    /// Returns true if this index reports matches as physical row addresses
+    /// (`fragment_id << 32 | offset`) rather than row ids
+    ///
+    /// Address-domain indices (e.g. zone map, bloom filter) are built over the
+    /// `_rowaddr` column. On a dataset with stable row ids the address and
+    /// row-id domains diverge, so these results must be translated back to row
+    /// ids (via the per-fragment row-id sequences, known only at the dataset
+    /// layer) before they are combined with row-id results or handed to the
+    /// scan. The default (row-id domain) needs no translation.
+    fn results_are_row_addresses(&self) -> bool {
+        false
+    }
+
     /// Returns true if the remap operation is supported
     fn can_remap(&self) -> bool;
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex>;
 
@@ -1131,6 +1145,14 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// This returns a ScalarIndexParams that can be used to recreate an index
     /// with the same configuration on another dataset.
     fn derive_index_params(&self) -> Result<ScalarIndexParams>;
+
+    /// Global `[min, max]` of the indexed column from index metadata, without a
+    /// scan, or `None` if this index type cannot supply a sound bound. When
+    /// `Some`, the range is a superset of live values (conservative under
+    /// deletes): safe to prune with, not guaranteed tight.
+    fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        None
+    }
 }
 
 /// Abstraction over any type that can remap row IDs during index loading.

@@ -39,6 +39,8 @@ mod manifest;
 pub mod memtable;
 pub mod scanner;
 pub mod sharding;
+#[cfg(test)]
+pub(crate) mod test_util;
 pub mod util;
 mod wal;
 pub mod write;

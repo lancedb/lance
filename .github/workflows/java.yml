@@ -54,7 +54,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       matrix:
-        java-version: [11, 17, 21]
+        java-version: [11, 17, 21, 25]
     name: Build and Test with Java ${{ matrix.java-version }}
     steps:
       - name: Checkout repository
@@ -79,7 +79,13 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
           cache: "maven"
+      # Skip the format gate on Java 25: google-java-format 1.22.0 (pinned via
+      # spotless) reaches into com.sun.tools.javac internals and throws
+      # NoSuchMethodError on JDK 25's javac. No google-java-format release runs
+      # on JDK 25 without also dropping JDK 11/17 support, so we exclude 25 from
+      # the (JDK-independent, already-enforced-on-11/17/21) style check instead.
       - name: Running code style check with Java ${{ matrix.java-version }}
+        if: matrix.java-version != '25'
         working-directory: java
         run: |
           mvn spotless:check
@@ -91,4 +97,7 @@ jobs:
         env:
           LANCE_INTEGRATION_TEST: "1"
         run: |
-          mvn install
+          # spotless is also bound into the build lifecycle, so on Java 25 the
+          # format gate must be skipped here too (-Dspotless.skip=true), not just
+          # in the standalone step above.
+          mvn install ${{ matrix.java-version == '25' && '-Dspotless.skip=true' || '' }}

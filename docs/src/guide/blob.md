@@ -8,7 +8,8 @@ Blob columns support both planned full-payload reads and lazy file-like access.
     - Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
 
 
-![Blob](../images/blob.png)
+![Blob v2 overview](../images/blob-v2-overview-light.png#only-light)
+![Blob v2 overview](../images/blob-v2-overview-dark.png#only-dark)
 
 If you're unsure about whether you need a blob column in the first place (and why it's useful), read the "[when to use blob column vs. inline binary](#when-to-use-a-blob-column-vs-inline-binary)" section below.
 

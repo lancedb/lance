@@ -10,6 +10,7 @@ use arrow_array::{ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use itertools::Itertools;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
@@ -1222,7 +1223,7 @@ impl IvfSubIndex for HNSW {
 
     fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>, // we don't need the mapping here because we rebuild the graph from remapped storage
+        _mapping: &RowAddrRemap, // we don't need the mapping here because we rebuild the graph from remapped storage
         store: &impl VectorStore,
     ) -> Result<Self> {
         // We can't simply remap the row ids in the graph because the vectors are changed,

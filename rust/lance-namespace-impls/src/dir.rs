@@ -43,6 +43,7 @@ use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutM
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
+use tokio::sync::OnceCell;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
@@ -738,7 +739,7 @@ impl DirectoryNamespaceBuilder {
             Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
 
         let manifest_ns = if self.manifest_enabled {
-            match manifest::ManifestNamespace::from_directory(
+            match manifest::ManifestNamespace::open_from_directory(
                 self.root.clone(),
                 self.storage_options.clone(),
                 self.session.clone(),
@@ -757,18 +758,19 @@ impl DirectoryNamespaceBuilder {
                     // degrading to a directory-listing view that ignores it.
                     return Err(e);
                 }
-                Err(e) => {
-                    // Failed to initialize manifest namespace, fall back to directory listing only
-                    log::warn!(
-                        "Failed to initialize manifest namespace, falling back to directory listing only: {}",
-                        e
-                    );
+                Err(e) if manifest::ManifestNamespace::is_not_found_load_error(&e) => {
+                    log::debug!("Manifest namespace does not exist yet: {}", e);
                     None
                 }
+                Err(e) => return Err(e),
             }
         } else {
             None
         };
+        let manifest_cell = OnceCell::new();
+        if let Some(manifest_ns) = manifest_ns {
+            let _ = manifest_cell.set(manifest_ns);
+        }
 
         // Create credential vendor once during initialization if enabled
         let credential_vendor = if has_credential_vendor_config(&self.credential_vendor_properties)
@@ -792,8 +794,12 @@ impl DirectoryNamespaceBuilder {
             session: self.session,
             object_store,
             base_path,
-            manifest_ns,
+            manifest_ns: manifest_cell,
+            write_manifest_ns: OnceCell::new(),
+            manifest_enabled: self.manifest_enabled,
             dir_listing_enabled: self.dir_listing_enabled,
+            inline_optimization_enabled: self.inline_optimization_enabled,
+            commit_retries: self.commit_retries,
             dir_listing_to_manifest_migration_enabled: self
                 .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
@@ -870,8 +876,12 @@ pub struct DirectoryNamespace {
     session: Option<Arc<Session>>,
     object_store: Arc<ObjectStore>,
     base_path: Path,
-    manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
+    manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
+    write_manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
+    manifest_enabled: bool,
     dir_listing_enabled: bool,
+    inline_optimization_enabled: bool,
+    commit_retries: Option<u32>,
     /// When true, root-level table operations check the manifest first before
     /// falling back to directory listing. When false, root-level tables skip
     /// the manifest check and use directory listing directly.
@@ -983,6 +993,52 @@ impl TransactionAlteration {
 }
 
 impl DirectoryNamespace {
+    fn manifest_ns_for_read(&self) -> Option<&Arc<manifest::ManifestNamespace>> {
+        self.write_manifest_ns
+            .get()
+            .or_else(|| self.manifest_ns.get())
+    }
+
+    async fn manifest_ns_for_write(&self) -> Result<Option<Arc<manifest::ManifestNamespace>>> {
+        if !self.manifest_enabled {
+            return Ok(None);
+        }
+
+        let manifest_ns = self
+            .write_manifest_ns
+            .get_or_try_init(|| async {
+                manifest::ManifestNamespace::from_directory(
+                    self.root.clone(),
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                    self.object_store.clone(),
+                    self.base_path.clone(),
+                    self.dir_listing_enabled,
+                    self.inline_optimization_enabled,
+                    self.commit_retries,
+                )
+                .await
+                .map(Arc::new)
+            })
+            .await?;
+        Ok(Some(manifest_ns.clone()))
+    }
+
+    fn child_namespace_requires_manifest_error(&self) -> Error {
+        if self.manifest_enabled {
+            NamespaceError::NamespaceNotFound {
+                message: "Child namespace reads require an existing __manifest dataset".to_string(),
+            }
+            .into()
+        } else {
+            NamespaceError::Unsupported {
+                message: "Child namespaces are only supported when manifest mode is enabled"
+                    .to_string(),
+            }
+            .into()
+        }
+    }
+
     /// Apply pagination to a list of table names
     ///
     /// Sorts the list alphabetically and applies pagination using page_token (start_after) and limit.
@@ -1634,10 +1690,11 @@ impl DirectoryNamespace {
         request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
         let skip_manifest_for_root = self.dir_listing_enabled
             && is_root_level
             && !self.dir_listing_to_manifest_migration_enabled;
-        if let Some(ref manifest_ns) = self.manifest_ns
+        if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !skip_manifest_for_root
         {
             match manifest_ns.describe_table(request.clone()).await {
@@ -1667,9 +1724,16 @@ impl DirectoryNamespace {
                 Err(e) => return Err(e),
             }
         }
+        if is_child_table {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
+        if !self.dir_listing_enabled {
+            return Err(NamespaceError::TableNotFound { message: table_id }.into());
+        }
+
         let table_uri = self.table_full_uri(&table_name);
 
         // Atomically check table existence and deregistration status
@@ -2525,7 +2589,7 @@ impl DirectoryNamespace {
     /// - Manifest registration fails
     pub async fn migrate(&self) -> Result<usize> {
         // We only care about tables in the root namespace
-        let Some(ref manifest_ns) = self.manifest_ns else {
+        let Some(manifest_ns) = self.manifest_ns_for_write().await? else {
             return Ok(0); // No manifest, nothing to migrate
         };
 
@@ -2797,10 +2861,13 @@ impl LanceNamespace for DirectoryNamespace {
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
         self.record_op("list_namespaces");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.list_namespaces(request).await;
         }
 
+        if request.id.as_ref().is_some_and(|id| !id.is_empty()) {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
         Self::validate_root_namespace_id(&request.id)?;
         Ok(ListNamespacesResponse::new(vec![]))
     }
@@ -2810,10 +2877,13 @@ impl LanceNamespace for DirectoryNamespace {
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
         self.record_op("describe_namespace");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.describe_namespace(request).await;
         }
 
+        if request.id.as_ref().is_some_and(|id| !id.is_empty()) {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
         Self::validate_root_namespace_id(&request.id)?;
         #[allow(clippy::needless_update)]
         Ok(DescribeNamespaceResponse {
@@ -2827,7 +2897,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
         self.record_op("create_namespace");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.create_namespace(request).await;
         }
 
@@ -2847,7 +2917,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
         self.record_op("drop_namespace");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.drop_namespace(request).await;
         }
 
@@ -2867,7 +2937,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
         self.record_op("namespace_exists");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.namespace_exists(request).await;
         }
 
@@ -2875,11 +2945,7 @@ impl LanceNamespace for DirectoryNamespace {
             return Ok(());
         }
 
-        Err(NamespaceError::NamespaceNotFound {
-            message: "Child namespaces are only supported when manifest mode is enabled"
-                .to_string(),
-        }
-        .into())
+        Err(self.child_namespace_requires_manifest_error())
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -2893,31 +2959,30 @@ impl LanceNamespace for DirectoryNamespace {
 
         // For child namespaces, always delegate to manifest (if enabled)
         if !namespace_id.is_empty() {
-            if let Some(ref manifest_ns) = self.manifest_ns {
+            if let Some(manifest_ns) = self.manifest_ns_for_read() {
                 return manifest_ns.list_tables(request).await;
             }
-            return Err(NamespaceError::Unsupported {
-                message: "Child namespaces are only supported when manifest mode is enabled"
-                    .to_string(),
-            }
-            .into());
+            return Err(self.child_namespace_requires_manifest_error());
         }
 
         // When only manifest is enabled (no directory listing), delegate directly to manifest
-        if let Some(ref manifest_ns) = self.manifest_ns
+        if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !self.dir_listing_enabled
         {
             return manifest_ns.list_tables(request).await;
         }
+        if !self.dir_listing_enabled {
+            return Ok(ListTablesResponse::new(vec![]));
+        }
 
         // When both manifest and directory listing are enabled with migration mode,
         // we need to merge and deduplicate
-        let mut tables = if self.manifest_ns.is_some()
+        let mut tables = if self.manifest_ns_for_read().is_some()
             && self.dir_listing_enabled
             && self.dir_listing_to_manifest_migration_enabled
         {
             // Get all manifest table locations (for deduplication)
-            let manifest_locations = if let Some(ref manifest_ns) = self.manifest_ns {
+            let manifest_locations = if let Some(manifest_ns) = self.manifest_ns_for_read() {
                 manifest_ns.list_manifest_table_locations().await?
             } else {
                 std::collections::HashSet::new()
@@ -2927,7 +2992,7 @@ impl LanceNamespace for DirectoryNamespace {
             let mut manifest_request = request.clone();
             manifest_request.limit = None;
             manifest_request.page_token = None;
-            let manifest_tables = if let Some(ref manifest_ns) = self.manifest_ns {
+            let manifest_tables = if let Some(manifest_ns) = self.manifest_ns_for_read() {
                 let manifest_response = manifest_ns.list_tables(manifest_request).await?;
                 manifest_response.tables
             } else {
@@ -2975,10 +3040,11 @@ impl LanceNamespace for DirectoryNamespace {
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
         self.record_op("table_exists");
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
         let skip_manifest_for_root = self.dir_listing_enabled
             && is_root_level
             && !self.dir_listing_to_manifest_migration_enabled;
-        if let Some(ref manifest_ns) = self.manifest_ns
+        if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !skip_manifest_for_root
         {
             match manifest_ns.table_exists(request.clone()).await {
@@ -2994,9 +3060,15 @@ impl LanceNamespace for DirectoryNamespace {
                 Err(e) => return Err(e),
             }
         }
+        if is_child_table {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
+        if !self.dir_listing_enabled {
+            return Err(NamespaceError::TableNotFound { message: table_id }.into());
+        }
 
         // Atomically check table existence and deregistration status
         let status = self.check_table_status(&table_name).await;
@@ -3020,7 +3092,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
         self.record_op("drop_table");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.drop_table(request).await;
         }
 
@@ -3050,7 +3122,7 @@ impl LanceNamespace for DirectoryNamespace {
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
         self.record_op("create_table");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.create_table(request, request_data).await;
         }
 
@@ -3097,7 +3169,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         self.record_op("declare_table");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
             if let Some(ref location) = response.location {
                 // For backwards compatibility, only skip vending credentials when explicitly set to false
@@ -3188,7 +3260,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<lance_namespace::models::RegisterTableResponse> {
         self.record_op("register_table");
         // If manifest is enabled, delegate to manifest namespace
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return LanceNamespace::register_table(manifest_ns.as_ref(), request).await;
         }
 
@@ -3205,7 +3277,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<lance_namespace::models::DeregisterTableResponse> {
         self.record_op("deregister_table");
         // If manifest is enabled, delegate to manifest namespace
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return LanceNamespace::deregister_table(manifest_ns.as_ref(), request).await;
         }
 
@@ -3263,7 +3335,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAddColumnsRequest,
     ) -> Result<AlterTableAddColumnsResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_add_columns(request).await;
         }
 
@@ -3321,7 +3393,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAlterColumnsRequest,
     ) -> Result<AlterTableAlterColumnsResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_alter_columns(request).await;
         }
 
@@ -3371,7 +3443,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableDropColumnsRequest,
     ) -> Result<AlterTableDropColumnsResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_drop_columns(request).await;
         }
 
@@ -5572,6 +5644,43 @@ mod tests {
         )
         .unwrap();
         create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    async fn create_legacy_manifest_without_primary_key_metadata(root: &str) {
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("object_id", DataType::Utf8, false),
+            Field::new("object_type", DataType::Utf8, false),
+            Field::new("location", DataType::Utf8, true),
+            Field::new("metadata", DataType::Utf8, true),
+            Field::new(
+                "base_objects",
+                DataType::List(Arc::new(Field::new("object_id", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::new_empty(schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(Box::new(reader), &format!("{}/__manifest", root), None)
+            .await
+            .unwrap();
+    }
+
+    async fn manifest_has_primary_key_metadata(root: &str) -> bool {
+        let dataset = Dataset::open(&format!("{}/__manifest", root))
+            .await
+            .unwrap();
+        dataset
+            .schema()
+            .field("object_id")
+            .map(|field| {
+                field
+                    .metadata
+                    .contains_key(lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+            })
+            .unwrap_or(false)
     }
 
     fn create_vector_table_ipc_data() -> Vec<u8> {
@@ -12433,6 +12542,109 @@ mod tests {
              without migration mode, but got {}",
             count
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_and_root_reads_do_not_create_manifest() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_path = std::path::Path::new(temp_path).join("__manifest");
+
+        let dir_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        create_scalar_table(&dir_only_ns, "catalog").await;
+        assert!(!manifest_path.exists());
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        assert!(!manifest_path.exists());
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["catalog".to_string()]);
+        namespace.table_exists(exists_req).await.unwrap();
+        assert!(!manifest_path.exists());
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["catalog".to_string()]);
+        namespace.describe_table(describe_req).await.unwrap();
+        assert!(!manifest_path.exists());
+
+        let list_response = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(list_response.tables, vec!["catalog".to_string()]);
+        assert!(!manifest_path.exists());
+
+        let mut list_namespaces_req = ListNamespacesRequest::new();
+        list_namespaces_req.id = Some(vec!["workspace".to_string()]);
+        let err = namespace
+            .list_namespaces(list_namespaces_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let err = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec!["workspace".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let mut child_describe_req = DescribeTableRequest::new();
+        child_describe_req.id = Some(vec!["workspace".to_string(), "catalog".to_string()]);
+        let err = namespace
+            .describe_table(child_describe_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let mut child_exists_req = TableExistsRequest::new();
+        child_exists_req.id = Some(vec!["workspace".to_string(), "catalog".to_string()]);
+        let err = namespace.table_exists(child_exists_req).await.unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+        assert!(manifest_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_updates_read_opened_legacy_manifest() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        create_legacy_manifest_without_primary_key_metadata(temp_path).await;
+        assert!(!manifest_has_primary_key_metadata(temp_path).await);
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        assert!(!manifest_has_primary_key_metadata(temp_path).await);
+
+        let migrated = namespace.migrate().await.unwrap();
+        assert_eq!(migrated, 0);
+        assert!(manifest_has_primary_key_metadata(temp_path).await);
     }
 
     #[tokio::test]

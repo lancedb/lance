@@ -509,7 +509,7 @@ async fn build_and_write_hnsw(
     let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
     writer.write_record_batch(batch).await?;
-    writer.finish_with_metadata(&metadata).await
+    Ok(writer.finish_with_metadata(&metadata).await?.num_rows as usize)
 }
 
 async fn build_and_write_pq_storage(
