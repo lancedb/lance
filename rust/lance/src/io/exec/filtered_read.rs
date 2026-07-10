@@ -353,7 +353,31 @@ impl FilteredReadStream {
         plan: FilteredReadInternalPlan,
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
+        let loaded_fragments = Self::load_all_fragments(&dataset, &options).await?;
+        let scan_scheduler = Self::make_scan_scheduler(&dataset, &options);
+        Ok(Self::new_shared(
+            dataset,
+            options,
+            global_metrics,
+            plan,
+            scan_scheduler,
+            &loaded_fragments,
+            0,
+        ))
+    }
 
+    /// Shared with the row-stream path, which injects its per-query
+    /// scheduler, cached fragments, and a per-batch priority offset
+    #[allow(clippy::too_many_arguments)]
+    fn new_shared(
+        dataset: Arc<Dataset>,
+        options: FilteredReadOptions,
+        global_metrics: Arc<FilteredReadGlobalMetrics>,
+        plan: FilteredReadInternalPlan,
+        scan_scheduler: Arc<ScanScheduler>,
+        loaded_fragments: &[LoadedFragment],
+        priority_offset: u32,
+    ) -> Self {
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -361,8 +385,6 @@ impl FilteredReadStream {
             .fragment_readahead
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             .max(1);
-
-        let loaded_fragments = Self::load_all_fragments(&dataset, &options).await?;
 
         log::debug!(
             "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
@@ -373,19 +395,22 @@ impl FilteredReadStream {
 
         let output_schema = Arc::new(options.projection.to_arrow_schema());
 
-        let scan_scheduler = Self::make_scan_scheduler(&dataset, &options);
-
         // Get scan_range_after_filter from the plan
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
 
         // Convert plan to scoped fragments for I/O
-        let scoped_fragments = Self::plan_to_scoped_fragments(
+        let mut scoped_fragments = Self::plan_to_scoped_fragments(
             &plan,
-            &loaded_fragments,
+            loaded_fragments,
             &dataset,
             &options,
             scan_scheduler.clone(),
         );
+        if priority_offset != 0 {
+            for scoped in &mut scoped_fragments {
+                scoped.priority = scoped.priority.saturating_add(priority_offset);
+            }
+        }
 
         let global_metrics_clone = global_metrics.clone();
 
@@ -404,7 +429,7 @@ impl FilteredReadStream {
             .buffered(fragment_readahead);
         let task_stream = fragment_streams.try_flatten().boxed();
 
-        Ok(Self {
+        Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
             scan_scheduler,
@@ -412,7 +437,17 @@ impl FilteredReadStream {
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
             scan_range_after_filter,
-        })
+        }
+    }
+
+    /// Drain the entire read into batches (used by the row-stream path,
+    /// which is the stream's only consumer and records metrics per batch)
+    async fn collect_all(&self, decode_parallelism: usize) -> Result<Vec<RecordBatch>> {
+        let mut task_stream = self.task_stream.lock().await;
+        (&mut *task_stream)
+            .try_buffered(decode_parallelism)
+            .try_collect()
+            .await
     }
 
     /// Load the metadata of the scoped fragments, or every dataset fragment
@@ -1551,7 +1586,7 @@ enum RowSelector {
     /// A stream of rows: record batches with a `_rowid`/`_rowaddr` column.
     /// Row order, duplicates, and the stream's own columns are preserved in
     /// the output ([`TakeExec`](super::TakeExec)'s contract).
-    RowStream(Box<RowStreamSource>),
+    RowStream(Arc<RowStreamSource>),
 }
 
 impl RowSelector {
@@ -1783,7 +1818,7 @@ impl FilteredReadExec {
             options,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-            input: RowSelector::RowStream(Box::new(RowStreamSource {
+            input: RowSelector::RowStream(Arc::new(RowStreamSource {
                 plan: input,
                 key_column,
                 read_options,
@@ -2076,30 +2111,23 @@ impl FilteredReadExec {
 
     fn execute_row_stream(
         &self,
-        source: &RowStreamSource,
+        source: &Arc<RowStreamSource>,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = source.plan.execute(partition, context)?;
         let dataset = self.dataset.clone();
-        let read_options = source.read_options.clone();
-        let key_column = source.key_column;
+        let source = source.clone();
         let carried_schema =
             Self::carried_schema(source.plan.schema().as_ref(), &self.options.projection);
-        let new_fields_schema = source.new_fields_schema.clone();
         let output_schema = self.schema();
         let metrics = self.metrics.clone();
 
-        // ScanScheduler::new launches the I/O scheduler in the background and
-        // we aren't allowed to do work in `execute`, so defer creation of the
-        // read until first polled.
         let lazy_stream = futures::stream::once(async move {
             let row_stream_read = Arc::new(RowStreamRead::new(
                 dataset,
-                read_options,
-                key_column,
+                source,
                 carried_schema,
-                new_fields_schema,
                 output_schema,
                 &metrics,
                 partition,
@@ -2126,15 +2154,9 @@ const ROW_STREAM_PREFETCH_ROUNDS: usize = 64;
 /// in (preserving order, duplicates, and carried columns).
 struct RowStreamRead {
     dataset: Arc<Dataset>,
-    /// Node options whose projection is the fields to read plus the key column
-    read_options: FilteredReadOptions,
-    /// The input column identifying rows: [`ROW_ID`] or [`ROW_ADDR`]
-    key_column: &'static str,
+    source: Arc<RowStreamSource>,
     /// The input columns that carry through to the output
     carried_schema: SchemaRef,
-    /// Arrow schema of what the read contributes to the output, used to
-    /// strip the key column from the read data before the merge
-    new_fields_schema: SchemaRef,
     output_schema: SchemaRef,
     scan_scheduler: Arc<ScanScheduler>,
     /// Fragment metadata, loaded on the first batch and reused afterwards
@@ -2144,24 +2166,20 @@ struct RowStreamRead {
 }
 
 impl RowStreamRead {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         dataset: Arc<Dataset>,
-        read_options: FilteredReadOptions,
-        key_column: &'static str,
+        source: Arc<RowStreamSource>,
         carried_schema: SchemaRef,
-        new_fields_schema: SchemaRef,
         output_schema: SchemaRef,
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
     ) -> Self {
-        let scan_scheduler = FilteredReadStream::make_scan_scheduler(&dataset, &read_options);
+        let scan_scheduler =
+            FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
         Self {
             dataset,
-            read_options,
-            key_column,
+            source,
             carried_schema,
-            new_fields_schema,
             output_schema,
             scan_scheduler,
             loaded_fragments: OnceCell::new(),
@@ -2173,7 +2191,7 @@ impl RowStreamRead {
     async fn load_fragments(&self) -> Result<&Vec<LoadedFragment>> {
         self.loaded_fragments
             .get_or_try_init(|| {
-                FilteredReadStream::load_all_fragments(&self.dataset, &self.read_options)
+                FilteredReadStream::load_all_fragments(&self.dataset, &self.source.read_options)
             })
             .await
     }
@@ -2214,16 +2232,18 @@ impl RowStreamRead {
         batch: &'a RecordBatch,
         producer: &str,
     ) -> DataFusionResult<&'a arrow_array::PrimitiveArray<UInt64Type>> {
-        let keys = batch.column_by_name(self.key_column).ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "the row-stream {} is missing the '{}' column",
-                producer, self.key_column
-            ))
-        })?;
+        let keys = batch
+            .column_by_name(self.source.key_column)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "the row-stream {} is missing the '{}' column",
+                    producer, self.source.key_column
+                ))
+            })?;
         keys.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
             DataFusionError::Internal(format!(
                 "expected the row-stream column '{}' to be UInt64 but it was {}",
-                self.key_column,
+                self.source.key_column,
                 keys.data_type()
             ))
         })
@@ -2243,7 +2263,7 @@ impl RowStreamRead {
         drop(compute_timer);
 
         let fragments = self.load_fragments().await?;
-        if self.key_column == ROW_ADDR {
+        if self.source.key_column == ROW_ADDR {
             // The mask path would misread addresses as row ids on a
             // stable-row-id dataset; addresses resolve directly instead
             Ok(Self::plan_round_from_addresses(&round_keys, fragments))
@@ -2255,76 +2275,39 @@ impl RowStreamRead {
             Ok(FilteredReadStream::plan_scan(
                 fragments,
                 &Some(evaluated_index),
-                &self.read_options,
+                &self.source.read_options,
             ))
         }
     }
 
-    /// Read the round's planned ranges, returning the rows in storage order,
-    /// deduplicated, with the key column included
+    /// Read the round's planned ranges through the same executor as a scan,
+    /// returning the rows in storage order, deduplicated, with the key
+    /// column included
     async fn read_round(
         &self,
         internal_plan: FilteredReadInternalPlan,
         round_index: u32,
     ) -> DataFusionResult<RecordBatch> {
         let fragments = self.load_fragments().await?;
-        let mut scoped_fragments = FilteredReadStream::plan_to_scoped_fragments(
-            &internal_plan,
-            fragments,
-            &self.dataset,
-            &self.read_options,
+        // I/O priority: earlier rounds strictly first (output emits in round
+        // order), fragments keep dataset order within a round
+        let priority_offset = round_index.saturating_mul(fragments.len() as u32);
+        let read = FilteredReadStream::new_shared(
+            self.dataset.clone(),
+            self.source.read_options.clone(),
+            self.global_metrics.clone(),
+            internal_plan,
             self.scan_scheduler.clone(),
+            fragments,
+            priority_offset,
         );
-        let num_fragments = fragments.len() as u32;
-        for scoped in &mut scoped_fragments {
-            // I/O priority: earlier rounds strictly first (output emits in
-            // round order), fragments keep dataset order within a round
-            scoped.priority = scoped
-                .priority
-                .saturating_add(round_index.saturating_mul(num_fragments));
-            scoped.batch_size = u32::MAX;
-        }
-
-        // Spawn per fragment: the CPU part of an open serializes under plain
-        // future concurrency (collecting into Vecs avoids FnOnce false
-        // positives from rustc)
-        let open_tasks = scoped_fragments
-            .into_iter()
-            .map(|scoped| {
-                let global_metrics = self.global_metrics.clone();
-                SpawnedTask::spawn(
-                    async move {
-                        FilteredReadStream::read_fragment(scoped, global_metrics, None).await
-                    }
-                    .in_current_span(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut read_tasks = Vec::new();
-        for open_task in open_tasks {
-            let mut stream = open_task
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))??;
-            while let Some(task) = stream.try_next().await? {
-                read_tasks.push(task);
-            }
-        }
-        let decode_tasks = read_tasks
-            .into_iter()
-            .map(|task| SpawnedTask::spawn(task.in_current_span()))
-            .collect::<Vec<_>>();
-        let mut read_batches = Vec::with_capacity(decode_tasks.len());
-        for decode_task in decode_tasks {
-            read_batches.push(
-                decode_task
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
-            );
-        }
-
-        let read_schema = Arc::new(self.read_options.projection.to_arrow_schema());
+        let decode_parallelism = match self.source.read_options.threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,
+            FilteredReadThreadingMode::MultiplePartitions(n) => n,
+        };
+        let read_batches = read.collect_all(decode_parallelism.max(1)).await?;
         Ok(arrow::compute::concat_batches(
-            &read_schema,
+            &read.output_schema,
             read_batches.iter(),
         )?)
     }
@@ -2346,7 +2329,7 @@ impl RowStreamRead {
             && read_data.num_rows() == round.num_rows()
             && read_keys.values() == keys.values()
         {
-            let new_data = read_data.project_by_schema(self.new_fields_schema.as_ref())?;
+            let new_data = read_data.project_by_schema(self.source.new_fields_schema.as_ref())?;
             let carried = round.project_by_schema(self.carried_schema.as_ref())?;
             return Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?);
         }
@@ -2387,7 +2370,7 @@ impl RowStreamRead {
 
         let new_data =
             arrow_select::take::take_record_batch(&read_data, &UInt32Array::from(indices))?;
-        let new_data = new_data.project_by_schema(self.new_fields_schema.as_ref())?;
+        let new_data = new_data.project_by_schema(self.source.new_fields_schema.as_ref())?;
         let carried = round.project_by_schema(self.carried_schema.as_ref())?;
         Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
@@ -2451,6 +2434,7 @@ impl RowStreamRead {
         // Rows per round; the flat fallback (instead of the scan's block-size
         // heuristic) fits a round's cost, which is planning overhead
         let round_target_rows = self
+            .source
             .read_options
             .batch_size
             .map(|batch_size| batch_size as usize)
