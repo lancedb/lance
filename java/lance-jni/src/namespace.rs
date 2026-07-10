@@ -2533,9 +2533,9 @@ fn create_rest_namespace_internal(
         builder = builder.context_provider(Arc::new(java_provider));
     }
 
-    let namespace = builder.build().map_err(|e| {
-        Error::runtime_error(format!("Failed to build RestNamespace: {}", e))
-    })?;
+    let namespace = builder
+        .build()
+        .map_err(|e| Error::runtime_error(format!("Failed to build RestNamespace: {}", e)))?;
 
     RT.block_on(namespace.warm_up_auth())
         .map_err(|e| Error::runtime_error(format!("Auth initialization failed: {}", e)))?;

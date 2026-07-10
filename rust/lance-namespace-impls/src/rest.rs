@@ -699,6 +699,11 @@ impl RestNamespace {
         }
     }
 
+    /// Eagerly runs the configured [`RestAuthProvider::initialize`] for
+    /// fail-fast credential validation at connect time.
+    ///
+    /// Invoked from `connect()` and the Python/Java bindings. It is a no-op when
+    /// no authentication provider is configured.
     pub async fn warm_up_auth(&self) -> Result<()> {
         if let Some(auth) = &self.rest_client.auth_provider {
             auth.initialize().await?;

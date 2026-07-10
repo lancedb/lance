@@ -19,10 +19,15 @@ use lance_namespace::error::NamespaceError;
 use tokio::sync::OnceCell;
 use url::Url;
 
+/// Property key for the AWS region used when signing (required).
 pub const REGION_KEY: &str = "rest.auth.sigv4.region";
+/// Property key for the AWS service name to sign for (defaults to `execute-api`).
 pub const SERVICE_KEY: &str = "rest.auth.sigv4.service";
+/// Property key for an explicit AWS access key id (optional; overrides the default chain).
 pub const ACCESS_KEY_ID_KEY: &str = "rest.auth.sigv4.access-key-id";
+/// Property key for an explicit AWS secret access key (optional; paired with [`ACCESS_KEY_ID_KEY`]).
 pub const SECRET_ACCESS_KEY_KEY: &str = "rest.auth.sigv4.secret-access-key";
+/// Property key for an optional AWS session token (used with explicit credentials).
 pub const SESSION_TOKEN_KEY: &str = "rest.auth.sigv4.session-token";
 const DEFAULT_SERVICE: &str = "execute-api";
 
@@ -40,6 +45,12 @@ impl Clock for SystemClock {
     }
 }
 
+/// AWS SigV4 authentication provider for REST Namespace requests.
+///
+/// Signs each request with AWS Signature Version 4. Credentials are resolved
+/// from explicit `rest.auth.sigv4.*` properties when provided (see
+/// [`from_properties`](Self::from_properties)), otherwise from the standard AWS
+/// default credential chain (environment, profile, IMDS).
 pub struct SigV4AuthProvider {
     region: String,
     service: String,
@@ -68,6 +79,17 @@ impl std::fmt::Debug for SigV4AuthProvider {
 }
 
 impl SigV4AuthProvider {
+    /// Builds a provider from `rest.auth.sigv4.*` properties.
+    ///
+    /// [`REGION_KEY`] is required; [`SERVICE_KEY`] defaults to `execute-api`.
+    /// Explicit static credentials are used when both [`ACCESS_KEY_ID_KEY`] and
+    /// [`SECRET_ACCESS_KEY_KEY`] are set (with an optional [`SESSION_TOKEN_KEY`]);
+    /// otherwise the AWS default credential chain is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NamespaceError::InvalidInput`] if the region is missing, or if
+    /// only one of the access-key-id / secret-access-key pair is set.
     pub fn from_properties(properties: &HashMap<String, String>) -> Result<Self> {
         let region =
             properties
@@ -111,11 +133,13 @@ impl SigV4AuthProvider {
         })
     }
 
+    /// Overrides the time source used for signing (primarily for tests).
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
     }
 
+    /// Injects an explicit credentials provider, bypassing the AWS default chain.
     pub fn with_credentials_provider(self, provider: SharedCredentialsProvider) -> Self {
         let cell = OnceCell::new();
         cell.set(provider)
