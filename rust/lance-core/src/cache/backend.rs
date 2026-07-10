@@ -134,7 +134,29 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Backends that cannot support this cheaply may leave it as a no-op;
     /// doing so only means those entries are evicted later by the normal
     /// capacity-based eviction policy instead of immediately.
-    async fn invalidate_key_prefix(&self, _prefix: &str, _key_prefix: &str) {}
+    ///
+    /// Defaults to a single-element call to
+    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes); backends
+    /// only need to implement one of the two.
+    async fn invalidate_key_prefix(&self, prefix: &str, key_prefix: &str) {
+        self.invalidate_key_prefixes(prefix, std::slice::from_ref(&key_prefix.to_owned()))
+            .await;
+    }
+
+    /// Like [`invalidate_key_prefix`](Self::invalidate_key_prefix), but
+    /// removes entries matching *any* of `key_prefixes` in a single pass
+    /// over the cache, instead of one pass per prefix.
+    ///
+    /// Prefer this over calling [`invalidate_key_prefix`](Self::invalidate_key_prefix)
+    /// in a loop when invalidating many keys at once (e.g. several dataset
+    /// versions' worth of cache entries after a cleanup run) — each call to
+    /// either method registers its own scan over the backend's entries, so
+    /// batching avoids `O(prefixes)` scans.
+    ///
+    /// Backends that cannot support this cheaply may leave it as a no-op;
+    /// doing so only means those entries are evicted later by the normal
+    /// capacity-based eviction policy instead of immediately.
+    async fn invalidate_key_prefixes(&self, _prefix: &str, _key_prefixes: &[String]) {}
 
     /// Remove all entries.
     async fn clear(&self);

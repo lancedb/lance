@@ -247,9 +247,42 @@ impl LanceCache {
     /// `invalidate_key_prefix("manifest/5")` removes both a `"manifest/5"`
     /// entry and a `"manifest/5/{e_tag}"` entry, but leaves `"manifest/50"`
     /// untouched.
+    ///
+    /// To invalidate many keys at once (e.g. several dataset versions after
+    /// a cleanup run), prefer [`Self::invalidate_key_prefixes`], which does
+    /// so in a single pass over the cache instead of one pass per key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::{borrow::Cow, sync::Arc};
+    /// # use lance_core::cache::{CacheKey, LanceCache};
+    /// # struct ManifestKey(u64);
+    /// # impl CacheKey for ManifestKey {
+    /// #     type ValueType = Vec<i32>;
+    /// #     fn key(&self) -> Cow<'_, str> { format!("manifest/{}", self.0).into() }
+    /// #     fn type_name() -> &'static str { "Manifest" }
+    /// # }
+    /// # async fn example() {
+    /// let cache = LanceCache::with_capacity(1024);
+    /// cache.insert_with_key(&ManifestKey(5), Arc::new(vec![1])).await;
+    /// cache.invalidate_key_prefix("manifest/5").await;
+    /// assert!(cache.get_with_key(&ManifestKey(5)).await.is_none());
+    /// # }
+    /// ```
     pub async fn invalidate_key_prefix(&self, key_prefix: &str) {
         self.cache
             .invalidate_key_prefix(&self.prefix, key_prefix)
+            .await;
+    }
+
+    /// Like [`Self::invalidate_key_prefix`], but removes entries matching
+    /// *any* of `key_prefixes` in a single pass over the cache, instead of
+    /// one pass per prefix. Prefer this when invalidating many keys at
+    /// once.
+    pub async fn invalidate_key_prefixes(&self, key_prefixes: &[String]) {
+        self.cache
+            .invalidate_key_prefixes(&self.prefix, key_prefixes)
             .await;
     }
 
@@ -949,6 +982,56 @@ mod tests {
         assert_eq!(
             remaining,
             BTreeSet::from(["manifest/50".to_string(), "txn/5".to_string()])
+        );
+    }
+
+    /// `invalidate_key_prefixes` removes entries matching any of several
+    /// prefixes in one call -- the batched form `invalidate_stale_version_caches`
+    /// (in `dataset/cleanup.rs`) uses so a cleanup run touching many
+    /// versions issues a handful of cache scans instead of one per
+    /// version per key type.
+    #[tokio::test]
+    async fn test_cache_invalidate_key_prefixes() {
+        let cache = LanceCache::with_capacity(1000);
+
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("manifest/5"), Arc::new(vec![1]))
+            .await;
+        cache
+            .insert_with_key(
+                &TestKey::<Vec<i32>>::new("txn/5/etag-abc"),
+                Arc::new(vec![2]),
+            )
+            .await;
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("manifest/7"), Arc::new(vec![3]))
+            .await;
+        // Must not be removed: neither prefix nor a "/"-suffixed extension of one.
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("manifest/50"), Arc::new(vec![4]))
+            .await;
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new("manifest/8"), Arc::new(vec![5]))
+            .await;
+        assert_eq!(cache.keys().await.unwrap().count(), 5);
+
+        cache
+            .invalidate_key_prefixes(&[
+                "manifest/5".to_string(),
+                "txn/5".to_string(),
+                "manifest/7".to_string(),
+            ])
+            .await;
+
+        let remaining: BTreeSet<String> = cache
+            .keys()
+            .await
+            .unwrap()
+            .map(|k| k.key().to_string())
+            .collect();
+        assert_eq!(
+            remaining,
+            BTreeSet::from(["manifest/50".to_string(), "manifest/8".to_string()])
         );
     }
 

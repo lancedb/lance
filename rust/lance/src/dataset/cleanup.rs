@@ -520,28 +520,37 @@ impl<'a> CleanupTask<'a> {
     /// capacity-based policy. See
     /// https://github.com/lance-format/lance/issues/1983 for follow-up.
     async fn invalidate_stale_version_caches(&self, stale_versions: &[u64]) {
-        for version in stale_versions {
-            self.dataset
-                .metadata_cache
-                .invalidate_key_prefix(&format!("manifest/{version}"))
-                .await;
-            self.dataset
-                .metadata_cache
-                .invalidate_key_prefix(&format!("txn/{version}"))
-                .await;
-            self.dataset
-                .metadata_cache
-                .invalidate_key_prefix(&format!("row_addr_mask/{version}"))
-                .await;
-            self.dataset
-                .metadata_cache
-                .invalidate_key_prefix(&format!("row_id_index/{version}"))
-                .await;
-            self.dataset
-                .index_cache
-                .invalidate_key_prefix(&version.to_string())
-                .await;
+        if stale_versions.is_empty() {
+            return;
         }
+        // Batched into two cache-wide passes (one per cache) rather than
+        // one pass per version per key type, so this stays cheap even when
+        // a cleanup run clears out many versions at once (e.g. the first
+        // cleanup after a long gap).
+        let metadata_key_prefixes: Vec<String> = stale_versions
+            .iter()
+            .flat_map(|version| {
+                [
+                    format!("manifest/{version}"),
+                    format!("txn/{version}"),
+                    format!("row_addr_mask/{version}"),
+                    format!("row_id_index/{version}"),
+                ]
+            })
+            .collect();
+        self.dataset
+            .metadata_cache
+            .invalidate_key_prefixes(&metadata_key_prefixes)
+            .await;
+
+        let index_key_prefixes: Vec<String> = stale_versions
+            .iter()
+            .map(|version| version.to_string())
+            .collect();
+        self.dataset
+            .index_cache
+            .invalidate_key_prefixes(&index_key_prefixes)
+            .await;
     }
 
     #[instrument(level = "debug", skip_all)]
