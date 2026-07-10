@@ -19,7 +19,7 @@ use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchIter;
 
 /// Default implementation of dot product.
@@ -263,9 +263,17 @@ impl Dot for f32 {
         // Exactly one arm compiles. Keeping each a tail expression (rather than
         // an early `return` guarded by `cfg`) mirrors `dot_f32_dispatched` and
         // avoids an unreachable tail on AVX2-baseline builds.
+        // AVX2-baseline build (the default `haswell` wheel): return exactly what
+        // the code returned before runtime dispatch existed — a lazy `Map` over
+        // the inlined, auto-vectorized scalar kernel. Wrapping it in anything
+        // (a trait object, or an enum) costs more than the dispatch it removes:
+        // `Map<ChunksExact, _>` is `TrustedLen`, so `.collect()` preallocates,
+        // and `Map::fold` drives `ChunksExact` in one inlined loop.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            dot_batch_f32_avx2_baseline(x, batch, dimension)
+            batch
+                .chunks_exact(dimension)
+                .map(move |y| dot_f32_scalar(x, y))
         }
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
         {
@@ -276,33 +284,6 @@ impl Dot for f32 {
             batch.chunks_exact(dimension).map(move |y| Self::dot(x, y))
         }
     }
-}
-
-/// AVX2-baseline builds (the default `haswell` wheel): the scalar kernel here
-/// inlines and auto-vectorizes exactly as it did before runtime dispatch
-/// existed, so a per-vector `*SIMD_SUPPORT` match plus a `#[target_feature]`
-/// call boundary would be pure overhead. Dispatch at most once, per batch.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline]
-fn dot_batch_f32_avx2_baseline<'a>(
-    x: &'a [f32],
-    batch: &'a [f32],
-    dimension: usize,
-) -> impl Iterator<Item = f32> + 'a {
-    // Only wide vectors benefit from AVX-512: at 16 lanes or fewer a masked
-    // 512-bit load loses to the plain AVX2 load, and the eager collect adds an
-    // allocation the baseline path does not need.
-    if dimension > 16 && matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-        // SAFETY: guarded by the runtime AVX-512 detection above.
-        return BatchIter::Eager(
-            unsafe { x86::dot_batch_f32_avx512(x, batch, dimension) }.into_iter(),
-        );
-    }
-    BatchIter::Lazy(
-        batch
-            .chunks_exact(dimension)
-            .map(move |y| dot_f32_scalar(x, y)),
-    )
 }
 
 /// Sub-AVX2 builds: the scalar kernel cannot reach the wide registers, so pick

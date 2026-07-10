@@ -26,7 +26,7 @@ use lance_core::utils::cpu::SIMD_SUPPORT;
 use lance_core::utils::cpu::SimdSupport;
 use num_traits::{AsPrimitive, Num};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 use crate::distance::BatchIter;
 
 /// Calculate the L2 distance between two vectors.
@@ -290,9 +290,11 @@ impl L2 for f32 {
         dimension: usize,
     ) -> impl Iterator<Item = Self> + 'a {
         // Exactly one arm compiles; see `Dot::dot_batch` for f32.
+        // See `Dot::dot_batch` for f32: on an AVX2-baseline build this is exactly
+        // the pre-dispatch iterator, wrapper-free.
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         {
-            l2_batch_f32_avx2_baseline(x, y, dimension)
+            y.chunks_exact(dimension).map(move |v| l2_f32_scalar(x, v))
         }
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
         {
@@ -303,26 +305,6 @@ impl L2 for f32 {
             y.chunks_exact(dimension).map(move |v| Self::l2(x, v))
         }
     }
-}
-
-/// AVX2-baseline builds: the scalar kernel here inlines and auto-vectorizes as
-/// it did before runtime dispatch existed, so per-vector dispatch would be pure
-/// overhead. Dispatch at most once, per batch. See `Dot::dot_batch` for f32.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline]
-fn l2_batch_f32_avx2_baseline<'a>(
-    x: &'a [f32],
-    y: &'a [f32],
-    dimension: usize,
-) -> impl Iterator<Item = f32> + 'a {
-    // Only wide vectors benefit from AVX-512: at 16 lanes or fewer a masked
-    // 512-bit load loses to the plain AVX2 load, and the eager collect adds an
-    // allocation the baseline path does not need.
-    if dimension > 16 && matches!(*SIMD_SUPPORT, SimdSupport::Avx512 | SimdSupport::Avx512FP16) {
-        // SAFETY: guarded by the runtime AVX-512 detection above.
-        return BatchIter::Eager(unsafe { x86::l2_batch_f32_avx512(x, y, dimension) }.into_iter());
-    }
-    BatchIter::Lazy(y.chunks_exact(dimension).map(move |v| l2_f32_scalar(x, v)))
 }
 
 /// Sub-AVX2 builds: pick a `#[target_feature]` kernel once for the batch.
