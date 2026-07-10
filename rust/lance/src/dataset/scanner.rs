@@ -2892,14 +2892,14 @@ impl Scanner {
         scan_range: Option<Range<u64>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Decide whether a limit can be pushed into the index search. The fragments the read
-        // covers are the requested subset, or the whole dataset when none was given; the index
+        // covers are the requested subset, or the whole dataset when none was given. The index
         // is only allowed to stop early when every fragment it covers is in this scanned set
         // and free of deletions (see `index_search_limit`).
         //
         // `scan_range` is a separate limit/offset pushdown that only applies when there is no
         // filter (see the `filter_plan.is_empty()` guard at its only call site). With no filter
-        // there is no index query, so `index_search_limit` returns `None`; the two pushdowns are
-        // therefore mutually exclusive and need no extra coordination here.
+        // there is no index query, so `index_search_limit` returns `None`. The two pushdowns are
+        // mutually exclusive and need no extra coordination here.
         let all_fragments = self.dataset.fragments();
         let scanned_fragments: &[Fragment] = fragments
             .as_ref()
@@ -4135,24 +4135,19 @@ impl Scanner {
     /// rows. The first N matches are as good as any N matches only when all of these hold.
     ///
     /// - There is a positive row limit.
-    /// - The scan is unordered (`scan_in_order(false)`). In the default ordered mode the
-    ///   scan returns the first matches in storage (row address) order, but a B-tree
-    ///   stops after collecting matches in index-value page order. Those are different
-    ///   subsets whenever storage order and index order disagree, so pushing the limit
-    ///   would silently change which rows `LIMIT`/`OFFSET` returns.
+    /// - The scan is unordered (`scan_in_order(false)`). The default ordered mode returns
+    ///   matches in storage order, but a B-tree stops in index-value order, so pushing the
+    ///   limit would change which rows `LIMIT`/`OFFSET` returns.
     /// - The rows are not reordered before the limit (no `ORDER BY`, vector or FTS search).
     /// - There is no aggregate (the limit applies after aggregation).
     /// - The index result is used as is, with no refine filter and no recheck. Either of
     ///   those re-filters rows later and could drop matches.
-    /// - The index cannot yield row addresses that are filtered out after the search. The
-    ///   index search returns row addresses from every fragment its segments cover, and those
-    ///   that do not survive into the final result are pruned *after* the search. An early stop
-    ///   would then spend its budget on rows that get dropped and could leave fewer than `limit`
-    ///   live rows. A row address is dropped after the search when it belongs to a fragment that
-    ///   has deletions (the deleted rows are masked out) or one that is not in the scanned set (a
-    ///   retired/compacted-away fragment the index still has stale entries for, or a fragment
-    ///   excluded by `with_fragments`). The single safe condition is therefore that every fragment
-    ///   the index covers is in the scanned set *and* has no deletion file.
+    /// - Every fragment the index covers is in the scanned set and has no deletion file.
+    ///   The index returns row addresses for every fragment it covers, and any that do not
+    ///   survive into the result are pruned after the search. An early stop would then spend
+    ///   its budget on rows that get dropped, leaving fewer than `limit` live rows. Rows are
+    ///   dropped when their fragment has deletions or is not scanned (a retired fragment the
+    ///   index still has stale entries for, or one excluded by `with_fragments`).
     ///
     /// Returns `None` when no limit can be pushed.
     async fn index_search_limit(
@@ -4186,9 +4181,9 @@ impl Scanner {
         }
         // Every row address the index covers must survive into the result, otherwise an early
         // stop could leave fewer than `limit` live rows. That requires every index-covered
-        // fragment to be both scanned and free of deletions. Fragments that are scanned but
-        // *not* covered by the index are fine: they only add rows (via a separate scan of the
-        // missing fragments), they never remove index hits.
+        // fragment to be both scanned and free of deletions. Fragments that are scanned but not
+        // covered by the index are fine. They only add rows via a separate scan of the missing
+        // fragments, and never remove index hits.
         let live_undeleted: RoaringBitmap = scanned_fragments
             .iter()
             .filter(|fragment| fragment.deletion_file.is_none())
@@ -4226,10 +4221,10 @@ impl Scanner {
             .partition_frags_by_coverage(index_expr, fragments)
             .await?;
 
-        // A limit can be pushed into the index search only when safe; see index_search_limit.
-        // `relevant_frags` is `covered ∩ scanned`, so requiring the index's covered fragments to
-        // be a subset of it rejects both retired/uncovered-scanned fragments and `with_fragments`
-        // subsets that drop covered fragments.
+        // A limit can be pushed into the index search only when safe. See index_search_limit.
+        // `relevant_frags` is the intersection of covered and scanned fragments, so requiring the
+        // index's covered fragments to be a subset of it rejects both retired or uncovered scanned
+        // fragments and `with_fragments` subsets that drop covered fragments.
         let pushdown_limit = self
             .index_search_limit(filter_plan, &relevant_frags)
             .await?;
@@ -6125,17 +6120,19 @@ mod test {
     #[tokio::test]
     async fn test_limit_pushed_into_scalar_index(
         // Legacy storage routes through `scalar_indexed_scan` (MaterializeIndexExec), Stable
-        // through `new_filtered_read` (ScalarIndexExec); both push the limit via the same gate.
+        // through `new_filtered_read` (ScalarIndexExec). Both push the limit via the same gate.
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        // A scalar-index limit can be pushed only for an unordered scan, since the B-tree stops in index-value order while an ordered scan returns storage-order matches.
+        // A scalar-index limit can be pushed only for an unordered scan, since the B-tree stops
+        // in index-value order while an ordered scan returns storage-order matches.
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             DataType::Int32,
             false,
         )]));
-        // Span several btree pages, with ids in descending order so storage order is the reverse of index-value order.
+        // Span several btree pages, with ids in descending order so storage order is the reverse
+        // of index-value order.
         let num_rows = 20_000i32;
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -6178,7 +6175,8 @@ mod test {
                 .to_vec()
         };
 
-        // Ordered scan (the default): limit not pushed, so the first matches are the largest ids (descending storage).
+        // Ordered scan (the default): limit not pushed, so the first matches are the largest ids
+        // (descending storage).
         let ids = scan_ids(Arc::new(dataset.clone()), true, None).await;
         assert_eq!(ids.len(), limit as usize);
         assert!(
@@ -6205,7 +6203,8 @@ mod test {
         );
         assert!(ids.iter().all(|&id| id >= 5));
 
-        // With deletions the limit must not be pushed even when unordered, since deleted rows are pruned after the index search.
+        // With deletions the limit must not be pushed even when unordered, since deleted rows are
+        // pruned after the index search.
         dataset.delete("id >= 5 AND id < 10000").await.unwrap();
         let ids = scan_ids(Arc::new(dataset), false, None).await;
         assert_eq!(ids.len(), limit as usize);
@@ -6221,9 +6220,9 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        // The scalar-index search runs over the whole dataset; a `with_fragments` subset is
+        // The scalar-index search runs over the whole dataset. A `with_fragments` subset is
         // applied only afterwards. If the limit were pushed, an unordered scan restricted to a
-        // fragment whose ids sort *last* would early-stop on matches in the other fragment and
+        // fragment whose ids sort last would early-stop on matches in the other fragment and
         // return too few (here zero) rows. The limit must therefore not be pushed for a subset.
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -6301,7 +6300,7 @@ mod test {
         // those rows are dropped after the search. If the limit were pushed, an unordered scan
         // could early-stop on the retired fragment's (smallest) ids and return fewer than `limit`
         // live rows. The limit must therefore not be pushed when the index covers a retired
-        // fragment, even though no *live* fragment has a deletion file.
+        // fragment, even though no live fragment has a deletion file.
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             DataType::Int32,

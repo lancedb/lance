@@ -2176,8 +2176,8 @@ impl BTreeIndex {
         // could refine that classification (see #6802).
         //
         // A `limit` implies a single positive lookup, so skip null tracking to stop early.
-        // Correctness then relies on the caller discarding nulls: every `search_limited`
-        // path goes through `evaluate_limited` -> `drop_nulls`, so the untracked null rows
+        // Correctness then relies on the caller discarding nulls. Every `search_limited`
+        // path goes through `evaluate_limited` and `drop_nulls`, so the untracked null rows
         // are dropped anyway. A future caller that keeps nulls must not pass a limit here.
         if limit.is_none() && !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
@@ -2218,7 +2218,7 @@ impl BTreeIndex {
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
 
-        // With a `limit`, read one page at a time and stop once we have enough; otherwise fan out across CPUs.
+        // With a `limit`, read one page at a time and stop once we have enough. Otherwise fan out across CPUs.
         let parallelism = if limit.is_some() {
             1
         } else {
@@ -2230,7 +2230,7 @@ impl BTreeIndex {
         let mut matches_found: u64 = 0;
         while let Some(page_result) = page_stream.try_next().await? {
             if let Some(limit) = limit {
-                // Count only TRUE matches toward the limit; `len()` already excludes nulls.
+                // Count only TRUE matches toward the limit. `len()` already excludes nulls.
                 matches_found += page_result.len().unwrap_or(0);
                 results.push(page_result);
                 if matches_found >= limit as u64 {
@@ -2245,10 +2245,10 @@ impl BTreeIndex {
         let selection = NullableRowAddrSet::union_all(&results);
 
         // A limited search may stop before reading every matching page, so the returned set is
-        // not the complete answer. Every row in it does satisfy the query (there may be more),
-        // which is exactly `AtLeast`. Reporting `Exact` here would let callers treat a partial
-        // match set as the full one. We conservatively report `AtLeast` for any limited search,
-        // even one that happened to read all pages, since the answer is still a valid lower bound.
+        // not the complete answer. Every row in it still satisfies the query, so the result is a
+        // valid lower bound, which is exactly `AtLeast`. Reporting `Exact` would let callers treat
+        // a partial match set as complete, so report `AtLeast` for any limited search even when it
+        // happened to read all pages.
         Ok(if limit.is_some() {
             SearchResult::AtLeast(selection)
         } else {

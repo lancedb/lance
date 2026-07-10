@@ -810,10 +810,10 @@ impl MaterializeIndexExec {
         // reach the user).
         //
         // `AtLeast` carries an unbounded `upper`, so we cannot use it as the
-        // candidate set. Instead we materialize its `lower` mask: every row
+        // candidate set. Instead we materialize its `lower` mask. Every row
         // in `lower` is a guaranteed match, so it is a sound (possibly
-        // partial) answer. This is exactly what the limit pushdown produces —
-        // the B-tree stops early and returns a confirmed lower bound, and a
+        // partial) answer. This is exactly what the limit pushdown produces.
+        // The B-tree stops early and returns a confirmed lower bound, and a
         // downstream `GlobalLimitExec` still enforces the exact limit.
         let candidate_mask = |result: IndexExprResult| -> Result<RowAddrMask> {
             if result.is_at_least() && !result.is_exact() {

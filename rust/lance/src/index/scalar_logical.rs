@@ -142,7 +142,8 @@ impl ScalarIndex for LogicalScalarIndex {
         metrics: &dyn MetricsCollector,
         limit: Option<usize>,
     ) -> Result<SearchResult> {
-        // Forwarding the limit to every segment is safe: the combined result still has at least `limit` matches.
+        // Forwarding the limit to every segment is safe. The combined result still has at least
+        // `limit` matches.
         let results = try_join_all(
             self.segments
                 .iter()
@@ -580,7 +581,7 @@ mod tests {
         .await
         .unwrap();
 
-        // All 64 rows match the unbounded range; with a limit the combined result across the
+        // All 64 rows match the unbounded range. With a limit the combined result across the
         // four segments must still satisfy at least `limit` matches.
         let query = SargableQuery::Range(Bound::Unbounded, Bound::Unbounded);
         let limit = 10usize;
@@ -589,7 +590,7 @@ mod tests {
             .await
             .unwrap();
         // Each B-tree segment short-circuits on the limit and reports `AtLeast`, so the combined
-        // result must also be `AtLeast` (a lower bound), never `Exact` — otherwise a caller could
+        // result must also be `AtLeast` (a lower bound), never `Exact`. Otherwise a caller could
         // treat this partial match set as the complete answer.
         let row_addrs = match result {
             SearchResult::AtLeast(row_addrs) => row_addrs,
