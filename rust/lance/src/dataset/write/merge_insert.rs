@@ -10038,7 +10038,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         #[case] enable_stable_row_ids: bool,
     ) {
         let schema = create_test_schema();
-        let test_uri = "memory://test_delete_if_full.lance";
+        let test_uri = "memory://";
 
         let ds = create_test_dataset(test_uri, version, enable_stable_row_ids).await;
 
@@ -10084,16 +10084,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(merge_stats.num_inserted_rows, 0);
         assert_eq!(merge_stats.num_updated_rows, 0);
 
-        let batches = merged_dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        let merged = concat_batches(&schema, &batches).unwrap();
+        let merged = merged_dataset.scan().try_into_batch().await.unwrap();
         let mut remaining_keys: Vec<u32> = merged
             .column(0)
             .as_primitive::<UInt32Type>()
@@ -10130,7 +10121,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_when_matched_delete_if_with_insert(#[case] version: LanceFileVersion) {
         let schema = create_test_schema();
-        let test_uri = "memory://test_delete_if_with_insert.lance";
+        let test_uri = "memory://";
 
         let ds = create_test_dataset(test_uri, version, false).await;
 
@@ -10159,16 +10150,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(merge_stats.num_inserted_rows, 3);
         assert_eq!(merge_stats.num_updated_rows, 0);
 
-        let batches = merged_dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        let merged = concat_batches(&schema, &batches).unwrap();
+        let merged = merged_dataset.scan().try_into_batch().await.unwrap();
         let mut remaining_keys: Vec<u32> = merged
             .column(0)
             .as_primitive::<UInt32Type>()
@@ -10208,7 +10190,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_when_matched_delete_if_never_true(#[case] version: LanceFileVersion) {
         let schema = create_test_schema();
-        let test_uri = "memory://test_delete_if_never_true.lance";
+        let test_uri = "memory://";
 
         let ds = create_test_dataset(test_uri, version, false).await;
 
@@ -10233,16 +10215,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert_eq!(merge_stats.num_inserted_rows, 0);
         assert_eq!(merge_stats.num_updated_rows, 0);
 
-        let batches = merged_dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        let merged = concat_batches(&schema, &batches).unwrap();
+        let merged = merged_dataset.scan().try_into_batch().await.unwrap();
         let mut remaining_keys: Vec<u32> = merged
             .column(0)
             .as_primitive::<UInt32Type>()
@@ -10257,7 +10230,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_when_matched_delete_if_expr_fast_path() {
         let schema = create_test_schema();
-        let test_uri = "memory://test_delete_if_expr.lance";
+        let test_uri = "memory://";
 
         let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
         let new_batch = create_new_batch(schema.clone());
@@ -10297,7 +10270,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], schema.clone()));
         let new_stream = reader_to_stream(new_reader);
 
-        let (_merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
+        let (merged_dataset, merge_stats) = job.execute(new_stream).await.unwrap();
 
         assert_eq!(
             merge_stats.num_deleted_rows, 1,
@@ -10305,6 +10278,22 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
         assert_eq!(merge_stats.num_inserted_rows, 0);
         assert_eq!(merge_stats.num_updated_rows, 0);
+        assert_eq!(
+            merged_dataset
+                .count_rows(Some("key = 6".to_string()))
+                .await
+                .unwrap(),
+            0,
+            "key 6 satisfied the condition and must be deleted"
+        );
+        assert_eq!(
+            merged_dataset
+                .count_rows(Some("key = 5".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "key 5 failed the condition and must survive"
+        );
     }
 
     /// Test WhenMatched::DeleteIf on the slow (Merger) path, forced by a scalar index on
@@ -10551,7 +10540,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     #[tokio::test]
     async fn test_when_matched_delete_if_errors() {
         let schema = create_test_schema();
-        let test_uri = "memory://test_delete_if_errors.lance";
+        let test_uri = "memory://";
         let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
         let new_batch = create_new_batch(schema.clone());
         let keys = vec!["key".to_string()];
@@ -10576,7 +10565,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             err
         );
 
-        let indexed_uri = "memory://test_delete_if_errors_indexed.lance";
+        let indexed_uri = "memory://";
         let mut indexed_ds =
             (*create_test_dataset(indexed_uri, LanceFileVersion::V2_0, false).await).clone();
         indexed_ds
@@ -10711,7 +10700,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             }
         }
 
-        let delete_if_uri = "memory://test_is_delete_only_delete_if.lance";
+        let delete_if_uri = "memory://";
         let ds = create_test_dataset(delete_if_uri, LanceFileVersion::V2_0, false).await;
         let condition = WhenMatched::delete_if(&ds, "source.filterme != target.filterme").unwrap();
         let new_batch = RecordBatch::try_new(
