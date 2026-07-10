@@ -6,7 +6,10 @@ use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::{Range, RangeInclusive},
+    sync::Arc,
+};
 
 use arrow::compute::BatchCoalescer;
 use arrow_array::cast::AsArray;
@@ -2122,6 +2125,25 @@ impl FilteredReadExec {
 /// parallelism setting)
 const ROW_STREAM_PREFETCH_BATCHES: usize = 64;
 
+/// Fragment metadata, loaded on the first batch and reused afterwards
+struct StreamFragments {
+    /// All dataset (or scoped) fragments, in dataset order
+    fragments: Vec<LoadedFragment>,
+    /// Fragment id → position in `fragments`
+    positions: HashMap<u32, usize>,
+    /// Each fragment's row-id span, for skipping fragments a batch cannot
+    /// touch (None = empty fragment)
+    id_spans: Vec<Option<RangeInclusive<u64>>>,
+}
+
+impl StreamFragments {
+    fn get(&self, fragment_id: u32) -> Option<&LoadedFragment> {
+        self.positions
+            .get(&fragment_id)
+            .map(|position| &self.fragments[*position])
+    }
+}
+
 /// Executes a [`FilteredReadExec`] over a row-stream source
 struct RowStreamRead {
     dataset: Arc<Dataset>,
@@ -2130,8 +2152,7 @@ struct RowStreamRead {
     carried_schema: SchemaRef,
     output_schema: SchemaRef,
     scan_scheduler: Arc<ScanScheduler>,
-    /// Fragment metadata, loaded on the first batch and reused afterwards
-    loaded_fragments: OnceCell<Vec<LoadedFragment>>,
+    loaded_fragments: OnceCell<StreamFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
     baseline_metrics: BaselineMetrics,
 }
@@ -2159,10 +2180,28 @@ impl RowStreamRead {
         }
     }
 
-    async fn load_fragments(&self) -> Result<&Vec<LoadedFragment>> {
+    async fn load_fragments(&self) -> Result<&StreamFragments> {
         self.loaded_fragments
-            .get_or_try_init(|| {
-                FilteredReadStream::load_all_fragments(&self.dataset, &self.source.read_options)
+            .get_or_try_init(|| async {
+                let fragments = FilteredReadStream::load_all_fragments(
+                    &self.dataset,
+                    &self.source.read_options,
+                )
+                .await?;
+                let positions = fragments
+                    .iter()
+                    .enumerate()
+                    .map(|(position, fragment)| (fragment.fragment.id() as u32, position))
+                    .collect();
+                let id_spans = fragments
+                    .iter()
+                    .map(|fragment| fragment.row_id_sequence.row_id_range())
+                    .collect();
+                Ok(StreamFragments {
+                    fragments,
+                    positions,
+                    id_spans,
+                })
             })
             .await
     }
@@ -2170,15 +2209,17 @@ impl RowStreamRead {
     /// Build a batch's read ranges directly from physical row addresses
     fn plan_batch_from_addresses(
         addrs: &RowAddrTreeMap,
-        fragments: &[LoadedFragment],
+        fragments: &StreamFragments,
     ) -> FilteredReadInternalPlan {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
-        for fragment in fragments {
-            let fragment_id = fragment.fragment.id() as u32;
-            let requested = match addrs.get(&fragment_id) {
-                None => continue,
-                Some(RowAddrSelection::Full) => vec![0..fragment.num_physical_rows],
-                Some(RowAddrSelection::Partial(bitmap)) => bitmap_to_ranges(bitmap),
+        for (fragment_id, requested) in addrs.iter() {
+            // Unknown fragments (e.g. fully deleted) drop like stale keys
+            let Some(fragment) = fragments.get(*fragment_id) else {
+                continue;
+            };
+            let requested = match requested {
+                RowAddrSelection::Full => vec![0..fragment.num_physical_rows],
+                RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
             };
             let valid = FilteredReadStream::full_frag_range(
                 fragment.num_physical_rows,
@@ -2186,7 +2227,52 @@ impl RowStreamRead {
             );
             let matched = FilteredReadStream::intersect_ranges(&valid, &requested);
             if !matched.is_empty() {
-                rows.insert(fragment_id, matched);
+                rows.insert(*fragment_id, matched);
+            }
+        }
+        FilteredReadInternalPlan {
+            rows,
+            filters: HashMap::new(),
+            scan_range_after_filter: None,
+        }
+    }
+
+    /// Build a batch's read ranges by resolving stable row ids through the
+    /// fragments' row-id sequences
+    fn plan_batch_from_row_ids(
+        ids: RowAddrTreeMap,
+        keys: &arrow_array::PrimitiveArray<UInt64Type>,
+        fragments: &StreamFragments,
+    ) -> FilteredReadInternalPlan {
+        let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+        let (Some(min_key), Some(max_key)) = (arrow::compute::min(keys), arrow::compute::max(keys))
+        else {
+            // Every key is null
+            return FilteredReadInternalPlan {
+                rows,
+                filters: HashMap::new(),
+                scan_range_after_filter: None,
+            };
+        };
+        let requested = RowAddrMask::from_allowed(ids);
+        for (fragment, id_span) in fragments.fragments.iter().zip(&fragments.id_spans) {
+            // Only fragments whose id span overlaps the batch's key range
+            // can hold requested rows
+            let Some(id_span) = id_span else { continue };
+            if *id_span.end() < min_key || *id_span.start() > max_key {
+                continue;
+            }
+            let offsets = fragment.row_id_sequence.mask_to_offset_ranges(&requested);
+            if offsets.is_empty() {
+                continue;
+            }
+            let valid = FilteredReadStream::full_frag_range(
+                fragment.num_physical_rows,
+                &fragment.deletion_vector,
+            );
+            let matched = FilteredReadStream::intersect_ranges(&valid, &offsets);
+            if !matched.is_empty() {
+                rows.insert(fragment.fragment.id() as u32, matched);
             }
         }
         FilteredReadInternalPlan {
@@ -2232,18 +2318,12 @@ impl RowStreamRead {
         drop(compute_timer);
 
         let fragments = self.load_fragments().await?;
-        if self.source.key_column == ROW_ADDR {
+        // Row ids equal row addresses when the dataset does not use stable
+        // row ids, so either key resolves directly by position
+        if self.source.key_column == ROW_ADDR || !self.dataset.manifest.uses_stable_row_ids() {
             Ok(Self::plan_batch_from_addresses(&batch_keys, fragments))
         } else {
-            let evaluated_index = Arc::new(EvaluatedIndex {
-                index_result: IndexExprResult::exact(RowAddrMask::from_allowed(batch_keys)),
-                applicable_fragments: self.dataset.fragment_bitmap.as_ref().clone(),
-            });
-            Ok(FilteredReadStream::plan_scan(
-                fragments,
-                &Some(evaluated_index),
-                &self.source.read_options,
-            ))
+            Ok(Self::plan_batch_from_row_ids(batch_keys, keys, fragments))
         }
     }
 
@@ -2255,7 +2335,7 @@ impl RowStreamRead {
         internal_plan: FilteredReadInternalPlan,
         batch_index: u32,
     ) -> DataFusionResult<RecordBatch> {
-        let fragments = self.load_fragments().await?;
+        let fragments = &self.load_fragments().await?.fragments;
         // I/O priority: earlier batches strictly first (output emits in batch
         // order), fragments keep dataset order within a batch
         let priority_offset = batch_index.saturating_mul(fragments.len() as u32);
@@ -5196,6 +5276,85 @@ mod tests {
                 .unwrap()
                 .as_primitive::<arrow::datatypes::Int32Type>();
             assert_eq!(i_col.value(0), 16);
+        }
+
+        /// Keys of a fully deleted fragment (gone from the manifest) are
+        /// dropped like stale rows
+        #[rstest]
+        #[case::by_row_addr(false, ROW_ADDR)]
+        #[case::by_row_id(false, ROW_ID)]
+        #[case::stable_by_row_addr(true, ROW_ADDR)]
+        #[case::stable_by_row_id(true, ROW_ID)]
+        #[tokio::test]
+        async fn take_drops_keys_of_deleted_fragment(
+            #[case] stable_row_ids: bool,
+            #[case] key: &str,
+        ) {
+            let fixture = take_fixture(stable_row_ids).await;
+            let mut dataset = fixture.dataset.as_ref().clone();
+            dataset.delete("i >= 10 and i < 20").await.unwrap();
+            let dataset = Arc::new(dataset);
+
+            let addr = |frag: u64, off: u64| (frag << 32) | off;
+            // The pre-delete identifiers of row 15 (fragment 1, now gone
+            // from the manifest) and row 20 (fragment 2, still live)
+            let keys: Vec<u64> = if key == ROW_ID && stable_row_ids {
+                vec![15, 20]
+            } else {
+                vec![addr(1, 5), addr(2, 0)]
+            };
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                key,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
+                .unwrap();
+
+            let plan = take_plan(&dataset, rows_input(vec![batch]), &["i"]).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            assert_eq!(result.num_rows(), 1);
+            let i_col = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            assert_eq!(i_col.value(0), 20);
+        }
+
+        /// After delete + compaction the stable row-id sequences are no
+        /// longer simple contiguous ranges; ids must still resolve to the
+        /// moved rows and deleted ids must still drop
+        #[tokio::test]
+        async fn take_stable_ids_after_compaction() {
+            use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+            let fixture = take_fixture(true).await;
+            let mut dataset = fixture.dataset.as_ref().clone();
+            // Punch holes, then rewrite all fragments into one
+            dataset.delete("i % 3 = 0").await.unwrap();
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+            let dataset = Arc::new(dataset);
+            assert_eq!(dataset.get_fragments().len(), 1);
+
+            // Survivors in scattered order, plus a compacted-away id (15)
+            let keys: Vec<u64> = vec![25, 1, 15, 14];
+            let input_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(input_schema, vec![Arc::new(UInt64Array::from(keys))])
+                .unwrap();
+
+            let plan = take_plan(&dataset, rows_input(vec![batch]), &["i"]).unwrap();
+            let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
+            let i_col = result
+                .column_by_name("i")
+                .unwrap()
+                .as_primitive::<arrow::datatypes::Int32Type>();
+            assert_eq!(i_col.values(), &[25, 1, 14]);
         }
 
         /// with_deleted_rows is rejected for a row-stream read
