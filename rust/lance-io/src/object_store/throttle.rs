@@ -31,13 +31,12 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
 use lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE;
-#[cfg(test)]
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
-    UploadPart,
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    RenameTargetMode, Result as OSResult, UploadPart,
 };
 use rand::Rng;
 use tokio::sync::Mutex;
@@ -755,9 +754,29 @@ impl ObjectStore for AimdThrottledStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+        // Perform copy and delete separately to handle throttling more gracefully.
+        // If the copy succeeds but the delete fails due to throttling, we can retry just
+        // the delete instead of failing because the destination already exists.
+        let RenameOptions {
+            target_mode,
+            extensions,
+        } = opts;
+        let copy_mode = match target_mode {
+            RenameTargetMode::Overwrite => CopyMode::Overwrite,
+            RenameTargetMode::Create => CopyMode::Create,
+        };
+        let copy_options = CopyOptions {
+            mode: copy_mode,
+            extensions,
+        };
         self.write
-            .throttled(|| self.target.rename_opts(from, to, opts.clone()))
-            .await
+            .throttled(|| self.target.copy_opts(from, to, copy_options.clone()))
+            .await?;
+
+        // Delete the source file, with separate retry logic.
+        // Even if this fails, the rename has effectively succeeded (destination exists).
+        // We still try to clean up the source to avoid leaving duplicate data.
+        self.delete.throttled(|| self.target.delete(from)).await
     }
 }
 
