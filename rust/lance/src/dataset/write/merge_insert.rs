@@ -76,10 +76,7 @@ use datafusion::common::NullEquality;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::DataFusionError;
 use datafusion::{
-    execution::{
-        context::{SessionConfig, SessionContext},
-        memory_pool::MemoryConsumer,
-    },
+    execution::memory_pool::MemoryConsumer,
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
@@ -585,11 +582,28 @@ impl MergeInsertBuilder {
     ///
     /// Matching source rows against a large target table can require
     /// significant memory. By default this is bounded by
-    /// `LanceExecutionOptions`'s default (the `LANCE_MEM_POOL_SIZE`
+    /// [`LanceExecutionOptions`]'s default (the `LANCE_MEM_POOL_SIZE`
     /// environment variable, or 150MB otherwise) and DataFusion spills to
     /// disk once the limit is reached. Raise this if you have memory to
     /// spare and want to avoid spilling; lower it to bound peak memory
     /// usage more tightly in a memory-constrained environment.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::MergeInsertBuilder;
+    /// # use datafusion::physical_plan::SendableRecordBatchStream;
+    /// # use std::sync::Arc;
+    /// # async fn example(dataset: Arc<Dataset>, new_data: SendableRecordBatchStream) -> Result<()> {
+    /// let (updated_dataset, _stats) = MergeInsertBuilder::try_new(dataset, vec!["my_key".to_string()])?
+    ///     .mem_pool_size(64 * 1024 * 1024) // 64MB
+    ///     .try_build()?
+    ///     .execute(new_data)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn mem_pool_size(&mut self, bytes: u64) -> &mut Self {
         self.params.mem_pool_size = Some(bytes);
         self
@@ -598,7 +612,25 @@ impl MergeInsertBuilder {
     /// Set the maximum size, in bytes, of the temporary directory used when
     /// the join in [`Self::mem_pool_size`] spills to disk.
     ///
-    /// Default is `LanceExecutionOptions`'s default (100GB).
+    /// Default is [`LanceExecutionOptions`]'s default (100GB).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::MergeInsertBuilder;
+    /// # use datafusion::physical_plan::SendableRecordBatchStream;
+    /// # use std::sync::Arc;
+    /// # async fn example(dataset: Arc<Dataset>, new_data: SendableRecordBatchStream) -> Result<()> {
+    /// let (updated_dataset, _stats) = MergeInsertBuilder::try_new(dataset, vec!["my_key".to_string()])?
+    ///     .mem_pool_size(64 * 1024 * 1024) // 64MB
+    ///     .max_temp_directory_size(10 * 1024 * 1024 * 1024) // 10GB
+    ///     .try_build()?
+    ///     .execute(new_data)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn max_temp_directory_size(&mut self, bytes: u64) -> &mut Self {
         self.params.max_temp_directory_size = Some(bytes);
         self
@@ -1706,8 +1738,7 @@ impl MergeInsertJob {
         //       projection pushdown for us.
         // Goal: we shouldn't have to add new branches in this code to handle
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
-        let session_config = SessionConfig::default();
-        let session_ctx = SessionContext::new_with_config(session_config);
+        let session_ctx = get_session_context(&self.join_execution_options());
         let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
         // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
         let on_cols = self
@@ -1803,6 +1834,8 @@ impl MergeInsertJob {
         Option<RowAddrTreeMap>,
         Option<KeyExistenceFilter>,
     )> {
+        // `create_plan` consumes `self`, so grab this first.
+        let exec_options = self.join_execution_options();
         let plan = self.create_plan(source).await?;
 
         // Execute the plan
@@ -1820,8 +1853,14 @@ impl MergeInsertJob {
             )));
         }
 
-        // Execute partition 0 (the only partition)
-        let task_context = Arc::new(datafusion::execution::TaskContext::default());
+        // Execute partition 0 (the only partition). Use the same
+        // memory-bounded, spilling-capable session as `create_plan` built
+        // the plan with (get_session_context caches by resolved config, so
+        // this reuses the same SessionContext instance rather than building
+        // a second one) -- a bare `TaskContext::default()` here would strip
+        // away the memory pool and disk manager the plan's join relies on
+        // to bound its memory use.
+        let task_context = get_session_context(&exec_options).task_ctx();
         let mut stream = plan.execute(0, task_context)?;
 
         // Assert that the execution produces no output (this is a write operation)
@@ -2368,10 +2407,10 @@ impl MergeInsertJob {
 
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
+        let options = cloned_job.join_execution_options();
         let plan = cloned_job.create_plan(source).await?;
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
-        let options = LanceExecutionOptions::default();
         let full_analysis = analyze_plan(plan, options).await?;
 
         // Remove the AnalyzeExec and TracedExec lines from the output
@@ -8768,23 +8807,54 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     }
 
     /// End-to-end smoke test: a merge_insert configured with a small
-    /// `mem_pool_size` on the full-table-scan join path (forced via
-    /// `use_index(false)`, matching the join used whenever the target
-    /// table has no index on the merge key) still completes successfully
-    /// and produces correct results. This exercises the actual
-    /// `create_full_table_joined_stream` code path this PR changed, not
-    /// just the config plumbing checked above.
+    /// `mem_pool_size` completes successfully and produces correct results.
+    ///
+    /// A full-schema `UpdateAll` with `use_index(false)` satisfies
+    /// `can_use_create_plan()`, so this exercises the dominant
+    /// `create_plan`/`execute_uncommitted_v2` "fast path" -- the path most
+    /// real-world merge_insert calls without a scalar index take, and the
+    /// one the original reproduction in lance-format/lance#1983 hit. It does
+    /// *not* exercise the legacy `create_joined_stream`/
+    /// `create_full_table_joined_stream` fallback, which turns out to be
+    /// reachable only when the source schema fails both the full-schema and
+    /// subset-schema compatibility checks (every `WhenMatched` /
+    /// `WhenNotMatchedBySource` variant is otherwise handled by
+    /// `create_plan`) -- a narrow, hard-to-construct-meaningfully edge case
+    /// not worth a dedicated test here. The fix is still applied there for
+    /// defense-in-depth.
+    ///
+    /// Data is sized (~5,000 rows, ~1KB each, ~5MB total) well beyond the
+    /// configured 512KB pool. Note this test cannot directly assert that
+    /// spilling *occurred* -- DataFusion's join operators don't expose a
+    /// reliably assertable "spilled" signal through this plan's public
+    /// metrics (a `HashJoinExec` build side is not itself spillable in this
+    /// DataFusion version, and this custom plan's `AnalyzeExec` wrapping
+    /// produced degenerate all-zero metrics when probed). What this test
+    /// does verify: with data clearly larger than the pool, if
+    /// `mem_pool_size` were applied as a hard cap *without* `use_spilling`
+    /// also being wired (a plausible regression -- e.g. the two config
+    /// values getting disconnected from each other), DataFusion would fail
+    /// the operation with `ResourcesExhausted` well before processing 5MB in
+    /// a 512KB budget. Success here is therefore still a meaningful
+    /// regression check, even though it can't prove spill-to-disk
+    /// specifically occurred. The config-plumbing itself (that
+    /// `mem_pool_size` reaches `LanceExecutionOptions` at all) is proven
+    /// precisely by `test_merge_insert_mem_pool_size_is_configurable` above.
     #[tokio::test]
-    async fn test_merge_insert_full_table_join_with_small_mem_pool_size() {
+    async fn test_merge_insert_with_small_mem_pool_size() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::UInt32, false),
+            Field::new("value", DataType::Utf8, false),
         ]));
+        let padding = "x".repeat(1024);
+        const NUM_ROWS: i32 = 5_000;
         let initial_data = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_iter_values(0..500)),
-                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(0, 500))),
+                Arc::new(Int32Array::from_iter_values(0..NUM_ROWS)),
+                Arc::new(arrow_array::StringArray::from_iter_values(
+                    std::iter::repeat_n(padding.as_str(), NUM_ROWS as usize),
+                )),
             ],
         )
         .unwrap();
@@ -8798,12 +8868,17 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .unwrap(),
         );
 
-        // 250 matches (ids 0..250, updated) + 50 new rows (ids 500..550).
+        // Half matches (updated), half new rows (inserted).
+        let updated_value = format!("updated-{padding}");
         let source_batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_iter_values((0..250).chain(500..550))),
-                Arc::new(UInt32Array::from_iter_values(std::iter::repeat_n(999, 300))),
+                Arc::new(Int32Array::from_iter_values(
+                    (0..NUM_ROWS / 2).chain(NUM_ROWS..NUM_ROWS + NUM_ROWS / 2),
+                )),
+                Arc::new(arrow_array::StringArray::from_iter_values(
+                    std::iter::repeat_n(updated_value.as_str(), NUM_ROWS as usize),
+                )),
             ],
         )
         .unwrap();
@@ -8817,24 +8892,25 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .when_matched(WhenMatched::UpdateAll)
             .when_not_matched(WhenNotMatched::InsertAll)
             .use_index(false)
-            // Deliberately tiny relative to the default (150MB): forces the
-            // join to lean on spilling rather than holding everything in
-            // memory, without requiring enough data to trigger a real OOM
-            // if spilling weren't wired up correctly.
-            .mem_pool_size(256 * 1024)
+            // ~5MB of data through a 512KB pool: clearly cannot fit without
+            // spilling (or without the pool limit silently not applying).
+            .mem_pool_size(512 * 1024)
             .max_temp_directory_size(64 * 1024 * 1024)
             .try_build()
             .unwrap();
 
         let (result_ds, stats) = job.execute_reader(source).await.unwrap();
-        assert_eq!(stats.num_updated_rows, 250);
-        assert_eq!(stats.num_inserted_rows, 50);
-        assert_eq!(result_ds.count_rows(None).await.unwrap(), 550);
+        assert_eq!(stats.num_updated_rows, (NUM_ROWS / 2) as u64);
+        assert_eq!(stats.num_inserted_rows, (NUM_ROWS / 2) as u64);
+        assert_eq!(
+            result_ds.count_rows(None).await.unwrap(),
+            (NUM_ROWS + NUM_ROWS / 2) as usize
+        );
         let updated_count = result_ds
-            .count_rows(Some("value = 999".to_string()))
+            .count_rows(Some(format!("value = '{updated_value}'")))
             .await
             .unwrap();
-        assert_eq!(updated_count, 300);
+        assert_eq!(updated_count, NUM_ROWS as usize);
     }
 
     #[tokio::test]

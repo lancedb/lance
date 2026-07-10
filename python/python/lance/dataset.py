@@ -557,6 +557,18 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         -------
         MergeInsertBuilder
             The builder instance for method chaining.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(data, "memory://mem_pool_size_example")
+        >>> new_data = pa.table({"id": [2, 3, 4], "value": ["x", "y", "z"]})
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
+        >>> builder = builder.mem_pool_size(64 * 1024 * 1024)  # 64MB
+        >>> result = builder.execute(new_data)
         """
         return super(MergeInsertBuilder, self).mem_pool_size(mem_pool_size)
 
@@ -579,6 +591,19 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         -------
         MergeInsertBuilder
             The builder instance for method chaining.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> data = pa.table({"id": [1, 2, 3], "value": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(data, "memory://max_temp_dir_example")
+        >>> new_data = pa.table({"id": [2, 3, 4], "value": ["x", "y", "z"]})
+        >>> builder = dataset.merge_insert("id")
+        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
+        >>> builder = builder.mem_pool_size(64 * 1024 * 1024)  # 64MB
+        >>> builder = builder.max_temp_directory_size(10 * 1024 * 1024 * 1024)  # 10GB
+        >>> result = builder.execute(new_data)
         """
         return super(MergeInsertBuilder, self).max_temp_directory_size(
             max_temp_directory_size
