@@ -282,12 +282,22 @@ impl Dot for f32 {
             target_feature = "fma"
         ))]
         {
+            // See `L2::l2_batch` for f32: below 16 lanes `dot_scalar`'s chunking
+            // degenerates to a scalar remainder loop, so the explicit AVX kernel
+            // wins big; above it the autovectorizer is already good and the
+            // 8-wide kernel can lose, so keep the pre-dispatch kernel exactly.
+            //
             // SAFETY: avx2+fma are enabled for the whole crate by the build
             // baseline, so the kernel's `#[target_feature]` contract holds
-            // statically and it inlines here.
-            batch
-                .chunks_exact(dimension)
-                .map(move |y| unsafe { x86::dot_f32_avx_fma(x, y) })
+            // statically.
+            let narrow = dimension <= 16;
+            batch.chunks_exact(dimension).map(move |y| {
+                if narrow {
+                    unsafe { x86::dot_f32_avx_fma(x, y) }
+                } else {
+                    dot_f32_scalar(x, y)
+                }
+            })
         }
         #[cfg(all(
             target_arch = "x86_64",

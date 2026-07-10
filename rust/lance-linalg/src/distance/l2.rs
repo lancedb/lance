@@ -300,12 +300,23 @@ impl L2 for f32 {
             target_feature = "fma"
         ))]
         {
+            // `l2_scalar::<_, _, 16>` chunks the vector by 16 lanes. At or below
+            // that width the chunking degenerates to its scalar remainder loop
+            // and vectorizes nothing, so the explicit AVX kernel is worth ~40%.
+            // Above it the autovectorizer already does well and the 8-wide
+            // kernel can lose, so keep the exact kernel the pre-dispatch code
+            // used and stay non-regressing by construction.
+            //
             // SAFETY: the build baseline enables avx2+fma, which imply avx+fma,
-            // so the kernel's `#[target_feature]` contract is met statically and
-            // it inlines into this loop. No runtime check, and no falling back
-            // to the scalar kernel — at small dimensions that costs ~4x.
-            y.chunks_exact(dimension)
-                .map(move |v| unsafe { x86::l2_f32_avx_fma(x, v) })
+            // so the kernel's `#[target_feature]` contract is met statically.
+            let narrow = dimension <= 16;
+            y.chunks_exact(dimension).map(move |v| {
+                if narrow {
+                    unsafe { x86::l2_f32_avx_fma(x, v) }
+                } else {
+                    l2_f32_scalar(x, v)
+                }
+            })
         }
         #[cfg(all(
             target_arch = "x86_64",
