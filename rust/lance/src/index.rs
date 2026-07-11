@@ -1451,12 +1451,13 @@ impl DatasetIndexExt for Dataset {
             .chunks(segments_per_task)
             .map(|chunk| chunk.to_vec())
             .collect();
-        if tasks.len() > 1 && tasks.last().is_some_and(|task| task.len() == 1) {
-            let leftover = tasks.pop().expect("tasks checked non-empty");
-            tasks
-                .last_mut()
-                .expect("tasks still non-empty after popping the leftover")
-                .extend(leftover);
+        if tasks.len() > 1
+            && let Some(leftover) = tasks.pop_if(|task| task.len() == 1)
+        {
+            match tasks.last_mut() {
+                Some(previous_task) => previous_task.extend(leftover),
+                None => tasks.push(leftover),
+            }
         }
         Ok(tasks)
     }
@@ -7118,19 +7119,30 @@ mod tests {
             "fewer than two qualifying segments should produce an empty plan"
         );
 
+        let err = dataset
+            .plan_index_segment_merge("vector_idx", 1, None)
+            .await
+            .unwrap_err();
         assert!(
-            dataset
-                .plan_index_segment_merge("vector_idx", 1, None)
-                .await
-                .is_err(),
-            "segments_per_task below 2 should be rejected"
+            matches!(err, Error::InvalidInput { .. }),
+            "segments_per_task below 2 should be invalid input, got {err:?}"
         );
         assert!(
-            dataset
-                .plan_index_segment_merge("missing_idx", 2, None)
-                .await
-                .is_err(),
-            "unknown index name should be rejected"
+            err.to_string().contains("segments_per_task >= 2"),
+            "unexpected error: {err}"
+        );
+
+        let err = dataset
+            .plan_index_segment_merge("missing_idx", 2, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::IndexNotFound { .. }),
+            "unknown index name should be not found, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("missing_idx"),
+            "unexpected error: {err}"
         );
     }
 

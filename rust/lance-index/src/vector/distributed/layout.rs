@@ -187,10 +187,16 @@ mod tests {
         let codes =
             FixedSizeListArray::try_new_from_values(Int32Array::from(vec![0, 1, 2, 3]), 2).unwrap();
 
-        let result = untranspose_pq_partition(code_batch(PQ_CODE_COLUMN, codes));
+        let err = untranspose_pq_partition(code_batch(PQ_CODE_COLUMN, codes)).unwrap_err();
 
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not u8"), "unexpected error: {err}");
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "unexpected error variant: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("not u8"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -198,9 +204,15 @@ mod tests {
         let codes =
             FixedSizeListArray::try_new_from_values(Int32Array::from(vec![0, 1, 2, 3]), 2).unwrap();
 
-        let result = unpack_rq_partition(code_batch(RABIT_CODE_COLUMN, codes));
+        let err = unpack_rq_partition(code_batch(RABIT_CODE_COLUMN, codes)).unwrap_err();
 
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not u8"), "unexpected error: {err}");
+        assert!(
+            matches!(err, Error::Index { .. }),
+            "unexpected error variant: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("not u8"),
+            "unexpected error: {err}"
+        );
     }
 }
