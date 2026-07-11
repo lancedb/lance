@@ -304,6 +304,7 @@ impl Field {
             !children.is_empty() // Some children were projected
                 || !projection.contains_field_id(self.id) // Caller is not asking for this field
                 || self.children.is_empty() // This isn't a nested field
+                || self.is_blob() // This is a blob field
         );
 
         if children.is_empty() && !projection.contains_field_id(self.id) {
@@ -311,7 +312,11 @@ impl Field {
         } else {
             let mut new_field = self.clone();
             new_field.children = children;
-            Some(projection.blob_handling.unload_if_needed(new_field))
+            let mut new_field = projection.blob_handling.unload_if_needed(new_field);
+            if new_field.is_blob() && new_field.children.is_empty() {
+                new_field.unloaded_mut();
+            }
+            Some(new_field)
         }
     }
 

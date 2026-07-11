@@ -1636,6 +1636,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repro_nested_blob_v2_projection_panic() {
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+
+        // image: struct<image_bytes: extension<lance.blob.v2>, error: utf8>
+        let blob_meta: HashMap<String, String> =
+            [(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string())]
+                .into_iter()
+                .collect();
+        let image_bytes = ArrowField::new(
+            "image_bytes",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("data", ArrowDataType::LargeBinary, true),
+                ArrowField::new("uri", ArrowDataType::Utf8, true),
+            ])),
+            true,
+        )
+        .with_metadata(blob_meta);
+        let error = ArrowField::new("error", ArrowDataType::Utf8, true);
+        let image = ArrowField::new(
+            "image",
+            ArrowDataType::Struct(ArrowFields::from(vec![image_bytes, error])),
+            true,
+        );
+
+        let mut schema = Schema::try_from(&ArrowSchema::new(vec![image])).unwrap();
+        schema.set_field_id(None);
+        let base = Arc::new(schema);
+
+        // Mirrors Scanner::filtered_projection for `image.image_bytes IS NOT NULL`
+        let filter_schema = Projection::empty(base.clone())
+            .union_column("image.image_bytes", OnMissing::Error)
+            .unwrap()
+            .into_schema();
+        let scan_projection = Projection::empty(base.clone()).union_schema(&filter_schema);
+        let _read_schema = scan_projection.into_schema(); // panics in Field::apply_projection
+    }
+
+    #[test]
     fn test_resolve_with_quoted_fields() {
         // Create a schema with fields containing dots
         let field_with_dots = Field::try_from(&ArrowField::new(
