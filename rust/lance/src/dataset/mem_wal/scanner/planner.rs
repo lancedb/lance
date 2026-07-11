@@ -47,9 +47,7 @@ pub struct LsmScanPlanner {
     base_schema: SchemaRef,
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
-    /// Store params threaded into flushed-generation opens so they reuse the
-    /// base's store — including the refreshing credential accessor for a
-    /// federated (namespace-backed) table — instead of resolving an ambient one.
+    /// Store params for opening flushed generations, reusing the base dataset's store.
     store_params: Option<ObjectStoreParams>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<dyn DatasetCache>>,
@@ -89,16 +87,13 @@ impl LsmScanPlanner {
         }
     }
 
-    /// Thread a session into flushed-generation opens so the first open
-    /// populates the shared index / file-metadata caches.
+    /// Set the session used to open flushed generations.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Thread the base dataset's store params into flushed-generation opens so
-    /// they reuse the base's store (federated: the refreshing accessor) rather
-    /// than resolving an ambient one.
+    /// Set the store params used to open flushed generations.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
         self.store_params = Some(store_params);
         self

@@ -251,15 +251,12 @@ pub struct ShardWriterConfig {
     /// WAL pod). Default: `None`.
     pub warmer: Option<Arc<dyn GenerationWarmer>>,
 
-    /// `ObjectStoreParams` the base dataset was opened with (endpoint / region /
-    /// vended-credential accessor). Injected by `mem_wal_writer` from the
-    /// dataset so the flusher's derived-URI opens (base + generations) reuse the
-    /// same store — instead of re-resolving an ambient one — matching the
-    /// ShardWriter's own store. Default: `None` (bare by-URI open).
+    /// Store params for the flusher's derived-URI opens (base + generations),
+    /// reusing the base dataset's store. Injected by `mem_wal_writer`.
+    /// Default: `None` (open by URI alone).
     pub store_params: Option<ObjectStoreParams>,
 
-    /// The dataset's shared `Session`, injected alongside `store_params` so the
-    /// flusher's opens hit the same store registry the base was resolved in.
+    /// Session for those opens, injected alongside `store_params`.
     /// Default: `None`.
     pub session: Option<Arc<Session>>,
 }

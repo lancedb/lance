@@ -707,19 +707,14 @@ impl DatasetMemWalExt for Dataset {
         // Set shard_id in config
         config.shard_id = shard_id;
 
-        // Inject the dataset's own storage context so the flusher's derived-URI
-        // opens (base + generations) reuse the same store the base was resolved
-        // with (endpoint / region / vended-credential accessor) instead of a
-        // fresh ambient one.
+        // Inject the dataset's store params + session so the flusher opens the
+        // base + generations with the same store the base was resolved with.
         config.store_params = self.store_params.as_deref().cloned();
         config.session = Some(self.session());
 
-        // Reuse the dataset's own object store + base path rather than
-        // re-resolving from the bare URI. `ObjectStore::from_uri` discards the
-        // `ObjectStoreParams` the dataset was opened with (endpoint / region /
-        // vended credentials), so the ShardWriter would sign the WAL log and
-        // manifest CAS with the ambient identity. Mirrors the sibling
-        // `list_mem_wal_latest_shard_ids`.
+        // Reuse the dataset's own object store + base path; `ObjectStore::from_uri`
+        // would discard the store params the dataset was opened with, signing WAL
+        // writes with the ambient identity. Mirrors `list_mem_wal_latest_shard_ids`.
         let base_uri = self.uri();
         let store = self.object_store(None).await?;
         let base_path = self.branch_location().path;

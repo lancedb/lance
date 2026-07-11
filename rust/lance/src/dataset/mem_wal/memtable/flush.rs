@@ -74,14 +74,11 @@ pub struct MemTableFlusher {
     /// When present, each new generation is warmed before it is committed, so
     /// the first query sees zero cold reads. `None` => no warming.
     warmer: Option<Arc<dyn GenerationWarmer>>,
-    /// `ObjectStoreParams` the base dataset was opened with, injected via
-    /// [`Self::with_storage_context`]. When present, the flusher's derived-URI
-    /// opens (base + generations) reuse the same store — including the
-    /// vended-credential accessor for federated tables — rather than
-    /// re-resolving an ambient one. `None` => bare by-URI open (native default).
+    /// Store params for the flusher's derived-URI opens (base + generations),
+    /// reusing the store the base was opened with. `None` opens by URI alone.
     store_params: Option<ObjectStoreParams>,
-    /// The dataset's shared `Session`, so derived opens hit the same store
-    /// registry the base was resolved in. `None` => a fresh session per open.
+    /// Session for those opens, sharing the base's store registry. `None` opens
+    /// with a fresh session.
     session: Option<Arc<Session>>,
 }
 
@@ -111,9 +108,8 @@ impl MemTableFlusher {
         self
     }
 
-    /// Attach the base dataset's storage context (params + session) so derived
-    /// opens reuse the dataset's store instead of re-resolving from bare URIs.
-    /// Injected by `mem_wal_writer` from the base `Dataset`.
+    /// Set the store params + session used for derived-URI opens. Injected by
+    /// `mem_wal_writer` from the base `Dataset`.
     pub fn with_storage_context(
         mut self,
         store_params: Option<ObjectStoreParams>,
@@ -124,12 +120,9 @@ impl MemTableFlusher {
         self
     }
 
-    /// Open a dataset at a URI derived from this shard's base — the base table
-    /// itself or a flushed generation under `_mem_wal/`. Threads the injected
-    /// store params + session so the open reuses the base's store (and its
-    /// refreshing credential accessor, for federated tables) rather than
-    /// re-resolving an ambient one. Falls back to a bare by-URI open when no
-    /// storage context was injected (native default / tests).
+    /// Open the dataset at a URI derived from this shard's base — the base table
+    /// itself or a flushed generation under `_mem_wal/` — reusing the injected
+    /// store params + session, or opening by URI alone when none were set.
     async fn open_derived(&self, uri: &str) -> Result<Dataset> {
         let mut builder = DatasetBuilder::from_uri(uri);
         if let Some(params) = &self.store_params {
@@ -346,10 +339,8 @@ impl MemTableFlusher {
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?),
-            // Write the generation through the base dataset's store params +
-            // session so it signs with the same identity the base was opened
-            // with (federated: the vended-credential accessor) instead of the
-            // ambient chain.
+            // Write the generation through the base's store params + session so
+            // it uses the same store the base was opened with.
             store_params: self.store_params.clone(),
             session: self.session.clone(),
             ..Default::default()

@@ -90,8 +90,7 @@ pub struct LsmPointLookupPlanner {
     bloom_filters: std::collections::HashMap<u64, Arc<Sbbf>>,
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
-    /// Store params threaded into flushed-generation opens (federated: the
-    /// refreshing accessor) so they reuse the base's store.
+    /// Store params for opening flushed generations, reusing the base dataset's store.
     store_params: Option<ObjectStoreParams>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<dyn DatasetCache>>,
@@ -136,15 +135,13 @@ impl LsmPointLookupPlanner {
         }
     }
 
-    /// Thread a session into flushed-generation opens so the first open
-    /// populates the shared index / file-metadata caches.
+    /// Set the session used to open flushed generations.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Thread the base dataset's store params into flushed-generation opens
-    /// (federated: the refreshing accessor) so they reuse the base's store.
+    /// Set the store params used to open flushed generations.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
         self.store_params = Some(store_params);
         self

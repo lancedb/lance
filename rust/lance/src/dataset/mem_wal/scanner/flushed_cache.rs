@@ -67,12 +67,9 @@ impl FlushedMemTableCache {
     }
 
     /// Get the dataset for `path`, opening it (exactly once) on a miss.
-    ///
-    /// `session` is threaded into the open so the first open populates the
-    /// shared index / file-metadata caches; subsequent hits are a pure
-    /// `Arc::clone` with zero object-store I/O. Concurrent callers for the
-    /// same path share a single open via `moka`'s single-flight
-    /// `try_get_with`.
+    /// Concurrent callers share a single open via `moka`'s single-flight
+    /// `try_get_with`; hits are a pure `Arc::clone`. `session` / `store_params`
+    /// configure the open.
     pub async fn get_or_open(
         &self,
         path: &str,

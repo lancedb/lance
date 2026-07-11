@@ -207,14 +207,11 @@ pub struct LsmScanner {
     // Primary key columns (required for deduplication)
     pk_columns: Vec<String>,
 
-    /// Session threaded into flushed-generation opens so the first open of
-    /// each generation populates the shared index / file-metadata caches.
-    /// Defaults to the base table's session when one is present.
+    /// Session for opening flushed generations (shares the base's caches).
+    /// Defaults to the base table's session.
     session: Option<Arc<Session>>,
-    /// Store params threaded into flushed-generation opens so they reuse the
-    /// base's store — including the refreshing accessor for a federated
-    /// (namespace-backed) table — rather than resolving an ambient one.
-    /// Defaults to the base table's params when one is present.
+    /// Store params for opening flushed generations, reusing the base dataset's
+    /// store. Defaults to the base table's params.
     store_params: Option<ObjectStoreParams>,
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
@@ -340,22 +337,15 @@ impl LsmScanner {
         self
     }
 
-    /// Thread an existing session into flushed-generation opens.
-    ///
-    /// The first open of each flushed generation then populates the shared
-    /// index / file-metadata caches, so later queries skip re-decoding them.
-    /// When a base table is configured this defaults to its session; call
-    /// this to override (e.g. on a fresh-tier-only scanner that owns its own
-    /// long-lived session).
+    /// Set the session used to open flushed generations. Defaults to the base
+    /// table's; set explicitly on a fresh-tier-only scanner (no base table).
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Thread the base dataset's store params into flushed-generation opens so
-    /// they reuse the base's store (federated: the refreshing accessor). When a
-    /// base table is configured this defaults to its params; call this on a
-    /// fresh-tier-only scanner (no base table) to inject them explicitly.
+    /// Set the store params used to open flushed generations. Defaults to the
+    /// base table's; set explicitly on a fresh-tier-only scanner (no base table).
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
         self.store_params = Some(store_params);
         self
