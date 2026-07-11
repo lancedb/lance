@@ -114,6 +114,7 @@ mod tests {
 
     use arrow_array::{Int32Array, UInt8Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
+    use rstest::rstest;
 
     use crate::vector::bq::storage::pack_codes;
 
@@ -182,29 +183,17 @@ mod tests {
         assert_eq!(column_values(&restored, PQ_CODE_COLUMN), values);
     }
 
-    #[test]
-    fn test_untranspose_pq_partition_rejects_non_u8_codes() {
+    #[rstest]
+    #[case::pq(PQ_CODE_COLUMN, untranspose_pq_partition)]
+    #[case::rq(RABIT_CODE_COLUMN, unpack_rq_partition)]
+    fn test_restore_rejects_non_u8_codes(
+        #[case] column: &str,
+        #[case] restore: fn(RecordBatch) -> Result<RecordBatch>,
+    ) {
         let codes =
             FixedSizeListArray::try_new_from_values(Int32Array::from(vec![0, 1, 2, 3]), 2).unwrap();
 
-        let err = untranspose_pq_partition(code_batch(PQ_CODE_COLUMN, codes)).unwrap_err();
-
-        assert!(
-            matches!(err, Error::Index { .. }),
-            "unexpected error variant: {err:?}"
-        );
-        assert!(
-            err.to_string().contains("not u8"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_unpack_rq_partition_rejects_non_u8_codes() {
-        let codes =
-            FixedSizeListArray::try_new_from_values(Int32Array::from(vec![0, 1, 2, 3]), 2).unwrap();
-
-        let err = unpack_rq_partition(code_batch(RABIT_CODE_COLUMN, codes)).unwrap_err();
+        let err = restore(code_batch(column, codes)).unwrap_err();
 
         assert!(
             matches!(err, Error::Index { .. }),
