@@ -390,6 +390,11 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 };
                 Ok(Self(op))
             }
+            "Composite" => {
+                let operations = extract_vec(&ob.getattr("operations")?)?;
+                let op = Operation::Composite { operations };
+                Ok(Self(op))
+            }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
             ))),
@@ -594,6 +599,13 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     let base_op = namespace.getattr("BaseOperation")?;
                     base_op.call0()
                 }
+            }
+            Operation::Composite { operations } => {
+                let operations = export_vec(py, operations.as_slice())?;
+                let cls = namespace
+                    .getattr("Composite")
+                    .expect("Failed to get Composite class");
+                cls.call1((operations,))
             }
             _ => todo!(),
         }

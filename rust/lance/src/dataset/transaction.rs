@@ -453,6 +453,17 @@ pub enum Operation {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
     },
+
+    /// An ordered list of operations applied sequentially as one atomic commit.
+    ///
+    /// Each operation is applied to the manifest produced by the previous one,
+    /// and the result is committed as a single new version. Conflict resolution
+    /// delegates to each sub-operation's existing rules.
+    ///
+    /// Sub-operations must not contain [`Operation::Restore`],
+    /// [`Operation::Clone`], or a nested composite, and the list must not be
+    /// empty.
+    Composite { operations: Vec<Self> },
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -502,6 +513,16 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+            Self::Composite { operations } => {
+                write!(f, "Composite[")?;
+                for (i, op) in operations.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", op.name())?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -1345,6 +1366,10 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            // Sub-operation order is semantic (operations apply sequentially),
+            // so composites compare element-wise in order.
+            (Self::Composite { operations: a }, Self::Composite { operations: b }) => a == b,
+            (Self::Composite { .. }, _) | (_, Self::Composite { .. }) => false,
         }
     }
 }
@@ -1410,6 +1435,10 @@ impl Operation {
                     }
                 })
                 .collect(),
+            Self::Composite { operations } => operations
+                .iter()
+                .flat_map(|op| op.get_upsert_config_keys())
+                .collect(),
             _ => Vec::<String>::new(),
         }
     }
@@ -1430,6 +1459,10 @@ impl Operation {
                         None
                     }
                 })
+                .collect(),
+            Self::Composite { operations } => operations
+                .iter()
+                .flat_map(|op| op.get_delete_config_keys())
                 .collect(),
             _ => Vec::<String>::new(),
         }
@@ -1469,6 +1502,12 @@ impl Operation {
                 }
                 false
             }
+            (Self::Composite { operations }, _) => {
+                operations.iter().any(|op| op.modifies_same_metadata(other))
+            }
+            (_, Self::Composite { operations }) => operations
+                .iter()
+                .any(|other_op| self.modifies_same_metadata(other_op)),
             _ => false,
         }
     }
@@ -1524,7 +1563,35 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
+            Self::Composite { .. } => "Composite",
         }
+    }
+
+    /// Validate the structural rules for a composite operation's
+    /// sub-operations: the list must be non-empty and must not contain
+    /// `Restore`, `Clone`, or a nested `Composite`. `Restore` and `Clone` are
+    /// applied outside the normal manifest-building path in the commit driver,
+    /// so they cannot participate in a sequential fold; nesting adds nothing
+    /// over a flat list.
+    pub(crate) fn validate_composite(operations: &[Self]) -> Result<()> {
+        if operations.is_empty() {
+            return Err(Error::invalid_input(
+                "Composite operation must contain at least one sub-operation",
+            ));
+        }
+        for (position, op) in operations.iter().enumerate() {
+            match op {
+                Self::Restore { .. } | Self::Clone { .. } | Self::Composite { .. } => {
+                    return Err(Error::invalid_input(format!(
+                        "Composite operation cannot contain {} (at position {})",
+                        op.name(),
+                        position
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1767,6 +1834,95 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        let new_version = current_manifest.map_or(1, |m| m.version + 1);
+        if let Operation::Composite { operations } = &self.operation {
+            return self.build_manifest_composite(
+                operations,
+                current_manifest,
+                current_indices,
+                transaction_file_path,
+                config,
+                new_version,
+            );
+        }
+        self.build_manifest_impl(
+            current_manifest,
+            current_indices,
+            transaction_file_path,
+            config,
+            new_version,
+        )
+    }
+
+    /// Apply a composite operation by folding its sub-operations: each
+    /// sub-operation is applied to the manifest produced by the previous one.
+    ///
+    /// All sub-operations are applied with the same `new_version` (the single
+    /// version this commit will create) so that row-level version metadata is
+    /// stamped correctly, and each intermediate manifest's version is pinned
+    /// back to `new_version` because [`Manifest::new_from_previous`] increments
+    /// the version on every application.
+    fn build_manifest_composite(
+        &self,
+        operations: &[Operation],
+        current_manifest: Option<&Manifest>,
+        current_indices: Vec<IndexMetadata>,
+        transaction_file_path: &str,
+        config: &ManifestWriteConfig,
+        new_version: u64,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
+        Operation::validate_composite(operations)?;
+        let mut state: Option<(Manifest, Vec<IndexMetadata>)> = None;
+        let mut initial_indices = Some(current_indices);
+        for operation in operations {
+            let sub_transaction = Self {
+                read_version: self.read_version,
+                uuid: self.uuid.clone(),
+                operation: operation.clone(),
+                tag: None,
+                transaction_properties: None,
+            };
+            let (mut manifest, indices) = match state.take() {
+                None => {
+                    // Validate each sub-operation against the manifest it will
+                    // actually apply to; entry-point validation only sees the
+                    // base manifest and cannot account for schema changes made
+                    // by earlier sub-operations.
+                    validate_operation(current_manifest, operation)?;
+                    sub_transaction.build_manifest_impl(
+                        current_manifest,
+                        initial_indices.take().expect("first fold step"),
+                        transaction_file_path,
+                        config,
+                        new_version,
+                    )?
+                }
+                Some((prev_manifest, prev_indices)) => {
+                    validate_operation(Some(&prev_manifest), operation)?;
+                    sub_transaction.build_manifest_impl(
+                        Some(&prev_manifest),
+                        prev_indices,
+                        transaction_file_path,
+                        config,
+                        new_version,
+                    )?
+                }
+            };
+            manifest.version = new_version;
+            state = Some((manifest, indices));
+        }
+        // validate_composite rejects empty operation lists, so state is set.
+        Ok(state.expect("non-empty composite"))
+    }
+
+    fn build_manifest_impl(
+        &self,
+        current_manifest: Option<&Manifest>,
+        current_indices: Vec<IndexMetadata>,
+        transaction_file_path: &str,
+        config: &ManifestWriteConfig,
+        new_version: u64,
+    ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
@@ -1861,12 +2017,16 @@ impl Transaction {
                     ))
                 });
 
-        let new_version = current_manifest.map_or(1, |m| m.version + 1);
-
         match &self.operation {
             Operation::Clone { .. } => {
                 return Err(Error::internal(
                     "Clone operation should not enter build_manifest.".to_string(),
+                ));
+            }
+            Operation::Composite { .. } => {
+                return Err(Error::internal(
+                    "Composite operation should be applied via build_manifest, not build_manifest_impl."
+                        .to_string(),
                 ));
             }
             Operation::Append { fragments } => {
@@ -3345,6 +3505,16 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::UpdateBases {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
+            Some(pb::transaction::Operation::Composite(pb::transaction::CompositeOperation {
+                transactions,
+            })) => {
+                let operations = transactions
+                    .into_iter()
+                    .map(|sub| Self::try_from(sub).map(|t| t.operation))
+                    .collect::<Result<Vec<_>>>()?;
+                Operation::validate_composite(&operations)?;
+                Operation::Composite { operations }
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -3632,6 +3802,25 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+            Operation::Composite { operations } => {
+                // Only the sub-transactions' `operation` field is meaningful;
+                // the outer transaction governs read_version/uuid/tag/properties.
+                let transactions = operations
+                    .iter()
+                    .map(|op| {
+                        Self::from(&Transaction {
+                            read_version: 0,
+                            uuid: String::new(),
+                            operation: op.clone(),
+                            tag: None,
+                            transaction_properties: None,
+                        })
+                    })
+                    .collect();
+                pb::transaction::Operation::Composite(pb::transaction::CompositeOperation {
+                    transactions,
+                })
+            }
         };
 
         let transaction_properties = value
@@ -3705,6 +3894,18 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             return Ok(());
         }
         (None, Operation::Clone { .. }) => return Ok(()),
+        (None, Operation::Composite { operations }) => {
+            Operation::validate_composite(operations)?;
+            // A composite can create a dataset only by starting with Overwrite.
+            // Sub-operations are validated against their intermediate manifests
+            // during the build_manifest fold.
+            if !matches!(operations.first(), Some(Operation::Overwrite { .. })) {
+                return Err(Error::invalid_input(
+                    "A composite operation on a non-existent dataset must start with Overwrite",
+                ));
+            }
+            return Ok(());
+        }
         (Some(manifest), _) => manifest,
         (None, _) => {
             return Err(Error::invalid_input(format!(
@@ -3745,6 +3946,9 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
             schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
         }
+        // Structural rules only; each sub-operation is validated against its
+        // intermediate manifest during the build_manifest fold.
+        Operation::Composite { operations } => Operation::validate_composite(operations),
         _ => Ok(()),
     }
 }
@@ -4134,6 +4338,330 @@ mod tests {
                 .iter()
                 .any(|idx| idx.uuid == second_index.uuid)
         );
+    }
+
+    fn sample_update_config(key: &str, value: &str) -> Operation {
+        Operation::UpdateConfig {
+            config_updates: Some(UpdateMap {
+                update_entries: vec![(key, value).into()],
+                replace: false,
+            }),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_composite_pb_roundtrip() {
+        let operations = vec![
+            Operation::Append {
+                fragments: vec![Fragment::new(0)],
+            },
+            sample_update_config("k", "v"),
+        ];
+        let transaction = Transaction::new_from_version(
+            3,
+            Operation::Composite {
+                operations: operations.clone(),
+            },
+        );
+
+        let pb_transaction = pb::Transaction::from(&transaction);
+        let Some(pb::transaction::Operation::Composite(ref composite)) = pb_transaction.operation
+        else {
+            panic!("expected a composite operation");
+        };
+        assert_eq!(composite.transactions.len(), 2);
+        for inner in &composite.transactions {
+            // Only the operation of each sub-transaction is meaningful.
+            assert_eq!(inner.read_version, 0);
+            assert!(inner.uuid.is_empty());
+        }
+
+        let roundtripped = Transaction::try_from(pb_transaction).unwrap();
+        assert_eq!(roundtripped.read_version, 3);
+        assert_eq!(roundtripped.operation, Operation::Composite { operations });
+    }
+
+    #[test]
+    fn test_composite_validation() {
+        assert!(Operation::validate_composite(&[]).is_err());
+        for op in [
+            Operation::Restore { version: 1 },
+            Operation::Clone {
+                is_shallow: true,
+                ref_name: None,
+                ref_version: 1,
+                ref_path: "path".to_string(),
+                branch_name: None,
+            },
+            Operation::Composite {
+                operations: vec![Operation::Append { fragments: vec![] }],
+            },
+        ] {
+            let err = Operation::validate_composite(std::slice::from_ref(&op)).unwrap_err();
+            assert!(
+                err.to_string().contains(op.name()),
+                "error should name the offending operation: {}",
+                err
+            );
+        }
+        Operation::validate_composite(&[Operation::Append { fragments: vec![] }]).unwrap();
+    }
+
+    #[test]
+    fn test_composite_pb_decode_rejects_invalid() {
+        let nested = pb::Transaction {
+            operation: Some(pb::transaction::Operation::Composite(
+                pb::transaction::CompositeOperation {
+                    transactions: vec![pb::Transaction {
+                        operation: Some(pb::transaction::Operation::Composite(
+                            pb::transaction::CompositeOperation {
+                                transactions: vec![pb::Transaction {
+                                    operation: Some(pb::transaction::Operation::Append(
+                                        pb::transaction::Append { fragments: vec![] },
+                                    )),
+                                    ..Default::default()
+                                }],
+                            },
+                        )),
+                        ..Default::default()
+                    }],
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(Transaction::try_from(nested).is_err());
+
+        let empty = pb::Transaction {
+            operation: Some(pb::transaction::Operation::Composite(
+                pb::transaction::CompositeOperation {
+                    transactions: vec![],
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(Transaction::try_from(empty).is_err());
+    }
+
+    #[test]
+    fn test_composite_build_manifest_folds_sequentially() {
+        let manifest = sample_manifest();
+        assert_eq!(manifest.version, 1);
+
+        let transaction = Transaction::new_from_version(
+            1,
+            Operation::Composite {
+                operations: vec![
+                    Operation::Append {
+                        fragments: vec![Fragment::new(0)],
+                    },
+                    Operation::Append {
+                        fragments: vec![Fragment::new(0)],
+                    },
+                    Operation::Delete {
+                        updated_fragments: vec![],
+                        deleted_fragment_ids: vec![0],
+                        predicate: "true".to_string(),
+                    },
+                ],
+            },
+        );
+
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // The whole composite creates exactly one new version.
+        assert_eq!(new_manifest.version, 2);
+        // The two appends received distinct sequential fragment ids and the
+        // delete removed the pre-existing fragment 0, including a fragment
+        // interleaving added and pre-existing ids.
+        let ids = new_manifest
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(new_manifest.max_fragment_id(), Some(2));
+    }
+
+    #[test]
+    fn test_composite_build_manifest_config_and_index() {
+        let manifest = sample_manifest();
+        let index = sample_index_metadata("vector_idx");
+        let transaction = Transaction::new_from_version(
+            1,
+            Operation::Composite {
+                operations: vec![
+                    sample_update_config("dataset.key", "value"),
+                    Operation::CreateIndex {
+                        new_indices: vec![index.clone()],
+                        removed_indices: vec![],
+                    },
+                ],
+            },
+        );
+
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(new_manifest.version, 2);
+        assert_eq!(
+            new_manifest.config.get("dataset.key"),
+            Some(&"value".to_string())
+        );
+        assert_eq!(final_indices.len(), 1);
+        assert_eq!(final_indices[0].uuid, index.uuid);
+    }
+
+    #[test]
+    fn test_composite_reserved_fragment_ids_append_and_index() {
+        let manifest = sample_manifest();
+        // Reserve fragment ids in a prior transaction so data and index files
+        // can be written against known ids before the composite commit.
+        let (manifest, _) =
+            Transaction::new_from_version(1, Operation::ReserveFragments { num_fragments: 2 })
+                .build_manifest(
+                    Some(&manifest),
+                    vec![],
+                    "txn-reserve",
+                    &ManifestWriteConfig::default(),
+                )
+                .unwrap();
+        assert_eq!(manifest.max_fragment_id, Some(2));
+
+        let mut index = sample_index_metadata("vector_idx");
+        index.fragment_bitmap = Some([1, 2].into_iter().collect());
+        let transaction = Transaction::new_from_version(
+            2,
+            Operation::Composite {
+                operations: vec![
+                    Operation::Append {
+                        fragments: vec![Fragment::new(1), Fragment::new(2)],
+                    },
+                    Operation::CreateIndex {
+                        new_indices: vec![index],
+                        removed_indices: vec![],
+                    },
+                ],
+            },
+        );
+
+        let (new_manifest, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        // Pre-reserved fragment ids pass through the append unchanged, so the
+        // index's fragment bitmap references the final ids.
+        let ids = new_manifest
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(final_indices.len(), 1);
+        assert_eq!(
+            final_indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn test_composite_build_manifest_rejects_invalid() {
+        let manifest = sample_manifest();
+        for operations in [
+            vec![],
+            vec![Operation::Restore { version: 1 }],
+            vec![Operation::Composite {
+                operations: vec![Operation::Append { fragments: vec![] }],
+            }],
+        ] {
+            let transaction = Transaction::new_from_version(1, Operation::Composite { operations });
+            assert!(
+                transaction
+                    .build_manifest(
+                        Some(&manifest),
+                        vec![],
+                        "txn",
+                        &ManifestWriteConfig::default(),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_composite_stable_row_ids_version_meta_uses_final_version() {
+        // A create-mode composite: Overwrite followed by Append with stable
+        // row ids. Both sub-operations must stamp row version metadata with
+        // the single committed version (1), not per-step intermediate versions.
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&schema).unwrap();
+        let mut frag1 = Fragment::new(0);
+        frag1.physical_rows = Some(10);
+        let mut frag2 = Fragment::new(0);
+        frag2.physical_rows = Some(5);
+
+        let config = ManifestWriteConfig {
+            use_stable_row_ids: true,
+            ..Default::default()
+        };
+        let transaction = Transaction::new_from_version(
+            0,
+            Operation::Composite {
+                operations: vec![
+                    Operation::Overwrite {
+                        fragments: vec![frag1],
+                        schema: lance_schema,
+                        config_upsert_values: None,
+                        initial_bases: None,
+                    },
+                    Operation::Append {
+                        fragments: vec![frag2],
+                    },
+                ],
+            },
+        );
+
+        let (manifest, _) = transaction
+            .build_manifest(None, vec![], "txn", &config)
+            .unwrap();
+
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.fragments.len(), 2);
+        let fragment_ids = manifest.fragments.iter().map(|f| f.id).collect::<Vec<_>>();
+        for fragment_id in fragment_ids {
+            let versions = created_at_versions(&manifest, fragment_id);
+            assert!(
+                versions.iter().all(|v| *v == 1),
+                "fragment {} has created-at versions {:?}, expected all 1",
+                fragment_id,
+                versions
+            );
+        }
     }
 
     #[test]

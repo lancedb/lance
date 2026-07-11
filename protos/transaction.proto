@@ -329,6 +329,23 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  // An ordered list of operations applied sequentially as one atomic commit.
+  //
+  // Each sub-transaction's `operation` is applied to the manifest produced by
+  // the previous one; the resulting manifest is committed as a single new
+  // version. Only the `operation` field of each sub-transaction is meaningful:
+  // the outer transaction's `read_version`, `uuid`, `tag` and
+  // `transaction_properties` govern the commit, and the corresponding inner
+  // fields are left unset by writers and ignored by readers. Inner fields are
+  // reserved for future per-statement metadata (e.g. merging independently
+  // created transactions while preserving their identity).
+  //
+  // Sub-transactions must not contain `Restore`, `Clone`, or a nested
+  // `CompositeOperation`, and the list must not be empty.
+  message CompositeOperation {
+    repeated Transaction transactions = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -346,6 +363,9 @@ message Transaction {
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
     UpdateBases update_bases = 114;
+    // Field 115 is intentionally skipped: it is used by an in-flight proposal
+    // (https://github.com/lance-format/lance/pull/7674).
+    CompositeOperation composite = 116;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

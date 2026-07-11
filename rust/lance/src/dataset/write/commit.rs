@@ -304,12 +304,16 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        if dest.dataset().is_none()
-            && !matches!(
-                transaction.operation,
-                Operation::Overwrite { .. } | Operation::Clone { .. }
-            )
-        {
+        let can_create_dataset = match &transaction.operation {
+            Operation::Overwrite { .. } | Operation::Clone { .. } => true,
+            // A composite can create a dataset by starting with Overwrite;
+            // validate_operation enforces this below.
+            Operation::Composite { operations } => {
+                matches!(operations.first(), Some(Operation::Overwrite { .. }))
+            }
+            _ => false,
+        };
+        if dest.dataset().is_none() && !can_create_dataset {
             return Err(Error::dataset_not_found(
                 base_path.to_string(),
                 "The dataset must already exist unless the operation is Overwrite".into(),
@@ -1000,6 +1004,235 @@ mod tests {
             matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
         );
         assert_eq!(transaction.read_version, 1);
+    }
+
+    fn sample_update_config_op(key: &str, value: &str) -> Operation {
+        use crate::dataset::transaction::UpdateMap;
+        Operation::UpdateConfig {
+            config_updates: Some(UpdateMap {
+                update_entries: vec![(key, value).into()],
+                replace: false,
+            }),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    fn composite_transaction(read_version: u64, operations: Vec<Operation>) -> Transaction {
+        Transaction {
+            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            operation: Operation::Composite { operations },
+            read_version,
+            tag: None,
+            transaction_properties: None,
+        }
+    }
+
+    async fn sample_dataset(uri: &str) -> (Arc<Dataset>, RecordBatch) {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new(uri)
+            .execute(vec![batch.clone()])
+            .await
+            .unwrap();
+        (Arc::new(dataset), batch)
+    }
+
+    async fn uncommitted_append(dataset: &Arc<Dataset>, batch: &RecordBatch) -> Operation {
+        use crate::dataset::WriteMode;
+        let transaction = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![batch.clone()])
+            .await
+            .unwrap();
+        transaction.operation
+    }
+
+    #[tokio::test]
+    async fn test_commit_composite() {
+        let (dataset, batch) = sample_dataset("memory://composite").await;
+        let append = uncommitted_append(&dataset, &batch).await;
+
+        let composite = composite_transaction(
+            dataset.manifest.version,
+            vec![append, sample_update_config_op("composite.key", "value")],
+        );
+        let new_ds = CommitBuilder::new(dataset.clone())
+            .execute(composite)
+            .await
+            .unwrap();
+
+        // Both effects land in a single new version.
+        assert_eq!(new_ds.manifest.version, 2);
+        assert_eq!(new_ds.count_rows(None).await.unwrap(), 20);
+        assert_eq!(
+            new_ds.manifest.config.get("composite.key"),
+            Some(&"value".to_string())
+        );
+
+        // The transaction is not inlined into the manifest so that released
+        // readers, which decode the inline section eagerly, can still open
+        // this version. It is still readable from the transaction file.
+        assert!(new_ds.manifest.transaction_section.is_none());
+        let read_back = new_ds.read_transaction().await.unwrap().unwrap();
+        assert!(matches!(
+            read_back.operation,
+            Operation::Composite { ref operations } if operations.len() == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_commit_composite_rebases_on_concurrent_append() {
+        let (dataset, batch) = sample_dataset("memory://composite-rebase").await;
+        let composite_append = uncommitted_append(&dataset, &batch).await;
+
+        // A concurrent plain append lands first, at version 2.
+        let concurrent_append = uncommitted_append(&dataset, &batch).await;
+        CommitBuilder::new(dataset.clone())
+            .execute(Transaction {
+                uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+                operation: concurrent_append,
+                read_version: 1,
+                tag: None,
+                transaction_properties: None,
+            })
+            .await
+            .unwrap();
+
+        // The composite, with a stale read version, rebases and succeeds.
+        let composite = composite_transaction(
+            1,
+            vec![
+                composite_append,
+                sample_update_config_op("composite.key", "value"),
+            ],
+        );
+        let new_ds = CommitBuilder::new(dataset.clone())
+            .execute(composite)
+            .await
+            .unwrap();
+
+        assert_eq!(new_ds.manifest.version, 3);
+        assert_eq!(new_ds.count_rows(None).await.unwrap(), 30);
+        assert_eq!(
+            new_ds.manifest.config.get("composite.key"),
+            Some(&"value".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_composite_incompatible_on_config_conflict() {
+        let (dataset, _batch) = sample_dataset("memory://composite-conflict").await;
+
+        // A plain config update lands first, at version 2.
+        CommitBuilder::new(dataset.clone())
+            .execute(Transaction {
+                uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+                operation: sample_update_config_op("composite.key", "first"),
+                read_version: 1,
+                tag: None,
+                transaction_properties: None,
+            })
+            .await
+            .unwrap();
+
+        // A composite upserting the same key from the same read version must
+        // surface the sub-operation's incompatibility.
+        let composite =
+            composite_transaction(1, vec![sample_update_config_op("composite.key", "second")]);
+        let res = CommitBuilder::new(dataset.clone()).execute(composite).await;
+        assert!(
+            matches!(res, Err(Error::IncompatibleTransaction { .. })),
+            "got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_plain_rebases_on_concurrent_composite() {
+        let (dataset, batch) = sample_dataset("memory://composite-other").await;
+        let plain_append = uncommitted_append(&dataset, &batch).await;
+
+        // A composite lands first, at version 2. Composites are not inlined
+        // into the manifest, so the plain transaction's conflict resolution
+        // must read it from the external transaction file and decompose it.
+        let composite_append = uncommitted_append(&dataset, &batch).await;
+        CommitBuilder::new(dataset.clone())
+            .execute(composite_transaction(
+                1,
+                vec![
+                    composite_append,
+                    sample_update_config_op("composite.key", "value"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        let new_ds = CommitBuilder::new(dataset.clone())
+            .execute(Transaction {
+                uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+                operation: plain_append,
+                read_version: 1,
+                tag: None,
+                transaction_properties: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(new_ds.manifest.version, 3);
+        assert_eq!(new_ds.count_rows(None).await.unwrap(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_commit_composite_creates_dataset() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        let lance_schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
+
+        // A composite starting with Overwrite can create a dataset.
+        let composite = composite_transaction(
+            0,
+            vec![
+                Operation::Overwrite {
+                    fragments: vec![],
+                    schema: lance_schema,
+                    config_upsert_values: None,
+                    initial_bases: None,
+                },
+                sample_update_config_op("created.by", "composite"),
+            ],
+        );
+        let dataset = CommitBuilder::new("memory://composite-create")
+            .execute(composite)
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.version, 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+        assert_eq!(
+            dataset.manifest.config.get("created.by"),
+            Some(&"composite".to_string())
+        );
+
+        // A composite not starting with Overwrite cannot.
+        let composite =
+            composite_transaction(0, vec![sample_update_config_op("created.by", "composite")]);
+        let res = CommitBuilder::new("memory://composite-create-2")
+            .execute(composite)
+            .await;
+        assert!(
+            matches!(res, Err(Error::DatasetNotFound { .. })),
+            "got {res:?}"
+        );
     }
 
     /// On non-lexically-ordered stores (e.g. S3 Express) a commit should use the

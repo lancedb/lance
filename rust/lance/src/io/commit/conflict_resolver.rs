@@ -35,10 +35,47 @@ pub struct TransactionRebase<'a> {
     /// Merged generations from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
     conflicting_mem_wal_merged_gens: Vec<MergedGeneration>,
+    /// One rebase per sub-operation when the transaction is a composite;
+    /// empty otherwise. Composite conflict checks and rebases delegate to
+    /// these so each sub-operation keeps its existing rules.
+    sub_rebases: Vec<Self>,
 }
 
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
+        dataset: &Dataset,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+    ) -> Result<Self> {
+        if let Operation::Composite { operations } = &transaction.operation {
+            // A single affected-rows map is ambiguous across multiple
+            // Delete/Update sub-operations, so sub-rebases fall back to
+            // fragment-level conflict detection.
+            let mut sub_rebases = Vec::with_capacity(operations.len());
+            for operation in operations {
+                let sub_transaction = Transaction {
+                    read_version: transaction.read_version,
+                    uuid: transaction.uuid.clone(),
+                    operation: operation.clone(),
+                    tag: None,
+                    transaction_properties: None,
+                };
+                sub_rebases.push(Self::try_new_single(dataset, sub_transaction, None).await?);
+            }
+            return Ok(Self {
+                transaction,
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+                sub_rebases,
+            });
+        }
+        Self::try_new_single(dataset, transaction, affected_rows).await
+    }
+
+    async fn try_new_single(
         dataset: &Dataset,
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
@@ -61,6 +98,7 @@ impl<'a> TransactionRebase<'a> {
                 modified_fragment_ids: HashSet::new(),
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_merged_gens: Vec::new(),
+                sub_rebases: Vec::new(),
             }),
             Operation::Delete {
                 updated_fragments,
@@ -89,6 +127,7 @@ impl<'a> TransactionRebase<'a> {
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
                         conflicting_mem_wal_merged_gens: Vec::new(),
+                        sub_rebases: Vec::new(),
                     });
                 }
 
@@ -102,6 +141,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_merged_gens: Vec::new(),
+                    sub_rebases: Vec::new(),
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -120,6 +160,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_merged_gens: Vec::new(),
+                    sub_rebases: Vec::new(),
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -135,6 +176,7 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_merged_gens: Vec::new(),
+                    sub_rebases: Vec::new(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -149,8 +191,12 @@ impl<'a> TransactionRebase<'a> {
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
                     conflicting_mem_wal_merged_gens: Vec::new(),
+                    sub_rebases: Vec::new(),
                 })
             }
+            Operation::Composite { .. } => Err(Error::internal(
+                "Composite sub-operations cannot be nested composites".to_string(),
+            )),
         }
     }
 
@@ -204,6 +250,29 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        // A committed composite conflicts iff any of its sub-operations
+        // conflicts: decompose it and check against each one.
+        if let Operation::Composite { operations } = &other_transaction.operation {
+            for operation in operations {
+                let sub_other = Transaction {
+                    read_version: other_transaction.read_version,
+                    uuid: other_transaction.uuid.clone(),
+                    operation: operation.clone(),
+                    tag: None,
+                    transaction_properties: None,
+                };
+                self.check_txn(&sub_other, other_version)?;
+            }
+            return Ok(());
+        }
+        // A composite in flight delegates to its sub-operations' rebases so
+        // each keeps its existing conflict rules.
+        if matches!(self.transaction.operation, Operation::Composite { .. }) {
+            for sub_rebase in self.sub_rebases.iter_mut() {
+                sub_rebase.check_txn(other_transaction, other_version)?;
+            }
+            return Ok(());
+        }
         let op = &self.transaction.operation;
         match op {
             Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
@@ -235,6 +304,8 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+            // Handled by the delegation above.
+            Operation::Composite { .. } => unreachable!("composite check_txn delegates above"),
         }
     }
 
@@ -245,6 +316,10 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::Delete { .. } = &self.transaction.operation {
             match &other_transaction.operation {
+                Operation::Composite { .. } => Err(Error::internal(
+                    "composite transactions are decomposed before per-operation conflict checks"
+                        .to_string(),
+                )),
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -393,6 +468,10 @@ impl<'a> TransactionRebase<'a> {
             }
 
             match &other_transaction.operation {
+                Operation::Composite { .. } => Err(Error::internal(
+                    "composite transactions are decomposed before per-operation conflict checks"
+                        .to_string(),
+                )),
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
@@ -512,6 +591,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                Operation::Composite { .. } => Err(Error::internal(
+                    "composite transactions are decomposed before per-operation conflict checks"
+                        .to_string(),
+                )),
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
@@ -665,6 +748,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                Operation::Composite { .. } => Err(Error::internal(
+                    "composite transactions are decomposed before per-operation conflict checks"
+                        .to_string(),
+                )),
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
@@ -841,6 +928,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            Operation::Composite { .. } => Err(Error::internal(
+                "composite transactions are decomposed before per-operation conflict checks"
+                    .to_string(),
+            )),
             Operation::Overwrite { .. } => {
                 if self
                     .transaction
@@ -889,6 +980,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            Operation::Composite { .. } => Err(Error::internal(
+                "composite transactions are decomposed before per-operation conflict checks"
+                    .to_string(),
+            )),
             // Append is not compatible with any operation that completely
             // overwrites the schema.
             Operation::Overwrite { .. }
@@ -918,6 +1013,10 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::DataReplacement { replacements } = &self.transaction.operation {
             match &other_transaction.operation {
+                Operation::Composite { .. } => Err(Error::internal(
+                    "composite transactions are decomposed before per-operation conflict checks"
+                        .to_string(),
+                )),
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -1061,6 +1160,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            Operation::Composite { .. } => Err(Error::internal(
+                "composite transactions are decomposed before per-operation conflict checks"
+                    .to_string(),
+            )),
             Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
@@ -1090,6 +1193,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            Operation::Composite { .. } => Err(Error::internal(
+                "composite transactions are decomposed before per-operation conflict checks"
+                    .to_string(),
+            )),
             Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::Overwrite { .. }
@@ -1116,6 +1223,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            Operation::Composite { .. } => Err(Error::internal(
+                "composite transactions are decomposed before per-operation conflict checks"
+                    .to_string(),
+            )),
             Operation::Overwrite { .. } | Operation::Restore { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
@@ -1141,6 +1252,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            Operation::Composite { .. } => Err(Error::internal(
+                "composite transactions are decomposed before per-operation conflict checks"
+                    .to_string(),
+            )),
             // Project is compatible with anything that doesn't change the schema
             Operation::Append { .. }
             | Operation::Update { .. }
@@ -1176,6 +1291,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                Operation::Composite { .. } => Err(Error::internal(
+                    "composite transactions are decomposed before per-operation conflict checks"
+                        .to_string(),
+                )),
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
@@ -1235,6 +1354,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                Operation::Composite { .. } => Err(Error::internal(
+                    "composite transactions are decomposed before per-operation conflict checks"
+                        .to_string(),
+                )),
                 Operation::UpdateMemWalState {
                     merged_generations: other_merged_generations,
                 } => {
@@ -1368,6 +1491,20 @@ impl<'a> TransactionRebase<'a> {
 
     /// Writes
     pub async fn finish(self, dataset: &Dataset) -> Result<Transaction> {
+        if matches!(self.transaction.operation, Operation::Composite { .. }) {
+            let mut operations = Vec::with_capacity(self.sub_rebases.len());
+            for sub_rebase in self.sub_rebases {
+                let finished = sub_rebase.finish_single(dataset).await?;
+                operations.push(finished.operation);
+            }
+            let mut transaction = self.transaction;
+            transaction.operation = Operation::Composite { operations };
+            return Ok(transaction);
+        }
+        self.finish_single(dataset).await
+    }
+
+    async fn finish_single(self, dataset: &Dataset) -> Result<Transaction> {
         match &self.transaction.operation {
             Operation::Delete { .. } | Operation::Update { .. } => {
                 self.finish_delete_update(dataset).await
@@ -1385,6 +1522,9 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
+            Operation::Composite { .. } => Err(Error::internal(
+                "Composite sub-operations cannot be nested composites".to_string(),
+            )),
         }
     }
 
@@ -2739,6 +2879,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_merged_gens: Vec::new(),
+                sub_rebases: Vec::new(),
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -2782,6 +2923,209 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_conflicts() {
+        use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
+
+        let fragment0 = Fragment::new(0);
+        let fragment1 = Fragment::new(1);
+
+        let sub_operations = vec![
+            Operation::Append {
+                fragments: vec![fragment1],
+            },
+            Operation::Delete {
+                updated_fragments: vec![fragment0.clone()],
+                deleted_fragment_ids: vec![],
+                predicate: "x > 2".to_string(),
+            },
+            create_update_config_for_test(
+                Some(HashMap::from_iter(vec![(
+                    "lance.test".to_string(),
+                    "value".to_string(),
+                )])),
+                None,
+                None,
+                None,
+            ),
+        ];
+        let composite_transaction = Transaction::new(
+            0,
+            Operation::Composite {
+                operations: sub_operations.clone(),
+            },
+            None,
+        );
+
+        // A plain in-flight transaction checked against a committed composite:
+        // the composite decomposes and each sub-operation's rules apply.
+        let plain_cases = [
+            (
+                // Does not overlap any sub-operation.
+                Operation::Append {
+                    fragments: vec![Fragment::new(3)],
+                },
+                Compatible,
+            ),
+            (
+                // Overlaps the composite's Delete of fragment 0.
+                Operation::Delete {
+                    updated_fragments: vec![fragment0.clone()],
+                    deleted_fragment_ids: vec![],
+                    predicate: "x > 2".to_string(),
+                },
+                Retryable,
+            ),
+            (
+                // Upserts the same config key as the composite's UpdateConfig.
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
+                        "lance.test".to_string(),
+                        "other-value".to_string(),
+                    )])),
+                    None,
+                    None,
+                    None,
+                ),
+                NotCompatible,
+            ),
+        ];
+        for (operation, expected) in &plain_cases {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, operation.clone(), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+                sub_rebases: Vec::new(),
+            };
+            let result = rebase.check_txn(&composite_transaction, 1);
+            assert_conflict_result(
+                result,
+                expected,
+                operation,
+                &composite_transaction.operation,
+            );
+        }
+
+        // An in-flight composite delegates to its sub-operations' rebases.
+        let make_composite_rebase = || TransactionRebase {
+            transaction: composite_transaction.clone(),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: sub_operations
+                .iter()
+                .map(|op| TransactionRebase {
+                    transaction: Transaction::new(0, op.clone(), None),
+                    initial_fragments: HashMap::new(),
+                    modified_fragment_ids: modified_fragment_ids(op).collect::<HashSet<_>>(),
+                    affected_rows: None,
+                    conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_merged_gens: Vec::new(),
+                    sub_rebases: Vec::new(),
+                })
+                .collect(),
+        };
+        let composite_cases = [
+            (
+                Operation::Append {
+                    fragments: vec![Fragment::new(3)],
+                },
+                Compatible,
+            ),
+            (
+                // Overlaps the composite's Delete sub-operation.
+                Operation::Delete {
+                    updated_fragments: vec![fragment0.clone()],
+                    deleted_fragment_ids: vec![],
+                    predicate: "x > 2".to_string(),
+                },
+                Retryable,
+            ),
+            (
+                // The composite's Append sub-operation is incompatible with a
+                // concurrent Overwrite.
+                Operation::Overwrite {
+                    fragments: vec![fragment0],
+                    schema: lance_core::datatypes::Schema::default(),
+                    config_upsert_values: None,
+                    initial_bases: None,
+                },
+                NotCompatible,
+            ),
+            (
+                // Upserts the same config key as the composite's UpdateConfig.
+                create_update_config_for_test(
+                    Some(HashMap::from_iter(vec![(
+                        "lance.test".to_string(),
+                        "other-value".to_string(),
+                    )])),
+                    None,
+                    None,
+                    None,
+                ),
+                NotCompatible,
+            ),
+        ];
+        for (operation, expected) in &composite_cases {
+            let mut rebase = make_composite_rebase();
+            let other = Transaction::new(0, operation.clone(), None);
+            let result = rebase.check_txn(&other, 1);
+            assert_conflict_result(
+                result,
+                expected,
+                &composite_transaction.operation,
+                operation,
+            );
+        }
+
+        // Composite vs composite: decomposed on both sides; the overlapping
+        // Delete sub-operations conflict.
+        let mut rebase = make_composite_rebase();
+        let result = rebase.check_txn(&composite_transaction, 1);
+        assert_conflict_result(
+            result,
+            &Retryable,
+            &composite_transaction.operation,
+            &composite_transaction.operation,
+        );
+    }
+
+    fn assert_conflict_result(
+        result: Result<()>,
+        expected: &ConflictResult,
+        operation: &Operation,
+        other: &Operation,
+    ) {
+        match expected {
+            ConflictResult::Compatible => assert!(
+                result.is_ok(),
+                "Transaction {:?} should be compatible with {:?}, but was {:?}",
+                operation,
+                other,
+                result
+            ),
+            ConflictResult::NotCompatible => assert!(
+                matches!(result, Err(Error::IncompatibleTransaction { .. })),
+                "Transaction {:?} should be incompatible with {:?}, but was {:?}",
+                operation,
+                other,
+                result
+            ),
+            ConflictResult::Retryable => assert!(
+                matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                "Transaction {:?} should be retryable with {:?}, but was {:?}",
+                operation,
+                other,
+                result
+            ),
+        }
+    }
+
+    #[test]
     fn test_create_index_conflicts_only_on_same_name() {
         let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -2816,6 +3160,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         let same_name = Transaction::new(
@@ -2870,6 +3215,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -3255,6 +3601,9 @@ mod tests {
             Operation::DataReplacement { replacements } => {
                 Box::new(replacements.iter().map(|r| r.0))
             }
+            Operation::Composite { operations } => {
+                Box::new(operations.iter().flat_map(modified_fragment_ids))
+            }
         }
     }
 
@@ -3507,6 +3856,7 @@ mod tests {
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
                 conflicting_mem_wal_merged_gens: Vec::new(),
+                sub_rebases: Vec::new(),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -3570,6 +3920,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -3608,6 +3959,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -3647,6 +3999,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -3686,6 +4039,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -3736,6 +4090,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -3761,6 +4116,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -3807,6 +4163,7 @@ mod tests {
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
             conflicting_mem_wal_merged_gens: Vec::new(),
+            sub_rebases: Vec::new(),
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState

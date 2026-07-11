@@ -4580,10 +4580,15 @@ class LanceDataset(pa.dataset.Dataset):
             and not isinstance(
                 operation, (LanceOperation.Overwrite, LanceOperation.Restore)
             )
+            and not (
+                isinstance(operation, LanceOperation.Composite)
+                and len(operation.operations) > 0
+                and isinstance(operation.operations[0], LanceOperation.Overwrite)
+            )
         ):
             raise ValueError(
                 "read_version is required for all operations except "
-                "Overwrite and Restore"
+                "Overwrite, Restore, and Composite starting with Overwrite"
             )
 
         # Storage options provider is automatically created in Rust when
@@ -6072,6 +6077,57 @@ class LanceOperation:
         table_metadata_updates: Optional[LanceOperation.UpdateMap] = None
         schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
         field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
+
+    @dataclass
+    class Composite(BaseOperation):
+        """
+        An ordered list of operations applied sequentially as one atomic commit.
+
+        Each operation is applied to the result of the previous one, and the
+        final state is committed as a single new version. This allows
+        multi-statement transactions such as an append and an index update
+        that become visible atomically.
+
+        The operations must not contain ``Restore`` or a nested ``Composite``.
+
+        Attributes
+        ----------
+        operations: list[LanceOperation.BaseOperation]
+            The operations to apply in order.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tab1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
+        >>> dataset = lance.write_dataset(tab1, "example")
+        >>> tab2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
+        >>> fragment = lance.fragment.LanceFragment.create("example", tab2)
+        >>> operation = lance.LanceOperation.Composite(
+        ...     [
+        ...         lance.LanceOperation.Append([fragment]),
+        ...         lance.LanceOperation.Delete([], [1], "a >= 3"),
+        ...     ]
+        ... )
+        >>> dataset = lance.LanceDataset.commit("example", operation,
+        ...                                     read_version=dataset.version)
+        >>> dataset.to_table().to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        """
+
+        operations: Iterable[LanceOperation.BaseOperation]
+
+        def __post_init__(self):
+            if not isinstance(self.operations, list) or not all(
+                isinstance(op, LanceOperation.BaseOperation) for op in self.operations
+            ):
+                raise TypeError(
+                    "operations must be list[LanceOperation.BaseOperation], "
+                    f"got {type(self.operations)}"
+                )
 
 
 @dataclass

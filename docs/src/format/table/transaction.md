@@ -498,6 +498,40 @@ An UpdateBases operation only modifies the base paths. As a result, it only conf
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
 
+### Composite
+
+An ordered list of operations applied sequentially as one atomic commit. Each sub-operation is
+applied to the manifest produced by the previous one, and the final manifest is committed as a
+single new version. This enables multi-statement transactions — for example, an append and an
+index update over the appended fragments (with fragment IDs reserved via ReserveFragments ahead
+of time) that become visible atomically.
+
+Each sub-transaction carries only its `operation`; the outer transaction's `read_version`, `uuid`,
+`tag`, and `transaction_properties` govern the commit, and the corresponding inner fields are left
+unset by writers and ignored by readers. The sub-operations must not contain Restore, Clone, or a
+nested Composite, and the list must not be empty.
+
+<details>
+<summary>CompositeOperation protobuf message</summary>
+
+```protobuf
+%%% proto.message.CompositeOperation %%%
+```
+
+</details>
+
+#### Composite Compatibility
+
+A Composite operation conflicts with a concurrent transaction if and only if at least one of its
+sub-operations conflicts with it, applying each sub-operation's own compatibility rules. When the
+concurrent transaction is itself a Composite, it is decomposed the same way, so two Composite
+operations conflict if any pair of their sub-operations conflicts. Rebases are likewise delegated:
+each sub-operation is rebased under its own rules and the results are reassembled in order.
+
+Writers do not inline Composite transactions into the manifest's transaction section: released
+readers eagerly decode that section when opening a dataset and would fail on an unknown operation.
+The transaction remains available in the external transaction file.
+
 ## Conflict Resolution
 
 ### Terminology

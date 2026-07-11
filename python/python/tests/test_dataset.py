@@ -1838,6 +1838,58 @@ def test_append_with_commit(tmp_path: Path):
     assert tbl == expected
 
 
+def test_composite_with_commit(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    composite = lance.LanceOperation.Composite(
+        [
+            lance.LanceOperation.Append([fragment]),
+            lance.LanceOperation.UpdateConfig(
+                config_updates=lance.LanceOperation.UpdateMap(
+                    updates={"composite.key": "value"}, replace=False
+                )
+            ),
+        ]
+    )
+
+    with pytest.raises(ValueError):
+        # Must specify read version
+        lance.LanceDataset.commit(dataset, composite)
+
+    dataset = lance.LanceDataset.commit(dataset, composite, read_version=1)
+
+    # Both effects are visible in a single new version.
+    assert dataset.version == 2
+    assert dataset.count_rows() == 200
+    assert dataset.config()["composite.key"] == "value"
+
+    # The committed transaction reads back as a composite.
+    transaction = dataset.read_transaction(2)
+    assert isinstance(transaction.operation, lance.LanceOperation.Composite)
+    assert len(transaction.operation.operations) == 2
+    assert isinstance(transaction.operation.operations[0], lance.LanceOperation.Append)
+
+
+def test_composite_validation():
+    with pytest.raises(TypeError):
+        lance.LanceOperation.Composite(operations="not-a-list")
+
+    data = pa.Table.from_pydict({"a": range(10), "b": range(10)})
+    dataset = lance.write_dataset(data, "memory://composite-validation")
+    empty = lance.LanceOperation.Composite(operations=[])
+    with pytest.raises(Exception, match="at least one"):
+        lance.LanceDataset.commit(dataset, empty, read_version=1)
+
+    nested = lance.LanceOperation.Composite(
+        operations=[lance.LanceOperation.Composite(operations=[])]
+    )
+    with pytest.raises(Exception, match="cannot contain"):
+        lance.LanceDataset.commit(dataset, nested, read_version=1)
+
+
 def test_commit_batch_append():
     data1 = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     dataset = lance.write_dataset(data1, "memory://test")

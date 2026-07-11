@@ -738,16 +738,32 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
-
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
+            // This is an opportunistic cache warm-up: a transaction written by
+            // a newer version may contain an operation this version cannot
+            // decode, and that must not prevent opening the dataset. Paths
+            // that need the transaction contents surface the error themselves.
+            match lance_table::format::pb::Transaction::decode(message_data)
+                .map_err(Error::from)
+                .and_then(Transaction::try_from)
+            {
+                Ok(transaction) => {
+                    let metadata_cache = session.metadata_cache.for_dataset(uri);
+                    let metadata_key = TransactionKey {
+                        version: manifest_location.version,
+                    };
+                    metadata_cache
+                        .insert_with_key(&metadata_key, Arc::new(transaction))
+                        .await;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Failed to decode the inline transaction of version {}; \
+                         it may have been written by a newer version of Lance: {}",
+                        manifest_location.version,
+                        err
+                    );
+                }
+            }
         }
 
         if manifest.should_use_legacy_format() {
@@ -3674,6 +3690,20 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
     mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
+    // Composite transactions are not inlined into the manifest: released
+    // readers eagerly decode the inline transaction section when opening a
+    // dataset and fail on unknown operation types, which would make this
+    // version unopenable for them. Without the inline section they open
+    // normally; only paths that need the transaction contents (conflict
+    // resolution, history) read the external transaction file.
+    // TODO: inline composites once readers with tolerant decoding are
+    // widespread.
+    if matches!(
+        transaction.map(|t| &t.operation),
+        Some(Operation::Composite { .. })
+    ) {
+        transaction = None;
+    }
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
