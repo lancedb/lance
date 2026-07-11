@@ -48,12 +48,12 @@ pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, Wa
 
 use super::memtable::flush::TriggerMemTableFlush;
 use super::scanner::GenerationWarmer;
-use crate::session::Session;
 use super::wal::{
     BatchDurableWatcher, TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState,
     WalRetryConfig, WalTailer, empty_flush_result,
 };
 use super::{TOMBSTONE, schema_with_tombstone};
+use crate::session::Session;
 
 use super::manifest::ShardManifestStore;
 

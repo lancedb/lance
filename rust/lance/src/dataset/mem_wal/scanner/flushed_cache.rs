@@ -344,8 +344,12 @@ mod tests {
         let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
         write_dataset(&uri, &[7, 8, 9]).await;
 
-        let a = open_flushed_dataset(&uri, None, None,None, None).await.unwrap();
-        let b = open_flushed_dataset(&uri, None, None,None, None).await.unwrap();
+        let a = open_flushed_dataset(&uri, None, None, None, None)
+            .await
+            .unwrap();
+        let b = open_flushed_dataset(&uri, None, None, None, None)
+            .await
+            .unwrap();
         assert!(
             !Arc::ptr_eq(&a, &b),
             "no-cache path must cold-open each call"
@@ -354,10 +358,10 @@ mod tests {
 
         // With a cache, the second call is a shared clone.
         let cache: Arc<dyn DatasetCache> = Arc::new(FlushedMemTableCache::new(8));
-        let c = open_flushed_dataset(&uri, None, None,Some(&cache), None)
+        let c = open_flushed_dataset(&uri, None, None, Some(&cache), None)
             .await
             .unwrap();
-        let d = open_flushed_dataset(&uri, None, None,Some(&cache), None)
+        let d = open_flushed_dataset(&uri, None, None, Some(&cache), None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&c, &d), "cached path must reuse the Arc");
@@ -395,7 +399,7 @@ mod tests {
             notify: notify.clone(),
         });
 
-        let ds = open_flushed_dataset(&uri, None, None,None, Some(&warmer))
+        let ds = open_flushed_dataset(&uri, None, None, None, Some(&warmer))
             .await
             .unwrap();
         assert_eq!(ds.count_rows(None).await.unwrap(), 3);

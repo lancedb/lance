@@ -539,7 +539,7 @@ mod tests {
             active_source(shard, 1, &[3]),
         ];
 
-        let memberships = fresh_tier_block_list(&sources, None, None, None,None)
+        let memberships = fresh_tier_block_list(&sources, None, None, None, None)
             .await
             .unwrap();
 
@@ -713,7 +713,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, None,Some(&watermarks))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&watermarks))
             .await
             .unwrap();
         assert!(blocks(&sets, 1).await);
@@ -721,7 +721,7 @@ mod tests {
         assert!(!blocks(&sets, 3).await);
 
         // No watermark → live tier: all three are members.
-        let sets = fresh_tier_block_list(&sources, None, None, None,None)
+        let sets = fresh_tier_block_list(&sources, None, None, None, None)
             .await
             .unwrap();
         for id in [1, 2, 3] {
@@ -755,7 +755,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, None,Some(&watermarks))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&watermarks))
             .await
             .unwrap();
         assert!(blocks(&sets, 1).await); // gen 1, whole
@@ -806,7 +806,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, None,Some(&at))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&at))
             .await
             .unwrap();
         assert!(!blocks(&sets, 5).await);
@@ -821,7 +821,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, None,Some(&above))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&above))
             .await
             .unwrap();
         assert!(blocks(&sets, 5).await);

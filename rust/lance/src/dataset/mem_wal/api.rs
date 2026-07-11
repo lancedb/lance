@@ -610,9 +610,14 @@ impl DatasetMemWalExt for Dataset {
                 snapshot.flushed_generations.iter().map(move |flushed| {
                     let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, flushed.path);
                     async move {
-                        let dataset =
-                            open_flushed_dataset(&path, Some(session), store_params.as_ref(), cache, None)
-                                .await?;
+                        let dataset = open_flushed_dataset(
+                            &path,
+                            Some(session),
+                            store_params.as_ref(),
+                            cache,
+                            None,
+                        )
+                        .await?;
                         prewarm_all_indexes(&dataset).await
                     }
                 })
@@ -717,7 +722,7 @@ impl DatasetMemWalExt for Dataset {
         // `list_mem_wal_latest_shard_ids`.
         let base_uri = self.uri();
         let store = self.object_store(None).await?;
-        let base_path = self.branch_location().path.clone();
+        let base_path = self.branch_location().path;
 
         // Create ShardWriter
         ShardWriter::open(
