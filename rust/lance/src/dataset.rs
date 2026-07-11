@@ -738,31 +738,16 @@ impl Dataset {
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            // This is an opportunistic cache warm-up: a transaction written by
-            // a newer version may contain an operation this version cannot
-            // decode, and that must not prevent opening the dataset. Paths
-            // that need the transaction contents surface the error themselves.
-            match lance_table::format::pb::Transaction::decode(message_data)
-                .map_err(Error::from)
-                .and_then(Transaction::try_from)
+            if let Some(transaction) =
+                decode_inline_transaction(message_data, manifest_location.version)
             {
-                Ok(transaction) => {
-                    let metadata_cache = session.metadata_cache.for_dataset(uri);
-                    let metadata_key = TransactionKey {
-                        version: manifest_location.version,
-                    };
-                    metadata_cache
-                        .insert_with_key(&metadata_key, Arc::new(transaction))
-                        .await;
-                }
-                Err(err) => {
-                    log::warn!(
-                        "Failed to decode the inline transaction of version {}; \
-                         it may have been written by a newer version of Lance: {}",
-                        manifest_location.version,
-                        err
-                    );
-                }
+                let metadata_cache = session.metadata_cache.for_dataset(uri);
+                let metadata_key = TransactionKey {
+                    version: manifest_location.version,
+                };
+                metadata_cache
+                    .insert_with_key(&metadata_key, Arc::new(transaction))
+                    .await;
             }
         }
 
@@ -3682,6 +3667,31 @@ impl ManifestWriteConfig {
     }
 }
 
+/// Decode an inline transaction section for opportunistic caching.
+///
+/// Returns `None` instead of failing when the transaction cannot be decoded:
+/// the section may have been written by a newer version of Lance with an
+/// operation type this version does not know, and that must not prevent
+/// opening the dataset. Paths that need the transaction contents surface the
+/// error at their call sites instead.
+fn decode_inline_transaction(message_data: &[u8], version: u64) -> Option<Transaction> {
+    match lance_table::format::pb::Transaction::decode(message_data)
+        .map_err(Error::from)
+        .and_then(Transaction::try_from)
+    {
+        Ok(transaction) => Some(transaction),
+        Err(err) => {
+            log::warn!(
+                "Failed to decode the inline transaction of version {}; \
+                 it may have been written by a newer version of Lance: {}",
+                version,
+                err
+            );
+            None
+        }
+    }
+}
+
 /// Commit a manifest file and create a copy at the latest manifest path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_manifest_file(
@@ -3694,25 +3704,6 @@ pub(crate) async fn write_manifest_file(
     naming_scheme: ManifestNamingScheme,
     mut transaction: Option<&Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
-    // Composite transactions are not inlined into the manifest: released
-    // readers eagerly decode the inline transaction section when opening a
-    // dataset and fail on unknown operation types, which would make this
-    // version unopenable for them. Without the inline section they open
-    // normally; only paths that need the transaction contents (conflict
-    // resolution, history) read the external transaction file. When the
-    // external file is disabled the inline section is the only transaction
-    // record, so it must be kept — dropping both would break conflict
-    // resolution for every later writer.
-    // TODO: inline composites once readers with tolerant decoding are
-    // widespread.
-    if !config.disable_transaction_file
-        && matches!(
-            transaction.map(|t| &t.operation),
-            Some(Operation::Composite { .. })
-        )
-    {
-        transaction = None;
-    }
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it

@@ -1081,10 +1081,9 @@ mod tests {
             Some(&"value".to_string())
         );
 
-        // The transaction is not inlined into the manifest so that released
-        // readers, which decode the inline section eagerly, can still open
-        // this version. It is still readable from the transaction file.
-        assert!(new_ds.manifest.transaction_section.is_none());
+        // Composites are inlined into the manifest like any other operation
+        // and read back as a composite.
+        assert!(new_ds.manifest.transaction_section.is_some());
         let read_back = new_ds.read_transaction().await.unwrap().unwrap();
         assert!(matches!(
             read_back.operation,

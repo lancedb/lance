@@ -528,10 +528,6 @@ concurrent transaction is itself a Composite, it is decomposed the same way, so 
 operations conflict if any pair of their sub-operations conflicts. Rebases are likewise delegated:
 each sub-operation is rebased under its own rules and the results are reassembled in order.
 
-Writers do not inline Composite transactions into the manifest's transaction section: released
-readers eagerly decode that section when opening a dataset and would fail on an unknown operation.
-The transaction remains available in the external transaction file.
-
 ## Conflict Resolution
 
 ### Terminology
