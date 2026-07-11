@@ -536,6 +536,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_round_trip_empty_values() {
+        // Empty values share size == 0 with nulls in the descriptor layout
+        // and schedule no read; each must decode to zero-length bytes without
+        // consuming the read result of a following non-empty blob. Empties
+        // are placed before payloads so a misassignment corrupts the output
+        // instead of only exhausting the read iterator.
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let val1: &[u8] = &vec![1u8; 1024];
+        let val2: &[u8] = &vec![2u8; 10240];
+        let empty: &[u8] = &[];
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(empty),
+            Some(val1),
+            None,
+            Some(empty),
+            Some(val2),
+            None,
+            Some(empty),
+        ]));
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+    }
+
+    #[tokio::test]
     async fn test_blob_v2_external_round_trip() {
         let blob_metadata = HashMap::from([(
             lance_arrow::ARROW_EXT_NAME_KEY.to_string(),

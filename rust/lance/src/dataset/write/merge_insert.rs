@@ -2021,7 +2021,7 @@ impl MergeInsertJob {
                 } else {
                     removed_row_ids
                 };
-            let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec.into_iter());
+            let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec);
 
             let (updated_fragments, removed_fragment_ids) =
                 Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
@@ -2132,7 +2132,7 @@ impl MergeInsertJob {
                         removed_row_ids
                     };
 
-                Ok(RoaringTreemap::from_iter(removed_row_addr_vec.into_iter()))
+                Ok(RoaringTreemap::from_iter(removed_row_addr_vec))
             }
             .await;
             let removed_row_addrs = match post_write_result {

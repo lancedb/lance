@@ -181,6 +181,29 @@ fn inner_put(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> 
     Ok(())
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_memwal_ShardWriter_nativeDelete(
+    mut env: JNIEnv,
+    this: JObject,
+    stream_addr: jlong,
+) {
+    ok_or_throw_without_return!(env, inner_delete(&mut env, this, stream_addr));
+}
+
+fn inner_delete(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<()> {
+    let stream_ptr = stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
+    if batches.is_empty() {
+        return Ok(());
+    }
+
+    let guard =
+        unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
+    RT.block_on(guard.writer.delete(batches))?;
+    Ok(())
+}
+
 /// Test-support: write a primary-key dedup sidecar (`_pk_index/`) for a
 /// flushed-generation dataset already staged at `gen_path`, mirroring what
 /// production flush emits. Lets Java tests stage a *faithful* flushed

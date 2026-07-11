@@ -57,13 +57,12 @@ tests = [
     "polars[pyarrow,pandas]",
     "psutil",
     "pytest",
-    # Only test tensorflow on linux for now. We will deprecate tensorflow soon.
-    "tensorflow; sys_platform == 'linux'",
     "tqdm",
     "datafusion>=53,<54",
 ]
 dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]
+otel = ["opentelemetry-api", "opentelemetry-sdk"]
 torch = ["torch>=2.0"]
 geo = [
     "geoarrow-rust-core",
@@ -81,9 +80,9 @@ tests = [
     "polars[pyarrow,pandas]==1.34.0",
     "psutil==7.1.0",
     "pytest==8.4.2",
-    "tensorflow==2.20.0; sys_platform == 'linux'",
     "tqdm==4.67.1",
     "datafusion==53.0.0",
+    "opentelemetry-sdk==1.30.0",
 ]
 dev = [
     "maturin==1.13.3",
@@ -137,9 +136,6 @@ markers = [
 filterwarnings = [
     'error::FutureWarning',
     'error::DeprecationWarning',
-    # TensorFlow import can emit NumPy deprecation FutureWarnings in some environments.
-    # We keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
-    'ignore:.*`np\\.object` will be defined as the corresponding NumPy scalar\\..*:FutureWarning',
     # Boto3
     'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
     # Hugging Face Hub calls this deprecated hf-xet API internally.
@@ -153,9 +149,8 @@ filterwarnings = [
     'ignore:.*the load_module\(\) method is deprecated.*:DeprecationWarning',
     # Pytorch uses deprecated jit.script_method internally (torch/utils/mkldnn.py)
     'ignore:.*torch\.jit\.script_method.*is deprecated.*:DeprecationWarning',
+    # Pytorch uses the same API internally on Python 3.14+ with a different warning message.
+    'ignore:.*torch\.jit\.script_method.*is not supported in Python 3\.14\+.*:DeprecationWarning',
     # huggingface_hub still calls the deprecated hf_xet.download_files() during Xet downloads
     'ignore:.*hf_xet\.download_files\(\) is deprecated.*:DeprecationWarning',
-    # TensorFlow/Keras import can emit NumPy deprecation FutureWarnings in some environments.
-    # Keep FutureWarnings as errors generally, but ignore this known-noisy import-time warning.
-    'ignore:.*np\.object.*:FutureWarning',
 ]

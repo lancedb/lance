@@ -277,6 +277,7 @@ mod tests {
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
+    use rayon::ThreadPoolBuilder;
 
     use arrow::compute::cast;
     use rstest::rstest;
@@ -307,7 +308,8 @@ mod tests {
         (0..100).flat_map(|i| std::iter::repeat_n(i as f32, 16)).collect::<Vec<_>>(),
     )) as ArrayRef, 42.0f32)]
     fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef, #[case] query_val: f32) {
-        let index = build_index(centroids, 16);
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let index = thread_pool.install(|| build_index(centroids, 16));
         let query: ArrayRef = Arc::new(Float32Array::from(vec![query_val; 16]));
         let (id, dist) = index.search(query).unwrap();
         assert_eq!(id, 42);

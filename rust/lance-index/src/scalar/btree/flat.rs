@@ -218,13 +218,13 @@ impl FlatIndex {
                         ));
                     }
                 }
-                (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded) => {
-                    if lower.is_null() {
-                        return Ok(NullableRowAddrSet::new(
-                            Default::default(),
-                            self.all_addrs_map.clone(),
-                        ));
-                    }
+                (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded)
+                    if lower.is_null() =>
+                {
+                    return Ok(NullableRowAddrSet::new(
+                        Default::default(),
+                        self.all_addrs_map.clone(),
+                    ));
                 }
                 _ => {}
             },
