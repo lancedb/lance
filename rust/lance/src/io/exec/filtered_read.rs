@@ -11,7 +11,6 @@ use std::{
     sync::Arc,
 };
 
-use arrow::compute::BatchCoalescer;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, BooleanArray, RecordBatch, UInt32Array};
@@ -2121,9 +2120,11 @@ impl FilteredReadExec {
     }
 }
 
-/// How many batches run ahead of the consumer (a prefetch depth, not a
-/// parallelism setting)
-const ROW_STREAM_PREFETCH_BATCHES: usize = 64;
+/// How many batches run concurrently.  Each batch's read already carries
+/// the full fragment-readahead and decode parallelism, so a shallow pipeline
+/// keeps the I/O pipe full; running every batch at once only multiplies that
+/// into lock contention
+const ROW_STREAM_CONCURRENT_BATCHES: usize = 4;
 
 /// Fragment metadata, loaded on the first batch and reused afterwards
 struct StreamFragments {
@@ -2426,38 +2427,71 @@ impl RowStreamRead {
         self.attach_columns(batch, read_data)
     }
 
-    /// Cut the input into batches of exactly `target` rows (final batch holds
-    /// the remainder): merging small batches amortizes per-batch planning,
-    /// slicing oversized ones bounds a batch's memory.  Order is preserved.
+    /// Coalesce the input up to `target` rows per batch the way
+    /// [`CoalesceBatchesExec`] does: small batches merge until the buffer
+    /// reaches the target, larger batches pass through whole — a caller's
+    /// batch is never split.  Bigger batches make denser reads (more ranges
+    /// per fragment close enough to merge into one I/O), so the window a
+    /// caller hands us is worth keeping.  Order is preserved.
+    ///
+    /// [`CoalesceBatchesExec`]: datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec
     fn coalesce_batches(
         input: SendableRecordBatchStream,
         target: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         struct CoalesceState {
             input: SendableRecordBatchStream,
-            coalescer: BatchCoalescer,
+            buffered: Vec<RecordBatch>,
+            buffered_rows: usize,
             exhausted: bool,
         }
-        let coalescer = BatchCoalescer::new(input.schema(), target);
+        let schema = input.schema();
         futures::stream::try_unfold(
             CoalesceState {
                 input,
-                coalescer,
+                buffered: Vec::new(),
+                buffered_rows: 0,
                 exhausted: false,
             },
-            |mut state| async move {
-                loop {
-                    if let Some(batch) = state.coalescer.next_completed_batch() {
-                        return Ok(Some((batch, state)));
-                    }
-                    if state.exhausted {
-                        return Ok(None);
-                    }
-                    match state.input.try_next().await? {
-                        Some(batch) => state.coalescer.push_batch(batch)?,
-                        None => {
-                            state.exhausted = true;
-                            state.coalescer.finish_buffered_batch()?;
+            move |mut state| {
+                let schema = schema.clone();
+                async move {
+                    loop {
+                        if state.buffered_rows >= target
+                            || (state.exhausted && !state.buffered.is_empty())
+                        {
+                            let batch = if state.buffered.len() == 1 {
+                                state.buffered.pop().unwrap()
+                            } else {
+                                arrow::compute::concat_batches(&schema, state.buffered.iter())?
+                            };
+                            state.buffered.clear();
+                            state.buffered_rows = 0;
+                            return Ok(Some((batch, state)));
+                        }
+                        if state.exhausted {
+                            return Ok(None);
+                        }
+                        match state.input.try_next().await? {
+                            Some(batch)
+                                if batch.num_rows() >= target && !state.buffered.is_empty() =>
+                            {
+                                // Flush the partial buffer on its own so the
+                                // large batch passes through without a copy
+                                // (it emits whole on the next iteration)
+                                let out =
+                                    arrow::compute::concat_batches(&schema, state.buffered.iter())?;
+                                state.buffered_rows = batch.num_rows();
+                                state.buffered = vec![batch];
+                                return Ok(Some((out, state)));
+                            }
+                            Some(batch) => {
+                                if batch.num_rows() > 0 {
+                                    state.buffered_rows += batch.num_rows();
+                                    state.buffered.push(batch);
+                                }
+                            }
+                            None => state.exhausted = true,
                         }
                     }
                 }
@@ -2496,7 +2530,7 @@ impl RowStreamRead {
                 )
             })
             .boxed()
-            .try_buffered(ROW_STREAM_PREFETCH_BATCHES)
+            .try_buffered(ROW_STREAM_CONCURRENT_BATCHES)
             .map(move |result| {
                 on_result
                     .global_metrics
@@ -4877,8 +4911,8 @@ mod tests {
             assert_eq!(payload_col.values(), &payload[..]);
         }
 
-        /// Tiny input batches merge into batches and oversized ones slice,
-        /// preserving order across the boundaries
+        /// Tiny input batches merge up to the target and oversized ones pass
+        /// through whole, preserving order across the boundaries
         #[tokio::test]
         async fn take_coalesces_input_to_batch_size() {
             let fixture = take_fixture(false).await;
@@ -4905,28 +4939,35 @@ mod tests {
             )
             .unwrap();
 
-            let assert_batches = |result: Vec<RecordBatch>, schema: SchemaRef| {
-                assert_eq!(
-                    result.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
-                    vec![3, 3, 1]
-                );
-                let merged = concat_batches(&schema, &result).unwrap();
-                let i_col = merged.column_by_name("i").unwrap();
-                assert_eq!(
-                    i_col.as_primitive::<arrow::datatypes::Int32Type>().values(),
-                    &expected_i[..]
-                );
-            };
+            let assert_batches =
+                |result: Vec<RecordBatch>, schema: SchemaRef, expected_sizes: Vec<usize>| {
+                    assert_eq!(
+                        result.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+                        expected_sizes
+                    );
+                    let merged = concat_batches(&schema, &result).unwrap();
+                    let i_col = merged.column_by_name("i").unwrap();
+                    assert_eq!(
+                        i_col.as_primitive::<arrow::datatypes::Int32Type>().values(),
+                        &expected_i[..]
+                    );
+                };
 
-            // Seven one-row batches merge into batches of exactly 3, 3, 1
+            // Seven one-row batches merge whenever the buffer reaches 3 rows
             let tiny = (0..7).map(|i| batch.slice(i, 1)).collect::<Vec<_>>();
             let plan = take_plan_sized(&fixture.dataset, rows_input(tiny), &["i"], 3).unwrap();
-            assert_batches(run(&plan).await, plan.schema());
+            assert_batches(run(&plan).await, plan.schema(), vec![3, 3, 1]);
 
-            // One oversized batch is sliced into the same batches
+            // One oversized batch passes through whole — never split
             let plan =
-                take_plan_sized(&fixture.dataset, rows_input(vec![batch]), &["i"], 3).unwrap();
-            assert_batches(run(&plan).await, plan.schema());
+                take_plan_sized(&fixture.dataset, rows_input(vec![batch.clone()]), &["i"], 3)
+                    .unwrap();
+            assert_batches(run(&plan).await, plan.schema(), vec![7]);
+
+            // A large batch flushes the partial buffer and passes through
+            let mixed = vec![batch.slice(0, 2), batch.slice(2, 5)];
+            let plan = take_plan_sized(&fixture.dataset, rows_input(mixed), &["i"], 3).unwrap();
+            assert_batches(run(&plan).await, plan.schema(), vec![2, 5]);
         }
 
         /// Storage-ordered input exercises the aligned fast path
