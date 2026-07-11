@@ -25,7 +25,7 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use log::{debug, error, info, warn};
 use object_store::path::Path;
 use tokio::sync::{RwLock, mpsc};
@@ -48,6 +48,7 @@ pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, Wa
 
 use super::memtable::flush::TriggerMemTableFlush;
 use super::scanner::GenerationWarmer;
+use crate::session::Session;
 use super::wal::{
     BatchDurableWatcher, TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState,
     WalRetryConfig, WalTailer, empty_flush_result,
@@ -249,6 +250,18 @@ pub struct ShardWriterConfig {
     /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
     /// WAL pod). Default: `None`.
     pub warmer: Option<Arc<dyn GenerationWarmer>>,
+
+    /// `ObjectStoreParams` the base dataset was opened with (endpoint / region /
+    /// vended-credential accessor). Injected by `mem_wal_writer` from the
+    /// dataset so the flusher's derived-URI opens (base + generations) reuse the
+    /// same store — instead of re-resolving an ambient one — matching the
+    /// ShardWriter's own store. Default: `None` (bare by-URI open).
+    pub store_params: Option<ObjectStoreParams>,
+
+    /// The dataset's shared `Session`, injected alongside `store_params` so the
+    /// flusher's opens hit the same store registry the base was resolved in.
+    /// Default: `None`.
+    pub session: Option<Arc<Session>>,
 }
 
 impl Default for ShardWriterConfig {
@@ -275,6 +288,8 @@ impl Default for ShardWriterConfig {
             enable_memtable: true,
             hnsw_params: HashMap::new(),
             warmer: None,
+            store_params: None,
+            session: None,
         }
     }
 }
@@ -1533,7 +1548,8 @@ impl ShardWriter {
 
         let flusher = Arc::new(
             MemTableFlusher::new(object_store, base_path, base_uri, shard_id, manifest_store)
-                .with_warmer(config.warmer.clone()),
+                .with_warmer(config.warmer.clone())
+                .with_storage_context(config.store_params.clone(), config.session.clone()),
         );
 
         let backpressure = BackpressureController::new(config.clone());

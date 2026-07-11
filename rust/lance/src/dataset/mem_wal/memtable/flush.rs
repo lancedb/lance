@@ -14,7 +14,7 @@ use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
@@ -28,10 +28,12 @@ use uuid::Uuid;
 use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
 use crate::Dataset;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::GenerationWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
 use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
+use crate::session::Session;
 
 #[derive(Debug, Clone)]
 pub struct FlushResult {
@@ -72,6 +74,15 @@ pub struct MemTableFlusher {
     /// When present, each new generation is warmed before it is committed, so
     /// the first query sees zero cold reads. `None` => no warming.
     warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// `ObjectStoreParams` the base dataset was opened with, injected via
+    /// [`Self::with_storage_context`]. When present, the flusher's derived-URI
+    /// opens (base + generations) reuse the same store — including the
+    /// vended-credential accessor for federated tables — rather than
+    /// re-resolving an ambient one. `None` => bare by-URI open (native default).
+    store_params: Option<ObjectStoreParams>,
+    /// The dataset's shared `Session`, so derived opens hit the same store
+    /// registry the base was resolved in. `None` => a fresh session per open.
+    session: Option<Arc<Session>>,
 }
 
 impl MemTableFlusher {
@@ -89,6 +100,8 @@ impl MemTableFlusher {
             shard_id,
             manifest_store,
             warmer: None,
+            store_params: None,
+            session: None,
         }
     }
 
@@ -96,6 +109,36 @@ impl MemTableFlusher {
     pub fn with_warmer(mut self, warmer: Option<Arc<dyn GenerationWarmer>>) -> Self {
         self.warmer = warmer;
         self
+    }
+
+    /// Attach the base dataset's storage context (params + session) so derived
+    /// opens reuse the dataset's store instead of re-resolving from bare URIs.
+    /// Injected by `mem_wal_writer` from the base `Dataset`.
+    pub fn with_storage_context(
+        mut self,
+        store_params: Option<ObjectStoreParams>,
+        session: Option<Arc<Session>>,
+    ) -> Self {
+        self.store_params = store_params;
+        self.session = session;
+        self
+    }
+
+    /// Open a dataset at a URI derived from this shard's base — the base table
+    /// itself or a flushed generation under `_mem_wal/`. Threads the injected
+    /// store params + session so the open reuses the base's store (and its
+    /// refreshing credential accessor, for federated tables) rather than
+    /// re-resolving an ambient one. Falls back to a bare by-URI open when no
+    /// storage context was injected (native default / tests).
+    async fn open_derived(&self, uri: &str) -> Result<Dataset> {
+        let mut builder = DatasetBuilder::from_uri(uri);
+        if let Some(params) = &self.store_params {
+            builder = builder.with_store_params(params.clone());
+        }
+        if let Some(session) = &self.session {
+            builder = builder.with_session(session.clone());
+        }
+        builder.load().await
     }
 
     /// Warm a just-written generation before it is committed. Best-effort: a
@@ -139,7 +182,7 @@ impl MemTableFlusher {
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
     async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
-        match Dataset::open(&self.base_uri).await {
+        match self.open_derived(&self.base_uri).await {
             Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
             Err(Error::DatasetNotFound { .. }) => {
                 Ok(lance_file::version::LanceFileVersion::default())
@@ -194,7 +237,7 @@ impl MemTableFlusher {
         // generation exposes newest-per-PK on every read path.
         if !deleted.is_empty() {
             let uri = self.path_to_uri(&gen_path);
-            let dataset = Dataset::open(&uri).await?;
+            let dataset = self.open_derived(&uri).await?;
             self.finalize_generation(&dataset, &deleted, None).await?;
         }
 
@@ -303,6 +346,12 @@ impl MemTableFlusher {
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?),
+            // Write the generation through the base dataset's store params +
+            // session so it signs with the same identity the base was opened
+            // with (federated: the vended-credential accessor) instead of the
+            // ambient chain.
+            store_params: self.store_params.clone(),
+            session: self.session.clone(),
             ..Default::default()
         };
         Dataset::write(reader, &uri, Some(write_params)).await?;
@@ -420,7 +469,7 @@ impl MemTableFlusher {
         // Open the dataset once for all index building. Dataset::write already
         // created a v1 manifest with the fragment data.
         let uri = self.path_to_uri(&gen_path);
-        let mut dataset = Dataset::open(&uri).await?;
+        let mut dataset = self.open_derived(&uri).await?;
 
         // Collect all index metadata without committing individually.
         // We write a single manifest containing both data and all indexes.

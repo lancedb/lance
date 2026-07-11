@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -597,6 +596,7 @@ impl DatasetMemWalExt for Dataset {
         cache: Option<&Arc<dyn DatasetCache>>,
     ) -> Result<()> {
         let session = self.session();
+        let store_params = self.store_params().cloned();
         // Resolve flushed paths exactly as the LSM collector does, so the
         // session/cache entries we warm key-match the paths later lookups open.
         let base_path = self.uri().trim_end_matches('/').to_string();
@@ -606,11 +606,13 @@ impl DatasetMemWalExt for Dataset {
                 let shard_id = snapshot.shard_id;
                 let base_path = &base_path;
                 let session = &session;
+                let store_params = &store_params;
                 snapshot.flushed_generations.iter().map(move |flushed| {
                     let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, flushed.path);
                     async move {
                         let dataset =
-                            open_flushed_dataset(&path, Some(session), cache, None).await?;
+                            open_flushed_dataset(&path, Some(session), store_params.as_ref(), cache, None)
+                                .await?;
                         prewarm_all_indexes(&dataset).await
                     }
                 })
@@ -700,9 +702,22 @@ impl DatasetMemWalExt for Dataset {
         // Set shard_id in config
         config.shard_id = shard_id;
 
-        // Get object store and base path
+        // Inject the dataset's own storage context so the flusher's derived-URI
+        // opens (base + generations) reuse the same store the base was resolved
+        // with (endpoint / region / vended-credential accessor) instead of a
+        // fresh ambient one.
+        config.store_params = self.store_params.as_deref().cloned();
+        config.session = Some(self.session());
+
+        // Reuse the dataset's own object store + base path rather than
+        // re-resolving from the bare URI. `ObjectStore::from_uri` discards the
+        // `ObjectStoreParams` the dataset was opened with (endpoint / region /
+        // vended credentials), so the ShardWriter would sign the WAL log and
+        // manifest CAS with the ambient identity. Mirrors the sibling
+        // `list_mem_wal_latest_shard_ids`.
         let base_uri = self.uri();
-        let (store, base_path) = ObjectStore::from_uri(base_uri).await?;
+        let store = self.object_store(None).await?;
+        let base_path = self.branch_location().path.clone();
 
         // Create ShardWriter
         ShardWriter::open(
@@ -849,7 +864,7 @@ mod tests {
         // The generation is resident in the cache (same session), with its
         // index loadable — a later lookup that opens this path is a pure hit.
         let warmed = cache
-            .get_or_open(&gen_uri, Some(base.session()))
+            .get_or_open(&gen_uri, Some(base.session()), base.store_params().cloned())
             .await
             .unwrap();
         assert_eq!(warmed.load_indices().await.unwrap().len(), 1);

@@ -31,6 +31,7 @@ use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use crate::dataset::Dataset;
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// Vector (KNN) search state, set by [`LsmScanner::nearest`] and friends. Mirrors
 /// the subset of `lance::dataset::scanner::Query` the LSM vector planner honors.
@@ -210,6 +211,11 @@ pub struct LsmScanner {
     /// each generation populates the shared index / file-metadata caches.
     /// Defaults to the base table's session when one is present.
     session: Option<Arc<Session>>,
+    /// Store params threaded into flushed-generation opens so they reuse the
+    /// base's store — including the refreshing accessor for a federated
+    /// (namespace-backed) table — rather than resolving an ambient one.
+    /// Defaults to the base table's params when one is present.
+    store_params: Option<ObjectStoreParams>,
     /// Cache of opened flushed-generation datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
     flushed_cache: Option<Arc<dyn DatasetCache>>,
@@ -239,6 +245,7 @@ impl LsmScanner {
         // the shared index / metadata caches without extra wiring. An
         // explicit `with_session` still overrides this.
         let session = Some(base_table.session());
+        let store_params = base_table.store_params().cloned();
         Self {
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),
@@ -254,6 +261,7 @@ impl LsmScanner {
             with_memtable_gen: false,
             pk_columns,
             session,
+            store_params,
             flushed_cache: None,
             warmer: None,
             overfetch_factor: None,
@@ -296,6 +304,7 @@ impl LsmScanner {
             with_memtable_gen: false,
             pk_columns,
             session: None,
+            store_params: None,
             flushed_cache: None,
             warmer: None,
             overfetch_factor: None,
@@ -340,6 +349,15 @@ impl LsmScanner {
     /// long-lived session).
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Thread the base dataset's store params into flushed-generation opens so
+    /// they reuse the base's store (federated: the refreshing accessor). When a
+    /// base table is configured this defaults to its params; call this on a
+    /// fresh-tier-only scanner (no base table) to inject them explicitly.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.store_params = Some(store_params);
         self
     }
 
@@ -564,6 +582,9 @@ impl LsmScanner {
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
+        if let Some(store_params) = &self.store_params {
+            planner = planner.with_store_params(store_params.clone());
+        }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
         }
@@ -640,6 +661,9 @@ impl LsmScanner {
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
+        if let Some(store_params) = &self.store_params {
+            planner = planner.with_store_params(store_params.clone());
+        }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
         }
@@ -685,6 +709,9 @@ impl LsmScanner {
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());
             }
+            if let Some(store_params) = &self.store_params {
+                planner = planner.with_store_params(store_params.clone());
+            }
             if let Some(cache) = &self.flushed_cache {
                 planner = planner.with_flushed_cache(cache.clone());
             }
@@ -703,6 +730,9 @@ impl LsmScanner {
         let mut planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
+        }
+        if let Some(store_params) = &self.store_params {
+            planner = planner.with_store_params(store_params.clone());
         }
         if let Some(cache) = &self.flushed_cache {
             planner = planner.with_flushed_cache(cache.clone());
@@ -802,6 +832,7 @@ impl LsmScanner {
         let memberships = super::block_list::fresh_tier_block_list(
             &sources,
             self.session.as_ref(),
+            self.store_params.as_ref(),
             self.flushed_cache.as_ref(),
             watermarks,
         )
