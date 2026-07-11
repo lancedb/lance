@@ -1384,11 +1384,15 @@ impl Dataset {
         detached: bool,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
-            || match operation {
-                Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
-                _ => Err(Error::invalid_input(
-                    "read_version must be specified for this operation",
-                )),
+            || {
+                if operation.overwrites_dataset() || matches!(operation, Operation::Restore { .. })
+                {
+                    Ok(0)
+                } else {
+                    Err(Error::invalid_input(
+                        "read_version must be specified for this operation",
+                    ))
+                }
             },
             Ok,
         )?;
@@ -3695,13 +3699,18 @@ pub(crate) async fn write_manifest_file(
     // dataset and fail on unknown operation types, which would make this
     // version unopenable for them. Without the inline section they open
     // normally; only paths that need the transaction contents (conflict
-    // resolution, history) read the external transaction file.
+    // resolution, history) read the external transaction file. When the
+    // external file is disabled the inline section is the only transaction
+    // record, so it must be kept — dropping both would break conflict
+    // resolution for every later writer.
     // TODO: inline composites once readers with tolerant decoding are
     // widespread.
-    if matches!(
-        transaction.map(|t| &t.operation),
-        Some(Operation::Composite { .. })
-    ) {
+    if !config.disable_transaction_file
+        && matches!(
+            transaction.map(|t| &t.operation),
+            Some(Operation::Composite { .. })
+        )
+    {
         transaction = None;
     }
     if config.auto_set_feature_flags {

@@ -174,6 +174,10 @@ impl<'a> CommitBuilder<'a> {
 
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
+    ///
+    /// Ignored for composite transactions: a single map is ambiguous across
+    /// multiple sub-operations, so they fall back to fragment-level conflict
+    /// detection.
     pub fn with_affected_rows(mut self, affected_rows: RowAddrTreeMap) -> Self {
         self.affected_rows = Some(affected_rows);
         self
@@ -304,15 +308,10 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        let can_create_dataset = match &transaction.operation {
-            Operation::Overwrite { .. } | Operation::Clone { .. } => true,
-            // A composite can create a dataset by starting with Overwrite;
-            // validate_operation enforces this below.
-            Operation::Composite { operations } => {
-                matches!(operations.first(), Some(Operation::Overwrite { .. }))
-            }
-            _ => false,
-        };
+        // A composite can create a dataset by starting with Overwrite;
+        // validate_operation enforces this below.
+        let can_create_dataset = transaction.operation.overwrites_dataset()
+            || matches!(transaction.operation, Operation::Clone { .. });
         if dest.dataset().is_none() && !can_create_dataset {
             return Err(Error::dataset_not_found(
                 base_path.to_string(),
@@ -355,7 +354,7 @@ impl<'a> CommitBuilder<'a> {
         {
             let passed_storage_format = DataStorageFormat::new(storage_format);
             if ds.manifest.data_storage_format != passed_storage_format
-                && !matches!(transaction.operation, Operation::Overwrite { .. })
+                && !transaction.operation.overwrites_dataset()
             {
                 return Err(Error::invalid_input_source(format!(
                     "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",

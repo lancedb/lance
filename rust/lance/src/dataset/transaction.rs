@@ -1593,6 +1593,72 @@ impl Operation {
         }
         Ok(())
     }
+
+    /// Whether this operation replaces the dataset wholesale: a plain
+    /// Overwrite, or a composite whose first sub-operation is an Overwrite.
+    pub(crate) fn overwrites_dataset(&self) -> bool {
+        match self {
+            Self::Overwrite { .. } => true,
+            Self::Composite { operations } => {
+                matches!(operations.first(), Some(Self::Overwrite { .. }))
+            }
+            _ => false,
+        }
+    }
+
+    /// Fragment ids this operation expects to already exist in the manifest
+    /// it applies to, as opposed to ids of fragments it adds.
+    fn referenced_fragment_ids(&self) -> HashSet<u64> {
+        match self {
+            Self::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                ..
+            } => updated_fragments
+                .iter()
+                .map(|f| f.id)
+                .chain(deleted_fragment_ids.iter().copied())
+                .collect(),
+            Self::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                ..
+            } => updated_fragments
+                .iter()
+                .map(|f| f.id)
+                .chain(removed_fragment_ids.iter().copied())
+                .collect(),
+            Self::Rewrite { groups, .. } => groups
+                .iter()
+                .flat_map(|g| g.old_fragments.iter().map(|f| f.id))
+                .collect(),
+            Self::DataReplacement { replacements } => replacements.iter().map(|r| r.0).collect(),
+            Self::Merge { fragments, .. } => fragments.iter().map(|f| f.id).collect(),
+            Self::CreateIndex { new_indices, .. } => new_indices
+                .iter()
+                .filter_map(|index| index.fragment_bitmap.as_ref())
+                .flat_map(|bitmap| bitmap.iter().map(u64::from))
+                .collect(),
+            _ => HashSet::new(),
+        }
+    }
+
+    /// Ids explicitly pre-assigned (non-zero, e.g. via ReserveFragments) on
+    /// fragments this operation adds. Unlike ids assigned during
+    /// `build_manifest`, these are stable across commit retries.
+    fn explicit_new_fragment_ids(&self) -> HashSet<u64> {
+        let added: Box<dyn Iterator<Item = &Fragment>> = match self {
+            Self::Append { fragments } | Self::Overwrite { fragments, .. } => {
+                Box::new(fragments.iter())
+            }
+            Self::Update { new_fragments, .. } => Box::new(new_fragments.iter()),
+            Self::Rewrite { groups, .. } => {
+                Box::new(groups.iter().flat_map(|g| g.new_fragments.iter()))
+            }
+            _ => Box::new(std::iter::empty()),
+        };
+        added.filter(|f| f.id != 0).map(|f| f.id).collect()
+    }
 }
 
 /// Helper function to apply UpdateMap changes to a HashMap<String, String>
@@ -1874,7 +1940,33 @@ impl Transaction {
         Operation::validate_composite(operations)?;
         let mut state: Option<(Manifest, Vec<IndexMetadata>)> = None;
         let mut initial_indices = Some(current_indices);
-        for operation in operations {
+        // Ids assigned during this fold to fragments that arrived with id 0.
+        // Such ids change whenever the commit is rebuilt against a newer
+        // manifest (conflict retry), so later sub-operations must not
+        // reference them: the reference would silently retarget another
+        // writer's fragment. Explicitly pre-assigned ids (ReserveFragments)
+        // are stable and stay referenceable.
+        let mut unstable_created_ids: HashSet<u64> = HashSet::new();
+        let mut previous_ids: HashSet<u64> = current_manifest
+            .map(|m| m.fragments.iter().map(|f| f.id).collect())
+            .unwrap_or_default();
+        for (position, operation) in operations.iter().enumerate() {
+            let forward_references = operation
+                .referenced_fragment_ids()
+                .intersection(&unstable_created_ids)
+                .copied()
+                .collect::<Vec<_>>();
+            if !forward_references.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "Composite sub-operation {} ({}) references fragment ids {:?} that were \
+                     assigned at commit time to fragments added earlier in this composite; \
+                     these ids are not stable across commit retries. Reserve fragment ids \
+                     with ReserveFragments and set them on the new fragments instead",
+                    position,
+                    operation.name(),
+                    forward_references,
+                )));
+            }
             let sub_transaction = Self {
                 read_version: self.read_version,
                 uuid: self.uuid.clone(),
@@ -1887,7 +1979,10 @@ impl Transaction {
                     // Validate each sub-operation against the manifest it will
                     // actually apply to; entry-point validation only sees the
                     // base manifest and cannot account for schema changes made
-                    // by earlier sub-operations.
+                    // by earlier sub-operations. Note this validation also
+                    // reruns on every commit retry against the caught-up
+                    // manifest, which is stricter than the entry-point-only
+                    // validation of plain operations.
                     validate_operation(current_manifest, operation)?;
                     sub_transaction.build_manifest_impl(
                         current_manifest,
@@ -1909,10 +2004,21 @@ impl Transaction {
                 }
             };
             manifest.version = new_version;
+            let current_ids: HashSet<u64> = manifest.fragments.iter().map(|f| f.id).collect();
+            let explicit_ids = operation.explicit_new_fragment_ids();
+            unstable_created_ids.extend(
+                current_ids
+                    .difference(&previous_ids)
+                    .filter(|id| !explicit_ids.contains(id)),
+            );
+            previous_ids = current_ids;
             state = Some((manifest, indices));
         }
         // validate_composite rejects empty operation lists, so state is set.
-        Ok(state.expect("non-empty composite"))
+        let (mut manifest, indices) = state.expect("non-empty composite");
+        // The outer transaction governs the tag; sub-transactions carry none.
+        manifest.tag.clone_from(&self.tag);
+        Ok((manifest, indices))
     }
 
     fn build_manifest_impl(
@@ -2106,7 +2212,12 @@ impl Transaction {
                     && let Some(UpdatedFragmentOffsets(off_map)) = updated_fragment_offsets
                     && !off_map.is_empty()
                 {
-                    let prev_version = current_manifest.map(|m| m.version).unwrap_or(0);
+                    // Derived from new_version rather than current_manifest:
+                    // inside a composite fold the intermediate manifest's
+                    // version is already pinned to new_version, which would
+                    // fabricate "updated at this commit" stamps for uncovered
+                    // rows. new_version is always current version + 1.
+                    let prev_version = new_version - 1;
                     for fragment in final_fragments.iter_mut() {
                         let Some(bitmap) = off_map.get(&fragment.id) else {
                             continue;
@@ -4587,6 +4698,97 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
+    }
+
+    #[test]
+    fn test_composite_rejects_references_to_assigned_ids() {
+        let manifest = sample_manifest();
+
+        // Deleting the id the append will receive: the id is assigned at
+        // commit time and shifts under concurrent-append rebase, so this
+        // must be rejected.
+        let delete_guessed = Transaction::new_from_version(
+            1,
+            Operation::Composite {
+                operations: vec![
+                    Operation::Append {
+                        fragments: vec![Fragment::new(0)],
+                    },
+                    Operation::Delete {
+                        updated_fragments: vec![],
+                        deleted_fragment_ids: vec![1],
+                        predicate: "true".to_string(),
+                    },
+                ],
+            },
+        );
+        let err = delete_guessed
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ReserveFragments"),
+            "error should point at reserving ids: {}",
+            err
+        );
+
+        // Same for an index bitmap over an unreserved append.
+        let mut index = sample_index_metadata("vector_idx");
+        index.fragment_bitmap = Some([1].into_iter().collect());
+        let index_guessed = Transaction::new_from_version(
+            1,
+            Operation::Composite {
+                operations: vec![
+                    Operation::Append {
+                        fragments: vec![Fragment::new(0)],
+                    },
+                    Operation::CreateIndex {
+                        new_indices: vec![index],
+                        removed_indices: vec![],
+                    },
+                ],
+            },
+        );
+        assert!(
+            index_guessed
+                .build_manifest(
+                    Some(&manifest),
+                    vec![],
+                    "txn",
+                    &ManifestWriteConfig::default(),
+                )
+                .is_err()
+        );
+
+        // Referencing a pre-existing fragment is fine even when the composite
+        // also appends (covered by test_composite_build_manifest_folds_sequentially),
+        // and explicitly pre-assigned ids stay referenceable (covered by
+        // test_composite_reserved_fragment_ids_append_and_index).
+    }
+
+    #[test]
+    fn test_composite_build_manifest_applies_outer_tag() {
+        let manifest = sample_manifest();
+        let transaction = Transaction::new(
+            1,
+            Operation::Composite {
+                operations: vec![sample_update_config("k", "v")],
+            },
+            Some("v1-tag".to_string()),
+        );
+        let (new_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+        assert_eq!(new_manifest.tag.as_deref(), Some("v1-tag"));
     }
 
     #[test]

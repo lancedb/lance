@@ -51,6 +51,12 @@ impl<'a> TransactionRebase<'a> {
             // A single affected-rows map is ambiguous across multiple
             // Delete/Update sub-operations, so sub-rebases fall back to
             // fragment-level conflict detection.
+            if affected_rows.is_some() {
+                log::warn!(
+                    "affected_rows is ignored for composite transactions; sub-operations \
+                     use fragment-level conflict detection"
+                );
+            }
             let mut sub_rebases = Vec::with_capacity(operations.len());
             for operation in operations {
                 let sub_transaction = Transaction {
@@ -1493,11 +1499,17 @@ impl<'a> TransactionRebase<'a> {
     pub async fn finish(self, dataset: &Dataset) -> Result<Transaction> {
         if matches!(self.transaction.operation, Operation::Composite { .. }) {
             let mut operations = Vec::with_capacity(self.sub_rebases.len());
+            let mut read_version = self.transaction.read_version;
             for sub_rebase in self.sub_rebases {
                 let finished = sub_rebase.finish_single(dataset).await?;
+                // finish_delete_update advances the read version of a sub-
+                // transaction whose deletion files were rebased against the
+                // current dataset; the outer transaction must reflect that.
+                read_version = read_version.max(finished.read_version);
                 operations.push(finished.operation);
             }
             let mut transaction = self.transaction;
+            transaction.read_version = read_version;
             transaction.operation = Operation::Composite { operations };
             return Ok(transaction);
         }

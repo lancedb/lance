@@ -6088,7 +6088,12 @@ class LanceOperation:
         multi-statement transactions such as an append and an index update
         that become visible atomically.
 
-        The operations must not contain ``Restore`` or a nested ``Composite``.
+        The operations must not contain ``Restore``, ``Clone``, or a nested
+        ``Composite``. Sub-operations must not reference fragment IDs that
+        are assigned to fragments added earlier in the same composite —
+        such IDs are not stable across commit retries. To reference new
+        fragments (e.g. an index over appended data), reserve fragment IDs
+        first and set them on the fragments explicitly.
 
         Attributes
         ----------
@@ -6107,27 +6112,32 @@ class LanceOperation:
         >>> operation = lance.LanceOperation.Composite(
         ...     [
         ...         lance.LanceOperation.Append([fragment]),
-        ...         lance.LanceOperation.Delete([], [1], "a >= 3"),
+        ...         lance.LanceOperation.Delete([], [0], "a < 3"),
         ...     ]
         ... )
         >>> dataset = lance.LanceDataset.commit("example", operation,
         ...                                     read_version=dataset.version)
         >>> dataset.to_table().to_pandas()
            a  b
-        0  1  a
-        1  2  b
+        0  3  c
+        1  4  d
         """
 
         operations: Iterable[LanceOperation.BaseOperation]
 
         def __post_init__(self):
-            if not isinstance(self.operations, list) or not all(
-                isinstance(op, LanceOperation.BaseOperation) for op in self.operations
-            ):
+            operations = list(self.operations)
+            invalid = [
+                op
+                for op in operations
+                if not isinstance(op, LanceOperation.BaseOperation)
+            ]
+            if invalid:
                 raise TypeError(
-                    "operations must be list[LanceOperation.BaseOperation], "
-                    f"got {type(self.operations)}"
+                    "operations must all be LanceOperation.BaseOperation, "
+                    f"got {[type(op) for op in invalid]}"
                 )
+            self.operations = operations
 
 
 @dataclass

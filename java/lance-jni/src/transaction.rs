@@ -575,7 +575,12 @@ fn convert_to_java_operation_inner<'local>(
             "(I)V",
             &[JValue::Int(num_fragments as i32)],
         )?),
-        _ => unimplemented!(),
+        // A panic here unwinds across the JNI boundary and aborts the JVM,
+        // so unmapped operations must surface as errors instead.
+        other => Err(Error::unsupported_error(format!(
+            "operation {} is not supported by the Java binding yet",
+            other.name()
+        ))),
     }
 }
 
@@ -1303,7 +1308,14 @@ fn convert_to_rust_operation(
                 removed_indices,
             });
         }
-        _ => unimplemented!(),
+        // A panic here unwinds across the JNI boundary and aborts the JVM,
+        // so unmapped operations must surface as errors instead.
+        other => {
+            return Err(Error::unsupported_error(format!(
+                "operation {} is not supported by the Java binding yet",
+                other
+            )));
+        }
     };
     Ok(op)
 }
