@@ -267,12 +267,16 @@ pub trait DatasetIndexExt {
     /// [OptimizeOptions::merge](lance_index::optimize::OptimizeOptions::merge).
     /// `None` plans every segment, which consolidates the full index and
     /// rewrites the oldest (typically largest) segment as well. Segments with
-    /// an empty fragment bitmap (deferred builds) are skipped, and planning a
-    /// legacy segment without a fragment bitmap is rejected with an error
-    /// because merging requires fragment coverage. A trailing leftover group
-    /// of one segment is folded into the previous task so every task merges
-    /// at least two segments. Returns an empty plan when fewer than two
-    /// segments qualify.
+    /// an empty fragment bitmap (deferred builds or fully remapped coverage)
+    /// are skipped before the bound is applied, so the bound counts qualifying
+    /// segments only. Planning a legacy segment without a fragment bitmap is
+    /// rejected with an error because merging requires fragment coverage.
+    /// That rejection applies only to segments within the bound, so planning
+    /// the newest segments of an index whose old base segment is legacy still
+    /// succeeds. A
+    /// trailing leftover group of one segment is folded into the previous
+    /// task so every task merges at least two segments. Returns an empty plan
+    /// when fewer than two segments qualify.
     ///
     /// # Examples
     ///

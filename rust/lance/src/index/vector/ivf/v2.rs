@@ -3950,7 +3950,10 @@ mod tests {
     /// same as a single-node build) and the PQ codebook is trained with an
     /// unseeded RNG. The 0.15 threshold sits in the middle of the band
     /// between a correct merge (~0.24) and the double-transpose corruption
-    /// signature (~0.07) to keep the assertion stable across runs.
+    /// signature (~0.07) to keep the assertion stable across runs. This is a
+    /// deliberate exception to the repository's usual 0.5 recall floor,
+    /// which is unreachable for PQ on this fixture regardless of merge
+    /// correctness.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
     #[case::ivf_pq(IndexType::IvfPq, 0.15)]

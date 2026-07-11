@@ -1399,7 +1399,7 @@ impl DatasetIndexExt for Dataset {
                     .is_none_or(|bitmap| !bitmap.is_empty());
                 if !keep {
                     log::debug!(
-                        "plan_index_segment_merge: skipping deferred segment {} (empty fragment bitmap)",
+                        "plan_index_segment_merge: skipping segment {} with empty fragment coverage",
                         segment.uuid
                     );
                 }
@@ -7117,6 +7117,27 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "fewer than two qualifying segments should produce an empty plan"
+        );
+        assert!(
+            dataset
+                .plan_index_segment_merge("vector_idx", 2, Some(0))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a zero bound should plan nothing, mirroring OptimizeOptions::append"
+        );
+
+        let wider_tasks = dataset
+            .plan_index_segment_merge("vector_idx", 3, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            wider_tasks
+                .iter()
+                .map(|task| task.len())
+                .collect::<Vec<_>>(),
+            vec![3, 2],
+            "a trailing group of two should not fold"
         );
 
         let err = dataset

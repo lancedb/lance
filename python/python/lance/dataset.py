@@ -4410,7 +4410,9 @@ class LanceDataset(pa.dataset.Dataset):
         :meth:`commit_existing_index_segments`. Groups cover disjoint fragment
         sets, so workers never contend. Segments with an empty fragment bitmap
         (deferred builds) are skipped, and a legacy segment without fragment
-        coverage is rejected with an error.
+        coverage is rejected with an error. The rejection applies only to
+        segments within ``max_segments_to_merge``, so planning the newest
+        segments of an index whose old base segment is legacy still succeeds.
 
         Parameters
         ----------
@@ -4422,8 +4424,10 @@ class LanceDataset(pa.dataset.Dataset):
             group.
         max_segments_to_merge: int, optional
             Plan at most this many segments, taking the newest ones first,
-            mirroring ``num_indices_to_merge`` in optimize. The default plans
-            every segment, which consolidates the full index and rewrites the
+            mirroring ``num_indices_to_merge`` in optimize. Segments with
+            empty fragment coverage are skipped before the bound is applied,
+            so it counts qualifying segments only. The default plans every
+            segment, which consolidates the full index and rewrites the
             oldest (typically largest) segment as well.
 
         Returns
