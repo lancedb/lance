@@ -670,6 +670,21 @@ fn duration_ns(started: Instant) -> BenchResult<u64> {
         .map_err(|_| bench_error("benchmark duration exceeds u64 nanoseconds"))
 }
 
+fn required_s3_request_metrics(operation: BenchmarkOperation) -> (bool, bool) {
+    let expects_get = matches!(
+        operation,
+        BenchmarkOperation::Open | BenchmarkOperation::TimeTravel
+    );
+    // Conflict retries can resolve the competing manifests and transactions
+    // from the shared metadata cache, so zero measured GETs is valid. Their
+    // conditional PUTs still prove that request metrics are active.
+    let expects_put = matches!(
+        operation,
+        BenchmarkOperation::Commit | BenchmarkOperation::ConflictRetry
+    );
+    (expects_get, expects_put)
+}
+
 #[cfg(target_os = "macos")]
 fn peak_rss_bytes() -> u64 {
     // SAFETY: getrusage initializes the provided rusage value for the current process.
@@ -710,16 +725,7 @@ fn finish_measurement(
 ) -> BenchResult<Measurement> {
     let metric_delta = snapshot_object_metrics(snapshotter).checked_delta(metrics_before)?;
     if job.storage == Storage::S3 {
-        let expects_get = matches!(
-            job.operation,
-            BenchmarkOperation::Open
-                | BenchmarkOperation::ConflictRetry
-                | BenchmarkOperation::TimeTravel
-        );
-        let expects_put = matches!(
-            job.operation,
-            BenchmarkOperation::Commit | BenchmarkOperation::ConflictRetry
-        );
+        let (expects_get, expects_put) = required_s3_request_metrics(job.operation);
         if expects_get && metric_delta.get_requests == 0 {
             return Err(bench_error(
                 "S3 operation recorded no GET metrics; build with the metrics feature",
@@ -1351,65 +1357,71 @@ mod tests {
         assert!(BenchmarkOperation::ConflictRetry.supports_fragments(10_000_000));
     }
 
-    async fn manifest_size_and_cold_open_io(
-        scenario: Scenario,
-        format: ManifestFormat,
-    ) -> (u64, IoStats) {
-        let temporary = tempfile::tempdir().unwrap();
-        let job = WorkerJob {
-            kind: WorkerKind::Measure,
-            uri: temporary
-                .path()
-                .join(format!("dataset-{}", format.as_str()))
-                .to_string_lossy()
-                .into_owned(),
-            scenario,
-            fragments: 1_000,
-            format,
-            storage: Storage::Ebs,
-            operation: BenchmarkOperation::Open,
-            round: 0,
-            seed: DEFAULT_SEED,
-            commit: "test".to_string(),
-            host: "test".to_string(),
-        };
-
-        let created = create_dataset_fixture(&job).await.unwrap();
-        let manifest_reader = created
-            .object_store(None)
-            .await
-            .unwrap()
-            .open(&created.manifest_location().path)
-            .await
-            .unwrap();
-        let manifest_size = u64::try_from(manifest_reader.size().await.unwrap()).unwrap();
-        drop(created);
-
-        let cold = dataset_builder(&job, Arc::new(IOTracker::default()))
-            .load()
-            .await
-            .unwrap();
-        assert_eq!(cold.count_fragments(), job.fragments);
+    #[test]
+    fn conflict_retry_requires_put_but_not_get_metrics() {
         assert_eq!(
-            cold.manifest()
-                .data_storage_format
-                .lance_file_version()
-                .unwrap()
-                .resolve(),
-            format.storage_version()
+            required_s3_request_metrics(BenchmarkOperation::ConflictRetry),
+            (false, true)
         );
-        let io = cold.object_store(None).await.unwrap().io_stats_snapshot();
-        (manifest_size, io)
+        assert_eq!(
+            required_s3_request_metrics(BenchmarkOperation::Open),
+            (true, false)
+        );
     }
 
     #[cfg(not(windows))]
     #[tokio::test]
     async fn columnar_overwrite_manifest_is_smaller_and_no_more_expensive_to_open() {
         for scenario in [Scenario::S1, Scenario::S2] {
-            let (protobuf_size, protobuf_io) =
-                manifest_size_and_cold_open_io(scenario, ManifestFormat::Protobuf).await;
-            let (lance_size, lance_io) =
-                manifest_size_and_cold_open_io(scenario, ManifestFormat::Lance).await;
+            let measure = |format: ManifestFormat| async move {
+                let temporary = tempfile::tempdir().unwrap();
+                let job = WorkerJob {
+                    kind: WorkerKind::Measure,
+                    uri: temporary
+                        .path()
+                        .join(format!("dataset-{}", format.as_str()))
+                        .to_string_lossy()
+                        .into_owned(),
+                    scenario,
+                    fragments: 1_000,
+                    format,
+                    storage: Storage::Ebs,
+                    operation: BenchmarkOperation::Open,
+                    round: 0,
+                    seed: DEFAULT_SEED,
+                    commit: "test".to_string(),
+                    host: "test".to_string(),
+                };
+
+                let created = create_dataset_fixture(&job).await.unwrap();
+                let manifest_reader = created
+                    .object_store(None)
+                    .await
+                    .unwrap()
+                    .open(&created.manifest_location().path)
+                    .await
+                    .unwrap();
+                let manifest_size = u64::try_from(manifest_reader.size().await.unwrap()).unwrap();
+                drop(created);
+
+                let cold = dataset_builder(&job, Arc::new(IOTracker::default()))
+                    .load()
+                    .await
+                    .unwrap();
+                assert_eq!(cold.count_fragments(), job.fragments);
+                assert_eq!(
+                    cold.manifest()
+                        .data_storage_format
+                        .lance_file_version()
+                        .unwrap()
+                        .resolve(),
+                    format.storage_version()
+                );
+                let io = cold.object_store(None).await.unwrap().io_stats_snapshot();
+                (manifest_size, io)
+            };
+            let (protobuf_size, protobuf_io) = measure(ManifestFormat::Protobuf).await;
+            let (lance_size, lance_io) = measure(ManifestFormat::Lance).await;
 
             assert!(
                 lance_size < protobuf_size,
