@@ -590,6 +590,12 @@ struct RenameManifestMutation {
     /// the source is missing we must NOT append the destination row from
     /// stale metadata, so `append_rows` fails the mutation.
     source_found: bool,
+    /// The `base_objects` carried by the source row. `query_manifest_for_table`
+    /// only surfaces `namespace`/`name`/`location`/`metadata` (it drops
+    /// `base_objects`), so we have to capture this field from the rewrite
+    /// stream and thread it through to the destination row. Otherwise a
+    /// rename would silently strip the table's dependency metadata.
+    source_base_objects: Option<Vec<String>>,
     /// Whether the destination row was already taken. The caller pre-checks
     /// this, but a concurrent writer could win the race between the check and
     /// the commit, so we still need a fail-on-conflict branch.
@@ -607,6 +613,10 @@ impl ManifestStreamMutation for RenameManifestMutation {
     ) -> Result<()> {
         if row.object_id == self.source_object_id {
             self.source_found = true;
+            // Capture the source's `base_objects` so `append_rows` can
+            // thread it onto the destination row. Without this, a rename
+            // would drop the table's declared dependency metadata.
+            self.source_base_objects = row.base_objects.clone();
             // Drop the source row: do not append it to the output batch.
             return Ok(());
         }
@@ -668,7 +678,7 @@ impl ManifestStreamMutation for RenameManifestMutation {
                 object_type: self.dest.object_type,
                 location: self.dest.location.as_deref(),
                 metadata: self.dest.metadata.as_deref(),
-                base_objects: None,
+                base_objects: self.source_base_objects.as_deref(),
             },
         )
     }
@@ -2586,6 +2596,9 @@ impl ManifestNamespace {
                 },
                 source_object_id: source_object_id_for_mutation.clone(),
                 source_found: false,
+                // Captured from the rewrite stream inside `process_existing_row`
+                // and written onto the destination row in `append_rows`.
+                source_base_objects: None,
                 dest_collision: false,
             }
         })
@@ -6363,6 +6376,7 @@ mod tests {
                 },
                 source_object_id: source_object_id.clone(),
                 source_found: false,
+                source_base_objects: None,
                 dest_collision: false,
             })
             .await;
@@ -6418,6 +6432,7 @@ mod tests {
                 },
                 source_object_id: source_object_id.clone(),
                 source_found: false,
+                source_base_objects: None,
                 dest_collision: false,
             })
             .await
@@ -6435,5 +6450,65 @@ mod tests {
             .unwrap()
             .expect("destination row should exist");
         assert_eq!(info.location, "new_table.lance");
+    }
+
+    /// A rename must thread the source row's `base_objects` onto the
+    /// destination row. `query_manifest_for_table()` (used by the
+    /// high-level `rename_table_entry`) drops that field, so the
+    /// mutation has to capture it from the rewrite stream and write it
+    /// back in `append_rows`; otherwise declared tables would lose
+    /// their dependency metadata on every rename.
+    #[tokio::test]
+    async fn test_rename_manifest_preserves_base_objects() {
+        use super::RenameManifestMutation;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let manifest_ns = create_manifest_namespace(temp_path, false).await;
+
+        let original_bases = vec!["base1.lance".to_string(), "base2.lance".to_string()];
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source_table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("source_table.lance".to_string()),
+                    metadata: None,
+                }],
+                Some(original_bases.clone()),
+            )
+            .await
+            .unwrap();
+
+        let source_object_id = "source_table".to_string();
+        manifest_ns
+            .rewrite_manifest("test base_objects", move || RenameManifestMutation {
+                dest: ManifestEntry {
+                    object_id: "dest_table".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("dest_table.lance".to_string()),
+                    metadata: None,
+                },
+                source_object_id: source_object_id.clone(),
+                source_found: false,
+                source_base_objects: None,
+                dest_collision: false,
+            })
+            .await
+            .unwrap();
+
+        // Destination row must carry the source's `base_objects`.
+        let after = manifest_base_objects(&manifest_ns).await;
+        let dest_bases = after
+            .get("dest_table")
+            .expect("destination row should exist");
+        assert_eq!(
+            dest_bases.as_ref(),
+            Some(&original_bases),
+            "rename must preserve the source's base_objects on the destination row"
+        );
+        // And the source row must of course be gone.
+        assert!(!after.contains_key("source_table"));
     }
 }
