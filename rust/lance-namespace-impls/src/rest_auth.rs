@@ -65,6 +65,25 @@ pub struct RequestContext {
 /// Implementors receive a [`RequestContext`] per request and return the headers
 /// to add before the request is sent. Selection is driven by the
 /// [`AUTH_TYPE_KEY`] property via [`create_auth_provider`].
+///
+/// # Examples
+///
+/// ```
+/// use lance_namespace_impls::rest_auth::{NoopAuthProvider, RequestContext, RestAuthProvider};
+/// use std::collections::HashMap;
+///
+/// # async fn demo() {
+/// let provider = NoopAuthProvider;
+/// let ctx = RequestContext {
+///     method: "GET".to_string(),
+///     url: "https://example.com/v1/tables".to_string(),
+///     headers: HashMap::new(),
+///     body_sha256: None,
+/// };
+/// let headers = provider.authenticate(&ctx).await.unwrap();
+/// assert!(headers.is_empty());
+/// # }
+/// ```
 #[async_trait]
 pub trait RestAuthProvider: Send + Sync + std::fmt::Debug {
     /// Authenticates a single request, returning the headers to add to it.
@@ -86,6 +105,15 @@ pub trait RestAuthProvider: Send + Sync + std::fmt::Debug {
 /// A [`RestAuthProvider`] that adds no authentication headers.
 ///
 /// Used when `rest.auth.type` is unset or `none`.
+///
+/// # Examples
+///
+/// ```
+/// use lance_namespace_impls::rest_auth::NoopAuthProvider;
+///
+/// let provider = NoopAuthProvider;
+/// # let _ = provider;
+/// ```
 #[derive(Debug, Default)]
 pub struct NoopAuthProvider;
 
@@ -104,6 +132,17 @@ impl RestAuthProvider for NoopAuthProvider {
 /// Returns [`NamespaceError::InvalidInput`] if [`AUTH_TYPE_KEY`] names an
 /// unsupported provider, or if the selected provider's own validation fails
 /// (e.g. missing required SigV4 properties).
+///
+/// # Examples
+///
+/// ```
+/// use lance_namespace_impls::rest_auth::create_auth_provider;
+/// use std::collections::HashMap;
+///
+/// // With no properties, the no-op provider is returned.
+/// let provider = create_auth_provider(&HashMap::new()).unwrap();
+/// # let _ = provider;
+/// ```
 pub fn create_auth_provider(
     properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn RestAuthProvider>> {

@@ -32,10 +32,29 @@ pub const SESSION_TOKEN_KEY: &str = "rest.auth.sigv4.session-token";
 const DEFAULT_SERVICE: &str = "execute-api";
 
 /// Injectable time source; tests use a fixed clock.
+///
+/// # Examples
+///
+/// ```
+/// use lance_namespace_impls::rest_auth::sigv4::{Clock, SystemClock};
+///
+/// let now = SystemClock.now();
+/// # let _ = now;
+/// ```
 pub trait Clock: Send + Sync + std::fmt::Debug {
     fn now(&self) -> SystemTime;
 }
 
+/// The default [`Clock`] backed by [`SystemTime::now`].
+///
+/// # Examples
+///
+/// ```
+/// use lance_namespace_impls::rest_auth::sigv4::{Clock, SystemClock};
+///
+/// let now = SystemClock.now();
+/// # let _ = now;
+/// ```
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
@@ -51,6 +70,18 @@ impl Clock for SystemClock {
 /// from explicit `rest.auth.sigv4.*` properties when provided (see
 /// [`from_properties`](Self::from_properties)), otherwise from the standard AWS
 /// default credential chain (environment, profile, IMDS).
+///
+/// # Examples
+///
+/// ```
+/// use lance_namespace_impls::rest_auth::sigv4::{SigV4AuthProvider, REGION_KEY};
+/// use std::collections::HashMap;
+///
+/// let mut properties = HashMap::new();
+/// properties.insert(REGION_KEY.to_string(), "us-east-1".to_string());
+/// let provider = SigV4AuthProvider::from_properties(&properties).unwrap();
+/// # let _ = provider;
+/// ```
 pub struct SigV4AuthProvider {
     region: String,
     service: String,
@@ -88,8 +119,21 @@ impl SigV4AuthProvider {
     ///
     /// # Errors
     ///
-    /// Returns [`NamespaceError::InvalidInput`] if the region is missing, or if
-    /// only one of the access-key-id / secret-access-key pair is set.
+    /// Returns [`NamespaceError::InvalidInput`] if the region is missing, if
+    /// only one of the access-key-id / secret-access-key pair is set, or if a
+    /// session token is set without that pair.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_namespace_impls::rest_auth::sigv4::{SigV4AuthProvider, REGION_KEY};
+    /// use std::collections::HashMap;
+    ///
+    /// let mut properties = HashMap::new();
+    /// properties.insert(REGION_KEY.to_string(), "us-east-1".to_string());
+    /// let provider = SigV4AuthProvider::from_properties(&properties).unwrap();
+    /// # let _ = provider;
+    /// ```
     pub fn from_properties(properties: &HashMap<String, String>) -> Result<Self> {
         let region =
             properties
@@ -105,15 +149,26 @@ impl SigV4AuthProvider {
 
         let ak = properties.get(ACCESS_KEY_ID_KEY);
         let sk = properties.get(SECRET_ACCESS_KEY_KEY);
+        let session_token = properties.get(SESSION_TOKEN_KEY);
         let static_credentials = match (ak, sk) {
             (Some(ak), Some(sk)) => Some(Credentials::new(
                 ak.clone(),
                 sk.clone(),
-                properties.get(SESSION_TOKEN_KEY).cloned(),
+                session_token.cloned(),
                 None,
                 "lance-sigv4-static",
             )),
-            (None, None) => None,
+            (None, None) => {
+                if session_token.is_some() {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "{SESSION_TOKEN_KEY} requires {ACCESS_KEY_ID_KEY} and {SECRET_ACCESS_KEY_KEY} to also be set"
+                        ),
+                    }
+                    .into());
+                }
+                None
+            }
             _ => {
                 return Err(NamespaceError::InvalidInput {
                     message: format!(
@@ -134,6 +189,21 @@ impl SigV4AuthProvider {
     }
 
     /// Overrides the time source used for signing (primarily for tests).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_namespace_impls::rest_auth::sigv4::{SigV4AuthProvider, SystemClock, REGION_KEY};
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    ///
+    /// let mut properties = HashMap::new();
+    /// properties.insert(REGION_KEY.to_string(), "us-east-1".to_string());
+    /// let provider = SigV4AuthProvider::from_properties(&properties)
+    ///     .unwrap()
+    ///     .with_clock(Arc::new(SystemClock));
+    /// # let _ = provider;
+    /// ```
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
@@ -306,10 +376,23 @@ mod tests {
             .with_credentials_provider(SharedCredentialsProvider::new(creds))
     }
 
+    /// Asserts `err` is a [`NamespaceError::InvalidInput`] and returns its message.
+    fn expect_invalid_input(err: &lance_core::Error) -> &str {
+        match err {
+            lance_core::Error::Namespace { source, .. } => {
+                match source.downcast_ref::<NamespaceError>() {
+                    Some(NamespaceError::InvalidInput { message }) => message,
+                    other => panic!("expected NamespaceError::InvalidInput, got {other:?}"),
+                }
+            }
+            other => panic!("expected lance_core::Error::Namespace, got {other:?}"),
+        }
+    }
+
     #[test]
     fn from_properties_requires_region() {
         let err = SigV4AuthProvider::from_properties(&HashMap::new()).unwrap_err();
-        assert!(err.to_string().contains(REGION_KEY));
+        assert!(expect_invalid_input(&err).contains(REGION_KEY));
     }
 
     #[test]
@@ -363,7 +446,7 @@ mod tests {
             body_sha256: Some(crate::rest::EMPTY_BODY_SHA256.to_string()),
         };
         let err = provider.authenticate(&ctx).await.unwrap_err();
-        assert!(err.to_string().contains("host"));
+        assert!(expect_invalid_input(&err).contains("host"));
     }
 
     #[tokio::test]
@@ -625,8 +708,20 @@ mod tests {
         props.insert(ACCESS_KEY_ID_KEY.to_string(), "AKID".to_string());
         let err = SigV4AuthProvider::from_properties(&props).unwrap_err();
         assert!(
-            err.to_string().contains(SECRET_ACCESS_KEY_KEY),
+            expect_invalid_input(&err).contains(SECRET_ACCESS_KEY_KEY),
             "error must mention missing key: {err}"
+        );
+    }
+
+    #[test]
+    fn from_properties_rejects_session_token_without_credentials() {
+        let mut props = HashMap::new();
+        props.insert(REGION_KEY.to_string(), "us-east-1".to_string());
+        props.insert(SESSION_TOKEN_KEY.to_string(), "token".to_string());
+        let err = SigV4AuthProvider::from_properties(&props).unwrap_err();
+        assert!(
+            expect_invalid_input(&err).contains(SESSION_TOKEN_KEY),
+            "error must mention the session token key: {err}"
         );
     }
 }
