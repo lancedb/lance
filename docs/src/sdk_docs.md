@@ -1,7 +1,7 @@
 # SDK Documentation
 
-Lance provides comprehensive documentation for all the language SDKs. 
-These auto-generated docs contain detailed information about 
+Lance provides comprehensive documentation for all the language SDKs.
+These auto-generated docs contain detailed information about
 all classes, functions, and methods available in each language.
 
 - [Python](https://lance-format.github.io/lance-python-doc)

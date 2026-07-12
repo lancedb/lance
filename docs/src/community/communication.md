@@ -26,7 +26,7 @@ There are two mailing lists used by Lance:
 
 ## Community Sync
 
-We hold Lance community syncs every other Thursday at 9am PT. Everyone is welcome to attend! 
+We hold Lance community syncs every other Thursday at 9am PT. Everyone is welcome to attend!
 
 - Subscribe to the [Lance Format mailing list](https://groups.google.com/a/lance.org/g/dev) to receive the meeting invite
 - Feel free to suggest discussion topics on the [meeting notes](https://docs.google.com/document/d/1cP058pJLVjj39DGaFV5yHI6qyWBwp1B2YKyIwXzYlAI/edit?tab=t.0)

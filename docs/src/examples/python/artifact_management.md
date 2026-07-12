@@ -1,6 +1,6 @@
 # Deep Learning Artifact Management using Lance
 
-Along with datasets, Lance file format can also be used for saving and versioning deep learning model weights. 
+Along with datasets, Lance file format can also be used for saving and versioning deep learning model weights.
 In fact deep learning artifact management can be made more streamlined (compared to vanilla weight saving methods) using Lance file format for PyTorch model weights.
 
 In this example we will be demonstrating how you save, version and load a PyTorch model's weights using Lance. More specifically we will be loading a pre-trained ResNet model, saving it in Lance file format, loading it back to PyTorch and verifying if the weights are still indeed the same.
@@ -143,7 +143,7 @@ def _load_state_dict(file_name: str, version: int = 1, map_location=None) -> Ord
     return state_dict
 ```
 
-The `load_state_dict` function will expect a lance weight dataset file name, a version and a device where the weights will be loaded into. 
+The `load_state_dict` function will expect a lance weight dataset file name, a version and a device where the weights will be loaded into.
 We essentially load all the weights from the lance weight dataset into our memory and iteratively convert them into weights using the utility function we wrote earlier and then put them on the device.
 
 One thing to note here is that this function will fail if the saved weights are larger than memory. For the sake of simplicity, we assume the weights to be loaded can fit in the memory and we don't have to deal with any sharding.
@@ -172,4 +172,4 @@ The `load_model` function will require the model, the lance weight dataset name,
 
 In conclusion, you only need to call the two functions: `save_model` and `load_model` to save and load the models respectively and as long as the weights can be fit in the memory and are in PyTorch, it should be fine.
 
-Although experimental, this approach defines a new way of doing deep learning artifact management. 
+Although experimental, this approach defines a new way of doing deep learning artifact management.
