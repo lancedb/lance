@@ -1254,7 +1254,7 @@ impl IndexWorker {
                     .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
 
                 for (doc, row_id) in docs {
-                    self.process_document(row_id, DocumentSource::Text(doc), false)
+                    self.process_document(row_id, DocumentSource::Text(doc))
                         .await?;
                 }
             }
@@ -1298,7 +1298,7 @@ impl IndexWorker {
                 continue;
             };
 
-            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()), true)
+            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()))
                 .await?;
         }
 
@@ -1324,12 +1324,7 @@ impl IndexWorker {
         doc
     }
 
-    async fn process_document(
-        &mut self,
-        row_id: u64,
-        document: DocumentSource<'_>,
-        skip_empty_document: bool,
-    ) -> Result<()> {
+    async fn process_document(&mut self, row_id: u64, document: DocumentSource<'_>) -> Result<()> {
         let with_position = self.has_position();
         let builder_was_empty = self.builder.docs.is_empty();
         let old_temporary_memory_size = self.temporary_memory_size();
@@ -1435,7 +1430,11 @@ impl IndexWorker {
             self.builder.tokens.memory_size() as u64,
         );
 
-        if skip_empty_document && token_num == 0 {
+        // A document that produces no tokens (e.g. an empty or whitespace-only
+        // string, or a list whose elements tokenize to nothing) is not indexed:
+        // it carries no searchable content, so counting it would only inflate
+        // `num_docs` and skew document-count-based statistics such as BM25.
+        if token_num == 0 {
             self.last_token_count = 0;
             self.trim_temporary_buffers();
             self.adjust_tracked_memory_size(

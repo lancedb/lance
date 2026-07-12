@@ -402,10 +402,18 @@ async fn test_create_fts_index_with_empty_strings() {
         false,
     )]));
 
+    // Mix documents that produce tokens with ones that tokenize to nothing
+    // (empty and whitespace-only strings). The latter carry no searchable
+    // content and must not be counted in `num_docs`.
     let batches: Vec<RecordBatch> = vec![
         RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(StringArray::from(vec!["", "", ""]))],
+            vec![Arc::new(StringArray::from(vec![
+                "lance",
+                "",
+                "lance database",
+                "   ",
+            ]))],
         )
         .unwrap(),
     ];
@@ -420,9 +428,29 @@ async fn test_create_fts_index_with_empty_strings() {
         .await
         .unwrap();
 
+    // Only the two token-producing rows are indexed; the empty and
+    // whitespace-only rows are skipped so they do not inflate BM25 statistics.
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("text_idx").await.unwrap()).unwrap();
+    assert_eq!(
+        stats["indices"][0]["num_docs"], 2,
+        "empty documents must not count: {stats}"
+    );
+
+    // The token-producing rows remain searchable.
     let batch = dataset
         .scan()
         .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 2);
+
+    // A term present in no document returns nothing.
+    let batch = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new("missing".to_owned()))
         .unwrap()
         .try_into_batch()
         .await
