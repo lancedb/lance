@@ -20,6 +20,11 @@ use pyo3::{
 };
 use std::sync::Arc;
 
+/// Reconstruct the PyArrow equivalent of [`BlobDescriptorArrayBuilder::field`].
+///
+/// Arrow's array bridge does not carry the enclosing extension field, so this
+/// rebuilds the canonical six nullable blob-v2 children and
+/// `ARROW:extension:name = lance.blob.v2` metadata.
 fn descriptor_field_to_pyarrow<'py>(
     field: &Field,
     py: pyo3::Python<'py>,
@@ -47,6 +52,11 @@ fn descriptor_field_to_pyarrow<'py>(
     pyarrow.call_method("field", (field.name().as_str(), data_type), Some(&kwargs))
 }
 
+/// Normalize inputs accepted by [`PackedBlobWriter::write_blobs`] into Arrow arrays.
+///
+/// BinaryArray, LargeBinaryArray, and ChunkedArray values of either binary type
+/// are accepted. Chunk boundaries, nulls, and empty values remain in the arrays;
+/// row-level blob semantics are handled by the core writer.
 fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     match ArrayData::from_pyarrow_bound(payloads) {
         Ok(data) => {
@@ -77,7 +87,7 @@ fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>>
             }
 
             let chunks = payloads.getattr("chunks")?;
-            let mut arrays = Vec::new();
+            let mut arrays = Vec::with_capacity(chunks.len()?);
             for chunk in chunks.try_iter()? {
                 arrays.push(make_array(ArrayData::from_pyarrow_bound(&chunk?)?));
             }
@@ -250,6 +260,12 @@ impl PyPackedBlobWriter {
         &self.path
     }
 
+    /// The descriptor field associated with the array returned by
+    /// :meth:`finish_array`.
+    ///
+    /// The field uses the name passed to ``finish_array`` and carries the
+    /// ``lance.blob.v2`` extension metadata. It is available only after
+    /// ``finish_array`` succeeds; accessing it earlier raises ``ValueError``.
     #[getter]
     pub fn field<'py>(&self, py: pyo3::Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let field = self.field.as_ref().ok_or_else(|| {
@@ -263,6 +279,24 @@ impl PyPackedBlobWriter {
             .infer_error()
     }
 
+    /// Append a batch of packed blob payloads.
+    ///
+    /// Parameters
+    /// ----------
+    /// payloads : pyarrow.BinaryArray, pyarrow.LargeBinaryArray, or pyarrow.ChunkedArray
+    ///     A binary Arrow array. Every chunk of a chunked array must be binary.
+    ///     Each input row produces one descriptor row, in order, across chunks
+    ///     and repeated calls. Null rows produce null descriptors; empty but
+    ///     non-null byte strings produce valid zero-length blobs.
+    ///
+    /// Examples
+    /// --------
+    /// >>> import pyarrow as pa
+    /// >>> payloads = pa.array([b"first", None, b""], type=pa.large_binary())
+    /// >>> writer.write_blobs(payloads)
+    /// >>> descriptors = writer.finish_array("blob")
+    /// >>> len(descriptors)
+    /// 3
     pub fn write_blobs(&mut self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
         let payloads = extract_blob_payloads(payloads)?;
         rt().block_on(None, async {
@@ -283,6 +317,32 @@ impl PyPackedBlobWriter {
         Ok(values.into_iter().map(Into::into).collect())
     }
 
+    /// Finish the upload and return its blob descriptors as a PyArrow array.
+    ///
+    /// The returned ``pyarrow.StructArray`` has one row per payload previously
+    /// passed to :meth:`write_blob` or :meth:`write_blobs`. The writer is consumed
+    /// by this call. After it succeeds, :attr:`field` returns the matching
+    /// extension field with ``field_name`` as its name.
+    ///
+    /// Parameters
+    /// ----------
+    /// field_name : str
+    ///     Name for the descriptor field exposed by :attr:`field`.
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.StructArray
+    ///     Row-aligned blob descriptors, including null rows from bulk input.
+    ///
+    /// Examples
+    /// --------
+    /// >>> import pyarrow as pa
+    /// >>> writer.write_blobs(pa.array([b"value", None]))
+    /// >>> descriptors = writer.finish_array("payload")
+    /// >>> descriptors.is_null().to_pylist()
+    /// [False, True]
+    /// >>> writer.field.name
+    /// 'payload'
     pub fn finish_array<'py>(
         &mut self,
         py: pyo3::Python<'py>,

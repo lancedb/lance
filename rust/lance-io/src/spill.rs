@@ -189,9 +189,7 @@ impl Writer for SpillWriter {
     }
 
     async fn abort(&mut self) -> Result<()> {
-        self.inner.abort().await?;
-        self.finished.store(true, Ordering::Relaxed);
-        Ok(())
+        self.inner.abort().await
     }
 }
 
@@ -377,6 +375,26 @@ mod tests {
 
         let reader = spill.reader().await.unwrap();
         assert_eq!(reader.get_all().await.unwrap().as_ref(), b"async");
+    }
+
+    #[tokio::test]
+    async fn test_reader_rejected_after_writer_abort() {
+        let store = LocalSpillStore::new().unwrap();
+        let (mut writer, spill) = store.new_spill().await.unwrap();
+        writer.write_all(b"partial").await.unwrap();
+        Writer::abort(writer.as_mut()).await.unwrap();
+
+        let Err(err) = spill.reader().await else {
+            panic!("reader after abort should be rejected");
+        };
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("before the writer was shut down"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

@@ -93,6 +93,10 @@ fn initial_upload_size() -> usize {
 /// This implements the `AsyncWrite` trait.
 pub struct ObjectWriter {
     state: UploadState,
+    // Kept separately from `state` so multipart resources remain owned by the
+    // writer if an abort future is cancelled or backend cleanup fails.
+    abort_incomplete: bool,
+    abort_error: Option<String>,
     path: Arc<Path>,
     cursor: usize,
     connection_resets: u16,
@@ -131,12 +135,26 @@ enum UploadState {
     /// completion error is returned to the caller.
     AbortingAfterCompletionFailure {
         upload: Arc<Mutex<Box<dyn MultipartUpload>>>,
-        future: BoxFuture<'static, io::Error>,
+        future: BoxFuture<'static, (io::Error, bool)>,
     },
     /// A terminal upload failure. The original error is returned once and its
     /// message is retained so later operations fail instead of polling a
     /// completed future.
     Failed(String),
+    /// A terminal part-upload failure that still owns multipart resources.
+    /// Later I/O returns `message`; abort or drop cleans up the upload.
+    FailedMultipart {
+        message: String,
+        upload: Box<dyn MultipartUpload>,
+        futures: JoinSet<std::result::Result<(), UploadPutError>>,
+    },
+    /// A terminal completion failure whose failed automatic abort can be retried.
+    FailedMultipartCompletion {
+        message: String,
+        upload: Arc<Mutex<Box<dyn MultipartUpload>>>,
+    },
+    /// The writer was explicitly aborted and cannot be reused.
+    Aborted,
     /// The writer has been shut down and all data has been written.
     Done(WriteResult),
 }
@@ -169,7 +187,10 @@ impl UploadState {
             Self::InProgress {
                 upload, futures, ..
             } => {
-                debug_assert!(futures.is_empty());
+                debug_assert!(
+                    futures.is_empty(),
+                    "multipart completion requires all part-upload tasks to finish"
+                );
                 let upload = Arc::new(Mutex::new(upload));
                 let completing_upload = upload.clone();
                 let fut = async move {
@@ -193,6 +214,8 @@ impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
+            abort_incomplete: false,
+            abort_error: None,
             cursor: 0,
             path: Arc::new(path.clone()),
             connection_resets: 0,
@@ -245,10 +268,27 @@ impl ObjectWriter {
         cx: &mut std::task::Context<'_>,
     ) -> std::result::Result<(), io::Error> {
         let mut_self = &mut *self;
+        if let Some(message) = &mut_self.abort_error {
+            return Err(io::Error::other(message.clone()));
+        }
+        if mut_self.abort_incomplete {
+            return Err(io::Error::other(format!(
+                "object writer for '{}' was aborted",
+                mut_self.path
+            )));
+        }
         loop {
             match &mut mut_self.state {
                 UploadState::Started(_) | UploadState::Done(_) => break,
-                UploadState::Failed(message) => {
+                UploadState::Aborted => {
+                    return Err(io::Error::other(format!(
+                        "object writer for '{}' was aborted",
+                        mut_self.path
+                    )));
+                }
+                UploadState::Failed(message)
+                | UploadState::FailedMultipart { message, .. }
+                | UploadState::FailedMultipartCompletion { message, .. } => {
                     return Err(io::Error::other(message.clone()));
                 }
                 UploadState::CreatingUpload(fut) => match fut.poll_unpin(cx) {
@@ -268,16 +308,24 @@ impl ObjectWriter {
                             upload,
                         };
                     }
-                    Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
+                    Poll::Ready(Err(e)) => {
+                        let error = io::Error::other(e);
+                        mut_self.state = UploadState::Failed(error.to_string());
+                        return Err(error);
+                    }
                     Poll::Pending => break,
                 },
                 UploadState::InProgress {
                     upload, futures, ..
                 } => {
+                    let mut upload_error = None;
                     while let Poll::Ready(Some(res)) = futures.poll_join_next(cx) {
                         match res {
                             Ok(Ok(())) => {}
-                            Err(err) => return Err(std::io::Error::other(err)),
+                            Err(err) => {
+                                upload_error = Some(io::Error::other(err));
+                                break;
+                            }
                             Ok(Err(err)) if should_retry_upload_put(&err.source) => {
                                 if mut_self.connection_resets < max_conn_reset_retries() {
                                     // Retry, but only up to max_conn_reset_retries of them.
@@ -295,7 +343,7 @@ impl ObjectWriter {
                                         Some(sleep_time),
                                     ));
                                 } else {
-                                    return Err(io::Error::new(
+                                    upload_error = Some(io::Error::new(
                                         io::ErrorKind::ConnectionReset,
                                         Box::new(ConnectionResetError {
                                             message: format!(
@@ -305,10 +353,33 @@ impl ObjectWriter {
                                             source: Box::new(err.source),
                                         }),
                                     ));
+                                    break;
                                 }
                             }
-                            Ok(Err(err)) => return Err(err.source.into()),
+                            Ok(Err(err)) => {
+                                upload_error = Some(err.source.into());
+                                break;
+                            }
                         }
+                    }
+                    if let Some(error) = upload_error {
+                        let message = error.to_string();
+                        let state = std::mem::replace(
+                            &mut mut_self.state,
+                            UploadState::Failed(message.clone()),
+                        );
+                        let UploadState::InProgress {
+                            upload, futures, ..
+                        } = state
+                        else {
+                            unreachable!()
+                        };
+                        mut_self.state = UploadState::FailedMultipart {
+                            message,
+                            upload,
+                            futures,
+                        };
+                        return Err(error);
                     }
                     break;
                 }
@@ -317,7 +388,11 @@ impl ObjectWriter {
                         res.size = mut_self.cursor;
                         mut_self.state = UploadState::Done(res)
                     }
-                    Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
+                    Poll::Ready(Err(e)) => {
+                        let error = io::Error::other(e);
+                        mut_self.state = UploadState::Failed(error.to_string());
+                        return Err(error);
+                    }
                     Poll::Pending => break,
                 },
                 UploadState::Completing { upload, future } => match future.poll_unpin(cx) {
@@ -330,10 +405,14 @@ impl ObjectWriter {
                         let aborting_upload = upload.clone();
                         let future = async move {
                             let abort_error = aborting_upload.lock().await.abort().await.err();
-                            io::Error::other(MultipartCompletionError {
-                                completion_error,
-                                abort_error,
-                            })
+                            let abort_failed = abort_error.is_some();
+                            (
+                                io::Error::other(MultipartCompletionError {
+                                    completion_error,
+                                    abort_error,
+                                }),
+                                abort_failed,
+                            )
                         };
                         mut_self.state = UploadState::AbortingAfterCompletionFailure {
                             upload,
@@ -342,10 +421,17 @@ impl ObjectWriter {
                     }
                     Poll::Pending => break,
                 },
-                UploadState::AbortingAfterCompletionFailure { future, .. } => {
+                UploadState::AbortingAfterCompletionFailure { upload, future } => {
                     match future.poll_unpin(cx) {
-                        Poll::Ready(error) => {
-                            mut_self.state = UploadState::Failed(error.to_string());
+                        Poll::Ready((error, abort_failed)) => {
+                            if abort_failed {
+                                mut_self.state = UploadState::FailedMultipartCompletion {
+                                    message: error.to_string(),
+                                    upload: upload.clone(),
+                                };
+                            } else {
+                                mut_self.state = UploadState::Failed(error.to_string());
+                            }
                             return Err(error);
                         }
                         Poll::Pending => break,
@@ -357,35 +443,95 @@ impl ObjectWriter {
     }
 
     async fn abort_inner(&mut self) -> Result<()> {
-        let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-        match state {
+        if matches!(
+            self.state,
+            UploadState::Done(_) | UploadState::Failed(_) | UploadState::Aborted
+        ) {
+            return Ok(());
+        }
+
+        // Reject I/O before the first await, but retain the active state until
+        // cleanup succeeds. Cancellation and backend errors therefore leave
+        // enough information for a later abort or Drop to retry cleanup.
+        self.abort_incomplete = true;
+        self.abort_error = None;
+        let prior_failure = match &self.state {
+            UploadState::FailedMultipart { message, .. }
+            | UploadState::FailedMultipartCompletion { message, .. } => Some(message.clone()),
+            _ => None,
+        };
+
+        let result = match &mut self.state {
             UploadState::InProgress {
                 upload, futures, ..
-            } => abort_in_progress_upload(upload, futures).await?,
+            }
+            | UploadState::FailedMultipart {
+                upload, futures, ..
+            } => abort_in_progress_upload_mut(upload.as_mut(), futures).await,
             UploadState::Completing { upload, future } => {
-                // Dropping the completion future releases its lock on the
-                // multipart handle before abort tries to acquire it.
-                drop(future);
-                upload.lock().await.abort().await?;
+                // Dropping the completion/abort future releases its lock on the
+                // multipart handle before this cleanup attempt acquires it.
+                drop(std::mem::replace(
+                    future,
+                    futures::future::pending::<OSResult<WriteResult>>().boxed(),
+                ));
+                upload.lock().await.abort().await
             }
             UploadState::AbortingAfterCompletionFailure { upload, future } => {
-                drop(future);
-                upload.lock().await.abort().await?;
+                drop(std::mem::replace(
+                    future,
+                    futures::future::pending::<(io::Error, bool)>().boxed(),
+                ));
+                upload.lock().await.abort().await
+            }
+            UploadState::FailedMultipartCompletion { upload, .. } => {
+                upload.lock().await.abort().await
             }
             UploadState::Started(_)
             | UploadState::CreatingUpload(_)
-            | UploadState::PuttingSingle(_)
-            | UploadState::Done(_)
-            | UploadState::Failed(_) => {}
+            | UploadState::PuttingSingle(_) => Ok(()),
+            UploadState::Done(_) | UploadState::Failed(_) | UploadState::Aborted => unreachable!(),
+        };
+
+        match result {
+            Ok(()) => {
+                self.abort_incomplete = false;
+                self.state = prior_failure
+                    .map(UploadState::Failed)
+                    .unwrap_or(UploadState::Aborted);
+                Ok(())
+            }
+            Err(error) => {
+                let message = if let Some(prior_failure) = prior_failure {
+                    format!(
+                        "{prior_failure}; additionally failed to abort multipart upload: {error}"
+                    )
+                } else {
+                    error.to_string()
+                };
+                self.abort_error = Some(message);
+                Err(error.into())
+            }
         }
-        Ok(())
     }
 
     /// Abort an unfinished write.
     ///
     /// This method predates [`Writer::abort`] and therefore cannot return a
     /// backend cleanup failure without changing its public signature. New code
-    /// should call [`Writer::abort`] to observe such failures.
+    /// should call [`Writer::abort`] to observe such failures. Ordinary method
+    /// syntax (`writer.abort().await`) selects this error-swallowing inherent
+    /// method, so use fully qualified syntax when the error matters:
+    ///
+    /// ```no_run
+    /// # use lance_core::Result;
+    /// # use lance_io::object_writer::ObjectWriter;
+    /// # use lance_io::traits::Writer;
+    /// # async fn discard(mut writer: ObjectWriter) -> Result<()> {
+    /// Writer::abort(&mut writer).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn abort(&mut self) {
         if let Err(error) = self.abort_inner().await {
             tracing::warn!(path = %self.path, %error, "failed to abort multipart upload");
@@ -396,6 +542,13 @@ impl ObjectWriter {
 async fn abort_in_progress_upload(
     mut upload: Box<dyn MultipartUpload>,
     mut futures: JoinSet<std::result::Result<(), UploadPutError>>,
+) -> OSResult<()> {
+    abort_in_progress_upload_mut(upload.as_mut(), &mut futures).await
+}
+
+async fn abort_in_progress_upload_mut(
+    upload: &mut dyn MultipartUpload,
+    futures: &mut JoinSet<std::result::Result<(), UploadPutError>>,
 ) -> OSResult<()> {
     futures.abort_all();
     while futures.join_next().await.is_some() {}
@@ -412,6 +565,9 @@ impl Drop for ObjectWriter {
 
         match state {
             UploadState::InProgress {
+                upload, futures, ..
+            }
+            | UploadState::FailedMultipart {
                 upload, futures, ..
             } => {
                 handle.spawn(async move {
@@ -436,11 +592,19 @@ impl Drop for ObjectWriter {
                     }
                 });
             }
+            UploadState::FailedMultipartCompletion { upload, .. } => {
+                handle.spawn(async move {
+                    if let Err(error) = upload.lock().await.abort().await {
+                        tracing::warn!(path = %path, %error, "failed to abort dropped multipart upload");
+                    }
+                });
+            }
             UploadState::Started(_)
             | UploadState::CreatingUpload(_)
             | UploadState::PuttingSingle(_)
             | UploadState::Done(_)
-            | UploadState::Failed(_) => {}
+            | UploadState::Failed(_)
+            | UploadState::Aborted => {}
         }
     }
 }
@@ -583,7 +747,15 @@ impl AsyncWrite for ObjectWriter {
                     Poll::Pending
                 }
             }
-            UploadState::Failed(message) => Poll::Ready(Err(io::Error::other(message.clone()))),
+            UploadState::Failed(message)
+            | UploadState::FailedMultipart { message, .. }
+            | UploadState::FailedMultipartCompletion { message, .. } => {
+                Poll::Ready(Err(io::Error::other(message.clone())))
+            }
+            UploadState::Aborted => Poll::Ready(Err(io::Error::other(format!(
+                "object writer for '{}' was aborted",
+                self.path
+            )))),
         }
     }
 
@@ -603,8 +775,16 @@ impl AsyncWrite for ObjectWriter {
                 | UploadState::PuttingSingle(_)
                 | UploadState::Completing { .. }
                 | UploadState::AbortingAfterCompletionFailure { .. } => return Poll::Pending,
-                UploadState::Failed(message) => {
+                UploadState::Failed(message)
+                | UploadState::FailedMultipart { message, .. }
+                | UploadState::FailedMultipartCompletion { message, .. } => {
                     return Poll::Ready(Err(io::Error::other(message.clone())));
+                }
+                UploadState::Aborted => {
+                    return Poll::Ready(Err(io::Error::other(format!(
+                        "object writer for '{}' was aborted",
+                        mut_self.path
+                    ))));
                 }
                 UploadState::Started(_) => {
                     // If we didn't start a multipart upload, we can just do a single put.
@@ -900,6 +1080,7 @@ mod tests {
     enum PartBehavior {
         Ready,
         Pending,
+        Failure,
     }
 
     #[derive(Debug)]
@@ -907,7 +1088,8 @@ mod tests {
         events: Arc<StdMutex<Vec<&'static str>>>,
         part_behavior: PartBehavior,
         fail_completion: bool,
-        fail_abort: bool,
+        abort_failures_remaining: usize,
+        pending_abort_once: bool,
     }
 
     impl TestMultipartUpload {
@@ -916,7 +1098,8 @@ mod tests {
                 events,
                 part_behavior,
                 fail_completion: false,
-                fail_abort: false,
+                abort_failures_remaining: 0,
+                pending_abort_once: false,
             }
         }
 
@@ -926,7 +1109,12 @@ mod tests {
         }
 
         fn with_abort_failure(mut self) -> Self {
-            self.fail_abort = true;
+            self.abort_failures_remaining = 1;
+            self
+        }
+
+        fn with_pending_abort(mut self) -> Self {
+            self.pending_abort_once = true;
             self
         }
     }
@@ -939,6 +1127,9 @@ mod tests {
                 PartBehavior::Pending => Box::pin(PendingPart {
                     events: self.events.clone(),
                 }),
+                PartBehavior::Failure => {
+                    future::ready(Err(test_object_store_error("part upload failed"))).boxed()
+                }
             }
         }
 
@@ -956,7 +1147,12 @@ mod tests {
 
         async fn abort(&mut self) -> OSResult<()> {
             self.events.lock().unwrap().push("abort");
-            if self.fail_abort {
+            if self.pending_abort_once {
+                self.pending_abort_once = false;
+                return future::pending::<OSResult<()>>().await;
+            }
+            if self.abort_failures_remaining > 0 {
+                self.abort_failures_remaining -= 1;
                 Err(test_object_store_error("abort failed"))
             } else {
                 Ok(())
@@ -989,15 +1185,10 @@ mod tests {
         }
     }
 
-    async fn writer_with_multipart_upload(upload: TestMultipartUpload) -> ObjectWriter {
-        let mut store = MockObjectStore::new();
-        store
-            .expect_put_multipart_opts()
-            .times(1)
-            .return_once(move |_, _| Ok(Box::new(upload)));
-        let store = LanceObjectStore::new(
+    fn test_lance_object_store(store: MockObjectStore) -> LanceObjectStore {
+        LanceObjectStore::new(
             Arc::new(store),
-            Url::parse("memory:///").unwrap(),
+            Url::parse("memory://").unwrap(),
             None,
             None,
             false,
@@ -1005,10 +1196,20 @@ mod tests {
             1,
             0,
             None,
-        );
+        )
+    }
+
+    async fn writer_with_multipart_upload(upload: TestMultipartUpload) -> ObjectWriter {
+        let mut store = MockObjectStore::new();
+        store
+            .expect_put_multipart_opts()
+            .times(1)
+            .return_once(move |_, _| Ok(Box::new(upload)));
+        let store = test_lance_object_store(store);
         let mut writer = ObjectWriter::new(&store, &Path::from("/multipart"))
             .await
             .unwrap();
+        writer.buffer = Vec::with_capacity(INITIAL_UPLOAD_STEP);
         writer
             .write_all(&vec![0; INITIAL_UPLOAD_STEP])
             .await
@@ -1063,6 +1264,92 @@ mod tests {
             .await
             .unwrap();
         Writer::abort(&mut object_writer).await.unwrap();
+
+        let write_error = object_writer.write_all(b"discarded").await.unwrap_err();
+        assert!(write_error.to_string().contains("was aborted"));
+
+        let shutdown_error = Writer::shutdown(&mut object_writer).await.unwrap_err();
+        assert!(shutdown_error.to_string().contains("was aborted"));
+
+        // Repeated abort remains safe without making the writer usable again.
+        Writer::abort(&mut object_writer).await.unwrap();
+        assert!(object_writer.write_all(b"still discarded").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_single_put_failure_is_terminal() {
+        let mut store = MockObjectStore::new();
+        store
+            .expect_put_opts()
+            .times(1)
+            .return_once(|_, _, _| Err(test_object_store_error("single put failed")));
+        let store = test_lance_object_store(store);
+        let mut writer = ObjectWriter::new(&store, &Path::from("/single"))
+            .await
+            .unwrap();
+        writer.write_all(b"payload").await.unwrap();
+
+        let first_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(first_error.to_string().contains("single put failed"));
+
+        let second_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(second_error.to_string().contains("single put failed"));
+        let write_error = writer.write_all(b"more").await.unwrap_err();
+        assert!(write_error.to_string().contains("single put failed"));
+    }
+
+    #[tokio::test]
+    async fn test_multipart_creation_failure_is_terminal() {
+        let mut store = MockObjectStore::new();
+        store
+            .expect_put_multipart_opts()
+            .times(1)
+            .return_once(|_, _| Err(test_object_store_error("multipart creation failed")));
+        let store = test_lance_object_store(store);
+        let mut writer = ObjectWriter::new(&store, &Path::from("/multipart"))
+            .await
+            .unwrap();
+        writer.buffer = Vec::with_capacity(INITIAL_UPLOAD_STEP);
+
+        let first_error = writer
+            .write_all(&vec![0; INITIAL_UPLOAD_STEP])
+            .await
+            .unwrap_err();
+        assert!(
+            first_error
+                .to_string()
+                .contains("multipart creation failed")
+        );
+
+        let write_error = writer.write_all(b"more").await.unwrap_err();
+        assert!(
+            write_error
+                .to_string()
+                .contains("multipart creation failed")
+        );
+        let shutdown_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("multipart creation failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_failure_is_terminal_and_abortable() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let upload = TestMultipartUpload::new(events.clone(), PartBehavior::Failure);
+        let mut writer = writer_with_multipart_upload(upload).await;
+
+        let first_error = writer.flush().await.unwrap_err();
+        assert!(first_error.to_string().contains("part upload failed"));
+        let write_error = writer.write_all(b"more").await.unwrap_err();
+        assert!(write_error.to_string().contains("part upload failed"));
+
+        Writer::abort(&mut writer).await.unwrap();
+        assert_eq!(*events.lock().unwrap(), ["abort"]);
+        let shutdown_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(shutdown_error.to_string().contains("part upload failed"));
     }
 
     #[tokio::test]
@@ -1080,6 +1367,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_completion_and_abort_failure_retains_cleanup() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let upload = TestMultipartUpload::new(events.clone(), PartBehavior::Ready)
+            .with_completion_failure()
+            .with_abort_failure();
+        let mut writer = writer_with_multipart_upload(upload).await;
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(error.to_string().contains("completion failed"));
+        assert!(error.to_string().contains("abort failed"));
+        assert_eq!(*events.lock().unwrap(), ["complete", "abort"]);
+
+        Writer::abort(&mut writer).await.unwrap();
+        assert_eq!(*events.lock().unwrap(), ["complete", "abort", "abort"]);
+        let shutdown_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(shutdown_error.to_string().contains("completion failed"));
+        assert!(shutdown_error.to_string().contains("abort failed"));
+    }
+
+    #[tokio::test]
     async fn test_abort_cancels_part_tasks_before_backend_abort() {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let upload = TestMultipartUpload::new(events.clone(), PartBehavior::Pending);
@@ -1088,6 +1395,39 @@ mod tests {
         Writer::abort(&mut writer).await.unwrap();
 
         assert_eq!(*events.lock().unwrap(), ["part_cancelled", "abort"]);
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_abort_remains_terminal_and_can_resume_cleanup() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let upload =
+            TestMultipartUpload::new(events.clone(), PartBehavior::Ready).with_pending_abort();
+        let mut writer = writer_with_multipart_upload(upload).await;
+
+        let mut abort = Box::pin(Writer::abort(&mut writer));
+        let mut reached_backend_abort = false;
+        for _ in 0..100 {
+            let poll = future::poll_fn(|cx| Poll::Ready(abort.as_mut().poll(cx))).await;
+            assert!(poll.is_pending());
+            if *events.lock().unwrap() == ["abort"] {
+                reached_backend_abort = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(abort);
+        assert!(
+            reached_backend_abort,
+            "abort did not reach backend cleanup after 100 polls"
+        );
+
+        let write_error = writer.write_all(b"discarded").await.unwrap_err();
+        assert!(write_error.to_string().contains("was aborted"));
+
+        Writer::abort(&mut writer).await.unwrap();
+        assert_eq!(*events.lock().unwrap(), ["abort", "abort"]);
+        let shutdown_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(shutdown_error.to_string().contains("was aborted"));
     }
 
     #[tokio::test]
@@ -1102,6 +1442,18 @@ mod tests {
         assert!(matches!(&error, Error::IO { .. }));
         assert!(error.to_string().contains("abort failed"));
         assert_eq!(*events.lock().unwrap(), ["abort"]);
+
+        let write_error = writer.write_all(b"discarded").await.unwrap_err();
+        assert!(write_error.to_string().contains("abort failed"));
+        let shutdown_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(shutdown_error.to_string().contains("abort failed"));
+
+        // The multipart handle is retained, so cleanup can be retried without
+        // ever making the writer writable again.
+        Writer::abort(&mut writer).await.unwrap();
+        assert_eq!(*events.lock().unwrap(), ["abort", "abort"]);
+        let write_error = writer.write_all(b"still discarded").await.unwrap_err();
+        assert!(write_error.to_string().contains("was aborted"));
     }
 
     #[tokio::test]

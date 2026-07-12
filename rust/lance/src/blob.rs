@@ -808,6 +808,29 @@ async fn shutdown_writer(writer: &mut Box<dyn Writer>, path: &Path) -> Result<()
 }
 
 /// Writes a Lance-owned packed sidecar blob for one data file and returns descriptors.
+///
+/// Create a writer with [`PackedBlobWriter::try_new`], append payloads, and call
+/// [`PackedBlobWriter::finish`] or [`PackedBlobWriter::finish_array`] once to commit
+/// the sidecar and obtain its descriptors.
+///
+/// ```no_run
+/// # use lance::{PackedBlobWriter, Result};
+/// # use lance_io::object_store::ObjectStore;
+/// # use object_store::path::Path;
+/// # async fn write() -> Result<()> {
+/// let mut writer = PackedBlobWriter::try_new(
+///     ObjectStore::memory(),
+///     Path::from("dataset/data.lance"),
+///     0,
+/// )
+/// .await?;
+/// writer.write_blob(b"first payload").await?;
+/// writer.write_blob(b"second payload").await?;
+/// let descriptors = writer.finish().await?;
+/// assert_eq!(descriptors.len(), 2);
+/// # Ok(())
+/// # }
+/// ```
 pub struct PackedBlobWriter {
     object_store: ObjectStore,
     path: Path,
@@ -999,6 +1022,8 @@ impl PackedBlobWriter {
     }
 
     /// Finish the packed sidecar and return descriptors in write order.
+    ///
+    /// See [`PackedBlobWriter`] for a complete lifecycle example.
     pub async fn finish(mut self) -> Result<Vec<BlobDescriptor>> {
         self.ensure_writable()?;
         let mut writer = self.writer.take().ok_or_else(|| {
@@ -1024,6 +1049,8 @@ impl PackedBlobWriter {
     /// compatible with the writer-side blob v2 field returned by
     /// [`BlobDescriptorArrayBuilder::field`].
     ///
+    /// See [`PackedBlobWriter`] for a complete lifecycle example.
+    ///
     /// ```
     /// # use lance::{PackedBlobWriter, Result};
     /// # async fn finish(writer: PackedBlobWriter) -> Result<()> {
@@ -1041,6 +1068,30 @@ impl PackedBlobWriter {
 }
 
 /// Writes a Lance-owned dedicated sidecar blob for one data file and returns its descriptor.
+///
+/// Create a writer with [`DedicatedBlobWriter::try_new`], append the payload in one or
+/// more writes, and call [`DedicatedBlobWriter::finish`] once to commit the sidecar.
+///
+/// ```no_run
+/// # use lance::{BlobDescriptor, DedicatedBlobWriter, Result};
+/// # use lance_io::object_store::ObjectStore;
+/// # use object_store::path::Path;
+/// # async fn write() -> Result<()> {
+/// let mut writer = DedicatedBlobWriter::try_new(
+///     ObjectStore::memory(),
+///     Path::from("dataset/data.lance"),
+///     0,
+/// )
+/// .await?;
+/// writer.write(b"one logical payload").await?;
+/// let descriptor = writer.finish().await?;
+/// assert!(matches!(
+///     descriptor,
+///     BlobDescriptor::Dedicated { size: 19, .. }
+/// ));
+/// # Ok(())
+/// # }
+/// ```
 pub struct DedicatedBlobWriter {
     object_store: ObjectStore,
     path: Path,
@@ -1130,6 +1181,8 @@ impl DedicatedBlobWriter {
     }
 
     /// Finish the dedicated sidecar and return its descriptor.
+    ///
+    /// See [`DedicatedBlobWriter`] for a complete lifecycle example.
     pub async fn finish(mut self) -> Result<BlobDescriptor> {
         self.ensure_writable()?;
         let mut writer = self.writer.take().ok_or_else(|| {

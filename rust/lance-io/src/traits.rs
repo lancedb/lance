@@ -33,7 +33,23 @@ pub trait Writer: AsyncWrite + Unpin + Send {
 
     /// Abort an unfinished write and release backend resources.
     ///
+    /// After this method succeeds, callers must treat the writer as terminal:
+    /// do not write, flush, or call [`Writer::shutdown`]. The trait does not
+    /// require abort to be idempotent, so repeated calls and retries after an
+    /// error have implementation-specific behavior unless the concrete writer
+    /// documents otherwise. An error can mean that cleanup is incomplete.
+    ///
     /// Writers without backend state may use the default no-op implementation.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::traits::Writer;
+    /// # async fn discard<W: Writer + ?Sized>(writer: &mut W) -> Result<()> {
+    /// Writer::abort(writer).await?;
+    /// // `writer` is no longer used after abort succeeds.
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn abort(&mut self) -> Result<()> {
         Ok(())
     }

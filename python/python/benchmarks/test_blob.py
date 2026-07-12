@@ -8,6 +8,8 @@ import pyarrow as pa
 import pytest
 from lance.file import LanceFileSession
 
+# Many small blobs isolate per-row Python overhead; fewer large blobs show how
+# the bulk path behaves once payload copying accounts for more of the CPU time.
 WORKLOADS = [
     pytest.param(50_000, 256, id="50000x256b"),
     pytest.param(2_000, 64 * 1024, id="2000x64kib"),
