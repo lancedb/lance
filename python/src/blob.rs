@@ -2,7 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::{error::PythonErrorExt, rt};
-use arrow::pyarrow::ToPyArrow;
+use arrow::{
+    array::{ArrayRef, make_array},
+    pyarrow::{FromPyArrow, ToPyArrow},
+};
+use arrow_data::ArrayData;
+use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use lance::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
@@ -11,9 +16,83 @@ use pyo3::{
     Bound, PyResult,
     exceptions::PyValueError,
     pyclass, pymethods,
-    types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule},
+    types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule, PyTypeMethods},
 };
 use std::sync::Arc;
+
+fn descriptor_field_to_pyarrow<'py>(
+    field: &Field,
+    py: pyo3::Python<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pyarrow = PyModule::import(py, "pyarrow")?;
+    let child_fields = PyList::empty(py);
+    for (name, type_fn) in [
+        ("kind", "uint8"),
+        ("data", "large_binary"),
+        ("uri", "utf8"),
+        ("blob_id", "uint32"),
+        ("blob_size", "uint64"),
+        ("position", "uint64"),
+    ] {
+        let data_type = pyarrow.getattr(type_fn)?.call0()?;
+        let child = pyarrow.call_method1("field", (name, data_type, true))?;
+        child_fields.append(child)?;
+    }
+    let data_type = pyarrow.call_method1("struct", (child_fields,))?;
+    let metadata = PyDict::new(py);
+    metadata.set_item("ARROW:extension:name", "lance.blob.v2")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("nullable", field.is_nullable())?;
+    kwargs.set_item("metadata", metadata)?;
+    pyarrow.call_method("field", (field.name().as_str(), data_type), Some(&kwargs))
+}
+
+fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
+    match ArrayData::from_pyarrow_bound(payloads) {
+        Ok(data) => {
+            let array = make_array(data);
+            if !matches!(array.data_type(), DataType::Binary | DataType::LargeBinary) {
+                return Err(PyValueError::new_err(format!(
+                    "Packed blob payloads must have Arrow type Binary or LargeBinary, got {}",
+                    array.data_type()
+                )));
+            }
+            Ok(vec![array])
+        }
+        Err(_) => {
+            let pyarrow = PyModule::import(payloads.py(), "pyarrow")?;
+            let chunked_array_type = pyarrow.getattr("ChunkedArray")?;
+            if !payloads.is_instance(&chunked_array_type)? {
+                return Err(PyValueError::new_err(format!(
+                    "payloads must be a pyarrow BinaryArray, LargeBinaryArray, or ChunkedArray, got {}",
+                    payloads.get_type().name()?
+                )));
+            }
+
+            let chunked_data_type = DataType::from_pyarrow_bound(&payloads.getattr("type")?)?;
+            if !matches!(chunked_data_type, DataType::Binary | DataType::LargeBinary) {
+                return Err(PyValueError::new_err(format!(
+                    "Packed blob payloads must have Arrow type Binary or LargeBinary, got {chunked_data_type}"
+                )));
+            }
+
+            let chunks = payloads.getattr("chunks")?;
+            let mut arrays = Vec::new();
+            for chunk in chunks.try_iter()? {
+                arrays.push(make_array(ArrayData::from_pyarrow_bound(&chunk?)?));
+            }
+            for (chunk_index, array) in arrays.iter().enumerate() {
+                if !matches!(array.data_type(), DataType::Binary | DataType::LargeBinary) {
+                    return Err(PyValueError::new_err(format!(
+                        "Packed blob payload chunk {chunk_index} must have Arrow type Binary or LargeBinary, got {}",
+                        array.data_type()
+                    )));
+                }
+            }
+            Ok(arrays)
+        }
+    }
+}
 
 #[pyclass(name = "BlobDescriptor", skip_from_py_object)]
 #[derive(Clone)]
@@ -61,31 +140,7 @@ impl PyBlobDescriptorArrayBuilder {
 
     #[getter]
     pub fn field<'py>(&self, py: pyo3::Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let pyarrow = PyModule::import(py, "pyarrow")?;
-        let child_fields = PyList::empty(py);
-        for (name, type_fn) in [
-            ("kind", "uint8"),
-            ("data", "large_binary"),
-            ("uri", "utf8"),
-            ("blob_id", "uint32"),
-            ("blob_size", "uint64"),
-            ("position", "uint64"),
-        ] {
-            let data_type = pyarrow.getattr(type_fn)?.call0()?;
-            let child = pyarrow.call_method1("field", (name, data_type, true))?;
-            child_fields.append(child)?;
-        }
-        let data_type = pyarrow.call_method1("struct", (child_fields,))?;
-        let metadata = PyDict::new(py);
-        metadata.set_item("ARROW:extension:name", "lance.blob.v2")?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("nullable", self.field.is_nullable())?;
-        kwargs.set_item("metadata", metadata)?;
-        pyarrow.call_method(
-            "field",
-            (self.field.name().as_str(), data_type),
-            Some(&kwargs),
-        )
+        descriptor_field_to_pyarrow(&self.field, py)
     }
 
     pub fn extend_packed(
@@ -152,6 +207,9 @@ impl PyBlobDescriptorArrayBuilder {
 
 #[pyclass(name = "PackedBlobWriter", skip_from_py_object, unsendable)]
 pub struct PyPackedBlobWriter {
+    blob_id: u32,
+    path: String,
+    field: Option<Field>,
     inner: Option<PackedBlobWriter>,
 }
 
@@ -165,13 +223,12 @@ impl PyPackedBlobWriter {
             PackedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
                 .await
                 .infer_error()?;
-        Ok(Self { inner: Some(inner) })
-    }
-
-    fn inner(&self) -> PyResult<&PackedBlobWriter> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))
+        Ok(Self {
+            blob_id: inner.blob_id(),
+            path: inner.path().to_string(),
+            field: None,
+            inner: Some(inner),
+        })
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut PackedBlobWriter> {
@@ -184,18 +241,37 @@ impl PyPackedBlobWriter {
 #[pymethods]
 impl PyPackedBlobWriter {
     #[getter]
-    pub fn blob_id(&self) -> PyResult<u32> {
-        Ok(self.inner()?.blob_id())
+    pub fn blob_id(&self) -> u32 {
+        self.blob_id
     }
 
     #[getter]
-    pub fn path(&self) -> PyResult<String> {
-        Ok(self.inner()?.path().to_string())
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[getter]
+    pub fn field<'py>(&self, py: pyo3::Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let field = self.field.as_ref().ok_or_else(|| {
+            PyValueError::new_err("PackedBlobWriter field is available after finish_array")
+        })?;
+        descriptor_field_to_pyarrow(field, py)
     }
 
     pub fn write_blob(&mut self, data: Vec<u8>) -> PyResult<()> {
         rt().block_on(None, self.inner_mut()?.write_blob(data))?
             .infer_error()
+    }
+
+    pub fn write_blobs(&mut self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
+        let payloads = extract_blob_payloads(payloads)?;
+        rt().block_on(None, async {
+            let writer = self.inner_mut()?;
+            for payloads in payloads {
+                writer.write_blobs(payloads.as_ref()).await.infer_error()?;
+            }
+            Ok(())
+        })?
     }
 
     pub fn finish(&mut self) -> PyResult<Vec<PyBlobDescriptor>> {
@@ -206,10 +282,29 @@ impl PyPackedBlobWriter {
         let values = rt().block_on(None, inner.finish())?.infer_error()?;
         Ok(values.into_iter().map(Into::into).collect())
     }
+
+    pub fn finish_array<'py>(
+        &mut self,
+        py: pyo3::Python<'py>,
+        field_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+        let column = rt()
+            .block_on(None, inner.finish_array(field_name))?
+            .infer_error()?;
+        let (field, array) = column.into_parts();
+        self.field = Some(field);
+        array.to_data().to_pyarrow(py)
+    }
 }
 
 #[pyclass(name = "DedicatedBlobWriter", skip_from_py_object, unsendable)]
 pub struct PyDedicatedBlobWriter {
+    blob_id: u32,
+    path: String,
     inner: Option<DedicatedBlobWriter>,
 }
 
@@ -223,13 +318,11 @@ impl PyDedicatedBlobWriter {
             DedicatedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
                 .await
                 .infer_error()?;
-        Ok(Self { inner: Some(inner) })
-    }
-
-    fn inner(&self) -> PyResult<&DedicatedBlobWriter> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))
+        Ok(Self {
+            blob_id: inner.blob_id(),
+            path: inner.path().to_string(),
+            inner: Some(inner),
+        })
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut DedicatedBlobWriter> {
@@ -242,13 +335,13 @@ impl PyDedicatedBlobWriter {
 #[pymethods]
 impl PyDedicatedBlobWriter {
     #[getter]
-    pub fn blob_id(&self) -> PyResult<u32> {
-        Ok(self.inner()?.blob_id())
+    pub fn blob_id(&self) -> u32 {
+        self.blob_id
     }
 
     #[getter]
-    pub fn path(&self) -> PyResult<String> {
-        Ok(self.inner()?.path().to_string())
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     pub fn write(&mut self, data: Vec<u8>) -> PyResult<()> {

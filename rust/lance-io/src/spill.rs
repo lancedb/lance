@@ -187,6 +187,12 @@ impl Writer for SpillWriter {
         self.finished.store(true, Ordering::Relaxed);
         Ok(result)
     }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.inner.abort().await?;
+        self.finished.store(true, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// A [`SpillStore`] that writes temporary files to a local temp directory.

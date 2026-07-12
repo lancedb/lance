@@ -15,6 +15,7 @@ use object_store::{Error as OSError, ObjectStore, Result as OSResult, path::Path
 use object_store::{MultipartUpload, ObjectStoreExt};
 use rand::Rng;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use lance_core::{Error, Result};
@@ -122,7 +123,20 @@ enum UploadState {
     /// This happens when shutdown is called before the buffer is full.
     PuttingSingle(BoxFuture<'static, OSResult<WriteResult>>),
     /// The writer is in the process of completing the multipart upload.
-    Completing(BoxFuture<'static, OSResult<WriteResult>>),
+    Completing {
+        upload: Arc<Mutex<Box<dyn MultipartUpload>>>,
+        future: BoxFuture<'static, OSResult<WriteResult>>,
+    },
+    /// Multipart completion failed and the upload is being aborted before the
+    /// completion error is returned to the caller.
+    AbortingAfterCompletionFailure {
+        upload: Arc<Mutex<Box<dyn MultipartUpload>>>,
+        future: BoxFuture<'static, io::Error>,
+    },
+    /// A terminal upload failure. The original error is returned once and its
+    /// message is retained so later operations fail instead of polling a
+    /// completed future.
+    Failed(String),
     /// The writer has been shut down and all data has been written.
     Done(WriteResult),
 }
@@ -153,19 +167,22 @@ impl UploadState {
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
             Self::InProgress {
-                mut upload,
-                futures,
-                ..
+                upload, futures, ..
             } => {
                 debug_assert!(futures.is_empty());
+                let upload = Arc::new(Mutex::new(upload));
+                let completing_upload = upload.clone();
                 let fut = async move {
-                    let res = upload.complete().await?;
+                    let res = completing_upload.lock().await.complete().await?;
                     Ok(WriteResult {
                         size: 0, // This will be set properly later.
                         e_tag: res.e_tag,
                     })
                 };
-                Self::Completing(Box::pin(fut))
+                Self::Completing {
+                    upload,
+                    future: Box::pin(fut),
+                }
             }
             _ => unreachable!(),
         };
@@ -231,6 +248,9 @@ impl ObjectWriter {
         loop {
             match &mut mut_self.state {
                 UploadState::Started(_) | UploadState::Done(_) => break,
+                UploadState::Failed(message) => {
+                    return Err(io::Error::other(message.clone()));
+                }
                 UploadState::CreatingUpload(fut) => match fut.poll_unpin(cx) {
                     Poll::Ready(Ok(mut upload)) => {
                         let mut futures = JoinSet::new();
@@ -292,13 +312,42 @@ impl ObjectWriter {
                     }
                     break;
                 }
-                UploadState::PuttingSingle(fut) | UploadState::Completing(fut) => {
-                    match fut.poll_unpin(cx) {
-                        Poll::Ready(Ok(mut res)) => {
-                            res.size = mut_self.cursor;
-                            mut_self.state = UploadState::Done(res)
+                UploadState::PuttingSingle(fut) => match fut.poll_unpin(cx) {
+                    Poll::Ready(Ok(mut res)) => {
+                        res.size = mut_self.cursor;
+                        mut_self.state = UploadState::Done(res)
+                    }
+                    Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
+                    Poll::Pending => break,
+                },
+                UploadState::Completing { upload, future } => match future.poll_unpin(cx) {
+                    Poll::Ready(Ok(mut res)) => {
+                        res.size = mut_self.cursor;
+                        mut_self.state = UploadState::Done(res)
+                    }
+                    Poll::Ready(Err(completion_error)) => {
+                        let upload = upload.clone();
+                        let aborting_upload = upload.clone();
+                        let future = async move {
+                            let abort_error = aborting_upload.lock().await.abort().await.err();
+                            io::Error::other(MultipartCompletionError {
+                                completion_error,
+                                abort_error,
+                            })
+                        };
+                        mut_self.state = UploadState::AbortingAfterCompletionFailure {
+                            upload,
+                            future: Box::pin(future),
+                        };
+                    }
+                    Poll::Pending => break,
+                },
+                UploadState::AbortingAfterCompletionFailure { future, .. } => {
+                    match future.poll_unpin(cx) {
+                        Poll::Ready(error) => {
+                            mut_self.state = UploadState::Failed(error.to_string());
+                            return Err(error);
                         }
-                        Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
                         Poll::Pending => break,
                     }
                 }
@@ -307,29 +356,122 @@ impl ObjectWriter {
         Ok(())
     }
 
-    pub async fn abort(&mut self) {
+    async fn abort_inner(&mut self) -> Result<()> {
         let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-        if let UploadState::InProgress { mut upload, .. } = state {
-            let _ = upload.abort().await;
+        match state {
+            UploadState::InProgress {
+                upload, futures, ..
+            } => abort_in_progress_upload(upload, futures).await?,
+            UploadState::Completing { upload, future } => {
+                // Dropping the completion future releases its lock on the
+                // multipart handle before abort tries to acquire it.
+                drop(future);
+                upload.lock().await.abort().await?;
+            }
+            UploadState::AbortingAfterCompletionFailure { upload, future } => {
+                drop(future);
+                upload.lock().await.abort().await?;
+            }
+            UploadState::Started(_)
+            | UploadState::CreatingUpload(_)
+            | UploadState::PuttingSingle(_)
+            | UploadState::Done(_)
+            | UploadState::Failed(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Abort an unfinished write.
+    ///
+    /// This method predates [`Writer::abort`] and therefore cannot return a
+    /// backend cleanup failure without changing its public signature. New code
+    /// should call [`Writer::abort`] to observe such failures.
+    pub async fn abort(&mut self) {
+        if let Err(error) = self.abort_inner().await {
+            tracing::warn!(path = %self.path, %error, "failed to abort multipart upload");
         }
     }
 }
 
+async fn abort_in_progress_upload(
+    mut upload: Box<dyn MultipartUpload>,
+    mut futures: JoinSet<std::result::Result<(), UploadPutError>>,
+) -> OSResult<()> {
+    futures.abort_all();
+    while futures.join_next().await.is_some() {}
+    upload.abort().await
+}
+
 impl Drop for ObjectWriter {
     fn drop(&mut self) {
-        // If there is a multipart upload started but not finished, we should abort it.
-        if matches!(self.state, UploadState::InProgress { .. }) {
-            // Take ownership of the state.
-            let state =
-                std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-            if let UploadState::InProgress { mut upload, .. } = state
-                && let Ok(handle) = Handle::try_current()
-            {
+        let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
+        let path = self.path.clone();
+        let Ok(handle) = Handle::try_current() else {
+            return;
+        };
+
+        match state {
+            UploadState::InProgress {
+                upload, futures, ..
+            } => {
                 handle.spawn(async move {
-                    let _ = upload.abort().await;
+                    if let Err(error) = abort_in_progress_upload(upload, futures).await {
+                        tracing::warn!(path = %path, %error, "failed to abort dropped multipart upload");
+                    }
                 });
             }
+            UploadState::Completing { upload, future } => {
+                drop(future);
+                handle.spawn(async move {
+                    if let Err(error) = upload.lock().await.abort().await {
+                        tracing::warn!(path = %path, %error, "failed to abort dropped multipart upload");
+                    }
+                });
+            }
+            UploadState::AbortingAfterCompletionFailure { upload, future } => {
+                drop(future);
+                handle.spawn(async move {
+                    if let Err(error) = upload.lock().await.abort().await {
+                        tracing::warn!(path = %path, %error, "failed to abort dropped multipart upload");
+                    }
+                });
+            }
+            UploadState::Started(_)
+            | UploadState::CreatingUpload(_)
+            | UploadState::PuttingSingle(_)
+            | UploadState::Done(_)
+            | UploadState::Failed(_) => {}
         }
+    }
+}
+
+#[derive(Debug)]
+struct MultipartCompletionError {
+    completion_error: OSError,
+    abort_error: Option<OSError>,
+}
+
+impl std::fmt::Display for MultipartCompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to complete multipart upload: {}",
+            self.completion_error
+        )?;
+        if let Some(abort_error) = &self.abort_error {
+            write!(
+                f,
+                "; additionally failed to abort multipart upload: {}",
+                abort_error
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MultipartCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.completion_error)
     }
 }
 
@@ -431,7 +573,8 @@ impl AsyncWrite for ObjectWriter {
         match &self.state {
             UploadState::Started(_) | UploadState::Done(_) => Poll::Ready(Ok(())),
             UploadState::CreatingUpload(_)
-            | UploadState::Completing(_)
+            | UploadState::Completing { .. }
+            | UploadState::AbortingAfterCompletionFailure { .. }
             | UploadState::PuttingSingle(_) => Poll::Pending,
             UploadState::InProgress { futures, .. } => {
                 if futures.is_empty() {
@@ -440,6 +583,7 @@ impl AsyncWrite for ObjectWriter {
                     Poll::Pending
                 }
             }
+            UploadState::Failed(message) => Poll::Ready(Err(io::Error::other(message.clone()))),
         }
     }
 
@@ -457,7 +601,11 @@ impl AsyncWrite for ObjectWriter {
                 UploadState::Done(_) => return Poll::Ready(Ok(())),
                 UploadState::CreatingUpload(_)
                 | UploadState::PuttingSingle(_)
-                | UploadState::Completing(_) => return Poll::Pending,
+                | UploadState::Completing { .. }
+                | UploadState::AbortingAfterCompletionFailure { .. } => return Poll::Pending,
+                UploadState::Failed(message) => {
+                    return Poll::Ready(Err(io::Error::other(message.clone())));
+                }
                 UploadState::Started(_) => {
                     // If we didn't start a multipart upload, we can just do a single put.
                     let part = std::mem::take(&mut mut_self.buffer);
@@ -512,6 +660,10 @@ impl Writer for ObjectWriter {
         } else {
             unreachable!()
         }
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.abort_inner().await
     }
 }
 
@@ -698,6 +850,11 @@ impl Writer for LocalWriter {
             _ => unreachable!(),
         }
     }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.state = LocalWriteState::Poisoned;
+        Ok(())
+    }
 }
 
 // Based on object store's implementation.
@@ -728,9 +885,137 @@ fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::sync::Mutex as StdMutex;
+
+    use futures::future;
+    use object_store::{PutPayload, PutResult, UploadPart};
     use tokio::io::AsyncWriteExt;
+    use url::Url;
 
     use super::*;
+    use crate::testing::MockObjectStore;
+
+    #[derive(Debug, Clone, Copy)]
+    enum PartBehavior {
+        Ready,
+        Pending,
+    }
+
+    #[derive(Debug)]
+    struct TestMultipartUpload {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+        part_behavior: PartBehavior,
+        fail_completion: bool,
+        fail_abort: bool,
+    }
+
+    impl TestMultipartUpload {
+        fn new(events: Arc<StdMutex<Vec<&'static str>>>, part_behavior: PartBehavior) -> Self {
+            Self {
+                events,
+                part_behavior,
+                fail_completion: false,
+                fail_abort: false,
+            }
+        }
+
+        fn with_completion_failure(mut self) -> Self {
+            self.fail_completion = true;
+            self
+        }
+
+        fn with_abort_failure(mut self) -> Self {
+            self.fail_abort = true;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl MultipartUpload for TestMultipartUpload {
+        fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+            match self.part_behavior {
+                PartBehavior::Ready => future::ready(Ok(())).boxed(),
+                PartBehavior::Pending => Box::pin(PendingPart {
+                    events: self.events.clone(),
+                }),
+            }
+        }
+
+        async fn complete(&mut self) -> OSResult<PutResult> {
+            self.events.lock().unwrap().push("complete");
+            if self.fail_completion {
+                Err(test_object_store_error("completion failed"))
+            } else {
+                Ok(PutResult {
+                    e_tag: None,
+                    version: None,
+                })
+            }
+        }
+
+        async fn abort(&mut self) -> OSResult<()> {
+            self.events.lock().unwrap().push("abort");
+            if self.fail_abort {
+                Err(test_object_store_error("abort failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct PendingPart {
+        events: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    impl Future for PendingPart {
+        type Output = OSResult<()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingPart {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push("part_cancelled");
+        }
+    }
+
+    fn test_object_store_error(message: &'static str) -> OSError {
+        OSError::Generic {
+            store: "test",
+            source: Box::new(io::Error::other(message)),
+        }
+    }
+
+    async fn writer_with_multipart_upload(upload: TestMultipartUpload) -> ObjectWriter {
+        let mut store = MockObjectStore::new();
+        store
+            .expect_put_multipart_opts()
+            .times(1)
+            .return_once(move |_, _| Ok(Box::new(upload)));
+        let store = LanceObjectStore::new(
+            Arc::new(store),
+            Url::parse("memory:///").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            1,
+            0,
+            None,
+        );
+        let mut writer = ObjectWriter::new(&store, &Path::from("/multipart"))
+            .await
+            .unwrap();
+        writer
+            .write_all(&vec![0; INITIAL_UPLOAD_STEP])
+            .await
+            .unwrap();
+        assert!(matches!(&writer.state, UploadState::InProgress { .. }));
+        writer
+    }
 
     #[tokio::test]
     async fn test_write() {
@@ -777,7 +1062,46 @@ mod tests {
         let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
             .await
             .unwrap();
-        object_writer.abort().await;
+        Writer::abort(&mut object_writer).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_completion_failure_aborts_multipart_upload() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let upload =
+            TestMultipartUpload::new(events.clone(), PartBehavior::Ready).with_completion_failure();
+        let mut writer = writer_with_multipart_upload(upload).await;
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(error.to_string().contains("completion failed"));
+        assert_eq!(*events.lock().unwrap(), ["complete", "abort"]);
+    }
+
+    #[tokio::test]
+    async fn test_abort_cancels_part_tasks_before_backend_abort() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let upload = TestMultipartUpload::new(events.clone(), PartBehavior::Pending);
+        let mut writer = writer_with_multipart_upload(upload).await;
+
+        Writer::abort(&mut writer).await.unwrap();
+
+        assert_eq!(*events.lock().unwrap(), ["part_cancelled", "abort"]);
+    }
+
+    #[tokio::test]
+    async fn test_abort_propagates_backend_error() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let upload =
+            TestMultipartUpload::new(events.clone(), PartBehavior::Ready).with_abort_failure();
+        let mut writer = writer_with_multipart_upload(upload).await;
+
+        let error = Writer::abort(&mut writer).await.unwrap_err();
+
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(error.to_string().contains("abort failed"));
+        assert_eq!(*events.lock().unwrap(), ["abort"]);
     }
 
     #[tokio::test]
@@ -813,6 +1137,24 @@ mod tests {
         let stats = io_tracker.stats();
         assert_eq!(stats.write_iops, 1);
         assert_eq!(stats.written_bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_abort_removes_temp_file() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("aborted.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, Arc::new(IOTracker::default()));
+
+        writer.write_all(b"partial").await.unwrap();
+        Writer::abort(&mut writer).await.unwrap();
+
+        assert!(!temp_file_path.exists());
+        assert!(!file_path.exists());
     }
 
     #[tokio::test]

@@ -1119,6 +1119,139 @@ def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_repl
     assert blobs[0].readall() == b"replacement"
 
 
+@pytest.mark.parametrize("array_type", [pa.binary(), pa.large_binary()])
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+@pytest.mark.parametrize(
+    "values,slice_offset,slice_length,expected_values,expected_data",
+    [
+        pytest.param(
+            [b"prefix", b"a", None, b"", b"bc", b"suffix"],
+            1,
+            4,
+            [b"a", None, b"", b"bc"],
+            b"abc",
+            id="interleaved_null",
+        ),
+        pytest.param(
+            [b"prefix", b"a", b"", b"bc", b"suffix"],
+            1,
+            3,
+            [b"a", b"", b"bc"],
+            b"abc",
+            id="all_valid",
+        ),
+        pytest.param(
+            [b"prefix", None, None, b"suffix"],
+            1,
+            2,
+            [None, None],
+            b"",
+            id="all_null",
+        ),
+        pytest.param(
+            [b"prefix", b"suffix"],
+            1,
+            0,
+            [],
+            b"",
+            id="empty",
+        ),
+    ],
+)
+def test_packed_blob_writer_bulk_arrow_array(
+    tmp_path,
+    array_type,
+    as_chunked,
+    values,
+    slice_offset,
+    slice_length,
+    expected_values,
+    expected_data,
+):
+    file_id = str(uuid.uuid4())
+    data_file_name = f"{file_id}.lance"
+    blob_id = 7
+    payloads = pa.array(values, type=array_type).slice(slice_offset, slice_length)
+    if as_chunked:
+        split_at = max(1, len(payloads) // 2)
+        payloads = pa.chunked_array(
+            [payloads.slice(0, split_at), payloads.slice(split_at)]
+        )
+
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(data_file_name, blob_id)
+    packed_path = packed.path
+    with pytest.raises(ValueError, match="available after finish_array"):
+        packed.field
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+    descriptor_field = packed.field
+
+    expected_descriptors = []
+    position = 0
+    for value in expected_values:
+        if value is None:
+            expected_descriptors.append(None)
+        else:
+            expected_descriptors.append(
+                {
+                    "kind": 1,
+                    "data": None,
+                    "uri": None,
+                    "blob_id": blob_id,
+                    "blob_size": len(value),
+                    "position": position,
+                }
+            )
+            position += len(value)
+
+    assert descriptors.to_pylist() == expected_descriptors
+    assert descriptor_field == lance.BlobDescriptorArrayBuilder("image_bytes").field
+    assert descriptor_field.metadata[b"ARROW:extension:name"] == b"lance.blob.v2"
+    assert pa.record_batch(
+        [descriptors], schema=pa.schema([descriptor_field])
+    ).num_rows == len(expected_values)
+    assert packed.path == packed_path
+    assert packed.blob_id == blob_id
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == expected_data
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        pytest.param(pa.array([1, 2], type=pa.int32()), id="array"),
+        pytest.param(pa.chunked_array([[1], [2]], type=pa.int32()), id="chunked_array"),
+        pytest.param([b"not an Arrow array"], id="python_list"),
+    ],
+)
+def test_packed_blob_writer_bulk_rejects_non_binary_array(tmp_path, payloads):
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer("data-file.lance", 1)
+
+    with pytest.raises(ValueError, match="Binary") as error:
+        packed.write_blobs(payloads)
+    if isinstance(payloads, pa.Array):
+        assert "chunk" not in str(error.value)
+
+    packed.write_blob(b"still usable")
+    assert len(packed.finish_array("blob")) == 1
+
+
+def test_packed_blob_writer_properties_available_after_failed_finish(tmp_path):
+    base_path = tmp_path / "base"
+    files = LanceFileSession(base_path)
+    packed = files.open_packed_blob_writer("data-file.lance", 7)
+    path = packed.path
+    packed.write_blob(b"payload")
+    _blob_sidecar_path(base_path, "data-file", 7).mkdir(parents=True)
+
+    with pytest.raises(OSError, match="failed to shutdown local writer"):
+        packed.finish_array("blob")
+
+    assert packed.path == path
+    assert packed.blob_id == 7
+
+
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):
     blob_path = tmp_path / "external_blob.bin"
 

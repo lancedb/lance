@@ -30,6 +30,13 @@ pub trait Writer: AsyncWrite + Unpin + Send {
     /// Flush all buffered data and finalize the write, returning metadata about
     /// the written object.
     async fn shutdown(&mut self) -> Result<WriteResult>;
+
+    /// Abort an unfinished write and release backend resources.
+    ///
+    /// Writers without backend state may use the default no-op implementation.
+    async fn abort(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -40,6 +47,10 @@ impl Writer for Box<dyn Writer> {
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
         self.as_mut().shutdown().await
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.as_mut().abort().await
     }
 }
 
