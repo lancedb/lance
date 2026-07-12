@@ -1089,7 +1089,7 @@ impl FileWriter {
         let mut column_zones: Vec<(String, Vec<column_stats::ColumnZoneStatistics>)> = Vec::new();
         let mut num_zones = None;
 
-        for (field, opt_processor) in schema.fields.iter().zip(processors.into_iter()) {
+        for (field, opt_processor) in schema.fields.iter().zip(processors) {
             let Some(processor) = opt_processor else {
                 continue; // Unsupported type (e.g. List), skip column stats
             };
