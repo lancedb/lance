@@ -363,6 +363,13 @@ pub async fn write_partition_rows(
     Ok(())
 }
 
+async fn write_partition_batches(w: &mut FileWriter, batches: Vec<RecordBatch>) -> Result<()> {
+    for batch in batches {
+        w.write_batch(&batch).await?;
+    }
+    Ok(())
+}
+
 /// Transpose the PQ code column for a batch and write it to the unified writer.
 ///
 /// This helper assumes `batch` contains a contiguous range of rows for a single
@@ -1471,23 +1478,33 @@ pub async fn merge_partial_vector_auxiliary_files(
             }
         }
         _ => {
-            for (pid, total_part_len) in accumulated_lengths.iter().copied().enumerate().take(nlist)
-            {
-                for shard in shard_infos.iter() {
-                    let part_len = shard.lengths[pid] as usize;
-                    if part_len == 0 {
-                        continue;
-                    }
-                    let offset = shard.partition_offsets[pid];
-                    if let Some(w) = v2w_opt.as_mut() {
-                        write_partition_rows(shard.reader.as_ref(), w, offset..offset + part_len)
-                            .await?;
-                    }
-                }
-                if total_part_len == 0 {
+            // Non-transformed storage (FLAT, SQ, and HNSW variants) can be
+            // copied directly, but still needs the windowed reader to avoid
+            // one read stream per (partition, shard).
+            let partition_window_size = *PARTITION_WINDOW_SIZE;
+            let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
+            let mut shard_merge_reader = ShardMergeReader::new(
+                shard_infos,
+                nlist,
+                partition_window_size,
+                prefetch_window_count,
+            );
+
+            while let Some((pid, batches)) = shard_merge_reader.next_partition().await? {
+                if accumulated_lengths[pid] == 0 {
                     continue;
                 }
-                merged_rows = merged_rows.saturating_add(total_part_len as u64);
+                if batches.is_empty() {
+                    return Err(Error::index(format!(
+                        "No merged batches found for non-empty partition {}",
+                        pid
+                    )));
+                }
+
+                if let Some(w) = v2w_opt.as_mut() {
+                    write_partition_batches(w, batches).await?;
+                }
+                merged_rows = merged_rows.saturating_add(accumulated_lengths[pid] as u64);
                 progress
                     .stage_progress("merge_partitions", merged_rows)
                     .await?;
@@ -1687,6 +1704,106 @@ mod tests {
         v2w.write_batch(&batch).await?;
         v2w.finish().await?;
         Ok(total_rows)
+    }
+
+    async fn flat_shard_info(store: &ObjectStore, aux_path: &Path) -> Result<ShardInfo> {
+        let sched = ScanScheduler::new(
+            Arc::new(store.clone()),
+            SchedulerConfig::max_bandwidth(store),
+        );
+        let fh = sched
+            .open_file(aux_path, &CachedFileSize::unknown())
+            .await?;
+        let reader = V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?;
+
+        let ivf_idx: u32 = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let bytes = reader.read_global_buffer(ivf_idx).await?;
+        let pb_ivf: pb::Ivf = prost::Message::decode(bytes)?;
+
+        let mut partition_offsets = Vec::with_capacity(pb_ivf.lengths.len());
+        let mut running_offset = 0usize;
+        for length in &pb_ivf.lengths {
+            partition_offsets.push(running_offset);
+            running_offset += *length as usize;
+        }
+
+        Ok(ShardInfo {
+            reader: Arc::new(reader),
+            lengths: pb_ivf.lengths,
+            partition_offsets,
+            total_rows: running_offset,
+        })
+    }
+
+    fn row_ids_from_batches(batches: &[RecordBatch]) -> Vec<u64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let row_ids = batch
+                    .column_by_name(ROW_ID_FIELD.name())
+                    .unwrap()
+                    .as_primitive::<arrow_array::types::UInt64Type>();
+                row_ids.values().iter().copied().collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_shard_merge_reader_reads_flat_partitions_in_windows() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/windowed_flat");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let partial1 = index_dir.clone().join("partial_1");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let aux1 = partial1.clone().join(INDEX_AUXILIARY_FILE_NAME);
+
+        let lengths0 = vec![2_u32, 0_u32, 1_u32, 2_u32, 0_u32];
+        let lengths1 = vec![1_u32, 1_u32, 0_u32, 1_u32, 2_u32];
+        let dim = 2_i32;
+
+        write_flat_partial_aux(&object_store, &aux0, dim, &lengths0, 0, DistanceType::L2)
+            .await
+            .unwrap();
+        write_flat_partial_aux(&object_store, &aux1, dim, &lengths1, 100, DistanceType::L2)
+            .await
+            .unwrap();
+
+        let shard_infos = vec![
+            flat_shard_info(&object_store, &aux0).await.unwrap(),
+            flat_shard_info(&object_store, &aux1).await.unwrap(),
+        ];
+        let mut reader = ShardMergeReader::new(shard_infos, lengths0.len(), 2, 1);
+
+        let mut observed = Vec::new();
+        while let Some((partition_id, batches)) = reader.next_partition().await.unwrap() {
+            observed.push((partition_id, row_ids_from_batches(&batches)));
+        }
+
+        assert_eq!(
+            observed,
+            vec![
+                (0, vec![0, 1, 100]),
+                (1, vec![101]),
+                (2, vec![2]),
+                (3, vec![3, 4, 102]),
+                (4, vec![103, 104]),
+            ]
+        );
     }
 
     #[tokio::test]
