@@ -3224,9 +3224,9 @@ mod tests {
         use std::sync::Arc;
 
         use arrow_array::{
-            Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt64Array,
+            Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StructArray, UInt64Array,
         };
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
         use lance_file::version::LanceFileVersion;
         use lance_file::writer::{FileWriter, FileWriterOptions};
@@ -3480,6 +3480,69 @@ mod tests {
             // falls through to the base value.
             assert!(val.is_null(0));
             assert_eq!(val.value(1), 10);
+        }
+
+        /// Overlays interact correctly with NULL *base* cells (distinct from a NULL
+        /// overlay value): a covered row whose base value is NULL is overridden to the
+        /// overlay's non-null value, while an uncovered NULL base cell falls through
+        /// and stays NULL.
+        #[rstest]
+        #[tokio::test]
+        async fn test_take_null_base_cell(
+            #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        ) {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("val", DataType::Int32, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    // `val` is NULL at offsets 1 and 3.
+                    Arc::new(Int32Array::from_iter([
+                        Some(0),
+                        None,
+                        Some(20),
+                        None,
+                        Some(40),
+                        Some(50),
+                    ])),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Cover offset 1 (NULL base) and offset 4 (non-null base); leave offset
+            // 3's NULL base uncovered.
+            let dataset = commit_overlay(
+                dataset,
+                "nullbase",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([1, 4])),
+                vec![i32_array([Some(111), Some(444)])],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 3, 4], &full_schema(&dataset)).await.unwrap();
+            let val = col(&batch, "val");
+            // Offset 1: NULL base overridden to 111. Offset 3: uncovered NULL base
+            // stays NULL. Offset 4: non-null base overridden to 444.
+            assert_eq!(val.value(0), 111);
+            assert!(val.is_null(1));
+            assert_eq!(val.value(2), 444);
         }
 
         #[rstest]
@@ -3848,7 +3911,7 @@ mod tests {
 
         /// A fragment with an overlay plan, but a take that touches only uncovered
         /// offsets, must fall entirely through to the base values (the
-        /// `routing.all_fall_through()` early-return with a plan present).
+        /// `!routing.any_overlay` early-return with a plan present).
         #[rstest]
         #[tokio::test]
         async fn test_take_plan_present_all_offsets_uncovered(
@@ -4138,9 +4201,6 @@ mod tests {
         async fn test_struct_overlay_end_to_end(
             #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
         ) {
-            use arrow_array::StructArray;
-            use arrow_schema::Fields;
-
             let struct_fields = Fields::from(vec![
                 ArrowField::new("x", DataType::Int32, true),
                 ArrowField::new("y", DataType::Int32, true),
@@ -4287,8 +4347,87 @@ mod tests {
             assert_eq!(row2.values(), &[77, 88, 99]);
         }
 
-        use arrow_array::StructArray;
-        use arrow_schema::Fields;
+        /// A top-level Map column resolves as a single atom even though its value
+        /// spans two leaves (key and value): both leaf ids map back to the one Map
+        /// atom, and the whole map value at a covered offset is replaced. Maps require
+        /// the 2.2+ file format, so this runs only at V2_2 (unlike the V2_0/V2_1
+        /// parametrized tests).
+        #[tokio::test]
+        async fn test_map_overlay_end_to_end() {
+            use arrow_array::MapArray;
+            use arrow_array::builder::{Int32Builder, MapBuilder};
+
+            let version = LanceFileVersion::V2_2;
+
+            // Base row i holds the single entry {i: i * 10}.
+            let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+            for i in 0..6i32 {
+                builder.keys().append_value(i);
+                builder.values().append_value(i * 10);
+                builder.append(true).unwrap();
+            }
+            let base_attrs = builder.finish();
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Int32, true),
+                ArrowField::new("attrs", base_attrs.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(base_attrs),
+                ],
+            )
+            .unwrap();
+            let write_params = WriteParams {
+                max_rows_per_file: 6,
+                max_rows_per_group: 6,
+                data_storage_version: Some(version),
+                ..Default::default()
+            };
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let dataset = Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap();
+
+            // Overlay `attrs` (top-level field id 1) at offset 2 with a two-entry map.
+            let mut ov = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+            ov.keys().append_value(7);
+            ov.values().append_value(77);
+            ov.keys().append_value(8);
+            ov.values().append_value(88);
+            ov.append(true).unwrap();
+            let overlay_attrs = ov.finish();
+            let dataset = commit_overlay(
+                dataset,
+                "mapov",
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([2])),
+                vec![Arc::new(overlay_attrs) as ArrayRef],
+                version,
+            )
+            .await;
+
+            let frag = dataset.get_fragment(0).unwrap();
+            let batch = frag.take(&[1, 2], &full_schema(&dataset)).await.unwrap();
+            let attrs = batch
+                .column(batch.schema().index_of("attrs").unwrap())
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap();
+
+            let entries = |i: usize| -> (Vec<i32>, Vec<i32>) {
+                let row = attrs.value(i);
+                let keys = row.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+                let vals = row.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+                (keys.values().to_vec(), vals.values().to_vec())
+            };
+            // Offset 1 falls through to the base entry {1: 10}; offset 2 takes the
+            // overlay map {7: 77, 8: 88}.
+            assert_eq!(entries(0), (vec![1], vec![10]));
+            assert_eq!(entries(1), (vec![7, 8], vec![77, 88]));
+        }
 
         /// Base `id` + a struct `s { a, b }` (6 rows). Field ids: s=1, a=2, b=3.
         async fn create_struct_dataset(version: LanceFileVersion) -> (Dataset, Fields) {
