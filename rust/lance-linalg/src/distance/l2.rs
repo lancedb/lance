@@ -443,6 +443,11 @@ mod x86 {
     ///
     /// # Safety
     /// The host must support AVX-512F.
+    ///
+    /// Only compiled for builds whose baseline is below avx2+fma; at or above
+    /// that baseline `l2_batch` inlines the kernel directly and never runtime-
+    /// dispatches, so this wrapper would be dead code (see `l2_batch`).
+    #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
     #[target_feature(enable = "avx512f")]
     pub(super) unsafe fn l2_batch_f32_avx512(
         x: &[f32],
@@ -459,6 +464,7 @@ mod x86 {
     ///
     /// # Safety
     /// The host must support AVX and FMA.
+    #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
     #[target_feature(enable = "avx,fma")]
     pub(super) unsafe fn l2_batch_f32_avx_fma(
         x: &[f32],
@@ -475,6 +481,7 @@ mod x86 {
     ///
     /// # Safety
     /// The host must support AVX.
+    #[cfg(not(all(target_feature = "avx2", target_feature = "fma")))]
     #[target_feature(enable = "avx")]
     pub(super) unsafe fn l2_batch_f32_avx(x: &[f32], batch: &[f32], dimension: usize) -> Vec<f32> {
         batch
@@ -1343,7 +1350,10 @@ mod tests {
 
     /// The per-batch `#[target_feature]` kernels are only reached on sub-AVX2
     /// builds or AVX-512 hosts, so call them directly to cover them.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx2", target_feature = "fma"))
+    ))]
     fn check_l2_batch_kernel(kernel: unsafe fn(&[f32], &[f32], usize) -> Vec<f32>) {
         for dimension in [8_usize, 16, 40] {
             let num_vectors = 3;
@@ -1364,7 +1374,12 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // The runtime-dispatch batch kernels only exist in sub-avx2+fma builds
+    // (see `x86::l2_batch_f32_avx512`), so gate their tests the same way.
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx2", target_feature = "fma"))
+    ))]
     #[test]
     fn test_l2_batch_avx_fma_matches_scalar() {
         if !std::is_x86_feature_detected!("avx") || !std::is_x86_feature_detected!("fma") {
@@ -1373,7 +1388,10 @@ mod tests {
         check_l2_batch_kernel(x86::l2_batch_f32_avx_fma);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx2", target_feature = "fma"))
+    ))]
     #[test]
     fn test_l2_batch_avx_matches_scalar() {
         if !std::is_x86_feature_detected!("avx") {
@@ -1382,7 +1400,10 @@ mod tests {
         check_l2_batch_kernel(x86::l2_batch_f32_avx);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "avx2", target_feature = "fma"))
+    ))]
     #[test]
     fn test_l2_batch_avx512_matches_scalar() {
         if !std::is_x86_feature_detected!("avx512f") {
