@@ -4213,7 +4213,7 @@ impl Scanner {
         if !covered_frags.is_subset(&live_undeleted) {
             return Ok(None);
         }
-        let offset = self.offset.unwrap_or(0).max(0) as usize;
+        let offset = self.offset.unwrap_or(0) as usize;
         Ok(Some((limit as usize).saturating_add(offset)))
     }
 
