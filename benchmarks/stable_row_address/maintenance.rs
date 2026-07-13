@@ -76,14 +76,14 @@ fn legacy_user_index_catalog(
     Ok(catalog)
 }
 
-/// Consolidate all user-index segments before replaying one contiguous
-/// no-stable-row-address compaction group.
+/// Consolidate all user-index segments before replaying one contiguous legacy
+/// v2.2 compaction group.
 ///
 /// The physical maintenance plan is validated by the caller before this
 /// index-only commit. This function rejects any data-fragment or current index
 /// coverage change so the caller can safely bind that plan to the new manifest
 /// version without replanning its physical topology.
-pub async fn consolidate_no_stable_index_segments(
+pub async fn consolidate_legacy_index_segments(
     dataset: &mut Dataset,
     indices_before: &[IndexMetadata],
 ) -> Result<Option<Duration>> {

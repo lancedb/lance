@@ -2172,16 +2172,17 @@ async fn compact_files_with_observation(
     let plan = if let Some(maintenance_plan) = maintenance_plan {
         options.target_rows_per_fragment = maintenance_plan.execution_target_rows_per_fragment;
         // Validate and bind the benchmark-owned physical plan before any
-        // maintenance write. A no-stable-row-address index remapper requires a
-        // contiguous rewrite group to be either fully indexed or fully
-        // unindexed. Repeated catch-up creates multiple complete same-name
-        // segments, so consolidate them inside this timed maintenance operation
-        // and then prove the physical source is byte-for-byte unchanged.
+        // maintenance write. A v2.2 index transaction requires a contiguous
+        // rewrite group to be either fully indexed or fully unindexed. Repeated
+        // catch-up creates multiple complete same-name segments, so consolidate
+        // them inside this timed maintenance operation and then prove the
+        // physical source is byte-for-byte unchanged.
         let tasks = validate_maintenance_plan(args, maintenance_plan, dataset)?;
-        if args.format == BenchFormat::V22NoStable
-            && let Some(elapsed) =
-                maintenance::consolidate_no_stable_index_segments(dataset, indices_before.as_ref())
-                    .await?
+        if matches!(
+            args.format,
+            BenchFormat::V22NoStable | BenchFormat::V22Stable
+        ) && let Some(elapsed) =
+            maintenance::consolidate_legacy_index_segments(dataset, indices_before.as_ref()).await?
         {
             layout_index_maintenance_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         }

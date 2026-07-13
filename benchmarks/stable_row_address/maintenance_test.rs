@@ -20,6 +20,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_io::utils::tracking_store::IoOperation;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{DataFile, Fragment};
+use rstest::rstest;
 
 fn fragment(id: u64, base_id: Option<u32>) -> Fragment {
     let mut fragment = Fragment::new(id);
@@ -79,8 +80,13 @@ fn aggregate_delete_control_request_is_metadata() {
     );
 }
 
+#[rstest]
+#[case::no_stable(false)]
+#[case::stable(true)]
 #[tokio::test]
-async fn no_stable_single_group_consolidates_vector_segments_before_compaction() {
+async fn legacy_single_group_consolidates_vector_segments_before_compaction(
+    #[case] enable_stable_row_ids: bool,
+) {
     let directory = tempfile::tempdir().unwrap();
     let uri = directory.path().to_str().unwrap();
     let make_reader = || {
@@ -94,7 +100,7 @@ async fn no_stable_single_group_consolidates_vector_segments_before_compaction()
         Some(WriteParams {
             data_storage_version: Some(LanceFileVersion::V2_2),
             max_rows_per_file: 128,
-            enable_stable_row_ids: false,
+            enable_stable_row_ids,
             ..Default::default()
         }),
     )
@@ -127,7 +133,7 @@ async fn no_stable_single_group_consolidates_vector_segments_before_compaction()
     let fragments_before = dataset.manifest().fragments.as_ref().clone();
     let source_version = dataset.version().version;
     assert!(
-        maintenance::consolidate_no_stable_index_segments(&mut dataset, indices_before.as_ref(),)
+        maintenance::consolidate_legacy_index_segments(&mut dataset, indices_before.as_ref(),)
             .await
             .unwrap()
             .is_some()
