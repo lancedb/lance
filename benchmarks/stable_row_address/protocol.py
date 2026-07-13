@@ -250,11 +250,12 @@ class Step:
             raise ValueError("non-standard compaction modes require default_compaction")
         if self.preflight_expected_admission is not None and self.operation not in {
             "default_compaction",
+            "default_compaction_preflight",
             "random_delete_reclaim",
             "bounded_recluster",
         }:
             raise ValueError(
-                "default-compaction preflight requires a relocation operation"
+                "default-compaction admission requires a relocation or plan-only operation"
             )
         if (
             self.maintenance_target_file_size_bytes is not None

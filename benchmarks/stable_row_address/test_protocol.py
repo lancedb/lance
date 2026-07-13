@@ -102,6 +102,21 @@ class ProtocolTests(unittest.TestCase):
             True,
         )
 
+    def test_default_compaction_preflight_preserves_frozen_admission(self) -> None:
+        relocation = protocol.Step(
+            "default_compaction",
+            expected_rows=99,
+            preflight_expected_admission=True,
+        )
+        preflight = dataclasses_replace(
+            relocation,
+            operation="default_compaction_preflight",
+        )
+
+        self.assertEqual(preflight.operation, "default_compaction_preflight")
+        self.assertIs(preflight.preflight_expected_admission, True)
+        self.assertEqual(preflight.implementation_path, "default_compaction_plan_only")
+
     def test_random_delete_reclaim_provenance_is_format_specific(self) -> None:
         reclaim = protocol.Step("random_delete_reclaim", expected_rows=50)
         runner = object.__new__(protocol.ProtocolRunner)
