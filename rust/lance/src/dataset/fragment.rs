@@ -3745,10 +3745,14 @@ mod tests {
             let batch = frag.take(&[0, 1], &val_only).await.unwrap();
             assert_eq!(col(&batch, "val").values(), &[0, 10]);
 
-            // A take that hits the coverage does need the file, so it now fails.
+            // A take that hits the coverage does need the file, so it now fails with
+            // a not-found error naming the missing overlay file.
+            let err = frag.take(&[5], &val_only).await.unwrap_err();
+            let err = format!("{err:?}");
             assert!(
-                frag.take(&[5], &val_only).await.is_err(),
-                "take hitting the overlay's coverage should require its missing file",
+                err.contains("miss.lance") && err.to_lowercase().contains("not found"),
+                "take hitting the overlay's coverage should fail with a not-found error \
+                 for its missing file, got: {err}",
             );
         }
 
@@ -4185,10 +4189,14 @@ mod tests {
                 .unwrap();
             assert_eq!(col(&batch, "id").values(), &[0, 1, 2, 3, 4, 5]);
 
-            // Projecting the overlaid `val` column does need the file, so it fails.
+            // Projecting the overlaid `val` column does need the file, so it fails
+            // with a not-found error naming the missing overlay file.
+            let err = frag.take(&[0], &val_only).await.unwrap_err();
+            let err = format!("{err:?}");
             assert!(
-                frag.take(&[0], &val_only).await.is_err(),
-                "projecting the overlaid column should require its missing file",
+                err.contains("valov.lance") && err.to_lowercase().contains("not found"),
+                "projecting the overlaid column should fail with a not-found error \
+                 for its missing file, got: {err}",
             );
         }
 
@@ -4704,6 +4712,20 @@ mod tests {
             // a: offset 1 base (1), offset 2 overlaid (777); b untouched.
             assert_eq!(i32_child(middle, 0).values(), &[1, 777]);
             assert_eq!(i32_child(middle, 1).values(), &[100, 200]);
+
+            // Projecting the *intermediate* struct `outer.middle` (field id 2) while
+            // the overlay targets a deeper field (id 3) must still apply: the
+            // overlay's leaf id falls inside the projected subtree, so it maps to a
+            // projected atom. (This is the case wjones127/westonpace flagged where a
+            // top-level-only mapping would miss the overlay.)
+            let middle_only = dataset.schema().project_by_ids(&[2], true);
+            let batch = frag.take(&[2], &middle_only).await.unwrap();
+            let middle = struct_col(&batch, "outer")
+                .column(0)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert_eq!(i32_child(middle, 0).values(), &[777]);
         }
     }
 
