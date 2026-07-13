@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::blob::{PyDedicatedBlobWriter, PyPackedBlobWriter};
 use crate::namespace::extract_namespace_arc;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
@@ -521,6 +522,30 @@ impl LanceFileSession {
                 keep_original_array,
                 max_page_bytes,
             ),
+        )?
+    }
+
+    pub fn open_packed_blob_writer(
+        &self,
+        path: String,
+        blob_id: u32,
+    ) -> PyResult<PyPackedBlobWriter> {
+        let path = self.base_path.child_path(&Path::from(path));
+        rt().block_on(
+            None,
+            PyPackedBlobWriter::try_new(self.object_store.clone(), path, blob_id),
+        )?
+    }
+
+    pub fn open_dedicated_blob_writer(
+        &self,
+        path: String,
+        blob_id: u32,
+    ) -> PyResult<PyDedicatedBlobWriter> {
+        let path = self.base_path.child_path(&Path::from(path));
+        rt().block_on(
+            None,
+            PyDedicatedBlobWriter::try_new(self.object_store.clone(), path, blob_id),
         )?
     }
 

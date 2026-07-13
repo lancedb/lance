@@ -12,6 +12,7 @@ use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
@@ -51,7 +52,7 @@ pub struct RemappedIndex {
 pub trait IndexRemapper: Send + Sync {
     async fn remap_indices(
         &self,
-        index_map: HashMap<u64, Option<u64>>,
+        index_map: RowAddrRemap,
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>>;
 }
@@ -69,11 +70,7 @@ pub struct IgnoreRemap {}
 
 #[async_trait]
 impl IndexRemapper for IgnoreRemap {
-    async fn remap_indices(
-        &self,
-        _: HashMap<u64, Option<u64>>,
-        _: &[u64],
-    ) -> Result<Vec<RemappedIndex>> {
+    async fn remap_indices(&self, _: RowAddrRemap, _: &[u64]) -> Result<Vec<RemappedIndex>> {
         Ok(Vec::new())
     }
 }
@@ -316,7 +313,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         .map(|old_addr| (old_addr, frag_reuse_index.remap_row_id(old_addr)))
         .collect();
 
-    let remap_result = index::remap_index(dataset, index_id, &composed_row_id_map).await?;
+    let remapper = RowAddrRemap::direct(composed_row_id_map);
+    let remap_result = index::remap_index(dataset, index_id, &remapper).await?;
 
     let new_index_meta = match remap_result {
         // The composed remap emptied the index (every row deleted). Matching the
@@ -410,6 +408,87 @@ pub async fn remap_column_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compact_matches_transpose() {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        // Ascending old fragments (compaction's scan order), with deletions.
+        let old = vec![
+            FragDigest {
+                id: 0,
+                physical_rows: 5,
+                num_deleted_rows: 2,
+            },
+            FragDigest {
+                id: 1,
+                physical_rows: 4,
+                num_deleted_rows: 1,
+            },
+            FragDigest {
+                id: 3,
+                physical_rows: 3,
+                num_deleted_rows: 0,
+            },
+        ];
+        // 9 rewritten rows (offsets that survived in each old fragment).
+        let rewritten = [
+            (0, 1),
+            (0, 2),
+            (0, 4),
+            (1, 0),
+            (1, 1),
+            (1, 3),
+            (3, 0),
+            (3, 1),
+            (3, 2),
+        ];
+        let addrs = RoaringTreemap::from_iter(
+            rewritten
+                .iter()
+                .map(|(f, o)| u64::from(RowAddress::new_from_parts(*f, *o))),
+        );
+        // 9 rewritten rows split across two new fragments.
+        let new = vec![
+            FragDigest {
+                id: 10,
+                physical_rows: 4,
+                num_deleted_rows: 0,
+            },
+            FragDigest {
+                id: 11,
+                physical_rows: 5,
+                num_deleted_rows: 0,
+            },
+        ];
+
+        let expected = transpose_row_ids_from_digest(addrs.clone(), &old, &new);
+        let compact = RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: addrs,
+            old_frag_ids: old.iter().map(|f| f.id as u32).collect(),
+            new_frags: new
+                .iter()
+                .map(|f| (f.id as u32, f.physical_rows as u32))
+                .collect(),
+        }])
+        .unwrap();
+
+        // Every real address in the old fragments must map identically.
+        for f in &old {
+            for o in 0..f.physical_rows as u32 {
+                let a = u64::from(RowAddress::new_from_parts(f.id as u32, o));
+                assert_eq!(
+                    compact.get(a),
+                    expected.get(&a).copied(),
+                    "mismatch at ({}, {})",
+                    f.id,
+                    o
+                );
+            }
+        }
+        // A fragment outside the group is unaffected by both.
+        let outside = u64::from(RowAddress::new_from_parts(99, 0));
+        assert_eq!(compact.get(outside), expected.get(&outside).copied());
+    }
 
     #[test]
     fn test_missing_indices() {

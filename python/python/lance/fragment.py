@@ -1029,6 +1029,7 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        target_all_bases: Optional[bool] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         external_blob_mode: Literal["reference", "ingest"] = "reference",
@@ -1054,6 +1055,7 @@ if TYPE_CHECKING:
         storage_options: Optional[Dict[str, str]] = None,
         enable_stable_row_ids: bool = False,
         target_bases: Optional[List[str]] = None,
+        target_all_bases: Optional[bool] = None,
         initial_bases: Optional[List["DatasetBasePath"]] = None,
         base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
         external_blob_mode: Literal["reference", "ingest"] = "reference",
@@ -1079,6 +1081,7 @@ def write_fragments(
     storage_options: Optional[Dict[str, str]] = None,
     enable_stable_row_ids: bool = False,
     target_bases: Optional[List[str]] = None,
+    target_all_bases: Optional[bool] = None,
     initial_bases: Optional[List["DatasetBasePath"]] = None,
     base_store_params: Optional[Dict[str, Dict[str, str]]] = None,
     external_blob_mode: Literal["reference", "ingest"] = "reference",
@@ -1149,6 +1152,11 @@ def write_fragments(
         **CREATE mode**: References must match bases in `initial_bases`
         **APPEND/OVERWRITE modes**: References must match bases in the
         existing manifest
+    target_all_bases : bool, optional
+        Write new data files round-robin across every base registered in the
+        manifest, resolved at execution time. When True, the dataset's
+        primary storage participates as the first slot. Cannot be combined
+        with `target_bases`.
     initial_bases : list of DatasetBasePath, optional
         Base paths to register when creating a new dataset (CREATE mode only).
 
@@ -1254,6 +1262,7 @@ def write_fragments(
         table_id=table_id,
         enable_stable_row_ids=enable_stable_row_ids,
         target_bases=target_bases,
+        target_all_bases=target_all_bases,
         initial_bases=initial_bases,
         base_store_params=base_store_params,
         external_blob_mode=external_blob_mode,

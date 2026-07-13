@@ -835,3 +835,130 @@ def test_fragment_delete_rows(tmp_path: Path):
         frag.delete_rows([100])
     with pytest.raises(ValueError, match="out of range"):
         frag.delete_rows([0, 50, 1000])
+
+
+def test_fragment_take_with_json_column(tmp_path):
+    """Test that FileFragment.take returns JSON columns in Arrow JSON format."""
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array(range(10), type=pa.int64()),
+            "meta": pa.array(
+                [f'{{"val":{i}}}' for i in range(10)],
+                type=json_type,
+            ),
+        }
+    )
+    dataset_uri = tmp_path / "test_frag_take_json"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    fragment = dataset.get_fragment(0)
+    result = fragment.take([1, 4, 7])
+
+    # Should return arrow.json type (Utf8), not lance.json (LargeBinary)
+    meta_field = result.schema.field("meta")
+    assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
+        f"Expected arrow.json (Utf8), got {meta_field.type}"
+    )
+
+    metas = result.column("meta").to_pylist()
+    assert metas[0] == '{"val":1}'
+    assert metas[1] == '{"val":4}'
+    assert metas[2] == '{"val":7}'
+
+
+def test_fragment_create_with_json_column(tmp_path):
+    """Test that LanceFragment.create works with Arrow JSON extension type.
+
+    Previously the single-fragment create path skipped the Arrow JSON (Utf8) ->
+    Lance JSON (JSONB LargeBinary) conversion that write_dataset/write_fragments
+    perform, so the raw UTF-8 string bytes were written into a column whose schema
+    declared JSONB. Reads then miss-decoded the bytes and returned garbage.
+    """
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "uid": pa.array(["a", "b", "c", "d"], type=pa.utf8()),
+            "payload": pa.array(
+                ['{"x":1}', '{"x":2}', '{"y":3}', '{"y":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    frag = LanceFragment.create(tmp_path, data)
+    operation = LanceOperation.Overwrite(data.schema, [frag])
+    dataset = LanceDataset.commit(tmp_path, operation)
+
+    result = dataset.to_table()
+    assert result.column("uid").to_pylist() == ["a", "b", "c", "d"]
+    payloads = result.column("payload").to_pylist()
+    assert [json.loads(p) for p in payloads] == [
+        {"x": 1},
+        {"x": 2},
+        {"y": 3},
+        {"y": 4},
+    ]
+
+
+def test_fragment_update_columns_with_json_column(tmp_path):
+    """Test that fragment update_columns works with Arrow JSON extension type.
+
+    Previously this would fail with a type mismatch error because the
+    HashJoiner didn't convert Arrow JSON (Utf8) to Lance JSON (LargeBinary).
+    """
+    # Create initial dataset with a JSON extension type column
+    json_type = pa.json_()
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4, 5], type=pa.int64()),
+            "name": pa.array(["a", "b", "c", "d", "e"], type=pa.utf8()),
+            "meta": pa.array(
+                ['{"x":1}', '{"x":2}', '{"x":3}', '{"x":4}', '{"x":5}'],
+                type=json_type,
+            ),
+        }
+    )
+    dataset_uri = tmp_path / "test_update_cols_json"
+    dataset = lance.write_dataset(data, dataset_uri)
+
+    # Prepare update data: update the JSON column for some rows
+    update_data = pa.table(
+        {
+            "_rowid": pa.array([1, 3], type=pa.uint64()),
+            "meta": pa.array(
+                ['{"updated":true,"id":2}', '{"updated":true,"id":4}'],
+                type=json_type,
+            ),
+        }
+    )
+
+    # This should NOT raise a type mismatch error
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(update_data)
+
+    assert len(fields_modified) > 0
+
+    # Commit and verify
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    result = updated_dataset.to_table()
+    ids = result.column("id").to_pylist()
+    metas = result.column("meta").to_pylist()
+
+    for i, (id_val, meta_val) in enumerate(zip(ids, metas)):
+        meta = json.loads(meta_val) if isinstance(meta_val, str) else meta_val
+        if id_val == 2 or id_val == 4:
+            assert "updated" in meta_val or meta.get("updated") is True, (
+                f"id={id_val} should be updated, got {meta_val}"
+            )
+        else:
+            assert "x" in meta_val or "x" in str(meta), (
+                f"id={id_val} should have original value, got {meta_val}"
+            )

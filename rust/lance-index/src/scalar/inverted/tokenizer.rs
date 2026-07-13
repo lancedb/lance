@@ -668,4 +668,75 @@ mod tests {
         }
         assert_eq!(tokens, vec!["lance".to_string(), "data".to_string()]);
     }
+
+    // Common English pronouns/function words such as `you`/`my`/`your`/`we`
+    // must be removed by the ICU `all()` stop-word path. These are among the
+    // highest-frequency tokens, so leaking them builds pathologically large
+    // single-term posting lists (and previously overflowed the u32 posting-list
+    // size counter, panicking the whole index build). The leak is independent
+    // of stemming, so we assert it for both stem=false and stem=true.
+    #[rstest]
+    #[case::icu_no_stem("icu", false)]
+    #[case::icu_stem("icu", true)]
+    #[case::icu_split_no_stem("icu/split", false)]
+    #[case::icu_split_stem("icu/split", true)]
+    // `simple` is the recommended tokenizer for monolingual English corpora and
+    // uses StopWordFilter::new(English) rather than the ICU all() path, so it
+    // must be covered too.
+    #[case::simple_no_stem("simple", false)]
+    #[case::simple_stem("simple", true)]
+    fn test_icu_common_english_stop_words_do_not_leak(
+        #[case] base_tokenizer: &str,
+        #[case] stem: bool,
+    ) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer(base_tokenizer.to_string())
+            .stem(stem)
+            .remove_stop_words(true)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("you my your we lance data");
+        let tokens: Vec<String> = std::iter::from_fn(|| stream.next().map(|t| t.text.clone()))
+            .filter(|t| matches!(t.as_str(), "you" | "my" | "your" | "we"))
+            .collect();
+        assert!(
+            tokens.is_empty(),
+            "common English stop words leaked through the icu pipeline (stem={stem}): {tokens:?}"
+        );
+    }
+
+    // Common Chinese function words/particles (了 是 在 的 和 有 我) are the
+    // highest-frequency Chinese tokens; like the English pronouns they must be
+    // removed by the ICU `all()` stop-word path so they don't build huge
+    // posting lists. Real content words (英语 = "English", 数据 = "data") must
+    // survive. ICU dictionary segmentation splits the input into words, so this
+    // exercises the CJK stop-word path end to end.
+    #[rstest]
+    #[case::icu("icu")]
+    #[case::icu_split("icu/split")]
+    fn test_icu_common_chinese_stop_words_do_not_leak(#[case] base_tokenizer: &str) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer(base_tokenizer.to_string())
+            .stem(true)
+            .remove_stop_words(true)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search("我 在 有 了 是 的 和 英语 数据");
+        let tokens: Vec<String> =
+            std::iter::from_fn(|| stream.next().map(|t| t.text.clone())).collect();
+        let stop = ["我", "在", "有", "了", "是", "的", "和"];
+        let leaked: Vec<&String> = tokens
+            .iter()
+            .filter(|t| stop.contains(&t.as_str()))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "common Chinese stop words leaked through the icu pipeline: {leaked:?} (all tokens: {tokens:?})"
+        );
+        // The real content words must still be indexed.
+        assert!(
+            tokens.iter().any(|t| t == "英语"),
+            "content word 英语 was dropped: {tokens:?}"
+        );
+    }
 }

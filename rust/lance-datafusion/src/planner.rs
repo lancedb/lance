@@ -503,7 +503,7 @@ impl Planner {
             }
             _ => Err(Error::invalid_input(format!(
                 "Unsupported function args: {:?}",
-                &func.args
+                func.args
             ))),
         }
     }
@@ -1062,13 +1062,9 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
                 self.columns.insert(path);
                 self.current_path.clear();
             }
-            Expr::ScalarFunction(udf) => {
-                if udf.name() == GetFieldFunc::default().name() {
-                    if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
-                        self.current_path.push_front(name.to_string())
-                    } else {
-                        self.current_path.clear();
-                    }
+            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
+                if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
+                    self.current_path.push_front(name.to_string())
                 } else {
                     self.current_path.clear();
                 }

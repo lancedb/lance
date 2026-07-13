@@ -396,6 +396,23 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn target_bases(
+        mut slf: PyRefMut<'_, Self>,
+        bases: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_base_names_or_paths(bases);
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (include_primary = true))]
+    pub fn target_all_bases(
+        mut slf: PyRefMut<'_, Self>,
+        include_primary: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_all_bases(include_primary);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -2583,18 +2600,44 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (name, *, with_position = false))]
-    fn prewarm_index(&self, name: &str, with_position: bool) -> PyResult<()> {
+    #[pyo3(signature = (name, *, with_position = false, index_segments = None))]
+    fn prewarm_index(
+        &self,
+        name: &str,
+        with_position: bool,
+        index_segments: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let index_segments = index_segments
+            .map(|segments| {
+                segments
+                    .into_iter()
+                    .map(|segment| {
+                        Uuid::parse_str(&segment).map_err(|err| {
+                            PyValueError::new_err(format!(
+                                "invalid index segment uuid '{segment}': {err}"
+                            ))
+                        })
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()?;
+
         rt().block_on(None, async {
             if with_position {
-                self.ds
-                    .prewarm_index_with_options(
-                        name,
-                        &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
-                    )
-                    .await
+                let options = PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true));
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds
+                        .prewarm_index_segments_with_options(name, index_segments, &options)
+                        .await
+                } else {
+                    self.ds.prewarm_index_with_options(name, &options).await
+                }
             } else {
-                self.ds.prewarm_index(name).await
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds.prewarm_index_segments(name, index_segments).await
+                } else {
+                    self.ds.prewarm_index(name).await
+                }
             }
         })?
         .infer_error()
@@ -4519,6 +4562,11 @@ pub fn get_write_params(
             && !target_bases_list.is_empty()
         {
             p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        // Handle target_all_bases parameter (bool: include primary storage)
+        if let Some(target_all_bases) = get_dict_opt::<bool>(options, "target_all_bases")? {
+            p = p.with_target_all_bases(target_all_bases);
         }
 
         // Handle base_store_params: per-base storage options keyed by base path URI

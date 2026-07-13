@@ -208,6 +208,8 @@ async fn main() -> lance_core::Result<()> {
     let total_batches_max = max_rows.div_ceil(batch_size);
     let writer_config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write,
         sync_indexed_write: true,

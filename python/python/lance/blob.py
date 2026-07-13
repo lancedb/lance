@@ -8,11 +8,28 @@ from typing import IO, Any, Iterator, Optional, Union
 
 import pyarrow as pa
 
-from .lance import LanceBlobFile
+from .lance import (
+    BlobDescriptor as BlobDescriptor,
+)
+from .lance import (
+    BlobDescriptorArrayBuilder as BlobDescriptorArrayBuilder,
+)
+from .lance import (
+    DedicatedBlobWriter as DedicatedBlobWriter,
+)
+from .lance import (
+    LanceBlobFile,
+)
+from .lance import (
+    PackedBlobWriter as PackedBlobWriter,
+)
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
     b"lance-encoding:blob-dedicated-size-threshold"
+)
+_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
+    b"lance-encoding:blob-pack-file-size-threshold"
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
 
@@ -217,6 +234,7 @@ def blob_field(
     nullable: bool = True,
     inline_size_threshold: Optional[int] = None,
     dedicated_size_threshold: Optional[int] = None,
+    pack_file_size_threshold: Optional[int] = None,
 ) -> pa.Field:
     """
     Construct an Arrow field for a Lance blob column.
@@ -234,14 +252,24 @@ def blob_field(
         Maximum payload size in bytes to store in packed blob storage before
         using dedicated blob storage. This threshold is checked before
         ``inline_size_threshold``.
+    pack_file_size_threshold : optional, int
+        Maximum size in bytes of a single packed blob sidecar (``.pack``) file.
+        Once a sidecar reaches this size a new one is started.
     """
     _validate_threshold("inline_size_threshold", inline_size_threshold, allow_zero=True)
     _validate_threshold(
         "dedicated_size_threshold", dedicated_size_threshold, allow_zero=False
     )
+    _validate_threshold(
+        "pack_file_size_threshold", pack_file_size_threshold, allow_zero=False
+    )
 
     field = pa.field(name, BlobType(), nullable=nullable)
-    if inline_size_threshold is None and dedicated_size_threshold is None:
+    if (
+        inline_size_threshold is None
+        and dedicated_size_threshold is None
+        and pack_file_size_threshold is None
+    ):
         return field
 
     metadata = dict(field.metadata or {})
@@ -252,6 +280,10 @@ def blob_field(
     if dedicated_size_threshold is not None:
         metadata[_BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY] = str(
             dedicated_size_threshold
+        ).encode()
+    if pack_file_size_threshold is not None:
+        metadata[_BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY] = str(
+            pack_file_size_threshold
         ).encode()
     return field.with_metadata(metadata)
 
