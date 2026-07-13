@@ -91,10 +91,13 @@ use std::sync::Arc;
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
-use super::rowids::{load_row_id_sequences, resolve_logical_row_version_sequences};
+use super::rowids::{
+    get_row_id_index, load_row_id_sequences, resolve_logical_row_version_sequences,
+};
+use super::scanner::ColumnOrdering;
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, RowAddressManifestApplyContext, Transaction,
-    TransactionBuilder,
+    TransactionBuilder, with_strict_full_ordered_rewrite_property,
 };
 use super::utils::make_rowid_capture_stream;
 use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
@@ -120,15 +123,18 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::Error;
 use lance_core::datatypes::{BlobHandling, BlobKind};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_datafusion::exec::execute_plan;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::is_system_index;
 use lance_table::format::{
-    Fragment, IndexMetadata, PlacementMaintenanceRequired, RowAddressLayoutDelta, RowIdMeta,
+    Fragment, IndexMetadata, PlacementMaintenanceRequired, RowAddressLayoutDelta,
+    RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
 };
-use lance_table::rowids::read_row_ids;
+use lance_table::rowids::segment::U64Segment;
+use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -964,6 +970,385 @@ pub async fn compact_files(
     info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
     let planner = DefaultCompactionPlanner::new(options);
     compact_files_with_planner(dataset, remap_options, &planner).await
+}
+
+fn version_sequence_from_values(values: &[u64]) -> RowDatasetVersionSequence {
+    let mut runs = Vec::new();
+    let mut start = 0_u64;
+    while start < values.len() as u64 {
+        let version = values[start as usize];
+        let mut end = start + 1;
+        while end < values.len() as u64 && values[end as usize] == version {
+            end += 1;
+        }
+        runs.push(RowDatasetVersionRun {
+            span: U64Segment::Range(start..end),
+            version,
+        });
+        start = end;
+    }
+    RowDatasetVersionSequence { runs }
+}
+
+async fn ordered_legacy_row_versions(
+    dataset: &Dataset,
+    row_ids: &RowIdSequence,
+) -> Result<(RowDatasetVersionSequence, RowDatasetVersionSequence)> {
+    let stable_index = get_row_id_index(dataset).await?;
+    let fragments = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id as u32, fragment))
+        .collect::<HashMap<_, _>>();
+    let mut metadata = HashMap::<
+        u32,
+        (
+            Option<RowDatasetVersionSequence>,
+            Option<RowDatasetVersionSequence>,
+        ),
+    >::new();
+    let mut created = Vec::with_capacity(row_ids.len() as usize);
+    let mut updated = Vec::with_capacity(row_ids.len() as usize);
+
+    for row_id in row_ids.iter() {
+        let physical = if let Some(index) = &stable_index {
+            index.get(row_id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "ordered rewrite captured non-live stable row ID {row_id}"
+                ))
+            })?
+        } else {
+            RowAddress::from(row_id)
+        };
+        let fragment = fragments.get(&physical.fragment_id()).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "ordered rewrite row {row_id} resolves to missing fragment {}",
+                physical.fragment_id()
+            ))
+        })?;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            metadata.entry(physical.fragment_id())
+        {
+            entry.insert((
+                fragment
+                    .created_at_version_meta
+                    .as_ref()
+                    .map(RowDatasetVersionMeta::load_sequence)
+                    .transpose()?,
+                fragment
+                    .last_updated_at_version_meta
+                    .as_ref()
+                    .map(RowDatasetVersionMeta::load_sequence)
+                    .transpose()?,
+            ));
+        }
+        let (created_sequence, updated_sequence) = metadata
+            .get(&physical.fragment_id())
+            .expect("ordered rewrite version metadata was initialized");
+        let offset = physical.row_offset() as usize;
+        let created_version = match created_sequence {
+            Some(sequence) => sequence.version_at(offset).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "created-at metadata for fragment {} does not cover row offset {offset}",
+                    fragment.id
+                ))
+            })?,
+            None => 1,
+        };
+        let updated_version = match updated_sequence {
+            Some(sequence) => sequence.version_at(offset).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "last-updated metadata for fragment {} does not cover row offset {offset}",
+                    fragment.id
+                ))
+            })?,
+            None => created_version,
+        };
+        created.push(created_version);
+        updated.push(updated_version);
+    }
+    Ok((
+        version_sequence_from_values(&created),
+        version_sequence_from_values(&updated),
+    ))
+}
+
+async fn apply_ordered_legacy_provenance(
+    dataset: &Dataset,
+    row_ids: RowIdSequence,
+    new_fragments: &mut [Fragment],
+) -> Result<Option<Vec<u8>>> {
+    let chunk_sizes = new_fragments
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap_or_default() as u64)
+        .collect::<Vec<_>>();
+    if row_ids.len() != chunk_sizes.iter().sum::<u64>() {
+        return Err(Error::invalid_input(
+            "ordered rewrite row identity count disagrees with output fragments",
+        ));
+    }
+    let (created, updated) = ordered_legacy_row_versions(dataset, &row_ids).await?;
+    let created = lance_table::rowids::version::rechunk_version_sequences(
+        [created],
+        chunk_sizes.clone(),
+        false,
+    )?;
+    let updated = lance_table::rowids::version::rechunk_version_sequences(
+        [updated],
+        chunk_sizes.clone(),
+        false,
+    )?;
+    for ((fragment, created), updated) in new_fragments.iter_mut().zip(created).zip(updated) {
+        fragment.created_at_version_meta = Some(RowDatasetVersionMeta::from_sequence(&created)?);
+        fragment.last_updated_at_version_meta =
+            Some(RowDatasetVersionMeta::from_sequence(&updated)?);
+    }
+
+    if dataset.manifest.uses_legacy_stable_row_ids() {
+        let sequences = lance_table::rowids::rechunk_sequences([row_ids], chunk_sizes, false)?;
+        for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&sequence)));
+        }
+        Ok(None)
+    } else {
+        Ok(Some(write_row_ids(&row_ids)))
+    }
+}
+
+/// Rewrite all current fragments into a deterministic user-column order.
+///
+/// Storage version 2.3 uses bounded inline clustering and rejects the rewrite
+/// before data-file writes if the source-contiguous extent or metadata budget
+/// would be exceeded.  Older formats preserve their native identity contract
+/// and synchronously remap physical-address indices.
+pub async fn rewrite_files_in_order(
+    dataset: &mut Dataset,
+    ordering: Vec<ColumnOrdering>,
+    mut options: CompactionOptions,
+    remap_options: Option<Arc<dyn IndexRemapperOptions>>,
+) -> Result<CompactionMetrics> {
+    if ordering.is_empty() {
+        return Err(Error::invalid_input(
+            "ordered rewrite requires at least one ordering column",
+        ));
+    }
+    for column in &ordering {
+        if column.column_name == lance_core::ROW_ID || column.column_name == lance_core::ROW_ADDR {
+            return Err(Error::invalid_input(
+                "ordered rewrite ordering must use user columns",
+            ));
+        }
+        if dataset.schema().field(&column.column_name).is_none() {
+            return Err(Error::invalid_input(format!(
+                "ordered rewrite column {} does not exist",
+                column.column_name
+            )));
+        }
+    }
+    if options.target_rows_per_fragment == 0 || options.max_rows_per_group == 0 {
+        return Err(Error::invalid_input(
+            "ordered rewrite row limits must be greater than zero",
+        ));
+    }
+    if dataset.manifest.fragments.is_empty() {
+        return Ok(CompactionMetrics::default());
+    }
+    options.transaction_properties = Some(with_strict_full_ordered_rewrite_property(
+        options.transaction_properties.clone(),
+    ));
+
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        let original_fragments = dataset.manifest.fragments.as_ref().clone();
+        let files_removed = original_fragments
+            .iter()
+            .map(|fragment| fragment.files.len() + usize::from(fragment.deletion_file.is_some()))
+            .sum();
+        let metrics = maintain_row_addresses(
+            dataset,
+            RowAddressMaintenanceOptions {
+                mode: RowAddressMaintenanceMode::BoundedRecluster { ordering },
+                target_rows_per_fragment: options.target_rows_per_fragment,
+                max_rows_per_group: options.max_rows_per_group,
+                max_bytes_per_file: options.max_bytes_per_file,
+                batch_size: options.batch_size,
+                io_buffer_size: options.io_buffer_size,
+                transaction_properties: options.transaction_properties,
+            },
+        )
+        .await?;
+        return Ok(CompactionMetrics {
+            groups_planned: 1,
+            groups_admitted: 1,
+            fragments_removed: metrics.fragments_removed,
+            fragments_added: metrics.fragments_added,
+            files_removed,
+            files_added: metrics.data_files_written,
+            ..CompactionMetrics::default()
+        });
+    }
+    if options.defer_index_remap {
+        return Err(Error::invalid_input(
+            "ordered rewrites cannot defer physical-address index remapping",
+        ));
+    }
+    if !matches!(options.index_remap_mode, IndexRemapMode::Direct) {
+        return Err(Error::invalid_input(
+            "ordered rewrites require direct index remapping",
+        ));
+    }
+    if !matches!(options.compaction_mode(), CompactionMode::Reencode) {
+        return Err(Error::invalid_input(
+            "ordered rewrites require re-encoding and cannot use binary copy",
+        ));
+    }
+    let original_fragments = dataset.manifest.fragments.as_ref().clone();
+    let index_fragmaps = load_index_fragmaps(dataset).await?;
+    if index_fragmaps.iter().any(|fragment_bitmap| {
+        original_fragments
+            .iter()
+            .any(|fragment| !fragment_bitmap.contains(fragment.id as u32))
+    }) {
+        return Err(Error::invalid_input(
+            "ordered rewrite requires every non-system legacy index to cover the full current fragment set; consolidate, rebuild, or drop partial indices before rewriting",
+        ));
+    }
+    let scan_fragments = migrate_fragments(dataset, &original_fragments, false).await?;
+    let mut scanner = dataset.scan();
+    if dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob() && !field.is_blob_v2())
+    {
+        scanner.blob_handling(BlobHandling::AllBinary);
+    }
+    let has_blob_v2_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob_v2());
+    if has_blob_v2_columns {
+        scanner.with_row_address();
+    }
+    if let Some(batch_size) = options.batch_size {
+        scanner.batch_size(batch_size);
+    }
+    if let Some(io_buffer_size) = options.io_buffer_size {
+        scanner.io_buffer_size(io_buffer_size);
+    }
+    scanner
+        .with_fragments(scan_fragments)
+        .with_row_id()
+        .scan_in_order(false);
+    let plan = scanner.create_plan().await?;
+    let mut sort_exprs = ordering
+        .iter()
+        .map(|column| {
+            Ok(PhysicalSortExpr {
+                expr: expressions::col(&column.column_name, plan.schema().as_ref())?,
+                options: arrow::compute::SortOptions {
+                    descending: !column.ascending,
+                    nulls_first: column.nulls_first,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sort_exprs.push(PhysicalSortExpr {
+        expr: expressions::col(lance_core::ROW_ID, plan.schema().as_ref())?,
+        options: arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: false,
+        },
+    });
+    let ordering = LexOrdering::new(sort_exprs)
+        .ok_or_else(|| Error::internal("ordered rewrite sort expression cannot be empty"))?;
+    let sorted = execute_plan(
+        Arc::new(SortExec::new(ordering, plan)),
+        scanner.execution_options(),
+    )?;
+    // SequenceStyle preserves destination order for both legacy stable IDs and
+    // physical row addresses. AddressStyle is a set and cannot represent a
+    // permutation.
+    let (stream, row_ids_rx) = make_rowid_capture_stream(sorted, true)?;
+    let stream = if has_blob_v2_columns {
+        transform_blob_v2_stream(dataset, stream)
+    } else {
+        stream
+    };
+    let mut write_params = WriteParams {
+        mode: WriteMode::Append,
+        max_rows_per_file: options.target_rows_per_fragment,
+        max_rows_per_group: options.max_rows_per_group,
+        allow_external_blob_outside_bases: true,
+        enable_stable_row_ids: dataset.manifest.uses_legacy_stable_row_ids(),
+        ..Default::default()
+    };
+    if let Some(max_bytes_per_file) = options.max_bytes_per_file {
+        write_params.max_bytes_per_file = max_bytes_per_file;
+    }
+    let (mut new_fragments, _) = write_fragments_internal(
+        Some(dataset),
+        dataset.object_store.clone(),
+        &dataset.base,
+        dataset.schema().clone(),
+        stream,
+        write_params,
+        None,
+    )
+    .await?;
+    let provenance = async {
+        let captured = row_ids_rx.try_recv().map_err(|error| {
+            Error::internal(format!(
+                "ordered rewrite row identity capture did not complete: {error}"
+            ))
+        })?;
+        let CapturedRowIds::SequenceStyle(row_ids) = captured else {
+            return Err(Error::internal(
+                "ordered rewrite captured identities without preserving order",
+            ));
+        };
+        apply_ordered_legacy_provenance(dataset, row_ids, &mut new_fragments).await
+    }
+    .await;
+    let ordered_row_addrs = match provenance {
+        Ok(ordered_row_addrs) => ordered_row_addrs,
+        Err(error) => {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
+                .await;
+            return Err(error);
+        }
+    };
+    let metrics = CompactionMetrics {
+        groups_planned: 1,
+        groups_admitted: 1,
+        fragments_removed: original_fragments.len(),
+        fragments_added: new_fragments.len(),
+        files_removed: original_fragments
+            .iter()
+            .map(|fragment| fragment.files.len() + usize::from(fragment.deletion_file.is_some()))
+            .sum(),
+        files_added: new_fragments
+            .iter()
+            .map(|fragment| fragment.files.len())
+            .sum(),
+        groups_not_admitted: 0,
+    };
+    let result = RewriteResult {
+        metrics,
+        new_fragments,
+        read_version: dataset.manifest.version,
+        original_fragments,
+        row_addrs: None,
+        ordered_row_addrs,
+        logical_row_ids: None,
+        retired_logical_row_ids: None,
+    };
+    commit_compaction(
+        dataset,
+        vec![result],
+        remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default())),
+        &options,
+    )
+    .await
 }
 
 pub async fn compact_files_with_planner(
@@ -2106,8 +2491,12 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
             let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-            let frags = 0..dataset_at_index.manifest.max_fragment_id.unwrap_or(0);
-            index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
+            let frags = dataset_at_index
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id as u32);
+            index_fragmaps.push(RoaringBitmap::from_iter(frags));
         }
     }
     Ok(index_fragmaps)
@@ -2141,6 +2530,12 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// Physical row addresses in destination order for an ordered rewrite of
+    /// a dataset without stable row identity.  Unlike `row_addrs`, this uses
+    /// the RowIdSequence codec because the addresses are intentionally not
+    /// sorted by their source physical location.
+    #[serde(default)]
+    pub ordered_row_addrs: Option<Vec<u8>>,
     /// Actual logical row-address sequence emitted by a storage-version-2.3
     /// rewrite, compressed with the stable RowIdSequence codec.
     #[serde(default)]
@@ -2155,6 +2550,9 @@ async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
 ) -> Result<()> {
+    if fragments.len() == 0 {
+        return Ok(());
+    }
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::ReserveFragments {
@@ -2203,6 +2601,7 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            ordered_row_addrs: None,
             logical_row_ids: None,
             retired_logical_row_ids: None,
         });
@@ -2232,6 +2631,7 @@ async fn rewrite_files(
                         read_version: dataset.manifest.version,
                         original_fragments: Vec::new(),
                         row_addrs: None,
+                        ordered_row_addrs: None,
                         logical_row_ids: None,
                         retired_logical_row_ids: None,
                     });
@@ -2525,6 +2925,7 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        ordered_row_addrs: None,
         logical_row_ids,
         retired_logical_row_ids,
     })
@@ -2778,11 +3179,13 @@ pub async fn commit_compaction(
         .unwrap_or(dataset.manifest.version);
 
     // Single reserve_fragment_ids for all address-style tasks
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    let has_address_style = completed_tasks
+        .iter()
+        .any(|t| t.row_addrs.is_some() || t.ordered_row_addrs.is_some());
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
-            .filter(|t| t.row_addrs.is_some())
+            .filter(|t| t.row_addrs.is_some() || t.ordered_row_addrs.is_some())
             .flat_map(|t| t.new_fragments.iter_mut())
             .collect();
         reserve_fragment_ids(dataset, frags.into_iter()).await?;
@@ -2837,7 +3240,19 @@ pub async fn commit_compaction(
         };
 
         if needs_remapping {
-            if let Some(row_addrs_bytes) = task.row_addrs {
+            if let Some(ordered_row_addrs) = task.ordered_row_addrs {
+                if !matches!(options.index_remap_mode, IndexRemapMode::Direct) {
+                    return Err(Error::invalid_input(
+                        "ordered rewrites require direct index remapping",
+                    ));
+                }
+                let ordered_row_addrs = read_row_ids(&ordered_row_addrs)?;
+                direct_row_id_map.extend(remapping::transpose_ordered_row_addrs(
+                    &ordered_row_addrs,
+                    &task.original_fragments,
+                    &task.new_fragments,
+                )?);
+            } else if let Some(row_addrs_bytes) = task.row_addrs {
                 let row_addrs =
                     RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
                 match options.index_remap_mode {
@@ -2877,6 +3292,11 @@ pub async fn commit_compaction(
                 }
             }
         } else if defers_remapping {
+            if task.ordered_row_addrs.is_some() {
+                return Err(Error::invalid_input(
+                    "ordered rewrites cannot defer index remapping",
+                ));
+            }
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
@@ -2970,13 +3390,18 @@ pub async fn commit_compaction(
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
     {
-        cleanup_data_fragments(
-            &dataset.object_store,
-            &dataset.base,
-            None,
-            &all_new_fragments,
-        )
-        .await;
+        // Retryable conflicts prove the files were not committed. Other
+        // failures can be ambiguous, so leave immutable objects available to
+        // version-aware GC in case the manifest PUT succeeded.
+        if matches!(e, Error::RetryableCommitConflict { .. }) {
+            cleanup_data_fragments(
+                &dataset.object_store,
+                &dataset.base,
+                None,
+                &all_new_fragments,
+            )
+            .await;
+        }
         return Err(e);
     }
 
@@ -2995,7 +3420,7 @@ mod tests {
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
+    use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type, UInt64Type};
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
         PrimitiveArray, RecordBatch, RecordBatchIterator,
@@ -3007,6 +3432,7 @@ mod tests {
     use lance_core::Error;
     use lance_core::ROW_ID;
     use lance_core::utils::address::{LogicalRowAddress, RowAddress};
+    use lance_core::utils::deletion::DeletionVector;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
@@ -3017,7 +3443,9 @@ mod tests {
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_index::{Index, IndexType};
+    use lance_io::utils::tracking_store::{IOTracker, IoOperation};
     use lance_linalg::distance::{DistanceType, MetricType};
+    use lance_table::io::deletion::write_deletion_file;
     use lance_table::io::manifest::read_manifest_indexes;
     use lance_table::rowids::RowIdSequence;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
@@ -3193,6 +3621,250 @@ mod tests {
         fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
             Ok(Box::new(self.clone()))
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn ordered_rewrite_preserves_v2_2_identity_and_index_contract(
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let values = Int32Array::from(vec![2, 3, 0, 1, 6, 7, 4, 5]);
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                enable_stable_row_ids: stable_row_ids,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".to_owned()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+        let index_before = dataset.load_indices().await.unwrap()[0].uuid;
+
+        async fn value_row_ids(dataset: &Dataset) -> HashMap<i32, u64> {
+            let mut scanner = dataset.scan();
+            scanner.project(&["i", ROW_ID]).unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            let values = batch["i"].as_primitive::<Int32Type>();
+            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            values
+                .values()
+                .iter()
+                .copied()
+                .zip(row_ids.values().iter().copied())
+                .collect()
+        }
+        let row_ids_before = value_row_ids(&dataset).await;
+
+        let metrics = rewrite_files_in_order(
+            &mut dataset,
+            vec![ColumnOrdering::asc_nulls_last("i".to_owned())],
+            CompactionOptions {
+                target_rows_per_fragment: 8,
+                max_rows_per_group: 8,
+                index_remap_mode: IndexRemapMode::Direct,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+
+        let mut scanner = dataset.scan();
+        scanner.scan_in_order(true).project(&["i"]).unwrap();
+        let ordered = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            ordered["i"].as_primitive::<Int32Type>().values(),
+            &[0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        let row_ids_after = value_row_ids(&dataset).await;
+        if stable_row_ids {
+            assert_eq!(row_ids_after, row_ids_before);
+            assert_eq!(dataset.load_indices().await.unwrap()[0].uuid, index_before);
+        } else {
+            assert_ne!(row_ids_after, row_ids_before);
+            assert_ne!(dataset.load_indices().await.unwrap()[0].uuid, index_before);
+        }
+
+        let mut indexed = dataset.scan();
+        indexed.filter("i = 4").unwrap().project(&["i"]).unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        assert_eq!(indexed.num_rows(), 1);
+        assert_eq!(indexed["i"].as_primitive::<Int32Type>().value(0), 4);
+    }
+
+    #[tokio::test]
+    async fn ordered_rewrite_rejects_partial_legacy_index_before_data_writes() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![3, 2, 1, 0]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                enable_stable_row_ids: false,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".to_owned()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let appended = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![7, 6, 5, 4]))],
+        )
+        .unwrap();
+        dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                enable_stable_row_ids: false,
+                max_rows_per_file: 4,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 2);
+
+        let tracker = Arc::new(IOTracker::default());
+        dataset = dataset.with_object_store_wrappers([
+            tracker.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        let version = dataset.version().version;
+        let data_files = count_data_files_in(test_dir.as_str());
+        tracker.incremental_stats();
+
+        let error = rewrite_files_in_order(
+            &mut dataset,
+            vec![ColumnOrdering::asc_nulls_last("i".to_owned())],
+            CompactionOptions {
+                target_rows_per_fragment: 8,
+                max_rows_per_group: 8,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("full current fragment set"));
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files);
+        let data_writes = tracker
+            .incremental_stats()
+            .requests
+            .into_iter()
+            .filter(|request| {
+                request.operation == IoOperation::Put
+                    && request.path.to_string().starts_with("data/")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            data_writes.is_empty(),
+            "partial index coverage must fail before data PUTs: {data_writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_rewrite_removes_fully_deleted_legacy_fragment() {
+        let test_dir = TempStrDir::default();
+        let values = Int32Array::from(vec![7, 6, 5, 4, 3, 2, 1, 0]);
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                enable_stable_row_ids: false,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 2);
+
+        let deletion_vector = DeletionVector::Set(HashSet::from_iter(0..4));
+        // Current delete writers remove fully deleted fragments immediately,
+        // but older manifests can retain a full deletion vector. Recreate that
+        // legacy snapshot state directly so migration filtering is exercised.
+        let mut manifest = dataset.manifest.as_ref().clone();
+        let mut fragments = manifest.fragments.as_ref().clone();
+        for fragment in &mut fragments {
+            fragment.deletion_file = write_deletion_file(
+                &dataset.base,
+                fragment.id,
+                dataset.version().version,
+                &deletion_vector,
+                dataset.object_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        }
+        manifest.fragments = Arc::new(fragments);
+        dataset.manifest = Arc::new(manifest);
+        assert_eq!(dataset.manifest.fragments.len(), 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        let metrics = rewrite_files_in_order(
+            &mut dataset,
+            vec![ColumnOrdering::asc_nulls_last("i".to_owned())],
+            CompactionOptions {
+                target_rows_per_fragment: 8,
+                max_rows_per_group: 8,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.groups_planned, 1);
+        assert_eq!(metrics.groups_admitted, 1);
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 0);
+        assert_eq!(metrics.files_removed, 4);
+        assert_eq!(metrics.files_added, 0);
+        assert!(dataset.manifest.fragments.is_empty());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
     }
 
     #[rstest]
@@ -3542,6 +4214,7 @@ mod tests {
             read_version: version,
             original_fragments: Vec::new(),
             row_addrs: None,
+            ordered_row_addrs: None,
             logical_row_ids: None,
             retired_logical_row_ids: None,
         };
@@ -8124,12 +8797,10 @@ mod tests {
         count_all_files_in(&data_dir).unwrap_or(0)
     }
 
-    /// Site 2 in PR #6320: when `commit_compaction` fails to apply the commit
-    /// after `rewrite_files` has already written new data files, those files
-    /// must be cleaned up. We force the commit failure by injecting an error on
-    /// writes to the `_transactions/` directory.
+    /// A non-conflict commit error can be ambiguous, so rewritten files must
+    /// remain available until version-aware GC proves they are unreferenced.
     #[tokio::test]
-    async fn test_commit_compaction_cleans_up_data_on_commit_failure() {
+    async fn test_commit_compaction_retains_data_on_ambiguous_commit_failure() {
         use crate::dataset::builder::DatasetBuilder;
         use crate::utils::test::FailingProxyStore;
         use lance_io::object_store::ObjectStoreParams;
@@ -8162,11 +8833,8 @@ mod tests {
         let baseline_files = count_data_files_in(test_uri);
 
         let failing = Arc::new(FailingProxyStore::new());
-        // `commit_compaction` first calls `reserve_fragment_ids` (which writes a
-        // ReserveFragments transaction) and then calls `apply_commit` for the
-        // rewrite itself. Skip the first transaction write so the reserve
-        // succeeds, and fail the second so `apply_commit` errors out — that's
-        // the branch we want to exercise cleanup for.
+        // The injected transaction-write error does not carry a proof that the
+        // manifest was not committed, so immediate deletion is unsafe.
         failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
         failing.fail_after_n(
             "put_multipart",
@@ -8197,15 +8865,14 @@ mod tests {
             "Compaction should fail when transaction commit fails"
         );
 
-        assert_eq!(
-            count_data_files_in(test_uri),
-            baseline_files,
-            "Compaction data files should be cleaned up when commit fails"
+        assert!(
+            count_data_files_in(test_uri) > baseline_files,
+            "ambiguous commit failures must retain rewritten data for version-aware GC"
         );
     }
 
     #[tokio::test]
-    async fn test_commit_compaction_cleans_up_blob_v2_sidecars_on_commit_failure() {
+    async fn test_commit_compaction_retains_blob_v2_sidecars_on_ambiguous_commit_failure() {
         use crate::BlobArrayBuilder;
         use crate::dataset::builder::DatasetBuilder;
         use crate::utils::test::FailingProxyStore;
@@ -8278,10 +8945,9 @@ mod tests {
             "Compaction should fail when transaction commit fails"
         );
 
-        assert_eq!(
-            count_data_files_in(test_uri),
-            baseline_files,
-            "Blob v2 sidecars should be cleaned up when commit fails"
+        assert!(
+            count_data_files_in(test_uri) > baseline_files,
+            "ambiguous commit failures must retain blob v2 sidecars for version-aware GC"
         );
     }
 

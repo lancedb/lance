@@ -21,15 +21,14 @@ use futures::stream;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
-use lance_table::format::{
-    Fragment, IndexMetadata, LogicalRowAddressSelection, RetiredLogicalRowMembership,
-};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use lance_table::format::{Fragment, IndexMetadata};
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
 use tracing::Instrument;
 use tracing::instrument;
+use uuid::Uuid;
 
 use crate::Dataset;
 use crate::Result;
@@ -67,7 +66,7 @@ impl DatasetPreFilter {
         if dataset.manifest.uses_stable_logical_row_addresses() {
             let indices = indices.to_vec();
             let deleted_ids = Some(SharedPrerequisite::spawn(
-                Self::do_create_deletion_mask_logical(dataset, indices).boxed(),
+                Self::do_create_logical_liveness_mask_for_indices(dataset, indices).boxed(),
             ));
             let filtered_ids = filter.map(|filtered_ids| {
                 SharedPrerequisite::spawn(filtered_ids.load().in_current_span())
@@ -104,22 +103,141 @@ impl DatasetPreFilter {
         }
     }
 
-    pub(crate) async fn do_create_deletion_mask_logical(
+    /// Build one logical-address prefilter per immutable index segment while
+    /// sharing dataset-level deletion work and the caller-provided filter.
+    pub(crate) fn new_logical_per_index(
         dataset: Arc<Dataset>,
-        mut indices: Vec<IndexMetadata>,
-    ) -> Result<Arc<RowAddrMask>> {
-        fn insert_selection(
-            block_list: &mut RowAddrTreeMap,
-            selection: &LogicalRowAddressSelection,
-        ) -> Result<()> {
-            for range in selection.to_ranges()? {
-                let start = (range.logical_fragment_id as u64) << 32 | range.start_slot as u64;
-                let end = (range.logical_fragment_id as u64) << 32 | range.end_slot as u64;
-                block_list.insert_range(start..end);
-            }
-            Ok(())
+        indices: &[IndexMetadata],
+        filter: Option<Box<dyn FilterLoader>>,
+    ) -> Result<HashMap<Uuid, Arc<Self>>> {
+        if !dataset.manifest.uses_stable_logical_row_addresses() {
+            return Err(crate::Error::invalid_input(
+                "per-index logical prefilters require storage version 2.3",
+            ));
         }
+        let invalidation_dataset = dataset;
+        let shared_filtered_ids = filter
+            .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
+        let mut prefilters = HashMap::with_capacity(indices.len());
+        for index in indices {
+            let invalidation_dataset = invalidation_dataset.clone();
+            let index_metadata = index.clone();
+            let deleted_ids = SharedPrerequisite::spawn(async move {
+                let liveness = Self::do_create_logical_liveness_mask_for_indices(
+                    invalidation_dataset.clone(),
+                    vec![index_metadata.clone()],
+                )
+                .await?;
+                let invalidations = crate::index::scalar_logical::logical_index_invalidations(
+                    invalidation_dataset.as_ref(),
+                    &index_metadata,
+                )
+                .await?;
+                if invalidations.is_empty() {
+                    Ok(liveness)
+                } else {
+                    Ok(Arc::new(
+                        liveness
+                            .as_ref()
+                            .clone()
+                            .also_block(invalidations.as_ref().clone()),
+                    ))
+                }
+            });
+            prefilters.insert(
+                index.uuid,
+                Arc::new(Self {
+                    deleted_ids: Some(deleted_ids),
+                    filtered_ids: shared_filtered_ids.clone(),
+                    deleted_fragments: None,
+                    final_mask: Mutex::new(OnceCell::new()),
+                }),
+            );
+        }
+        Ok(prefilters)
+    }
 
+    #[cfg(test)]
+    pub(crate) async fn do_create_logical_liveness_mask(
+        dataset: Arc<Dataset>,
+    ) -> Result<Arc<RowAddrMask>> {
+        let physical_coverage = dataset.fragment_bitmap.as_ref().clone();
+        Self::do_create_logical_liveness_mask_for_scope(
+            dataset,
+            physical_coverage,
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn do_create_logical_liveness_mask_for_indices(
+        dataset: Arc<Dataset>,
+        indices: Vec<IndexMetadata>,
+    ) -> Result<Arc<RowAddrMask>> {
+        let scope = crate::index::logical_index_query_scope(dataset.as_ref(), &indices).await?;
+        let mut index_ids = indices.iter().map(|index| index.uuid).collect::<Vec<_>>();
+        index_ids.sort_unstable();
+        index_ids.dedup();
+        Self::do_create_logical_liveness_mask_for_scope(
+            dataset,
+            scope.physical_fragments,
+            scope.logical_rows,
+            index_ids,
+        )
+        .await
+    }
+
+    pub(crate) async fn do_create_logical_liveness_mask_for_physical_coverage(
+        dataset: Arc<Dataset>,
+        physical_coverage: RoaringBitmap,
+        logical_coverage: Option<roaring::RoaringTreemap>,
+        mut index_ids: Vec<Uuid>,
+    ) -> Result<Arc<RowAddrMask>> {
+        index_ids.sort_unstable();
+        index_ids.dedup();
+        Self::do_create_logical_liveness_mask_for_scope(
+            dataset,
+            physical_coverage,
+            logical_coverage,
+            index_ids,
+        )
+        .await
+    }
+
+    async fn do_create_logical_liveness_mask_for_scope(
+        dataset: Arc<Dataset>,
+        physical_coverage: RoaringBitmap,
+        logical_coverage: Option<roaring::RoaringTreemap>,
+        index_ids: Vec<Uuid>,
+    ) -> Result<Arc<RowAddrMask>> {
+        let namespace_uuid = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                crate::Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+            })?
+            .namespace_uuid;
+        let key = crate::session::index_caches::LogicalLivenessMaskKey {
+            namespace_uuid,
+            version: dataset.manifest.version,
+            index_ids,
+        };
+        let cache = dataset.index_cache.clone();
+        cache
+            .get_or_insert_with_key(key, move || async move {
+                Self::build_logical_liveness_mask(dataset, physical_coverage, logical_coverage)
+                    .await
+            })
+            .await
+    }
+
+    async fn build_logical_liveness_mask(
+        dataset: Arc<Dataset>,
+        physical_coverage: RoaringBitmap,
+        logical_coverage: Option<roaring::RoaringTreemap>,
+    ) -> Result<RowAddrMask> {
         async fn insert_current_owners(
             dataset: &Dataset,
             block_list: &mut RowAddrTreeMap,
@@ -136,19 +254,6 @@ impl DatasetPreFilter {
             Ok(())
         }
 
-        for index in &mut indices {
-            if index
-                .logical_coverage
-                .as_ref()
-                .is_some_and(|coverage| coverage.requires_authoritative_resolution())
-            {
-                index.logical_coverage = Some(
-                    crate::index::resolve_logical_index_coverage(dataset.as_ref(), index).await?,
-                );
-            }
-        }
-        crate::index::validate_resolved_logical_index_overlaps(&indices)?;
-
         let layout = dataset
             .manifest
             .row_address_layout
@@ -157,74 +262,26 @@ impl DatasetPreFilter {
                 crate::Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
             })?;
         let mut block_list = RowAddrTreeMap::new();
-        let mut coverage_by_name = HashMap::<String, RowAddrTreeMap>::new();
-        for index in &indices {
-            let Some(coverage) = index.logical_coverage.as_ref() else {
-                continue;
-            };
-            for shard in &coverage.shards {
-                let covered = coverage_by_name.entry(index.name.clone()).or_default();
-                let selection = shard.selection.as_ref().ok_or_else(|| {
-                    crate::Error::internal(format!(
-                        "logical index {} coverage detail was not resolved",
-                        index.uuid
-                    ))
-                })?;
-                insert_selection(covered, selection)?;
-                for watermark in &shard.validated_through {
-                    // Commit floors fence incoming index builds after detailed
-                    // invalidation regions have been retired.  They do not
-                    // invalidate a shard already admitted to the current
-                    // catalog: that shard may cover a disjoint, unchanged
-                    // selection.  Current query validity is determined by the
-                    // field default and the retained intersecting regions.
-                    if layout
-                        .field_default_generations
-                        .binary_search_by_key(&watermark.field_id, |generation| generation.field_id)
-                        .ok()
-                        .is_none_or(|position| {
-                            layout.field_default_generations[position].generation
-                                > watermark.generation
-                        })
-                    {
-                        insert_selection(&mut block_list, selection)?;
-                    }
-                    for region in &layout.generation_regions {
-                        if region.generation > watermark.generation
-                            && region.field_ids.binary_search(&watermark.field_id).is_ok()
-                        {
-                            insert_selection(&mut block_list, &region.selection)?;
-                        }
-                    }
-                }
-            }
-        }
-        let allowed = coverage_by_name
-            .into_values()
-            .reduce(|left, right| left & right);
 
         // Retired logical rows can remain in immutable index postings after a
         // rewrite.  Keep this mask sparse and independent of physical
         // placement so compaction never requires rewriting the postings.
-        for retired in &layout.retired_rows {
-            match &retired.membership {
-                RetiredLogicalRowMembership::AllRows => {
-                    for ordinal in 0..retired.domains.domain_count() {
-                        let domain = retired.domains.domain_at(ordinal)?;
-                        let start = (domain.logical_fragment_id as u64) << 32;
-                        block_list.insert_range(start..start + domain.slot_count as u64);
-                    }
-                }
-                RetiredLogicalRowMembership::Selection(selection) => {
-                    insert_selection(&mut block_list, selection)?;
-                }
-            }
+        let retired_rows = if let Some(logical_coverage) = logical_coverage.as_ref() {
+            layout.retired_logical_row_bitmap_for_coverage(logical_coverage)?
+        } else {
+            layout.retired_logical_row_bitmap()?
+        };
+        for (logical_fragment_id, slots) in retired_rows.bitmaps() {
+            block_list.insert_bitmap(logical_fragment_id, slots.clone());
         }
 
         let fragments_with_deletions = dataset
             .get_fragments()
             .into_iter()
-            .filter(|fragment| fragment.metadata().deletion_file.is_some())
+            .filter(|fragment| {
+                physical_coverage.contains(fragment.id() as u32)
+                    && fragment.metadata().deletion_file.is_some()
+            })
             .collect::<Vec<_>>();
         let deletion_vectors = stream::iter(fragments_with_deletions)
             .map(|fragment| async move {
@@ -238,6 +295,13 @@ impl DatasetPreFilter {
             let Some(deletion_vector) = deletion_vector else {
                 continue;
             };
+            if let Some(native) = fragment.metadata().native_logical_domain.as_ref() {
+                block_list.insert_bitmap(
+                    native.logical_fragment_id,
+                    RoaringBitmap::from(deletion_vector.as_ref()),
+                );
+                continue;
+            }
             const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
             let mut deleted_addresses = Vec::with_capacity(RESOLVE_BATCH_SIZE);
             for offset in deletion_vector.to_sorted_iter() {
@@ -253,10 +317,8 @@ impl DatasetPreFilter {
                     .await?;
             }
         }
-        Ok(Arc::new(match allowed {
-            Some(allowed) => RowAddrMask::from_allowed(allowed).also_block(block_list),
-            None => RowAddrMask::from_block(block_list),
-        }))
+
+        Ok(RowAddrMask::from_block(block_list))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -593,7 +655,7 @@ impl PreFilter for DatasetPreFilter {
 mod test {
     use lance_encoding::version::LanceFileVersion;
     use lance_select::RowSetOps;
-    use lance_table::format::RowReferenceDomain;
+    use lance_table::format::{LogicalRowAddressSelection, RowReferenceDomain};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
     use crate::dataset::WriteParams;
@@ -745,7 +807,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_v23_full_coverage_without_deletions_does_not_initialize_router() {
+    async fn test_v23_liveness_without_deletions_does_not_initialize_router() {
         let test_data = BatchGenerator::new()
             .col(Box::new(IncrementingInt32::new().named("x")))
             .batch(9);
@@ -762,22 +824,72 @@ mod test {
             .await
             .unwrap(),
         );
-        let fragments = RoaringBitmap::from_iter(
-            dataset
-                .get_fragments()
-                .iter()
-                .map(|fragment| fragment.id() as u32),
+        assert!(dataset.row_address_router.get().is_none());
+        let mask = DatasetPreFilter::do_create_logical_liveness_mask(dataset.clone())
+            .await
+            .unwrap();
+        let cached = DatasetPreFilter::do_create_logical_liveness_mask(dataset.clone())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&mask, &cached));
+        assert_eq!(mask.block_list().and_then(RowAddrTreeMap::len), Some(0));
+        assert!(dataset.row_address_router.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_v23_per_segment_prefilter_blocks_transferred_ownership() {
+        use lance_table::format::{
+            FieldGeneration, LogicalIndexCoverage, LogicalIndexCoverageShard,
+        };
+
+        let test_data = BatchGenerator::new()
+            .col(Box::new(IncrementingInt32::new().named("x")))
+            .batch(9);
+        let dataset = Arc::new(
+            Dataset::write(
+                test_data,
+                "memory://v23-segment-prefilter",
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
         );
+        let fragments = dataset.fragment_bitmap.as_ref().clone();
         let field_id = dataset.schema().field("x").unwrap().id;
-        let coverage =
+        let mut base_coverage =
             crate::index::build_logical_index_coverage(&dataset, &[field_id], &fragments)
                 .await
                 .unwrap();
-        let metadata = IndexMetadata {
-            uuid: uuid::Uuid::new_v4(),
+        let raw_selection = base_coverage.shards[0].selection.as_ref().unwrap();
+        let transferred_raw = raw_selection.select(0).unwrap().unwrap().raw();
+        let retained_raw = raw_selection.select(1).unwrap().unwrap().raw();
+        let transferred =
+            LogicalRowAddressSelection::from_bitmap(roaring::RoaringTreemap::from_iter([
+                transferred_raw,
+            ]))
+            .unwrap();
+        assert!(base_coverage.exclude_rows_unbound(&transferred).unwrap());
+        let delta_coverage = LogicalIndexCoverage::new_exact(vec![
+            LogicalIndexCoverageShard::new_exact(
+                transferred,
+                vec![field_id],
+                vec![FieldGeneration {
+                    field_id,
+                    generation: dataset.manifest.version,
+                }],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let metadata = |uuid, coverage| IndexMetadata {
+            uuid,
             fields: vec![field_id],
             name: "x_idx".to_string(),
-            dataset_version: dataset.version().version,
+            dataset_version: dataset.manifest.version,
             fragment_bitmap: None,
             index_details: None,
             index_version: 0,
@@ -787,14 +899,22 @@ mod test {
             row_reference_domain: Some(RowReferenceDomain::StableLogicalRowAddress),
             logical_coverage: Some(coverage),
         };
+        let base_uuid = Uuid::new_v4();
+        let delta_uuid = Uuid::new_v4();
+        let indices = vec![
+            metadata(base_uuid, base_coverage),
+            metadata(delta_uuid, delta_coverage),
+        ];
 
-        assert!(dataset.row_address_router.get().is_none());
-        let mask =
-            DatasetPreFilter::do_create_deletion_mask_logical(dataset.clone(), vec![metadata])
-                .await
-                .unwrap();
-        assert_eq!(mask.allow_list().and_then(RowAddrTreeMap::len), Some(9));
-        assert!(dataset.row_address_router.get().is_none());
+        let prefilters = DatasetPreFilter::new_logical_per_index(dataset, &indices, None).unwrap();
+        let base = prefilters.get(&base_uuid).unwrap();
+        let delta = prefilters.get(&delta_uuid).unwrap();
+        base.wait_for_ready().await.unwrap();
+        delta.wait_for_ready().await.unwrap();
+
+        assert!(!base.mask().selected(transferred_raw));
+        assert!(base.mask().selected(retained_raw));
+        assert!(delta.mask().selected(transferred_raw));
     }
 
     // Regression test for issue #6877.

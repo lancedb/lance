@@ -78,7 +78,10 @@ pub(in crate::index) async fn merge_segments(
     let logical_coverage = dataset
         .manifest
         .uses_stable_logical_row_addresses()
-        .then(|| crate::index::merge_logical_index_coverage(dataset, &segment_refs))
+        .then(|| {
+            let effective = crate::index::merge_logical_index_coverage(dataset, &segment_refs)?;
+            crate::index::mark_logical_coverage_validated_at_snapshot(dataset, &effective)
+        })
         .transpose()?;
 
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
@@ -116,16 +119,17 @@ pub(in crate::index) async fn merge_segments(
         validate_nullable_segment_for_merge(dataset, field_id, segment).await?;
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
-        let label_list_index = scalar_index
-            .as_any()
-            .downcast_ref::<LabelListIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected label list segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
+        let label_list_index =
+            crate::index::scalar_logical::raw_scalar_segment(scalar_index.as_ref())
+                .as_any()
+                .downcast_ref::<LabelListIndex>()
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "merge_existing_index_segments: expected label list segment {}, got {:?}",
+                        segment.uuid,
+                        scalar_index.index_type()
+                    ))
+                })?;
         source_indices.push(Arc::new(label_list_index.clone()));
     }
 

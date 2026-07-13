@@ -2390,6 +2390,68 @@ async fn test_fts_prewarm_with_position_controls_phrase_query_cache() {
 }
 
 #[tokio::test]
+async fn test_v23_fts_prewarm_accepts_generation_restricted_segment() {
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "doc",
+            Arc::new(GenericStringArray::<i32>::from(vec![
+                "lance search",
+                "phrase query",
+            ])) as ArrayRef,
+        ),
+        ("id", Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef),
+    ])
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        batches,
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some("fts_idx".to_owned()),
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id = 0")
+        .unwrap()
+        .set("doc", "'updated search'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset
+        .as_ref()
+        .clone();
+
+    dataset
+        .prewarm_index_with_options(
+            "fts_idx",
+            &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_prewarm_index_with_position_validation() {
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -4112,4 +4174,96 @@ async fn test_manifest_read_recovers_from_stale_size() {
         .expect("read_manifest_indexes should recover from a stale manifest size");
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
+}
+
+#[tokio::test]
+async fn test_v23_index_metadata_cache_isolated_across_dataset_incarnations() {
+    let test_uri = TempStrDir::default();
+    let session = Arc::new(Session::default());
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..32))],
+    )
+    .unwrap();
+    let reader =
+        || RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+    let write_params = || WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_3),
+        session: Some(session.clone()),
+        ..Default::default()
+    };
+
+    let mut indexed = Dataset::write(reader(), &test_uri, Some(write_params()))
+        .await
+        .unwrap();
+    indexed
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let indexed_version = indexed.version().version;
+    let indexed_namespace = indexed
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .unwrap()
+        .namespace_uuid;
+    assert_eq!(indexed.load_indices().await.unwrap().len(), 1);
+    assert_eq!(indexed.describe_indices(None).await.unwrap().len(), 1);
+
+    let object_store = indexed.object_store.clone();
+    let base = indexed.base.clone();
+    drop(indexed);
+    object_store.remove_dir_all(base).await.unwrap();
+
+    Dataset::write(reader(), &test_uri, Some(write_params()))
+        .await
+        .unwrap();
+    let recreated = Dataset::write(
+        reader(),
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..write_params()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recreated.version().version, indexed_version);
+    assert_ne!(
+        recreated
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .namespace_uuid,
+        indexed_namespace
+    );
+    drop(recreated);
+
+    let reopened = DatasetBuilder::from_uri(&test_uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.version().version, indexed_version);
+    assert!(reopened.load_indices().await.unwrap().is_empty());
+    assert!(
+        reopened
+            .load_indices_by_name("id_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(reopened.describe_indices(None).await.unwrap().is_empty());
 }

@@ -90,6 +90,7 @@ run_all() {
   local shard_id
   local shard_output
   local shard_status
+  local execution_incomplete=0
   local -a command
   rm -f "${RESULT_ROOT}/stable-row-address-release.pass" || return 2
   rm -f "${RESULT_ROOT}/stable-row-address-release.execution-complete" || return 2
@@ -106,10 +107,11 @@ run_all() {
     else
       shard_status=$?
       (( shard_status > status )) && status=${shard_status}
+      (( shard_status > 1 )) && execution_incomplete=1
       echo "${shard_id} did not complete successfully (status ${shard_status})" >&2
     fi
   done
-  if [[ ${status} -eq 0 ]]; then
+  if [[ ${execution_incomplete} -eq 0 ]]; then
     local marker
     marker="${RESULT_ROOT}/.stable-row-address-release.execution-complete.tmp-$$"
     git rev-parse HEAD >"${marker}" || return 2
@@ -143,6 +145,8 @@ report_all() {
     "${RESULT_ROOT}/stable-row-address-release.aggregate.json" || return 2
   if "${PYTHON}" benchmarks/stable_row_address/protocol_aggregate.py \
     "${RESULT_ROOT}"/stable-row-address-release.shard-*-of-009.jsonl \
+    --expected-commit "${actual_commit}" \
+    --execution-marker "${RESULT_ROOT}/stable-row-address-release.execution-complete" \
     --markdown "${RESULT_ROOT}/stable-row-address-release.aggregate.md" \
     --json "${RESULT_ROOT}/stable-row-address-release.aggregate.json"; then
     :

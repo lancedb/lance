@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -20,12 +21,35 @@ import protocol_report  # noqa: E402
 
 
 def aggregate(
-    inputs: Sequence[Path], *, bootstrap_samples: int
+    inputs: Sequence[Path],
+    *,
+    bootstrap_samples: int,
+    expected_commit: str | None = None,
+    execution_marker: Path | None = None,
 ) -> tuple[int, str, dict[str, Any]]:
     if not inputs:
         raise ValueError("at least one shard input is required")
+    if (expected_commit is None) != (execution_marker is None):
+        raise ValueError(
+            "expected_commit and execution_marker must be provided together"
+        )
+    if (
+        expected_commit is not None
+        and re.fullmatch(r"[0-9a-f]{40}", expected_commit) is None
+    ):
+        raise ValueError("expected_commit must be a lowercase full Git SHA")
     shard_results = []
     issues: list[str] = []
+    if execution_marker is not None:
+        try:
+            marker_lines = execution_marker.read_text(encoding="utf-8").splitlines()
+        except OSError as error:
+            issues.append(f"execution-complete marker is unavailable: {error}")
+        else:
+            if marker_lines != [expected_commit]:
+                issues.append(
+                    "execution-complete marker does not contain exactly the expected commit"
+                )
     for input_path in inputs:
         sidecar, records, load_issues = protocol_report.load_evidence(input_path)
         result = protocol_report.analyze(
@@ -44,9 +68,11 @@ def aggregate(
         common_fields = (
             "commit",
             "source_provenance",
+            "development_tiny",
+            "host",
             "profile",
+            "cargo_profile",
             "storage",
-            "base_dataset_root",
             "seed",
             "matrix_sha256",
             "policy_sha256",
@@ -57,13 +83,47 @@ def aggregate(
             values = {sidecar[field] for sidecar in sidecars}
             if len(values) != 1:
                 issues.append(f"shards disagree on {field}: {sorted(values)}")
+        if expected_commit is not None and any(
+            sidecar["commit"] != expected_commit for sidecar in sidecars
+        ):
+            issues.append(
+                "one or more shard sidecars do not match the execution-complete commit"
+            )
+        attestation_values = {
+            json.dumps(
+                sidecar["storage_region_attestation"],
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for sidecar in sidecars
+        }
+        if len(attestation_values) != 1:
+            issues.append("shards disagree on storage_region_attestation")
+        base_dataset_roots: list[str] = []
+        dataset_roots: list[str] = []
+        for sidecar in sidecars:
+            try:
+                base_dataset_roots.append(
+                    protocol_report.canonical_dataset_root(
+                        sidecar["base_dataset_root"], sidecar["storage"]
+                    )
+                )
+                dataset_roots.append(
+                    protocol_report.validate_dataset_root_binding(sidecar)
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                issues.append(f"{sidecar.get('shard_id', '<unknown shard>')}: {error}")
+        if len(set(base_dataset_roots)) != 1:
+            issues.append(
+                "shards disagree on base_dataset_root: "
+                f"{sorted(set(base_dataset_roots))}"
+            )
         expected_count = sidecars[0]["shard_count"]
         indices = [sidecar["shard_index"] for sidecar in sidecars]
         if Counter(indices) != Counter(range(expected_count)):
             issues.append(
                 f"expected shard indices 0..{expected_count - 1}, found {sorted(indices)}"
             )
-        dataset_roots = [sidecar["dataset_root"] for sidecar in sidecars]
         if len(set(dataset_roots)) != len(dataset_roots):
             issues.append("shards do not use independent dataset prefixes")
 
@@ -199,6 +259,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--bootstrap-samples", type=int, default=protocol_report.BOOTSTRAP_SAMPLES
     )
+    parser.add_argument("--expected-commit")
+    parser.add_argument("--execution-marker", type=Path)
     return parser
 
 
@@ -209,7 +271,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"aggregate reports require at least {protocol_report.BOOTSTRAP_SAMPLES} bootstrap samples"
         )
     exit_code, markdown, machine = aggregate(
-        args.inputs, bootstrap_samples=args.bootstrap_samples
+        args.inputs,
+        bootstrap_samples=args.bootstrap_samples,
+        expected_commit=args.expected_commit,
+        execution_marker=args.execution_marker,
     )
     protocol.replace_text_atomic(args.markdown, markdown)
     protocol.replace_text_atomic(

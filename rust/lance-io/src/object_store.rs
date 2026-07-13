@@ -292,26 +292,35 @@ impl ObjectStoreParams {
     }
 }
 
+fn optional_arc_ptr_eq<T: ?Sized>(left: Option<&Arc<T>>, right: Option<&Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 // We implement hash for caching
 impl std::hash::Hash for ObjectStoreParams {
     #[allow(deprecated)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // For hashing, we use pointer values for ObjectStore, S3 credentials, wrapper
+        // Trait-object vtable addresses are not stable across coercion sites.
+        // Cache identity is the Arc allocation, so hash only the data pointer.
         self.block_size.hash(state);
         if let Some((store, url)) = &self.object_store {
-            Arc::as_ptr(store).hash(state);
+            Arc::as_ptr(store).cast::<()>().hash(state);
             url.hash(state);
         }
         self.s3_credentials_refresh_offset.hash(state);
         #[cfg(feature = "aws")]
         if let Some(aws_credentials) = &self.aws_credentials {
-            Arc::as_ptr(aws_credentials).hash(state);
+            Arc::as_ptr(aws_credentials).cast::<()>().hash(state);
         }
         if let Some(io_tracker) = &self.io_tracker {
-            Arc::as_ptr(io_tracker).hash(state);
+            Arc::as_ptr(io_tracker).cast::<()>().hash(state);
         }
         if let Some(wrapper) = &self.object_store_wrapper {
-            Arc::as_ptr(wrapper).hash(state);
+            Arc::as_ptr(wrapper).cast::<()>().hash(state);
         }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
@@ -327,26 +336,32 @@ impl PartialEq for ObjectStoreParams {
     #[allow(deprecated)]
     fn eq(&self, other: &Self) -> bool {
         #[cfg(feature = "aws")]
-        if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
-            return false;
-        }
+        let same_aws_credentials = optional_arc_ptr_eq(
+            self.aws_credentials.as_ref(),
+            other.aws_credentials.as_ref(),
+        );
+        #[cfg(not(feature = "aws"))]
+        let same_aws_credentials = true;
 
-        // For equality, we use pointer comparison for ObjectStore, S3 credentials, wrapper
+        let same_object_store = match (&self.object_store, &other.object_store) {
+            (Some((left_store, left_url)), Some((right_store, right_url))) => {
+                Arc::ptr_eq(left_store, right_store) && left_url == right_url
+            }
+            (None, None) => true,
+            _ => false,
+        };
+
+        // Compare Arc allocation addresses without trait-object vtable metadata.
         // For accessor, we use accessor_id() for semantic equality
         self.block_size == other.block_size
-            && self
-                .object_store
-                .as_ref()
-                .map(|(store, url)| (Arc::as_ptr(store), url))
-                == other
-                    .object_store
-                    .as_ref()
-                    .map(|(store, url)| (Arc::as_ptr(store), url))
+            && same_object_store
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self.io_tracker.as_ref().map(Arc::as_ptr)
-                == other.io_tracker.as_ref().map(Arc::as_ptr)
-            && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
-                == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
+            && same_aws_credentials
+            && optional_arc_ptr_eq(self.io_tracker.as_ref(), other.io_tracker.as_ref())
+            && optional_arc_ptr_eq(
+                self.object_store_wrapper.as_ref(),
+                other.object_store_wrapper.as_ref(),
+            )
             && self
                 .storage_options_accessor
                 .as_ref()
@@ -1525,6 +1540,42 @@ mod tests {
         fn called(&self) -> bool {
             self.called.load(Ordering::Relaxed)
         }
+    }
+
+    fn first_wrapper_params(wrapper: Arc<TestWrapper>) -> ObjectStoreParams {
+        ObjectStoreParams {
+            object_store_wrapper: Some(wrapper),
+            ..ObjectStoreParams::default()
+        }
+    }
+
+    fn second_wrapper_params(wrapper: Arc<TestWrapper>) -> ObjectStoreParams {
+        ObjectStoreParams {
+            object_store_wrapper: Some(wrapper),
+            ..ObjectStoreParams::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_registry_wrapper_identity_ignores_vtable_metadata() {
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: Arc::new(InMemory::new()),
+        });
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory:///").unwrap();
+
+        let first = registry
+            .get_store(url.clone(), &first_wrapper_params(wrapper.clone()))
+            .await
+            .unwrap();
+        let second = registry
+            .get_store(url, &second_wrapper_params(wrapper))
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(registry.stats().hits, 1);
     }
 
     #[tokio::test]

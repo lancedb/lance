@@ -50,6 +50,8 @@
         "pack_random_mutation_chain",
         "indexed_n_to_one_compaction",
         "indexed_repeated_compaction",
+        "bounded_recluster",
+        "fragment_reuse",
         "scalar_index",
         "vector_index"
       ]

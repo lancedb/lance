@@ -23,7 +23,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, Partitioning, expressions};
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_core::utils::address::LogicalRowAddress;
+use lance_core::utils::address::{LogicalRowAddress, RowAddress};
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ADDR, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::OneShotExec;
@@ -215,6 +215,23 @@ fn planned_fragments(row_count: usize, rows_per_fragment: usize) -> Vec<Fragment
     fragments
 }
 
+fn retired_rows_for_removed_fragments(
+    rows_by_fragment: &BTreeMap<u32, RoaringTreemap>,
+    removed_fragment_ids: &[u64],
+) -> lance_core::Result<Vec<LogicalRowAddress>> {
+    let mut retired = Vec::new();
+    for fragment_id in removed_fragment_ids {
+        let fragment_id = u32::try_from(*fragment_id)
+            .map_err(|_| Error::invalid_input("removed fragment id exceeds u32"))?;
+        if let Some(rows) = rows_by_fragment.get(&fragment_id) {
+            for row_id in rows.iter() {
+                retired.push(LogicalRowAddress::try_from(row_id)?);
+            }
+        }
+    }
+    Ok(retired)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn preflight_v2_3_merge(
     dataset: &Dataset,
@@ -222,16 +239,11 @@ pub async fn preflight_v2_3_merge(
     source_row_ids: &[LogicalRowAddress],
     direct_fragments: &[Fragment],
     retired_row_ids: &[LogicalRowAddress],
+    changed_field_ids: &[i32],
     deletion_plan: &DeletionPlan,
     merged_generations: &[lance_index::mem_wal::MergedGeneration],
     inserted_rows_filter: Option<KeyExistenceFilter>,
 ) -> lance_core::Result<lance_table::format::RowAddressLayoutDelta> {
-    let changed_field_ids = dataset
-        .schema()
-        .fields_pre_order()
-        .filter(|field| field.id >= 0)
-        .map(|field| field.id)
-        .collect::<Vec<_>>();
     let mut delta = build_v2_3_merge_layout_delta(
         dataset,
         source_backed_fragments,
@@ -239,7 +251,7 @@ pub async fn preflight_v2_3_merge(
         direct_fragments,
         retired_row_ids,
         source_row_ids,
-        &changed_field_ids,
+        changed_field_ids,
     )?;
     super::super::super::include_previous_deletions_in_v2_3_retirement(
         dataset,
@@ -319,6 +331,7 @@ async fn execute_preflighted_v2_3_write(
     target_bases_info: Option<Vec<crate::dataset::write::TargetBaseInfo>>,
     merged_generations: Vec<lance_index::mem_wal::MergedGeneration>,
     is_primary_key: bool,
+    updated_field_ids: Vec<i32>,
 ) -> lance_core::Result<PreflightedV2_3Write> {
     let temp_dir = Arc::new(TempDir::try_new()?);
     let (update_spill, insert_spill) = tokio::try_join!(
@@ -326,24 +339,24 @@ async fn execute_preflighted_v2_3_write(
         spool_stream(insert_stream, temp_dir.clone(), "inserts.arrow"),
     )?;
     let (update_spill, source_row_ids) = sort_update_spill(update_spill, temp_dir, context).await?;
-    let (retired_row_ids, delete_row_addrs, inserted_rows_filter) = {
+    let (delete_row_addrs, inserted_rows_filter) = {
         let state = merge_state.lock().map_err(|error| {
             Error::internal(format!("failed to lock merge preflight state: {error}"))
         })?;
-        let retired_row_ids = state
-            .retiring_row_ids
-            .iter()
-            .map(LogicalRowAddress::try_from)
-            .collect::<lance_core::Result<Vec<_>>>()?;
         let inserted_rows_filter = is_primary_key
             .then(|| KeyExistenceFilter::from_bloom_filter(&state.inserted_rows_filter));
-        (
-            retired_row_ids,
-            state.delete_row_addrs.clone(),
-            inserted_rows_filter,
-        )
+        (state.delete_row_addrs.clone(), inserted_rows_filter)
     };
     let deletion_plan = plan_deletions(&dataset, &delete_row_addrs).await?;
+    let retired_row_ids = {
+        let state = merge_state.lock().map_err(|error| {
+            Error::internal(format!("failed to lock merge retirement state: {error}"))
+        })?;
+        retired_rows_for_removed_fragments(
+            &state.retiring_row_ids,
+            &deletion_plan.removed_fragment_ids,
+        )?
+    };
     let write_params = WriteParams {
         max_bytes_per_file: usize::MAX,
         ..WriteParams::default()
@@ -357,6 +370,7 @@ async fn execute_preflighted_v2_3_write(
         &source_row_ids,
         &direct_plan,
         &retired_row_ids,
+        &updated_field_ids,
         &deletion_plan,
         &merged_generations,
         inserted_rows_filter,
@@ -462,7 +476,7 @@ struct MergeState {
     /// Row addresses that need to be deleted, due to a row update or delete action
     delete_row_addrs: RoaringTreemap,
     /// Logical identities removed without a replacement output row.
-    retiring_row_ids: RoaringTreemap,
+    retiring_row_ids: BTreeMap<u32, RoaringTreemap>,
     /// Shared collection to capture row ids that need to be updated
     updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     /// Track keys of newly inserted rows (not updates).
@@ -489,7 +503,7 @@ impl MergeState {
     ) -> Self {
         Self {
             delete_row_addrs: RoaringTreemap::new(),
-            retiring_row_ids: RoaringTreemap::new(),
+            retiring_row_ids: BTreeMap::new(),
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(stable_row_ids))),
             inserted_rows_filter: KeyExistenceFilterBuilder::new(field_ids),
             metrics,
@@ -539,7 +553,10 @@ impl MergeState {
 
                     self.delete_row_addrs.insert(row_addr);
                     if self.stable_row_ids {
-                        self.retiring_row_ids.insert(row_id);
+                        self.retiring_row_ids
+                            .entry(RowAddress::from(row_addr).fragment_id())
+                            .or_default()
+                            .insert(row_id);
                     }
                     self.metrics.num_deleted_rows.add(1);
                 }
@@ -625,6 +642,7 @@ pub struct FullSchemaMergeInsertExec {
     transaction: Arc<Mutex<Option<Transaction>>>,
     affected_rows: Arc<Mutex<Option<RoaringTreemap>>>,
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
+    updated_field_ids: Vec<i32>,
     /// Whether the ON columns match the schema's unenforced primary key.
     /// If true, inserted_rows_filter will be included in the transaction for conflict detection.
     is_primary_key: bool,
@@ -646,6 +664,7 @@ impl FullSchemaMergeInsertExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
+        updated_field_ids: Vec<i32>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -679,6 +698,7 @@ impl FullSchemaMergeInsertExec {
             transaction: Arc::new(Mutex::new(None)),
             affected_rows: Arc::new(Mutex::new(None)),
             inserted_rows_filter: Arc::new(Mutex::new(None)),
+            updated_field_ids,
             is_primary_key,
         })
     }
@@ -1321,6 +1341,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             transaction: self.transaction.clone(),
             affected_rows: self.affected_rows.clone(),
             inserted_rows_filter: self.inserted_rows_filter.clone(),
+            updated_field_ids: self.updated_field_ids.clone(),
             is_primary_key: self.is_primary_key,
         }))
     }
@@ -1398,6 +1419,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let merged_generations = self.params.merged_generations.clone();
         let is_primary_key = self.is_primary_key;
+        let updated_field_ids = self.updated_field_ids.clone();
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
             state.updating_row_ids.clone()
@@ -1421,6 +1443,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                         target_bases_info,
                         merged_generations.clone(),
                         is_primary_key,
+                        updated_field_ids,
                     )
                     .await?;
                     let PreflightedV2_3Write {
@@ -1599,6 +1622,25 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 mod tests {
     use super::*;
     use arrow_array::UInt64Array;
+
+    #[test]
+    fn retirement_materializes_only_fully_removed_fragment_rows() {
+        let large_partial_fragment = (0..1_000_000_u32)
+            .map(|slot| {
+                LogicalRowAddress::try_new_from_parts(0, slot)
+                    .unwrap()
+                    .raw()
+            })
+            .collect::<RoaringTreemap>();
+        let fully_removed_row = LogicalRowAddress::try_new_from_parts(1, 7).unwrap();
+        let rows_by_fragment = BTreeMap::from([
+            (10, large_partial_fragment),
+            (11, RoaringTreemap::from_iter([fully_removed_row.raw()])),
+        ]);
+
+        let retired = retired_rows_for_removed_fragments(&rows_by_fragment, &[11]).unwrap();
+        assert_eq!(retired, vec![fully_removed_row]);
+    }
 
     #[test]
     fn test_merge_state_duplicate_rowid_detection_fail() {

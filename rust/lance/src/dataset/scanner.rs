@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use datafusion::config::ConfigOptions;
 use lance_select::result::IndexExprResultWireFormat;
@@ -75,8 +75,8 @@ use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query
 use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
-use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
-use lance_table::format::{Fragment, IndexMetadata};
+use lance_select::{IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap};
+use lance_table::format::{Fragment, IndexMetadata, LogicalRowAddressSelection};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
@@ -85,11 +85,14 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
-use crate::index::scalar_logical::scalar_index_fragment_bitmap;
+use crate::index::scalar_logical::{logical_index_invalidations, scalar_index_fragment_bitmap};
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, logical_index_coverage_is_current};
+use crate::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, logical_index_coverage_is_current,
+    logical_index_covers_all_current_slots,
+};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
@@ -98,12 +101,12 @@ use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
-    LanceScanExec, LogicalCoverageFilterExec, LogicalCoverageGroup, Planner, PreFilterSource,
-    ScanConfig, TakeExec,
+    LanceScanExec, LogicalCoverageGroup, LogicalMissingRows, LogicalRowIdRangeExec, Planner,
+    PreFilterSource, ScanConfig, TakeExec,
     knn::{
         KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_exec, query_index_field,
     },
-    project,
+    merged_missing_logical_rows_in_fragments, project,
 };
 use crate::io::exec::{
     AddRowOffsetExec, LANCE_RELATIONAL_ALGEBRA_VERSION, LanceFilterExec, LanceScanConfig,
@@ -2914,13 +2917,22 @@ impl Scanner {
         }
 
         let result_format = self.index_expr_result_format();
-        let index_input = filter_plan.index_query.clone().map(|index_query| {
-            Arc::new(ScalarIndexExec::new(
-                self.dataset.clone(),
-                index_query,
-                result_format,
-            )) as Arc<dyn ExecutionPlan>
-        });
+        let index_input = if let Some(index_query) = filter_plan.index_query.clone() {
+            let exec = if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                let groups = self.logical_coverage_groups(&index_query).await?;
+                ScalarIndexExec::new_with_logical_coverage(
+                    self.dataset.clone(),
+                    index_query,
+                    result_format,
+                    groups,
+                )
+            } else {
+                ScalarIndexExec::new(self.dataset.clone(), index_query, result_format)
+            };
+            Some(Arc::new(exec) as Arc<dyn ExecutionPlan>)
+        } else {
+            None
+        };
 
         Ok(Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
@@ -3162,6 +3174,15 @@ impl Scanner {
             .load_scalar_index(IndexCriteria::default().for_column(column).supports_fts())
             .await?;
         match index {
+            Some(index) if self.dataset.manifest.uses_stable_logical_row_addresses() => {
+                let segments = self.retain_relevant_index_segments(
+                    self.dataset.load_indices_by_name(&index.name).await?,
+                )?;
+                *accum |=
+                    crate::index::logical_index_physical_coverage(self.dataset.as_ref(), &segments)
+                        .await?;
+                Ok(true)
+            }
             Some(index) => match &index.fragment_bitmap {
                 Some(fragmap) => {
                     *accum |= fragmap;
@@ -3462,6 +3483,20 @@ impl Scanner {
         Ok(plan)
     }
 
+    fn preopened_fts_index_files(
+        coverage_group: &LogicalCoverageGroup,
+        segments: &[IndexMetadata],
+    ) -> HashMap<Uuid, lance_index::scalar::lance_format::OpenedIndexFile> {
+        segments
+            .iter()
+            .filter_map(|segment| {
+                coverage_group
+                    .preopened_index_file(&segment.uuid)
+                    .map(|opened| (segment.uuid, opened))
+            })
+            .collect()
+    }
+
     async fn plan_phrase_query(
         &self,
         query: &PhraseQuery,
@@ -3486,15 +3521,14 @@ impl Scanner {
                 .to_string()));
         }
 
-        let phrase_plan: Arc<dyn ExecutionPlan> = Arc::new(PhraseQueryExec::new_with_segments(
-            self.dataset.clone(),
-            query.clone(),
-            params.clone(),
-            prefilter_source.clone(),
-            segments.clone(),
-        ));
-        if !self.dataset.manifest.uses_stable_logical_row_addresses() || self.fast_search {
-            return Ok(phrase_plan);
+        if !self.dataset.manifest.uses_stable_logical_row_addresses() {
+            return Ok(Arc::new(PhraseQueryExec::new_with_segments(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+                segments,
+            )));
         }
 
         let target_fragments = self
@@ -3502,10 +3536,23 @@ impl Scanner {
             .clone()
             .unwrap_or_else(|| self.dataset.fragments().to_vec());
         let coverage_group = self.logical_coverage_group_for_indices(&segments).await?;
-        if self.logical_coverage_covers_all_live_rows(
-            std::slice::from_ref(&coverage_group),
-            &target_fragments,
-        )? {
+        let preopened_index_files = Self::preopened_fts_index_files(&coverage_group, &segments);
+        let phrase_plan: Arc<dyn ExecutionPlan> = Arc::new(
+            PhraseQueryExec::new_with_segments(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+                segments.clone(),
+            )
+            .with_preopened_index_files(preopened_index_files),
+        );
+        if self.fast_search
+            || self.logical_coverage_covers_all_live_rows(
+                std::slice::from_ref(&coverage_group),
+                &target_fragments,
+            )?
+        {
             return Ok(phrase_plan);
         }
         let fallback_fragments = self
@@ -3516,14 +3563,7 @@ impl Scanner {
         }
 
         let flat_phrase_plan = self
-            .plan_flat_phrase_query(
-                fallback_fragments,
-                query,
-                params,
-                filter_plan,
-                coverage_group,
-                segments,
-            )
+            .plan_flat_phrase_query(query, params, filter_plan, coverage_group, segments)
             .await?;
         self.combine_fts_index_and_flat(phrase_plan, flat_phrase_plan, params.limit)
     }
@@ -3567,14 +3607,18 @@ impl Scanner {
                                 ))
                             })?;
                     let coverage_group = self.logical_coverage_group_for_indices(&segments).await?;
-                    let match_plan: Arc<dyn ExecutionPlan> =
-                        Arc::new(MatchQueryExec::new_with_segments(
+                    let preopened_index_files =
+                        Self::preopened_fts_index_files(&coverage_group, &segments);
+                    let match_plan: Arc<dyn ExecutionPlan> = Arc::new(
+                        MatchQueryExec::new_with_segments(
                             self.dataset.clone(),
                             query.clone(),
                             params.clone(),
                             prefilter_source.clone(),
                             segments.clone(),
-                        ));
+                        )
+                        .with_preopened_index_files(preopened_index_files),
+                    );
                     if self.fast_search
                         || self.logical_coverage_covers_all_live_rows(
                             std::slice::from_ref(&coverage_group),
@@ -3711,6 +3755,42 @@ impl Scanner {
     }
 
     /// Plan match query on unindexed fragments
+    async fn plan_logical_fts_fallback(
+        &self,
+        columns: &[String],
+        filter_plan: &ExprFilterPlan,
+        logical_coverage_group: LogicalCoverageGroup,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let output_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(columns, OnMissing::Error)?;
+        let take_projection = output_projection
+            .clone()
+            .union_columns(filter_plan.all_columns(), OnMissing::Error)?;
+        let missing_rows = merged_missing_logical_rows_in_fragments(
+            self.dataset.as_ref(),
+            std::slice::from_ref(&logical_coverage_group),
+            self.fragments.as_deref(),
+        )
+        .await?;
+        let row_ids: Arc<dyn ExecutionPlan> = Arc::new(LogicalRowIdRangeExec::new(
+            missing_rows,
+            self.get_batch_size(),
+        ));
+        let mut plan = self.take(row_ids, take_projection)?;
+        if let Some(filter) = filter_plan.full_expr.as_ref() {
+            let planner = Planner::new(plan.schema());
+            let optimized_filter = planner.optimize_expr(filter.clone())?;
+            plan = Arc::new(LanceFilterExec::try_new(optimized_filter, plan)?);
+        }
+        Ok(Arc::new(project(
+            plan,
+            &output_projection.to_arrow_schema(),
+        )?))
+    }
+
     async fn plan_flat_match_query(
         &self,
         fragments: Vec<Fragment>,
@@ -3732,44 +3812,50 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             columns.extend(Planner::column_names_in_expr(refine_expr));
         }
-        let scan_projection = self
-            .dataset
-            .empty_projection()
-            .with_row_id()
-            .union_columns(&columns, OnMissing::Error)?;
-
-        let PlannedFilteredScan { mut plan, .. } = self
-            .filtered_read(
-                filter_plan,
-                scan_projection,
-                /*make_deletions_null=*/ false,
-                Some(Arc::new(fragments)),
-                None,
-                /*is_prefilter=*/ true,
-            )
-            .await?;
-
-        if let Some(coverage_group) = logical_coverage_group {
-            plan = Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
-                plan,
-                vec![coverage_group],
-                false,
-            )?);
-        }
-
-        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
-            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
-        }
+        let preopened_index_files = logical_coverage_group
+            .as_ref()
+            .zip(segments.as_ref())
+            .map(|(coverage_group, segments)| {
+                Self::preopened_fts_index_files(coverage_group, segments)
+            })
+            .unwrap_or_default();
+        let mut plan = if let Some(coverage_group) = logical_coverage_group {
+            self.plan_logical_fts_fallback(&columns, filter_plan, coverage_group)
+                .await?
+        } else {
+            let scan_projection = self
+                .dataset
+                .empty_projection()
+                .with_row_id()
+                .union_columns(&columns, OnMissing::Error)?;
+            let PlannedFilteredScan { mut plan, .. } = self
+                .filtered_read(
+                    filter_plan,
+                    scan_projection,
+                    /*make_deletions_null=*/ false,
+                    Some(Arc::new(fragments)),
+                    None,
+                    /*is_prefilter=*/ true,
+                )
+                .await?;
+            if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+                plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+            }
+            plan
+        };
         plan = self.ensure_column_alias(plan, &column)?;
 
         let flat_match_plan = match segments {
-            Some(segments) => Arc::new(FlatMatchQueryExec::new_with_segments(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                plan,
-                segments,
-            )),
+            Some(segments) => Arc::new(
+                FlatMatchQueryExec::new_with_segments(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    plan,
+                    segments,
+                )
+                .with_preopened_index_files(preopened_index_files),
+            ),
             None => Arc::new(FlatMatchQueryExec::new(
                 self.dataset.clone(),
                 query.clone(),
@@ -3782,7 +3868,6 @@ impl Scanner {
 
     async fn plan_flat_phrase_query(
         &self,
-        fragments: Vec<Fragment>,
         query: &PhraseQuery,
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
@@ -3800,45 +3885,33 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             columns.extend(Planner::column_names_in_expr(refine_expr));
         }
-        let scan_projection = self
-            .dataset
-            .empty_projection()
-            .with_row_id()
-            .union_columns(&columns, OnMissing::Error)?;
-        let PlannedFilteredScan { mut plan, .. } = self
-            .filtered_read(
-                filter_plan,
-                scan_projection,
-                false,
-                Some(Arc::new(fragments)),
-                None,
-                true,
-            )
+        let preopened_index_files =
+            Self::preopened_fts_index_files(&logical_coverage_group, &segments);
+        let mut plan = self
+            .plan_logical_fts_fallback(&columns, filter_plan, logical_coverage_group)
             .await?;
-        plan = Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
-            plan,
-            vec![logical_coverage_group],
-            false,
-        )?);
-        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
-            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
-        }
         plan = self.ensure_column_alias(plan, &column)?;
-        plan = Arc::new(FlatMatchFilterExec::new_phrase_with_segments(
-            plan,
-            self.dataset.clone(),
-            query.clone(),
-            params.clone(),
-            segments.clone(),
-        ));
+        plan = Arc::new(
+            FlatMatchFilterExec::new_phrase_with_segments(
+                plan,
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                segments.clone(),
+            )
+            .with_preopened_index_files(preopened_index_files.clone()),
+        );
         let match_query = MatchQuery::new(query.terms.clone()).with_column(query.column.clone());
-        Ok(Arc::new(FlatMatchQueryExec::new_with_segments(
-            self.dataset.clone(),
-            match_query,
-            params.clone(),
-            plan,
-            segments,
-        )))
+        Ok(Arc::new(
+            FlatMatchQueryExec::new_with_segments(
+                self.dataset.clone(),
+                match_query,
+                params.clone(),
+                plan,
+                segments,
+            )
+            .with_preopened_index_files(preopened_index_files),
+        ))
     }
 
     // ANN/KNN search execution node with optional prefilter
@@ -3910,15 +3983,21 @@ impl Scanner {
                 if selected_index_segments.is_empty() {
                     None
                 } else {
-                    let idx = self
-                        .dataset
-                        .open_vector_index(
-                            q.column.as_str(),
-                            &selected_index_segments[0].uuid,
-                            &NoOpMetricsCollector,
-                        )
-                        .await?;
-                    let index_metric = idx.metric_type();
+                    let index_metric = if let Some(metric) =
+                        crate::index::vector::details::metric_type_from_index_metadata(
+                            &selected_index_segments[0],
+                        ) {
+                        metric
+                    } else {
+                        self.dataset
+                            .open_vector_index(
+                                q.column.as_str(),
+                                &selected_index_segments[0].uuid,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?
+                            .metric_type()
+                    };
                     let use_this_index = match q.metric_type {
                         Some(user_metric) => {
                             if user_metric == index_metric {
@@ -3973,8 +4052,13 @@ impl Scanner {
                     let index_segments = self.retain_relevant_index_segments(
                         self.dataset.load_indices_by_name(&index.name).await?,
                     )?;
-                    let index_frags = self.get_indexed_frags(&index_segments);
-                    if !index_segments.is_empty() && !index_frags.is_empty() {
+                    let has_indexed_fragments =
+                        if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                            !index_segments.is_empty()
+                        } else {
+                            !self.get_indexed_frags(&index_segments).await?.is_empty()
+                        };
+                    if !index_segments.is_empty() && has_indexed_fragments {
                         Some((index.name.clone(), index_segments, index_metric))
                     } else {
                         None
@@ -4004,9 +4088,34 @@ impl Scanner {
                     "Refine factor cannot be zero".to_string(),
                 ));
             }
+            let logical_coverage_group =
+                if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                    Some(
+                        self.logical_coverage_group_for_indices(&index_segments)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
             let ann_node = match vector_type {
-                DataType::FixedSizeList(_, _) => self.ann(&q, &index_segments, filter_plan).await?,
-                DataType::List(_) => self.multivec_ann(&q, &index_segments, filter_plan).await?,
+                DataType::FixedSizeList(_, _) => {
+                    self.ann(
+                        &q,
+                        &index_segments,
+                        filter_plan,
+                        logical_coverage_group.clone(),
+                    )
+                    .await?
+                }
+                DataType::List(_) => {
+                    self.multivec_ann(
+                        &q,
+                        &index_segments,
+                        filter_plan,
+                        logical_coverage_group.clone(),
+                    )
+                    .await?
+                }
                 _ => unreachable!(),
             };
 
@@ -4024,7 +4133,14 @@ impl Scanner {
 
             if !self.fast_search {
                 knn_node = self
-                    .knn_combined(&q, &index_name, &index_segments, knn_node, filter_plan)
+                    .knn_combined(
+                        &q,
+                        &index_name,
+                        &index_segments,
+                        knn_node,
+                        filter_plan,
+                        logical_coverage_group,
+                    )
                     .await?;
             }
 
@@ -4161,16 +4277,12 @@ impl Scanner {
         indexed_segments: &[IndexMetadata],
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
+        logical_coverage_group: Option<LogicalCoverageGroup>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let logical_coverage_groups = if self.dataset.manifest.uses_stable_logical_row_addresses() {
-            Some(vec![
-                self.logical_coverage_group_for_indices(indexed_segments)
-                    .await?,
-            ])
-        } else {
-            None
-        };
-        let fallback_fragments = if let Some(groups) = logical_coverage_groups.as_ref() {
+        let logical_coverage_groups = logical_coverage_group.map(|group| vec![group]);
+        let fallback_fragments = if self.index_segments.is_some() && self.fragments.is_none() {
+            Vec::new()
+        } else if let Some(groups) = logical_coverage_groups.as_ref() {
             let target = self
                 .fragments
                 .as_deref()
@@ -4181,7 +4293,7 @@ impl Scanner {
                 self.logical_fallback_fragments(groups, target).await?
             }
         } else if let Some(target_fragments) = &self.fragments {
-            let indexed_fragments = self.get_indexed_frags(indexed_segments);
+            let indexed_fragments = self.get_indexed_frags(indexed_segments).await?;
             target_fragments
                 .iter()
                 .filter(|fragment| !indexed_fragments.contains(fragment.id as u32))
@@ -4213,30 +4325,44 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 columns.extend(filter_columns);
             }
-            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            // Note: we could try and use the scalar indices here to reduce the scope of this scan but the
-            // most common case is that fragments that are newer than the vector index are going to be newer
-            // than the scalar indices anyways
-            let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                false,
-                false,
-                false,
-                vector_scan_projection,
-                Arc::new(fallback_fragments),
-                // Can't pushdown limit/offset in an ANN search
-                None,
-                // We are re-ordering anyways, so no need to get data in data
-                // in a deterministic order.
-                false,
-            );
-
-            if let Some(groups) = logical_coverage_groups.clone() {
-                scan_node = Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
-                    scan_node, groups, false,
-                )?);
-            }
+            let mut scan_node = if let Some(groups) = logical_coverage_groups.clone() {
+                let missing_rows = merged_missing_logical_rows_in_fragments(
+                    self.dataset.as_ref(),
+                    &groups,
+                    self.fragments.as_deref(),
+                )
+                .await?;
+                let row_ids: Arc<dyn ExecutionPlan> = Arc::new(LogicalRowIdRangeExec::new(
+                    missing_rows,
+                    self.get_batch_size(),
+                ));
+                let take_projection = self
+                    .dataset
+                    .empty_projection()
+                    .with_row_id()
+                    .union_columns(&columns, OnMissing::Error)?;
+                self.take(row_ids, take_projection)?
+            } else {
+                let vector_scan_projection =
+                    Arc::new(self.dataset.schema().project(&columns).unwrap());
+                // Note: we could try and use the scalar indices here to reduce the scope of this scan but the
+                // most common case is that fragments that are newer than the vector index are going to be newer
+                // than the scalar indices anyways
+                self.scan_fragments(
+                    true,
+                    false,
+                    false,
+                    false,
+                    false,
+                    vector_scan_projection,
+                    Arc::new(fallback_fragments),
+                    // Can't push down limit/offset in an ANN search
+                    None,
+                    // We are re-ordering anyways, so no need to get data in data
+                    // in a deterministic order.
+                    false,
+                )
+            };
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
@@ -4297,14 +4423,17 @@ impl Scanner {
     }
 
     #[async_recursion]
-    async fn logical_coverage_groups(
+    pub(crate) async fn logical_coverage_groups(
         &self,
         index_expr: &ScalarIndexExpr,
     ) -> Result<Vec<LogicalCoverageGroup>> {
         match index_expr {
             ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
-                let mut groups = self.logical_coverage_groups(left).await?;
-                groups.extend(self.logical_coverage_groups(right).await?);
+                let (mut groups, right_groups) = futures::try_join!(
+                    self.logical_coverage_groups(left),
+                    self.logical_coverage_groups(right)
+                )?;
+                groups.extend(right_groups);
                 Ok(groups)
             }
             ScalarIndexExpr::Not(inner) => self.logical_coverage_groups(inner).await,
@@ -4327,78 +4456,138 @@ impl Scanner {
         }
     }
 
-    async fn logical_coverage_group_for_indices(
+    pub(crate) async fn logical_coverage_group_for_indices(
         &self,
         indices: &[IndexMetadata],
     ) -> Result<LogicalCoverageGroup> {
-        let mut indices = indices.to_vec();
-        for index in &mut indices {
-            if index
-                .logical_coverage
-                .as_ref()
-                .is_some_and(|coverage| coverage.requires_authoritative_resolution())
-            {
-                index.logical_coverage = Some(
-                    crate::index::resolve_logical_index_coverage(self.dataset.as_ref(), index)
-                        .await?,
-                );
-            }
-        }
-        crate::index::validate_resolved_logical_index_overlaps(&indices)?;
-        let mut base = Vec::new();
-        let mut invalidated = Vec::new();
-        let layout = self
+        let mut index_ids = indices.iter().map(|index| index.uuid).collect::<Vec<_>>();
+        index_ids.sort_unstable();
+        let namespace_uuid = self
             .dataset
             .manifest
             .row_address_layout
             .as_ref()
             .ok_or_else(|| {
                 Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
-            })?;
-        for index in &indices {
-            let coverage = index.logical_coverage.as_ref().ok_or_else(|| {
-                Error::internal(format!(
-                    "v2.3 index segment {} is missing exact logical coverage",
-                    index.uuid
-                ))
-            })?;
-            for shard in &coverage.shards {
-                let selection = shard.selection.as_ref().ok_or_else(|| {
-                    Error::internal(format!(
-                        "logical index {} coverage detail was not resolved",
-                        index.uuid
-                    ))
-                })?;
-                for watermark in &shard.validated_through {
-                    // A floor rejects an incoming build that predates retired
-                    // invalidation detail.  It cannot invalidate an existing
-                    // disjoint shard in the current catalog.
-                    if layout
-                        .field_default_generations
-                        .binary_search_by_key(&watermark.field_id, |generation| generation.field_id)
-                        .ok()
-                        .is_none_or(|position| {
-                            layout.field_default_generations[position].generation
-                                > watermark.generation
-                        })
-                    {
-                        invalidated.push(selection.clone());
-                    }
-                    invalidated.extend(
-                        layout
-                            .generation_regions
-                            .iter()
-                            .filter(|region| {
-                                region.generation > watermark.generation
-                                    && region.field_ids.binary_search(&watermark.field_id).is_ok()
-                            })
-                            .map(|region| region.selection.as_ref().clone()),
-                    );
+            })?
+            .namespace_uuid;
+        let key = crate::session::index_caches::LogicalCoverageGroupKey {
+            namespace_uuid,
+            version: self.dataset.manifest.version,
+            index_ids: index_ids.clone(),
+        };
+        let dataset = self.dataset.clone();
+        let indices = indices.to_vec();
+        let group = self
+            .dataset
+            .index_cache
+            .get_or_insert_with_key(key, move || async move {
+                let segment_refs = indices.iter().collect::<Vec<_>>();
+                if logical_index_covers_all_current_slots(dataset.as_ref(), &segment_refs)? {
+                    let fully_covered = dataset
+                        .manifest
+                        .row_address_layout
+                        .as_ref()
+                        .expect("v2.3 layout was checked before cache lookup")
+                        .current_logical_fragment_bitmap(
+                            dataset.manifest.fragments.as_ref(),
+                        )?;
+                    return Ok(LogicalCoverageGroup::all_current(
+                        index_ids,
+                        fully_covered,
+                        dataset.fragment_bitmap.as_ref().clone(),
+                    ));
                 }
-                base.push(selection.clone());
-            }
-        }
-        Ok(LogicalCoverageGroup { base, invalidated })
+                let resolved =
+                    futures::future::try_join_all(indices.into_iter().map(|mut index| {
+                        let dataset = dataset.clone();
+                        async move {
+                            let mut preopened = None;
+                            if index.logical_coverage.as_ref().is_some_and(|coverage| {
+                                coverage.requires_authoritative_resolution()
+                            }) {
+                                let (coverage, opened) =
+                                    crate::index::resolve_logical_index_coverage_with_reader(
+                                        dataset.as_ref(),
+                                        &index,
+                                    )
+                                    .await?;
+                                index.logical_coverage = Some(coverage);
+                                preopened = opened.map(|opened| (index.uuid, opened));
+                            }
+                            Ok::<_, Error>((index, preopened))
+                        }
+                    }))
+                    .await?;
+                let mut preopened_index_files = std::collections::HashMap::new();
+                let indices = resolved
+                    .into_iter()
+                    .map(|(index, preopened)| {
+                        if let Some((index_id, opened)) = preopened {
+                            preopened_index_files.insert(index_id, opened);
+                        }
+                        index
+                    })
+                    .collect::<Vec<_>>();
+                let resolved_index_coverages = indices
+                    .iter()
+                    .map(|index| {
+                        Ok((
+                            index.uuid,
+                            index.logical_coverage.clone().ok_or_else(|| {
+                                Error::internal(format!(
+                                    "v2.3 index segment {} is missing logical coverage",
+                                    index.uuid
+                                ))
+                            })?,
+                        ))
+                    })
+                    .collect::<Result<std::collections::HashMap<_, _>>>()?;
+                let segments = futures::future::try_join_all(indices.iter().map(|index| async {
+                    let selections = index
+                        .logical_coverage
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "v2.3 index segment {} is missing logical coverage",
+                                index.uuid
+                            ))
+                        })?
+                        .shards
+                        .iter()
+                        .map(|shard| {
+                            shard.selection.clone().ok_or_else(|| {
+                                Error::internal(
+                                    "resolved logical index coverage unexpectedly remained external",
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok::<_, Error>((
+                        selections,
+                        logical_index_invalidations(dataset.as_ref(), index).await?,
+                    ))
+                }))
+                .await?;
+                let group = LogicalCoverageGroup::from_resolved_index_segments(index_ids, segments)
+                    .with_preopened_index_files(preopened_index_files)
+                    .with_resolved_index_coverages(resolved_index_coverages);
+                let (
+                    covered_physical_fragments,
+                    fallback_physical_fragments,
+                    fully_covered_logical_fragments,
+                    missing_logical_rows,
+                ) =
+                    Self::logical_coverage_snapshot_summary(dataset.as_ref(), &group)?;
+                Ok(group.with_snapshot_summary(
+                    covered_physical_fragments,
+                    fallback_physical_fragments,
+                    fully_covered_logical_fragments,
+                    missing_logical_rows,
+                ))
+            })
+            .await?;
+        Ok(group.as_ref().clone())
     }
 
     fn logical_coverage_covers_all_live_rows(
@@ -4406,151 +4595,141 @@ impl Scanner {
         groups: &[LogicalCoverageGroup],
         fragments: &[Fragment],
     ) -> Result<bool> {
-        let Some(layout) = self.dataset.manifest.row_address_layout.as_ref() else {
+        if groups.is_empty() {
             return Ok(false);
-        };
-        let current_slots = Self::current_logical_slots(layout, fragments)?;
-        for group in groups {
-            if !group.invalidated.is_empty() {
-                return Ok(false);
-            }
-            let covered_slots = Self::logical_selection_union(&group.base)?;
-            if !current_slots.is_subset(&covered_slots) {
-                return Ok(false);
-            }
         }
-        Ok(!groups.is_empty())
+        let target_fragments = fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
+        Ok(groups.iter().all(|group| {
+            group
+                .fallback_physical_fragments()
+                .is_disjoint(&target_fragments)
+        }))
     }
 
-    fn logical_selection_union(
-        selections: &[lance_table::format::LogicalRowAddressSelection],
-    ) -> Result<RoaringTreemap> {
-        let mut slots = RoaringTreemap::new();
-        for selection in selections {
-            for range in selection.to_ranges()? {
-                let start = (range.logical_fragment_id as u64) << 32 | range.start_slot as u64;
-                let end = (range.logical_fragment_id as u64) << 32 | range.end_slot as u64;
-                slots.insert_range(start..end);
-            }
-        }
-        Ok(slots)
-    }
-
-    fn current_logical_slots(
-        layout: &lance_table::format::RowAddressLayout,
-        fragments: &[Fragment],
-    ) -> Result<RoaringTreemap> {
-        let mut slots = RoaringTreemap::new();
-        for logical_fragment_id in layout.current_logical_fragment_bitmap(fragments)? {
-            let domain = layout
-                .logical_domain(fragments, logical_fragment_id)?
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "current logical domain {logical_fragment_id} is missing metadata"
-                    ))
-                })?;
-            let start = (logical_fragment_id as u64) << 32;
-            slots.insert_range(start..start + domain.slot_count as u64);
-        }
-        for retired in &layout.retired_rows {
-            match &retired.membership {
-                lance_table::format::RetiredLogicalRowMembership::AllRows => {
-                    for ordinal in 0..retired.domains.domain_count() {
-                        let domain = retired.domains.domain_at(ordinal)?;
-                        let start = (domain.logical_fragment_id as u64) << 32;
-                        slots.remove_range(start..start + domain.slot_count as u64);
-                    }
-                }
-                lance_table::format::RetiredLogicalRowMembership::Selection(selection) => {
-                    for range in selection.to_ranges()? {
-                        let start =
-                            (range.logical_fragment_id as u64) << 32 | range.start_slot as u64;
-                        let end = (range.logical_fragment_id as u64) << 32 | range.end_slot as u64;
-                        slots.remove_range(start..end);
-                    }
-                }
-            }
-        }
-        Ok(slots)
-    }
-
-    async fn logical_fallback_fragments(
+    pub(crate) async fn logical_fully_covered_domains(
         &self,
-        groups: &[LogicalCoverageGroup],
-        fragments: &[Fragment],
-    ) -> Result<Vec<Fragment>> {
-        let layout = self
-            .dataset
+        group: &LogicalCoverageGroup,
+    ) -> Result<RoaringBitmap> {
+        Ok(group.fully_covered_logical_fragments().clone())
+    }
+
+    fn logical_coverage_snapshot_summary(
+        dataset: &Dataset,
+        group: &LogicalCoverageGroup,
+    ) -> Result<(
+        RoaringBitmap,
+        RoaringBitmap,
+        RoaringBitmap,
+        LogicalMissingRows,
+    )> {
+        let layout = dataset
             .manifest
             .row_address_layout
             .as_ref()
             .ok_or_else(|| {
                 Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
             })?;
-        let current_slots = Self::current_logical_slots(layout, fragments)?;
-        let router = self.dataset.row_address_router()?;
-        let mut fallback_logical_fragments = RoaringBitmap::new();
+        let mut retired_rows = RowAddrTreeMap::new();
+        for (logical_fragment_id, slots) in layout.retired_logical_row_bitmap()?.bitmaps() {
+            retired_rows.insert_bitmap(logical_fragment_id, slots.clone());
+        }
+        let effective_rows_by_domain = group.effective_rows_by_domain()?;
+        let mut covered_physical_fragments = RoaringBitmap::new();
+        let mut fallback_physical_fragments = RoaringBitmap::new();
+        let mut fully_covered_logical_fragments = RoaringBitmap::new();
+        let mut missing_logical_ranges = Vec::new();
+        let mut sparse_missing_domains = Vec::<(u32, RoaringBitmap)>::new();
+        let fragments = dataset.manifest.fragments.as_ref();
+        let router = dataset.row_address_router()?;
+        for logical_fragment_id in layout.current_logical_fragment_bitmap(fragments)? {
+            let domain = router.logical_domain(logical_fragment_id)?.ok_or_else(|| {
+                Error::internal(format!(
+                    "current logical domain {logical_fragment_id} is missing metadata"
+                ))
+            })?;
+            let mut effective_rows = match effective_rows_by_domain.as_ref() {
+                None => RoaringBitmap::from_sorted_iter(0..domain.slot_count)
+                    .expect("logical domain slots are sorted"),
+                Some(rows_by_domain) => match rows_by_domain.get(&logical_fragment_id) {
+                    Some(RowAddrSelection::Full) => {
+                        RoaringBitmap::from_sorted_iter(0..domain.slot_count)
+                            .expect("logical domain slots are sorted")
+                    }
+                    Some(RowAddrSelection::Partial(slots)) => slots.clone(),
+                    None => RoaringBitmap::new(),
+                },
+            };
+
+            let retired_row_count = match retired_rows.get(&logical_fragment_id) {
+                Some(RowAddrSelection::Full) => {
+                    effective_rows.clear();
+                    u64::from(domain.slot_count)
+                }
+                Some(RowAddrSelection::Partial(retired_slots)) => {
+                    effective_rows -= retired_slots;
+                    retired_slots.range_cardinality(0..domain.slot_count)
+                }
+                None => 0,
+            };
+            let domain_live_rows = u64::from(domain.slot_count)
+                .checked_sub(retired_row_count)
+                .ok_or_else(|| Error::internal("retired logical row count exceeds its domain"))?;
+            let covered_live_rows = effective_rows.range_cardinality(0..domain.slot_count);
+            covered_physical_fragments |= router
+                .logical_selection_destination_fragments(logical_fragment_id, &effective_rows)?;
+            if covered_live_rows == domain_live_rows {
+                fully_covered_logical_fragments.insert(logical_fragment_id);
+                continue;
+            }
+
+            let mut missing_rows = RoaringBitmap::new();
+            missing_rows.insert_range(0..domain.slot_count);
+            if let Some(retired) = retired_rows.get(&logical_fragment_id) {
+                match retired {
+                    RowAddrSelection::Full => missing_rows.clear(),
+                    RowAddrSelection::Partial(retired) => missing_rows -= retired,
+                }
+            }
+            missing_rows -= &effective_rows;
+            if let (Some(start), Some(end)) = (missing_rows.min(), missing_rows.max()) {
+                if missing_rows.len() == u64::from(end - start) + 1 {
+                    missing_logical_ranges.push(lance_table::format::LogicalRowAddressRange::new(
+                        logical_fragment_id,
+                        start,
+                        end + 1,
+                    ));
+                } else {
+                    sparse_missing_domains.push((logical_fragment_id, missing_rows.clone()));
+                }
+            }
+            fallback_physical_fragments |= router
+                .logical_selection_destination_fragments(logical_fragment_id, &missing_rows)?;
+        }
+        let sparse_missing = sparse_missing_domains
+            .into_iter()
+            .collect::<RoaringTreemap>();
+        let sparse_missing = (!sparse_missing.is_empty())
+            .then(|| LogicalRowAddressSelection::from_bitmap(sparse_missing))
+            .transpose()?;
+        Ok((
+            covered_physical_fragments,
+            fallback_physical_fragments,
+            fully_covered_logical_fragments,
+            LogicalMissingRows::new(missing_logical_ranges, sparse_missing),
+        ))
+    }
+
+    pub(crate) async fn logical_fallback_fragments(
+        &self,
+        groups: &[LogicalCoverageGroup],
+        fragments: &[Fragment],
+    ) -> Result<Vec<Fragment>> {
         let mut physical_fragments = RoaringBitmap::new();
         for group in groups {
-            let covered_slots = Self::logical_selection_union(&group.base)?;
-            let missing_slots = &current_slots - &covered_slots;
-            fallback_logical_fragments.extend(
-                missing_slots
-                    .bitmaps()
-                    .map(|(logical_fragment_id, _)| logical_fragment_id),
-            );
-            for invalidated in &group.invalidated {
-                const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
-                let mut row_ids = Vec::with_capacity(RESOLVE_BATCH_SIZE);
-                for address in invalidated.iter() {
-                    row_ids.push(address?.raw());
-                    if row_ids.len() == RESOLVE_BATCH_SIZE {
-                        for physical in self
-                            .dataset
-                            .resolve_logical_row_ids_async(&row_ids)
-                            .await?
-                            .into_iter()
-                            .flatten()
-                        {
-                            physical_fragments.insert(physical.fragment_id());
-                        }
-                        row_ids.clear();
-                    }
-                }
-                if !row_ids.is_empty() {
-                    for physical in self
-                        .dataset
-                        .resolve_logical_row_ids_async(&row_ids)
-                        .await?
-                        .into_iter()
-                        .flatten()
-                    {
-                        physical_fragments.insert(physical.fragment_id());
-                    }
-                }
-            }
-        }
-        for logical_fragment_id in fallback_logical_fragments {
-            for destination in router.logical_domain_destination_ranges(logical_fragment_id)? {
-                match destination {
-                    lance_table::format::LogicalDomainDestination::Inline(range) => {
-                        physical_fragments.insert(range.physical_fragment_id);
-                    }
-                    lance_table::format::LogicalDomainDestination::ExplicitMap {
-                        placement_index,
-                    } => {
-                        let placement = layout
-                            .placements
-                            .get(placement_index as usize)
-                            .ok_or_else(|| {
-                                Error::internal("ExplicitMap placement index is out of bounds")
-                            })?;
-                        for (fragment_id, _, _) in placement.destination_ranges() {
-                            physical_fragments.insert(fragment_id);
-                        }
-                    }
-                }
-            }
+            physical_fragments |= group.fallback_physical_fragments();
         }
         Ok(fragments
             .iter()
@@ -4623,15 +4802,17 @@ impl Scanner {
                 };
             (relevant, missing)
         } else {
-            self.partition_frags_by_coverage(index_expr, fragments)
+            self.partition_frags_by_coverage(index_expr, fragments.clone())
                 .await?
         };
 
-        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(MaterializeIndexExec::new(
-            self.dataset.clone(),
-            index_expr.clone(),
-            Arc::new(relevant_frags),
-        ));
+        let mut plan: Arc<dyn ExecutionPlan> =
+            Arc::new(MaterializeIndexExec::new_with_logical_coverage(
+                self.dataset.clone(),
+                index_expr.clone(),
+                Arc::new(relevant_frags),
+                logical_coverage_groups.clone(),
+            ));
 
         let refine_expr = filter_plan.refine_expr.as_ref();
 
@@ -4698,37 +4879,50 @@ impl Scanner {
             let filter = filter_plan.full_expr.as_ref().unwrap();
             let filter_cols = Planner::column_names_in_expr(filter);
             let scan_projection = projection.union_columns(filter_cols, OnMissing::Error)?;
-
-            let scan_schema = Arc::new(scan_projection.to_bare_schema());
-            let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
-            let planner = Planner::new(scan_arrow_schema);
-            let optimized_filter = planner.optimize_expr(filter.clone())?;
-
-            let new_data_scan = self.scan_fragments(
-                true,
-                self.projection_plan.physical_projection.with_row_addr,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_last_updated_at_version,
-                self.projection_plan
-                    .physical_projection
-                    .with_row_created_at_version,
-                false,
-                scan_schema,
-                missing_frags.into(),
-                // No pushdown of limit/offset when doing scalar indexed scan
-                None,
-                false,
-            );
             let filtered: Arc<dyn ExecutionPlan> =
-                Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
-            let filtered = if let Some(groups) = logical_coverage_groups.clone() {
-                Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
-                    filtered, groups, false,
-                )?) as Arc<dyn ExecutionPlan>
-            } else {
-                filtered
-            };
+                if let Some(groups) = logical_coverage_groups.clone() {
+                    let missing_rows = merged_missing_logical_rows_in_fragments(
+                        self.dataset.as_ref(),
+                        &groups,
+                        Some(fragments.as_ref()),
+                    )
+                    .await?;
+                    let row_ids: Arc<dyn ExecutionPlan> = Arc::new(LogicalRowIdRangeExec::new(
+                        missing_rows,
+                        self.get_batch_size(),
+                    ));
+                    let mut take_projection = scan_projection.clone();
+                    take_projection.with_row_addr = false;
+                    let mut taken = self.take(row_ids, take_projection)?;
+                    if self.projection_plan.physical_projection.with_row_addr {
+                        taken = Arc::new(AddRowAddrExec::try_new(taken, self.dataset.clone(), 0)?);
+                    }
+                    let planner = Planner::new(taken.schema());
+                    let optimized_filter = planner.optimize_expr(filter.clone())?;
+                    Arc::new(LanceFilterExec::try_new(optimized_filter, taken)?)
+                } else {
+                    let scan_schema = Arc::new(scan_projection.to_bare_schema());
+                    let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
+                    let planner = Planner::new(scan_arrow_schema);
+                    let optimized_filter = planner.optimize_expr(filter.clone())?;
+                    let new_data_scan = self.scan_fragments(
+                        true,
+                        self.projection_plan.physical_projection.with_row_addr,
+                        self.projection_plan
+                            .physical_projection
+                            .with_row_last_updated_at_version,
+                        self.projection_plan
+                            .physical_projection
+                            .with_row_created_at_version,
+                        false,
+                        scan_schema,
+                        missing_frags.into(),
+                        // No pushdown of limit/offset when doing scalar indexed scan
+                        None,
+                        false,
+                    );
+                    Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?)
+                };
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
         } else {
             log::trace!("scalar_indexed_scan will not need full scan of any missing fragments");
@@ -5167,8 +5361,15 @@ impl Scanner {
         fragments
     }
 
-    fn get_indexed_frags(&self, index: &[IndexMetadata]) -> RoaringBitmap {
+    async fn get_indexed_frags(&self, index: &[IndexMetadata]) -> Result<RoaringBitmap> {
         let all_fragments = self.get_fragments_as_bitmap();
+
+        if self.dataset.manifest.uses_stable_logical_row_addresses() {
+            return Ok(
+                crate::index::logical_index_physical_coverage(self.dataset.as_ref(), index).await?
+                    & all_fragments,
+            );
+        }
 
         let mut all_indexed_frags = RoaringBitmap::new();
         for idx in index {
@@ -5177,11 +5378,11 @@ impl Scanner {
             } else {
                 // If any index is missing the fragment bitmap it is safest to just assume we
                 // need all fragments
-                return all_fragments;
+                return Ok(all_fragments);
             }
         }
 
-        all_indexed_frags & all_fragments
+        Ok(all_indexed_frags & all_fragments)
     }
 
     /// Create an Execution plan to do indexed ANN search
@@ -5190,11 +5391,22 @@ impl Scanner {
         q: &Query,
         index: &[IndexMetadata],
         filter_plan: &ExprFilterPlan,
+        logical_coverage_group: Option<LogicalCoverageGroup>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let indexed_fragments = match logical_coverage_group.as_ref() {
+            Some(group) => group.covered_physical_fragments() & self.get_fragments_as_bitmap(),
+            None => self.get_indexed_frags(index).await?,
+        };
         let prefilter_source = self
-            .prefilter_source(filter_plan, self.get_indexed_frags(index))
+            .prefilter_source(filter_plan, indexed_fragments)
             .await?;
-        let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
+        let inner_fanout_search = new_knn_exec(
+            self.dataset.clone(),
+            index,
+            q,
+            prefilter_source,
+            logical_coverage_group,
+        )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
             options: SortOptions {
@@ -5221,6 +5433,7 @@ impl Scanner {
         q: &Query,
         index: &[IndexMetadata],
         filter_plan: &ExprFilterPlan,
+        logical_coverage_group: Option<LogicalCoverageGroup>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // we split the query procedure into two steps:
         // 1. collect the candidates by vector searching on each query vector
@@ -5228,8 +5441,12 @@ impl Scanner {
 
         let over_fetch_factor = *DEFAULT_XTR_OVERFETCH;
 
+        let indexed_fragments = match logical_coverage_group.as_ref() {
+            Some(group) => group.covered_physical_fragments() & self.get_fragments_as_bitmap(),
+            None => self.get_indexed_frags(index).await?,
+        };
         let prefilter_source = self
-            .prefilter_source(filter_plan, self.get_indexed_frags(index))
+            .prefilter_source(filter_plan, indexed_fragments)
             .await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
 
@@ -5253,6 +5470,7 @@ impl Scanner {
                 index,
                 &query,
                 prefilter_source.clone(),
+                logical_coverage_group.clone(),
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
@@ -5333,11 +5551,22 @@ impl Scanner {
         // are not in the fragments we are scanning.
         if filter_plan.is_exact_index_search() && self.fragments.is_none() {
             let index_query = filter_plan.index_query.as_ref().expect_ok()?;
-            let (_, missing_frags) = self
-                .partition_frags_by_coverage(index_query, fragments.clone())
-                .await?;
+            let uses_logical_addresses = self.dataset.manifest.uses_stable_logical_row_addresses();
+            let logical_coverage_groups = if uses_logical_addresses {
+                Some(self.logical_coverage_groups(index_query).await?)
+            } else {
+                None
+            };
+            let fully_covered = if let Some(groups) = logical_coverage_groups.as_ref() {
+                self.logical_coverage_covers_all_live_rows(groups, fragments.as_ref())?
+            } else {
+                let (_, missing_frags) = self
+                    .partition_frags_by_coverage(index_query, fragments.clone())
+                    .await?;
+                missing_frags.is_empty()
+            };
 
-            if missing_frags.is_empty() || self.fast_search {
+            if fully_covered || (self.fast_search && !uses_logical_addresses) {
                 log::trace!("prefilter entirely satisfied by exact index search");
                 let result_format = self.index_expr_result_format();
                 // We can only avoid materializing the index for a prefilter if:
@@ -5345,9 +5574,20 @@ impl Scanner {
                 // 2. The index search is an exact search with no recheck or refine
                 // 3. The indices cover at least the same fragments as the vector index,
                 //    unless fast_search allows skipping uncovered fragments.
-                return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(
-                    ScalarIndexExec::new(self.dataset.clone(), index_query.clone(), result_format),
-                )));
+                let exec = match logical_coverage_groups {
+                    Some(groups) => ScalarIndexExec::new_with_logical_coverage(
+                        self.dataset.clone(),
+                        index_query.clone(),
+                        result_format,
+                        groups,
+                    ),
+                    None => ScalarIndexExec::new(
+                        self.dataset.clone(),
+                        index_query.clone(),
+                        result_format,
+                    ),
+                };
+                return Ok(PreFilterSource::ScalarIndexQuery(Arc::new(exec)));
             } else {
                 log::trace!("exact index search did not cover all fragments");
             }
@@ -5834,7 +6074,9 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::optimize::{
+        CompactionOptions, RowAddressMaintenanceOptions, compact_files, maintain_row_addresses,
+    };
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
     use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
@@ -12390,6 +12632,757 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         // pruning. This guards against treating any ordinary filter as indexed.
         assert_eq!(scan_count(&dataset, "a >= 95", false).await, 15);
         assert_eq!(scan_count(&dataset, "a >= 95", true).await, 15);
+    }
+
+    #[tokio::test]
+    async fn test_v23_fast_search_blocks_stale_scalar_postings_before_catchup() {
+        let (_tmp_dir, _schema, mut dataset) =
+            make_scalar_filter_test_dataset(LanceFileVersion::V2_3).await;
+        create_scalar_index(&mut dataset, "a").await;
+        dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("a < 5")
+            .unwrap()
+            .set("a", "1000 + a")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+
+        assert_eq!(scan_count(&dataset, "a < 5", false).await, 0);
+        assert_eq!(scan_count(&dataset, "a < 5", true).await, 0);
+        assert_eq!(scan_count(&dataset, "a >= 1000", false).await, 5);
+        assert_eq!(
+            scan_count(&dataset, "a >= 1000", true).await,
+            0,
+            "fast search may omit unindexed updated rows but cannot return stale postings"
+        );
+        assert_eq!(scan_count(&dataset, "NOT (a >= 1000)", false).await, 95);
+        let mut fast_not = dataset.scan();
+        fast_not
+            .filter("NOT (a >= 1000)")
+            .unwrap()
+            .project(&["a"])
+            .unwrap()
+            .fast_search();
+        let fast_not = fast_not.try_into_batch().await.unwrap();
+        let values = fast_not["a"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values();
+        assert!(
+            values.iter().all(|value| *value < 1000),
+            "fast search cannot let boolean complement reintroduce stale rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_scalar_fallback_respects_fragment_scope() {
+        let (_tmp_dir, schema, mut dataset) =
+            make_scalar_filter_test_dataset(LanceFileVersion::V2_3).await;
+        create_scalar_index(&mut dataset, "a").await;
+        append_scalar_filter_test_data(&mut dataset, schema.clone(), 100, 110).await;
+        append_scalar_filter_test_data(&mut dataset, schema, 110, 120).await;
+        let fragments = dataset.fragments();
+        assert_eq!(fragments.len(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .with_fragments(vec![fragments[0].clone(), fragments[1].clone()])
+            .filter("a >= 95")
+            .unwrap()
+            .project(&["a"])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut values = batch["a"].as_primitive::<Int32Type>().values().to_vec();
+        values.sort_unstable();
+        assert_eq!(values, (95..110).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_v23_ann_scalar_prefilter_falls_back_only_until_catchup() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        fixture.make_vector_index().await.unwrap();
+        fixture.make_scalar_index().await.unwrap();
+        fixture.dataset = UpdateBuilder::new(Arc::new(fixture.dataset))
+            .update_where("i < 5")
+            .unwrap()
+            .set("i", "1000 + i")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+
+        let scalar_segments = fixture.dataset.load_indices_by_name("i_idx").await.unwrap();
+        let coverage_scanner = fixture.dataset.scan();
+        let coverage_group = coverage_scanner
+            .logical_coverage_group_for_indices(&scalar_segments)
+            .await
+            .unwrap();
+        let fallback_fragments = coverage_scanner
+            .logical_fallback_fragments(
+                &[coverage_group],
+                fixture.dataset.manifest.fragments.as_ref(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback_fragments.len(),
+            1,
+            "a sparse generation hole must route only to its update fragment"
+        );
+
+        let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+        let mut scan = fixture.dataset.scan();
+        scan.nearest("vec", &query, 20)
+            .unwrap()
+            .filter("NOT (i >= 1000)")
+            .unwrap()
+            .prefilter(true)
+            .fast_search()
+            .project(&["i"])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert!(
+            batch["i"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .iter()
+                .all(|value| *value < 1000),
+            "ANN scalar prefilter cannot admit generation-stale rows"
+        );
+
+        let mut before_catchup = fixture.dataset.scan();
+        before_catchup
+            .nearest("vec", &query, 20)
+            .unwrap()
+            .filter("NOT (i >= 1000)")
+            .unwrap()
+            .prefilter(true)
+            .fast_search()
+            .project(&["_distance", ROW_ID])
+            .unwrap();
+        let before_catchup = before_catchup.explain_plan(false).await.unwrap();
+        assert!(
+            before_catchup.contains("LanceScan") || before_catchup.contains("LanceRead"),
+            "generation gap must use a filtered prefilter fallback:\n{before_catchup}"
+        );
+
+        fixture
+            .dataset
+            .optimize_indices(&lance_index::optimize::OptimizeOptions::append())
+            .await
+            .unwrap();
+        let mut after_catchup = fixture.dataset.scan();
+        after_catchup
+            .nearest("vec", &query, 20)
+            .unwrap()
+            .filter("NOT (i >= 1000)")
+            .unwrap()
+            .prefilter(true)
+            .fast_search()
+            .project(&["_distance", ROW_ID])
+            .unwrap();
+        let after_catchup = after_catchup.explain_plan(false).await.unwrap();
+        assert!(
+            after_catchup.contains("ScalarIndexQuery"),
+            "full logical catch-up must restore direct scalar prefiltering:\n{after_catchup}"
+        );
+    }
+
+    async fn externalize_named_index_coverage(dataset: &mut Dataset, index_name: &str) {
+        let indices = dataset.load_indices().await.unwrap();
+        let mut new_indices = Vec::new();
+        let mut removed_indices = Vec::new();
+        for index in indices.iter().filter(|index| index.name == index_name) {
+            let mut externalized = index.clone();
+            externalized
+                .logical_coverage
+                .as_mut()
+                .unwrap()
+                .externalize_detail_over(0)
+                .unwrap();
+            removed_indices.push(index.clone());
+            new_indices.push(externalized);
+        }
+        assert!(
+            !new_indices.is_empty(),
+            "index '{index_name}' was not found"
+        );
+        let transaction = crate::dataset::transaction::TransactionBuilder::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+
+    async fn logical_row_ids_matching(dataset: &Dataset, predicate: &str) -> Vec<u64> {
+        let mut scan = dataset.scan();
+        scan.filter(predicate).unwrap().project(&[ROW_ID]).unwrap();
+        scan.try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec()
+    }
+
+    fn assert_logical_rows_retired(dataset: &Dataset, row_ids: &[u64]) {
+        let retired = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .retired_logical_row_bitmap()
+            .unwrap();
+        for row_id in row_ids {
+            assert!(
+                retired.contains(*row_id),
+                "logical row {row_id} must remain retired after Repack"
+            );
+        }
+    }
+
+    async fn open_with_fresh_session(uri: &str) -> Dataset {
+        let session = Arc::new(crate::session::Session::new(
+            128 * 1024 * 1024,
+            128 * 1024 * 1024,
+            Default::default(),
+        ));
+        crate::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_v23_external_vector_coverage_survives_generation_update() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        fixture.make_vector_index().await.unwrap();
+        externalize_named_index_coverage(&mut fixture.dataset, "idx").await;
+        fixture.dataset = UpdateBuilder::new(Arc::new(fixture.dataset))
+            .update_where("i < 5")
+            .unwrap()
+            .set("vec", "vec")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+
+        let segments = fixture.dataset.load_indices_by_name("idx").await.unwrap();
+        assert!(
+            segments[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .has_external_detail()
+        );
+        let vector_field_id = fixture.dataset.schema().field_id("vec").unwrap();
+        assert!(
+            fixture
+                .dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .generation_regions
+                .iter()
+                .any(|region| region.field_ids.contains(&vector_field_id))
+        );
+
+        let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+        let mut scan = fixture.dataset.scan();
+        scan.nearest("vec", &query, 20)
+            .unwrap()
+            .project(&[ROW_ID])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 20);
+
+        let index = fixture
+            .dataset
+            .load_indices_by_name("idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let external = index
+            .logical_coverage
+            .as_ref()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .clone();
+        let index_id = index.uuid;
+        for (cache_mode, cache_bytes) in [
+            ("normal", 128 * 1024 * 1024),
+            ("cache=0", 0),
+            ("eviction", 1),
+        ] {
+            let session = Arc::new(crate::session::Session::new(
+                cache_bytes,
+                cache_bytes,
+                Default::default(),
+            ));
+            let dataset =
+                crate::dataset::builder::DatasetBuilder::from_uri(fixture.tmp_dir.as_str())
+                    .with_session(session)
+                    .load()
+                    .await
+                    .unwrap();
+            let _ = dataset.object_store.as_ref().io_stats_incremental();
+
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, 20)
+                .unwrap()
+                .project(&[ROW_ID])
+                .unwrap();
+            assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 20);
+
+            let stats = dataset.object_store.as_ref().io_stats_incremental();
+            let coverage_tail_gets =
+                crate::index::coverage_anchor_tail_gets(&stats, index_id, &external);
+            assert_eq!(
+                coverage_tail_gets, 1,
+                "{cache_mode} must hand the planner's coverage anchor reader to both ANN stages; requests: {:#?}",
+                stats.requests
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v23_ann_single_segment_does_not_shortcut_unindexed_filter_rows() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        fixture.make_vector_index().await.unwrap();
+        fixture.append_new_data().await.unwrap();
+        let query = Float32Array::from(vec![0.0; 32]);
+
+        let mut normal = fixture.dataset.scan();
+        normal
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .filter("i = 400")
+            .unwrap()
+            .prefilter(true)
+            .project(&["i", "_distance"])
+            .unwrap();
+        let normal = normal.try_into_batch().await.unwrap();
+        assert_eq!(normal.num_rows(), 1);
+        assert_eq!(normal["i"].as_primitive::<Int32Type>().value(0), 400);
+
+        let mut fast = fixture.dataset.scan();
+        fast.nearest("vec", &query, 10)
+            .unwrap()
+            .filter("i = 400")
+            .unwrap()
+            .prefilter(true)
+            .fast_search()
+            .project(&["i", "_distance"])
+            .unwrap();
+        assert_eq!(fast.try_into_batch().await.unwrap().num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_v23_ann_fallback_respects_fragment_scope() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        fixture.make_segmented_vector_index().await.unwrap();
+        fixture.append_data_with_range(400, 410).await.unwrap();
+        fixture.append_data_with_range(410, 420).await.unwrap();
+        let fragments = fixture.dataset.fragments();
+        assert_eq!(fragments.len(), 4);
+
+        let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+        let mut scanner = fixture.dataset.scan();
+        scanner
+            .nearest("vec", &query, 420)
+            .unwrap()
+            .with_fragments(vec![fragments[0].clone(), fragments[2].clone()])
+            .project(&["i"])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let values = batch["i"].as_primitive::<Int32Type>();
+        assert_eq!(values.len(), 210);
+        assert!(values.iter().all(|value| {
+            value.is_some_and(|value| (0..200).contains(&value) || (400..410).contains(&value))
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_v23_ann_selected_segments_do_not_search_global_holes() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        let segment_ids = fixture.make_segmented_vector_index().await.unwrap();
+        fixture.append_data_with_range(400, 410).await.unwrap();
+        fixture.append_data_with_range(410, 420).await.unwrap();
+
+        let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+        let mut scanner = fixture.dataset.scan();
+        scanner
+            .nearest("vec", &query, 420)
+            .unwrap()
+            .with_index_segments(vec![segment_ids[0]])
+            .unwrap()
+            .project(&["i"])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let values = batch["i"].as_primitive::<Int32Type>();
+        assert_eq!(values.len(), 200);
+        assert!(
+            values
+                .iter()
+                .all(|value| value.is_some_and(|value| (0..200).contains(&value)))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_external_fts_coverage_survives_generation_update() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        fixture.make_fts_index().await.unwrap();
+        externalize_named_index_coverage(&mut fixture.dataset, "s_idx").await;
+        fixture.dataset = UpdateBuilder::new(Arc::new(fixture.dataset))
+            .update_where("i < 5")
+            .unwrap()
+            .set("s", "'needle'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+
+        let segments = fixture.dataset.load_indices_by_name("s_idx").await.unwrap();
+        assert!(
+            segments[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .has_external_detail()
+        );
+        let mut scan = fixture.dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new("needle".to_string()))
+            .unwrap()
+            .project(&["i"])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut ids = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..5).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_v23_external_fts_coverage_reader_is_reused() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        let params = InvertedIndexParams::default()
+            .with_position(true)
+            .remove_stop_words(false);
+        let fragment_ids = fixture
+            .dataset
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let expected_segments = fragment_ids.len();
+        let mut segments = Vec::with_capacity(expected_segments);
+        for fragment_id in fragment_ids {
+            segments.push(
+                fixture
+                    .dataset
+                    .create_index_builder(&["s"], IndexType::Inverted, &params)
+                    .name("s_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(
+            segments.len() > 1,
+            "the test requires multiple FTS segments"
+        );
+        fixture
+            .dataset
+            .commit_existing_index_segments("s_idx", "s", segments)
+            .await
+            .unwrap();
+        externalize_named_index_coverage(&mut fixture.dataset, "s_idx").await;
+        fixture.dataset = UpdateBuilder::new(Arc::new(fixture.dataset))
+            .update_where("i < 5")
+            .unwrap()
+            .set("s", "'needle exact'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+
+        let anchors = fixture
+            .dataset
+            .load_indices_by_name("s_idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|segment| {
+                let external = segment
+                    .logical_coverage
+                    .as_ref()
+                    .and_then(|coverage| coverage.external.as_ref())
+                    .expect("externalized segment must have a coverage anchor")
+                    .clone();
+                (segment.uuid, external)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(anchors.len(), expected_segments);
+
+        for (case, query, fast_search, expected_rows) in [
+            (
+                "match",
+                FullTextSearchQuery::new_query(
+                    MatchQuery::new("needle".to_string())
+                        .with_column(Some("s".to_string()))
+                        .into(),
+                ),
+                false,
+                5,
+            ),
+            (
+                "phrase",
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new("needle exact".to_string())
+                        .with_column(Some("s".to_string()))
+                        .into(),
+                ),
+                false,
+                5,
+            ),
+            (
+                "phrase-fast-search",
+                FullTextSearchQuery::new_query(
+                    PhraseQuery::new("needle exact".to_string())
+                        .with_column(Some("s".to_string()))
+                        .into(),
+                ),
+                true,
+                0,
+            ),
+        ] {
+            let session = Arc::new(crate::session::Session::new(
+                128 * 1024 * 1024,
+                128 * 1024 * 1024,
+                Default::default(),
+            ));
+            let dataset =
+                crate::dataset::builder::DatasetBuilder::from_uri(fixture.tmp_dir.as_str())
+                    .with_session(session)
+                    .load()
+                    .await
+                    .unwrap();
+            let _ = dataset.object_store.as_ref().io_stats_incremental();
+
+            let mut scan = dataset.scan();
+            scan.full_text_search(query)
+                .unwrap()
+                .project(&["i"])
+                .unwrap();
+            if fast_search {
+                scan.fast_search();
+            }
+            assert_eq!(
+                scan.try_into_batch().await.unwrap().num_rows(),
+                expected_rows,
+                "unexpected result count for {case}"
+            );
+
+            let stats = dataset.object_store.as_ref().io_stats_incremental();
+            for (index_id, external) in &anchors {
+                assert_eq!(
+                    crate::index::coverage_anchor_tail_gets(&stats, *index_id, external),
+                    1,
+                    "{case} must reuse segment {index_id}'s coverage anchor reader; requests: {:#?}",
+                    stats.requests
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v23_repack_retired_rows_filter_ann_before_top_k() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        let params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, IvfBuildParams::new(1));
+        fixture
+            .dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let deleted_row_ids = logical_row_ids_matching(&fixture.dataset, "i % 80 = 0").await;
+        assert_eq!(deleted_row_ids.len(), 5);
+        fixture.dataset.delete("i % 80 = 0").await.unwrap();
+        maintain_row_addresses(&mut fixture.dataset, RowAddressMaintenanceOptions::repack())
+            .await
+            .unwrap();
+        assert_logical_rows_retired(&fixture.dataset, &deleted_row_ids);
+
+        let dataset = open_with_fresh_session(fixture.tmp_dir.as_str()).await;
+        let query = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, 1)
+            .unwrap()
+            .nprobes(1)
+            .fast_search()
+            .project(&["i", ROW_ID])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0) % 80, 1);
+        assert!(!deleted_row_ids.contains(&batch[ROW_ID].as_primitive::<UInt64Type>().value(0)));
+    }
+
+    #[tokio::test]
+    async fn test_v23_repack_retired_rows_filter_fts_before_top_k() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        for (predicate, value) in [
+            ("i = 0", "'needle needle needle needle'"),
+            ("i = 1", "'needle'"),
+        ] {
+            fixture.dataset = UpdateBuilder::new(Arc::new(fixture.dataset))
+                .update_where(predicate)
+                .unwrap()
+                .set("s", value)
+                .unwrap()
+                .build()
+                .unwrap()
+                .execute()
+                .await
+                .unwrap()
+                .new_dataset
+                .as_ref()
+                .clone();
+        }
+        fixture.make_fts_index().await.unwrap();
+
+        let deleted_row_ids = logical_row_ids_matching(&fixture.dataset, "i = 0").await;
+        assert_eq!(deleted_row_ids.len(), 1);
+        fixture.dataset.delete("i = 0").await.unwrap();
+        maintain_row_addresses(&mut fixture.dataset, RowAddressMaintenanceOptions::repack())
+            .await
+            .unwrap();
+        assert_logical_rows_retired(&fixture.dataset, &deleted_row_ids);
+
+        let dataset = open_with_fresh_session(fixture.tmp_dir.as_str()).await;
+        let query = FullTextSearchQuery::new("needle".to_string())
+            .with_column("s".to_string())
+            .unwrap()
+            .limit(Some(1));
+        let mut scan = dataset.scan();
+        scan.full_text_search(query)
+            .unwrap()
+            .fast_search()
+            .project(&["i", ROW_ID])
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), 1);
+        assert!(!deleted_row_ids.contains(&batch[ROW_ID].as_primitive::<UInt64Type>().value(0)));
+    }
+
+    #[tokio::test]
+    async fn test_v23_fts_sparse_update_after_compaction_uses_logical_take() {
+        let mut fixture = TestVectorDataset::new(LanceFileVersion::V2_3, false)
+            .await
+            .unwrap();
+        fixture.make_fts_index().await.unwrap();
+        fixture.dataset = UpdateBuilder::new(Arc::new(fixture.dataset))
+            .update_where("i < 5")
+            .unwrap()
+            .set("s", "'needle'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        compact_files(
+            &mut fixture.dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.dataset.fragments().len(), 1);
+
+        let mut scan = fixture.dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new("needle".to_string()))
+            .unwrap()
+            .project(&["i"])
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("LogicalRowIdRanges: ranges=1, rows=5"),
+            "the FTS fallback must take only the sparse logical generation hole:\n{plan}"
+        );
+
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut ids = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..5).collect::<Vec<_>>());
     }
 
     #[rstest]

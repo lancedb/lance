@@ -9,7 +9,7 @@ use super::{
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
 use super::{
-    builder::{IvfIndexBuilder, index_type_string},
+    builder::{IvfIndexBuilder, index_type_string, persist_logical_coverage_artifact},
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
@@ -110,7 +110,10 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
-use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata, RowReferenceDomain};
+use lance_table::format::{
+    IndexFile, IndexMetadata as TableIndexMetadata, LogicalIndexCoverage,
+    LogicalIndexCoverageArtifact, RowReferenceDomain,
+};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
@@ -395,6 +398,7 @@ pub(crate) async fn optimize_vector_indices(
     vector_column: &str,
     logical_index: &LogicalIvfView<'_>,
     options: &OptimizeOptions,
+    logical_coverage: Option<LogicalIndexCoverage>,
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     let existing_indices = logical_index.indices().cloned().collect::<Vec<_>>();
     // Sanity check the indices
@@ -413,8 +417,15 @@ pub(crate) async fn optimize_vector_indices(
             vector_column,
             &existing_indices,
             options,
+            logical_coverage,
         )
         .await;
+    }
+
+    if logical_coverage.is_some() {
+        return Err(Error::not_supported(
+            "exact logical-selection catch-up requires the v3 vector index format",
+        ));
     }
 
     let new_uuid = Uuid::new_v4();
@@ -485,6 +496,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn VectorIndex>],
     options: &OptimizeOptions,
+    logical_coverage: Option<LogicalIndexCoverage>,
 ) -> Result<(Uuid, usize, Vec<IndexFile>)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
@@ -527,6 +539,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_logical_coverage(logical_coverage.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -545,6 +558,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_logical_coverage(logical_coverage.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -566,6 +580,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_logical_coverage(logical_coverage.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -586,6 +601,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_logical_coverage(logical_coverage.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -606,6 +622,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_logical_coverage(logical_coverage.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -625,6 +642,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_logical_coverage(logical_coverage.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -646,6 +664,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_logical_coverage(logical_coverage.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -664,6 +683,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(existing_indices.clone())
+                .with_logical_coverage(logical_coverage.clone())
                 .with_progress(options.progress.clone())
                 .shuffle_data_input(unindexed)
                 .build()
@@ -685,6 +705,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_logical_coverage(logical_coverage.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -705,6 +726,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(existing_indices.clone())
+            .with_logical_coverage(logical_coverage.clone())
             .with_progress(options.progress.clone())
             .shuffle_data_input(unindexed)
             .build()
@@ -2174,14 +2196,14 @@ async fn write_ivf_hnsw_file(
 
 /// Merge one caller-defined group of source segments into a single segment.
 pub(crate) async fn merge_segments(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
+    dataset: &Dataset,
     segments: Vec<TableIndexMetadata>,
+    logical_coverage: Option<LogicalIndexCoverage>,
 ) -> Result<TableIndexMetadata> {
     merge_segments_with_progress(
-        object_store,
-        indices_dir,
+        dataset,
         segments,
+        logical_coverage,
         lance_index::progress::noop_progress(),
     )
     .await
@@ -2190,9 +2212,9 @@ pub(crate) async fn merge_segments(
 /// Merge one caller-defined group of source segments into a single segment and
 /// report progress through the provided callback.
 pub(crate) async fn merge_segments_with_progress(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
+    dataset: &Dataset,
     segments: Vec<TableIndexMetadata>,
+    logical_coverage: Option<LogicalIndexCoverage>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
@@ -2219,6 +2241,11 @@ pub(crate) async fn merge_segments_with_progress(
             "vector segment merge cannot mix physical and logical coverage",
         ));
     }
+    if logical != logical_coverage.is_some() {
+        return Err(Error::invalid_input(
+            "vector segment merge logical coverage does not match its source row-reference domain",
+        ));
+    }
     for segment in &segments {
         if !logical {
             let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
@@ -2233,13 +2260,26 @@ pub(crate) async fn merge_segments_with_progress(
 
     let index_version = infer_source_index_version(&segments)?;
     let segment_uuid = Uuid::new_v4();
+    let object_store = dataset.object_store.as_ref();
+    let indices_dir = dataset.indices_dir();
     let final_dir = indices_dir.clone().join(segment_uuid.to_string());
+    let logical_coverage_artifact = logical_coverage
+        .map(|coverage| {
+            crate::index::build_logical_index_coverage_artifact_from_exact(
+                dataset,
+                segment_uuid,
+                &merged_segment.fields,
+                coverage,
+            )
+        })
+        .transpose()?;
     let files = merge_segments_to_dir(
         object_store,
-        indices_dir,
+        &indices_dir,
         &final_dir,
         &segments,
         None,
+        logical_coverage_artifact.as_ref(),
         progress,
     )
     .await?;
@@ -2268,6 +2308,7 @@ async fn merge_segments_to_dir(
     final_dir: &Path,
     segments: &[TableIndexMetadata],
     _requested_index_type: Option<IndexType>,
+    logical_coverage_artifact: Option<&LogicalIndexCoverageArtifact>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
     reset_final_segment_dir(object_store, final_dir).await?;
@@ -2309,6 +2350,7 @@ async fn merge_segments_to_dir(
         final_dir,
         None,
         &source_index_paths,
+        logical_coverage_artifact,
         progress.clone(),
     )
     .await?;
@@ -2342,6 +2384,7 @@ async fn write_root_vector_index_from_auxiliary(
     index_dir: &Path,
     requested_index_type: Option<IndexType>,
     centroid_source_index_paths: &[Path],
+    logical_coverage_artifact: Option<&LogicalIndexCoverageArtifact>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<IndexFile> {
     let aux_path = index_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
@@ -2466,6 +2509,9 @@ async fn write_root_vector_index_from_auxiliary(
             ..Default::default()
         },
     )?;
+    if let Some(artifact) = logical_coverage_artifact {
+        persist_logical_coverage_artifact(&mut v2_writer, artifact).await?;
+    }
 
     // For HNSW variants, attach per-partition metadata list; for FLAT-based
     // variants, attach minimal placeholder metadata.

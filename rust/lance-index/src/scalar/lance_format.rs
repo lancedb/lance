@@ -51,12 +51,40 @@ struct LogicalIndexCoverageWrite {
     object_id: Uuid,
 }
 
-struct OpenedCoverageAnchor(Arc<dyn IndexReader>);
+/// A strongly-held index file opened while resolving logical coverage.
+///
+/// The typed current-format reader lets vector execution reuse the same footer
+/// and retained global buffers. Scalar execution uses the type-erased reader.
+#[derive(Clone)]
+pub struct OpenedIndexFile {
+    reader: Arc<dyn IndexReader>,
+    current_reader: Option<Arc<current_reader::FileReader>>,
+}
 
-impl DeepSizeOf for OpenedCoverageAnchor {
+impl std::fmt::Debug for OpenedIndexFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedIndexFile")
+            .field("current_format", &self.current_reader.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OpenedIndexFile {
+    /// Return the format-agnostic index reader.
+    pub fn reader(&self) -> Arc<dyn IndexReader> {
+        self.reader.clone()
+    }
+
+    /// Return the current-format reader when the file is not legacy.
+    pub fn current_reader(&self) -> Option<Arc<current_reader::FileReader>> {
+        self.current_reader.clone()
+    }
+}
+
+impl DeepSizeOf for OpenedIndexFile {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        4096 + self.0.schema().deep_size_of_children(context)
-            + self.0.retained_global_buffer_bytes()
+        4096 + self.reader.schema().deep_size_of_children(context)
+            + self.reader.retained_global_buffer_bytes()
     }
 }
 
@@ -65,7 +93,7 @@ struct OpenedCoverageAnchorKey {
 }
 
 impl CacheKey for OpenedCoverageAnchorKey {
-    type ValueType = OpenedCoverageAnchor;
+    type ValueType = OpenedIndexFile;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.path)
@@ -109,6 +137,7 @@ pub struct LanceIndexStore {
     io_priority: u64,
     logical_coverage_write: Option<Arc<LogicalIndexCoverageWrite>>,
     logical_coverage_read: Option<LogicalIndexCoverageFile>,
+    preopened_index_files: Arc<HashMap<String, OpenedIndexFile>>,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -158,6 +187,7 @@ impl LanceIndexStore {
             io_priority: 0,
             logical_coverage_write: None,
             logical_coverage_read: None,
+            preopened_index_files: Arc::new(HashMap::new()),
         }
     }
 
@@ -186,6 +216,16 @@ impl LanceIndexStore {
         reference: LogicalIndexCoverageFile,
     ) -> Self {
         self.logical_coverage_read = Some(reference);
+        self
+    }
+
+    /// Reuse an index file already opened by logical-coverage planning.
+    pub fn with_preopened_index_file(
+        mut self,
+        path: impl Into<String>,
+        opened: OpenedIndexFile,
+    ) -> Self {
+        Arc::make_mut(&mut self.preopened_index_files).insert(path.into(), opened);
         self
     }
 
@@ -221,7 +261,7 @@ impl LanceIndexStore {
         .map_err(|err| Error::invalid_input(format!("invalid index file path {name:?}: {err}")))
     }
 
-    async fn open_index_file_uncached(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+    async fn open_index_file_uncached(&self, name: &str) -> Result<OpenedIndexFile> {
         let path = self.index_file_path(name)?;
         let cached_size = self
             .file_sizes
@@ -254,7 +294,11 @@ impl LanceIndexStore {
                     .with_key_prefix(name)
                     .insert_with_key(&CoverageAnchorMetadataKey, reader.metadata().clone())
                     .await;
-                Ok(Arc::new(reader))
+                let reader = Arc::new(reader);
+                Ok(OpenedIndexFile {
+                    reader: reader.clone(),
+                    current_reader: Some(reader),
+                })
             }
             Err(e) => {
                 if let Error::VersionConflict { .. } = e {
@@ -265,12 +309,39 @@ impl LanceIndexStore {
                         Some(&self.metadata_cache),
                     )
                     .await?;
-                    Ok(Arc::new(file_reader))
+                    Ok(OpenedIndexFile {
+                        reader: Arc::new(file_reader),
+                        current_reader: None,
+                    })
                 } else {
                     Err(e)
                 }
             }
         }
+    }
+
+    /// Open an index file while retaining its concrete current-format reader.
+    pub async fn open_index_file_handle(&self, name: &str) -> Result<OpenedIndexFile> {
+        if let Some(opened) = self.preopened_index_files.get(name) {
+            return Ok(opened.clone());
+        }
+        if self
+            .logical_coverage_read
+            .as_ref()
+            .is_some_and(|reference| reference.path == name)
+        {
+            return self
+                .metadata_cache
+                .get_or_insert_with_key(
+                    OpenedCoverageAnchorKey {
+                        path: name.to_string(),
+                    },
+                    || async { self.open_index_file_uncached(name).await },
+                )
+                .await
+                .map(|opened| opened.as_ref().clone());
+        }
+        self.open_index_file_uncached(name).await
     }
 }
 
@@ -652,27 +723,7 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        if self
-            .logical_coverage_read
-            .as_ref()
-            .is_some_and(|reference| reference.path == name)
-        {
-            let cached = self
-                .metadata_cache
-                .get_or_insert_with_key(
-                    OpenedCoverageAnchorKey {
-                        path: name.to_string(),
-                    },
-                    || async {
-                        Ok(OpenedCoverageAnchor(
-                            self.open_index_file_uncached(name).await?,
-                        ))
-                    },
-                )
-                .await?;
-            return Ok(cached.0.clone());
-        }
-        self.open_index_file_uncached(name).await
+        Ok(self.open_index_file_handle(name).await?.reader())
     }
 
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<IndexFile> {

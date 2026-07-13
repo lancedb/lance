@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
@@ -22,13 +22,15 @@ use lance_datafusion::exec::execute_plan;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_table::format::{
-    ExplicitMapDestination, ExplicitMapPage, ExplicitMapRowAddressPlacement, Fragment,
-    LogicalRowAddressSelection, ReplacedContentGeneration, RowAddressLayoutDelta,
-    RowAddressLogicalDomain, RowAddressPlacementDelta, RowAddressPlacementKind,
-    RowAddressSourceFloor, RowAddressTargetFragment, RowAddressTargetRange, RowDatasetVersionMeta,
-    RowSequenceFingerprintBuilder, SparseSelectionSource,
+    ExplicitMapDestination, ExplicitMapPage, ExplicitMapRowAddressPlacement, ExplicitMapRowIdPage,
+    Fragment, LogicalRowAddressRange, LogicalRowAddressSelection, ReplacedContentGeneration,
+    RowAddressLayoutDelta, RowAddressLogicalDomain, RowAddressPlacementDelta,
+    RowAddressPlacementKind, RowAddressSourceFloor, RowAddressTargetFragment,
+    RowAddressTargetRange, RowDatasetVersionMeta, RowSequenceFingerprintBuilder,
+    SparseSelectionSource, fingerprint_explicit_map_u64_page,
 };
 use object_store::path::Path;
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,6 +40,7 @@ use super::super::scanner::ColumnOrdering;
 use super::super::transaction::RowAddressManifestApplyContext;
 use super::super::transaction::{
     Operation, RewriteGroup, TransactionBuilder, generation_region_can_retire,
+    with_strict_full_ordered_rewrite_property,
 };
 use super::super::utils::{CapturedRowIds, make_rowid_capture_stream};
 use super::super::write::{
@@ -61,6 +64,9 @@ fn explicit_object_path(base: &Path, relative_path: &str) -> Path {
 pub enum RowAddressMaintenanceMode {
     /// Rewrite in logical-address order and require an inline fast-path layout.
     NormalizePlacement,
+    /// Cluster in the requested order when the resulting source-contiguous
+    /// extents fit the inline fast-path layout budget.
+    BoundedRecluster { ordering: Vec<ColumnOrdering> },
     /// Rewrite in logical-address order and externalize the permutation.
     Repack,
     /// Rewrite in the requested global order and externalize the permutation.
@@ -78,14 +84,16 @@ pub struct RowAddressMaintenanceOptions {
     pub target_rows_per_fragment: usize,
     /// Maximum rows in one writer batch group.
     pub max_rows_per_group: usize,
-    /// Optional physical file-size limit.  This is rejected by
-    /// [`RowAddressMaintenanceMode::NormalizePlacement`] because exact
-    /// preflight requires deterministic row-count boundaries.
+    /// Optional physical file-size limit.  This is rejected by inline
+    /// maintenance because exact preflight requires deterministic row-count
+    /// boundaries.
     pub max_bytes_per_file: Option<usize>,
     /// Optional scan batch size.
     pub batch_size: Option<usize>,
     /// Optional input scan I/O buffer size.
     pub io_buffer_size: Option<u64>,
+    /// Optional properties recorded on the maintenance transaction.
+    pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
 
 impl RowAddressMaintenanceOptions {
@@ -93,6 +101,14 @@ impl RowAddressMaintenanceOptions {
     pub fn normalize_placement() -> Self {
         Self {
             mode: RowAddressMaintenanceMode::NormalizePlacement,
+            ..Self::default()
+        }
+    }
+
+    /// Create options for admitted source-contiguous clustering.
+    pub fn bounded_recluster(ordering: Vec<ColumnOrdering>) -> Self {
+        Self {
+            mode: RowAddressMaintenanceMode::BoundedRecluster { ordering },
             ..Self::default()
         }
     }
@@ -131,6 +147,7 @@ impl Default for RowAddressMaintenanceOptions {
             max_bytes_per_file: None,
             batch_size: None,
             io_buffer_size: None,
+            transaction_properties: None,
         }
     }
 }
@@ -163,23 +180,28 @@ fn validate_options(dataset: &Dataset, options: &RowAddressMaintenanceOptions) -
             "row-address maintenance row limits must be greater than zero",
         ));
     }
-    if matches!(options.mode, RowAddressMaintenanceMode::NormalizePlacement)
-        && options.max_bytes_per_file.is_some()
+    if matches!(
+        options.mode,
+        RowAddressMaintenanceMode::NormalizePlacement
+            | RowAddressMaintenanceMode::BoundedRecluster { .. }
+    ) && options.max_bytes_per_file.is_some()
     {
         return Err(Error::invalid_input(
-            "NormalizePlacement requires row-count-only output boundaries so exact Delta/W preflight can finish before remote writes; max_bytes_per_file is not supported",
+            "inline row-address maintenance requires row-count-only output boundaries so exact Delta/W preflight can finish before remote writes; max_bytes_per_file is not supported",
         ));
     }
-    if let RowAddressMaintenanceMode::Recluster { ordering } = &options.mode {
+    if let RowAddressMaintenanceMode::BoundedRecluster { ordering }
+    | RowAddressMaintenanceMode::Recluster { ordering } = &options.mode
+    {
         if ordering.is_empty() {
             return Err(Error::invalid_input(
-                "Recluster requires at least one ordering column",
+                "clustering requires at least one ordering column",
             ));
         }
         for column in ordering {
             if column.column_name == ROW_ID || column.column_name == ROW_ADDR {
                 return Err(Error::invalid_input(
-                    "Recluster ordering must use user columns; _rowid is appended as a deterministic tie-breaker",
+                    "clustering ordering must use user columns; _rowid is appended as a deterministic tie-breaker",
                 ));
             }
             if dataset.schema().field(&column.column_name).is_none() {
@@ -221,7 +243,8 @@ async fn sorted_maintenance_stream(
     scanner.with_row_id().scan_in_order(false);
     let mut plan = scanner.create_plan().await?;
     let mut ordering = match &options.mode {
-        RowAddressMaintenanceMode::Recluster { ordering } => ordering
+        RowAddressMaintenanceMode::BoundedRecluster { ordering }
+        | RowAddressMaintenanceMode::Recluster { ordering } => ordering
             .iter()
             .map(|column| {
                 Ok(PhysicalSortExpr {
@@ -359,7 +382,202 @@ async fn normalize_delta(
     Ok(delta)
 }
 
-async fn preflight_normalize(
+fn append_bounded_output(
+    router: &lance_table::format::RowAddressRouter,
+    rows: &[u64],
+    target: RowAddressTargetRange,
+    source_domains: &mut BTreeMap<u32, RowAddressLogicalDomain>,
+    delta: &mut RowAddressLayoutDelta,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Err(Error::invalid_input(
+            "bounded clustering output run must not be empty",
+        ));
+    }
+    if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::invalid_input(
+            "bounded clustering output run must be in strict logical source order",
+        ));
+    }
+
+    let mut ranges = Vec::<LogicalRowAddressRange>::new();
+    let mut stats = BTreeMap::<u32, (u64, u32, u32)>::new();
+    for raw in rows {
+        let address = LogicalRowAddress::try_from(*raw)?;
+        let logical_fragment_id = address.logical_fragment_id();
+        let slot = address.immutable_slot();
+        if let Some(previous) = ranges.last_mut()
+            && previous.logical_fragment_id == logical_fragment_id
+            && previous.end_slot == slot
+        {
+            previous.end_slot = slot
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("logical row-address slot overflow"))?;
+        } else {
+            ranges.push(LogicalRowAddressRange::new(
+                logical_fragment_id,
+                slot,
+                slot.checked_add(1)
+                    .ok_or_else(|| Error::invalid_input("logical row-address slot overflow"))?,
+            ));
+        }
+        stats
+            .entry(logical_fragment_id)
+            .and_modify(|(count, first, last)| {
+                *count += 1;
+                *first = (*first).min(slot);
+                *last = (*last).max(slot);
+            })
+            .or_insert((1, slot, slot));
+    }
+
+    let mut all_domains_full = true;
+    for (logical_fragment_id, (count, first, last)) in &stats {
+        let domain = router
+            .logical_domain(*logical_fragment_id)?
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "bounded clustering emitted unknown logical fragment {logical_fragment_id}"
+                ))
+            })?;
+        if source_domains
+            .insert(*logical_fragment_id, domain)
+            .is_some_and(|previous| previous != domain)
+        {
+            return Err(Error::invalid_input(format!(
+                "logical fragment {logical_fragment_id} has inconsistent source metadata"
+            )));
+        }
+        all_domains_full &= *count == domain.slot_count as u64
+            && *first == 0
+            && last.checked_add(1) == Some(domain.slot_count);
+    }
+
+    let selection = LogicalRowAddressSelection::from_ranges(ranges.clone())?;
+    let mut fingerprint = RowSequenceFingerprintBuilder::new(target);
+    for range in ranges {
+        fingerprint.update_range(range)?;
+    }
+    let output_cardinality = rows.len() as u64;
+    let placement_kind = if stats.len() > 1 && all_domains_full {
+        RowAddressPlacementKind::PackedRun
+    } else if stats.len() == 1 {
+        RowAddressPlacementKind::Selected
+    } else {
+        RowAddressPlacementKind::SparseSelection
+    };
+    delta.placements.push(RowAddressPlacementDelta {
+        source_selections: vec![selection],
+        target,
+        placement_kind,
+        output_cardinality,
+        output_row_sequence_fingerprint: fingerprint.finish(output_cardinality)?,
+    });
+    Ok(())
+}
+
+async fn bounded_recluster_delta(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    row_ids: &[u64],
+) -> Result<RowAddressLayoutDelta> {
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .expect("validated storage-version-2.3 layout");
+    let router = dataset.row_address_router()?;
+    let mut delta = RowAddressLayoutDelta {
+        expected_layout_fingerprint: layout.fingerprint.clone(),
+        ..RowAddressLayoutDelta::default()
+    };
+    let mut source_domains = BTreeMap::new();
+    let mut cursor = 0_usize;
+    for (ordinal, fragment) in fragments.iter().enumerate() {
+        let row_count = fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input("bounded clustering output fragment is missing physical_rows")
+        })?;
+        let end = cursor
+            .checked_add(row_count)
+            .ok_or_else(|| Error::invalid_input("bounded clustering row count overflow"))?;
+        let fragment_rows = row_ids.get(cursor..end).ok_or_else(|| {
+            Error::invalid_input(
+                "bounded clustering output fragments exceed the captured logical row sequence",
+            )
+        })?;
+        let fragment_ordinal = u32::try_from(ordinal)
+            .map_err(|_| Error::invalid_input("bounded clustering fragment ordinal exceeds u32"))?;
+        let mut run_start = 0_usize;
+        for run_end in 1..=fragment_rows.len() {
+            let ends_run = run_end == fragment_rows.len()
+                || fragment_rows[run_end] <= fragment_rows[run_end - 1];
+            if !ends_run {
+                continue;
+            }
+            let target_start = u32::try_from(run_start).map_err(|_| {
+                Error::invalid_input("bounded clustering target offset exceeds u32")
+            })?;
+            let target_end = u32::try_from(run_end).map_err(|_| {
+                Error::invalid_input("bounded clustering target offset exceeds u32")
+            })?;
+            append_bounded_output(
+                &router,
+                &fragment_rows[run_start..run_end],
+                RowAddressTargetRange {
+                    fragment: RowAddressTargetFragment::NewFragmentOrdinal(fragment_ordinal),
+                    start_offset: target_start,
+                    end_offset: target_end,
+                },
+                &mut source_domains,
+                &mut delta,
+            )?;
+            run_start = run_end;
+        }
+        cursor = end;
+    }
+    if cursor != row_ids.len() {
+        return Err(Error::invalid_input(
+            "captured logical row sequence exceeds bounded clustering output fragments",
+        ));
+    }
+
+    if let Some(retired_row_ids) =
+        retired_logical_row_ids(dataset, &dataset.manifest.fragments).await?
+    {
+        let retired = lance_table::rowids::read_row_ids(&retired_row_ids)?;
+        let mut bitmap = RoaringTreemap::new();
+        for raw in retired.iter() {
+            let address = LogicalRowAddress::try_from(raw)?;
+            let domain = router
+                .logical_domain(address.logical_fragment_id())?
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "bounded clustering retired unknown logical fragment {}",
+                        address.logical_fragment_id()
+                    ))
+                })?;
+            if source_domains
+                .insert(address.logical_fragment_id(), domain)
+                .is_some_and(|previous| previous != domain)
+            {
+                return Err(Error::invalid_input(format!(
+                    "logical fragment {} has inconsistent source metadata",
+                    address.logical_fragment_id()
+                )));
+            }
+            bitmap.insert(raw);
+        }
+        if !bitmap.is_empty() {
+            delta
+                .retired_selections
+                .push(LogicalRowAddressSelection::from_bitmap(bitmap)?);
+        }
+    }
+    delta.source_domains = source_domains.into_values().collect();
+    Ok(delta)
+}
+
+async fn preflight_inline_rewrite(
     dataset: &Dataset,
     planned: Vec<Fragment>,
     delta: RowAddressLayoutDelta,
@@ -413,7 +631,7 @@ async fn preflight_normalize(
     transaction.build_manifest_with_row_address_context(
         Some(dataset.manifest.as_ref()),
         indices.as_ref().clone(),
-        "normalize-placement-preflight.txn",
+        "inline-row-address-rewrite-preflight.txn",
         &Default::default(),
         Some(&context),
     )?;
@@ -470,7 +688,7 @@ async fn write_u64_file(
     relative_path: &str,
     names: &[&str],
     columns: &[&[u64]],
-) -> Result<u64> {
+) -> Result<(u64, Vec<ExplicitMapRowIdPage>)> {
     let row_count = columns.first().map_or(0, |column| column.len());
     if names.is_empty()
         || names.len() != columns.len()
@@ -500,8 +718,18 @@ async fn write_u64_file(
             ..Default::default()
         },
     )?;
+    let mut pages = Vec::with_capacity(row_count.div_ceil(EXPLICIT_ROW_ADDRESS_PAGE_ROWS));
     for row_start in (0..row_count).step_by(EXPLICIT_ROW_ADDRESS_PAGE_ROWS) {
         let row_end = (row_start + EXPLICIT_ROW_ADDRESS_PAGE_ROWS).min(row_count);
+        let page_columns = columns
+            .iter()
+            .map(|column| &column[row_start..row_end])
+            .collect::<Vec<_>>();
+        pages.push(ExplicitMapRowIdPage {
+            row_start: row_start as u64,
+            row_count: (row_end - row_start) as u64,
+            content_fingerprint: fingerprint_explicit_map_u64_page(&page_columns)?,
+        });
         let arrays = columns
             .iter()
             .map(|column| {
@@ -511,7 +739,7 @@ async fn write_u64_file(
         let batch = RecordBatch::try_new(schema.clone(), arrays)?;
         writer.write_batch(&batch).await?;
     }
-    Ok(writer.finish().await?.size_bytes)
+    Ok((writer.finish().await?.size_bytes, pages))
 }
 
 async fn cleanup_explicit_paths(dataset: &Dataset, paths: &[Path]) {
@@ -544,7 +772,7 @@ async fn write_explicit_map(
             let relative_path =
                 format!("{EXPLICIT_ROW_ADDRESS_DIR}/{operation_id}-destination-{ordinal}.lance");
             created_paths.push(explicit_object_path(&dataset.base, &relative_path));
-            let size =
+            let (size, row_id_pages) =
                 write_u64_file(dataset, &relative_path, &[ROW_ID], &[fragment_row_ids]).await?;
             total_bytes += size;
             let physical_fragment_id = u32::try_from(fragment.id)
@@ -566,6 +794,7 @@ async fn write_explicit_map(
                 row_count,
                 row_id_file_path: relative_path,
                 row_id_file_size: size,
+                row_id_pages,
             });
             cursor = end;
         }
@@ -586,25 +815,26 @@ async fn write_explicit_map(
                 "ExplicitMap requires at least one live row",
             ));
         }
-        let pages = logical
-            .chunks(EXPLICIT_ROW_ADDRESS_PAGE_ROWS)
-            .enumerate()
-            .map(|(page_index, rows)| ExplicitMapPage {
-                first_logical_address: rows[0],
-                last_logical_address: rows[rows.len() - 1],
-                row_start: (page_index * EXPLICIT_ROW_ADDRESS_PAGE_ROWS) as u64,
-                row_count: rows.len() as u64,
-            })
-            .collect::<Vec<_>>();
         let object_path = format!("{EXPLICIT_ROW_ADDRESS_DIR}/{operation_id}-locator.lance");
         created_paths.push(explicit_object_path(&dataset.base, &object_path));
-        let object_size = write_u64_file(
+        let (object_size, locator_content_pages) = write_u64_file(
             dataset,
             &object_path,
             &[ROW_ID, ROW_ADDR],
             &[logical.as_slice(), physical.as_slice()],
         )
         .await?;
+        let pages = logical
+            .chunks(EXPLICIT_ROW_ADDRESS_PAGE_ROWS)
+            .zip(locator_content_pages)
+            .map(|(rows, content)| ExplicitMapPage {
+                first_logical_address: rows[0],
+                last_logical_address: rows[rows.len() - 1],
+                row_start: content.row_start,
+                row_count: content.row_count,
+                content_fingerprint: content.content_fingerprint,
+            })
+            .collect::<Vec<_>>();
         total_bytes += object_size;
         if domains.is_empty() {
             return Err(Error::invalid_input("ExplicitMap requires source domains"));
@@ -688,8 +918,21 @@ fn explicit_delta(
     for row_id in row_ids {
         fingerprint.update(LogicalRowAddress::try_from(*row_id)?)?;
     }
+    let mut domain_rows = RoaringTreemap::new();
+    for domain in &domains {
+        let start = u64::from(domain.logical_fragment_id) << 32;
+        domain_rows.insert_range(start..start + u64::from(domain.slot_count));
+    }
+    let live_rows = row_ids.iter().copied().collect::<RoaringTreemap>();
+    if !live_rows.is_subset(&domain_rows) {
+        return Err(Error::invalid_input(
+            "ExplicitMap output contains a row outside its source domains",
+        ));
+    }
+    let mut replacement_retirements = domain_rows;
+    replacement_retirements -= live_rows;
     let source_selection = LogicalRowAddressSelection::from_full_domains(&domains)?;
-    Ok(RowAddressLayoutDelta {
+    let mut delta = RowAddressLayoutDelta {
         source_domains: domains,
         placements: vec![RowAddressPlacementDelta {
             source_selections: vec![source_selection],
@@ -701,7 +944,15 @@ fn explicit_delta(
         expected_layout_fingerprint: layout.fingerprint.clone(),
         explicit_map_placements: BTreeMap::from([(0, placement)]),
         ..RowAddressLayoutDelta::default()
-    })
+    };
+    if !replacement_retirements.is_empty() {
+        delta
+            .retired_selections
+            .push(LogicalRowAddressSelection::from_bitmap(
+                replacement_retirements,
+            )?);
+    }
+    Ok(delta)
 }
 
 async fn generation_checkpoint_delta(dataset: &Dataset) -> Result<RowAddressLayoutDelta> {
@@ -736,7 +987,10 @@ async fn generation_checkpoint_delta(dataset: &Dataset) -> Result<RowAddressLayo
     })
 }
 
-async fn commit_checkpoint(dataset: &mut Dataset) -> Result<RowAddressMaintenanceMetrics> {
+async fn commit_checkpoint(
+    dataset: &mut Dataset,
+    transaction_properties: Option<Arc<HashMap<String, String>>>,
+) -> Result<RowAddressMaintenanceMetrics> {
     let delta = generation_checkpoint_delta(dataset).await?;
     let transaction = TransactionBuilder::new(
         dataset.manifest.version,
@@ -747,6 +1001,7 @@ async fn commit_checkpoint(dataset: &mut Dataset) -> Result<RowAddressMaintenanc
         },
     )
     .row_address_layout_delta(Some(delta))
+    .transaction_properties(transaction_properties)
     .build();
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
@@ -756,7 +1011,7 @@ async fn commit_checkpoint(dataset: &mut Dataset) -> Result<RowAddressMaintenanc
 
 /// Execute one explicit storage-version-2.3 row-address maintenance cycle.
 ///
-/// `NormalizePlacement` performs an exact metadata admission preflight before
+/// Inline maintenance performs an exact metadata admission preflight before
 /// opening remote data writers. `Repack` and `Recluster` intentionally publish
 /// an external locator and expose its read and write cost.
 ///
@@ -781,25 +1036,38 @@ pub async fn maintain_row_addresses(
 ) -> Result<RowAddressMaintenanceMetrics> {
     validate_options(dataset, &options)?;
     if matches!(
-        options.mode,
+        &options.mode,
         RowAddressMaintenanceMode::CheckpointGeneration
     ) {
-        return commit_checkpoint(dataset).await;
+        return commit_checkpoint(dataset, options.transaction_properties.clone()).await;
     }
     if dataset.manifest.fragments.is_empty() {
         return Ok(RowAddressMaintenanceMetrics::default());
     }
+    let inline_preflight = matches!(
+        &options.mode,
+        RowAddressMaintenanceMode::NormalizePlacement
+            | RowAddressMaintenanceMode::BoundedRecluster { .. }
+    );
     let old_fragments = dataset.manifest.fragments.as_ref().clone();
     let sorted_stream = sorted_maintenance_stream(dataset, &options).await?;
     let mut row_ids_rx = None;
     let mut preflight_row_ids = None;
     let mut preflight_delta = None;
     let mut planned_counts = None;
-    let stream = if matches!(options.mode, RowAddressMaintenanceMode::NormalizePlacement) {
+    let stream = if inline_preflight {
         let (replay, row_ids) = spool_normalize_stream(sorted_stream).await?;
         let planned = planned_fragments(row_ids.len(), options.target_rows_per_fragment);
-        let delta = normalize_delta(dataset, &planned, &row_ids).await?;
-        preflight_normalize(dataset, planned.clone(), delta.clone()).await?;
+        let delta = match &options.mode {
+            RowAddressMaintenanceMode::NormalizePlacement => {
+                normalize_delta(dataset, &planned, &row_ids).await?
+            }
+            RowAddressMaintenanceMode::BoundedRecluster { .. } => {
+                bounded_recluster_delta(dataset, &planned, &row_ids).await?
+            }
+            _ => unreachable!("inline preflight mode changed after validation"),
+        };
+        preflight_inline_rewrite(dataset, planned.clone(), delta.clone()).await?;
         planned_counts = Some(
             planned
                 .iter()
@@ -823,7 +1091,7 @@ pub async fn maintain_row_addresses(
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
         write_params.max_bytes_per_file = max_bytes_per_file;
-    } else if matches!(options.mode, RowAddressMaintenanceMode::NormalizePlacement) {
+    } else if inline_preflight {
         // Exact preflight plans row-count boundaries.  Byte-driven splitting
         // would make the target ranges unknowable before the remote write.
         write_params.max_bytes_per_file = usize::MAX;
@@ -838,9 +1106,21 @@ pub async fn maintain_row_addresses(
         None,
     )
     .await?;
-    if let Err(error) = assign_physical_fragment_ids(dataset, &mut new_fragments) {
-        cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments).await;
-        return Err(error);
+    if matches!(
+        &options.mode,
+        RowAddressMaintenanceMode::Repack | RowAddressMaintenanceMode::Recluster { .. }
+    ) {
+        if let Err(error) = assign_physical_fragment_ids(dataset, &mut new_fragments) {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
+                .await;
+            return Err(error);
+        }
+    } else {
+        for fragment in &mut new_fragments {
+            fragment.id = 0;
+            fragment.native_logical_domain = None;
+            fragment.row_id_meta = None;
+        }
     }
     if let Some(planned_counts) = planned_counts
         && new_fragments
@@ -851,7 +1131,7 @@ pub async fn maintain_row_addresses(
     {
         cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments).await;
         return Err(Error::internal(
-            "NormalizePlacement writer did not honor its preflight row boundaries",
+            "inline row-address maintenance writer did not honor its preflight row boundaries",
         ));
     }
     let row_ids = if let Some(row_ids) = preflight_row_ids {
@@ -886,9 +1166,21 @@ pub async fn maintain_row_addresses(
 
     let mut extra_paths = Vec::new();
     let mut locator_bytes = 0_u64;
+    let transaction_properties = if matches!(
+        &options.mode,
+        RowAddressMaintenanceMode::BoundedRecluster { .. }
+            | RowAddressMaintenanceMode::Recluster { .. }
+    ) {
+        Some(with_strict_full_ordered_rewrite_property(
+            options.transaction_properties.clone(),
+        ))
+    } else {
+        options.transaction_properties.clone()
+    };
     let delta_result = match options.mode {
-        RowAddressMaintenanceMode::NormalizePlacement => {
-            Ok(preflight_delta.expect("NormalizePlacement delta was preflighted"))
+        RowAddressMaintenanceMode::NormalizePlacement
+        | RowAddressMaintenanceMode::BoundedRecluster { .. } => {
+            Ok(preflight_delta.expect("inline maintenance delta was preflighted"))
         }
         RowAddressMaintenanceMode::Repack | RowAddressMaintenanceMode::Recluster { .. } => {
             match current_domains(dataset) {
@@ -929,13 +1221,22 @@ pub async fn maintain_row_addresses(
         },
     )
     .row_address_layout_delta(Some(delta))
+    .transaction_properties(transaction_properties)
     .build();
     if let Err(error) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await
     {
-        cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments).await;
-        cleanup_explicit_paths(dataset, &extra_paths).await;
+        // Retryable conflicts prove this attempt was not committed. Other
+        // errors can be ambiguous (for example, the manifest PUT succeeded but
+        // the response and reconciliation read both failed), so leave their
+        // immutable objects for version-aware GC instead of risking deletion
+        // of files referenced by a committed snapshot.
+        if matches!(error, Error::RetryableCommitConflict { .. }) {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
+                .await;
+            cleanup_explicit_paths(dataset, &extra_paths).await;
+        }
         return Err(error);
     }
 
@@ -974,6 +1275,7 @@ mod tests {
     use lance_table::io::commit::{
         CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
     };
+    use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
 
     use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
@@ -1697,6 +1999,14 @@ mod tests {
         .unwrap();
         assert!(metrics.fragments_added > 1);
         let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+        let retired = layout.retired_logical_row_bitmap().unwrap();
+        assert_eq!(
+            retired.iter().collect::<Vec<_>>(),
+            original
+                .iter()
+                .filter_map(|(value, row_id)| (value % 2 == 0).then_some(*row_id))
+                .collect::<Vec<_>>()
+        );
         let RowAddressPlacement::ExplicitMap(explicit) = &layout.placements[0] else {
             panic!("Repack must publish ExplicitMap")
         };
@@ -1883,6 +2193,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_recluster_preserves_identity_without_explicit_locator() {
+        let temp = TempStrDir::default();
+        let mut dataset = write_dataset(&temp, vec![2, 3, 0, 1, 6, 7, 4, 5]).await;
+        let expected_ids = scan_i_and_row_ids(&dataset)
+            .await
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        let metrics = maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions {
+                target_rows_per_fragment: 8,
+                max_rows_per_group: 8,
+                ..RowAddressMaintenanceOptions::bounded_recluster(vec![
+                    ColumnOrdering::asc_nulls_last("i".to_owned()),
+                ])
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.locator_objects_written, 0);
+        assert_eq!(metrics.locator_bytes_written, 0);
+        let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+        assert!(
+            layout
+                .placements
+                .iter()
+                .all(|placement| !matches!(placement, RowAddressPlacement::ExplicitMap(_)))
+        );
+        let scanned = scan_i_and_row_ids(&dataset).await;
+        assert_eq!(
+            scanned.iter().map(|(value, _)| *value).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        for (value, row_id) in scanned {
+            assert_eq!(expected_ids[&value], row_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_recluster_admits_monotonic_selection_with_many_deletion_holes() {
+        let temp = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..80))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            temp.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("i % 2 = 0").await.unwrap();
+
+        let metrics = maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions {
+                target_rows_per_fragment: 80,
+                max_rows_per_group: 80,
+                ..RowAddressMaintenanceOptions::bounded_recluster(vec![
+                    ColumnOrdering::asc_nulls_last("i".to_owned()),
+                ])
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.locator_objects_written, 0);
+        assert_eq!(metrics.rows_rewritten, 40);
+        assert!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .placements
+                .iter()
+                .all(|placement| !matches!(placement, RowAddressPlacement::ExplicitMap(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_recluster_rejects_excessive_fanout_before_data_writes() {
+        use lance_io::utils::tracking_store::{IOTracker, IoOperation};
+
+        let temp = TempStrDir::default();
+        let mut dataset = write_dataset(&temp, (0..40).collect()).await;
+        let tracker = Arc::new(IOTracker::default());
+        dataset = dataset.with_object_store_wrappers([
+            tracker.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        let version = dataset.version_id();
+        tracker.incremental_stats();
+
+        let error = maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions {
+                target_rows_per_fragment: 40,
+                max_rows_per_group: 40,
+                ..RowAddressMaintenanceOptions::bounded_recluster(vec![
+                    ColumnOrdering::desc_nulls_last("i".to_owned()),
+                ])
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ExtentFanout"), "{error}");
+        assert_eq!(dataset.version_id(), version);
+        let data_writes = tracker
+            .incremental_stats()
+            .requests
+            .into_iter()
+            .filter(|request| {
+                request.operation == IoOperation::Put
+                    && request.path.to_string().starts_with("data/")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            data_writes.is_empty(),
+            "bounded clustering admission must precede data-object writes: {data_writes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn recluster_arbitrary_order_preserves_identity_and_take() {
         let temp = TempStrDir::default();
         let mut dataset = write_dataset(&temp, vec![3, 1, 4, 2, 5, 0]).await;
@@ -2058,10 +2501,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_explicit_commit_cleans_data_and_locator_objects() {
+    async fn ambiguous_explicit_commit_error_leaves_objects_for_gc() {
         let temp = TempStrDir::default();
         let mut dataset = write_dataset(&temp, (0..10).collect()).await;
         let before = lance_files(std::path::Path::new(temp.as_ref()).join("data").as_path());
+        let original_commit_handler = dataset.commit_handler.clone();
         dataset.commit_handler = Arc::new(FailingCommitHandler);
         let error = maintain_row_addresses(
             &mut dataset,
@@ -2079,7 +2523,34 @@ mod tests {
                 .contains("intentional maintenance commit failure")
         );
         let after = lance_files(std::path::Path::new(temp.as_ref()).join("data").as_path());
-        assert_eq!(before, after);
+        assert!(after.len() > before.len());
+
+        // Cleanup does not enumerate objects newer than the earliest retained
+        // manifest. Publish a later metadata-only snapshot before asking GC to
+        // classify the ambiguous attempt as abandoned.
+        dataset.commit_handler = original_commit_handler;
+        MockClock::set_system_time(
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                + std::time::Duration::from_secs(60),
+        );
+        maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions::checkpoint_generation(),
+        )
+        .await
+        .unwrap();
+
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&dataset, 1)
+            .await
+            .unwrap()
+            .delete_unverified(true)
+            .build();
+        cleanup_old_versions(&dataset, policy).await.unwrap();
+        let collected = lance_files(std::path::Path::new(temp.as_ref()).join("data").as_path());
+        assert_eq!(before, collected);
     }
 
     #[tokio::test]

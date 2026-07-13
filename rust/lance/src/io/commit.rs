@@ -49,7 +49,8 @@ use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{
     Operation, RowAddressManifestApplyContext, Transaction, data_replacement_successor_fragment,
-    merge_rewritten_existing_field_ids, row_aligned_data_file_identity_eq,
+    logical_index_is_monotonic_coverage_restriction, merge_rewritten_existing_field_ids,
+    row_aligned_data_file_identity_eq,
 };
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
@@ -57,7 +58,11 @@ use crate::dataset::{
 };
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::details::infer_missing_vector_details;
-use crate::index::{DatasetIndexExt, validate_index_contract};
+use crate::index::{
+    DatasetIndexExt, load_authoritative_logical_index_coverage,
+    resolve_logical_index_coverage_from_authoritative, resolve_logical_index_metadata,
+    validate_index_contract, validate_resolved_logical_index_overlaps,
+};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -203,6 +208,11 @@ async fn prepare_row_address_manifest_context(
         .row_address_layout_delta
         .as_ref()
         .expect("row-address context predicate requires a delta");
+    // A pure ExplicitMap replacement carries the exact complement of its live
+    // output as a replacement mask.  That complement legitimately includes
+    // rows retired by an earlier delete; all other delta kinds must still
+    // resolve every newly retired source row in the current snapshot.
+    let allows_already_retired = delta.is_pure_explicit_rewrite();
     let mut current_fragment_ids = HashSet::<u32>::new();
     let mut pending = Vec::<u64>::with_capacity(4096);
     for selection in &delta.retired_selections {
@@ -210,12 +220,17 @@ async fn prepare_row_address_manifest_context(
             pending.push(logical_address?.raw());
             if pending.len() == 4096 {
                 for physical_address in dataset.resolve_logical_row_ids_async(&pending).await? {
-                    let physical_address = physical_address.ok_or_else(|| {
-                        Error::invalid_input(
-                            "retired logical selection contains an unmapped source address",
-                        )
-                    })?;
-                    current_fragment_ids.insert(physical_address.fragment_id());
+                    match physical_address {
+                        Some(physical_address) => {
+                            current_fragment_ids.insert(physical_address.fragment_id());
+                        }
+                        None if allows_already_retired => {}
+                        None => {
+                            return Err(Error::invalid_input(
+                                "retired logical selection contains an unmapped source address",
+                            ));
+                        }
+                    }
                 }
                 pending.clear();
             }
@@ -223,12 +238,17 @@ async fn prepare_row_address_manifest_context(
     }
     if !pending.is_empty() {
         for physical_address in dataset.resolve_logical_row_ids_async(&pending).await? {
-            let physical_address = physical_address.ok_or_else(|| {
-                Error::invalid_input(
-                    "retired logical selection contains an unmapped source address",
-                )
-            })?;
-            current_fragment_ids.insert(physical_address.fragment_id());
+            match physical_address {
+                Some(physical_address) => {
+                    current_fragment_ids.insert(physical_address.fragment_id());
+                }
+                None if allows_already_retired => {}
+                None => {
+                    return Err(Error::invalid_input(
+                        "retired logical selection contains an unmapped source address",
+                    ));
+                }
+            }
         }
     }
     current_fragment_ids.extend(
@@ -361,6 +381,174 @@ async fn prepare_row_address_manifest_context(
         }
     }
     Ok(Some(context))
+}
+
+async fn validate_v23_incoming_index_artifacts(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<()> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Ok(());
+    }
+    let Operation::CreateIndex {
+        new_indices,
+        removed_indices,
+    } = &transaction.operation
+    else {
+        return Ok(());
+    };
+    let incoming = new_indices
+        .iter()
+        .filter(|index| {
+            index.row_reference_domain
+                == Some(lance_table::format::RowReferenceDomain::StableLogicalRowAddress)
+        })
+        .collect::<Vec<_>>();
+    let current_indices = dataset.load_indices().await?;
+    let mut removed_uuids = HashSet::with_capacity(removed_indices.len());
+    for removed in removed_indices {
+        if !removed_uuids.insert(removed.uuid) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex removes index segment {} more than once",
+                removed.uuid
+            )));
+        }
+        if current_indices
+            .iter()
+            .find(|current| current.uuid == removed.uuid)
+            != Some(removed)
+        {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex removed segment {} does not match its exact current metadata",
+                removed.uuid
+            )));
+        }
+    }
+    let mut incoming_uuids = HashSet::with_capacity(new_indices.len());
+    for index in new_indices {
+        if !incoming_uuids.insert(index.uuid) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex publishes index segment {} more than once",
+                index.uuid
+            )));
+        }
+        if current_indices
+            .iter()
+            .any(|current| current.uuid == index.uuid)
+            && !removed_uuids.contains(&index.uuid)
+        {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex replaces current segment {} without removing its exact metadata",
+                index.uuid
+            )));
+        }
+    }
+    let mut final_uuids = current_indices
+        .iter()
+        .filter(|index| {
+            !removed_uuids.contains(&index.uuid) && !incoming_uuids.contains(&index.uuid)
+        })
+        .map(|index| index.uuid)
+        .collect::<HashSet<_>>();
+    for index in new_indices {
+        if !final_uuids.insert(index.uuid) {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex final catalog contains duplicate segment UUID {}",
+                index.uuid
+            )));
+        }
+    }
+    if incoming.is_empty() {
+        return Ok(());
+    }
+
+    let mut resolved_incoming = Vec::with_capacity(incoming.len());
+    for replacement in incoming {
+        let has_exclusions = replacement
+            .logical_coverage
+            .as_ref()
+            .is_some_and(|coverage| {
+                coverage
+                    .shards
+                    .iter()
+                    .any(|shard| shard.excluded_selection.is_some())
+            });
+        if !has_exclusions {
+            let mut resolved = replacement.clone();
+            resolved.logical_coverage =
+                Some(load_authoritative_logical_index_coverage(dataset, replacement).await?);
+            resolved_incoming.push(resolved);
+            continue;
+        }
+
+        let current = current_indices
+            .iter()
+            .find(|index| index.uuid == replacement.uuid)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "v2.3 index segment {} cannot add ownership exclusions without replacing a current segment",
+                    replacement.uuid
+                ))
+            })?;
+        let removed = removed_indices
+            .iter()
+            .find(|index| index.uuid == replacement.uuid)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "v2.3 index segment {} cannot add ownership exclusions without removing its exact current metadata",
+                    replacement.uuid
+                ))
+            })?;
+        if current != removed
+            || !logical_index_is_monotonic_coverage_restriction(current, replacement)?
+        {
+            return Err(Error::invalid_input(format!(
+                "v2.3 index segment {} ownership restriction does not replace its exact current metadata",
+                replacement.uuid
+            )));
+        }
+
+        let authoritative =
+            resolve_logical_index_coverage_from_authoritative(dataset, replacement).await?;
+        for (shard_index, shard) in authoritative.shards.iter().enumerate() {
+            let Some(excluded) = shard.excluded_selection.as_ref() else {
+                continue;
+            };
+            let raw_selection = shard.selection.as_ref().ok_or_else(|| {
+                Error::internal(format!(
+                    "v2.3 index segment {} authoritative shard {} remained external",
+                    replacement.uuid, shard_index
+                ))
+            })?;
+            if !excluded.is_subset_of(raw_selection)? {
+                return Err(Error::invalid_input(format!(
+                    "v2.3 index segment {} shard {} ownership exclusion is not a subset of its authoritative coverage",
+                    replacement.uuid, shard_index
+                )));
+            }
+        }
+        let mut resolved = replacement.clone();
+        resolved.logical_coverage = Some(authoritative);
+        resolved_incoming.push(resolved);
+    }
+
+    let touched_names = resolved_incoming
+        .iter()
+        .map(|index| index.name.as_str())
+        .collect::<HashSet<_>>();
+    let retained = current_indices
+        .iter()
+        .filter(|index| {
+            touched_names.contains(index.name.as_str())
+                && !removed_uuids.contains(&index.uuid)
+                && !incoming_uuids.contains(&index.uuid)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut final_touched = resolve_logical_index_metadata(dataset, &retained).await?;
+    final_touched.extend(resolved_incoming);
+    validate_resolved_logical_index_overlaps(&final_touched)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1819,7 +2007,9 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, ManifestLocation)> {
     let mut transaction = transaction.clone();
+    transaction.refresh_original_request_fingerprint();
     enrich_v2_3_row_aligned_rewrite(dataset, &mut transaction).await?;
+    validate_v23_incoming_index_artifacts(dataset, &transaction).await?;
     let transaction_file = if !write_config.disable_transaction_file() {
         transaction_file_name(&transaction)
     } else {
@@ -1912,9 +2102,14 @@ pub(crate) async fn do_commit_detached_transaction(
                 tokio::time::sleep(backoff.next_backoff()).await;
             }
             Err(CommitError::OtherError(err)) => {
-                // If other error, return
+                // The detached manifest may have committed even though its response was lost.
+                // There is no authoritative reconciliation for a random detached version, so
+                // retain the transaction file for readers and version-aware GC.
                 if transaction_file_written {
-                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                    log::warn!(
+                        "Detached manifest commit failed ambiguously; retaining transaction file '{}'",
+                        transaction_file
+                    );
                 }
                 return Err(err);
             }
@@ -1923,9 +2118,8 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    if transaction_file_written {
-        cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
-    }
+    // A concurrent submitter can share this UUID-derived transaction-file key.
+    // Conflicts do not prove the object is unreachable; version-aware GC does.
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -2026,6 +2220,13 @@ fn source_free_direct_enrichment_matches(
 }
 
 pub(crate) fn same_transaction_request(requested: &Transaction, committed: &Transaction) -> bool {
+    if let Some(committed_fingerprint) = committed.original_request_fingerprint.as_deref() {
+        return requested
+            .canonical_original_request_fingerprint()
+            .is_some_and(|requested_fingerprint| {
+                requested_fingerprint.as_slice() == committed_fingerprint
+            });
+    }
     let same_operation = match (&requested.operation, &committed.operation) {
         (
             Operation::Append {
@@ -2142,8 +2343,9 @@ pub(crate) async fn commit_transaction(
             dataset.clone()
         };
 
-    let requested_transaction = transaction.clone();
-    let mut transaction = transaction.clone();
+    let mut requested_transaction = transaction.clone();
+    requested_transaction.refresh_original_request_fingerprint();
+    let mut transaction = requested_transaction.clone();
     let transaction_base_dataset = dataset.clone();
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
@@ -2153,10 +2355,6 @@ pub(crate) async fn commit_transaction(
     // Other transactions that may have been committed since the read_version.
     // We keep pair of (version, transaction). No other transactions to check initially
     let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
-    // Track the transaction file written in the current loop iteration so we can
-    // delete it if the commit ultimately fails.
-    let mut current_transaction_file = String::new();
-
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
         // we need to check for. We could be optimistic here and blindly
@@ -2190,8 +2388,9 @@ pub(crate) async fn commit_transaction(
         }
 
         enrich_v2_3_row_aligned_rewrite(&dataset, &mut transaction).await?;
+        validate_v23_incoming_index_artifacts(&dataset, &transaction).await?;
 
-        current_transaction_file = if !write_config.disable_transaction_file() {
+        let current_transaction_file = if !write_config.disable_transaction_file() {
             transaction_file_name(&transaction)
         } else {
             String::new()
@@ -2300,9 +2499,7 @@ pub(crate) async fn commit_transaction(
                     .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
                     .await;
                 if !indices.is_empty() {
-                    let key = IndexMetadataKey {
-                        version: target_version,
-                    };
+                    let key = IndexMetadataKey::for_manifest(target_version, &manifest);
                     dataset
                         .index_cache
                         .insert_with_key(&key, Arc::new(indices))
@@ -2333,14 +2530,8 @@ pub(crate) async fn commit_transaction(
                 }
 
                 if next_attempt_i < num_attempts {
-                    // The transaction file from this attempt is now stale; clean it up
-                    // before the next attempt writes a new one (possibly rebased).
-                    cleanup_transaction_file(
-                        object_store,
-                        &dataset.base,
-                        &current_transaction_file,
-                    )
-                    .await;
+                    // Another submitter may be committing the same transaction UUID and
+                    // sharing this transaction-file key. Leave conflict cleanup to GC.
                     tokio::time::sleep(backoff.next_backoff()).await;
                     continue;
                 } else {
@@ -2348,21 +2539,36 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
-                if let Ok((latest, transactions)) =
-                    load_and_sort_new_transactions(&transaction_base_dataset).await
-                    && let Some(version) =
-                        committed_transaction_version(&requested_transaction, &transactions)?
-                {
-                    return committed_transaction_result(&latest, version).await;
+                match load_and_sort_new_transactions(&transaction_base_dataset).await {
+                    Ok((latest, transactions)) => {
+                        if let Some(version) =
+                            committed_transaction_version(&requested_transaction, &transactions)?
+                        {
+                            return committed_transaction_result(&latest, version).await;
+                        }
+                        cleanup_transaction_file(
+                            object_store,
+                            &dataset.base,
+                            &current_transaction_file,
+                        )
+                        .await;
+                    }
+                    Err(reconciliation_error) => {
+                        // The manifest may have committed even though its response was lost.
+                        // Without a successful reconciliation, the transaction file can be
+                        // referenced by that manifest and must remain available for readers.
+                        log::warn!(
+                            "Failed to reconcile an ambiguous manifest commit; retaining transaction file '{}': {}",
+                            current_transaction_file,
+                            reconciliation_error
+                        );
+                    }
                 }
-                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
-                    .await;
                 return Err(err);
             }
         }
     }
 
-    cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(
@@ -2384,9 +2590,11 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::writer::{FileWriter, FileWriterOptions};
     use lance_index::IndexType;
+    use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
     use lance_linalg::distance::MetricType;
     use lance_table::format::{
         DataFile, DataStorageFormat, NativeLogicalDomain, RowAddressLayout, RowAddressLayoutDelta,
@@ -2402,7 +2610,7 @@ mod tests {
 
     use crate::Dataset;
     use crate::dataset::transaction::{DataReplacementGroup, TransactionBuilder};
-    use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+    use crate::dataset::{CommitBuilder, DeleteBuilder, InsertBuilder, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
@@ -3163,6 +3371,132 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ToggleReadFailureWrapper {
+        enabled: Arc<std::sync::atomic::AtomicBool>,
+        failed_reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WrappingObjectStore for ToggleReadFailureWrapper {
+        fn wrap(
+            &self,
+            _storage_prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            let enabled = self.enabled.clone();
+            let failed_reads = self.failed_reads.clone();
+            let mut policy = ProxyObjectStorePolicy::new();
+            policy.set_before_policy(
+                "fail_reads_after_ambiguous_commit",
+                Arc::new(move |method, _path| {
+                    if method == "get_opts" && enabled.load(std::sync::atomic::Ordering::SeqCst) {
+                        failed_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(Error::io("simulated reconciliation read failure"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+            );
+            Arc::new(ProxyObjectStore::new(
+                original,
+                Arc::new(Mutex::new(policy)),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CommitThenErrorAndBlockReadsHandler {
+        block_reads: Arc<std::sync::atomic::AtomicBool>,
+        committed_location: Arc<Mutex<Option<ManifestLocation>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for CommitThenErrorAndBlockReadsHandler {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let location = RenameCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await?;
+            *self.committed_location.lock().unwrap() = Some(location.clone());
+            self.block_reads
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(CommitError::OtherError(Error::io(format!(
+                "simulated response loss after committing {}",
+                location.version
+            ))))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FirstAttemptBarrierCommitHandler {
+        barrier: Arc<tokio::sync::Barrier>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for FirstAttemptBarrierCommitHandler {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                self.barrier.wait().await;
+            }
+            RenameCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[derive(Debug)]
+    struct AlwaysCommitConflictHandler;
+
+    #[async_trait::async_trait]
+    impl CommitHandler for AlwaysCommitConflictHandler {
+        async fn commit(
+            &self,
+            _manifest: &mut Manifest,
+            _indices: Option<Vec<IndexMetadata>>,
+            _base_path: &Path,
+            _object_store: &ObjectStore,
+            _manifest_writer: ManifestWriter,
+            _naming_scheme: ManifestNamingScheme,
+            _transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            Err(CommitError::CommitConflict)
+        }
+    }
+
     #[tokio::test]
     async fn post_commit_other_error_is_reconciled_by_transaction_uuid() {
         let uri = TempStrDir::default();
@@ -3206,6 +3540,408 @@ mod tests {
             .unwrap();
         assert_eq!(committed.version_id(), 2);
         assert_eq!(committed.count_rows(None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_post_commit_error_retains_transaction_for_later_reconciliation() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let block_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapper = Arc::new(ToggleReadFailureWrapper {
+            enabled: block_reads.clone(),
+            failed_reads: failed_reads.clone(),
+        });
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper),
+                    ..ObjectStoreParams::default()
+                }),
+                ..WriteParams::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..WriteParams::default()
+            })
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+        let handler = Arc::new(CommitThenErrorAndBlockReadsHandler {
+            block_reads: block_reads.clone(),
+            committed_location: Arc::new(Mutex::new(None)),
+        });
+
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_commit_handler(handler)
+            .execute(transaction.clone())
+            .await
+            .expect_err("failed reconciliation must preserve the ambiguous error");
+        assert!(error.to_string().contains("simulated response loss"));
+        assert!(failed_reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+
+        block_reads.store(false, std::sync::atomic::Ordering::SeqCst);
+        let committed = Dataset::open(uri.as_str()).await.unwrap();
+        assert_eq!(committed.version_id(), 2);
+        assert_eq!(committed.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            committed.read_transaction().await.unwrap().unwrap().uuid,
+            transaction.uuid
+        );
+        let transaction_path = committed
+            .base
+            .clone()
+            .join(TRANSACTIONS_DIR)
+            .join(committed.manifest.transaction_file.as_deref().unwrap());
+        committed
+            .object_store
+            .inner
+            .head(&transaction_path)
+            .await
+            .unwrap();
+
+        let reconciled = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(reconciled.version_id(), committed.version_id());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_detached_commit_retains_transaction_file() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..WriteParams::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..WriteParams::default()
+            })
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+        let committed_location = Arc::new(Mutex::new(None));
+        let handler = CommitThenErrorAndBlockReadsHandler {
+            block_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            committed_location: committed_location.clone(),
+        };
+
+        let error = do_commit_detached_transaction(
+            &dataset,
+            dataset.object_store.as_ref(),
+            &handler,
+            &transaction,
+            &ManifestWriteConfig::default(),
+            &CommitConfig::default(),
+        )
+        .await
+        .expect_err("detached response loss must remain caller-visible");
+        assert!(error.to_string().contains("simulated response loss"));
+
+        let location = committed_location.lock().unwrap().clone().unwrap();
+        assert!(is_detached_version(location.version));
+        let committed = dataset.checkout_version(location.version).await.unwrap();
+        assert_eq!(committed.count_rows(None).await.unwrap(), 2);
+        let transaction_path = committed
+            .base
+            .clone()
+            .join(TRANSACTIONS_DIR)
+            .join(transaction_file_name(&transaction));
+        committed
+            .object_store
+            .inner
+            .head(&transaction_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.read_transaction().await.unwrap().unwrap().uuid,
+            transaction.uuid
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::terminal_conflict(1)]
+    #[case::retry_after_conflict(2)]
+    #[tokio::test]
+    async fn concurrent_same_transaction_conflict_keeps_shared_transaction_file(
+        #[case] max_retries: u32,
+    ) {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..WriteParams::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..WriteParams::default()
+            })
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+        let handler = Arc::new(FirstAttemptBarrierCommitHandler {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let first = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_commit_handler(handler.clone())
+            .with_max_retries(max_retries)
+            .execute(transaction.clone());
+        let second = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(handler)
+            .with_max_retries(max_retries)
+            .execute(transaction.clone());
+        let (first, second) = tokio::join!(first, second);
+        let successes = [&first, &second]
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count();
+        if max_retries == 1 {
+            assert_eq!(successes, 1);
+            let error = [first.as_ref().err(), second.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .next()
+                .unwrap();
+            assert!(matches!(error, Error::CommitConflict { .. }));
+        } else {
+            assert_eq!(successes, 2);
+            assert_eq!(first.as_ref().unwrap().version_id(), 2);
+            assert_eq!(second.as_ref().unwrap().version_id(), 2);
+        }
+
+        let committed = Dataset::open(uri.as_str()).await.unwrap();
+        assert_eq!(committed.version_id(), 2);
+        let transaction_path = committed
+            .base
+            .clone()
+            .join(TRANSACTIONS_DIR)
+            .join(committed.manifest.transaction_file.as_deref().unwrap());
+        committed
+            .object_store
+            .inner
+            .head(&transaction_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.read_transaction().await.unwrap().unwrap().uuid,
+            transaction.uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_conflict_keeps_shared_transaction_file() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..WriteParams::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..WriteParams::default()
+            })
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+        let (_, committed_location) = do_commit_detached_transaction(
+            &dataset,
+            dataset.object_store.as_ref(),
+            &RenameCommitHandler,
+            &transaction,
+            &ManifestWriteConfig::default(),
+            &CommitConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let error = do_commit_detached_transaction(
+            &dataset,
+            dataset.object_store.as_ref(),
+            &AlwaysCommitConflictHandler,
+            &transaction,
+            &ManifestWriteConfig::default(),
+            &CommitConfig {
+                num_retries: 1,
+                ..CommitConfig::default()
+            },
+        )
+        .await
+        .expect_err("the forced detached conflict must exhaust its retry budget");
+        assert!(matches!(error, Error::CommitConflict { .. }));
+
+        let committed = dataset
+            .checkout_version(committed_location.version)
+            .await
+            .unwrap();
+        let transaction_path = committed
+            .base
+            .clone()
+            .join(TRANSACTIONS_DIR)
+            .join(transaction_file_name(&transaction));
+        committed
+            .object_store
+            .inner
+            .head(&transaction_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.read_transaction().await.unwrap().unwrap().uuid,
+            transaction.uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn post_commit_other_error_is_reconciled_after_v2_3_rebase() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let staged = DeleteBuilder::new(Arc::new(dataset.clone()), "value = 1")
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![4]))]).unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let appended_dataset = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&append_params)
+            .execute(vec![appended])
+            .await
+            .unwrap();
+        assert_eq!(appended_dataset.version_id(), 2);
+
+        let transaction = staged.transaction;
+        let affected_rows = staged.affected_rows.unwrap();
+        let handler = Arc::new(CommitThenErrorHandler {
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+        });
+        let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_affected_rows(affected_rows.clone())
+            .with_commit_handler(handler)
+            .execute(transaction.clone())
+            .await
+            .unwrap();
+        assert_eq!(committed.version_id(), 3);
+        let committed_transaction = committed.read_transaction().await.unwrap().unwrap();
+        assert_eq!(committed_transaction.read_version, 2);
+        assert_eq!(
+            committed_transaction
+                .original_request_fingerprint
+                .as_ref()
+                .unwrap()
+                .len(),
+            crate::dataset::transaction::ORIGINAL_REQUEST_FINGERPRINT_SIZE
+        );
+
+        let mut different_request = transaction.clone();
+        let Operation::Delete { predicate, .. } = &mut different_request.operation else {
+            unreachable!()
+        };
+        *predicate = "value = 2".to_owned();
+        different_request.original_request_fingerprint =
+            committed_transaction.original_request_fingerprint.clone();
+        let retried = CommitBuilder::new(Arc::new(dataset))
+            .with_affected_rows(affected_rows)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(retried.version_id(), committed.version_id());
+        assert_eq!(retried.count_rows(None).await.unwrap(), 3);
+
+        let error = CommitBuilder::new(Arc::new(retried))
+            .execute(different_request)
+            .await
+            .expect_err("same UUID with a different predicate must be rejected");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("different request"));
     }
 
     #[tokio::test]

@@ -266,6 +266,18 @@ message ExplicitMapPage {
   // page that can contain a requested logical address.
   uint64 row_start = 3;
   uint64 row_count = 4;
+  // Deterministic 16-byte fingerprint of the logical and physical UInt64
+  // columns in this locator page. Readers verify it from the same page read.
+  bytes content_fingerprint = 5;
+}
+
+// One independently readable page of a destination hidden _rowid file.
+message ExplicitMapRowIdPage {
+  uint64 row_start = 1;
+  uint64 row_count = 2;
+  // Deterministic 16-byte fingerprint of this page's UInt64 _rowid column.
+  // The field is required for storage version 2.3 ExplicitMap metadata.
+  bytes content_fingerprint = 3;
 }
 
 message ExplicitMapDestination {
@@ -276,6 +288,8 @@ message ExplicitMapDestination {
   // column used for physical-to-logical inverse projection.
   string row_id_file_path = 4;
   uint64 row_id_file_size = 5;
+  // Complete, row-contiguous page directory for the hidden _rowid file.
+  repeated ExplicitMapRowIdPage row_id_pages = 6;
 }
 
 // External inverse locator used only by explicit Repack/Recluster operations.
@@ -375,6 +389,11 @@ message RowAddressLayout {
   // metadata. Entries are sorted by encoded bytes and serialized once.
   repeated LogicalRowAddressSelection selection_pool = 11;
   repeated RetiredLogicalRowSet retired_rows = 12;
+  // Placement-independent identity of the complete logical-domain set in the
+  // current manifest closure, encoded from (logical_fragment_id, slot_count,
+  // creation_version). Compaction and deletion preserve this value; append
+  // and overwrite change it. Required in storage version 2.3.
+  bytes logical_domain_fingerprint = 13;
 }
 
 enum RowReferenceDomain {
@@ -395,6 +414,11 @@ message LogicalIndexCoverageShard {
   // Portable RoaringBitmap of logical fragment ids touched by the exact
   // selection. This conservative routing summary always remains inline.
   bytes logical_fragment_bitmap = 6;
+  // Present when a newer segment owns part of this immutable segment's raw
+  // selection. The excluded rows remain in the index artifact but must be
+  // filtered before per-segment ranking or result union. Absent means the
+  // complete raw selection is effective.
+  optional LogicalRowAddressSelection excluded_selection = 7;
 }
 
 message LogicalIndexCoverageFile {
@@ -435,6 +459,12 @@ message LogicalIndexCoverage {
   optional LogicalIndexCoverageFile external = 2;
   bytes fingerprint = 3;
   optional LogicalIndexCoverageCloneProvenance clone_provenance = 4;
+  // Present only when the exact coverage contained every live slot in the
+  // build snapshot. The value equals RowAddressLayout.logical_domain_fingerprint
+  // and participates in this coverage's root fingerprint. Absent means the
+  // manifest summary cannot prove full current coverage without resolving
+  // exact selection detail.
+  bytes full_domain_fingerprint = 5;
 }
 
 // Core-generated build provenance stored in an existing index Lance file.

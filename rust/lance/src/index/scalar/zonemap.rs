@@ -31,7 +31,10 @@ pub(in crate::index) async fn merge_segments(
     let logical_coverage = dataset
         .manifest
         .uses_stable_logical_row_addresses()
-        .then(|| crate::index::merge_logical_index_coverage(dataset, &segment_refs))
+        .then(|| {
+            let effective = crate::index::merge_logical_index_coverage(dataset, &segment_refs)?;
+            crate::index::mark_logical_coverage_validated_at_snapshot(dataset, &effective)
+        })
         .transpose()?;
 
     let mut scalar_indices = Vec::with_capacity(segments.len());
@@ -60,7 +63,7 @@ pub(in crate::index) async fn merge_segments(
 
     let mut source_indices = Vec::with_capacity(scalar_indices.len());
     for (segment_uuid, scalar_index) in &scalar_indices {
-        let zonemap_index = scalar_index
+        let zonemap_index = crate::index::scalar_logical::raw_scalar_segment(scalar_index.as_ref())
             .as_any()
             .downcast_ref::<ZoneMapIndex>()
             .ok_or_else(|| {

@@ -13,13 +13,18 @@ the remote host's default `python3` is older.
   row-aligned backfill, N-to-one and repeated compaction, scalar/vector index
   take/optimize, cold open/scan/random take, indexed relocation, and the
   `N-to-one pack -> random update/delete -> cold scan/take` chain. Clustered
-  delete reclaim must be admitted by default compaction. Before random 50% and
-  90% delete reclaim, v2.3 runs `default_compaction_preflight`: it calls only
-  the default compaction planner, never executes or commits its tasks, and must
-  leave the dataset version and every object-store write counter unchanged.
-  The bounded smoke fixture freezes `must_admit`; the 100M-row release fixture
-  freezes `must_not_admit`. Paired explicit `Repack`/baseline compaction then
-  reaches the same postcondition independently of that plan-only observation.
+  delete reclaim must be admitted by default compaction. Random 1% delete runs
+  a must-admit plan-only preflight and then executes paired default reclaim.
+  Random 50%/90% delete freezes the profile-specific admission result before
+  paired explicit `Repack`/baseline compaction reaches the same postcondition;
+  scalar and vector variants prebuild their index and gate coverage reuse,
+  recall, cold index take, and path-specific read I/O. Every plan-only probe
+  must leave the dataset version and every object-store write counter unchanged.
+  The matrix also includes deterministic non-uniform 10K/100K-fragment pack
+  fixtures and compares one-shot with repeated canonical placement bytes.
+  Default bounded clustering is a three-format paired gate with equal values,
+  physical order, topology, coverage, and recall; arbitrary explicit
+  `Recluster` remains a v2.3-only diagnostic.
 - `sustained` updates one fixed, exactly sampled hot set. Only the deterministic
   v2.2 no-stable physical policy may create a common maintenance boundary.
   Placement backpressure is a failure.
@@ -36,7 +41,9 @@ The release profile freezes 100M rows, 16-byte/128-byte/vector schemas,
 100/10K/100K logical fragments, 1/32/1024/10K takes, the specified mutation
 ratios, ten paired repeats, and 100-round repeated chains. The smoke profile
 keeps the same protocol with bounded fixtures. Release runs require same-region
-S3; EBS is intentionally smoke-only.
+S3; EBS is intentionally smoke-only. Both protocol profiles build the worker
+with Cargo's optimized `release-with-debug` profile. Unoptimized binaries are
+valid only for correctness debugging and never produce performance evidence.
 
 ```bash
 python3 benchmarks/stable_row_address/protocol.py \
@@ -44,6 +51,16 @@ python3 benchmarks/stable_row_address/protocol.py \
   --output /mnt/results/stable-row-address.jsonl \
   --profile smoke \
   --track matrix
+
+# Canonical four-track EBS smoke. The driver verifies a clean fixed checkout,
+# resumes durable evidence, runs the report, and writes the pass marker only
+# after the report confirms PASS for EXPECTED_COMMIT.
+DATASET_ROOT=/mnt/bench/stable-row-address-smoke \
+RESULT_ROOT=/mnt/results/stable-row-address-smoke \
+EXPECTED_COMMIT=0123456789abcdef0123456789abcdef01234567 \
+PYTHON=/usr/bin/python3.11 \
+CARGO_TARGET_DIR=/mnt/bench/cargo-target \
+benchmarks/stable_row_address/smoke_remote.sh smoke-all
 
 # Run one fixture-local release shard. Run indices 0 through 8 on independent
 # workers; the runner adds the shard suffix to both the S3 and local paths.
@@ -90,6 +107,7 @@ RESULT_ROOT=/mnt/results/stable-row-address-release \
 AWS_REGION=us-east-2 \
 EXPECTED_COMMIT=0123456789abcdef0123456789abcdef01234567 \
 PYTHON=/usr/bin/python3.11 \
+CARGO_TARGET_DIR=/mnt/bench/cargo-target \
 benchmarks/stable_row_address/release_remote_systemd.sh install
 ```
 
@@ -150,7 +168,9 @@ is validated after latency, I/O, and peak-RSS snapshots with a separate
 tracker, so deletion-vector verification cannot improve or pollute a measured
 operation. Each
 record also contains peak RSS, physical/live bytes, manifest and placement
-bytes, admission state, mutation counts, and a format-neutral state digest.
+bytes, admission state, mutation counts, a format-neutral state digest, and an
+order-sensitive scan digest. Cold open/take/index-take gates require v2.3 to
+issue no additional metadata-path GET/HEAD/LIST requests.
 Compaction records additionally expose the post-data-file
 layout/index-maintenance duration, compacted/index bytes, remapped rows and
 indices, coverage reuse, and group admission counts. Indexed relocation gates

@@ -5,6 +5,7 @@
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,16 +13,17 @@ use futures::future::try_join_all;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
+use lance_index::scalar::lance_format::OpenedIndexFile;
 use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};
 use lance_index::{Index, IndexType};
-use lance_select::NullableRowAddrSet;
-use lance_table::format::IndexMetadata;
+use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
+use lance_table::format::{IndexMetadata, LogicalRowAddressSelection};
 use roaring::RoaringBitmap;
 use serde_json::json;
 
 use crate::dataset::Dataset;
 use crate::index::scalar::fetch_index_details;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, logical_index_coverage_is_current};
+use crate::index::{DatasetIndexExt, logical_index_coverage_is_current};
 
 #[derive(Debug)]
 pub struct LogicalScalarIndex {
@@ -178,6 +180,344 @@ impl ScalarIndex for LogicalScalarIndex {
     }
 }
 
+#[derive(Debug)]
+struct OwnerRestrictedScalarIndex {
+    inner: Arc<dyn ScalarIndex>,
+    excluded: Arc<RowAddrTreeMap>,
+}
+
+impl DeepSizeOf for OwnerRestrictedScalarIndex {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.inner.deep_size_of_children(context) + self.excluded.deep_size_of_children(context)
+    }
+}
+
+#[async_trait]
+impl Index for OwnerRestrictedScalarIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        self.inner.statistics()
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        self.inner.prewarm().await
+    }
+
+    fn index_type(&self) -> IndexType {
+        self.inner.index_type()
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        self.inner.calculate_included_frags().await
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for OwnerRestrictedScalarIndex {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        Ok(exclude_search_result(
+            self.inner.search(query, metrics).await?,
+            &self.excluded,
+        ))
+    }
+
+    fn results_are_row_addresses(&self) -> bool {
+        self.inner.results_are_row_addresses()
+    }
+
+    fn can_remap(&self) -> bool {
+        false
+    }
+
+    async fn remap(
+        &self,
+        _mapping: &RowAddrRemap,
+        _dest_store: &dyn lance_index::scalar::IndexStore,
+    ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input(
+            "an owner-restricted scalar index is a query view and cannot be remapped; use the raw segment maintenance path",
+        ))
+    }
+
+    async fn update(
+        &self,
+        _new_data: datafusion::physical_plan::SendableRecordBatchStream,
+        _dest_store: &dyn lance_index::scalar::IndexStore,
+        _old_data_filter: Option<lance_index::scalar::OldIndexDataFilter>,
+    ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input(
+            "an owner-restricted scalar index is a query view and cannot be updated; use the raw segment maintenance path",
+        ))
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        self.inner.update_criteria()
+    }
+
+    fn derive_index_params(&self) -> Result<lance_index::scalar::ScalarIndexParams> {
+        self.inner.derive_index_params()
+    }
+
+    fn value_range(
+        &self,
+    ) -> Option<(
+        datafusion::scalar::ScalarValue,
+        datafusion::scalar::ScalarValue,
+    )> {
+        self.inner.value_range()
+    }
+}
+
+fn exclude_search_result(result: SearchResult, excluded: &RowAddrTreeMap) -> SearchResult {
+    let exclude = |set: NullableRowAddrSet| {
+        NullableRowAddrSet::new(
+            set.selected_rows().clone() - excluded,
+            set.null_rows().clone() - excluded,
+        )
+    };
+    match result {
+        SearchResult::Exact(set) => SearchResult::Exact(exclude(set)),
+        SearchResult::AtMost(set) => SearchResult::AtMost(exclude(set)),
+        SearchResult::AtLeast(set) => SearchResult::AtLeast(exclude(set)),
+    }
+}
+
+fn selection_to_row_addr_map(selection: &LogicalRowAddressSelection) -> Result<RowAddrTreeMap> {
+    let mut rows = RowAddrTreeMap::new();
+    for (logical_fragment_id, slots) in selection.to_roaring_treemap()?.bitmaps() {
+        rows.insert_bitmap(logical_fragment_id, slots.clone());
+    }
+    Ok(rows)
+}
+
+pub fn logical_coverage_row_ids(
+    coverage: &lance_table::format::LogicalIndexCoverage,
+) -> Result<RowAddrTreeMap> {
+    let mut rows = RowAddrTreeMap::new();
+    for shard in &coverage.shards {
+        let selection = shard.selection.as_ref().ok_or_else(|| {
+            Error::internal("effective logical index coverage unexpectedly remained external")
+        })?;
+        rows |= selection_to_row_addr_map(selection)?;
+    }
+    Ok(rows)
+}
+
+fn segment_invalidations(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Option<RowAddrTreeMap>> {
+    let Some(coverage) = index.logical_coverage.as_ref() else {
+        return Ok(None);
+    };
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    let mut excluded = RowAddrTreeMap::new();
+    for shard in &coverage.shards {
+        if let Some(selection) = shard.excluded_selection.as_ref() {
+            excluded |= selection_to_row_addr_map(selection)?;
+        }
+        for watermark in &shard.validated_through {
+            let default_is_newer = layout
+                .field_default_generations
+                .binary_search_by_key(&watermark.field_id, |generation| generation.field_id)
+                .ok()
+                .is_none_or(|position| {
+                    layout.field_default_generations[position].generation > watermark.generation
+                });
+            if default_is_newer {
+                let selection = shard.selection.as_ref().ok_or_else(|| {
+                    Error::internal(format!(
+                        "logical index segment {} coverage detail was not resolved",
+                        index.uuid
+                    ))
+                })?;
+                excluded |= selection_to_row_addr_map(selection)?;
+                continue;
+            }
+            for region in &layout.generation_regions {
+                if region.generation > watermark.generation
+                    && region.field_ids.binary_search(&watermark.field_id).is_ok()
+                {
+                    let selection = shard.selection.as_ref().ok_or_else(|| {
+                        Error::internal(format!(
+                            "logical index segment {} coverage detail was not resolved",
+                            index.uuid
+                        ))
+                    })?;
+                    let invalidated = selection.intersection(&region.selection)?;
+                    if !invalidated.is_empty() {
+                        excluded |= selection_to_row_addr_map(&invalidated)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok((!excluded.is_empty()).then_some(excluded))
+}
+
+fn external_segment_invalidations(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Option<RowAddrTreeMap>> {
+    let coverage = index.logical_coverage.as_ref().ok_or_else(|| {
+        Error::internal(format!(
+            "logical index segment {} is missing coverage",
+            index.uuid
+        ))
+    })?;
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    let mut excluded = RowAddrTreeMap::new();
+    for shard in &coverage.shards {
+        if let Some(selection) = shard.excluded_selection.as_ref() {
+            excluded |= selection_to_row_addr_map(selection)?;
+        }
+        let shard_domains = shard.logical_fragment_bitmap()?;
+        for watermark in &shard.validated_through {
+            let default_is_newer = layout
+                .field_default_generations
+                .binary_search_by_key(&watermark.field_id, |generation| generation.field_id)
+                .ok()
+                .is_none_or(|position| {
+                    layout.field_default_generations[position].generation > watermark.generation
+                });
+            if default_is_newer {
+                for logical_fragment_id in shard_domains.iter() {
+                    excluded.insert_fragment(logical_fragment_id);
+                }
+                continue;
+            }
+            for region in &layout.generation_regions {
+                if region.generation <= watermark.generation
+                    || region.field_ids.binary_search(&watermark.field_id).is_err()
+                {
+                    continue;
+                }
+                for (logical_fragment_id, slots) in region.selection.to_roaring_treemap()?.bitmaps()
+                {
+                    if shard_domains.contains(logical_fragment_id) {
+                        excluded.insert_bitmap(logical_fragment_id, slots.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok((!excluded.is_empty()).then_some(excluded))
+}
+
+fn external_shards_are_domain_disjoint(index: &IndexMetadata) -> Result<bool> {
+    let coverage = index.logical_coverage.as_ref().ok_or_else(|| {
+        Error::internal(format!(
+            "logical index segment {} is missing coverage",
+            index.uuid
+        ))
+    })?;
+    let mut covered = roaring::RoaringBitmap::new();
+    for shard in &coverage.shards {
+        let domains = shard.logical_fragment_bitmap()?;
+        if !covered.is_disjoint(&domains) {
+            return Ok(false);
+        }
+        covered |= domains;
+    }
+    Ok(true)
+}
+
+pub async fn logical_index_invalidations(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<Arc<RowAddrTreeMap>> {
+    let namespace_uuid = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| Error::internal("storage-version-2.3 manifest is missing RowAddressLayout"))?
+        .namespace_uuid;
+    let key = crate::session::index_caches::LogicalIndexInvalidationsKey {
+        namespace_uuid,
+        version: dataset.manifest.version,
+        uuid: &index.uuid,
+    };
+    dataset
+        .index_cache
+        .get_or_insert_with_key(key, || async {
+            let coverage = index.logical_coverage.as_ref().ok_or_else(|| {
+                Error::internal(format!(
+                    "logical index segment {} is missing coverage",
+                    index.uuid
+                ))
+            })?;
+            let invalidations = if !coverage.has_external_detail() {
+                segment_invalidations(dataset, index)?
+            } else if external_shards_are_domain_disjoint(index)? {
+                external_segment_invalidations(dataset, index)?
+            } else {
+                let mut resolved = index.clone();
+                resolved.logical_coverage =
+                    Some(crate::index::resolve_logical_index_coverage(dataset, index).await?);
+                segment_invalidations(dataset, &resolved)?
+            };
+            Ok(invalidations.unwrap_or_else(RowAddrTreeMap::new))
+        })
+        .await
+}
+
+pub async fn restrict_scalar_segment_rows(
+    dataset: &Dataset,
+    segment: Arc<dyn ScalarIndex>,
+    index: &IndexMetadata,
+) -> Result<Arc<dyn ScalarIndex>> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Ok(segment);
+    }
+    let excluded = logical_index_invalidations(dataset, index).await?;
+    if excluded.is_empty() {
+        return Ok(segment);
+    }
+    // V2.3 address-oriented trainers persist logical row IDs in their
+    // `_rowaddr` input, so their search results share this block-list domain.
+    Ok(Arc::new(OwnerRestrictedScalarIndex {
+        inner: segment,
+        excluded,
+    }))
+}
+
+pub fn raw_scalar_segment(segment: &dyn ScalarIndex) -> &dyn ScalarIndex {
+    segment
+        .as_any()
+        .downcast_ref::<OwnerRestrictedScalarIndex>()
+        .map_or(segment, |restricted| restricted.inner.as_ref())
+}
+
+pub fn raw_restricted_scalar_index(index: &dyn Index) -> Option<&dyn ScalarIndex> {
+    index
+        .as_any()
+        .downcast_ref::<OwnerRestrictedScalarIndex>()
+        .map(|restricted| restricted.inner.as_ref())
+}
+
 fn combine_search_results(results: Vec<SearchResult>) -> Result<SearchResult> {
     let mut saw_at_most = false;
     let mut saw_at_least = false;
@@ -239,8 +579,15 @@ pub async fn load_named_scalar_segments(
     column: &str,
     index_name: &str,
 ) -> Result<Vec<IndexMetadata>> {
+    let field_id = dataset.schema().field_id(column)?;
     let mut usable_indices = Vec::new();
     for index in dataset.load_indices_by_name(index_name).await? {
+        if index.fields != [field_id] {
+            return Err(Error::invalid_input(format!(
+                "Scalar index '{}' on column '{}' contains segment {} for fields {:?}",
+                index_name, column, index.uuid, index.fields
+            )));
+        }
         if index_intersects_dataset(&index, dataset)? {
             usable_indices.push(index);
         }
@@ -297,12 +644,12 @@ pub async fn scalar_index_fragment_bitmap(
         if indices.is_empty() {
             return Ok(None);
         }
-        let indices = crate::index::resolve_logical_index_metadata(dataset, &indices).await?;
-        return crate::index::fully_covered_logical_domains(
-            dataset,
-            &indices.iter().collect::<Vec<_>>(),
-        )
-        .map(Some);
+        let scanner = dataset.scan();
+        let group = scanner.logical_coverage_group_for_indices(&indices).await?;
+        return scanner
+            .logical_fully_covered_domains(&group)
+            .await
+            .map(Some);
     }
     match indices.len() {
         0 => Ok(None),
@@ -320,6 +667,17 @@ pub async fn open_named_scalar_index(
     index_name: &str,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
+    open_named_scalar_index_with_readers(dataset, column, index_name, metrics, &HashMap::new())
+        .await
+}
+
+pub async fn open_named_scalar_index_with_readers(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    metrics: &dyn MetricsCollector,
+    preopened: &HashMap<uuid::Uuid, OpenedIndexFile>,
+) -> Result<Arc<dyn ScalarIndex>> {
     let indices = load_named_scalar_segments(dataset, column, index_name).await?;
     match indices.len() {
         0 => Err(Error::internal(format!(
@@ -327,15 +685,25 @@ pub async fn open_named_scalar_index(
             index_name, column
         ))),
         1 => {
-            dataset
-                .open_scalar_index(column, &indices[0].uuid, metrics)
-                .await
+            crate::index::scalar::open_resolved_scalar_index_with_reader(
+                dataset,
+                column,
+                &indices[0],
+                metrics,
+                preopened.get(&indices[0].uuid).cloned(),
+            )
+            .await
         }
         _ => {
             let segments = try_join_all(indices.iter().map(|index| async move {
-                dataset
-                    .open_scalar_index(column, &index.uuid, metrics)
-                    .await
+                crate::index::scalar::open_resolved_scalar_index_with_reader(
+                    dataset,
+                    column,
+                    index,
+                    metrics,
+                    preopened.get(&index.uuid).cloned(),
+                )
+                .await
             }))
             .await?;
 
@@ -371,6 +739,102 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
+
+    #[tokio::test]
+    async fn segment_generation_invalidation_is_shard_local() {
+        use lance_datagen::{BatchCount, RowCount};
+        use lance_file::version::LanceFileVersion;
+        use lance_table::format::{
+            ContentGenerationRegion, FieldGeneration, LogicalIndexCoverage,
+            LogicalIndexCoverageShard, LogicalRowAddressRange, LogicalRowAddressSelection,
+            RowReferenceDomain,
+        };
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let logical_fragment_id = dataset.manifest.fragments[0]
+            .native_logical_domain
+            .as_ref()
+            .unwrap()
+            .logical_fragment_id;
+        let field_id = dataset.schema().field("value").unwrap().id;
+        let selection = |start, end| {
+            LogicalRowAddressSelection::from_ranges(vec![LogicalRowAddressRange::new(
+                logical_fragment_id,
+                start,
+                end,
+            )])
+            .unwrap()
+        };
+        let stale = LogicalIndexCoverageShard::new_exact(
+            selection(0, 2),
+            vec![field_id],
+            vec![FieldGeneration {
+                field_id,
+                generation: 1,
+            }],
+        )
+        .unwrap();
+        let current = LogicalIndexCoverageShard::new_exact(
+            selection(2, 4),
+            vec![field_id],
+            vec![FieldGeneration {
+                field_id,
+                generation: 2,
+            }],
+        )
+        .unwrap();
+        let coverage = LogicalIndexCoverage::new_exact(vec![stale, current]).unwrap();
+        let index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "value_idx".to_string(),
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            row_reference_domain: Some(RowReferenceDomain::StableLogicalRowAddress),
+            logical_coverage: Some(coverage),
+        };
+        let layout = Arc::make_mut(
+            Arc::make_mut(&mut dataset.manifest)
+                .row_address_layout
+                .as_mut()
+                .unwrap(),
+        );
+        layout.field_default_generations = vec![FieldGeneration {
+            field_id,
+            generation: 1,
+        }];
+        layout.generation_regions = vec![ContentGenerationRegion {
+            selection: Arc::new(selection(1, 3)),
+            field_ids: vec![field_id],
+            generation: 2,
+        }];
+
+        let invalid = logical_index_invalidations(&dataset, &index).await.unwrap();
+        let cached = logical_index_invalidations(&dataset, &index).await.unwrap();
+        assert!(Arc::ptr_eq(&invalid, &cached));
+        let raw = |slot: u32| (u64::from(logical_fragment_id) << 32) | u64::from(slot);
+        assert!(invalid.contains(raw(1)));
+        assert!(!invalid.contains(raw(2)));
+    }
 
     #[tokio::test]
     async fn test_v23_external_btree_coverage_prunes_after_compact_and_repack() {
@@ -466,7 +930,7 @@ mod tests {
                 .any(|placement| matches!(placement, RowAddressPlacement::ExplicitMap(_)))
         );
 
-        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let mut dataset = Dataset::open(test_dir.as_str()).await.unwrap();
         let committed = dataset
             .load_indices_by_name("value_btree_external")
             .await
@@ -537,6 +1001,52 @@ mod tests {
             indexed_bytes < full_scan_bytes,
             "indexed query read {indexed_bytes} bytes, full scan read {full_scan_bytes} bytes"
         );
+
+        let external = committed[0]
+            .logical_coverage
+            .as_ref()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .clone();
+        let index_id = committed[0].uuid;
+        let appended = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col(
+                "payload",
+                array::rand_fixedbin(ByteCount::from(4096), false),
+            )
+            .into_reader_rows(RowCount::from(16), BatchCount::from(1));
+        dataset.append(appended, None).await.unwrap();
+
+        for (cache_mode, cache_bytes) in [
+            ("normal", 128 * 1024 * 1024),
+            ("cache=0", 0),
+            ("eviction", 1),
+        ] {
+            let session = Arc::new(crate::session::Session::new(
+                cache_bytes,
+                cache_bytes,
+                Default::default(),
+            ));
+            let dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_dir.as_str())
+                .with_session(session)
+                .load()
+                .await
+                .unwrap();
+            let _ = dataset.object_store.as_ref().io_stats_incremental();
+            assert_eq!(query(&dataset, true).await.num_rows(), 1);
+
+            let stats = dataset.object_store.as_ref().io_stats_incremental();
+            let coverage_tail_gets =
+                crate::index::coverage_anchor_tail_gets(&stats, index_id, &external);
+            assert_eq!(
+                coverage_tail_gets, 1,
+                "{cache_mode} must hand the planner's coverage anchor reader to scalar execution; requests: {:#?}",
+                stats.requests
+            );
+        }
     }
 
     #[tokio::test]
@@ -637,6 +1147,61 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+    }
+
+    #[rstest::rstest]
+    #[case::no_stable_row_ids(false)]
+    #[case::stable_row_ids(true)]
+    #[tokio::test]
+    async fn v2_2_scalar_index_open_skips_logical_row_restriction(
+        #[case] enable_stable_row_ids: bool,
+    ) {
+        use lance_file::version::LanceFileVersion;
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(64),
+                lance_datagen::BatchCount::from(4),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                enable_stable_row_ids,
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let segment = CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+            .name("value_btree".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("value_btree", "value", vec![segment])
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert!(!dataset.manifest.uses_stable_logical_row_addresses());
+        let index =
+            open_named_scalar_index(&dataset, "value", "value_btree", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let result = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(17))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.row_addrs().true_rows().len(), Some(1));
     }
 
     #[tokio::test]

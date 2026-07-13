@@ -16,6 +16,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::rowids::RowIdSequence;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -160,6 +161,72 @@ pub fn transpose_row_addrs(
     let old_frag_digests: Vec<FragDigest> = old_fragments.iter().map(|frag| frag.into()).collect();
     let new_frag_digests: Vec<FragDigest> = new_fragments.iter().map(|frag| frag.into()).collect();
     transpose_row_ids_from_digest(row_addrs, &old_frag_digests, &new_frag_digests)
+}
+
+/// Build an old-to-new address map when the rewrite intentionally changed row
+/// order.  The input sequence is destination ordered; deleted source rows are
+/// added with a `None` destination.
+pub fn transpose_ordered_row_addrs(
+    ordered_row_addrs: &RowIdSequence,
+    old_fragments: &[Fragment],
+    new_fragments: &[Fragment],
+) -> Result<HashMap<u64, Option<u64>>> {
+    let old_rows = old_fragments
+        .iter()
+        .map(|fragment| {
+            let rows = fragment.physical_rows.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "ordered rewrite source fragment {} is missing physical_rows",
+                    fragment.id
+                ))
+            })?;
+            Ok((fragment.id as u32, rows as u32))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+    let output_rows = new_fragments
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap_or_default() as u64)
+        .sum::<u64>();
+    if ordered_row_addrs.len() != output_rows {
+        return Err(Error::invalid_input(format!(
+            "ordered rewrite captured {} live source rows but wrote {output_rows} destination rows",
+            ordered_row_addrs.len()
+        )));
+    }
+
+    let destinations = new_fragments.iter().flat_map(|fragment| {
+        let fragment_id = fragment.id as u32;
+        (0..fragment.physical_rows.unwrap_or_default() as u32)
+            .map(move |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+    });
+    let mut mapping =
+        HashMap::with_capacity(old_rows.values().map(|row_count| *row_count as usize).sum());
+    for (source, destination) in ordered_row_addrs.iter().zip(destinations) {
+        let source_address = RowAddress::from(source);
+        let Some(row_count) = old_rows.get(&source_address.fragment_id()) else {
+            return Err(Error::invalid_input(format!(
+                "ordered rewrite captured row address {source} outside its source fragments"
+            )));
+        };
+        if source_address.row_offset() >= *row_count {
+            return Err(Error::invalid_input(format!(
+                "ordered rewrite captured row address {source} beyond fragment row count {row_count}"
+            )));
+        }
+        if mapping.insert(source, Some(destination)).is_some() {
+            return Err(Error::invalid_input(format!(
+                "ordered rewrite captured duplicate row address {source}"
+            )));
+        }
+    }
+    for (fragment_id, row_count) in old_rows {
+        for offset in 0..row_count {
+            mapping
+                .entry(u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+                .or_insert(None);
+        }
+    }
+    Ok(mapping)
 }
 
 pub fn transpose_row_ids_from_digest(

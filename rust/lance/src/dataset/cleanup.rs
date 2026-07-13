@@ -53,7 +53,7 @@ use lance_core::{
     },
 };
 use lance_table::{
-    format::{IndexMetadata, Manifest},
+    format::{IndexMetadata, Manifest, is_detached_version},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -458,6 +458,12 @@ impl<'a> CleanupTask<'a> {
     }
 
     async fn run(self) -> Result<CleanupRunResult> {
+        if is_detached_version(self.read_version) {
+            return Err(Error::invalid_input(format!(
+                "cleanup cannot run from detached manifest {} (version {}): detached manifests are permanent GC roots; open the attached dataset head before cleanup",
+                self.dataset.manifest_location.path, self.read_version
+            )));
+        }
         let mut final_result = CleanupRunResult::default();
         let candidate_file_limit = self.action.candidate_file_limit();
         // First check if we need to clean referenced branches
@@ -591,24 +597,38 @@ impl<'a> CleanupTask<'a> {
         }
 
         let current_manifest_path = &self.dataset.manifest_location.path;
-        self.dataset
+        let attached = self
+            .dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
-            .try_filter(|location| {
+            .map_ok(|location| (location, false));
+        let detached = self
+            .dataset
+            .commit_handler
+            .list_detached_manifest_locations(&self.dataset.base, &self.dataset.object_store)
+            .map_ok(|location| (location, true));
+        // Detached manifests have no implicit retention policy or deletion API.
+        // While one exists it remains addressable and is therefore a permanent GC root.
+        stream::select(attached, detached)
+            .try_filter(|(location, _)| {
                 future::ready(
                     location.path != *current_manifest_path
                         && !self.ignored_manifests.contains(&location.path),
                 )
             })
-            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(
-                    location,
-                    &inspection,
-                    tagged_versions,
-                    shallow_clone_pins,
-                    generation_blocked_transaction_start,
-                )
-            })
+            .try_for_each_concurrent(
+                self.dataset.object_store.io_parallelism(),
+                |(location, is_detached)| {
+                    self.process_manifest_file(
+                        location,
+                        &inspection,
+                        tagged_versions,
+                        shallow_clone_pins,
+                        generation_blocked_transaction_start,
+                        is_detached,
+                    )
+                },
+            )
             .await?;
         Ok(inspection.into_inner().unwrap())
     }
@@ -620,6 +640,7 @@ impl<'a> CleanupTask<'a> {
         tagged_versions: &HashSet<u64>,
         shallow_clone_pins: &ActiveShallowClonePins,
         generation_blocked_transaction_start: Option<u64>,
+        is_detached: bool,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
@@ -638,7 +659,8 @@ impl<'a> CleanupTask<'a> {
         let is_generation_pinned = generation_blocked_transaction_start.is_some_and(|start| {
             manifest.version >= start && manifest.version <= self.read_version
         });
-        let in_working_set = is_latest
+        let in_working_set = is_detached
+            || is_latest
             || !self.policy.should_clean(&manifest)
             || is_tagged
             || is_shallow_clone_pinned
@@ -1507,6 +1529,10 @@ impl CleanupPolicyBuilder {
 ///
 /// The latest manifest is always considered valid and will not be removed
 /// even if it satisfied the cleanup policy.
+///
+/// Returns [`Error::InvalidInput`] when `dataset` is a detached manifest.
+/// Cleanup must run from the attached head; every existing detached manifest
+/// remains a permanent garbage-collection root.
 pub async fn cleanup_old_versions(
     dataset: &Dataset,
     policy: CleanupPolicy,
@@ -1695,12 +1721,13 @@ mod tests {
 
     use super::*;
     use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::dataset::optimize::{RowAddressMaintenanceOptions, maintain_row_addresses};
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{
-            AutoCleanupParams, ReadParams, UpdateBuilder, WriteMode, WriteParams,
-            builder::DatasetBuilder,
+            AutoCleanupParams, CommitBuilder, InsertBuilder, ReadParams, UpdateBuilder, WriteMode,
+            WriteParams, builder::DatasetBuilder,
         },
         index::vector::VectorIndexParams,
     };
@@ -1721,6 +1748,7 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
     use lance_linalg::distance::MetricType;
+    use lance_table::format::RowAddressPlacement;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
@@ -2198,6 +2226,140 @@ mod tests {
         assert_gt!(after_count.num_data_files, 0);
         // We should keep referenced tx files
         assert_gt!(after_count.num_tx_files, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_retains_files_referenced_by_detached_manifests() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions {
+                target_rows_per_fragment: 3,
+                max_rows_per_group: 3,
+                ..RowAddressMaintenanceOptions::repack()
+            },
+        )
+        .await
+        .unwrap();
+        let explicit = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .placements
+            .iter()
+            .find_map(|placement| match placement {
+                RowAddressPlacement::ExplicitMap(explicit) => Some(explicit.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let explicit_paths = std::iter::once(explicit.object_path.clone())
+            .chain(
+                explicit
+                    .destinations
+                    .iter()
+                    .map(|destination| destination.row_id_file_path.clone()),
+            )
+            .collect::<Vec<_>>();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![10]))]).unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&append_params)
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+        let detached = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_detached(true)
+            .execute(transaction)
+            .await
+            .unwrap();
+        let detached_version = detached.version_id();
+        let attached_head = dataset.latest_version_id().await.unwrap();
+        let detached_data_path = detached.data_dir().join(
+            detached
+                .manifest
+                .fragments
+                .last()
+                .unwrap()
+                .files
+                .first()
+                .unwrap()
+                .path
+                .as_str(),
+        );
+        assert!(
+            detached
+                .object_store
+                .exists(&detached_data_path)
+                .await
+                .unwrap()
+        );
+
+        let error = cleanup_old_versions(
+            &detached,
+            CleanupPolicyBuilder::default()
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("detached manifest"));
+        assert!(error.to_string().contains(&detached_version.to_string()));
+        assert_eq!(dataset.latest_version_id().await.unwrap(), attached_head);
+        assert!(
+            detached
+                .object_store
+                .exists(&detached_data_path)
+                .await
+                .unwrap()
+        );
+
+        let mut restored = dataset.checkout_version(1).await.unwrap();
+        restored.restore().await.unwrap();
+
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&restored, 1)
+            .await
+            .unwrap()
+            .delete_unverified(true)
+            .build();
+        cleanup_old_versions(&restored, policy).await.unwrap();
+
+        let reopened = Dataset::open(uri.as_str()).await.unwrap();
+        let detached = reopened.checkout_version(detached_version).await.unwrap();
+        assert_eq!(detached.count_rows(None).await.unwrap(), 11);
+        for relative_path in explicit_paths {
+            let path = relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .fold(detached.base.clone(), |path, segment| path.join(segment));
+            assert!(detached.object_store.exists(&path).await.unwrap());
+        }
     }
 
     #[tokio::test]

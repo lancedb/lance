@@ -862,9 +862,10 @@ impl Dataset {
                 .collect::<Result<Vec<_>>>()?;
             retain_supported_indices(&mut indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
-            let metadata_key = crate::session::index_caches::IndexMetadataKey {
-                version: manifest_location.version,
-            };
+            let metadata_key = crate::session::index_caches::IndexMetadataKey::for_manifest(
+                manifest_location.version,
+                &manifest,
+            );
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
                 .await;

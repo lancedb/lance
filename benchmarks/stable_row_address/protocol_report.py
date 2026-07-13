@@ -24,6 +24,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import protocol  # noqa: E402
 import run  # noqa: E402
+import environment_attestation  # noqa: E402
 
 
 BOOTSTRAP_SAMPLES = 10_000
@@ -36,9 +37,11 @@ SIDECAR_FIELDS = {
     "created_at_utc",
     "commit",
     "source_provenance",
+    "development_tiny",
     "host",
     "seed",
     "profile",
+    "cargo_profile",
     "tracks",
     "variants",
     "matrix_case_names",
@@ -53,6 +56,7 @@ SIDECAR_FIELDS = {
     "executable",
     "data_retention",
     "storage_scope",
+    "storage_region_attestation",
     "fixture_strategy",
     "fixture_lineage_jsonl",
     "checkpoint_json",
@@ -80,6 +84,7 @@ COMMIT_OPERATIONS = {
     "random_delete_reclaim",
     "normalize_placement",
     "repack",
+    "bounded_recluster",
     "recluster",
     "checkpoint_generation",
     "index_build",
@@ -90,9 +95,39 @@ RELOCATION_OPERATIONS = {
     "random_delete_reclaim",
     "normalize_placement",
     "repack",
+    "bounded_recluster",
     "recluster",
 }
 DEFAULT_COMPACTION_PREFLIGHT = "default_compaction_preflight"
+EXPLICIT_MATRIX_DIAGNOSTIC_OPERATIONS = {
+    "random_delete_reclaim",
+    "repack",
+    "recluster",
+}
+DIAGNOSTIC_ONLY_GATE_TRACKS = {"adversarial_aligned"}
+REPEATED_UPDATE_TRACKS = {
+    "sustained",
+    "adversarial_natural",
+    "adversarial_aligned",
+}
+PMR_DIAGNOSTIC_FIELDS = (
+    "pmr_reason",
+    "pmr_projected_delta_bytes",
+    "pmr_delta_limit_bytes",
+    "pmr_projected_epoch_bytes",
+    "pmr_epoch_limit_bytes",
+    "pmr_generation_delta_bytes",
+    "pmr_generation_epoch_bytes",
+    "pmr_blocking_indices",
+)
+STRUCTURAL_PMR_REASONS = {
+    "extent_fanout",
+    "existing_explicit_map_requires_rewrite",
+    "explicit_map_metadata_required",
+    "selection_subtraction_requires_rewrite",
+    "packed_run_subtraction_requires_rewrite",
+    "logical_order_requires_rewrite",
+}
 STANDARD_METRICS = (
     "latency",
     "throughput",
@@ -105,6 +140,11 @@ STANDARD_METRICS = (
     "get_requests",
     "head_requests",
     "list_requests",
+)
+PLACEMENT_METADATA_REQUEST_METRICS = (
+    "metadata_get_requests",
+    "metadata_head_requests",
+    "metadata_list_requests",
 )
 PROVENANCE_FIELDS = (
     "operation",
@@ -143,6 +183,7 @@ TIMING_SCOPES = {
     "random_delete_reclaim": "cold_session_open_and_same_postcondition_random_delete_reclaim_commit",
     "normalize_placement": "cold_session_open_and_normalize_placement_commit",
     "repack": "cold_session_open_and_repack_commit",
+    "bounded_recluster": "cold_session_open_and_bounded_recluster_commit",
     "recluster": "cold_session_open_and_recluster_commit",
     "checkpoint_generation": "cold_session_open_and_generation_checkpoint_commit",
     "index_build": "cold_session_open_and_index_build_commit",
@@ -192,8 +233,15 @@ class Gate:
             operator = "<" if self.strict else "<="
         return f"{self.direction} CI {operator} {self.threshold:.2f}"
 
+    @property
+    def aggregate_release_gate(self) -> bool:
+        return self.track not in DIAGNOSTIC_ONLY_GATE_TRACKS
+
     def as_json(self) -> dict[str, Any]:
-        return dataclasses.asdict(self) | {"contract": self.contract}
+        return dataclasses.asdict(self) | {
+            "contract": self.contract,
+            "aggregate_release_gate": self.aggregate_release_gate,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,11 +293,38 @@ def frozen_release_policy() -> tuple[str, str]:
     return canonical, hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def canonical_dataset_root(root: Any, storage: Any) -> str:
+    if not isinstance(root, str) or not root.strip():
+        raise ValueError("dataset root must be a non-empty string")
+    if storage == "s3":
+        if not root.startswith("s3://"):
+            raise ValueError("storage=s3 requires s3:// dataset roots")
+        return root.rstrip("/")
+    if storage == "ebs":
+        if root.startswith("s3://"):
+            raise ValueError("storage=ebs requires local dataset roots")
+        return str(Path(root).expanduser().resolve())
+    raise ValueError("protocol sidecar storage is unsupported")
+
+
 def frozen_dataset_root(sidecar: dict[str, Any]) -> str:
-    base = sidecar["base_dataset_root"]
+    base = canonical_dataset_root(
+        sidecar.get("base_dataset_root"), sidecar.get("storage")
+    )
     if sidecar["shard_count"] == 1:
         return base
-    return f"{base.rstrip('/')}/{sidecar['shard_id']}"
+    return f"{base}/{sidecar['shard_id']}"
+
+
+def validate_dataset_root_binding(sidecar: dict[str, Any]) -> str:
+    actual = canonical_dataset_root(sidecar.get("dataset_root"), sidecar.get("storage"))
+    expected = frozen_dataset_root(sidecar)
+    if actual != expected:
+        raise ValueError(
+            "protocol sidecar dataset_root is inconsistent with its shard: "
+            f"expected={expected!r}, actual={actual!r}"
+        )
+    return actual
 
 
 def validate_storage_roots(sidecar: dict[str, Any]) -> None:
@@ -283,26 +358,32 @@ def frozen_release_shard_contract(
     cases = tuple(
         protocol.iter_matrix_cases(profile, set(matrix["tracks"]["matrix"]["cases"]))
     )
-    fixture_keys = {
-        (case.schema_kind, case.rows_per_fragment, case.fixture_index_kind)
-        for case in cases
-    }
+    fixture_keys = {protocol.fixture_key_for_case(case) for case in cases}
     repeated_rows_per_fragment = max(
         1,
         (profile["rows"] + profile["logical_fragment_counts"][0] - 1)
         // profile["logical_fragment_counts"][0],
     )
     variant_layouts = {
-        "bare": ("narrow16", repeated_rows_per_fragment, "none"),
-        "scalar": ("narrow16", repeated_rows_per_fragment, "scalar"),
-        "vector": ("vector", repeated_rows_per_fragment, "vector"),
+        "bare": (
+            "narrow16",
+            ((profile["rows"], repeated_rows_per_fragment),),
+            "none",
+        ),
+        "scalar": (
+            "narrow16",
+            ((profile["rows"], repeated_rows_per_fragment),),
+            "scalar",
+        ),
+        "vector": (
+            "vector",
+            ((profile["rows"], repeated_rows_per_fragment),),
+            "vector",
+        ),
     }
     fixture_keys.update(variant_layouts.values())
     data_layouts = sorted(
-        {
-            (schema_kind, rows_per_fragment)
-            for schema_kind, rows_per_fragment, _ in fixture_keys
-        }
+        {(schema_kind, segments) for schema_kind, segments, _ in fixture_keys}
     )
     selected_data_layouts = {
         layout
@@ -315,8 +396,7 @@ def frozen_release_shard_contract(
     matrix_case_names = tuple(
         case.name
         for case in cases
-        if (case.schema_kind, case.rows_per_fragment, case.fixture_index_kind)
-        in selected_fixture_keys
+        if protocol.fixture_key_for_case(case) in selected_fixture_keys
     )
     variants = tuple(
         variant
@@ -383,6 +463,7 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         "source_provenance",
         "host",
         "profile",
+        "cargo_profile",
         "storage",
         "dataset_root",
         "base_dataset_root",
@@ -409,6 +490,15 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         "dirty-development-override",
     }:
         raise ValueError("protocol sidecar source_provenance is invalid")
+    if not isinstance(value["development_tiny"], bool):
+        raise ValueError("protocol sidecar development_tiny must be a boolean")
+    if value["development_tiny"] and (
+        value["profile"] != "smoke"
+        or value["source_provenance"] != "dirty-development-override"
+    ):
+        raise ValueError(
+            "development_tiny evidence requires dirty-development smoke provenance"
+        )
     if (
         value["profile"] == "release"
         and value["source_provenance"] != "clean-committed-source"
@@ -416,6 +506,8 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         raise ValueError("release evidence requires clean committed source")
     if value["profile"] not in {"smoke", "release"}:
         raise ValueError("protocol sidecar profile is unsupported")
+    if value["cargo_profile"] != run.CARGO_PROFILE:
+        raise ValueError(f"protocol sidecar cargo_profile must be {run.CARGO_PROFILE}")
     if value["storage"] not in {"ebs", "s3"}:
         raise ValueError("protocol sidecar storage is unsupported")
     if (
@@ -431,9 +523,8 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         raise ValueError("protocol sidecar shard specification is invalid")
     if value["shard_strategy"] != "schema_and_fragment_layout_fixture_locality":
         raise ValueError("protocol sidecar shard_strategy is unsupported")
-    if value["dataset_root"] != frozen_dataset_root(value):
-        raise ValueError("protocol sidecar dataset_root is inconsistent with its shard")
     validate_storage_roots(value)
+    validate_dataset_root_binding(value)
     if value["data_retention"] != "preserve":
         raise ValueError("protocol sidecar must preserve datasets")
     expected_scope = (
@@ -445,6 +536,12 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         raise ValueError("protocol sidecar storage_scope is inconsistent with profile")
     if value["profile"] == "release" and value["storage"] != "s3":
         raise ValueError("release evidence requires same-region S3")
+    if value["profile"] == "release":
+        environment_attestation.validate_same_region_s3_attestation(
+            value["storage_region_attestation"], value["base_dataset_root"]
+        )
+    elif value["storage_region_attestation"] is not None:
+        raise ValueError("smoke evidence must not claim a release region attestation")
     if value["fixture_strategy"] != (
         "canonical_base_per_format_schema_fragment_layout_then_shallow_clone"
     ):
@@ -496,12 +593,37 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
     if hashlib.sha256(matrix_canonical.encode()).hexdigest() != value["matrix_sha256"]:
         raise ValueError("matrix SHA-256 does not match canonical JSON")
     frozen, frozen_canonical, frozen_sha256 = frozen_matrix()
-    if matrix_canonical != frozen_canonical or value["matrix_sha256"] != frozen_sha256:
-        raise ValueError("protocol sidecar does not contain the frozen workload matrix")
+    expected_matrix = (
+        protocol.development_tiny_matrix(frozen)
+        if value["development_tiny"]
+        else frozen
+    )
+    expected_canonical = (
+        json.dumps(
+            expected_matrix,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        if value["development_tiny"]
+        else frozen_canonical
+    )
+    expected_sha256 = (
+        hashlib.sha256(expected_canonical.encode()).hexdigest()
+        if value["development_tiny"]
+        else frozen_sha256
+    )
+    if (
+        matrix_canonical != expected_canonical
+        or value["matrix_sha256"] != expected_sha256
+    ):
+        raise ValueError(
+            "protocol sidecar does not contain the expected frozen workload matrix"
+        )
     validate_frozen_release_selection(value)
     validate_frozen_release_identity(value)
     # Re-run the complete matrix validator against the repository-owned object.
-    temporary_matrix = frozen
+    temporary_matrix = expected_matrix
     _strict_object(
         temporary_matrix,
         {"schema_version", "name", "profiles", "tracks", "measurement"},
@@ -716,8 +838,7 @@ def audit_maintenance_plans(
                 or value["fragment_count"] > value["max_source_fragments_per_group"]
                 or group["source_live_rows"] != value["expected_rows"]
                 or group["source_live_rows"] > group["source_physical_rows"]
-                or group["source_live_data_bytes"]
-                > group["source_physical_data_bytes"]
+                or group["source_live_data_bytes"] > group["source_physical_data_bytes"]
             ):
                 raise ValueError("plan source group or topology is inconsistent")
             live_rows = group["source_live_rows"]
@@ -736,7 +857,9 @@ def audit_maintenance_plans(
             expected_outputs = max(
                 1, (live_rows + expected_target - 1) // expected_target
             )
-            expected_output_live_rows = [expected_target] * (live_rows // expected_target)
+            expected_output_live_rows = [expected_target] * (
+                live_rows // expected_target
+            )
             if live_rows % expected_target:
                 expected_output_live_rows.append(live_rows % expected_target)
             if not expected_output_live_rows:
@@ -902,6 +1025,11 @@ def metric_value(record: dict[str, Any], metric: str) -> int | None:
         return record["io_by_path"]["metadata"]["read_bytes"]
     if metric == "metadata_write_bytes":
         return record["io_by_path"]["metadata"]["write_bytes"]
+    if metric.startswith("metadata_") and metric.endswith("_requests"):
+        request_kind = metric.removeprefix("metadata_")
+        if request_kind not in {"get_requests", "head_requests", "list_requests"}:
+            raise ValueError(f"unsupported metadata request metric: {metric}")
+        return record["io_by_path"]["metadata"][request_kind]
     if metric == "total_read_bytes":
         return record["read_bytes"]
     if metric == "total_write_bytes":
@@ -1042,7 +1170,11 @@ def group_by_pair(records: Iterable[dict[str, Any]]) -> dict[str, list[dict[str,
 
 
 def _implementation_path(
-    operation: str, format_name: str, index_kind: str, selection: str
+    operation: str,
+    format_name: str,
+    index_kind: str,
+    selection: str,
+    compaction_mode: str,
 ) -> str:
     if operation == "update":
         return (
@@ -1061,6 +1193,12 @@ def _implementation_path(
         return "capability_gated_explicit_maintenance"
     if operation == "default_compaction_preflight":
         return "default_compaction_plan_only"
+    if operation == "default_compaction" and compaction_mode == "fragment_reuse":
+        return {
+            "v22_no_stable": "deferred_fragment_reuse_compaction",
+            "v22_stable": "inline_index_remap_compaction",
+            "v23_logical": "stable_logical_zero_remap_compaction",
+        }[format_name]
     if operation == "default_compaction":
         return "default_compaction"
     if operation == "random_delete_reclaim":
@@ -1068,6 +1206,12 @@ def _implementation_path(
             "explicit_repack"
             if format_name == "v23_logical"
             else "same_postcondition_default_compaction"
+        )
+    if operation == "bounded_recluster":
+        return (
+            "default_bounded_recluster_fast_path"
+            if format_name == "v23_logical"
+            else "same_postcondition_bounded_recluster_rewrite"
         )
     if operation in {"index_build", "index_take", "index_optimize"}:
         return INDEX_NAMES[index_kind]
@@ -1099,6 +1243,7 @@ def _expected_provenance(
     schema_kind: str = "narrow16",
     index_kind: str = "none",
     selection: str = "range",
+    compaction_mode: str = "standard",
 ) -> dict[str, Any]:
     return {
         "operation": operation,
@@ -1119,7 +1264,7 @@ def _expected_provenance(
         "index_kind": INDEX_NAMES[index_kind],
         "selection": SELECTION_NAMES[selection],
         "implementation_path": _implementation_path(
-            operation, format_name, index_kind, selection
+            operation, format_name, index_kind, selection, compaction_mode
         ),
         "policy_version": 1,
     }
@@ -1133,14 +1278,17 @@ def _expected_record_provenance(
     tracks: tuple[str, ...],
     variants: tuple[str, ...],
     matrix_case_names: tuple[str, ...],
+    development_tiny: bool,
     optional_pairs: frozenset[str] | None,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     matrix, _, _ = frozen_matrix()
+    if development_tiny:
+        matrix = protocol.development_tiny_matrix(matrix)
     profile = matrix["profiles"][profile_name]
     rows = profile["rows"]
     repeats = profile["paired_repeats"]
     expected: dict[tuple[str, str], dict[str, Any]] = {}
-    seen_fixtures: set[tuple[str, int, str]] = set()
+    seen_fixtures: set[protocol.FixtureKey] = set()
     current_take_count = profile["take_counts"][-1]
     phase_index = 0
 
@@ -1149,6 +1297,9 @@ def _expected_record_provenance(
         order = run.format_order(repeat, phase_index)
         phase_index += 1
         return order
+
+    def dynamic_order(repeat: int, scope: str) -> tuple[str, ...]:
+        return run.dynamic_format_order(repeat, scope)
 
     def include_optional(pair_id: str) -> bool:
         return optional_pairs is None or pair_id in optional_pairs
@@ -1162,13 +1313,13 @@ def _expected_record_provenance(
 
     def fixture_uri(
         schema_kind: str,
-        rows_per_fragment: int,
+        segments: tuple[tuple[int, int], ...],
         index_kind: str,
         format_name: str,
     ) -> str:
         suffix = (
-            f"{run_id}/fixtures/{schema_kind}/rows-{rows}/"
-            f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}/"
+            f"{run_id}/fixtures/{schema_kind}/{protocol.fixture_layout_path(segments)}/"
+            f"index-{index_kind}/"
             f"{format_name}.lance"
         )
         return _dataset_uri(dataset_root, suffix)
@@ -1191,7 +1342,9 @@ def _expected_record_provenance(
         schema_kind: str = "narrow16",
         index_kind: str = "none",
         selection: str = "range",
+        compaction_mode: str = "standard",
         order_indices: Sequence[int] | None = None,
+        configured_rows: int | None = None,
     ) -> None:
         if order_indices is None:
             order_indices = range(len(formats))
@@ -1204,7 +1357,7 @@ def _expected_record_provenance(
                 dataset_uri=uri_for_format(format_name),
                 repeat=repeat,
                 order_index=order_index,
-                rows=rows,
+                rows=rows if configured_rows is None else configured_rows,
                 rows_per_fragment=rows_per_fragment,
                 take_count=take_count,
                 expected_rows=expected_rows,
@@ -1216,6 +1369,7 @@ def _expected_record_provenance(
                 schema_kind=schema_kind,
                 index_kind=index_kind,
                 selection=selection,
+                compaction_mode=compaction_mode,
             )
             key = (pair_id, format_name)
             previous = expected.setdefault(key, value)
@@ -1224,18 +1378,20 @@ def _expected_record_provenance(
 
     def add_fixture(
         schema_kind: str,
-        rows_per_fragment: int,
+        segments: tuple[tuple[int, int], ...],
         index_kind: str,
         take_count: int,
     ) -> None:
-        key = (schema_kind, rows_per_fragment, index_kind)
+        key: protocol.FixtureKey = (schema_kind, segments, index_kind)
         if key in seen_fixtures:
             return
+        total_rows = sum(segment_rows for segment_rows, _ in segments)
+        rows_per_fragment = segments[0][1]
         if index_kind != "none":
-            add_fixture(schema_kind, rows_per_fragment, "none", take_count)
+            add_fixture(schema_kind, segments, "none", take_count)
             prefix = (
-                f"{run_id}/fixtures/{schema_kind}/rows-{rows}/"
-                f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}"
+                f"{run_id}/fixtures/{schema_kind}/{protocol.fixture_layout_path(segments)}/"
+                f"index-{index_kind}"
             )
             add(
                 f"{prefix}/fixture_clone",
@@ -1244,10 +1400,10 @@ def _expected_record_provenance(
                 repeat=0,
                 rows_per_fragment=rows_per_fragment,
                 take_count=take_count,
-                expected_rows=rows,
+                expected_rows=total_rows,
                 schema_kind=schema_kind,
                 uri_for_format=lambda format_name: fixture_uri(
-                    schema_kind, rows_per_fragment, index_kind, format_name
+                    schema_kind, segments, index_kind, format_name
                 ),
             )
             add(
@@ -1257,31 +1413,44 @@ def _expected_record_provenance(
                 repeat=0,
                 rows_per_fragment=rows_per_fragment,
                 take_count=take_count,
-                expected_rows=rows,
+                expected_rows=total_rows,
                 schema_kind=schema_kind,
                 index_kind=index_kind,
                 uri_for_format=lambda format_name: fixture_uri(
-                    schema_kind, rows_per_fragment, index_kind, format_name
+                    schema_kind, segments, index_kind, format_name
                 ),
             )
         else:
             prefix = (
-                f"{run_id}/fixtures/{schema_kind}/rows-{rows}/"
-                f"rows-per-fragment-{rows_per_fragment}/index-none"
+                f"{run_id}/fixtures/{schema_kind}/{protocol.fixture_layout_path(segments)}/"
+                "index-none"
             )
-            add(
-                f"{prefix}/create",
-                paired_order(0),
-                operation="create",
-                repeat=0,
-                rows_per_fragment=rows_per_fragment,
-                take_count=take_count,
-                expected_rows=rows,
-                schema_kind=schema_kind,
-                uri_for_format=lambda format_name: fixture_uri(
-                    schema_kind, rows_per_fragment, "none", format_name
-                ),
-            )
+            cumulative_rows = 0
+            for segment_index, (segment_rows, segment_rows_per_fragment) in enumerate(
+                segments
+            ):
+                operation = "create" if segment_index == 0 else "append"
+                cumulative_before = cumulative_rows
+                cumulative_rows += segment_rows
+                label = (
+                    "create" if segment_index == 0 else f"append-{segment_index:03d}"
+                )
+                add(
+                    f"{prefix}/{label}",
+                    paired_order(0),
+                    operation=operation,
+                    repeat=0,
+                    rows_per_fragment=segment_rows_per_fragment,
+                    take_count=take_count,
+                    expected_rows=cumulative_rows,
+                    mutation_count=(segment_rows if operation == "append" else 1),
+                    id_start=cumulative_before,
+                    schema_kind=schema_kind,
+                    configured_rows=segment_rows,
+                    uri_for_format=lambda format_name: fixture_uri(
+                        schema_kind, segments, "none", format_name
+                    ),
+                )
         seen_fixtures.add(key)
 
     def add_probes(
@@ -1350,6 +1519,7 @@ def _expected_record_provenance(
             schema_kind=step_value.schema_kind,
             index_kind=step_value.index_kind,
             selection=step_value.selection,
+            compaction_mode=step_value.compaction_mode,
             uri_for_format=lambda format_name: workload_uri(
                 track, case, repeat, format_name
             ),
@@ -1378,7 +1548,7 @@ def _expected_record_provenance(
                 current_take_count = case.take_count
                 add_fixture(
                     case.schema_kind,
-                    case.rows_per_fragment,
+                    protocol.fixture_segments_for_case(case),
                     case.fixture_index_kind,
                     current_take_count,
                 )
@@ -1394,7 +1564,9 @@ def _expected_record_provenance(
                         expected_rows=rows,
                         schema_kind=case.schema_kind,
                         index_kind=case.fixture_index_kind,
-                        uri_for_format=lambda format_name, case_name=case_name, repeat=repeat: (
+                        uri_for_format=lambda format_name,
+                        case_name=case_name,
+                        repeat=repeat: (
                             workload_uri("matrix", case_name, repeat, format_name)
                         ),
                     )
@@ -1411,8 +1583,14 @@ def _expected_record_provenance(
                                 index_kind=step_value.index_kind,
                                 step=step_index,
                             )
+                        if step_value.preflight_expected_admission is not None:
+                            preflight_label = (
+                                "default-reclaim-preflight"
+                                if step_value.operation == "random_delete_reclaim"
+                                else "default-compaction-preflight"
+                            )
                             add_step(
-                                f"{prefix}/step-{step_index:03d}/default-reclaim-preflight",
+                                f"{prefix}/step-{step_index:03d}/{preflight_label}",
                                 ("v23_logical",),
                                 step_value,
                                 operation="default_compaction_preflight",
@@ -1424,7 +1602,11 @@ def _expected_record_provenance(
                             )
                         add_step(
                             f"{prefix}/step-{step_index:03d}/{step_value.operation}",
-                            paired_order(repeat),
+                            (
+                                ("v23_logical",)
+                                if step_value.operation == "recluster"
+                                else paired_order(repeat)
+                            ),
                             step_value,
                             operation=None,
                             repeat=repeat,
@@ -1458,7 +1640,7 @@ def _expected_record_provenance(
             schema_kind, index_kind = variant_config[variant]
             add_fixture(
                 schema_kind,
-                repeated_rows_per_fragment,
+                ((rows, repeated_rows_per_fragment),),
                 index_kind,
                 current_take_count,
             )
@@ -1474,9 +1656,10 @@ def _expected_record_provenance(
                     expected_rows=rows,
                     schema_kind=schema_kind,
                     index_kind=index_kind,
-                    uri_for_format=lambda format_name, track=track, variant=variant, repeat=repeat: (
-                        workload_uri(track, variant, repeat, format_name)
-                    ),
+                    uri_for_format=lambda format_name,
+                    track=track,
+                    variant=variant,
+                    repeat=repeat: (workload_uri(track, variant, repeat, format_name)),
                 )
                 for update_round in range(profile["repeated_update_rounds"]):
                     update_selection_step = 0 if track == "sustained" else update_round
@@ -1491,7 +1674,10 @@ def _expected_record_provenance(
                         "schema_kind": schema_kind,
                         "index_kind": index_kind,
                         "selection": "random",
-                        "uri_for_format": lambda format_name, track=track, variant=variant, repeat=repeat: (
+                        "uri_for_format": lambda format_name,
+                        track=track,
+                        variant=variant,
+                        repeat=repeat: (
                             workload_uri(track, variant, repeat, format_name)
                         ),
                     }
@@ -1510,17 +1696,27 @@ def _expected_record_provenance(
                             **update_kwargs,
                         )
                         pmr_pair = f"{prefix}/round-{update_round:03d}/pmr-maintenance"
+                        pmr_order_scope = (
+                            f"adversarial_natural/{variant}/repeat-{repeat:03d}/"
+                            f"round-{update_round:03d}/pmr-maintenance"
+                        )
+                        pmr_order = dynamic_order(repeat, pmr_order_scope)
+                        candidate_order_index = pmr_order.index("v23_logical")
                         if include_optional(pmr_pair):
                             add(
                                 pmr_pair,
                                 ("v23_logical",),
                                 operation="normalize_placement",
+                                order_indices=(candidate_order_index,),
                                 **update_kwargs,
                             )
+                        retry_pair = f"{prefix}/round-{update_round:03d}/update-retry"
+                        if include_optional(retry_pair):
                             add(
-                                f"{prefix}/round-{update_round:03d}/update-retry",
+                                retry_pair,
                                 ("v23_logical",),
                                 operation="update",
+                                order_indices=(candidate_order_index,),
                                 **update_kwargs,
                             )
                     else:
@@ -1531,27 +1727,41 @@ def _expected_record_provenance(
                             **update_kwargs,
                         )
                         normalize_pair = f"{prefix}/round-{update_round:03d}/normalize"
+                        aligned_scope = (
+                            f"adversarial_aligned/{variant}/repeat-{repeat:03d}/"
+                            f"round-{update_round:03d}/aligned-maintenance"
+                        )
+                        aligned_order = dynamic_order(repeat, aligned_scope)
                         if include_optional(normalize_pair):
                             add(
                                 normalize_pair,
                                 ("v23_logical",),
                                 operation="normalize_placement",
+                                order_indices=(aligned_order.index("v23_logical"),),
                                 **update_kwargs,
                             )
-                            for order_index, format_name in enumerate(
-                                ("v22_no_stable", "v22_stable")
-                            ):
+                        for format_name in ("v22_no_stable", "v22_stable"):
+                            baseline_pair = (
+                                f"{prefix}/round-{update_round:03d}/"
+                                f"forced-baseline-maintenance/{format_name}"
+                            )
+                            if include_optional(baseline_pair):
                                 add(
-                                    f"{prefix}/round-{update_round:03d}/forced-baseline-maintenance/{format_name}",
+                                    baseline_pair,
                                     (format_name,),
                                     operation="default_compaction",
-                                    order_indices=(order_index,),
+                                    order_indices=(aligned_order.index(format_name),),
                                     **update_kwargs,
                                 )
+                        retry_pair = (
+                            f"{prefix}/round-{update_round:03d}/candidate-retry"
+                        )
+                        if include_optional(retry_pair):
                             add(
-                                f"{prefix}/round-{update_round:03d}/candidate-retry",
+                                retry_pair,
                                 ("v23_logical",),
                                 operation="update",
+                                order_indices=(aligned_order.index("v23_logical"),),
                                 **update_kwargs,
                             )
                         add(
@@ -1608,11 +1818,16 @@ def _expected_record_provenance(
                                 step=profile["repeated_update_rounds"] + update_round,
                             )
                     elif track == "adversarial_natural":
+                        natural_scope = (
+                            f"{prefix}/round-{update_round:03d}/natural-maintenance"
+                        )
+                        natural_order_scope = (
+                            f"adversarial_natural/{variant}/repeat-{repeat:03d}/"
+                            f"round-{update_round:03d}/natural-maintenance"
+                        )
+                        natural_order = dynamic_order(repeat, natural_order_scope)
                         for format_name in run.FORMATS:
-                            maintenance_pair = (
-                                f"{prefix}/round-{update_round:03d}/"
-                                f"natural-maintenance/{format_name}"
-                            )
+                            maintenance_pair = f"{natural_scope}/{format_name}"
                             if include_optional(maintenance_pair):
                                 add(
                                     maintenance_pair,
@@ -1625,6 +1840,7 @@ def _expected_record_provenance(
                                     step=update_round,
                                     schema_kind=schema_kind,
                                     index_kind=index_kind,
+                                    order_indices=(natural_order.index(format_name),),
                                     uri_for_format=update_kwargs["uri_for_format"],
                                 )
                         add_probes(
@@ -1642,7 +1858,16 @@ def _expected_record_provenance(
 
 
 def _schedule_arguments(sidecar: dict[str, Any]) -> tuple[Any, ...]:
-    _, canonical, sha256 = frozen_matrix()
+    matrix, canonical, sha256 = frozen_matrix()
+    development_tiny = sidecar.get("development_tiny")
+    if not isinstance(development_tiny, bool):
+        raise ValueError("sidecar development_tiny must be a boolean")
+    if development_tiny:
+        matrix = protocol.development_tiny_matrix(matrix)
+        canonical = json.dumps(
+            matrix, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        sha256 = hashlib.sha256(canonical.encode()).hexdigest()
     embedded = json.dumps(
         sidecar.get("matrix"), sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
@@ -1655,10 +1880,8 @@ def _schedule_arguments(sidecar: dict[str, Any]) -> tuple[Any, ...]:
     profile_name = sidecar.get("profile")
     if profile_name not in {"smoke", "release"}:
         raise ValueError("sidecar profile is unsupported")
-    dataset_root = frozen_dataset_root(sidecar)
-    if sidecar.get("dataset_root") != dataset_root:
-        raise ValueError("sidecar dataset_root is inconsistent with its shard")
     validate_storage_roots(sidecar)
+    dataset_root = validate_dataset_root_binding(sidecar)
     if ("matrix" in sidecar["tracks"]) != bool(sidecar["matrix_case_names"]):
         raise ValueError("matrix track and matrix_case_names must be present together")
     validate_frozen_release_selection(sidecar)
@@ -1670,6 +1893,7 @@ def _schedule_arguments(sidecar: dict[str, Any]) -> tuple[Any, ...]:
         tuple(sidecar["tracks"]),
         tuple(sidecar["variants"]),
         tuple(sidecar["matrix_case_names"]),
+        development_tiny,
     )
 
 
@@ -1727,7 +1951,13 @@ def _derive_optional_pairs(
                         if candidate is not None and (
                             candidate["placement_maintenance_required"] is True
                         ):
-                            optional.add(f"{round_prefix}/pmr-maintenance")
+                            maintenance_pair = f"{round_prefix}/pmr-maintenance"
+                            optional.add(maintenance_pair)
+                            maintained = valid_records.get(
+                                (maintenance_pair, "v23_logical")
+                            )
+                            if maintained is not None and maintained["status"] == "ok":
+                                optional.add(f"{round_prefix}/update-retry")
                         scan_pair = f"{prefix}/step-{update_round:03d}/cold-scan"
                         for format_name in run.FORMATS:
                             if policy_triggered(scan_pair, format_name):
@@ -1740,7 +1970,31 @@ def _derive_optional_pairs(
                     if candidate is not None and (
                         candidate["placement_maintenance_required"] is True
                     ):
-                        optional.add(f"{round_prefix}/normalize")
+                        normalize_pair = f"{round_prefix}/normalize"
+                        baseline_pairs = tuple(
+                            (
+                                f"{round_prefix}/forced-baseline-maintenance/"
+                                f"{format_name}",
+                                format_name,
+                            )
+                            for format_name in ("v22_no_stable", "v22_stable")
+                        )
+                        optional.add(normalize_pair)
+                        optional.update(pair_id for pair_id, _ in baseline_pairs)
+                        predecessors = [
+                            valid_records.get((normalize_pair, "v23_logical")),
+                            *(
+                                valid_records.get((pair_id, format_name))
+                                for pair_id, format_name in baseline_pairs
+                            ),
+                        ]
+                        if all(
+                            record is not None
+                            and record["status"] == "ok"
+                            and record["placement_maintenance_required"] is not True
+                            for record in predecessors
+                        ):
+                            optional.add(f"{round_prefix}/candidate-retry")
     return frozenset(optional), issues
 
 
@@ -1834,7 +2088,7 @@ def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
     profile = matrix["profiles"][sidecar["profile"]]
     repeats = profile["paired_repeats"]
     expected: set[str] = set()
-    fixture_keys: set[tuple[str, int, str]] = set()
+    fixture_keys: set[protocol.FixtureKey] = set()
     if "matrix" in sidecar["tracks"]:
         cases_by_name = {
             case.name: case
@@ -1856,7 +2110,8 @@ def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
                         if step.operation == "create"
                         else step.operation
                     )
-                    expected.add(f"{prefix}/step-{step_index:03d}/{operation}")
+                    if step.operation != "recluster":
+                        expected.add(f"{prefix}/step-{step_index:03d}/{operation}")
                     if step.operation == "random_delete_reclaim":
                         expected.update(
                             {
@@ -1879,9 +2134,7 @@ def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
                 )
                 if case.steps[-1].index_kind != "none":
                     expected.add(f"{prefix}/step-{probe_step:03d}/cold-index-take")
-            fixture_keys.add(
-                (case.schema_kind, case.rows_per_fragment, case.fixture_index_kind)
-            )
+            fixture_keys.add(protocol.fixture_key_for_case(case))
 
     rounds = profile["repeated_update_rounds"]
     for track in set(sidecar["tracks"]) & {
@@ -1895,7 +2148,9 @@ def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
             rows_per_fragment = protocol._rows_per_fragment(
                 profile["rows"], profile["logical_fragment_counts"][0]
             )
-            fixture_keys.add((schema_kind, rows_per_fragment, index_kind))
+            fixture_keys.add(
+                (schema_kind, ((profile["rows"], rows_per_fragment),), index_kind)
+            )
             for repeat in range(repeats):
                 prefix = f"{run_id}/{track}/{variant}/repeat-{repeat:03d}"
                 expected.add(f"{prefix}/setup/fixture-clone")
@@ -1932,21 +2187,195 @@ def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
                             )
     expanded_fixture_keys = set(fixture_keys)
     expanded_fixture_keys.update(
-        (schema_kind, rows_per_fragment, "none")
-        for schema_kind, rows_per_fragment, index_kind in fixture_keys
+        (schema_kind, segments, "none")
+        for schema_kind, segments, index_kind in fixture_keys
         if index_kind != "none"
     )
-    for schema_kind, rows_per_fragment, index_kind in expanded_fixture_keys:
+    for schema_kind, segments, index_kind in expanded_fixture_keys:
         fixture_prefix = (
-            f"{run_id}/fixtures/{schema_kind}/rows-{profile['rows']}/"
-            f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}"
+            f"{run_id}/fixtures/{schema_kind}/{protocol.fixture_layout_path(segments)}/"
+            f"index-{index_kind}"
         )
         if index_kind == "none":
-            expected.add(f"{fixture_prefix}/create")
+            for segment_index in range(len(segments)):
+                label = (
+                    "create" if segment_index == 0 else f"append-{segment_index:03d}"
+                )
+                expected.add(f"{fixture_prefix}/{label}")
         else:
             expected.add(f"{fixture_prefix}/fixture_clone")
             expected.add(f"{fixture_prefix}/index_build")
     return expected
+
+
+def audit_row_address_record_contract(
+    sidecar: dict[str, Any], record: dict[str, Any]
+) -> list[str]:
+    failures: list[str] = []
+    context = f"{record['pair_id']}/{record['format']}"
+    delta = record["placement_delta_bytes"]
+    claimed_delta = record["placement_delta_claimed_bytes"]
+
+    if record["format"] == "v23_logical":
+        if (delta is None) != (claimed_delta is None):
+            failures.append(
+                f"{context}: placement Delta measurement and independent claim "
+                "must be both present or both null"
+            )
+        elif delta is not None and delta != claimed_delta:
+            failures.append(
+                f"{context}: measured placement Delta {delta} does not match "
+                f"independent claim {claimed_delta}"
+            )
+    elif delta is not None or claimed_delta is not None:
+        failures.append(f"{context}: legacy format claimed v2.3 placement Delta")
+
+    pmr = record["placement_maintenance_required"] is True
+    reason = record["pmr_reason"]
+    diagnostic_values = {
+        field: record[field] for field in PMR_DIAGNOSTIC_FIELDS if field != "pmr_reason"
+    }
+    if not pmr:
+        populated = [
+            field for field in PMR_DIAGNOSTIC_FIELDS if record[field] is not None
+        ]
+        if populated:
+            failures.append(
+                f"{context}: non-PMR record populated PMR diagnostics {populated}"
+            )
+    elif record["format"] != "v23_logical":
+        failures.append(f"{context}: legacy format returned v2.3 PMR")
+    elif reason == "projected_delta_bytes":
+        required = ("pmr_projected_delta_bytes", "pmr_delta_limit_bytes")
+        unexpected = [
+            field
+            for field, value in diagnostic_values.items()
+            if field not in required and value is not None
+        ]
+        missing = [field for field in required if record[field] is None]
+        if missing or unexpected:
+            failures.append(
+                f"{context}: projected_delta_bytes PMR has missing={missing}, "
+                f"unexpected={unexpected}"
+            )
+        else:
+            projected = record["pmr_projected_delta_bytes"]
+            limit = record["pmr_delta_limit_bytes"]
+            if limit != B_FAST or projected <= limit:
+                failures.append(
+                    f"{context}: projected_delta_bytes PMR requires projected > "
+                    f"limit == B_fast ({B_FAST}), observed {projected}/{limit}"
+                )
+    elif reason == "projected_epoch_bytes":
+        required = ("pmr_projected_epoch_bytes", "pmr_epoch_limit_bytes")
+        unexpected = [
+            field
+            for field, value in diagnostic_values.items()
+            if field not in required and value is not None
+        ]
+        missing = [field for field in required if record[field] is None]
+        if missing or unexpected:
+            failures.append(
+                f"{context}: projected_epoch_bytes PMR has missing={missing}, "
+                f"unexpected={unexpected}"
+            )
+        else:
+            projected = record["pmr_projected_epoch_bytes"]
+            limit = record["pmr_epoch_limit_bytes"]
+            if limit != W_FAST or projected <= limit:
+                failures.append(
+                    f"{context}: projected_epoch_bytes PMR requires projected > "
+                    f"limit == W_fast ({W_FAST}), observed {projected}/{limit}"
+                )
+    elif reason == "index_generation_blocked":
+        missing = [field for field, value in diagnostic_values.items() if value is None]
+        if missing:
+            failures.append(
+                f"{context}: index_generation_blocked PMR is missing {missing}"
+            )
+        else:
+            projected_delta = record["pmr_projected_delta_bytes"]
+            delta_limit = record["pmr_delta_limit_bytes"]
+            projected_epoch = record["pmr_projected_epoch_bytes"]
+            epoch_limit = record["pmr_epoch_limit_bytes"]
+            generation_delta = record["pmr_generation_delta_bytes"]
+            generation_epoch = record["pmr_generation_epoch_bytes"]
+            blockers = record["pmr_blocking_indices"]
+            if delta_limit != B_FAST or epoch_limit != W_FAST:
+                failures.append(
+                    f"{context}: index_generation_blocked PMR limits must equal "
+                    f"B_fast/W_fast, observed {delta_limit}/{epoch_limit}"
+                )
+            if projected_delta <= delta_limit and projected_epoch <= epoch_limit:
+                failures.append(
+                    f"{context}: index_generation_blocked PMR has no exceeded budget"
+                )
+            if generation_delta == 0 or generation_epoch == 0:
+                failures.append(
+                    f"{context}: index_generation_blocked PMR generation counters "
+                    "must be positive"
+                )
+            if generation_delta > projected_delta or generation_epoch > projected_epoch:
+                failures.append(
+                    f"{context}: index_generation_blocked PMR generation bytes "
+                    "exceed their enclosing totals"
+                )
+            if not blockers:
+                failures.append(
+                    f"{context}: index_generation_blocked PMR has no blocking indices"
+                )
+            else:
+                for blocker_index, blocker in enumerate(blockers):
+                    blocker_context = f"{context}: blocker[{blocker_index}]"
+                    start = blocker["blocked_transaction_start"]
+                    end = blocker["blocked_transaction_end"]
+                    if (
+                        not blocker["field_ids"]
+                        or blocker["oldest_generation"] == 0
+                        or blocker["region_bytes"] == 0
+                    ):
+                        failures.append(
+                            f"{blocker_context} must identify positive generation-region debt"
+                        )
+                    if start != blocker["oldest_generation"] or start > end:
+                        failures.append(
+                            f"{blocker_context} has invalid blocked transaction range "
+                            f"{start}..{end} for oldest generation "
+                            f"{blocker['oldest_generation']}"
+                        )
+    elif reason in STRUCTURAL_PMR_REASONS:
+        populated = [
+            field for field, value in diagnostic_values.items() if value is not None
+        ]
+        if populated:
+            failures.append(
+                f"{context}: structural PMR {reason} populated diagnostics {populated}"
+            )
+    else:
+        failures.append(f"{context}: unknown or missing PMR reason {reason!r}")
+
+    if (
+        record["format"] == "v23_logical"
+        and record["status"] == "ok"
+        and not pmr
+        and standard_scope_is_gated(
+            sidecar,
+            track_of(record["pair_id"], sidecar["run_id"]),
+            normalized_pair_template(record["pair_id"]),
+            record["operation"],
+        )
+    ):
+        if delta is not None and delta > B_FAST:
+            failures.append(
+                f"{context}: default-fast placement Delta {delta} exceeds B_fast "
+                f"{B_FAST}"
+            )
+        epoch = record["w_epoch_bytes"]
+        if epoch is not None and epoch > W_FAST:
+            failures.append(
+                f"{context}: default-fast W_epoch {epoch} exceeds W_fast {W_FAST}"
+            )
+    return failures
 
 
 def audit_grid_and_correctness(
@@ -2112,27 +2541,38 @@ def audit_grid_and_correctness(
                             planned = record["compaction_groups_planned"]
                             admitted = record["compaction_groups_admitted"]
                             not_admitted = record["compaction_groups_not_admitted"]
-                            if planned is None or admitted is None or not_admitted is None:
+                            if (
+                                planned is None
+                                or admitted is None
+                                or not_admitted is None
+                            ):
                                 issues.append(
                                     f"{compaction_pair_id}/{record['format']}: "
                                     "missing compaction admission counts"
                                 )
-                            elif planned <= 0 or admitted != planned or not_admitted != 0:
+                            elif (
+                                planned <= 0 or admitted != planned or not_admitted != 0
+                            ):
                                 failures.append(
                                     f"{compaction_pair_id}/{record['format']}: "
                                     f"fast-path admission is {admitted}/{planned} "
                                     f"with {not_admitted} rejected groups"
                                 )
-                    if step.operation != "random_delete_reclaim":
+                    if step.preflight_expected_admission is None:
                         continue
+                    preflight_label = (
+                        "default-reclaim-preflight"
+                        if step.operation == "random_delete_reclaim"
+                        else "default-compaction-preflight"
+                    )
                     pair_id = (
                         f"{sidecar['run_id']}/matrix/{case_name}/repeat-{repeat:03d}/"
-                        f"step-{step_index:03d}/default-reclaim-preflight"
+                        f"step-{step_index:03d}/{preflight_label}"
                     )
                     preflight = grouped.get(pair_id, [])
                     if [record["format"] for record in preflight] != ["v23_logical"]:
                         issues.append(
-                            f"{pair_id}: expected one v23_logical reclaim preflight"
+                            f"{pair_id}: expected one v23_logical compaction preflight"
                         )
                         continue
                     record = preflight[0]
@@ -2147,9 +2587,16 @@ def audit_grid_and_correctness(
                             f"{pair_id}: reclaim preflight used implementation path "
                             f"{record['implementation_path']}"
                         )
+                    source_step = case.steps[step_index - 1]
+                    source_operation = (
+                        "fixture_clone"
+                        if source_step.operation == "create"
+                        else source_step.operation
+                    )
                     source_pair_id = (
                         f"{sidecar['run_id']}/matrix/{case_name}/"
-                        f"repeat-{repeat:03d}/step-{step_index - 1:03d}/delete"
+                        f"repeat-{repeat:03d}/step-{step_index - 1:03d}/"
+                        f"{source_operation}"
                     )
                     source = next(
                         (
@@ -2166,9 +2613,7 @@ def audit_grid_and_correctness(
                     planned = record["compaction_groups_planned"]
                     admitted = record["compaction_groups_admitted"]
                     not_admitted = record["compaction_groups_not_admitted"]
-                    expected_admission = (
-                        profile["random_delete_reclaim_admission"] == "must_admit"
-                    )
+                    expected_admission = step.preflight_expected_admission
                     if (
                         record["placement_maintenance_required"] is True
                         or planned is None
@@ -2184,9 +2629,8 @@ def audit_grid_and_correctness(
                         )
                     elif record["admission"] is not expected_admission:
                         failures.append(
-                            f"{pair_id}: profile requires "
-                            f"{profile['random_delete_reclaim_admission']}, observed "
-                            f"admission={record['admission']}"
+                            f"{pair_id}: workload requires admission="
+                            f"{expected_admission}, observed admission={record['admission']}"
                         )
                     if (
                         source is not None
@@ -2219,10 +2663,37 @@ def audit_grid_and_correctness(
                         "index_coverage_reuse",
                         "layout_index_maintenance_ns",
                     )
-                    if any(record[field] is not None for field in relocation_only_fields):
+                    if any(
+                        record[field] is not None for field in relocation_only_fields
+                    ):
                         failures.append(
                             f"{pair_id}: plan-only preflight reported relocation output"
                         )
+
+                if any(step.operation == "bounded_recluster" for step in case.steps):
+                    scan_pair_id = (
+                        f"{sidecar['run_id']}/matrix/{case_name}/repeat-{repeat:03d}/"
+                        f"step-{len(case.steps):03d}/cold-scan"
+                    )
+                    scan_records = grouped.get(scan_pair_id, [])
+                    if Counter(record["format"] for record in scan_records) != Counter(
+                        run.FORMATS
+                    ):
+                        issues.append(
+                            f"{scan_pair_id}: bounded clustering postcondition scan is incomplete"
+                        )
+                    else:
+                        physical_order_digests = {
+                            record["physical_order_digest"] for record in scan_records
+                        }
+                        if None in physical_order_digests:
+                            issues.append(
+                                f"{scan_pair_id}: physical order digest is missing"
+                            )
+                        elif len(physical_order_digests) != 1:
+                            failures.append(
+                                f"{scan_pair_id}: physical row order differs across formats"
+                            )
 
     provenance_fields = (
         "run_id",
@@ -2233,6 +2704,7 @@ def audit_grid_and_correctness(
         "policy_sha256",
     )
     for record in records:
+        failures.extend(audit_row_address_record_contract(sidecar, record))
         expected_values = {
             "run_id": sidecar["run_id"],
             "commit": sidecar["commit"],
@@ -2273,6 +2745,7 @@ def audit_grid_and_correctness(
         if (
             record["status"] == "ok"
             and record["operation"] in {"index_build", "index_optimize"}
+            and index_operation_requires_write(record)
             and record["io_by_path"]["index"]["write_bytes"] == 0
         ):
             failures.append(
@@ -2321,10 +2794,11 @@ def audit_grid_and_correctness(
             for field in (
                 "placement_root_bytes",
                 "placement_delta_bytes",
+                "placement_delta_claimed_bytes",
                 "w_epoch_bytes",
             )
         ):
-            issues.append(
+            failures.append(
                 f"{record['pair_id']}/{record['format']}: legacy format claimed v2.3 layout metrics"
             )
         if record["placement_maintenance_required"] is True:
@@ -2343,8 +2817,7 @@ def audit_grid_and_correctness(
                     f"{record['pair_id']}: isolated first update returned PMR"
                 )
         elif (
-            record["operation"] in COMMIT_OPERATIONS
-            and record["admission"] is not True
+            record["operation"] in COMMIT_OPERATIONS and record["admission"] is not True
         ):
             failures.append(
                 f"{record['pair_id']}/{record['format']}: commit operation was not admitted"
@@ -2421,12 +2894,16 @@ def audit_grid_and_correctness(
                                 )
                             ],
                         ]
-                        if len(aligned_records) == 3 and len(
-                            {
-                                record["maintenance_plan_sha256"]
-                                for record in aligned_records
-                            }
-                        ) != 1:
+                        if (
+                            len(aligned_records) == 3
+                            and len(
+                                {
+                                    record["maintenance_plan_sha256"]
+                                    for record in aligned_records
+                                }
+                            )
+                            != 1
+                        ):
                             failures.append(
                                 f"{prefix}: aligned maintenance did not share one plan"
                             )
@@ -2448,11 +2925,54 @@ def track_of(pair_id: str, run_id: str) -> str:
     return pair_id[len(prefix) :].split("/", 1)[0]
 
 
-def standard_scope_is_gated(track: str, template: str, operation: str) -> bool:
+def index_operation_requires_write(record: dict[str, Any]) -> bool:
+    if record["operation"] == "index_build":
+        return True
+    if record["operation"] != "index_optimize":
+        return False
+    pair_id = record["pair_id"]
+    repeated_vector_value_update = (
+        record["schema_kind"] == "vector_f32_128"
+        and record["index_kind"] == "vector_ivf_flat"
+        and pair_id.endswith("/index-catch-up")
+        and any(f"/{track}/" in pair_id for track in REPEATED_UPDATE_TRACKS)
+    )
+    return not repeated_vector_value_update
+
+
+def is_explicit_matrix_diagnostic(
+    sidecar: dict[str, Any], template: str, operation: str
+) -> bool:
+    if operation in EXPLICIT_MATRIX_DIAGNOSTIC_OPERATIONS:
+        return True
+    if operation not in {"open", "scan", "take", "index_take"}:
+        return False
+    matrix = sidecar["matrix"]
+    profile = matrix["profiles"][sidecar["profile"]]
+    selected = set(sidecar["matrix_case_names"])
+    for case in protocol.iter_matrix_cases(
+        profile, set(matrix["tracks"]["matrix"]["cases"])
+    ):
+        if case.name not in selected:
+            continue
+        if case.steps[-1].operation not in EXPLICIT_MATRIX_DIAGNOSTIC_OPERATIONS:
+            continue
+        post_prefix = (
+            f"{sidecar['run_id']}/matrix/{case.name}/repeat-*/"
+            f"step-{len(case.steps):03d}/"
+        )
+        if template.startswith(post_prefix):
+            return True
+    return False
+
+
+def standard_scope_is_gated(
+    sidecar: dict[str, Any], track: str, template: str, operation: str
+) -> bool:
     if operation == DEFAULT_COMPACTION_PREFLIGHT:
         return False
     if track == "matrix":
-        return True
+        return not is_explicit_matrix_diagnostic(sidecar, template, operation)
     if track == "sustained":
         return operation in {
             "update",
@@ -2490,7 +3010,7 @@ def add_standard_pair_gates(
         track = track_of(pair_id, sidecar["run_id"])
         template = normalized_pair_template(pair_id)
         operation = next(iter(pair.values()))["operation"]
-        if standard_scope_is_gated(track, template, operation):
+        if standard_scope_is_gated(sidecar, track, template, operation):
             by_template[template].append(pair)
     for template, samples in sorted(by_template.items()):
         track = track_of(template, sidecar["run_id"])
@@ -2500,7 +3020,10 @@ def add_standard_pair_gates(
             )
             continue
         samples.sort(key=lambda pair: pair["v23_logical"]["round"])
+        operation = samples[0]["v23_logical"]["operation"]
         metrics = list(STANDARD_METRICS)
+        if operation in {"open", "take", "index_take"}:
+            metrics.extend(PLACEMENT_METADATA_REQUEST_METRICS)
         if sidecar["storage"] == "s3":
             metrics.extend(
                 ("actual_get_attempts", "actual_head_attempts", "actual_list_attempts")
@@ -2531,6 +3054,7 @@ def add_standard_pair_gates(
                 "actual_get_attempts",
                 "actual_head_attempts",
                 "actual_list_attempts",
+                *PLACEMENT_METADATA_REQUEST_METRICS,
             }:
                 no_stable_direction, no_stable_threshold = "upper", 1.0
                 stable_direction, stable_threshold = "upper", 1.0
@@ -2562,7 +3086,122 @@ def add_standard_pair_gates(
                     baseline=values["v22_stable"],
                     direction=stable_direction,
                     threshold=stable_threshold,
+                    strict=(
+                        operation in RELOCATION_OPERATIONS
+                        and metric in {"latency", "throughput"}
+                    ),
+                    samples=bootstrap_samples,
+                    ratio_statistic="p95" if metric == "latency" else "median",
+                )
+            )
+    return gates
+
+
+def add_indexed_repack_lookup_gates(
+    sidecar: dict[str, Any],
+    complete: dict[str, dict[str, dict[str, Any]]],
+    *,
+    bootstrap_samples: int,
+    issues: list[str],
+) -> list[Gate]:
+    if "matrix" not in sidecar["tracks"]:
+        return []
+    profile = sidecar["matrix"]["profiles"][sidecar["profile"]]
+    repeats = profile["paired_repeats"]
+    selected = set(sidecar["matrix_case_names"])
+    cases = [
+        case
+        for case in protocol.iter_matrix_cases(
+            profile, set(sidecar["matrix"]["tracks"]["matrix"]["cases"])
+        )
+        if case.name in selected
+        and case.name.startswith("indexed-repack-random-delete-")
+    ]
+    gates: list[Gate] = []
+    request_metrics = {
+        "get_requests",
+        "head_requests",
+        "list_requests",
+        *PLACEMENT_METADATA_REQUEST_METRICS,
+    }
+    metrics = [
+        "latency",
+        "data_read_bytes",
+        "index_read_bytes",
+        "metadata_read_bytes",
+        "total_read_bytes",
+        "get_requests",
+        "head_requests",
+        "list_requests",
+        *PLACEMENT_METADATA_REQUEST_METRICS,
+    ]
+    if sidecar["storage"] == "s3":
+        metrics.extend(
+            ("actual_get_attempts", "actual_head_attempts", "actual_list_attempts")
+        )
+        request_metrics.update(
+            {"actual_get_attempts", "actual_head_attempts", "actual_list_attempts"}
+        )
+    for case in cases:
+        scope = (
+            f"{sidecar['run_id']}/matrix/{case.name}/repeat-*/"
+            f"step-{len(case.steps):03d}/cold-index-take/indexed-repack-lookup"
+        )
+        samples = []
+        for repeat in range(repeats):
+            pair_id = (
+                f"{sidecar['run_id']}/matrix/{case.name}/repeat-{repeat:03d}/"
+                f"step-{len(case.steps):03d}/cold-index-take"
+            )
+            pair = complete.get(pair_id)
+            if pair is not None:
+                samples.append(pair)
+        if len(samples) != repeats:
+            issues.append(
+                f"{scope}: expected {repeats} indexed Repack lookup repeats, "
+                f"found {len(samples)}"
+            )
+            continue
+        for metric in metrics:
+            values: dict[str, list[int]] = {name: [] for name in run.FORMATS}
+            unavailable = False
+            for pair in samples:
+                for format_name in run.FORMATS:
+                    measured = metric_value(pair[format_name], metric)
+                    if measured is None:
+                        unavailable = True
+                    else:
+                        values[format_name].append(measured)
+            if unavailable:
+                issues.append(f"{scope}: metric {metric} is unavailable")
+                continue
+            threshold = 1.0 if metric in request_metrics else 1.05
+            gates.append(
+                make_gate(
+                    track="matrix",
+                    scope=scope,
+                    metric="latency_p95" if metric == "latency" else metric,
+                    baseline_name="v22_no_stable",
+                    candidate=values["v23_logical"],
+                    baseline=values["v22_no_stable"],
+                    direction="upper",
+                    threshold=threshold,
                     strict=False,
+                    samples=bootstrap_samples,
+                    ratio_statistic="p95" if metric == "latency" else "median",
+                )
+            )
+            gates.append(
+                make_gate(
+                    track="matrix",
+                    scope=scope,
+                    metric="latency_p95" if metric == "latency" else metric,
+                    baseline_name="v22_stable",
+                    candidate=values["v23_logical"],
+                    baseline=values["v22_stable"],
+                    direction="upper",
+                    threshold=1.0,
+                    strict=metric == "latency",
                     samples=bootstrap_samples,
                     ratio_statistic="p95" if metric == "latency" else "median",
                 )
@@ -2598,6 +3237,7 @@ def add_sustained_prefix_gates(
     bootstrap_samples: int,
     issues: list[str],
     failures: list[str],
+    observations: dict[str, Any],
 ) -> list[Gate]:
     if "sustained" not in sidecar["tracks"]:
         return []
@@ -2618,6 +3258,26 @@ def add_sustained_prefix_gates(
             failures.append(f"{record['pair_id']}: W_epoch {epoch} exceeds W_fast")
 
     for variant in sidecar["variants"]:
+        prefix_metrics = [
+            "latency",
+            "data_read_bytes",
+            "data_write_bytes",
+            "metadata_read_bytes",
+            "metadata_write_bytes",
+            "row_address_resident_bytes",
+            "row_address_epoch_write_bytes",
+            "get_requests",
+            "head_requests",
+            "list_requests",
+        ]
+        if sidecar["storage"] == "s3":
+            prefix_metrics.extend(
+                (
+                    "actual_get_attempts",
+                    "actual_head_attempts",
+                    "actual_list_attempts",
+                )
+            )
         boundary_rounds_by_repeat: list[list[int]] = []
         samples_by_boundary: dict[int, dict[str, dict[str, list[int]]]] = defaultdict(
             lambda: defaultdict(lambda: {name: [] for name in run.FORMATS})
@@ -2650,19 +3310,26 @@ def add_sustained_prefix_gates(
                     is not None
                     and record_round <= boundary_round
                 ]
-                for metric in (
-                    "latency",
-                    "data_read_bytes",
-                    "data_write_bytes",
-                    "get_requests",
-                    "head_requests",
-                    "list_requests",
-                ):
+                for metric in prefix_metrics:
                     for format_name in run.FORMATS:
-                        value = total_metric(
-                            [r for r in cumulative if r["format"] == format_name],
-                            metric,
-                        )
+                        format_records = [
+                            r for r in cumulative if r["format"] == format_name
+                        ]
+                        if metric == "row_address_resident_bytes":
+                            value = max(
+                                (
+                                    r["placement_delta_bytes"] or 0
+                                    for r in format_records
+                                ),
+                                default=0,
+                            )
+                        elif metric == "row_address_epoch_write_bytes":
+                            value = max(
+                                (r["w_epoch_bytes"] or 0 for r in format_records),
+                                default=0,
+                            )
+                        else:
+                            value = total_metric(format_records, metric)
                         if value is None:
                             issues.append(
                                 f"sustained/{variant}/repeat-{repeat}/boundary-"
@@ -2679,7 +3346,38 @@ def add_sustained_prefix_gates(
             issues.append(
                 f"sustained/{variant}: natural boundary rounds differ by repeat"
             )
+        variant_observations = []
         for boundary_ordinal, by_metric in sorted(samples_by_boundary.items()):
+            complete_observation = all(
+                len(values[format_name]) == repeats
+                for values in by_metric.values()
+                for format_name in run.FORMATS
+            )
+            if complete_observation:
+                variant_observations.append(
+                    {
+                        "boundary_ordinal": boundary_ordinal,
+                        "boundary_round": (
+                            boundary_rounds_by_repeat[0][boundary_ordinal]
+                            if boundary_rounds_by_repeat
+                            and boundary_ordinal < len(boundary_rounds_by_repeat[0])
+                            else None
+                        ),
+                        "repeats": [
+                            {
+                                "repeat": repeat,
+                                "formats": {
+                                    format_name: {
+                                        metric: by_metric[metric][format_name][repeat]
+                                        for metric in prefix_metrics
+                                    }
+                                    for format_name in run.FORMATS
+                                },
+                            }
+                            for repeat in range(repeats)
+                        ],
+                    }
+                )
             for metric, values in by_metric.items():
                 if any(len(values[name]) != repeats for name in run.FORMATS):
                     issues.append(
@@ -2687,7 +3385,18 @@ def add_sustained_prefix_gates(
                         f"incomplete {metric} prefix samples"
                     )
                     continue
-                threshold = 1.0 if metric.endswith("requests") else 1.05
+                if metric in {
+                    "metadata_read_bytes",
+                    "metadata_write_bytes",
+                    "row_address_resident_bytes",
+                    "row_address_epoch_write_bytes",
+                }:
+                    continue
+                threshold = (
+                    1.0
+                    if metric.endswith("requests") or metric.startswith("actual_")
+                    else 1.05
+                )
                 scope = f"sustained/{variant}/boundary-{boundary_ordinal}/prefix"
                 gates.append(
                     make_gate(
@@ -2717,6 +3426,7 @@ def add_sustained_prefix_gates(
                         samples=bootstrap_samples,
                     )
                 )
+        observations.setdefault("variants", {})[variant] = variant_observations
     return gates
 
 
@@ -3187,6 +3897,7 @@ def add_indexed_relocation_contract_gates(
         for case in sidecar["matrix_case_names"]
         if case.startswith("indexed-compact-")
         or case.startswith("indexed-repeated-compaction-")
+        or case.startswith("fragment-reuse-")
     ]
     grouped = group_by_pair(records)
     gates: list[Gate] = []
@@ -3219,6 +3930,25 @@ def add_indexed_relocation_contract_gates(
                 continue
             for sample in samples:
                 candidate = sample["v23_logical"]
+                if case_name.startswith("fragment-reuse-"):
+                    expected_reuse_presence = {
+                        "v22_no_stable": True,
+                        "v22_stable": False,
+                        "v23_logical": False,
+                    }
+                    for (
+                        format_name,
+                        expected_present,
+                    ) in expected_reuse_presence.items():
+                        if (
+                            sample[format_name]["fragment_reuse_index_present"]
+                            is not expected_present
+                        ):
+                            failures.append(
+                                f"{sample[format_name]['pair_id']}/{format_name}: "
+                                "fragment-reuse comparison did not materialize the "
+                                f"expected system-index state {expected_present}"
+                            )
                 if candidate["row_addresses_remapped"] != 0:
                     failures.append(f"{candidate['pair_id']}: remapped row addresses")
                 if candidate["indices_remapped"] != 0:
@@ -3289,6 +4019,404 @@ def add_indexed_relocation_contract_gates(
     return gates
 
 
+def audit_placement_history_independence(
+    sidecar: dict[str, Any],
+    records: Sequence[dict[str, Any]],
+    *,
+    issues: list[str],
+    failures: list[str],
+) -> dict[str, Any]:
+    if "matrix" not in sidecar["tracks"]:
+        return {"comparisons": []}
+    profile = sidecar["matrix"]["profiles"][sidecar["profile"]]
+    source_fragments = profile["logical_fragment_counts"][-1]
+    selected = set(sidecar["matrix_case_names"])
+    grouped = group_by_pair(records)
+    comparisons: list[dict[str, Any]] = []
+
+    def unique_candidate(pair_id: str) -> dict[str, Any] | None:
+        matches = [
+            record
+            for record in grouped.get(pair_id, [])
+            if record["format"] == "v23_logical"
+        ]
+        if len(matches) != 1:
+            issues.append(f"{pair_id}: expected one v23 history-independence record")
+            return None
+        return matches[0]
+
+    for schema in profile["schemas"]:
+        one_shot_case = f"compact-{source_fragments}-to-1/{schema}"
+        for rounds in profile["repeated_compaction_rounds"]:
+            repeated_case = f"repeated-compaction-{rounds}/{schema}"
+            if one_shot_case not in selected and repeated_case not in selected:
+                continue
+            if one_shot_case not in selected or repeated_case not in selected:
+                if sidecar["profile"] == "release":
+                    issues.append(
+                        f"matrix/{schema}: one-shot and repeated compaction must be co-located"
+                    )
+                continue
+            for repeat in range(profile["paired_repeats"]):
+                one_prefix = (
+                    f"{sidecar['run_id']}/matrix/{one_shot_case}/repeat-{repeat:03d}"
+                )
+                repeated_prefix = (
+                    f"{sidecar['run_id']}/matrix/{repeated_case}/repeat-{repeat:03d}"
+                )
+                one_relocation = unique_candidate(
+                    f"{one_prefix}/step-001/default_compaction"
+                )
+                repeated_relocation = unique_candidate(
+                    f"{repeated_prefix}/step-{rounds:03d}/default_compaction"
+                )
+                one_scan = unique_candidate(f"{one_prefix}/step-002/cold-scan")
+                repeated_scan = unique_candidate(
+                    f"{repeated_prefix}/step-{rounds + 1:03d}/cold-scan"
+                )
+                if any(
+                    value is None
+                    for value in (
+                        one_relocation,
+                        repeated_relocation,
+                        one_scan,
+                        repeated_scan,
+                    )
+                ):
+                    continue
+                assert one_relocation is not None
+                assert repeated_relocation is not None
+                assert one_scan is not None
+                assert repeated_scan is not None
+                projection_fields = (
+                    "schema_kind",
+                    "expected_rows",
+                    "result_rows",
+                    "fragments",
+                    "physical_rows",
+                    "state_digest",
+                )
+                one_projection = {field: one_scan[field] for field in projection_fields}
+                repeated_projection = {
+                    field: repeated_scan[field] for field in projection_fields
+                }
+                if any(value is None for value in one_projection.values()) or any(
+                    value is None for value in repeated_projection.values()
+                ):
+                    issues.append(
+                        f"{repeated_prefix}: canonical topology projection is incomplete"
+                    )
+                    continue
+                canonical = json.dumps(
+                    one_projection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+                fingerprint = hashlib.sha256(canonical.encode()).hexdigest()
+                repeated_canonical = json.dumps(
+                    repeated_projection,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+                repeated_fingerprint = hashlib.sha256(
+                    repeated_canonical.encode()
+                ).hexdigest()
+                if fingerprint != repeated_fingerprint:
+                    failures.append(
+                        f"{repeated_prefix}: ID-normalized final topology differs from one-shot"
+                    )
+                ratios: dict[str, float | None] = {}
+                for field in ("placement_delta_bytes", "placement_root_bytes"):
+                    one_value = one_relocation[field]
+                    repeated_value = repeated_relocation[field]
+                    if one_value is None or repeated_value is None:
+                        issues.append(
+                            f"{repeated_prefix}: {field} is missing for history comparison"
+                        )
+                        ratios[field] = None
+                        continue
+                    if one_value == 0 or repeated_value == 0:
+                        ratio = 1.0 if one_value == repeated_value else math.inf
+                    else:
+                        ratio = max(one_value, repeated_value) / min(
+                            one_value, repeated_value
+                        )
+                    ratios[field] = ratio
+                    if ratio > 1.05:
+                        failures.append(
+                            f"{repeated_prefix}: {field} is history-dependent: "
+                            f"one-shot={one_value}, repeated={repeated_value}, ratio={ratio:.6f}"
+                        )
+                comparisons.append(
+                    {
+                        "schema": schema,
+                        "rounds": rounds,
+                        "repeat": repeat,
+                        "one_shot_case": one_shot_case,
+                        "repeated_case": repeated_case,
+                        "id_normalized_semantic_fingerprint": fingerprint,
+                        "repeated_semantic_fingerprint": repeated_fingerprint,
+                        "placement_byte_ratios": ratios,
+                    }
+                )
+    return {"comparisons": comparisons}
+
+
+def audit_skewed_packed_run_fixtures(
+    sidecar: dict[str, Any],
+    records: Sequence[dict[str, Any]],
+    *,
+    issues: list[str],
+    failures: list[str],
+) -> dict[str, Any]:
+    if "matrix" not in sidecar["tracks"]:
+        return {"fixtures": []}
+    profile = sidecar["matrix"]["profiles"][sidecar["profile"]]
+    cases = {
+        case.name: case
+        for case in protocol.iter_matrix_cases(
+            profile, set(sidecar["matrix"]["tracks"]["matrix"]["cases"])
+        )
+        if case.fixture_segments
+    }
+    grouped = group_by_pair(records)
+    observations: list[dict[str, Any]] = []
+    for case_name in sidecar["matrix_case_names"]:
+        case = cases.get(case_name)
+        if case is None:
+            continue
+        segments = protocol.fixture_segments_for_case(case)
+        expected_fragments = 0
+        cumulative_rows = 0
+        layout = protocol.fixture_layout_path(segments)
+        for segment_index, (segment_rows, rows_per_fragment) in enumerate(segments):
+            expected_fragments += segment_rows // rows_per_fragment
+            cumulative_rows += segment_rows
+            label = "create" if segment_index == 0 else f"append-{segment_index:03d}"
+            pair_id = (
+                f"{sidecar['run_id']}/fixtures/{case.schema_kind}/{layout}/"
+                f"index-none/{label}"
+            )
+            pair_records = grouped.get(pair_id, [])
+            if Counter(record["format"] for record in pair_records) != Counter(
+                run.FORMATS
+            ):
+                issues.append(f"{pair_id}: segmented fixture phase is incomplete")
+                continue
+            for record in pair_records:
+                if record["fragments"] != expected_fragments:
+                    failures.append(
+                        f"{pair_id}/{record['format']}: wrote {record['fragments']} "
+                        f"fragments, expected {expected_fragments}"
+                    )
+                if record["result_rows"] != cumulative_rows:
+                    failures.append(
+                        f"{pair_id}/{record['format']}: fixture has "
+                        f"{record['result_rows']} rows, expected {cumulative_rows}"
+                    )
+        target_fragments = sum(
+            segment_rows // rows_per_fragment
+            for segment_rows, rows_per_fragment in segments
+        )
+        if len({rows_per_fragment for _, rows_per_fragment in segments}) < 2:
+            failures.append(f"matrix/{case_name}: fixture row counts are uniform")
+        observations.append(
+            {
+                "case": case_name,
+                "segments": [list(segment) for segment in segments],
+                "source_fragments": target_fragments,
+                "source_rows": sum(segment_rows for segment_rows, _ in segments),
+            }
+        )
+    return {"fixtures": observations}
+
+
+def build_explicit_maintenance_observations(
+    sidecar: dict[str, Any],
+    records: Sequence[dict[str, Any]],
+    *,
+    issues: list[str],
+    failures: list[str],
+) -> dict[str, Any]:
+    if "matrix" not in sidecar["tracks"]:
+        return {"cases": {}}
+    matrix = sidecar["matrix"]
+    profile = matrix["profiles"][sidecar["profile"]]
+    repeats = profile["paired_repeats"]
+    selected = set(sidecar["matrix_case_names"])
+    cases = [
+        case
+        for case in protocol.iter_matrix_cases(
+            profile, set(matrix["tracks"]["matrix"]["cases"])
+        )
+        if case.name in selected
+        and case.steps[-1].operation in EXPLICIT_MATRIX_DIAGNOSTIC_OPERATIONS
+    ]
+    grouped = group_by_pair(records)
+    observations: dict[str, list[dict[str, Any]]] = {}
+    for case in cases:
+        step_index = len(case.steps) - 1
+        operation = case.steps[-1].operation
+        case_values: list[dict[str, Any]] = []
+        for repeat in range(repeats):
+            prefix = f"{sidecar['run_id']}/matrix/{case.name}/repeat-{repeat:03d}"
+            pair_id = f"{prefix}/step-{step_index:03d}/{operation}"
+            maintenance_records = grouped.get(pair_id, [])
+            expected_formats = (
+                ("v23_logical",) if operation == "recluster" else run.FORMATS
+            )
+            if Counter(record["format"] for record in maintenance_records) != Counter(
+                expected_formats
+            ):
+                issues.append(
+                    f"{pair_id}: explicit maintenance expected formats "
+                    f"{list(expected_formats)}, found "
+                    f"{sorted(record['format'] for record in maintenance_records)}"
+                )
+                continue
+            by_format = {record["format"]: record for record in maintenance_records}
+            candidate = by_format["v23_logical"]
+            required = {
+                field: candidate[field]
+                for field in (
+                    "rows_updated",
+                    "compacted_data_bytes",
+                    "row_addresses_remapped",
+                    "indices_remapped",
+                    "layout_index_maintenance_ns",
+                    "explicit_locator_objects_written",
+                    "explicit_locator_bytes_written",
+                )
+            }
+            missing = sorted(
+                field for field, value in required.items() if value is None
+            )
+            if missing:
+                issues.append(f"{pair_id}: explicit cost fields are missing: {missing}")
+                continue
+            if required["rows_updated"] != candidate["expected_rows"]:
+                failures.append(
+                    f"{pair_id}: explicit maintenance rewrote "
+                    f"{required['rows_updated']} rows, expected {candidate['expected_rows']}"
+                )
+            if required["compacted_data_bytes"] <= 0:
+                failures.append(
+                    f"{pair_id}: explicit maintenance has no source data bytes"
+                )
+            if required["explicit_locator_objects_written"] <= 0:
+                failures.append(
+                    f"{pair_id}: explicit maintenance wrote no locator objects"
+                )
+            if required["explicit_locator_bytes_written"] <= 0:
+                failures.append(
+                    f"{pair_id}: explicit maintenance wrote no locator bytes"
+                )
+            if required["row_addresses_remapped"] != 0:
+                failures.append(
+                    f"{pair_id}: explicit maintenance remapped logical addresses"
+                )
+            if required["indices_remapped"] != 0:
+                failures.append(
+                    f"{pair_id}: explicit maintenance remapped index objects"
+                )
+            if candidate["index_kind"] != "none":
+                if candidate["index_coverage_reuse"] != 1.0:
+                    failures.append(
+                        f"{pair_id}: explicit maintenance did not reuse full index coverage"
+                    )
+                index_io = candidate["io_by_path"]["index"]
+                if any(value != 0 for value in index_io.values()):
+                    failures.append(
+                        f"{pair_id}: explicit maintenance accessed index objects"
+                    )
+
+            maintenance_by_format = {
+                format_name: {
+                    "duration_ns": record["duration_ns"],
+                    "data_read_bytes": record["io_by_path"]["data"]["read_bytes"],
+                    "data_write_bytes": record["io_by_path"]["data"]["write_bytes"],
+                    "index_read_bytes": record["io_by_path"]["index"]["read_bytes"],
+                    "index_write_bytes": record["io_by_path"]["index"]["write_bytes"],
+                    "metadata_read_bytes": record["io_by_path"]["metadata"][
+                        "read_bytes"
+                    ],
+                    "metadata_write_bytes": record["io_by_path"]["metadata"][
+                        "write_bytes"
+                    ],
+                    "get_requests": record["get_requests"],
+                    "head_requests": record["head_requests"],
+                    "list_requests": record["list_requests"],
+                }
+                for format_name, record in by_format.items()
+            }
+            post_step = len(case.steps)
+            post_cold_lookup: dict[str, dict[str, dict[str, int | None]]] = {}
+            for label in ("cold-take", "cold-index-take"):
+                if label == "cold-index-take" and case.steps[-1].index_kind == "none":
+                    continue
+                probe_pair_id = f"{prefix}/step-{post_step:03d}/{label}"
+                probe_records = grouped.get(probe_pair_id, [])
+                if Counter(record["format"] for record in probe_records) != Counter(
+                    run.FORMATS
+                ):
+                    issues.append(
+                        f"{probe_pair_id}: explicit post-maintenance lookup is incomplete"
+                    )
+                    continue
+                post_cold_lookup[label] = {
+                    record["format"]: {
+                        "duration_ns": record["duration_ns"],
+                        "data_read_bytes": record["io_by_path"]["data"]["read_bytes"],
+                        "index_read_bytes": record["io_by_path"]["index"]["read_bytes"],
+                        "metadata_read_bytes": record["io_by_path"]["metadata"][
+                            "read_bytes"
+                        ],
+                        "get_requests": record["get_requests"],
+                        "head_requests": record["head_requests"],
+                        "list_requests": record["list_requests"],
+                        "metadata_get_requests": record["io_by_path"]["metadata"][
+                            "get_requests"
+                        ],
+                        "metadata_head_requests": record["io_by_path"]["metadata"][
+                            "head_requests"
+                        ],
+                        "metadata_list_requests": record["io_by_path"]["metadata"][
+                            "list_requests"
+                        ],
+                    }
+                    for record in probe_records
+                }
+            rows_rewritten = required["rows_updated"]
+            compacted_data_bytes = required["compacted_data_bytes"]
+            data_write_bytes = candidate["io_by_path"]["data"]["write_bytes"]
+            case_values.append(
+                {
+                    "repeat": repeat,
+                    "operation": operation,
+                    "mapping_bytes_per_row": (
+                        required["explicit_locator_bytes_written"] / rows_rewritten
+                        if rows_rewritten > 0
+                        else None
+                    ),
+                    "data_write_amplification": (
+                        data_write_bytes / compacted_data_bytes
+                        if compacted_data_bytes > 0
+                        else None
+                    ),
+                    "locator_objects_written": required[
+                        "explicit_locator_objects_written"
+                    ],
+                    "locator_bytes_written": required["explicit_locator_bytes_written"],
+                    "maintenance": maintenance_by_format,
+                    "post_cold_lookup": post_cold_lookup,
+                }
+            )
+        observations[case.name] = case_values
+    return {"cases": observations}
+
+
 def analyze(
     sidecar: dict[str, Any],
     records: Sequence[dict[str, Any]],
@@ -3306,6 +4434,10 @@ def analyze(
         complete = {}
         gates: list[Gate] = []
         adversarial_natural = {}
+        explicit_maintenance = {"cases": {}}
+        sustained_prefixes = {"variants": {}}
+        placement_history_independence = {"comparisons": []}
+        skewed_packed_run_fixtures = {"fixtures": []}
     else:
         grid_issues, correctness_failures, complete = audit_grid_and_correctness(
             sidecar, records
@@ -3318,11 +4450,38 @@ def analyze(
             issues=issues,
             failures=failures,
         )
+        explicit_maintenance = build_explicit_maintenance_observations(
+            sidecar,
+            records,
+            issues=issues,
+            failures=failures,
+        )
+        placement_history_independence = audit_placement_history_independence(
+            sidecar,
+            records,
+            issues=issues,
+            failures=failures,
+        )
+        skewed_packed_run_fixtures = audit_skewed_packed_run_fixtures(
+            sidecar,
+            records,
+            issues=issues,
+            failures=failures,
+        )
+        sustained_prefixes = {"variants": {}}
         gates = add_standard_pair_gates(
             sidecar,
             complete,
             bootstrap_samples=bootstrap_samples,
             issues=issues,
+        )
+        gates.extend(
+            add_indexed_repack_lookup_gates(
+                sidecar,
+                complete,
+                bootstrap_samples=bootstrap_samples,
+                issues=issues,
+            )
         )
         gates.extend(
             add_sustained_prefix_gates(
@@ -3331,6 +4490,7 @@ def analyze(
                 bootstrap_samples=bootstrap_samples,
                 issues=issues,
                 failures=failures,
+                observations=sustained_prefixes,
             )
         )
         gates.extend(
@@ -3360,11 +4520,17 @@ def analyze(
             )
         )
     failed_gates = [gate for gate in gates if not gate.passed]
+    failed_release_gates = [
+        gate for gate in failed_gates if gate.aggregate_release_gate
+    ]
+    failed_diagnostic_gates = [
+        gate for gate in failed_gates if not gate.aggregate_release_gate
+    ]
     if enforce_gates is None:
         enforce_gates = bool(sidecar) and sidecar.get("profile") == "release"
     if issues:
         verdict = "INCOMPLETE"
-    elif failures or (enforce_gates and failed_gates):
+    elif failures or (enforce_gates and failed_release_gates):
         verdict = "FAIL"
     else:
         verdict = "PASS"
@@ -3372,9 +4538,11 @@ def analyze(
         "schema_version": 1,
         "suite": "stable_row_address_design_protocol_report",
         "run_id": sidecar.get("run_id") if sidecar else None,
+        "commit": sidecar.get("commit") if sidecar else None,
         "verdict": verdict,
         "bootstrap_samples": bootstrap_samples,
         "performance_gates_enforced": enforce_gates,
+        "diagnostic_only_gate_tracks": sorted(DIAGNOSTIC_ONLY_GATE_TRACKS),
         "records": len(records),
         "complete_pairs": len(complete),
         "storage_projections": (
@@ -3395,6 +4563,10 @@ def analyze(
         "failures": failures,
         "gates": [gate.as_json() for gate in gates],
         "adversarial_natural": adversarial_natural,
+        "explicit_maintenance": explicit_maintenance,
+        "placement_history_independence": placement_history_independence,
+        "skewed_packed_run_fixtures": skewed_packed_run_fixtures,
+        "sustained_prefixes": sustained_prefixes,
     }
     lines = [
         "# Stable Logical Row Address Protocol Report",
@@ -3404,8 +4576,8 @@ def analyze(
         f"Records: {len(records)}; complete paired phases: {len(complete)}; "
         f"bootstrap resamples: {bootstrap_samples}",
         "",
-        "| Track | Scope | Metric | Baseline | Samples | Ratio | 95% CI | Contract | Result |",
-        "|---|---|---|---|---:|---:|---:|---|---|",
+        "| Track | Scope | Metric | Baseline | Samples | Ratio | 95% CI | Contract | Role | Result |",
+        "|---|---|---|---|---:|---:|---:|---|---|---|",
     ]
     if sidecar:
         lines[6:6] = [
@@ -3431,10 +4603,41 @@ def analyze(
         lines.append(
             f"| {gate.track} | {gate.scope} | {gate.metric} | {gate.baseline} | "
             f"{gate.samples} | {ratio} | {ci} | {gate.contract} | "
+            f"{'release gate' if gate.aggregate_release_gate else 'diagnostic-only'} | "
             f"{'PASS' if gate.passed else 'FAIL'} |"
         )
     if not gates:
-        lines.append("| — | — | — | — | — | — | — | — | INCOMPLETE |")
+        lines.append("| — | — | — | — | — | — | — | — | — | INCOMPLETE |")
+    sustained_variants = sustained_prefixes.get("variants", {})
+    if any(sustained_variants.values()):
+        lines.extend(
+            (
+                "",
+                "## Sustained maintenance-boundary prefix totals",
+                "",
+                "| Variant | Boundary | Round | Repeat | Format | Metadata R/W bytes | Actual GET/HEAD/LIST | Row-address resident/epoch-write bytes |",
+                "|---|---:|---:|---:|---|---:|---:|---:|",
+            )
+        )
+        for variant, boundaries in sustained_variants.items():
+            for boundary in boundaries:
+                for repeat_value in boundary["repeats"]:
+                    for format_name, totals in repeat_value["formats"].items():
+                        actual_attempts = (
+                            f"{totals['actual_get_attempts']}/"
+                            f"{totals['actual_head_attempts']}/"
+                            f"{totals['actual_list_attempts']}"
+                            if sidecar["storage"] == "s3"
+                            else "—"
+                        )
+                        lines.append(
+                            f"| {variant} | {boundary['boundary_ordinal']} | "
+                            f"{boundary['boundary_round']} | {repeat_value['repeat']} | "
+                            f"{format_name} | {totals['metadata_read_bytes']}/"
+                            f"{totals['metadata_write_bytes']} | {actual_attempts} | "
+                            f"{totals['row_address_resident_bytes']}/"
+                            f"{totals['row_address_epoch_write_bytes']} |"
+                        )
     variants = adversarial_natural.get("variants", {})
     if variants:
         lines.extend(
@@ -3461,18 +4664,67 @@ def analyze(
                         f"{terminal.get('placement_delta_bytes', '—')} | "
                         f"{terminal.get('w_epoch_bytes', '—')} |"
                     )
+    explicit_cases = explicit_maintenance.get("cases", {})
+    if explicit_cases:
+        lines.extend(
+            (
+                "",
+                "## Explicit maintenance public cost",
+                "",
+                "These observations are diagnostics and are not default-operation gates.",
+                "",
+                "| Case | Repeat | Mapping bytes/row | Data write amplification | Locator objects | Locator bytes | Candidate latency (ns) |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            )
+        )
+        for case_name, case_values in explicit_cases.items():
+            for value in case_values:
+                candidate = value["maintenance"]["v23_logical"]
+                mapping = value["mapping_bytes_per_row"]
+                amplification = value["data_write_amplification"]
+                lines.append(
+                    f"| {case_name} | {value['repeat']} | "
+                    f"{mapping if mapping is not None else '—'} | "
+                    f"{amplification if amplification is not None else '—'} | "
+                    f"{value['locator_objects_written']} | "
+                    f"{value['locator_bytes_written']} | {candidate['duration_ns']} |"
+                )
+        lines.extend(
+            (
+                "",
+                "### Paired maintenance and lookup cost",
+                "",
+                "| Case | Repeat | Format | Maintenance ns | Data R/W bytes | Index R/W bytes | Metadata R/W bytes | GET/HEAD/LIST | Post cold take ns | Post cold index take ns |",
+                "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+            )
+        )
+        for case_name, case_values in explicit_cases.items():
+            for value in case_values:
+                cold_take = value["post_cold_lookup"].get("cold-take", {})
+                cold_index_take = value["post_cold_lookup"].get("cold-index-take", {})
+                for format_name, cost in value["maintenance"].items():
+                    lines.append(
+                        f"| {case_name} | {value['repeat']} | {format_name} | "
+                        f"{cost['duration_ns']} | "
+                        f"{cost['data_read_bytes']}/{cost['data_write_bytes']} | "
+                        f"{cost['index_read_bytes']}/{cost['index_write_bytes']} | "
+                        f"{cost['metadata_read_bytes']}/{cost['metadata_write_bytes']} | "
+                        f"{cost['get_requests']}/{cost['head_requests']}/{cost['list_requests']} | "
+                        f"{cold_take.get(format_name, {}).get('duration_ns', '—')} | "
+                        f"{cold_index_take.get(format_name, {}).get('duration_ns', '—')} |"
+                    )
     if issues:
         lines.extend(("", "## Incomplete evidence", ""))
         lines.extend(f"- {issue}" for issue in issues)
     if failures:
         lines.extend(("", "## Correctness and protocol failures", ""))
         lines.extend(f"- {failure}" for failure in failures)
-    if failed_gates:
+    if failed_release_gates:
         lines.extend(("", "## Failed performance gates", ""))
         lines.extend(
             f"- {gate.track}/{gate.scope}/{gate.metric} vs {gate.baseline}: "
             f"{gate.detail or gate.contract}"
-            for gate in failed_gates
+            for gate in failed_release_gates
         )
         if not enforce_gates:
             lines.extend(
@@ -3481,6 +4733,16 @@ def analyze(
                     "Smoke performance failures are diagnostic; release reports always enforce them.",
                 )
             )
+    if failed_diagnostic_gates:
+        lines.extend(("", "## Failed diagnostic-only comparisons", ""))
+        lines.append(
+            "These comparisons are reported but do not affect the aggregate release verdict."
+        )
+        lines.extend(
+            f"- {gate.track}/{gate.scope}/{gate.metric} vs {gate.baseline}: "
+            f"{gate.detail or gate.contract}"
+            for gate in failed_diagnostic_gates
+        )
     return ReportResult(verdict, "\n".join(lines) + "\n", machine)
 
 

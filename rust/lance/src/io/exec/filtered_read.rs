@@ -1686,6 +1686,10 @@ pub struct FilteredReadExec {
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     index_input: Option<Arc<dyn ExecutionPlan>>,
+    // An index result that has already been decoded and translated into the
+    // dataset's physical row-address space. This lets callers partition one
+    // ordered scan without repeating the index query or translation per part.
+    evaluated_index: Option<Arc<EvaluatedIndex>>,
     // Precomputed internal plan
     plan: Arc<OnceCell<FilteredReadInternalPlan>>,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
@@ -1798,6 +1802,7 @@ impl FilteredReadExec {
             running_stream: Arc::new(AsyncMutex::new(None)),
             metrics,
             index_input,
+            evaluated_index: None,
             plan: Arc::new(OnceCell::new()),
         })
     }
@@ -1838,33 +1843,45 @@ impl FilteredReadExec {
         })
     }
 
+    async fn evaluate_index_impl(
+        dataset: &Arc<Dataset>,
+        index_input: Option<&Arc<dyn ExecutionPlan>>,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+    ) -> Result<Option<Arc<EvaluatedIndex>>> {
+        let Some(index_input) = index_input else {
+            return Ok(None);
+        };
+        let mut index_search = index_input.execute(partition, ctx)?;
+        let index_search_result = index_search.next().await.ok_or_else(|| {
+            Error::internal("Index search did not yield any results".to_string())
+        })??;
+        let decoded = EvaluatedIndex::try_from_arrow(&index_search_result)?;
+        let evaluated = if dataset.manifest.uses_stable_logical_row_addresses() {
+            EvaluatedIndex::translate_logical(dataset.as_ref(), decoded).await?
+        } else {
+            decoded
+        };
+        Ok(Some(Arc::new(evaluated)))
+    }
+
     /// Get or create the internal plan
     async fn get_or_create_plan_impl<'a>(
         plan_cell: &'a OnceCell<FilteredReadInternalPlan>,
         dataset: Arc<Dataset>,
         options: &FilteredReadOptions,
         index_input: Option<&Arc<dyn ExecutionPlan>>,
+        precomputed_index: Option<&Arc<EvaluatedIndex>>,
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<&'a FilteredReadInternalPlan> {
         plan_cell
             .get_or_try_init(|| async {
-                // Execute index if present
-                let mut evaluated_index = None;
-                if let Some(index_input) = index_input {
-                    let mut index_search = index_input.execute(partition, ctx)?;
-                    let index_search_result = index_search.next().await.ok_or_else(|| {
-                        Error::internal("Index search did not yield any results".to_string())
-                    })??;
-                    let decoded = EvaluatedIndex::try_from_arrow(&index_search_result)?;
-                    if dataset.manifest.uses_stable_logical_row_addresses() {
-                        evaluated_index = Some(Arc::new(
-                            EvaluatedIndex::translate_logical(dataset.as_ref(), decoded).await?,
-                        ));
-                    } else {
-                        evaluated_index = Some(Arc::new(decoded));
-                    }
-                }
+                let evaluated_index = if let Some(precomputed_index) = precomputed_index {
+                    Some(precomputed_index.clone())
+                } else {
+                    Self::evaluate_index_impl(&dataset, index_input, partition, ctx).await?
+                };
 
                 // Load fragments to compute the plan
                 let io_parallelism = dataset.object_store.io_parallelism();
@@ -1889,14 +1906,51 @@ impl FilteredReadExec {
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                // Plan the scan
-                Ok(FilteredReadStream::plan_scan(
-                    &loaded_fragments,
-                    &evaluated_index,
-                    options,
-                ))
+                let plan =
+                    FilteredReadStream::plan_scan(&loaded_fragments, &evaluated_index, options);
+                let planned_fragment_ids = loaded_fragments
+                    .iter()
+                    .map(|fragment| fragment.fragment.id() as u32)
+                    .collect::<RoaringBitmap>();
+                if plan
+                    .rows
+                    .keys()
+                    .any(|fragment_id| !planned_fragment_ids.contains(*fragment_id))
+                    || plan
+                        .filters
+                        .keys()
+                        .any(|fragment_id| !planned_fragment_ids.contains(*fragment_id))
+                    || plan
+                        .filters
+                        .keys()
+                        .any(|fragment_id| !plan.rows.contains_key(fragment_id))
+                {
+                    return Err(Error::internal(
+                        "filtered-read rows or filters escaped their planned fragment scope",
+                    ));
+                }
+                Ok(plan)
             })
             .await
+    }
+
+    /// Evaluate and translate the scalar-index input without materializing a
+    /// row-selection plan.
+    pub(crate) async fn evaluate_index(
+        &self,
+        ctx: Arc<TaskContext>,
+    ) -> Result<Option<Arc<EvaluatedIndex>>> {
+        if let Some(evaluated_index) = &self.evaluated_index {
+            return Ok(Some(evaluated_index.clone()));
+        }
+        Self::evaluate_index_impl(&self.dataset, self.index_input.as_ref(), 0, ctx).await
+    }
+
+    /// Consume a physical index result that was evaluated by another read.
+    pub(crate) fn with_evaluated_index(mut self, evaluated_index: Arc<EvaluatedIndex>) -> Self {
+        self.index_input = None;
+        self.evaluated_index = Some(evaluated_index);
+        self
     }
 
     /// Get the existing plan or create it if it doesn't exist
@@ -1906,6 +1960,7 @@ impl FilteredReadExec {
             self.dataset.clone(),
             &self.options,
             self.index_input.as_ref(),
+            self.evaluated_index.as_ref(),
             0,
             ctx,
         )
@@ -1938,6 +1993,7 @@ impl FilteredReadExec {
             .and_then(|o| o.batch_size_bytes);
         let metrics = self.metrics.clone();
         let index_input = self.index_input.clone();
+        let evaluated_index = self.evaluated_index.clone();
         let plan_cell = self.plan.clone();
 
         let stream = futures::stream::once(async move {
@@ -1950,6 +2006,7 @@ impl FilteredReadExec {
                     dataset.clone(),
                     &options,
                     index_input.as_ref(),
+                    evaluated_index.as_ref(),
                     partition,
                     context.clone(),
                 )
@@ -2234,6 +2291,7 @@ impl ExecutionPlan for FilteredReadExec {
                 // out just in case
                 running_stream: Arc::new(AsyncMutex::new(None)),
                 index_input,
+                evaluated_index: self.evaluated_index.clone(),
                 plan: Arc::new(OnceCell::new()),
             }))
         }

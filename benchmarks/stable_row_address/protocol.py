@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import datetime as dt
 import hashlib
@@ -22,6 +23,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import run  # noqa: E402
+import environment_attestation  # noqa: E402
 
 
 DEFAULT_MATRIX = SCRIPT_DIR / "workload_matrix.v1.json"
@@ -192,6 +194,24 @@ def load_matrix(path: Path) -> tuple[dict[str, Any], str, str]:
     return matrix, canonical, digest
 
 
+def development_tiny_matrix(matrix: dict[str, Any]) -> dict[str, Any]:
+    """Return the single canonical smoke-only reduction used by local plumbing tests."""
+
+    reduced = copy.deepcopy(matrix)
+    reduced["profiles"]["smoke"].update(
+        {
+            "rows": 4096,
+            "logical_fragment_counts": [8],
+            "take_counts": [16],
+            "repeated_compaction_rounds": [3],
+            "repeated_update_rounds": 3,
+            "hot_set_rows": 41,
+            "minimum_sustained_boundaries": 3,
+        }
+    )
+    return reduced
+
+
 @dataclasses.dataclass(frozen=True)
 class Step:
     operation: str
@@ -206,6 +226,9 @@ class Step:
     update_driver: str = "native"
     selection: str = "range"
     target_rows_per_fragment: int = 1_000_000
+    compaction_mode: str = "standard"
+    preflight_expected_admission: bool | None = None
+    maintenance_target_file_size_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.operation not in run.WORKER_OPERATIONS:
@@ -218,6 +241,26 @@ class Step:
             raise ValueError(f"unsupported index_kind: {self.index_kind}")
         if self.selection not in SELECTION_RECORD_NAMES:
             raise ValueError(f"unsupported selection: {self.selection}")
+        if self.compaction_mode not in {"standard", "fragment_reuse"}:
+            raise ValueError(f"unsupported compaction_mode: {self.compaction_mode}")
+        if (
+            self.compaction_mode != "standard"
+            and self.operation != "default_compaction"
+        ):
+            raise ValueError("non-standard compaction modes require default_compaction")
+        if self.preflight_expected_admission is not None and self.operation not in {
+            "default_compaction",
+            "random_delete_reclaim",
+            "bounded_recluster",
+        }:
+            raise ValueError(
+                "default-compaction preflight requires a relocation operation"
+            )
+        if (
+            self.maintenance_target_file_size_bytes is not None
+            and self.maintenance_target_file_size_bytes <= 0
+        ):
+            raise ValueError("maintenance target file size must be positive")
 
     @property
     def implementation_path(self) -> str:
@@ -236,12 +279,17 @@ class Step:
             "checkpoint_generation",
         }:
             return "capability_gated_explicit_maintenance"
-        if self.operation == "default_compaction":
+        if (
+            self.operation == "default_compaction"
+            and self.compaction_mode == "standard"
+        ):
             return "default_compaction"
         if self.operation == "default_compaction_preflight":
             return "default_compaction_plan_only"
         if self.operation == "random_delete_reclaim":
             return "same_postcondition_repack_or_default_compaction"
+        if self.operation == "bounded_recluster":
+            return "same_postcondition_bounded_recluster"
         if self.operation in {"index_build", "index_take", "index_optimize"}:
             return INDEX_RECORD_NAMES[self.index_kind]
         return "native_dataset_api"
@@ -255,6 +303,21 @@ class Step:
                 if format_name == "v23_logical"
                 else "same_postcondition_default_compaction"
             )
+        if self.operation == "bounded_recluster":
+            return (
+                "default_bounded_recluster_fast_path"
+                if format_name == "v23_logical"
+                else "same_postcondition_bounded_recluster_rewrite"
+            )
+        if (
+            self.operation == "default_compaction"
+            and self.compaction_mode == "fragment_reuse"
+        ):
+            return {
+                "v22_no_stable": "deferred_fragment_reuse_compaction",
+                "v22_stable": "inline_index_remap_compaction",
+                "v23_logical": "stable_logical_zero_remap_compaction",
+            }[format_name]
         return self.implementation_path
 
 
@@ -266,10 +329,86 @@ class MatrixCase:
     take_count: int
     steps: tuple[Step, ...]
     fixture_index_kind: str = "none"
+    fixture_segments: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.steps or self.steps[0].operation != "create":
+            raise ValueError("matrix cases must start from a create fixture")
+        if not self.fixture_segments:
+            return
+        if any(
+            rows <= 0 or rows_per_fragment <= 0
+            for rows, rows_per_fragment in self.fixture_segments
+        ):
+            raise ValueError("fixture segments must contain positive row counts")
+        if (
+            sum(rows for rows, _ in self.fixture_segments)
+            != self.steps[0].expected_rows
+        ):
+            raise ValueError("fixture segments must sum to the fixture row count")
+        if self.fixture_segments[0][1] != self.rows_per_fragment:
+            raise ValueError("first fixture segment must define rows_per_fragment")
+
+
+FixtureKey = tuple[str, tuple[tuple[int, int], ...], str]
+
+
+def fixture_segments_for_case(case: MatrixCase) -> tuple[tuple[int, int], ...]:
+    return case.fixture_segments or (
+        (case.steps[0].expected_rows, case.rows_per_fragment),
+    )
+
+
+def fixture_key_for_case(case: MatrixCase) -> FixtureKey:
+    return (
+        case.schema_kind,
+        fixture_segments_for_case(case),
+        case.fixture_index_kind,
+    )
+
+
+def fixture_layout_path(segments: tuple[tuple[int, int], ...]) -> str:
+    rows = sum(segment_rows for segment_rows, _ in segments)
+    if len(segments) == 1:
+        return f"rows-{rows}/rows-per-fragment-{segments[0][1]}"
+    canonical = json.dumps(segments, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    return f"rows-{rows}/segmented-layout-{digest}"
+
+
+def skewed_fixture_segments(rows: int, fragments: int) -> tuple[tuple[int, int], ...]:
+    if rows % fragments != 0 or fragments % 2 != 0:
+        raise ValueError("skewed fixture requires an even exact fragment partition")
+    mean = rows // fragments
+    if mean <= 1:
+        raise ValueError("skewed fixture requires at least two rows per fragment")
+    half = fragments // 2
+    return (
+        (half * (mean - 1), mean - 1),
+        (half * (mean + 1), mean + 1),
+    )
 
 
 def _rows_per_fragment(rows: int, fragments: int) -> int:
     return max(1, math.ceil(rows / fragments))
+
+
+def repeated_compaction_target_rows(
+    rows: int, source_fragments: int, rounds: int, round_index: int
+) -> int:
+    if rounds <= 0 or source_fragments <= rounds:
+        raise ValueError(
+            "repeated compaction requires more source fragments than rounds"
+        )
+    if round_index < 0 or round_index >= rounds:
+        raise ValueError("repeated compaction round index is out of range")
+    rounds_remaining = rounds - round_index - 1
+    target_fragments = (
+        1
+        if rounds_remaining == 0
+        else math.ceil(source_fragments * rounds_remaining / rounds)
+    )
+    return math.ceil(rows / target_fragments)
 
 
 def iter_matrix_cases(
@@ -303,7 +442,11 @@ def iter_matrix_cases(
                     continue
                 for percentage in profile["delete_percentages"]:
                     count = rows * percentage // 100
-                    reclaim = delete_kind == "random" and percentage in {50, 90}
+                    inline_reclaim = delete_kind == "random" and percentage == 1
+                    explicit_reclaim = delete_kind == "random" and percentage in {
+                        50,
+                        90,
+                    }
                     steps = [
                         Step("create", rows, schema_kind=schema),
                         Step(
@@ -327,7 +470,19 @@ def iter_matrix_cases(
                                 target_rows_per_fragment=max(1, rows - count),
                             )
                         )
-                    if reclaim:
+                    if inline_reclaim:
+                        steps.append(
+                            Step(
+                                "default_compaction",
+                                rows - count,
+                                mutation_count=count,
+                                schema_kind=schema,
+                                selection="random",
+                                target_rows_per_fragment=max(1, rows - count),
+                                preflight_expected_admission=True,
+                            )
+                        )
+                    if explicit_reclaim:
                         steps.append(
                             Step(
                                 "random_delete_reclaim",
@@ -336,6 +491,10 @@ def iter_matrix_cases(
                                 schema_kind=schema,
                                 selection="random",
                                 target_rows_per_fragment=max(1, rows - count),
+                                preflight_expected_admission=(
+                                    profile["random_delete_reclaim_admission"]
+                                    == "must_admit"
+                                ),
                             )
                         )
                     yield MatrixCase(
@@ -413,6 +572,44 @@ def iter_matrix_cases(
                         ),
                     )
 
+    if "delete_random" in selected:
+        expected_reclaim_admission = (
+            profile["random_delete_reclaim_admission"] == "must_admit"
+        )
+        for percentage in profile["delete_percentages"]:
+            if percentage not in {50, 90}:
+                continue
+            count = rows * percentage // 100
+            for schema, index_kind in (("narrow16", "scalar"), ("vector", "vector")):
+                yield MatrixCase(
+                    f"indexed-repack-random-delete-{percentage}/{index_kind}",
+                    schema,
+                    default_rows_per_fragment,
+                    min(profile["take_counts"][-1], rows - count),
+                    (
+                        Step("create", rows, schema_kind=schema, index_kind=index_kind),
+                        Step(
+                            "delete",
+                            rows - count,
+                            mutation_count=count,
+                            schema_kind=schema,
+                            index_kind=index_kind,
+                            selection="random",
+                        ),
+                        Step(
+                            "random_delete_reclaim",
+                            rows - count,
+                            mutation_count=count,
+                            schema_kind=schema,
+                            index_kind=index_kind,
+                            selection="random",
+                            target_rows_per_fragment=max(1, rows - count),
+                            preflight_expected_admission=expected_reclaim_admission,
+                        ),
+                    ),
+                    index_kind,
+                )
+
     if "n_to_one_compaction" in selected:
         for fragments in profile["logical_fragment_counts"]:
             for schema in profile["schemas"]:
@@ -431,6 +628,26 @@ def iter_matrix_cases(
                         ),
                     ),
                 )
+        for fragments in profile["logical_fragment_counts"]:
+            if fragments not in {10_000, 100_000}:
+                continue
+            segments = skewed_fixture_segments(rows, fragments)
+            yield MatrixCase(
+                f"compact-{fragments}-skew-to-1/narrow16",
+                "narrow16",
+                segments[0][1],
+                min(profile["take_counts"][-1], rows),
+                (
+                    Step("create", rows, schema_kind="narrow16"),
+                    Step(
+                        "default_compaction",
+                        rows,
+                        schema_kind="narrow16",
+                        target_rows_per_fragment=rows,
+                    ),
+                ),
+                fixture_segments=segments,
+            )
     if "repeated_compaction" in selected:
         fragments = profile["logical_fragment_counts"][-1]
         for rounds in profile["repeated_compaction_rounds"]:
@@ -442,7 +659,9 @@ def iter_matrix_cases(
                         rows,
                         step=step,
                         schema_kind=schema,
-                        target_rows_per_fragment=rows,
+                        target_rows_per_fragment=repeated_compaction_target_rows(
+                            rows, fragments, rounds, step
+                        ),
                     )
                     for step in range(rounds)
                 )
@@ -501,6 +720,18 @@ def iter_matrix_cases(
                         selection="random",
                     ),
                 ]
+                if percentage == 1:
+                    steps.append(
+                        Step(
+                            "default_compaction",
+                            expected,
+                            mutation_count=count,
+                            schema_kind=schema,
+                            selection="random",
+                            target_rows_per_fragment=max(1, expected),
+                            preflight_expected_admission=True,
+                        )
+                    )
                 if percentage in {50, 90}:
                     steps.append(
                         Step(
@@ -510,6 +741,10 @@ def iter_matrix_cases(
                             schema_kind=schema,
                             selection="random",
                             target_rows_per_fragment=max(1, expected),
+                            preflight_expected_admission=(
+                                profile["random_delete_reclaim_admission"]
+                                == "must_admit"
+                            ),
                         )
                     )
                 yield MatrixCase(
@@ -553,7 +788,9 @@ def iter_matrix_cases(
                         step=step,
                         schema_kind=schema,
                         index_kind=index_kind,
-                        target_rows_per_fragment=rows,
+                        target_rows_per_fragment=repeated_compaction_target_rows(
+                            rows, fragments, rounds, step
+                        ),
                     )
                     for step in range(rounds)
                 )
@@ -563,6 +800,69 @@ def iter_matrix_cases(
                     _rows_per_fragment(rows, fragments),
                     min(profile["take_counts"][-1], rows),
                     tuple(steps),
+                    index_kind,
+                )
+    if "bounded_recluster" in selected:
+        fragments = profile["logical_fragment_counts"][0]
+        rows_per_fragment = _rows_per_fragment(rows, fragments)
+        for schema, index_kind in (
+            ("narrow16", "scalar"),
+            ("wide128", "none"),
+            ("vector", "vector"),
+        ):
+            yield MatrixCase(
+                f"bounded-default-clustering-{fragments}/{schema}",
+                schema,
+                rows_per_fragment,
+                min(profile["take_counts"][-1], rows),
+                (
+                    Step("create", rows, schema_kind=schema, index_kind=index_kind),
+                    Step(
+                        "bounded_recluster",
+                        rows,
+                        schema_kind=schema,
+                        index_kind=index_kind,
+                        target_rows_per_fragment=max(1, rows_per_fragment * 8),
+                    ),
+                ),
+                index_kind,
+            )
+            yield MatrixCase(
+                f"bounded-recluster-{fragments}/{schema}",
+                schema,
+                rows_per_fragment,
+                min(profile["take_counts"][-1], rows),
+                (
+                    Step("create", rows, schema_kind=schema),
+                    Step(
+                        "recluster",
+                        rows,
+                        schema_kind=schema,
+                        index_kind=index_kind,
+                        target_rows_per_fragment=rows_per_fragment,
+                    ),
+                ),
+                index_kind,
+            )
+    if "fragment_reuse" in selected:
+        for fragments in profile["logical_fragment_counts"]:
+            for schema, index_kind in (("narrow16", "scalar"), ("vector", "vector")):
+                yield MatrixCase(
+                    f"fragment-reuse-{fragments}-to-1/{index_kind}",
+                    schema,
+                    _rows_per_fragment(rows, fragments),
+                    min(profile["take_counts"][-1], rows),
+                    (
+                        Step("create", rows, schema_kind=schema),
+                        Step(
+                            "default_compaction",
+                            rows,
+                            schema_kind=schema,
+                            index_kind=index_kind,
+                            target_rows_per_fragment=rows,
+                            compaction_mode="fragment_reuse",
+                        ),
+                    ),
                     index_kind,
                 )
     if "scalar_index" in selected:
@@ -737,7 +1037,7 @@ class ProtocolRunner:
             self._lineage_sink = self.fixture_lineage_path.open(
                 "x", encoding="utf-8", buffering=1
             )
-        self._fixtures: set[tuple[str, int, int, str]] = set()
+        self._fixtures: set[FixtureKey] = set()
         self.take_ids_root = output.parent / f"{output.name}.{run_id}.take_ids"
         self.maintenance_plans_root = (
             output.parent / f"{output.name}.{run_id}.maintenance_plans"
@@ -841,10 +1141,14 @@ class ProtocolRunner:
         rows_per_fragment: int,
         index_kind: str,
         format_name: str,
+        fixture_segments: tuple[tuple[int, int], ...] | None = None,
     ) -> str:
+        segments = fixture_segments or ((rows, rows_per_fragment),)
+        if sum(segment_rows for segment_rows, _ in segments) != rows:
+            raise ValueError("fixture URI segments do not sum to rows")
         suffix = (
-            f"{self.run_id}/fixtures/{schema_kind}/rows-{rows}/"
-            f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}/"
+            f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
+            f"index-{index_kind}/"
             f"{format_name}.lance"
         )
         if self.dataset_root.startswith("s3://"):
@@ -927,6 +1231,7 @@ class ProtocolRunner:
             index_kind=step.index_kind,
             update_driver=step.update_driver,
             selection=step.selection,
+            compaction_mode=step.compaction_mode,
             target_rows_per_fragment=step.target_rows_per_fragment,
             target_file_size_bytes=(
                 target_file_size_bytes
@@ -1038,17 +1343,36 @@ class ProtocolRunner:
         return record
 
     def ensure_fixture(
-        self, schema_kind: str, rows_per_fragment: int, index_kind: str
+        self,
+        schema_kind: str,
+        rows_per_fragment: int,
+        index_kind: str,
+        fixture_segments: tuple[tuple[int, int], ...] | None = None,
     ) -> None:
-        key = (schema_kind, self.rows, rows_per_fragment, index_kind)
+        segments = fixture_segments or ((self.rows, rows_per_fragment),)
+        total_rows = sum(segment_rows for segment_rows, _ in segments)
+        if segments[0][1] != rows_per_fragment:
+            raise ValueError(
+                "fixture primary rows_per_fragment does not match segments"
+            )
+        key: FixtureKey = (schema_kind, segments, index_kind)
         if key in self._fixtures:
             return
+        saved_rows = self.rows
+        saved_rows_per_fragment = self.rows_per_fragment
         if index_kind != "none":
-            self.ensure_fixture(schema_kind, rows_per_fragment, "none")
-            clone_step = Step("fixture_clone", self.rows, schema_kind=schema_kind)
+            self.ensure_fixture(
+                schema_kind,
+                rows_per_fragment,
+                "none",
+                fixture_segments=segments,
+            )
+            self.rows = total_rows
+            self.rows_per_fragment = rows_per_fragment
+            clone_step = Step("fixture_clone", total_rows, schema_kind=schema_kind)
             clone_pair_id = (
-                f"{self.run_id}/fixtures/{schema_kind}/rows-{self.rows}/"
-                f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}/"
+                f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
+                f"index-{index_kind}/"
                 "fixture_clone"
             )
             order = run.format_order(0, self.phase_index)
@@ -1057,17 +1381,19 @@ class ProtocolRunner:
             for order_index, format_name in enumerate(order):
                 source_uri = self.fixture_uri(
                     schema_kind,
-                    self.rows,
+                    total_rows,
                     rows_per_fragment,
                     "none",
                     format_name,
+                    segments,
                 )
                 target_uri = self.fixture_uri(
                     schema_kind,
-                    self.rows,
+                    total_rows,
                     rows_per_fragment,
                     index_kind,
                     format_name,
+                    segments,
                 )
                 clone_records.append(
                     self.invoke_one(
@@ -1100,13 +1426,13 @@ class ProtocolRunner:
             )
             index_step = Step(
                 "index_build",
-                self.rows,
+                total_rows,
                 schema_kind=schema_kind,
                 index_kind=index_kind,
             )
             index_pair_id = (
-                f"{self.run_id}/fixtures/{schema_kind}/rows-{self.rows}/"
-                f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}/index_build"
+                f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
+                f"index-{index_kind}/index_build"
             )
             order = run.format_order(0, self.phase_index)
             self.phase_index += 1
@@ -1121,10 +1447,11 @@ class ProtocolRunner:
                     order_index=order_index,
                     dataset_uri_override=self.fixture_uri(
                         schema_kind,
-                        self.rows,
+                        total_rows,
                         rows_per_fragment,
                         index_kind,
                         format_name,
+                        segments,
                     ),
                 )
                 for order_index, format_name in enumerate(order)
@@ -1134,35 +1461,62 @@ class ProtocolRunner:
                 f"fixture/{schema_kind}/{rows_per_fragment}/{index_kind}/index",
             )
             self._fixtures.add(key)
+            self.rows = saved_rows
+            self.rows_per_fragment = saved_rows_per_fragment
             return
-        step = Step("create", self.rows, schema_kind=schema_kind)
-        pair_id = (
-            f"{self.run_id}/fixtures/{schema_kind}/rows-{self.rows}/"
-            f"rows-per-fragment-{rows_per_fragment}/index-none/create"
-        )
-        order = run.format_order(0, self.phase_index)
-        self.phase_index += 1
-        records = []
-        for order_index, format_name in enumerate(order):
-            records.append(
-                self.invoke_one(
-                    step,
-                    track="fixtures",
-                    case=f"{schema_kind}-{rows_per_fragment}",
-                    repeat=0,
-                    format_name=format_name,
-                    pair_id=pair_id,
-                    order_index=order_index,
-                    dataset_uri_override=self.fixture_uri(
-                        schema_kind,
-                        self.rows,
-                        rows_per_fragment,
-                        "none",
-                        format_name,
-                    ),
+        cumulative_rows = 0
+        try:
+            for segment_index, (segment_rows, segment_rows_per_fragment) in enumerate(
+                segments
+            ):
+                self.rows = segment_rows
+                self.rows_per_fragment = segment_rows_per_fragment
+                operation = "create" if segment_index == 0 else "append"
+                cumulative_before = cumulative_rows
+                cumulative_rows += segment_rows
+                step = Step(
+                    operation,
+                    cumulative_rows,
+                    mutation_count=(segment_rows if operation == "append" else 1),
+                    id_start=cumulative_before,
+                    schema_kind=schema_kind,
                 )
-            )
-        self.require_success(records, f"fixture/{schema_kind}/{rows_per_fragment}")
+                label = (
+                    "create" if segment_index == 0 else f"append-{segment_index:03d}"
+                )
+                pair_id = (
+                    f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
+                    f"index-none/{label}"
+                )
+                order = run.format_order(0, self.phase_index)
+                self.phase_index += 1
+                records = [
+                    self.invoke_one(
+                        step,
+                        track="fixtures",
+                        case=f"{schema_kind}-{fixture_layout_path(segments)}",
+                        repeat=0,
+                        format_name=format_name,
+                        pair_id=pair_id,
+                        order_index=order_index,
+                        dataset_uri_override=self.fixture_uri(
+                            schema_kind,
+                            total_rows,
+                            rows_per_fragment,
+                            "none",
+                            format_name,
+                            segments,
+                        ),
+                    )
+                    for order_index, format_name in enumerate(order)
+                ]
+                self.require_success(
+                    records,
+                    f"fixture/{schema_kind}/{fixture_layout_path(segments)}/{label}",
+                )
+        finally:
+            self.rows = saved_rows
+            self.rows_per_fragment = saved_rows_per_fragment
         self._fixtures.add(key)
 
     def clone_fixture_all(
@@ -1175,11 +1529,21 @@ class ProtocolRunner:
         rows_per_fragment: int,
         index_kind: str,
         label: str,
+        fixture_segments: tuple[tuple[int, int], ...] | None = None,
     ) -> dict[str, dict[str, Any]]:
-        self.ensure_fixture(schema_kind, rows_per_fragment, index_kind)
+        segments = fixture_segments or ((self.rows, rows_per_fragment),)
+        total_rows = sum(segment_rows for segment_rows, _ in segments)
+        if total_rows != self.rows:
+            raise ValueError("fixture clone row count does not match protocol state")
+        self.ensure_fixture(
+            schema_kind,
+            rows_per_fragment,
+            index_kind,
+            fixture_segments=segments,
+        )
         step = Step(
             "fixture_clone",
-            self.rows,
+            total_rows,
             schema_kind=schema_kind,
             index_kind=index_kind,
         )
@@ -1190,10 +1554,11 @@ class ProtocolRunner:
         for order_index, format_name in enumerate(order):
             source_uri = self.fixture_uri(
                 schema_kind,
-                self.rows,
+                total_rows,
                 rows_per_fragment,
                 index_kind,
                 format_name,
+                segments,
             )
             target_uri = self.dataset_uri(track, case, repeat, format_name)
             record = self.invoke_one(
@@ -1516,7 +1881,9 @@ class ProtocolRunner:
                     "expected_output_fragments",
                 )
             ):
-                raise ValueError("physical maintenance group values must be non-negative integers")
+                raise ValueError(
+                    "physical maintenance group values must be non-negative integers"
+                )
             if (
                 group["start_ordinal"] != expected_start
                 or group["end_ordinal"] <= expected_start
@@ -1526,10 +1893,11 @@ class ProtocolRunner:
                 raise ValueError("physical maintenance plan groups are not contiguous")
             if (
                 group["source_live_rows"] > group["source_physical_rows"]
-                or group["source_live_data_bytes"]
-                > group["source_physical_data_bytes"]
+                or group["source_live_data_bytes"] > group["source_physical_data_bytes"]
             ):
-                raise ValueError("physical maintenance plan live source exceeds physical source")
+                raise ValueError(
+                    "physical maintenance plan live source exceeds physical source"
+                )
             expected_start = group["end_ordinal"]
             expected_outputs += group["expected_output_fragments"]
             planned_live_rows += group["source_live_rows"]
@@ -1559,9 +1927,9 @@ class ProtocolRunner:
             (planned_live_rows + expected_execution_target - 1)
             // expected_execution_target,
         )
-        expected_output_live_rows = [
-            expected_execution_target
-        ] * (planned_live_rows // expected_execution_target)
+        expected_output_live_rows = [expected_execution_target] * (
+            planned_live_rows // expected_execution_target
+        )
         if planned_live_rows % expected_execution_target:
             expected_output_live_rows.append(
                 planned_live_rows % expected_execution_target
@@ -1570,8 +1938,7 @@ class ProtocolRunner:
             expected_output_live_rows.append(0)
         if (
             planned_live_rows != step.expected_rows
-            or plan["execution_target_rows_per_fragment"]
-            != expected_execution_target
+            or plan["execution_target_rows_per_fragment"] != expected_execution_target
             or groups[0]["expected_output_fragments"] != expected_output_count
             or plan["expected_output_live_rows"] != expected_output_live_rows
             or plan["expected_output_fragment_count"] != expected_output_count
@@ -1668,13 +2035,24 @@ class ProtocolRunner:
                 take_ids_input=take_artifacts[format_name],
             )
         if index_kind != "none":
-            self.invoke_all(
-                dataclasses.replace(common, operation="index_take"),
-                track=track,
-                case=case,
-                repeat=repeat,
-                label=f"step-{step_index:03d}/cold-index-take",
+            index_take_step = dataclasses.replace(common, operation="index_take")
+            index_pair_id = (
+                f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/"
+                f"step-{step_index:03d}/cold-index-take"
             )
+            index_order = run.format_order(repeat, self.phase_index)
+            self.phase_index += 1
+            for order_index, format_name in enumerate(index_order):
+                self.invoke_one(
+                    index_take_step,
+                    track=track,
+                    case=case,
+                    repeat=repeat,
+                    format_name=format_name,
+                    pair_id=index_pair_id,
+                    order_index=order_index,
+                    take_ids_input=take_artifacts[format_name],
+                )
         return scans
 
     def require_success(self, records: Iterable[dict[str, Any]], context: str) -> None:
@@ -1714,6 +2092,7 @@ def run_matrix(
                         rows_per_fragment=case.rows_per_fragment,
                         index_kind=case.fixture_index_kind,
                         label=f"step-{step_index:03d}/fixture_clone",
+                        fixture_segments=fixture_segments_for_case(case),
                     )
                     runner.require_success(
                         records.values(),
@@ -1721,11 +2100,6 @@ def run_matrix(
                     )
                     continue
                 if step.operation == "random_delete_reclaim":
-                    source_version = records["v23_logical"]["dataset_version"]
-                    if source_version is None:
-                        raise RuntimeError(
-                            "uniform-random delete did not report its committed version"
-                        )
                     runner.probes(
                         track="matrix",
                         case=case.name,
@@ -1734,6 +2108,17 @@ def run_matrix(
                         schema_kind=case.schema_kind,
                         index_kind=step.index_kind,
                         step_index=step_index,
+                    )
+                if step.preflight_expected_admission is not None:
+                    source_version = records["v23_logical"]["dataset_version"]
+                    if source_version is None:
+                        raise RuntimeError(
+                            "uniform-random delete did not report its committed version"
+                        )
+                    preflight_label = (
+                        "default-reclaim-preflight"
+                        if step.operation == "random_delete_reclaim"
+                        else "default-compaction-preflight"
                     )
                     preflight = runner.invoke_one(
                         dataclasses.replace(
@@ -1745,44 +2130,103 @@ def run_matrix(
                         format_name="v23_logical",
                         pair_id=(
                             f"{runner.run_id}/matrix/{case.name}/repeat-{repeat:03d}/"
-                            f"step-{step_index:03d}/default-reclaim-preflight"
+                            f"step-{step_index:03d}/{preflight_label}"
                         ),
                         order_index=0,
                     )
                     assert_default_compaction_preflight(
                         preflight,
                         source_version=source_version,
-                        expected_admission=(
-                            profile["random_delete_reclaim_admission"] == "must_admit"
-                        ),
-                        context="uniform-random delete reclaim",
+                        expected_admission=step.preflight_expected_admission,
+                        context=f"{case.name} default compaction",
                     )
                 maintenance_plan = None
                 max_source_fragments = None
                 target_file_size_bytes = None
-                if step.operation in {"default_compaction", "random_delete_reclaim"}:
+                if step.operation in {
+                    "default_compaction",
+                    "random_delete_reclaim",
+                    "bounded_recluster",
+                    "recluster",
+                }:
                     max_source_fragments = max(profile["logical_fragment_counts"]) * 2
-                    target_file_size_bytes = sys.maxsize
+                    source_format = (
+                        "v23_logical"
+                        if step.operation == "recluster"
+                        else "v22_no_stable"
+                    )
+                    if step.maintenance_target_file_size_bytes is not None:
+                        target_file_size_bytes = step.maintenance_target_file_size_bytes
+                    else:
+                        source = records[source_format]
+                        live_rows = source["result_rows"]
+                        live_bytes = source["estimated_live_data_bytes"]
+                        physical_bytes = source["physical_data_bytes"]
+                        if (
+                            not isinstance(live_rows, int)
+                            or live_rows <= 0
+                            or not isinstance(live_bytes, int)
+                            or live_bytes <= 0
+                        ):
+                            raise RuntimeError(
+                                "maintenance source is missing positive live rows or bytes"
+                            )
+                        target_rows = min(step.target_rows_per_fragment, live_rows)
+                        if target_rows == live_rows:
+                            if (
+                                not isinstance(physical_bytes, int)
+                                or physical_bytes <= 0
+                            ):
+                                raise RuntimeError(
+                                    "full-table maintenance target requires physical bytes"
+                                )
+                            target_file_size_bytes = physical_bytes
+                        else:
+                            target_file_size_bytes = max(
+                                1,
+                                (live_bytes * target_rows + live_rows - 1) // live_rows,
+                            )
                     maintenance_plan = runner.prepare_maintenance_plan(
                         dataclasses.replace(step, step=step_index),
                         track="matrix",
                         case=case.name,
                         repeat=repeat,
                         label=f"step-{step_index:03d}/{step.operation}-plan",
-                        source_format="v22_no_stable",
+                        source_format=source_format,
                         max_source_fragments_per_group=max_source_fragments,
                         target_file_size_bytes=target_file_size_bytes,
                     )
-                records = runner.invoke_all(
-                    dataclasses.replace(step, step=step_index),
-                    track="matrix",
-                    case=case.name,
-                    repeat=repeat,
-                    label=f"step-{step_index:03d}/{step.operation}",
-                    maintenance_plan=maintenance_plan,
-                    max_source_fragments_per_group=max_source_fragments,
-                    target_file_size_bytes=target_file_size_bytes,
-                )
+                measured_step = dataclasses.replace(step, step=step_index)
+                if step.operation == "recluster":
+                    pair_id = (
+                        f"{runner.run_id}/matrix/{case.name}/repeat-{repeat:03d}/"
+                        f"step-{step_index:03d}/recluster"
+                    )
+                    records = {
+                        "v23_logical": runner.invoke_one(
+                            measured_step,
+                            track="matrix",
+                            case=case.name,
+                            repeat=repeat,
+                            format_name="v23_logical",
+                            pair_id=pair_id,
+                            order_index=0,
+                            maintenance_plan=maintenance_plan,
+                            max_source_fragments_per_group=max_source_fragments,
+                            target_file_size_bytes=target_file_size_bytes,
+                        )
+                    }
+                else:
+                    records = runner.invoke_all(
+                        measured_step,
+                        track="matrix",
+                        case=case.name,
+                        repeat=repeat,
+                        label=f"step-{step_index:03d}/{step.operation}",
+                        maintenance_plan=maintenance_plan,
+                        max_source_fragments_per_group=max_source_fragments,
+                        target_file_size_bytes=target_file_size_bytes,
+                    )
                 runner.require_success(
                     records.values(), f"matrix/{case.name}/step-{step_index}"
                 )
@@ -1819,12 +2263,9 @@ def fixture_keys_for_run(
     tracks: Sequence[str],
     variants: Sequence[str],
     matrix_cases: Sequence[MatrixCase],
-) -> set[tuple[str, int, str]]:
+) -> set[FixtureKey]:
     keys = (
-        {
-            (case.schema_kind, case.rows_per_fragment, case.fixture_index_kind)
-            for case in matrix_cases
-        }
+        {fixture_key_for_case(case) for case in matrix_cases}
         if "matrix" in tracks
         else set()
     )
@@ -1834,19 +2275,16 @@ def fixture_keys_for_run(
         )
         for variant in variants:
             schema_kind, index_kind = variant_config(variant)
-            keys.add((schema_kind, rows_per_fragment, index_kind))
+            keys.add((schema_kind, ((profile["rows"], rows_per_fragment),), index_kind))
     return keys
 
 
 def fixture_keys_for_shard(
-    fixture_keys: Iterable[tuple[str, int, str]], shard_count: int, shard_index: int
-) -> set[tuple[str, int, str]]:
+    fixture_keys: Iterable[FixtureKey], shard_count: int, shard_index: int
+) -> set[FixtureKey]:
     fixture_keys = set(fixture_keys)
     data_keys = sorted(
-        {
-            (schema_kind, rows_per_fragment)
-            for schema_kind, rows_per_fragment, _ in fixture_keys
-        }
+        {(schema_kind, segments) for schema_kind, segments, _ in fixture_keys}
     )
     selected_data_keys = {
         key
@@ -1857,28 +2295,29 @@ def fixture_keys_for_shard(
 
 
 def projected_canonical_payload_bytes(
-    profile: dict[str, Any], fixture_keys: Iterable[tuple[str, int, str]]
+    profile: dict[str, Any], fixture_keys: Iterable[FixtureKey]
 ) -> int:
     bytes_per_row = {"narrow16": 16, "wide128": 128, "vector": 528}
-    data_keys = {
-        (schema_kind, rows_per_fragment)
-        for schema_kind, rows_per_fragment, _ in fixture_keys
-    }
+    data_keys = {(schema_kind, segments) for schema_kind, segments, _ in fixture_keys}
     return sum(
-        profile["rows"] * bytes_per_row[schema_kind] * len(run.FORMATS)
-        for schema_kind, _ in data_keys
+        sum(segment_rows for segment_rows, _ in segments)
+        * bytes_per_row[schema_kind]
+        * len(run.FORMATS)
+        for schema_kind, segments in data_keys
     )
 
 
 def projected_unique_initial_index_payload_bytes_lower_bound(
     profile: dict[str, Any],
-    fixture_keys: Iterable[tuple[str, int, str]],
+    fixture_keys: Iterable[FixtureKey],
     matrix_cases: Sequence[MatrixCase],
 ) -> int:
     index_bytes_per_row = {"scalar": 48, "vector": 520}
     canonical = sum(
-        profile["rows"] * index_bytes_per_row[index_kind] * len(run.FORMATS)
-        for _, _, index_kind in set(fixture_keys)
+        sum(segment_rows for segment_rows, _ in segments)
+        * index_bytes_per_row[index_kind]
+        * len(run.FORMATS)
+        for _, segments, index_kind in set(fixture_keys)
         if index_kind != "none"
     )
     measured_builds = sum(
@@ -2255,6 +2694,16 @@ def run_adversarial_natural(
                 assert_pmr_preflight(candidate, "adversarial natural")
                 if candidate["placement_maintenance_required"] is True:
                     runner.pmr_triggers += 1
+                    maintenance_order_scope = (
+                        f"adversarial_natural/{variant}/"
+                        f"repeat-{repeat:03d}/round-{update_round:03d}/"
+                        "pmr-maintenance"
+                    )
+                    maintenance_pair = f"{runner.run_id}/{maintenance_order_scope}"
+                    maintenance_order = run.dynamic_format_order(
+                        repeat, maintenance_order_scope
+                    )
+                    candidate_order_index = maintenance_order.index("v23_logical")
                     maintenance = dataclasses.replace(
                         update,
                         operation="normalize_placement",
@@ -2283,11 +2732,8 @@ def run_adversarial_natural(
                         case=variant,
                         repeat=repeat,
                         format_name="v23_logical",
-                        pair_id=(
-                            f"{runner.run_id}/adversarial_natural/{variant}/"
-                            f"repeat-{repeat:03d}/round-{update_round:03d}/pmr-maintenance"
-                        ),
-                        order_index=0,
+                        pair_id=maintenance_pair,
+                        order_index=candidate_order_index,
                         maintenance_plan=maintenance_plan,
                         max_source_fragments_per_group=max_source_fragments,
                         target_file_size_bytes=runner.policy["target_topology"][
@@ -2306,7 +2752,7 @@ def run_adversarial_natural(
                             f"{runner.run_id}/adversarial_natural/{variant}/"
                             f"repeat-{repeat:03d}/round-{update_round:03d}/update-retry"
                         ),
-                        order_index=0,
+                        order_index=candidate_order_index,
                     )
                     runner.require_success([retry], "adversarial candidate retry")
                 else:
@@ -2331,7 +2777,19 @@ def run_adversarial_natural(
                     index_kind=index_kind,
                     step_index=update_round,
                 )
-                for format_name, record in scans.items():
+                natural_maintenance_order_scope = (
+                    f"adversarial_natural/{variant}/"
+                    f"repeat-{repeat:03d}/round-{update_round:03d}/"
+                    "natural-maintenance"
+                )
+                natural_maintenance_scope = (
+                    f"{runner.run_id}/{natural_maintenance_order_scope}"
+                )
+                natural_maintenance_order = run.dynamic_format_order(
+                    repeat, natural_maintenance_order_scope
+                )
+                for order_index, format_name in enumerate(natural_maintenance_order):
+                    record = scans[format_name]
                     triggered, _ = policy_triggers(record, runner.policy)
                     if not triggered:
                         continue
@@ -2369,12 +2827,8 @@ def run_adversarial_natural(
                         case=variant,
                         repeat=repeat,
                         format_name=format_name,
-                        pair_id=(
-                            f"{runner.run_id}/adversarial_natural/{variant}/"
-                            f"repeat-{repeat:03d}/round-{update_round:03d}/"
-                            f"natural-maintenance/{format_name}"
-                        ),
-                        order_index=0,
+                        pair_id=(f"{natural_maintenance_scope}/{format_name}"),
+                        order_index=order_index,
                         maintenance_plan=maintenance_plan,
                         max_source_fragments_per_group=max_source_fragments,
                         target_file_size_bytes=runner.policy["target_topology"][
@@ -2477,23 +2931,6 @@ def run_adversarial_aligned(
                             "target_file_size_bytes"
                         ],
                     )
-                    maintained = runner.invoke_one(
-                        normalize,
-                        track="adversarial_aligned",
-                        case=variant,
-                        repeat=repeat,
-                        format_name="v23_logical",
-                        pair_id=(
-                            f"{runner.run_id}/adversarial_aligned/{variant}/"
-                            f"repeat-{repeat:03d}/round-{update_round:03d}/normalize"
-                        ),
-                        order_index=0,
-                        maintenance_plan=maintenance_plan,
-                        max_source_fragments_per_group=max_source_fragments,
-                        target_file_size_bytes=runner.policy["target_topology"][
-                            "target_file_size_bytes"
-                        ],
-                    )
                     baseline_maintenance = dataclasses.replace(
                         update,
                         operation="default_compaction",
@@ -2501,18 +2938,35 @@ def run_adversarial_aligned(
                             schema_kind, runner.policy
                         ),
                     )
-                    baseline_records = [
-                        runner.invoke_one(
-                            baseline_maintenance,
+                    maintenance_order_scope = (
+                        f"adversarial_aligned/{variant}/"
+                        f"repeat-{repeat:03d}/round-{update_round:03d}/"
+                        "aligned-maintenance"
+                    )
+                    maintenance_order = run.dynamic_format_order(
+                        repeat, maintenance_order_scope
+                    )
+                    maintenance_records: dict[str, dict[str, Any]] = {}
+                    for order_index, format_name in enumerate(maintenance_order):
+                        is_candidate = format_name == "v23_logical"
+                        operation = normalize if is_candidate else baseline_maintenance
+                        pair_id = (
+                            f"{runner.run_id}/adversarial_aligned/{variant}/"
+                            f"repeat-{repeat:03d}/round-{update_round:03d}/normalize"
+                            if is_candidate
+                            else (
+                                f"{runner.run_id}/adversarial_aligned/{variant}/"
+                                f"repeat-{repeat:03d}/round-{update_round:03d}/"
+                                f"forced-baseline-maintenance/{format_name}"
+                            )
+                        )
+                        maintenance_records[format_name] = runner.invoke_one(
+                            operation,
                             track="adversarial_aligned",
                             case=variant,
                             repeat=repeat,
                             format_name=format_name,
-                            pair_id=(
-                                f"{runner.run_id}/adversarial_aligned/{variant}/"
-                                f"repeat-{repeat:03d}/round-{update_round:03d}/"
-                                f"forced-baseline-maintenance/{format_name}"
-                            ),
+                            pair_id=pair_id,
                             order_index=order_index,
                             maintenance_plan=maintenance_plan,
                             max_source_fragments_per_group=max_source_fragments,
@@ -2520,9 +2974,10 @@ def run_adversarial_aligned(
                                 "target_file_size_bytes"
                             ],
                         )
-                        for order_index, format_name in enumerate(
-                            ("v22_no_stable", "v22_stable")
-                        )
+                    maintained = maintenance_records["v23_logical"]
+                    baseline_records = [
+                        maintenance_records[format_name]
+                        for format_name in ("v22_no_stable", "v22_stable")
                     ]
                     runner.require_success(
                         [maintained, *baseline_records], "aligned maintenance"
@@ -2537,7 +2992,7 @@ def run_adversarial_aligned(
                             f"{runner.run_id}/adversarial_aligned/{variant}/"
                             f"repeat-{repeat:03d}/round-{update_round:03d}/candidate-retry"
                         ),
-                        order_index=0,
+                        order_index=maintenance_order.index("v23_logical"),
                     )
                 runner.require_success([candidate], "aligned candidate update")
                 baseline_updates = [
@@ -2678,18 +3133,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError(
                 "--development-tiny requires --development-executable and --profile=smoke"
             )
-        smoke = matrix["profiles"]["smoke"]
-        smoke.update(
-            {
-                "rows": 4096,
-                "logical_fragment_counts": [8],
-                "take_counts": [16],
-                "repeated_compaction_rounds": [3],
-                "repeated_update_rounds": 3,
-                "hot_set_rows": 41,
-                "minimum_sustained_boundaries": 3,
-            }
-        )
+        matrix = development_tiny_matrix(matrix)
         matrix_canonical = json.dumps(
             matrix, sort_keys=True, separators=(",", ":"), ensure_ascii=True
         )
@@ -2747,8 +3191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     matrix_cases = [
         case
         for case in matrix_cases
-        if (case.schema_kind, case.rows_per_fragment, case.fixture_index_kind)
-        in selected_fixture_keys
+        if fixture_key_for_case(case) in selected_fixture_keys
     ]
     repeated_requested = set(tracks) & {
         "sustained",
@@ -2763,7 +3206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for variant in variants
         if (
             variant_config(variant)[0],
-            repeated_rows_per_fragment,
+            ((profile["rows"], repeated_rows_per_fragment),),
             variant_config(variant)[1],
         )
         in selected_fixture_keys
@@ -2776,6 +3219,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     if not tracks:
         raise ValueError("selected shard contains no workload units")
+    storage_region_attestation = (
+        environment_attestation.attest_same_region_s3(args.dataset_root)
+        if args.profile == "release"
+        else None
+    )
     matrix_case_names = [case.name for case in matrix_cases]
     shard_id = f"shard-{args.shard_index:03d}-of-{args.shard_count:03d}"
     dataset_root = (
@@ -2851,9 +3299,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "created_at_utc": timestamp,
             "commit": commit_after,
             "source_provenance": source_provenance,
+            "development_tiny": args.development_tiny,
             "host": host,
             "seed": args.seed,
             "profile": args.profile,
+            "cargo_profile": run.CARGO_PROFILE,
             "tracks": tracks,
             "variants": variants,
             "matrix_case_names": matrix_case_names,
@@ -2872,6 +3322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.profile == "release"
                 else "bounded_smoke"
             ),
+            "storage_region_attestation": storage_region_attestation,
             "fixture_strategy": "canonical_base_per_format_schema_fragment_layout_then_shallow_clone",
             "fixture_lineage_jsonl": str(fixture_lineage_path),
             "checkpoint_json": str(Path(f"{output}.checkpoint.json")),
@@ -2891,12 +3342,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     resume_expected = {
         "commit": commit_after,
         "source_provenance": source_provenance,
+        "development_tiny": args.development_tiny,
         "seed": args.seed,
         "profile": args.profile,
+        "cargo_profile": run.CARGO_PROFILE,
         "tracks": tracks,
         "variants": variants,
         "matrix_case_names": matrix_case_names,
         "storage": args.storage,
+        "storage_region_attestation": storage_region_attestation,
         "dataset_root": dataset_root,
         "base_dataset_root": args.dataset_root,
         "shard_count": args.shard_count,

@@ -16,8 +16,8 @@ use lance_io::ReadBatchParams;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    ExplicitMapDestination, PhysicalRowLocator, PhysicalToLogicalResolution, PlacementResolution,
-    RowAddressPlacement,
+    ExplicitMapDestination, ExplicitMapRowIdPage, PhysicalRowLocator, PhysicalToLogicalResolution,
+    PlacementResolution, RowAddressPlacement, fingerprint_explicit_map_u64_page,
 };
 
 use super::Dataset;
@@ -34,6 +34,23 @@ fn explicit_object_path(
         .split('/')
         .filter(|segment| !segment.is_empty())
         .fold(base.clone(), |path, segment| path.join(segment))
+}
+
+fn verify_explicit_u64_page(
+    relative_path: &str,
+    columns: &[&[u64]],
+    expected_fingerprint: &[u8],
+) -> Result<()> {
+    let actual_fingerprint = fingerprint_explicit_map_u64_page(columns)?;
+    if actual_fingerprint != expected_fingerprint {
+        return Err(Error::corrupt_file(
+            object_store::path::Path::from(relative_path),
+            format!(
+                "ExplicitMap page content fingerprint mismatch: expected={expected_fingerprint:02x?}, actual={actual_fingerprint:02x?}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -340,7 +357,7 @@ impl Dataset {
                 RowAddressPlacement::ExplicitMap(explicit) => explicit
                     .pages
                     .get(page_index as usize)
-                    .copied()
+                    .cloned()
                     .map(|page| {
                         (
                             explicit.base_id,
@@ -370,6 +387,11 @@ impl Dataset {
         let [logical, physical]: [Arc<UInt64Array>; 2] = columns.try_into().map_err(|_| {
             Error::internal("ExplicitMap locator reader returned the wrong column count")
         })?;
+        verify_explicit_u64_page(
+            &object_path,
+            &[logical.values().as_ref(), physical.values().as_ref()],
+            &page.content_fingerprint,
+        )?;
         let page_row_count = usize::try_from(page.row_count)
             .map_err(|_| Error::invalid_input("ExplicitMap page row count exceeds usize"))?;
         if logical.len() != page_row_count
@@ -464,6 +486,33 @@ impl Dataset {
         destination: &ExplicitMapDestination,
         row_range: Range<u64>,
     ) -> Result<Arc<UInt64Array>> {
+        let covered_pages = destination
+            .row_id_pages
+            .iter()
+            .filter(|page| {
+                page.row_start >= row_range.start
+                    && page
+                        .row_start
+                        .checked_add(page.row_count)
+                        .is_some_and(|page_end| page_end <= row_range.end)
+            })
+            .collect::<Vec<_>>();
+        let mut expected_start = row_range.start;
+        for page in &covered_pages {
+            if page.row_start != expected_start {
+                return Err(Error::invalid_input(
+                    "ExplicitMap hidden _rowid read must align to persisted page boundaries",
+                ));
+            }
+            expected_start = expected_start.checked_add(page.row_count).ok_or_else(|| {
+                Error::invalid_input("ExplicitMap hidden _rowid page row range overflow")
+            })?;
+        }
+        if covered_pages.is_empty() || expected_start != row_range.end {
+            return Err(Error::invalid_input(
+                "ExplicitMap hidden _rowid read must cover complete persisted pages",
+            ));
+        }
         let columns = self
             .read_explicit_u64_columns(
                 base_id,
@@ -486,7 +535,43 @@ impl Dataset {
                 expected
             )));
         }
+        for page in covered_pages {
+            let local_start = usize::try_from(page.row_start - row_range.start)
+                .map_err(|_| Error::invalid_input("ExplicitMap page start exceeds usize"))?;
+            let local_end = usize::try_from(page.row_start + page.row_count - row_range.start)
+                .map_err(|_| Error::invalid_input("ExplicitMap page end exceeds usize"))?;
+            verify_explicit_u64_page(
+                &destination.row_id_file_path,
+                &[&row_ids.values()[local_start..local_end]],
+                &page.content_fingerprint,
+            )?;
+        }
         Ok(row_ids)
+    }
+
+    fn explicit_destination_page(
+        destination: &ExplicitMapDestination,
+        destination_row_offset: u32,
+    ) -> Result<(usize, &ExplicitMapRowIdPage)> {
+        let row_offset = destination_row_offset as u64;
+        let page_index = destination
+            .row_id_pages
+            .partition_point(|page| page.row_start <= row_offset)
+            .checked_sub(1)
+            .ok_or_else(|| {
+                Error::invalid_input("ExplicitMap destination row offset precedes its first page")
+            })?;
+        let page = &destination.row_id_pages[page_index];
+        let page_end = page
+            .row_start
+            .checked_add(page.row_count)
+            .ok_or_else(|| Error::invalid_input("ExplicitMap destination page range overflow"))?;
+        if row_offset >= page_end {
+            return Err(Error::invalid_input(
+                "ExplicitMap destination row offset is outside its page directory",
+            ));
+        }
+        Ok((page_index, page))
     }
 
     pub(crate) async fn explicit_row_ids_for_fragment(
@@ -533,7 +618,7 @@ impl Dataset {
             .row_address_router()?
             .physical_to_logical_many(addresses)?;
         let mut result = vec![None; addresses.len()];
-        let mut explicit = BTreeMap::<(u32, u32, u64), Vec<(usize, u32)>>::new();
+        let mut explicit = BTreeMap::<(u32, u32, usize), Vec<(usize, u32)>>::new();
         for (index, resolution) in resolutions.into_iter().enumerate() {
             match resolution {
                 PhysicalToLogicalResolution::Logical(logical) => result[index] = Some(logical),
@@ -542,11 +627,24 @@ impl Dataset {
                     destination_index,
                     destination_row_offset,
                 } => {
-                    let page_start =
-                        (destination_row_offset as usize / EXPLICIT_ROW_ADDRESS_PAGE_ROWS
-                            * EXPLICIT_ROW_ADDRESS_PAGE_ROWS) as u64;
+                    let destination = self
+                        .manifest
+                        .row_address_layout
+                        .as_ref()
+                        .and_then(|layout| layout.placements.get(placement_index as usize))
+                        .and_then(|placement| match placement {
+                            RowAddressPlacement::ExplicitMap(explicit) => {
+                                explicit.destinations.get(destination_index as usize)
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            Error::invalid_input("ExplicitMap destination index is invalid")
+                        })?;
+                    let (page_index, _) =
+                        Self::explicit_destination_page(destination, destination_row_offset)?;
                     explicit
-                        .entry((placement_index, destination_index, page_start))
+                        .entry((placement_index, destination_index, page_index))
                         .or_default()
                         .push((index, destination_row_offset));
                 }
@@ -554,7 +652,7 @@ impl Dataset {
             }
         }
         let reads = stream::iter(explicit.into_iter().map(
-            |((placement_index, destination_index, page_start), indices)| async move {
+            |((placement_index, destination_index, page_index), indices)| async move {
                 let (base_id, destination) = self
                     .manifest
                     .row_address_layout
@@ -571,8 +669,14 @@ impl Dataset {
                     .ok_or_else(|| {
                         Error::invalid_input("ExplicitMap destination index is invalid")
                     })?;
-                let page_end = (page_start + EXPLICIT_ROW_ADDRESS_PAGE_ROWS as u64)
-                    .min(destination.row_count as u64);
+                let page = destination
+                    .row_id_pages
+                    .get(page_index)
+                    .ok_or_else(|| Error::invalid_input("ExplicitMap page index is invalid"))?;
+                let page_start = page.row_start;
+                let page_end = page_start.checked_add(page.row_count).ok_or_else(|| {
+                    Error::invalid_input("ExplicitMap destination page range overflow")
+                })?;
                 let row_ids = self
                     .explicit_destination_row_ids(base_id, &destination, page_start..page_end)
                     .await?;
@@ -638,5 +742,27 @@ impl Dataset {
             }
         }
         Ok(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_page_verifier_rejects_same_size_middle_value_corruption() {
+        let original = [10, 20, 30, 40];
+        let expected = fingerprint_explicit_map_u64_page(&[&original]).unwrap();
+        let corrupted = [10, 20, 31, 40];
+
+        let error = verify_explicit_u64_page(
+            "data/_row_addresses/row_ids.lance",
+            &[&corrupted],
+            &expected,
+        )
+        .unwrap_err();
+
+        assert!(matches!(&error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("content fingerprint mismatch"));
     }
 }

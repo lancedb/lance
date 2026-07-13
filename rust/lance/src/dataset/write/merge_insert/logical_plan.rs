@@ -36,12 +36,14 @@ pub struct MergeInsertWriteNode {
     input: LogicalPlan,
     pub(crate) dataset: Arc<Dataset>,
     pub(crate) params: MergeInsertParams,
+    updated_field_ids: Vec<i32>,
     schema: Arc<DFSchema>,
 }
 
 impl PartialEq for MergeInsertWriteNode {
     fn eq(&self, other: &Self) -> bool {
         self.params == other.params
+            && self.updated_field_ids == other.updated_field_ids
             && self.input == other.input
             && self.dataset.base == other.dataset.base
     }
@@ -52,6 +54,7 @@ impl Eq for MergeInsertWriteNode {}
 impl std::hash::Hash for MergeInsertWriteNode {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.params.hash(state);
+        self.updated_field_ids.hash(state);
         self.input.hash(state);
         self.dataset.base.hash(state);
     }
@@ -60,20 +63,31 @@ impl std::hash::Hash for MergeInsertWriteNode {
 impl PartialOrd for MergeInsertWriteNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match self.params.partial_cmp(&other.params) {
-            Some(Ordering::Equal) => self.input.partial_cmp(&other.input),
+            Some(Ordering::Equal) => {
+                match self.updated_field_ids.partial_cmp(&other.updated_field_ids) {
+                    Some(Ordering::Equal) => self.input.partial_cmp(&other.input),
+                    cmp => cmp,
+                }
+            }
             cmp => cmp,
         }
     }
 }
 
 impl MergeInsertWriteNode {
-    pub fn new(input: LogicalPlan, dataset: Arc<Dataset>, params: MergeInsertParams) -> Self {
+    pub fn new(
+        input: LogicalPlan,
+        dataset: Arc<Dataset>,
+        params: MergeInsertParams,
+        updated_field_ids: Vec<i32>,
+    ) -> Self {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let schema = Arc::new(DFSchema::try_from(empty_schema).unwrap());
         Self {
             input,
             dataset,
             params,
+            updated_field_ids,
             schema,
         }
     }
@@ -143,6 +157,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             inputs[0].clone(),
             self.dataset.clone(),
             self.params.clone(),
+            self.updated_field_ids.clone(),
         ))
     }
 
@@ -254,6 +269,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         physical_inputs[0].clone(),
                         write_node.dataset.clone(),
                         write_node.params.clone(),
+                        write_node.updated_field_ids.clone(),
                     )?)
                 };
                 Some(exec)

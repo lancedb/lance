@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import protocol  # noqa: E402
+import protocol_report  # noqa: E402
 import run  # noqa: E402
 
 
@@ -33,9 +35,7 @@ class ProtocolTests(unittest.TestCase):
             matrix["profiles"]["smoke"]["random_delete_reclaim_admission"],
             "must_admit",
         )
-        self.assertEqual(
-            release["random_delete_reclaim_admission"], "must_not_admit"
-        )
+        self.assertEqual(release["random_delete_reclaim_admission"], "must_not_admit")
         self.assertEqual(len(digest), 64)
         self.assertIn('"schema_version":1', canonical)
 
@@ -67,6 +67,9 @@ class ProtocolTests(unittest.TestCase):
                 for step in delete_cases["delete-random-1/narrow16/take-1"].steps
             ],
         )
+        one_percent_reclaim = delete_cases["delete-random-1/narrow16/take-1"].steps[-1]
+        self.assertEqual(one_percent_reclaim.operation, "default_compaction")
+        self.assertIs(one_percent_reclaim.preflight_expected_admission, True)
         self.assertEqual(
             delete_cases["delete-random-50/narrow16/take-1"].steps[-1].operation,
             "random_delete_reclaim",
@@ -87,6 +90,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(
             chain_cases["pack-random-delete-90/vector"].steps[-1].operation,
             "random_delete_reclaim",
+        )
+        self.assertEqual(
+            chain_cases["pack-random-delete-1/vector"].steps[-1].operation,
+            "default_compaction",
+        )
+        self.assertIs(
+            chain_cases["pack-random-delete-1/vector"]
+            .steps[-1]
+            .preflight_expected_admission,
+            True,
         )
 
     def test_random_delete_reclaim_provenance_is_format_specific(self) -> None:
@@ -121,9 +134,7 @@ class ProtocolTests(unittest.TestCase):
                 maintenance_plan_path=None,
                 maintenance_plan_sha256=None,
             )
-            self.assertEqual(
-                expected["implementation_path"], implementation_path
-            )
+            self.assertEqual(expected["implementation_path"], implementation_path)
             record = dict.fromkeys(run.RECORD_FIELDS)
             record.update(expected)
             record.update(
@@ -168,6 +179,7 @@ class ProtocolTests(unittest.TestCase):
                 ["create", "delete", "default_compaction"],
             )
             self.assertEqual(case.steps[-1].selection, "range")
+
     def test_indexed_relocation_cases_cover_scalar_and_vector(self) -> None:
         matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
         cases = list(
@@ -192,6 +204,194 @@ class ProtocolTests(unittest.TestCase):
             {case.fixture_index_kind for case in cases}, {"scalar", "vector"}
         )
 
+    def test_indexed_random_delete_repack_is_prebuilt_and_paired(self) -> None:
+        matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
+        cases = {
+            case.name: case
+            for case in protocol.iter_matrix_cases(
+                matrix["profiles"]["release"], {"delete_random"}
+            )
+            if case.name.startswith("indexed-repack-random-delete-")
+        }
+        self.assertEqual(
+            set(cases),
+            {
+                "indexed-repack-random-delete-50/scalar",
+                "indexed-repack-random-delete-50/vector",
+                "indexed-repack-random-delete-90/scalar",
+                "indexed-repack-random-delete-90/vector",
+            },
+        )
+        for case in cases.values():
+            self.assertIn(case.fixture_index_kind, {"scalar", "vector"})
+            self.assertEqual(case.steps[-1].index_kind, case.fixture_index_kind)
+            self.assertEqual(case.steps[-1].operation, "random_delete_reclaim")
+            self.assertIs(case.steps[-1].preflight_expected_admission, False)
+
+    def test_index_probe_reuses_prepared_live_user_ids(self) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.run_id = "run-1"
+        runner.phase_index = 0
+        runner.failures = []
+        invocations: list[tuple[str, str, Path | None]] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts: dict[str, Path] = {}
+            for format_name in run.FORMATS:
+                path = Path(directory) / f"{format_name}.json"
+                path.write_text(json.dumps({"user_ids": [7, 41]}), encoding="utf-8")
+                artifacts[format_name] = path
+
+            runner.invoke_all = mock.Mock(
+                side_effect=lambda step, **_: {
+                    name: {"status": "ok", "state_digest": "same"}
+                    for name in run.FORMATS
+                }
+            )
+            runner.prepare_take_ids = mock.Mock(
+                side_effect=lambda _step, *, format_name, **__: artifacts[format_name]
+            )
+
+            def invoke_one(
+                step: protocol.Step,
+                *,
+                format_name: str,
+                take_ids_input: Path | None = None,
+                **_: object,
+            ) -> dict[str, object]:
+                invocations.append((step.operation, format_name, take_ids_input))
+                return {"status": "ok"}
+
+            runner.invoke_one = invoke_one
+            runner.probes(
+                track="matrix",
+                case="indexed-repack-random-delete-90/vector",
+                repeat=0,
+                expected_rows=10,
+                schema_kind="vector",
+                index_kind="vector",
+                step_index=2,
+            )
+
+        indexed = [
+            invocation for invocation in invocations if invocation[0] == "index_take"
+        ]
+        self.assertEqual(len(indexed), len(run.FORMATS))
+        self.assertEqual(
+            {format_name: artifact for _, format_name, artifact in indexed},
+            artifacts,
+        )
+
+    def test_explicit_recluster_and_fragment_reuse_cases_are_frozen(self) -> None:
+        matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
+        profile = matrix["profiles"]["smoke"]
+        cases = {
+            case.name: case
+            for case in protocol.iter_matrix_cases(
+                profile, {"bounded_recluster", "fragment_reuse"}
+            )
+        }
+        bounded_fragments = profile["logical_fragment_counts"][0]
+        self.assertEqual(
+            {name for name in cases if name.startswith("bounded-default-clustering-")},
+            {
+                f"bounded-default-clustering-{bounded_fragments}/narrow16",
+                f"bounded-default-clustering-{bounded_fragments}/wide128",
+                f"bounded-default-clustering-{bounded_fragments}/vector",
+            },
+        )
+        for name, case in cases.items():
+            if not name.startswith("bounded-default-clustering-"):
+                continue
+            step = case.steps[-1]
+            self.assertEqual(step.operation, "bounded_recluster")
+            self.assertEqual(
+                {
+                    format_name: step.implementation_path_for_format(format_name)
+                    for format_name in run.FORMATS
+                },
+                {
+                    "v22_no_stable": "same_postcondition_bounded_recluster_rewrite",
+                    "v22_stable": "same_postcondition_bounded_recluster_rewrite",
+                    "v23_logical": "default_bounded_recluster_fast_path",
+                },
+            )
+        self.assertEqual(
+            {name for name in cases if name.startswith("bounded-recluster-")},
+            {
+                f"bounded-recluster-{bounded_fragments}/narrow16",
+                f"bounded-recluster-{bounded_fragments}/wide128",
+                f"bounded-recluster-{bounded_fragments}/vector",
+            },
+        )
+        self.assertTrue(
+            all(
+                case.steps[-1].operation == "recluster"
+                for name, case in cases.items()
+                if name.startswith("bounded-recluster-")
+            )
+        )
+
+        reuse_cases = {
+            name: case
+            for name, case in cases.items()
+            if name.startswith("fragment-reuse-")
+        }
+        self.assertEqual(len(reuse_cases), 2 * len(profile["logical_fragment_counts"]))
+        for case in reuse_cases.values():
+            step = case.steps[-1]
+            self.assertEqual(step.compaction_mode, "fragment_reuse")
+            self.assertEqual(
+                {
+                    format_name: step.implementation_path_for_format(format_name)
+                    for format_name in run.FORMATS
+                },
+                {
+                    "v22_no_stable": "deferred_fragment_reuse_compaction",
+                    "v22_stable": "inline_index_remap_compaction",
+                    "v23_logical": "stable_logical_zero_remap_compaction",
+                },
+            )
+
+    def test_release_skewed_packed_run_fixtures_are_exact(self) -> None:
+        matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
+        profile = matrix["profiles"]["release"]
+        cases = {
+            case.name: case
+            for case in protocol.iter_matrix_cases(profile, {"n_to_one_compaction"})
+            if case.fixture_segments
+        }
+        for fragments in (10_000, 100_000):
+            case = cases[f"compact-{fragments}-skew-to-1/narrow16"]
+            segments = case.fixture_segments
+            self.assertEqual(sum(rows for rows, _ in segments), profile["rows"])
+            self.assertEqual(
+                sum(rows // rows_per_fragment for rows, rows_per_fragment in segments),
+                fragments,
+            )
+            self.assertEqual(
+                len({rows_per_fragment for _, rows_per_fragment in segments}), 2
+            )
+
+    def test_repeated_compaction_has_strictly_progressive_topology(self) -> None:
+        rows = 65_536
+        source_fragments = 64
+        rounds = 10
+        targets = [
+            protocol.repeated_compaction_target_rows(
+                rows, source_fragments, rounds, round_index
+            )
+            for round_index in range(rounds)
+        ]
+        output_fragments = [math.ceil(rows / target) for target in targets]
+        self.assertTrue(
+            all(
+                later < earlier
+                for earlier, later in zip(output_fragments, output_fragments[1:])
+            )
+        )
+        self.assertEqual(output_fragments[-1], 1)
+
     def test_release_fixture_dedup_and_cost_projection_are_frozen(self) -> None:
         matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
         profile = matrix["profiles"]["release"]
@@ -203,10 +403,10 @@ class ProtocolTests(unittest.TestCase):
             )
         )
         keys = protocol.fixture_keys_for_run(profile, tracks, variants, cases)
-        self.assertEqual(len(keys), 15)
+        self.assertEqual(len(keys), 17)
         self.assertEqual(
             protocol.projected_canonical_payload_bytes(profile, keys),
-            604_800_000_000,
+            614_400_000_000,
         )
         self.assertEqual(
             protocol.projected_unique_initial_index_payload_bytes_lower_bound(
@@ -218,7 +418,7 @@ class ProtocolTests(unittest.TestCase):
             protocol.projected_minimum_full_scan_payload_bytes(
                 profile, tracks, variants, cases
             ),
-            1_669_685_760_000_000,
+            1_691_650_560_000_000,
         )
         shards = [protocol.fixture_keys_for_shard(keys, 4, index) for index in range(4)]
         self.assertEqual(set().union(*shards), keys)
@@ -230,7 +430,7 @@ class ProtocolTests(unittest.TestCase):
             )
         )
 
-    def test_focused_sustained_sidecar_excludes_matrix_cases(self) -> None:
+    def test_focused_sustained_development_tiny_sidecar_is_verifiable(self) -> None:
         class FakeRunner:
             records = 0
             boundaries = 0
@@ -271,6 +471,7 @@ class ProtocolTests(unittest.TestCase):
                             "bare",
                             "--development-executable",
                             str(executable),
+                            "--development-tiny",
                         ]
                     ),
                     0,
@@ -281,6 +482,9 @@ class ProtocolTests(unittest.TestCase):
             )
             self.assertEqual(sidecar["tracks"], ["sustained"])
             self.assertEqual(sidecar["matrix_case_names"], [])
+            self.assertTrue(sidecar["development_tiny"])
+            self.assertEqual(sidecar["matrix"]["profiles"]["smoke"]["rows"], 4096)
+            self.assertEqual(protocol_report.validate_sidecar(sidecar), sidecar)
 
     def test_release_requires_canonical_shards_and_selection(self) -> None:
         base = [
@@ -616,9 +820,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_matrix_rejects_changed_reclaim_admission_contract(self) -> None:
         matrix = json.loads(protocol.DEFAULT_MATRIX.read_text(encoding="utf-8"))
-        matrix["profiles"]["smoke"][
-            "random_delete_reclaim_admission"
-        ] = "must_not_admit"
+        matrix["profiles"]["smoke"]["random_delete_reclaim_admission"] = (
+            "must_not_admit"
+        )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "matrix.json"
             path.write_text(json.dumps(matrix), encoding="utf-8")

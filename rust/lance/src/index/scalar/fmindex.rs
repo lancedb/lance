@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, LogicalRowAddressSelection, RowReferenceDomain};
 use roaring::RoaringBitmap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -35,6 +35,59 @@ pub(in crate::index) async fn merge_segments(
         ))
     })?;
     let column = dataset.schema().field_path(field_id)?;
+
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        let segment_refs = segments.iter().collect::<Vec<_>>();
+        let effective = crate::index::merge_logical_index_coverage(dataset, &segment_refs)?;
+        let logical_coverage =
+            crate::index::mark_logical_coverage_validated_at_snapshot(dataset, &effective)?;
+        let mut ranges = Vec::new();
+        for shard in &logical_coverage.shards {
+            let shard_selection = shard.selection.as_ref().ok_or_else(|| {
+                Error::internal("materialized FM-Index coverage unexpectedly remained external")
+            })?;
+            ranges.extend(shard_selection.to_ranges()?);
+        }
+        let selection = LogicalRowAddressSelection::from_ranges(ranges)?;
+
+        // FM-Index structures cannot be combined. Rebuild from current rows and
+        // use logical selection as the authoritative filter; physical placement
+        // is only a scan boundary and may have changed since the source builds.
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect();
+        let new_uuid = Uuid::new_v4();
+        let created_index = super::build_scalar_index_for_logical_selection(
+            dataset,
+            &column,
+            new_uuid,
+            &lance_index::scalar::ScalarIndexParams::for_builtin(
+                lance_index::scalar::BuiltinIndexType::Fm,
+            ),
+            fragments,
+            selection,
+            &logical_coverage,
+            Arc::new(lance_index::progress::NoopIndexBuildProgress),
+        )
+        .await?;
+
+        return Ok(IndexMetadata {
+            uuid: new_uuid,
+            fields: vec![field_id],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: None,
+            index_details: Some(Arc::new(created_index.index_details)),
+            index_version: created_index.index_version as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(created_index.files),
+            row_reference_domain: Some(RowReferenceDomain::StableLogicalRowAddress),
+            logical_coverage: Some(logical_coverage),
+            ..segments[0].clone()
+        });
+    }
 
     let mut fragment_bitmap = RoaringBitmap::new();
     for segment in &segments {

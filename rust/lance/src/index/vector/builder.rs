@@ -74,7 +74,9 @@ use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
-use lance_table::format::{IndexFile, pb as table_pb};
+use lance_table::format::{
+    IndexFile, LogicalIndexCoverage, LogicalIndexCoverageArtifact, pb as table_pb,
+};
 use log::info;
 use object_store::path::Path;
 use prost::Message;
@@ -160,6 +162,9 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
     // fragments for distributed indexing
     fragment_filter: Option<Vec<u32>>,
 
+    // Exact logical coverage authored by the v2.3 index catch-up planner.
+    logical_coverage: Option<LogicalIndexCoverage>,
+
     // optimize options for only incremental build
     optimize_options: Option<OptimizeOptions>,
     // number of indices merged
@@ -181,6 +186,25 @@ type UnindexedStream = Box<dyn Stream<Item = Result<RecordBatch>> + Send + Unpin
 pub struct VectorIndexBuildSummary {
     pub indices_merged: usize,
     pub files: Vec<IndexFile>,
+}
+
+pub(crate) async fn persist_logical_coverage_artifact(
+    index_writer: &mut FileWriter,
+    artifact: &LogicalIndexCoverageArtifact,
+) -> Result<()> {
+    let object_id = artifact.object_id;
+    let payload = table_pb::LogicalIndexCoverageArtifact::from(artifact).encode_to_vec();
+    let offset = index_writer.tell().await?;
+    let byte_length = payload.len() as u64;
+    let global_buffer_index = index_writer.add_global_buffer(payload.into()).await?;
+    index_writer.add_schema_metadata(
+        LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY,
+        global_buffer_index.to_string(),
+    );
+    index_writer.add_schema_metadata(LOGICAL_INDEX_COVERAGE_OFFSET_KEY, offset.to_string());
+    index_writer.add_schema_metadata(LOGICAL_INDEX_COVERAGE_LENGTH_KEY, byte_length.to_string());
+    index_writer.add_schema_metadata(LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY, object_id.to_string());
+    Ok(())
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
@@ -219,6 +243,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             existing_indices: Vec::new(),
             frag_reuse_index,
             fragment_filter: None,
+            logical_coverage: None,
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
@@ -286,6 +311,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             existing_indices: vec![index],
             frag_reuse_index: None,
             fragment_filter: None,
+            logical_coverage: None,
             optimize_options: None,
             merged_num: 0,
             transpose_codes: true,
@@ -404,6 +430,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
+    /// Override physical-fragment-derived coverage with an exact core-authored
+    /// logical selection.
+    pub(crate) fn with_logical_coverage(
+        &mut self,
+        coverage: Option<LogicalIndexCoverage>,
+    ) -> &mut Self {
+        self.logical_coverage = coverage;
+        self
+    }
+
     /// Control whether codes are transposed when building storage.
     /// This mainly affects intermediate PQ/RQ storage when building distributed indices.
     pub fn with_transpose(&mut self, transpose: bool) -> &mut Self {
@@ -435,33 +471,28 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ))
             })?;
         let field_id = dataset.schema().field_id(&self.column)?;
-        let physical_fragments = self
-            .fragment_filter
-            .as_ref()
-            .map(|fragments| RoaringBitmap::from_iter(fragments.iter().copied()))
-            .unwrap_or_else(|| dataset.fragment_bitmap.as_ref().clone());
-        let artifact = crate::index::build_logical_index_coverage_artifact(
-            dataset,
-            index_uuid,
-            &[field_id],
-            &physical_fragments,
-        )
-        .await?;
-        let object_id = artifact.object_id;
-        let payload = table_pb::LogicalIndexCoverageArtifact::from(&artifact).encode_to_vec();
-        let offset = index_writer.tell().await?;
-        let byte_length = payload.len() as u64;
-        let global_buffer_index = index_writer.add_global_buffer(payload.into()).await?;
-        index_writer.add_schema_metadata(
-            LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY,
-            global_buffer_index.to_string(),
-        );
-        index_writer.add_schema_metadata(LOGICAL_INDEX_COVERAGE_OFFSET_KEY, offset.to_string());
-        index_writer
-            .add_schema_metadata(LOGICAL_INDEX_COVERAGE_LENGTH_KEY, byte_length.to_string());
-        index_writer
-            .add_schema_metadata(LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY, object_id.to_string());
-        Ok(())
+        let artifact = if let Some(coverage) = self.logical_coverage.as_ref() {
+            crate::index::build_logical_index_coverage_artifact_from_exact(
+                dataset,
+                index_uuid,
+                &[field_id],
+                coverage.clone(),
+            )?
+        } else {
+            let physical_fragments = self
+                .fragment_filter
+                .as_ref()
+                .map(|fragments| RoaringBitmap::from_iter(fragments.iter().copied()))
+                .unwrap_or_else(|| dataset.fragment_bitmap.as_ref().clone());
+            crate::index::build_logical_index_coverage_artifact(
+                dataset,
+                index_uuid,
+                &[field_id],
+                &physical_fragments,
+            )
+            .await?
+        };
+        persist_logical_coverage_artifact(index_writer, &artifact).await
     }
 
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]

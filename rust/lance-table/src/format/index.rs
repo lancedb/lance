@@ -243,15 +243,29 @@ fn append_coverage_shard_summary(bytes: &mut Vec<u8>, shard: &LogicalIndexCovera
         bytes.extend_from_slice(&generation.generation.to_le_bytes());
     }
     append_length_prefixed(bytes, &shard.logical_fragment_bitmap);
+    match shard.excluded_selection.as_ref() {
+        Some(excluded) => {
+            bytes.push(1);
+            append_length_prefixed(bytes, &excluded.canonical_proto().encode_to_vec());
+        }
+        None => bytes.push(0),
+    }
 }
 
-fn coverage_root_fingerprint(shards: &[LogicalIndexCoverageShard]) -> Vec<u8> {
+fn coverage_root_fingerprint(
+    shards: &[LogicalIndexCoverageShard],
+    full_domain_fingerprint: Option<&[u8; LOGICAL_COVERAGE_FINGERPRINT_SIZE]>,
+) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(48 + shards.len() * LOGICAL_COVERAGE_FINGERPRINT_SIZE);
-    bytes.extend_from_slice(b"lance.logical-index-coverage.v1\0");
+    bytes.extend_from_slice(b"lance.logical-index-coverage.v3\0");
     bytes.extend_from_slice(&(shards.len() as u64).to_le_bytes());
     for shard in shards {
         append_coverage_shard_summary(&mut bytes, shard);
     }
+    append_length_prefixed(
+        &mut bytes,
+        full_domain_fingerprint.map_or(&[], |fingerprint| fingerprint.as_slice()),
+    );
     logical_coverage_fingerprint(&bytes)
 }
 
@@ -278,6 +292,7 @@ fn append_length_prefixed(bytes: &mut Vec<u8>, value: &[u8]) {
 
 fn bound_coverage_root_fingerprint(
     shards: &[LogicalIndexCoverageShard],
+    full_domain_fingerprint: Option<&[u8; LOGICAL_COVERAGE_FINGERPRINT_SIZE]>,
     namespace_uuid: Uuid,
     index_uuid: Uuid,
     external: &LogicalIndexCoverageFile,
@@ -289,13 +304,17 @@ fn bound_coverage_root_fingerprint(
         160 + shards.len() * LOGICAL_COVERAGE_FINGERPRINT_SIZE
             + files.iter().map(|file| file.path.len() + 16).sum::<usize>(),
     );
-    bytes.extend_from_slice(b"lance.logical-index-coverage-bound.v2\0");
+    bytes.extend_from_slice(b"lance.logical-index-coverage-bound.v3\0");
     bytes.extend_from_slice(namespace_uuid.as_bytes());
     bytes.extend_from_slice(index_uuid.as_bytes());
     bytes.extend_from_slice(&(shards.len() as u64).to_le_bytes());
     for shard in shards {
         append_coverage_shard_summary(&mut bytes, shard);
     }
+    append_length_prefixed(
+        &mut bytes,
+        full_domain_fingerprint.map_or(&[], |fingerprint| fingerprint.as_slice()),
+    );
     append_length_prefixed(&mut bytes, external.path.as_bytes());
     bytes.extend_from_slice(&external.offset.to_le_bytes());
     bytes.extend_from_slice(&external.byte_length.to_le_bytes());
@@ -384,6 +403,16 @@ impl LogicalIndexCoverageArtifact {
         if self.coverage.external.is_some() {
             return Err(Error::invalid_input(
                 "logical index coverage artifact must contain inline authoritative selections",
+            ));
+        }
+        if self
+            .coverage
+            .shards
+            .iter()
+            .any(|shard| shard.excluded_selection.is_some())
+        {
+            return Err(Error::invalid_input(
+                "logical index coverage artifact cannot contain manifest ownership exclusions",
             ));
         }
         if self.field_ids.is_empty()
@@ -646,6 +675,7 @@ impl LogicalIndexCoverageShard {
             validated_through,
             fingerprint: Vec::new(),
             logical_fragment_bitmap,
+            excluded_selection: None,
         };
         shard.fingerprint = coverage_shard_fingerprint(&shard)?;
         Ok(shard)
@@ -659,17 +689,82 @@ impl LogicalIndexCoverageShard {
     /// detail falls back to logical-domain intersection and therefore never
     /// treats unknown membership as disjoint.
     pub fn may_overlap(&self, selection: &LogicalRowAddressSelection) -> Result<bool> {
-        if let Some(detail) = self.selection.as_ref() {
-            detail.overlaps(selection)
+        let candidate = match self.excluded_selection.as_ref() {
+            Some(excluded) => selection.difference(excluded)?,
+            None => selection.clone(),
+        };
+        if candidate.is_empty() {
+            return Ok(false);
+        }
+        if self.selection.is_some() {
+            self.effective_selection()?.overlaps(&candidate)
         } else {
             Ok(!self
                 .logical_fragment_bitmap()?
-                .is_disjoint(&selection.logical_fragment_bitmap()?))
+                .is_disjoint(&candidate.logical_fragment_bitmap()?))
         }
+    }
+
+    /// Return the rows currently owned by this segment. The immutable index
+    /// artifact still contains the raw selection; callers must apply this
+    /// effective selection before ranking or combining segment results.
+    pub fn effective_selection(&self) -> Result<LogicalRowAddressSelection> {
+        let selection = self
+            .selection
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("logical coverage detail is external"))?;
+        match self.excluded_selection.as_ref() {
+            Some(excluded) => selection.difference(excluded),
+            None => Ok(selection.clone()),
+        }
+    }
+
+    fn add_exclusion(&mut self, excluded: &LogicalRowAddressSelection) -> Result<bool> {
+        let selection = self.selection.as_ref().ok_or_else(|| {
+            Error::invalid_input(
+                "logical coverage must be resolved before adding an ownership exclusion",
+            )
+        })?;
+        let owned_exclusion = selection.intersection(excluded)?;
+        if owned_exclusion.is_empty() {
+            return Ok(false);
+        }
+        let combined = match self.excluded_selection.as_ref() {
+            Some(current) => selection.intersection(current)?.union(&owned_exclusion)?,
+            None => owned_exclusion,
+        };
+        if self.excluded_selection.as_ref() == Some(&combined) {
+            return Ok(false);
+        }
+        self.excluded_selection = Some(combined);
+        self.fingerprint = coverage_shard_fingerprint(self)?;
+        Ok(true)
     }
 }
 
 impl LogicalIndexCoverage {
+    /// Transfer ownership while coverage is still inline and unbound. This is
+    /// used while assembling a multi-segment plan before each segment is
+    /// bound to its immutable anchor.
+    pub fn exclude_rows_unbound(&mut self, selection: &LogicalRowAddressSelection) -> Result<bool> {
+        if self.external.is_some() {
+            return Err(Error::invalid_input(
+                "unbound ownership transfer requires inline coverage",
+            ));
+        }
+        let mut changed = false;
+        for shard in &mut self.shards {
+            changed |= shard.add_exclusion(selection)?;
+        }
+        if changed {
+            self.full_domain_fingerprint = None;
+            self.fingerprint =
+                coverage_root_fingerprint(&self.shards, self.full_domain_fingerprint.as_deref());
+            self.validate_exact(None, None)?;
+        }
+        Ok(changed)
+    }
+
     /// Create canonical inline exact coverage.
     pub fn new_exact(mut shards: Vec<LogicalIndexCoverageShard>) -> Result<Self> {
         shards.retain(|shard| shard.row_count != 0);
@@ -692,10 +787,54 @@ impl LogicalIndexCoverage {
             external: None,
             fingerprint: Vec::new(),
             clone_provenance: None,
+            full_domain_fingerprint: None,
         };
-        coverage.fingerprint = coverage_root_fingerprint(&coverage.shards);
+        coverage.fingerprint = coverage_root_fingerprint(
+            &coverage.shards,
+            coverage.full_domain_fingerprint.as_deref(),
+        );
         coverage.validate_exact(None, None)?;
         Ok(coverage)
+    }
+
+    /// Set or clear the manifest-only proof that this exact, unbound coverage
+    /// contained every live logical slot in the build snapshot.
+    ///
+    /// The caller must derive `fingerprint` from the snapshot's complete
+    /// logical-domain identity. Binding the coverage to an index subsequently
+    /// protects this value together with the shard summaries and anchor files.
+    pub fn set_full_domain_fingerprint(&mut self, fingerprint: Option<Vec<u8>>) -> Result<()> {
+        if self.external.is_some() {
+            return Err(Error::invalid_input(
+                "full-domain proof must be set before logical coverage is bound to an index",
+            ));
+        }
+        if fingerprint.is_some()
+            && self
+                .shards
+                .iter()
+                .any(|shard| shard.excluded_selection.is_some())
+        {
+            return Err(Error::invalid_input(
+                "full-domain proof cannot coexist with ownership exclusions",
+            ));
+        }
+        self.full_domain_fingerprint = fingerprint
+            .map(|fingerprint| {
+                fingerprint
+                    .try_into()
+                    .map(Box::new)
+                    .map_err(|fingerprint: Vec<u8>| {
+                        Error::invalid_input(format!(
+                            "logical index full-domain proof requires a 16-byte fingerprint, got {} bytes",
+                            fingerprint.len()
+                        ))
+                    })
+            })
+            .transpose()?;
+        self.fingerprint =
+            coverage_root_fingerprint(&self.shards, self.full_domain_fingerprint.as_deref());
+        self.validate_exact(None, None)
     }
 
     /// Validate inline detail or an external summary without reading index data.
@@ -715,12 +854,30 @@ impl LogicalIndexCoverage {
             fields.dedup();
             fields
         });
+        if self.full_domain_fingerprint.is_some()
+            && self
+                .shards
+                .iter()
+                .any(|shard| shard.excluded_selection.is_some())
+        {
+            return Err(Error::invalid_input(
+                "full-domain proof cannot coexist with ownership exclusions",
+            ));
+        }
         let mut previous_first = None;
         let mut has_external_detail = false;
         for (shard_index, shard) in self.shards.iter().enumerate() {
             let summary_fragments = decode_logical_fragment_bitmap(&shard.logical_fragment_bitmap)?;
             if let Some(selection) = shard.selection.as_ref() {
                 selection.validate()?;
+                if let Some(excluded) = shard.excluded_selection.as_ref() {
+                    excluded.validate()?;
+                    if excluded.is_empty() || excluded.cardinality() > shard.row_count {
+                        return Err(Error::invalid_input(format!(
+                            "logical index coverage shard {shard_index} has an invalid ownership exclusion"
+                        )));
+                    }
+                }
                 let first = first_covered_row(selection)?;
                 if previous_first.is_some_and(|previous| previous >= first) {
                     return Err(Error::invalid_input(
@@ -738,6 +895,15 @@ impl LogicalIndexCoverage {
                 }
             } else {
                 has_external_detail = true;
+                if shard
+                    .excluded_selection
+                    .as_ref()
+                    .is_some_and(LogicalRowAddressSelection::is_empty)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "logical index coverage shard {shard_index} has an empty ownership exclusion"
+                    )));
+                }
             }
             if shard.row_count == 0
                 || summary_fragments.is_empty()
@@ -787,7 +953,10 @@ impl LogicalIndexCoverage {
                 "logical index coverage summary is missing its external detail reference",
             ));
         }
-        if self.external.is_none() && self.fingerprint != coverage_root_fingerprint(&self.shards) {
+        if self.external.is_none()
+            && self.fingerprint
+                != coverage_root_fingerprint(&self.shards, self.full_domain_fingerprint.as_deref())
+        {
             return Err(Error::invalid_input(
                 "logical index coverage root fingerprint does not match its shards",
             ));
@@ -830,6 +999,46 @@ impl LogicalIndexCoverage {
         Ok(())
     }
 
+    /// Transfer ownership of `selection` to newer segments without rewriting
+    /// this coverage's immutable index artifact. The owner-bound root
+    /// fingerprint is refreshed so the exclusion is protected by the manifest.
+    pub fn exclude_rows(
+        &mut self,
+        selection: &LogicalRowAddressSelection,
+        namespace_uuid: Uuid,
+        index_uuid: Uuid,
+        files: &[IndexFile],
+    ) -> Result<bool> {
+        if self.external.is_none() || self.has_external_detail() {
+            return Err(Error::invalid_input(
+                "logical index coverage must be owner-bound and resolved before excluding rows",
+            ));
+        }
+        let mut changed = false;
+        for shard in &mut self.shards {
+            changed |= shard.add_exclusion(selection)?;
+        }
+        if !changed {
+            return Ok(false);
+        }
+        self.full_domain_fingerprint = None;
+        let external = self.external.as_ref().ok_or_else(|| {
+            Error::internal("owner-bound logical coverage lost its external anchor")
+        })?;
+        self.fingerprint = bound_coverage_root_fingerprint(
+            &self.shards,
+            self.full_domain_fingerprint.as_deref(),
+            namespace_uuid,
+            index_uuid,
+            external,
+            self.clone_provenance.as_ref(),
+            files,
+        )?;
+        self.validate_index_binding(namespace_uuid, index_uuid, files)?;
+        self.validate_exact(None, None)?;
+        Ok(true)
+    }
+
     /// Bind coverage integrity to its owning index segment and immutable anchor.
     /// The complete declared file set participates in the root fingerprint so a
     /// path, size, anchor range, or object substitution is detected at open.
@@ -847,6 +1056,7 @@ impl LogicalIndexCoverage {
         }
         let fingerprint = bound_coverage_root_fingerprint(
             &self.shards,
+            self.full_domain_fingerprint.as_deref(),
             namespace_uuid,
             index_uuid,
             &external,
@@ -904,6 +1114,7 @@ impl LogicalIndexCoverage {
         })?;
         self.fingerprint = bound_coverage_root_fingerprint(
             &self.shards,
+            self.full_domain_fingerprint.as_deref(),
             target_namespace_uuid,
             index_uuid,
             external,
@@ -961,6 +1172,7 @@ impl LogicalIndexCoverage {
         }
         let expected = bound_coverage_root_fingerprint(
             &self.shards,
+            self.full_domain_fingerprint.as_deref(),
             namespace_uuid,
             index_uuid,
             external,
@@ -1008,9 +1220,26 @@ impl LogicalIndexCoverage {
     /// All manifest-resident summaries must agree before detail is accepted.
     pub fn resolve_from_authoritative(&self, authoritative: &Self) -> Result<Self> {
         authoritative.validate_exact(None, None)?;
-        if authoritative.external.is_some() || self.shards.len() != authoritative.shards.len() {
+        if authoritative
+            .shards
+            .iter()
+            .any(|shard| shard.excluded_selection.is_some())
+        {
             return Err(Error::invalid_input(
-                "logical index coverage artifact does not match manifest shard count",
+                "logical index coverage artifact contains a manifest ownership exclusion",
+            ));
+        }
+        if authoritative.external.is_some()
+            || self.shards.len() != authoritative.shards.len()
+            || self
+                .full_domain_fingerprint
+                .as_ref()
+                .is_some_and(|summary| {
+                    authoritative.full_domain_fingerprint.as_ref() != Some(summary)
+                })
+        {
+            return Err(Error::invalid_input(
+                "logical index coverage artifact does not match manifest summary",
             ));
         }
         let mut resolved = self.clone();
@@ -1354,12 +1583,18 @@ mod tests {
 
     #[test]
     fn test_exact_logical_coverage_validates_fingerprints_and_projection() {
-        let coverage =
+        let mut coverage =
             LogicalIndexCoverage::new_exact(vec![coverage_shard(9, 3, 6), coverage_shard(2, 0, 2)])
                 .unwrap();
         coverage
+            .set_full_domain_fingerprint(Some(vec![5; LOGICAL_COVERAGE_FINGERPRINT_SIZE]))
+            .unwrap();
+        coverage
             .validate_exact(Some(&[7]), Some(&BTreeSet::from([7])))
             .unwrap();
+        let round_trip =
+            LogicalIndexCoverage::try_from(pb::LogicalIndexCoverage::from(&coverage)).unwrap();
+        assert_eq!(round_trip, coverage);
         assert_eq!(
             coverage.logical_fragment_bitmap().unwrap(),
             RoaringBitmap::from_iter([2, 9])
@@ -1380,6 +1615,31 @@ mod tests {
             LogicalIndexCoverage::new_exact(vec![coverage_shard(3, 0, 4), coverage_shard(3, 2, 8)])
                 .unwrap_err();
         assert!(error.to_string().contains("overlap"));
+    }
+
+    #[test]
+    fn test_full_domain_proof_rejects_ownership_exclusions() {
+        let excluded =
+            LogicalRowAddressSelection::from_ranges(vec![LogicalRowAddressRange::new(3, 2, 4)])
+                .unwrap();
+        let mut excluded_before_proof =
+            LogicalIndexCoverage::new_exact(vec![coverage_shard(3, 0, 8)]).unwrap();
+        excluded_before_proof.shards[0].excluded_selection = Some(excluded.clone());
+        let error = excluded_before_proof
+            .set_full_domain_fingerprint(Some(vec![7; LOGICAL_COVERAGE_FINGERPRINT_SIZE]))
+            .unwrap_err();
+        assert!(error.to_string().contains("ownership exclusions"));
+
+        let mut proof_before_exclusion =
+            LogicalIndexCoverage::new_exact(vec![coverage_shard(3, 0, 8)]).unwrap();
+        proof_before_exclusion
+            .set_full_domain_fingerprint(Some(vec![7; LOGICAL_COVERAGE_FINGERPRINT_SIZE]))
+            .unwrap();
+        proof_before_exclusion.shards[0].excluded_selection = Some(excluded);
+        let error = proof_before_exclusion
+            .validate_exact(Some(&[7]), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("ownership exclusions"));
     }
 
     #[test]
@@ -1408,6 +1668,9 @@ mod tests {
         };
         let mut coverage = LogicalIndexCoverage::new_exact(vec![coverage_shard(3, 0, 4)]).unwrap();
         coverage
+            .set_full_domain_fingerprint(Some(vec![9; LOGICAL_COVERAGE_FINGERPRINT_SIZE]))
+            .unwrap();
+        coverage
             .bind_to_index(namespace_uuid, index_uuid, external, &files)
             .unwrap();
         coverage
@@ -1426,6 +1689,17 @@ mod tests {
         range_tampered.external.as_mut().unwrap().offset += 1;
         assert!(
             range_tampered
+                .validate_index_binding(namespace_uuid, index_uuid, &files)
+                .is_err()
+        );
+
+        let mut domain_proof_tampered = coverage.clone();
+        domain_proof_tampered
+            .full_domain_fingerprint
+            .as_mut()
+            .unwrap()[0] ^= 1;
+        assert!(
+            domain_proof_tampered
                 .validate_index_binding(namespace_uuid, index_uuid, &files)
                 .is_err()
         );
@@ -1486,6 +1760,87 @@ mod tests {
         let mut mismatched = exact;
         mismatched.shards[0].row_count += 1;
         assert!(summary.resolve_from_authoritative(&mismatched).is_err());
+    }
+
+    #[test]
+    fn test_owner_bound_exclusion_preserves_immutable_artifact_coverage() {
+        let namespace_uuid = Uuid::new_v4();
+        let index_uuid = Uuid::new_v4();
+        let files = vec![IndexFile {
+            path: "anchor.lance".to_string(),
+            size_bytes: 1024,
+        }];
+        let mut exact = LogicalIndexCoverage::new_exact(vec![coverage_shard(3, 0, 8)]).unwrap();
+        exact
+            .set_full_domain_fingerprint(Some(vec![3; LOGICAL_COVERAGE_FINGERPRINT_SIZE]))
+            .unwrap();
+        let raw_shard_fingerprint = exact.shards[0].fingerprint.clone();
+        let mut summary = exact.clone();
+        summary
+            .bind_to_index(
+                namespace_uuid,
+                index_uuid,
+                LogicalIndexCoverageFile {
+                    path: "anchor.lance".to_string(),
+                    offset: 128,
+                    byte_length: 256,
+                    global_buffer_index: 2,
+                    object_size: 1024,
+                    object_id: Uuid::new_v4(),
+                    artifact_namespace_uuid: namespace_uuid,
+                    artifact_layout_fingerprint: vec![1; LOGICAL_COVERAGE_FINGERPRINT_SIZE],
+                },
+                &files,
+            )
+            .unwrap();
+        let original_root = summary.fingerprint.clone();
+        let excluded = LogicalRowAddressSelection::from_ranges(vec![
+            LogicalRowAddressRange::new(3, 2, 4),
+            LogicalRowAddressRange::new(3, 6, 7),
+        ])
+        .unwrap();
+
+        assert!(
+            summary
+                .exclude_rows(&excluded, namespace_uuid, index_uuid, &files)
+                .unwrap()
+        );
+        assert_ne!(summary.fingerprint, original_root);
+        assert!(summary.full_domain_fingerprint.is_none());
+        assert!(exact.full_domain_fingerprint.is_some());
+        assert_eq!(summary.shards[0].fingerprint, raw_shard_fingerprint);
+        assert_eq!(
+            summary.shards[0].effective_selection().unwrap(),
+            LogicalRowAddressSelection::from_ranges(vec![
+                LogicalRowAddressRange::new(3, 0, 2),
+                LogicalRowAddressRange::new(3, 4, 6),
+                LogicalRowAddressRange::new(3, 7, 8),
+            ])
+            .unwrap()
+        );
+
+        assert!(summary.externalize_detail_over(0).unwrap());
+        let resolved = summary.resolve_from_authoritative(&exact).unwrap();
+        assert_eq!(
+            resolved.shards[0].effective_selection().unwrap(),
+            LogicalRowAddressSelection::from_ranges(vec![
+                LogicalRowAddressRange::new(3, 0, 2),
+                LogicalRowAddressRange::new(3, 4, 6),
+                LogicalRowAddressRange::new(3, 7, 8),
+            ])
+            .unwrap()
+        );
+        resolved
+            .validate_index_binding(namespace_uuid, index_uuid, &files)
+            .unwrap();
+
+        let mut tampered = summary;
+        tampered.shards[0].excluded_selection = None;
+        assert!(
+            tampered
+                .validate_index_binding(namespace_uuid, index_uuid, &files)
+                .is_err()
+        );
     }
 
     #[test]

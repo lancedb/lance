@@ -1333,6 +1333,41 @@ mod tests {
             ])
             .unwrap(),
         );
+        let mut raw_forged = forged.clone();
+        let mut raw_forged_coverage = raw_forged.logical_coverage.take().unwrap();
+        let original_coverage = segment.logical_coverage.as_ref().unwrap();
+        raw_forged_coverage
+            .bind_to_index(
+                dataset
+                    .manifest
+                    .row_address_layout
+                    .as_ref()
+                    .unwrap()
+                    .namespace_uuid,
+                raw_forged.uuid,
+                original_coverage.external.clone().unwrap(),
+                raw_forged.files.as_ref().unwrap(),
+            )
+            .unwrap();
+        raw_forged.logical_coverage = Some(raw_forged_coverage);
+        let raw_transaction = crate::dataset::transaction::TransactionBuilder::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![raw_forged],
+                removed_indices: Vec::new(),
+            },
+        )
+        .build();
+        let raw_error = dataset
+            .apply_commit(raw_transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            raw_error
+                .to_string()
+                .contains("differs from its core-authored artifact"),
+            "unexpected raw forged-coverage error: {raw_error}"
+        );
         let error = dataset
             .commit_existing_index_segments("a_idx", "a", vec![forged])
             .await
@@ -1364,6 +1399,93 @@ mod tests {
                 .map(|shard| shard.row_count)
                 .sum::<u64>(),
             32
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_restriction_rejects_rows_outside_authoritative_shard() {
+        let tmpdir = TempStrDir::default();
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(16),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let first_fragment = dataset.manifest.fragments[0].id as u32;
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .fragments(vec![first_fragment])
+            .execute()
+            .await
+            .unwrap();
+
+        let current = dataset
+            .load_indices_by_name("a_idx")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let other_logical_fragment = dataset.manifest.fragments[1]
+            .native_logical_domain
+            .as_ref()
+            .unwrap()
+            .logical_fragment_id;
+        let wrong_exclusion = lance_table::format::LogicalRowAddressSelection::from_ranges(vec![
+            lance_table::format::LogicalRowAddressRange::new(other_logical_fragment, 0, 1),
+        ])
+        .unwrap();
+        let mut replacement = current.clone();
+        let namespace_uuid = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .namespace_uuid;
+        let replacement_uuid = replacement.uuid;
+        let files = replacement.files.clone().unwrap();
+        let external = replacement
+            .logical_coverage
+            .as_ref()
+            .unwrap()
+            .external
+            .clone()
+            .unwrap();
+        let coverage = replacement.logical_coverage.as_mut().unwrap();
+        coverage.shards[0].excluded_selection = Some(wrong_exclusion);
+        coverage
+            .bind_to_index(namespace_uuid, replacement_uuid, external, &files)
+            .unwrap();
+
+        let transaction = crate::dataset::transaction::TransactionBuilder::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![replacement],
+                removed_indices: vec![current],
+            },
+        )
+        .build();
+        let error = dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ownership exclusion is not a subset"),
+            "unexpected ownership restriction error: {error}"
         );
     }
 
@@ -1411,6 +1533,25 @@ mod tests {
             .externalize_detail_over(0)
             .unwrap();
 
+        let raw_transaction = crate::dataset::transaction::TransactionBuilder::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![first.clone(), second.clone()],
+                removed_indices: Vec::new(),
+            },
+        )
+        .build();
+        let raw_error = dataset
+            .apply_commit(raw_transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            raw_error
+                .to_string()
+                .contains("overlapping exact segment coverage"),
+            "unexpected raw overlapping-coverage error: {raw_error}"
+        );
+
         let error = dataset
             .commit_existing_index_segments("a_idx", "a", vec![first, second])
             .await
@@ -1419,6 +1560,64 @@ mod tests {
             error
                 .to_string()
                 .contains("overlapping authoritative logical coverage")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_same_name_segments_require_identical_fields() {
+        let tmpdir = TempStrDir::default();
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(16),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragments = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<Vec<_>>();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let first = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("mixed_idx".to_string())
+            .fragments(vec![fragments[0]])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let second = CreateIndexBuilder::new(&mut dataset, &["b"], IndexType::BTree, &params)
+            .name("mixed_idx".to_string())
+            .fragments(vec![fragments[1]])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let transaction = crate::dataset::transaction::TransactionBuilder::new(
+            dataset.manifest.version,
+            crate::dataset::transaction::Operation::CreateIndex {
+                new_indices: vec![first, second],
+                removed_indices: Vec::new(),
+            },
+        )
+        .build();
+        let error = dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("mixes fields"),
+            "unexpected mixed-field segment error: {error}"
         );
     }
 
@@ -1732,6 +1931,45 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    async fn commit_v23_materialized_segment(
+        dataset: &mut Dataset,
+        index_name: &str,
+        column: &str,
+        merged: IndexMetadata,
+    ) -> IndexMetadata {
+        assert_eq!(
+            merged.row_reference_domain,
+            Some(RowReferenceDomain::StableLogicalRowAddress)
+        );
+        assert!(merged.fragment_bitmap.is_none());
+        let expected_shards = merged.logical_coverage.as_ref().unwrap().shards.clone();
+        assert!(expected_shards.iter().all(|shard| {
+            shard
+                .validated_through
+                .iter()
+                .all(|watermark| watermark.generation == dataset.version().version)
+        }));
+
+        // Resolving the staged output proves that the materialized watermark is
+        // also bound into the immutable artifact, not only patched into metadata.
+        let mut resolved = merged.clone();
+        let exact = crate::index::finalize_v23_index_coverage(dataset, &mut resolved)
+            .await
+            .unwrap();
+        assert_eq!(exact.shards, expected_shards);
+
+        dataset
+            .commit_existing_index_segments(index_name, column, vec![merged])
+            .await
+            .unwrap();
+        let committed = dataset.load_indices_by_name(index_name).await.unwrap();
+        assert_eq!(committed.len(), 1);
+        crate::index::resolve_logical_index_coverage(dataset, &committed[0])
+            .await
+            .unwrap();
+        committed[0].clone()
     }
 
     async fn prepare_vector_ivf(dataset: &Dataset, vector_column: &str) -> IvfBuildParams {
@@ -2794,6 +3032,293 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 20);
+    }
+
+    #[tokio::test]
+    async fn test_v23_inverted_merge_binds_materialized_coverage() {
+        let tmpdir = TempStrDir::default();
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 10,
+                max_rows_per_group: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = InvertedIndexParams::default();
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut segments = Vec::with_capacity(fragment_ids.len());
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
+                    .name("text_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        commit_v23_materialized_segment(&mut dataset, "text_idx", "text", merged).await;
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("document".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 14);
+    }
+
+    #[tokio::test]
+    async fn test_v23_fm_merge_rebuilds_current_logical_coverage() {
+        use lance_index::scalar::TextQuery;
+
+        let tmpdir = TempStrDir::default();
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 10,
+                max_rows_per_group: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+        let first_fragment_id = dataset.get_fragments()[0].id() as u32;
+        let segment = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
+            .name("text_fm".to_string())
+            .fragments(vec![first_fragment_id])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let merged = dataset
+            .merge_existing_index_segments(vec![segment])
+            .await
+            .unwrap();
+        assert_eq!(
+            merged
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            10
+        );
+
+        let committed =
+            commit_v23_materialized_segment(&mut dataset, "text_fm", "text", merged).await;
+        let index = crate::index::scalar::open_scalar_index(
+            &dataset,
+            "text",
+            &committed,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let result = index
+            .search(
+                &TextQuery::StringContains("document 15".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let matched = match result {
+            SearchResult::Exact(rows) => rows.true_rows().row_addrs().unwrap().count(),
+            other => panic!("expected exact FM-Index result, got {other:?}"),
+        };
+        assert_eq!(matched, 0);
+
+        let result = index
+            .search(
+                &TextQuery::StringContains("document 0".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let matched = match result {
+            SearchResult::Exact(rows) => rows.true_rows().row_addrs().unwrap().count(),
+            other => panic!("expected exact FM-Index result, got {other:?}"),
+        };
+        assert_eq!(matched, 1);
+
+        let update = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 0")
+            .unwrap()
+            .set("text", "'updated-only-marker'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = update.new_dataset;
+        let error = dataset
+            .merge_existing_index_segments(dataset.load_indices_by_name("text_fm").await.unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("filtered rebuild"));
+    }
+
+    #[tokio::test]
+    async fn test_v23_raw_scalar_merge_rejects_generation_stale_rows() {
+        let tmpdir = TempStrDir::default();
+        for (suffix, index_type, builtin) in [
+            (
+                "bitmap",
+                IndexType::Bitmap,
+                lance_index::scalar::BuiltinIndexType::Bitmap,
+            ),
+            (
+                "zonemap",
+                IndexType::ZoneMap,
+                lance_index::scalar::BuiltinIndexType::ZoneMap,
+            ),
+        ] {
+            let uri = format!("{}/{suffix}", tmpdir.as_str());
+            let mut dataset = gen_batch()
+                .col("value", lance_datagen::array::step::<Int32Type>())
+                .into_dataset_with_params(
+                    &uri,
+                    FragmentCount::from(2),
+                    FragmentRowCount::from(16),
+                    Some(WriteParams {
+                        data_storage_version: Some(LanceFileVersion::V2_3),
+                        max_rows_per_file: 16,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let params = ScalarIndexParams::for_builtin(builtin);
+            let fragment_ids = dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>();
+            let mut segments = Vec::with_capacity(fragment_ids.len());
+            for fragment_id in fragment_ids {
+                segments.push(
+                    CreateIndexBuilder::new(&mut dataset, &["value"], index_type, &params)
+                        .name(format!("{suffix}_idx"))
+                        .fragments(vec![fragment_id])
+                        .execute_uncommitted()
+                        .await
+                        .unwrap(),
+                );
+            }
+            let merged = dataset
+                .merge_existing_index_segments(segments)
+                .await
+                .unwrap();
+            commit_v23_materialized_segment(
+                &mut dataset,
+                &format!("{suffix}_idx"),
+                "value",
+                merged,
+            )
+            .await;
+
+            let update = UpdateBuilder::new(Arc::new(dataset))
+                .update_where("value = 0")
+                .unwrap()
+                .set("value", "1000")
+                .unwrap()
+                .build()
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+            let dataset = update.new_dataset;
+            let error = dataset
+                .merge_existing_index_segments(
+                    dataset
+                        .load_indices_by_name(&format!("{suffix}_idx"))
+                        .await
+                        .unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains("filtered rebuild"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v23_label_list_merge_binds_materialized_coverage() {
+        let tmpdir = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col(
+                "labels",
+                lance_datagen::array::rand_list_any(
+                    lance_datagen::array::cycle::<Int64Type>(vec![1, 2, 3]),
+                    false,
+                ),
+            )
+            .into_dataset_with_params(
+                tmpdir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(16),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    max_rows_per_file: 16,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList);
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        let mut segments = Vec::with_capacity(fragment_ids.len());
+        for fragment_id in fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["labels"], IndexType::LabelList, &params)
+                    .name("labels_idx".to_string())
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        commit_v23_materialized_segment(&mut dataset, "labels_idx", "labels", merged).await;
     }
 
     #[tokio::test]

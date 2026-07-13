@@ -335,6 +335,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                         &[],
                         &[],
                         &retired_row_ids,
+                        &[],
                         &plan,
                         &merged_generations,
                         None,

@@ -34,12 +34,13 @@ use lance_table::{
     format::{
         BasePath, ContentGenerationRegion, DataFile, DataStorageFormat,
         ExplicitMapRowAddressPlacement, FieldGeneration, Fragment, IndexFile,
-        IndexGenerationBlocker, IndexMetadata, Manifest, NativeLogicalDomain,
-        PhysicalToLogicalResolution, PlacementMaintenanceRequired, RowAddressDeltaApplyContext,
-        RowAddressLayout, RowAddressLayoutApplyResult, RowAddressLayoutDelta,
-        RowAddressPlacementKind, RowAddressTargetFragment, RowDatasetVersionMeta,
-        RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta, RowReferenceDomain,
-        evaluate_projected_row_address_delta, evaluate_projected_row_address_epoch, pb,
+        IndexGenerationBlocker, IndexMetadata, LogicalRowAddressSelection, Manifest,
+        NativeLogicalDomain, PhysicalToLogicalResolution, PlacementMaintenanceRequired,
+        RowAddressDeltaApplyContext, RowAddressLayout, RowAddressLayoutApplyResult,
+        RowAddressLayoutDelta, RowAddressPlacementKind, RowAddressTargetFragment,
+        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        RowReferenceDomain, evaluate_projected_row_address_delta,
+        evaluate_projected_row_address_epoch, pb,
     },
     io::{
         commit::CommitHandler,
@@ -62,9 +63,40 @@ use std::{
 };
 use uuid::Uuid;
 
+pub(crate) const STRICT_FULL_ORDERED_REWRITE_TRANSACTION_PROPERTY: &str =
+    "lance.internal.strict_full_ordered_rewrite";
+
+pub(crate) fn with_strict_full_ordered_rewrite_property(
+    properties: Option<Arc<HashMap<String, String>>>,
+) -> Arc<HashMap<String, String>> {
+    let mut properties = properties.as_deref().cloned().unwrap_or_default();
+    properties.insert(
+        STRICT_FULL_ORDERED_REWRITE_TRANSACTION_PROPERTY.to_owned(),
+        "true".to_owned(),
+    );
+    Arc::new(properties)
+}
+
 /// Fallback version for rows whose original creation version cannot be determined.
 /// Version 1 is the initial dataset version in the Lance format.
 const UNKNOWN_CREATED_AT_VERSION: u64 = 1;
+pub(crate) const ORIGINAL_REQUEST_FINGERPRINT_SIZE: usize = 16;
+
+fn append_fingerprint_frame(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+fn fingerprint_original_request(bytes: &[u8]) -> [u8; ORIGINAL_REQUEST_FINGERPRINT_SIZE] {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let mut hash = OFFSET;
+    for byte in b"LanceTransactionOriginalRequestV1".iter().chain(bytes) {
+        hash ^= *byte as u128;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash.to_le_bytes()
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct RowAddressManifestApplyContext {
@@ -128,6 +160,7 @@ pub(crate) fn generation_region_field_can_retire(
         let Some(coverage) = index.logical_coverage.as_ref() else {
             continue;
         };
+        let mut stale_shards = Vec::new();
         for shard in &coverage.shards {
             let validated_through = shard
                 .validated_through
@@ -135,10 +168,27 @@ pub(crate) fn generation_region_field_can_retire(
                 .find(|watermark| watermark.field_id == field_id)
                 .map(|watermark| watermark.generation)
                 .unwrap_or(0);
-            if shard.field_ids.contains(&field_id)
-                && validated_through < region.generation
-                && shard.may_overlap(&region.selection)?
-            {
+            if shard.field_ids.contains(&field_id) && validated_through < region.generation {
+                stale_shards.push(shard);
+            }
+        }
+        let mut combined_exclusion = None::<LogicalRowAddressSelection>;
+        for excluded in stale_shards
+            .iter()
+            .filter_map(|shard| shard.excluded_selection.as_ref())
+        {
+            combined_exclusion = Some(match combined_exclusion {
+                Some(current) => current.union(excluded)?,
+                None => excluded.clone(),
+            });
+        }
+        if let Some(excluded) = combined_exclusion.as_ref()
+            && region.selection.is_subset_of(excluded)?
+        {
+            continue;
+        }
+        for shard in stale_shards {
+            if shard.may_overlap(&region.selection)? {
                 return Ok(false);
             }
         }
@@ -282,6 +332,8 @@ fn validate_generation_replacements_against_catalog(
 fn validate_incoming_logical_index_generations(
     current_manifest: &Manifest,
     indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+    current_indices: &[IndexMetadata],
 ) -> Result<()> {
     if !current_manifest.uses_stable_logical_row_addresses() {
         return Ok(());
@@ -295,12 +347,60 @@ fn validate_incoming_logical_index_generations(
     for index in indices.iter().filter(|index| {
         index.row_reference_domain == Some(RowReferenceDomain::StableLogicalRowAddress)
     }) {
+        let current = current_indices
+            .iter()
+            .find(|current| current.uuid == index.uuid);
+        let removed = removed_indices
+            .iter()
+            .find(|removed| removed.uuid == index.uuid);
+        let is_restriction_only_replacement = match current.zip(removed) {
+            Some((current, removed)) if current == removed => {
+                logical_index_is_monotonic_coverage_restriction(current, index)?
+            }
+            _ => false,
+        };
         let coverage = index.logical_coverage.as_ref().ok_or_else(|| {
             Error::invalid_input(format!(
                 "v2.3 incoming index segment {} is missing exact logical coverage",
                 index.uuid
             ))
         })?;
+        coverage.validate_exact(Some(&index.fields), None)?;
+        let files = index.files.as_ref().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "v2.3 incoming index segment {} is missing declared files",
+                index.uuid
+            ))
+        })?;
+        coverage.validate_index_binding(layout.namespace_uuid, index.uuid, files)?;
+        let has_ownership_exclusions = coverage
+            .shards
+            .iter()
+            .any(|shard| shard.excluded_selection.is_some());
+        if has_ownership_exclusions
+            && !index.index_details.as_ref().is_some_and(|details| {
+                details.type_url.ends_with("BTreeIndexDetails")
+                    || details.type_url.ends_with("VectorIndexDetails")
+            })
+        {
+            return Err(Error::invalid_input(format!(
+                "v2.3 index segment {} uses ownership exclusions for an unsupported index type",
+                index.uuid
+            )));
+        }
+        if has_ownership_exclusions && !is_restriction_only_replacement {
+            return Err(Error::retryable_commit_conflict_source(
+                current_manifest.version,
+                format!(
+                    "v2.3 index segment {} changed ownership without replacing the exact current metadata",
+                    index.uuid
+                )
+                .into(),
+            ));
+        }
+        if is_restriction_only_replacement {
+            continue;
+        }
         for shard in &coverage.shards {
             let ranges = shard
                 .selection
@@ -365,6 +465,63 @@ fn validate_incoming_logical_index_generations(
         }
     }
     Ok(())
+}
+
+pub(crate) fn logical_index_is_monotonic_coverage_restriction(
+    current: &IndexMetadata,
+    replacement: &IndexMetadata,
+) -> Result<bool> {
+    if current.uuid != replacement.uuid
+        || current.fields != replacement.fields
+        || current.name != replacement.name
+        || current.dataset_version != replacement.dataset_version
+        || current.fragment_bitmap != replacement.fragment_bitmap
+        || current.index_details != replacement.index_details
+        || current.index_version != replacement.index_version
+        || current.created_at != replacement.created_at
+        || current.base_id != replacement.base_id
+        || current.files != replacement.files
+        || current.row_reference_domain != replacement.row_reference_domain
+    {
+        return Ok(false);
+    }
+    let Some(current_coverage) = current.logical_coverage.as_ref() else {
+        return Ok(false);
+    };
+    let Some(replacement_coverage) = replacement.logical_coverage.as_ref() else {
+        return Ok(false);
+    };
+    if current_coverage.external != replacement_coverage.external
+        || current_coverage.clone_provenance != replacement_coverage.clone_provenance
+        || current_coverage.shards.len() != replacement_coverage.shards.len()
+    {
+        return Ok(false);
+    }
+    for (current_shard, replacement_shard) in current_coverage
+        .shards
+        .iter()
+        .zip(&replacement_coverage.shards)
+    {
+        if current_shard.selection != replacement_shard.selection
+            || current_shard.field_ids != replacement_shard.field_ids
+            || current_shard.validated_through != replacement_shard.validated_through
+            || current_shard.fingerprint != replacement_shard.fingerprint
+            || current_shard.row_count != replacement_shard.row_count
+            || current_shard.logical_fragment_bitmap != replacement_shard.logical_fragment_bitmap
+        {
+            return Ok(false);
+        }
+        match (
+            current_shard.excluded_selection.as_ref(),
+            replacement_shard.excluded_selection.as_ref(),
+        ) {
+            (None, None) => {}
+            (None, Some(replacement)) if !replacement.is_empty() => {}
+            (Some(current), Some(replacement)) if current.is_subset_of(replacement)? => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 /// Look up the `created_at` version for a single UPDATE-branch row ID.
@@ -641,6 +798,8 @@ pub struct Transaction {
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
     /// Explicit stable logical row-address provenance for storage version 2.3.
     pub row_address_layout_delta: Option<RowAddressLayoutDelta>,
+    /// Canonical caller request identity before commit-time mutation.
+    pub original_request_fingerprint: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -2080,11 +2239,25 @@ impl TransactionBuilder {
             tag: self.tag,
             transaction_properties: self.transaction_properties,
             row_address_layout_delta: self.row_address_layout_delta,
+            original_request_fingerprint: None,
         }
     }
 }
 
 impl Transaction {
+    pub(crate) fn is_strict_full_ordered_rewrite(&self) -> bool {
+        self.transaction_properties
+            .as_ref()
+            .and_then(|properties| properties.get(STRICT_FULL_ORDERED_REWRITE_TRANSACTION_PROPERTY))
+            .is_some_and(|value| value == "true")
+    }
+
+    pub(crate) fn uses_snapshot_assigned_explicit_fragment_ids(&self) -> bool {
+        self.row_address_layout_delta
+            .as_ref()
+            .is_some_and(RowAddressLayoutDelta::is_pure_explicit_rewrite)
+    }
+
     pub fn new_from_version(read_version: u64, operation: Operation) -> Self {
         TransactionBuilder::new(read_version, operation).build()
     }
@@ -2093,6 +2266,68 @@ impl Transaction {
         TransactionBuilder::new(read_version, operation)
             .tag(tag)
             .build()
+    }
+
+    pub(crate) fn canonical_original_request_fingerprint(
+        &self,
+    ) -> Option<[u8; ORIGINAL_REQUEST_FINGERPRINT_SIZE]> {
+        if self.row_address_layout_delta.is_none()
+            || !matches!(
+                &self.operation,
+                Operation::Delete { .. } | Operation::Update { .. } | Operation::Rewrite { .. }
+            )
+        {
+            return None;
+        }
+
+        let mut message = pb::Transaction::from(self);
+        message.original_request_fingerprint.clear();
+
+        let mut canonical = Vec::new();
+        let mut transaction_properties = message.transaction_properties.drain().collect::<Vec<_>>();
+        transaction_properties.sort_unstable();
+        canonical.extend_from_slice(&(transaction_properties.len() as u64).to_le_bytes());
+        for (key, value) in transaction_properties {
+            append_fingerprint_frame(&mut canonical, key.as_bytes());
+            append_fingerprint_frame(&mut canonical, value.as_bytes());
+        }
+
+        if let Some(pb::transaction::Operation::Update(update)) = message.operation.as_mut() {
+            let mut updated_fragment_offsets =
+                update.updated_fragment_offsets.drain().collect::<Vec<_>>();
+            updated_fragment_offsets.sort_unstable_by_key(|(fragment_id, _)| *fragment_id);
+            canonical.extend_from_slice(&(updated_fragment_offsets.len() as u64).to_le_bytes());
+            for (fragment_id, offsets) in updated_fragment_offsets {
+                canonical.extend_from_slice(&fragment_id.to_le_bytes());
+                append_fingerprint_frame(&mut canonical, &offsets.encode_to_vec());
+            }
+        } else {
+            canonical.extend_from_slice(&0_u64.to_le_bytes());
+        }
+
+        let frag_reuse_index = match &self.operation {
+            Operation::Rewrite {
+                frag_reuse_index, ..
+            } => frag_reuse_index.as_ref(),
+            _ => None,
+        };
+        if let Some(index) = frag_reuse_index {
+            canonical.push(1);
+            append_fingerprint_frame(
+                &mut canonical,
+                &pb::IndexMetadata::from(index).encode_to_vec(),
+            );
+        } else {
+            canonical.push(0);
+        }
+        append_fingerprint_frame(&mut canonical, &message.encode_to_vec());
+        Some(fingerprint_original_request(&canonical))
+    }
+
+    pub(crate) fn refresh_original_request_fingerprint(&mut self) {
+        self.original_request_fingerprint = self
+            .canonical_original_request_fingerprint()
+            .map(|fingerprint| fingerprint.to_vec());
     }
 
     pub(crate) fn rebase_row_address_layout_delta(
@@ -2762,7 +2997,8 @@ impl Transaction {
         fast_manifest.row_address_layout = fast_manifest
             .row_address_layout
             .as_ref()
-            .map(|layout| Arc::new(layout.fast_admission_projection()));
+            .map(|layout| layout.fast_admission_projection().map(Arc::new))
+            .transpose()?;
         let fast_manifest_bytes = pb::Manifest::from(&fast_manifest).encoded_len() as u64;
         let fast_index_bytes = full_index_bytes;
 
@@ -2899,7 +3135,10 @@ impl Transaction {
         let mut converged = false;
         for _ in 0..16 {
             let root_bytes = Self::serialized_row_address_metadata_bytes(manifest, indices)?;
-            snapshot_bytes = root_bytes.checked_add(transaction_snapshot_bytes)?;
+            // Delta is the canonical successor manifest/catalog overhead.
+            // Transaction metadata contributes to W_epoch because it is
+            // written by the commit, but it is not part of snapshot M_2.3.
+            snapshot_bytes = root_bytes;
             let commit_bytes = root_bytes.checked_add(transaction_write_bytes)?;
             let next_epoch_bytes = if maintenance_boundary {
                 commit_bytes
@@ -3569,6 +3808,14 @@ impl Transaction {
                 new_indices,
                 removed_indices,
             } => {
+                if let Some(current_manifest) = current_manifest {
+                    validate_incoming_logical_index_generations(
+                        current_manifest,
+                        new_indices,
+                        removed_indices,
+                        &final_indices,
+                    )?;
+                }
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let removed_uuids = removed_indices
                     .iter()
@@ -3957,12 +4204,6 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
         };
-
-        if let (Some(current_manifest), Operation::CreateIndex { new_indices, .. }) =
-            (current_manifest, &self.operation)
-        {
-            validate_incoming_logical_index_generations(current_manifest, new_indices)?;
-        }
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
@@ -4924,6 +5165,16 @@ impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
     fn try_from(message: pb::Transaction) -> Result<Self> {
+        let original_request_fingerprint = if message.original_request_fingerprint.is_empty() {
+            None
+        } else if message.original_request_fingerprint.len() == ORIGINAL_REQUEST_FINGERPRINT_SIZE {
+            Some(message.original_request_fingerprint.clone())
+        } else {
+            return Err(Error::invalid_input(format!(
+                "transaction original_request_fingerprint must be {ORIGINAL_REQUEST_FINGERPRINT_SIZE} bytes, got {}",
+                message.original_request_fingerprint.len()
+            )));
+        };
         let row_address_layout_delta = message
             .row_address_layout_delta
             .map(RowAddressLayoutDelta::try_from)
@@ -5222,6 +5473,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                 ));
             }
         };
+        if original_request_fingerprint.is_some()
+            && (row_address_layout_delta.is_none()
+                || !matches!(
+                    &operation,
+                    Operation::Delete { .. } | Operation::Update { .. } | Operation::Rewrite { .. }
+                ))
+        {
+            return Err(Error::invalid_input(
+                "transaction original_request_fingerprint is only valid for v2.3 Delete, Update, or Rewrite requests",
+            ));
+        }
         Ok(Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
@@ -5237,6 +5499,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 Some(Arc::new(message.transaction_properties))
             },
             row_address_layout_delta,
+            original_request_fingerprint,
         })
     }
 }
@@ -5521,6 +5784,10 @@ impl From<&Transaction> for pb::Transaction {
                 .row_address_layout_delta
                 .as_ref()
                 .map(pb::transaction::RowAddressLayoutDelta::from),
+            original_request_fingerprint: value
+                .original_request_fingerprint
+                .clone()
+                .unwrap_or_default(),
         }
     }
 }
@@ -6135,6 +6402,35 @@ mod tests {
     }
 
     #[test]
+    fn segment_ownership_exclusion_allows_generation_region_retirement() {
+        let schema = sample_manifest().schema;
+        let domain = RowAddressLogicalDomain::new(0, 4, 1).unwrap();
+        let all_rows = LogicalRowAddressSelection::from_full_domains(&[domain]).unwrap();
+        let changed = LogicalRowAddressSelection::from_ranges(vec![
+            lance_table::format::LogicalRowAddressRange::new(0, 1, 3),
+        ])
+        .unwrap();
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.field_default_generations = vec![FieldGeneration {
+            field_id: 0,
+            generation: 1,
+        }];
+        layout.index_commit_floors = layout.field_default_generations.clone();
+        layout.generation_regions = vec![ContentGenerationRegion {
+            selection: Arc::new(changed.clone()),
+            field_ids: vec![0],
+            generation: 2,
+        }];
+        let mut stale_base = covered_index("value_idx", all_rows, 1);
+        stale_base.logical_coverage.as_mut().unwrap().shards[0].excluded_selection = Some(changed);
+
+        Transaction::reconcile_row_address_schema(&mut layout, &schema, &[stale_base], 3).unwrap();
+
+        assert!(layout.generation_regions.is_empty());
+        assert_eq!(layout.index_commit_floors[0].generation, 2);
+    }
+
+    #[test]
     fn unrelated_commit_does_not_advance_unindexed_field_floor() {
         let schema = sample_manifest().schema;
         let mut layout = RowAddressLayout::new(Uuid::new_v4());
@@ -6243,6 +6539,117 @@ mod tests {
     }
 
     #[test]
+    fn original_request_fingerprint_canonicalizes_maps_and_binds_request() {
+        let transaction = |reverse_insertion_order: bool| {
+            let mut properties = HashMap::new();
+            let mut offsets = HashMap::new();
+            if reverse_insertion_order {
+                properties.insert("second".to_owned(), "2".to_owned());
+                properties.insert("first".to_owned(), "1".to_owned());
+                offsets.insert(8, RoaringBitmap::from_iter([2, 4]));
+                offsets.insert(3, RoaringBitmap::from_iter([1, 5]));
+            } else {
+                properties.insert("first".to_owned(), "1".to_owned());
+                properties.insert("second".to_owned(), "2".to_owned());
+                offsets.insert(3, RoaringBitmap::from_iter([1, 5]));
+                offsets.insert(8, RoaringBitmap::from_iter([2, 4]));
+            }
+            TransactionBuilder::new(
+                7,
+                Operation::Update {
+                    removed_fragment_ids: vec![1],
+                    updated_fragments: vec![],
+                    new_fragments: vec![],
+                    fields_modified: vec![0],
+                    merged_generations: vec![],
+                    fields_for_preserving_frag_bitmap: vec![0],
+                    update_mode: Some(UpdateMode::RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: Some(UpdatedFragmentOffsets(offsets)),
+                },
+            )
+            .uuid("fixed-request-uuid".to_owned())
+            .transaction_properties(Some(Arc::new(properties)))
+            .row_address_layout_delta(Some(RowAddressLayoutDelta {
+                expected_layout_fingerprint: vec![7; 16],
+                ..Default::default()
+            }))
+            .build()
+        };
+
+        let mut requested = transaction(false);
+        let reordered = transaction(true);
+        assert_eq!(
+            requested.canonical_original_request_fingerprint(),
+            reordered.canonical_original_request_fingerprint()
+        );
+
+        let mut altered = reordered;
+        let Operation::Update {
+            fields_modified, ..
+        } = &mut altered.operation
+        else {
+            unreachable!()
+        };
+        fields_modified.push(1);
+        assert_ne!(
+            requested.canonical_original_request_fingerprint(),
+            altered.canonical_original_request_fingerprint()
+        );
+
+        requested.refresh_original_request_fingerprint();
+        let fingerprint = requested.original_request_fingerprint.clone().unwrap();
+        assert_eq!(fingerprint.len(), ORIGINAL_REQUEST_FINGERPRINT_SIZE);
+        let round_tripped = Transaction::try_from(pb::Transaction::from(&requested)).unwrap();
+        assert_eq!(
+            round_tripped.original_request_fingerprint,
+            Some(fingerprint)
+        );
+
+        let mut rewrite = TransactionBuilder::new(
+            7,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(sample_index_metadata("first")),
+            },
+        )
+        .row_address_layout_delta(Some(RowAddressLayoutDelta {
+            expected_layout_fingerprint: vec![7; 16],
+            ..Default::default()
+        }))
+        .build();
+        let first = rewrite.canonical_original_request_fingerprint();
+        let Operation::Rewrite {
+            frag_reuse_index, ..
+        } = &mut rewrite.operation
+        else {
+            unreachable!()
+        };
+        frag_reuse_index.as_mut().unwrap().name = "second".to_owned();
+        assert_ne!(first, rewrite.canonical_original_request_fingerprint());
+    }
+
+    #[test]
+    fn original_request_fingerprint_rejects_invalid_length() {
+        let transaction = TransactionBuilder::new(
+            1,
+            Operation::Delete {
+                updated_fragments: vec![],
+                deleted_fragment_ids: vec![],
+                predicate: "true".to_owned(),
+            },
+        )
+        .row_address_layout_delta(Some(RowAddressLayoutDelta::default()))
+        .build();
+        let mut message = pb::Transaction::from(&transaction);
+        message.original_request_fingerprint = vec![0; ORIGINAL_REQUEST_FINGERPRINT_SIZE - 1];
+        let error = Transaction::try_from(message).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("must be 16 bytes"));
+    }
+
+    #[test]
     fn v2_3_write_debt_counts_inline_and_external_transaction_metadata() {
         let namespace_uuid = Uuid::new_v4();
         let schema = sample_manifest().schema;
@@ -6272,8 +6679,15 @@ mod tests {
             .build_manifest(None, vec![], "txn", &v2_3_manifest_config())
             .unwrap();
         let debt = &manifest.row_address_layout.as_ref().unwrap().debt_summary;
+        let snapshot_bytes =
+            Transaction::serialized_row_address_metadata_bytes(&manifest, &[]).unwrap();
+        assert_eq!(
+            debt.fast_delta_bytes, snapshot_bytes.fast,
+            "Delta is snapshot manifest/catalog overhead and excludes transaction files"
+        );
         assert!(
-            debt.metadata_bytes_written_since_maintenance >= transaction_bytes.fast * 2,
+            debt.metadata_bytes_written_since_maintenance
+                >= snapshot_bytes.fast + transaction_bytes.fast * 2,
             "default commits write the logical delta both inline and to the external transaction file"
         );
         assert!(debt.generation_delta_bytes > 0);
@@ -6304,6 +6718,7 @@ mod tests {
                 last_logical_address: (4_u64 << 32) | 1,
                 row_start: 0,
                 row_count: 2,
+                content_fingerprint: vec![11; 16],
             }],
             destinations: vec![lance_table::format::ExplicitMapDestination {
                 physical_fragment_id: 7,
@@ -6311,6 +6726,11 @@ mod tests {
                 row_count: 2,
                 row_id_file_path: "data/_row_addresses/row_ids.lance".to_owned(),
                 row_id_file_size: 64,
+                row_id_pages: vec![lance_table::format::ExplicitMapRowIdPage {
+                    row_start: 0,
+                    row_count: 2,
+                    content_fingerprint: vec![12; 16],
+                }],
             }],
             base_id: None,
         };

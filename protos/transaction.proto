@@ -117,6 +117,8 @@ message Transaction {
     // Logical identities that have no successor location because they were
     // already not live in the source snapshot and maintenance reclaimed their
     // physical rows. These identities must not appear in placement outputs.
+    // For a pure ExplicitMap rewrite this is the exact replacement liveness
+    // mask for its source domains, including previously retired identities.
     repeated LogicalRowAddressSelection retired_selections = 9;
     // External locator roots produced by explicit placement maintenance.  The
     // index addresses the corresponding entry in `placements`.  Persisting
@@ -137,6 +139,12 @@ message Transaction {
   // Required for storage-version-2.3 operations that change row placement,
   // identity, or indexed field generations. Absent for older storage versions.
   optional RowAddressLayoutDelta row_address_layout_delta = 5;
+
+  // Domain-separated 128-bit fingerprint of the caller's canonical request
+  // before commit-time enrichment or conflict rebasing. Present on v2.3
+  // Delete, Update, and Rewrite transactions so ambiguous retries can compare
+  // exact request provenance instead of reverse-engineering rebase mutations.
+  bytes original_request_fingerprint = 6;
 
   // Add new rows to the dataset.
   message Append {

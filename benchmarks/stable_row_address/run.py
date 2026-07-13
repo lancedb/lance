@@ -20,6 +20,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_POLICY = Path(__file__).with_name("physical_maintenance_policy.v1.json")
 SCHEMA_VERSION = 1
 SUITE = "stable_row_address_e2e"
+CARGO_PROFILE = "release-with-debug"
 FORMATS = ("v22_no_stable", "v22_stable", "v23_logical")
 FORMAT_CLI_NAMES = {
     "v22_no_stable": "v22-no-stable",
@@ -40,6 +41,7 @@ WORKER_OPERATIONS = (
     "random_delete_reclaim",
     "normalize_placement",
     "repack",
+    "bounded_recluster",
     "recluster",
     "checkpoint_generation",
     "index_build",
@@ -62,6 +64,7 @@ TIMING_SCOPES = {
     "random_delete_reclaim": "cold_session_open_and_same_postcondition_random_delete_reclaim_commit",
     "normalize_placement": "cold_session_open_and_normalize_placement_commit",
     "repack": "cold_session_open_and_repack_commit",
+    "bounded_recluster": "cold_session_open_and_bounded_recluster_commit",
     "recluster": "cold_session_open_and_recluster_commit",
     "checkpoint_generation": "cold_session_open_and_generation_checkpoint_commit",
     "index_build": "cold_session_open_and_index_build_commit",
@@ -137,11 +140,20 @@ RECORD_FIELDS = frozenset(
         "manifest_bytes",
         "placement_root_bytes",
         "placement_delta_bytes",
+        "placement_delta_claimed_bytes",
         "w_epoch_bytes",
         "coverage",
         "recall",
         "admission",
         "placement_maintenance_required",
+        "pmr_reason",
+        "pmr_projected_delta_bytes",
+        "pmr_delta_limit_bytes",
+        "pmr_projected_epoch_bytes",
+        "pmr_epoch_limit_bytes",
+        "pmr_generation_delta_bytes",
+        "pmr_generation_epoch_bytes",
+        "pmr_blocking_indices",
         "rows_inserted",
         "rows_updated",
         "rows_deleted",
@@ -151,10 +163,14 @@ RECORD_FIELDS = frozenset(
         "indices_remapped",
         "index_coverage_reuse",
         "layout_index_maintenance_ns",
+        "fragment_reuse_index_present",
+        "explicit_locator_objects_written",
+        "explicit_locator_bytes_written",
         "compaction_groups_planned",
         "compaction_groups_admitted",
         "compaction_groups_not_admitted",
         "state_digest",
+        "physical_order_digest",
         "io_by_path",
         "io_metrics_status",
         "status",
@@ -210,6 +226,7 @@ NULLABLE_INTEGER_FIELDS = frozenset(
         "manifest_bytes",
         "placement_root_bytes",
         "placement_delta_bytes",
+        "placement_delta_claimed_bytes",
         "w_epoch_bytes",
         "rows_inserted",
         "rows_updated",
@@ -219,6 +236,14 @@ NULLABLE_INTEGER_FIELDS = frozenset(
         "row_addresses_remapped",
         "indices_remapped",
         "layout_index_maintenance_ns",
+        "explicit_locator_objects_written",
+        "explicit_locator_bytes_written",
+        "pmr_projected_delta_bytes",
+        "pmr_delta_limit_bytes",
+        "pmr_projected_epoch_bytes",
+        "pmr_epoch_limit_bytes",
+        "pmr_generation_delta_bytes",
+        "pmr_generation_epoch_bytes",
         "compaction_groups_planned",
         "compaction_groups_admitted",
         "compaction_groups_not_admitted",
@@ -227,9 +252,15 @@ NULLABLE_INTEGER_FIELDS = frozenset(
 NULLABLE_FLOAT_FIELDS = frozenset(
     {"coverage", "recall", "scan_byte_amplification", "index_coverage_reuse"}
 )
-NULLABLE_BOOLEAN_FIELDS = frozenset({"admission", "placement_maintenance_required"})
+NULLABLE_BOOLEAN_FIELDS = frozenset(
+    {
+        "admission",
+        "placement_maintenance_required",
+        "fragment_reuse_index_present",
+    }
+)
 NULLABLE_STRING_FIELDS = frozenset(
-    {"maintenance_plan_path", "maintenance_plan_sha256"}
+    {"maintenance_plan_path", "maintenance_plan_sha256", "pmr_reason"}
 )
 REQUEST_FIELDS = frozenset(
     {
@@ -475,6 +506,14 @@ def format_order(round_index: int, operation_index: int) -> tuple[str, ...]:
     return FORMATS[start:] + FORMATS[:start]
 
 
+def dynamic_format_order(repeat: int, scope: str) -> tuple[str, ...]:
+    """Derive a replayable order for optional work without mutating phase state."""
+
+    scope_hash = hashlib.sha256(scope.encode("utf-8")).digest()
+    operation_index = int.from_bytes(scope_hash[:8], "big")
+    return format_order(repeat, operation_index)
+
+
 def _validate_clean_checkout(commit: str, status: str) -> str:
     commit = commit.strip()
     if SHA_PATTERN.fullmatch(commit) is None:
@@ -510,7 +549,7 @@ def build_harness() -> Path:
         "cargo",
         "build",
         "--profile",
-        "release-with-debug",
+        CARGO_PROFILE,
         "--package",
         "lance",
         "--features",
@@ -587,9 +626,54 @@ def validate_record(
             not isinstance(record[field], str) or not record[field].strip()
         ):
             raise RecordValidationError(f"{field} must be null or a non-empty string")
-    if record["maintenance_plan_sha256"] is not None and SHA256_PATTERN.fullmatch(
-        record["maintenance_plan_sha256"]
-    ) is None:
+    blockers = record["pmr_blocking_indices"]
+    if blockers is not None:
+        blocker_fields = {
+            "index_id",
+            "index_name",
+            "field_ids",
+            "oldest_generation",
+            "region_bytes",
+            "blocked_transaction_start",
+            "blocked_transaction_end",
+        }
+        if not isinstance(blockers, list):
+            raise RecordValidationError("pmr_blocking_indices must be null or a list")
+        for blocker in blockers:
+            if not isinstance(blocker, dict) or blocker.keys() != blocker_fields:
+                raise RecordValidationError(
+                    "pmr_blocking_indices entries have an invalid schema"
+                )
+            if any(
+                not isinstance(blocker[field], str) or not blocker[field].strip()
+                for field in ("index_id", "index_name")
+            ):
+                raise RecordValidationError(
+                    "pmr_blocking_indices identifiers must be non-empty strings"
+                )
+            field_ids = blocker["field_ids"]
+            if not isinstance(field_ids, list) or any(
+                not _is_int(field_id) for field_id in field_ids
+            ):
+                raise RecordValidationError(
+                    "pmr_blocking_indices field_ids must be an integer list"
+                )
+            if any(
+                not _is_int(blocker[field]) or blocker[field] < 0
+                for field in (
+                    "oldest_generation",
+                    "region_bytes",
+                    "blocked_transaction_start",
+                    "blocked_transaction_end",
+                )
+            ):
+                raise RecordValidationError(
+                    "pmr_blocking_indices counters must be non-negative integers"
+                )
+    if (
+        record["maintenance_plan_sha256"] is not None
+        and SHA256_PATTERN.fullmatch(record["maintenance_plan_sha256"]) is None
+    ):
         raise RecordValidationError(
             "maintenance_plan_sha256 must be null or a lowercase SHA-256 digest"
         )
@@ -705,14 +789,14 @@ def validate_record(
         raise RecordValidationError("index_kind is unsupported")
     if record["selection"] not in {"range", "uniform_without_replacement"}:
         raise RecordValidationError("selection is unsupported")
-    state_digest = record["state_digest"]
-    if state_digest is not None and (
-        not isinstance(state_digest, str)
-        or re.fullmatch(r"[0-9a-f]{48}", state_digest) is None
-    ):
-        raise RecordValidationError(
-            "state_digest must be null or 48 lowercase hex digits"
-        )
+    for digest_field in ("state_digest", "physical_order_digest"):
+        digest = record[digest_field]
+        if digest is not None and (
+            not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{48}", digest) is None
+        ):
+            raise RecordValidationError(
+                f"{digest_field} must be null or 48 lowercase hex digits"
+            )
     if (
         record["placement_maintenance_required"] is True
         and record["admission"] is not False
@@ -854,6 +938,7 @@ def _worker_command(
     index_kind: str = "none",
     update_driver: str = "native",
     selection: str = "range",
+    compaction_mode: str = "standard",
     target_rows_per_fragment: int = 1_000_000,
     target_file_size_bytes: int = 134_217_728,
     max_source_fragments_per_group: int = sys.maxsize,
@@ -935,6 +1020,8 @@ def _worker_command(
     )
     if source_dataset_uri is not None:
         command += ("--source-dataset-uri", source_dataset_uri)
+    if compaction_mode != "standard":
+        command += ("--compaction-mode", compaction_mode.replace("_", "-"))
     if take_ids_input is not None:
         command += ("--take-ids-input", str(take_ids_input))
     if prepare_take_ids_output is not None:

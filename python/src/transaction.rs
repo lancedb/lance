@@ -686,6 +686,7 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             tag: None,
             transaction_properties,
             row_address_layout_delta,
+            original_request_fingerprint: None,
         }))
     }
 }

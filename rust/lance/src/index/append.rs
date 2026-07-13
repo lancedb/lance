@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
-use lance_core::{Error, Result};
+use lance_core::{Error, ROW_ID, Result};
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     metrics::NoOpMetricsCollector,
@@ -15,8 +15,12 @@ use lance_index::{
         lance_format::LanceIndexStore,
     },
 };
+use lance_io::stream::{RecordBatchStream as _, RecordBatchStreamAdapter};
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::{Fragment, IndexMetadata, LogicalIndexCoverage};
+use lance_table::format::{
+    FieldGeneration, Fragment, IndexMetadata, LogicalIndexCoverage, LogicalIndexCoverageShard,
+    LogicalRowAddressSelection,
+};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -33,6 +37,9 @@ use crate::index::vector_index_details_default;
 pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
+    /// Existing immutable segments whose manifest ownership metadata changed.
+    /// Each entry has a matching original in `removed_indices`.
+    pub retained_indices: Vec<IndexMetadata>,
     pub new_fragment_bitmap: RoaringBitmap,
     /// Exact output coverage for storage-version-2.3.  When present the
     /// manifest must omit `fragment_bitmap`.
@@ -43,16 +50,138 @@ pub struct IndexMergeResults<'a> {
     pub files: Vec<lance_table::format::IndexFile>,
 }
 
-fn coverage_has_same_canonical_selection(
-    left: &LogicalIndexCoverage,
-    right: &LogicalIndexCoverage,
-) -> bool {
-    left.shards.len() == right.shards.len()
-        && left
-            .shards
-            .iter()
-            .zip(&right.shards)
-            .all(|(left, right)| left.selection == right.selection)
+fn exact_coverage_selection(
+    coverage: &LogicalIndexCoverage,
+    context: &str,
+) -> Result<LogicalRowAddressSelection> {
+    let mut ranges = Vec::new();
+    for shard in &coverage.shards {
+        ranges.extend(
+            shard
+                .effective_selection()
+                .map_err(|_| {
+                    Error::internal(format!(
+                        "{context} is missing resolved logical selection detail"
+                    ))
+                })?
+                .to_ranges()?,
+        );
+    }
+    LogicalRowAddressSelection::from_ranges(ranges)
+}
+
+fn restrict_v23_index_owners<'a>(
+    dataset: &Dataset,
+    old_indices: &[&'a IndexMetadata],
+    resolved_old: Vec<IndexMetadata>,
+    transferred: &LogicalRowAddressSelection,
+) -> Result<(Vec<&'a IndexMetadata>, Vec<IndexMetadata>)> {
+    let namespace_uuid = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| Error::internal("storage-version-2.3 manifest is missing RowAddressLayout"))?
+        .namespace_uuid;
+    let mut removed = Vec::new();
+    let mut retained = Vec::new();
+    for (original, mut resolved) in old_indices.iter().copied().zip(resolved_old) {
+        let raw_detail_was_external = original
+            .logical_coverage
+            .as_ref()
+            .is_some_and(LogicalIndexCoverage::has_external_detail);
+        let files = resolved.files.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "storage-version-2.3 index segment {} has no declared files",
+                resolved.uuid
+            ))
+        })?;
+        let coverage = resolved.logical_coverage.as_mut().ok_or_else(|| {
+            Error::internal(format!(
+                "storage-version-2.3 index segment {} has no logical coverage",
+                resolved.uuid
+            ))
+        })?;
+        if !coverage.exclude_rows(transferred, namespace_uuid, resolved.uuid, files)? {
+            continue;
+        }
+        removed.push(original);
+        let still_owns_rows = coverage.shards.iter().try_fold(false, |owned, shard| {
+            Ok::<_, Error>(owned || !shard.effective_selection()?.is_empty())
+        })?;
+        if still_owns_rows {
+            // Raw selections remain authoritative in the immutable artifact;
+            // restore the original manifest representation and keep only the
+            // ownership exclusion newly inline.
+            if raw_detail_was_external {
+                coverage.externalize_detail_over(0)?;
+            }
+            retained.push(resolved);
+        }
+    }
+    Ok((removed, retained))
+}
+
+fn exact_delta_coverage(
+    dataset: &Dataset,
+    field_id: i32,
+    selection: LogicalRowAddressSelection,
+) -> Result<LogicalIndexCoverage> {
+    LogicalIndexCoverage::new_exact(vec![LogicalIndexCoverageShard::new_exact(
+        selection,
+        vec![field_id],
+        vec![FieldGeneration {
+            field_id,
+            generation: dataset.manifest.version,
+        }],
+    )?])
+}
+
+async fn current_fragments_for_logical_selection(
+    dataset: &Dataset,
+    selection: &LogicalRowAddressSelection,
+) -> Result<Vec<Fragment>> {
+    const RESOLUTION_BATCH_SIZE: usize = 64 * 1024;
+
+    let mut fragment_ids = RoaringBitmap::new();
+    let mut pending = Vec::with_capacity(RESOLUTION_BATCH_SIZE);
+    for address in selection.iter() {
+        pending.push(address?.raw());
+        if pending.len() == RESOLUTION_BATCH_SIZE {
+            for physical in dataset
+                .resolve_logical_row_ids_async(&pending)
+                .await?
+                .into_iter()
+                .flatten()
+            {
+                fragment_ids.insert(physical.fragment_id());
+            }
+            pending.clear();
+        }
+    }
+    if !pending.is_empty() {
+        for physical in dataset
+            .resolve_logical_row_ids_async(&pending)
+            .await?
+            .into_iter()
+            .flatten()
+        {
+            fragment_ids.insert(physical.fragment_id());
+        }
+    }
+
+    fragment_ids
+        .iter()
+        .map(|fragment_id| {
+            dataset
+                .get_fragment(fragment_id as usize)
+                .map(|fragment| fragment.metadata().clone())
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "logical index catch-up resolved missing physical fragment {fragment_id}"
+                    ))
+                })
+        })
+        .collect()
 }
 
 async fn rebuild_v23_index<'a>(
@@ -79,14 +208,170 @@ async fn rebuild_v23_index<'a>(
         crate::index::merge_logical_index_coverage(dataset.as_ref(), &resolved_refs)?;
     let no_explicit_rebuild =
         !options.retrain && options.num_indices_to_merge.is_none_or(|count| count == 0);
-    if no_explicit_rebuild
-        && coverage_has_same_canonical_selection(&current_coverage, &effective_old)
-        && old_indices.len() == 1
-    {
-        return Ok(None);
+    let first_is_vector = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
+    let current_selection = exact_coverage_selection(&current_coverage, "current coverage")?;
+    let old_selection = exact_coverage_selection(&effective_old, "effective old coverage")?;
+    let missing_selection = current_selection.difference(&old_selection)?;
+
+    if no_explicit_rebuild && missing_selection.is_empty() {
+        if first_is_vector {
+            return Ok(None);
+        }
+        let source_index = dataset
+            .open_scalar_index(&field_path, &old_indices[0].uuid, &NoOpMetricsCollector)
+            .await?;
+        if source_index.index_type() == IndexType::BTree || old_indices.len() == 1 {
+            return Ok(None);
+        }
     }
 
-    let first_is_vector = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
+    if no_explicit_rebuild && !missing_selection.is_empty() {
+        let fragments =
+            current_fragments_for_logical_selection(dataset.as_ref(), &missing_selection).await?;
+        let delta_coverage =
+            exact_delta_coverage(dataset.as_ref(), field_id, missing_selection.clone())?;
+        if first_is_vector {
+            let full_logical_index = dataset
+                .open_logical_vector_index(&field_path, &old_indices[0].name)
+                .await?;
+            let ivf_view = full_logical_index.as_ivf()?;
+            let column = dataset
+                .schema()
+                .field_by_id(field_id)
+                .ok_or_else(|| Error::index(format!("column {field_id} does not exist")))?;
+            let mut scanner = dataset.scan();
+            scanner
+                .with_fragments(fragments)
+                .with_row_id()
+                .project(&[&field_path])?;
+            if column.nullable {
+                let column_expr = lance_datafusion::logical_expr::field_path_to_expr(&field_path)?;
+                scanner.filter_expr(column_expr.is_not_null());
+            }
+            let new_data_stream = scanner.try_into_stream().await?;
+            let stream_schema = new_data_stream.schema();
+            let row_id_position = stream_schema.index_of(ROW_ID).map_err(|_| {
+                Error::internal("v2.3 vector catch-up stream is missing its logical row-id column")
+            })?;
+            let selected_rows = Arc::new(missing_selection.clone());
+            let new_data_stream = new_data_stream.and_then(move |batch| {
+                futures::future::ready(super::scalar::filter_batch_to_logical_selection(
+                    &batch,
+                    row_id_position,
+                    selected_rows.as_ref(),
+                ))
+            });
+            let new_data_stream = RecordBatchStreamAdapter::new(stream_schema, new_data_stream);
+            let mut delta_options = options.clone();
+            delta_options.retrain = false;
+            delta_options.num_indices_to_merge = Some(0);
+            let (built_uuid, indices_merged, files) = optimize_vector_indices(
+                dataset.as_ref().clone(),
+                Some(new_data_stream),
+                &field_path,
+                &ivf_view,
+                &delta_options,
+                Some(delta_coverage.clone()),
+            )
+            .await?;
+            if indices_merged != 0 {
+                return Err(Error::internal(format!(
+                    "v2.3 vector catch-up unexpectedly merged {indices_merged} existing segments"
+                )));
+            }
+            let index_details = old_indices
+                .iter()
+                .filter_map(|index| index.index_details.as_ref())
+                .find(|details| !details.value.is_empty())
+                .map(|details| details.as_ref().clone())
+                .unwrap_or_else(vector_index_details_default);
+            let (removed_indices, retained_indices) = restrict_v23_index_owners(
+                dataset.as_ref(),
+                old_indices,
+                resolved_old,
+                &missing_selection,
+            )?;
+            return Ok(Some(IndexMergeResults {
+                new_uuid: built_uuid,
+                removed_indices,
+                retained_indices,
+                new_fragment_bitmap: RoaringBitmap::new(),
+                new_logical_coverage: Some(delta_coverage),
+                new_index_version: IndexType::Vector.version(),
+                new_index_details: index_details,
+                files,
+            }));
+        }
+
+        let source_index = dataset
+            .open_scalar_index(&field_path, &old_indices[0].uuid, &NoOpMetricsCollector)
+            .await?;
+        let new_uuid = Uuid::new_v4();
+        if source_index.index_type() != IndexType::BTree {
+            // Other scalar types keep the full-snapshot rebuild path until
+            // their trainers can consume an exact logical selection.
+            let created_index = rebuild_scalar_segment(
+                dataset.as_ref(),
+                &source_index,
+                &field_path,
+                dataset
+                    .schema()
+                    .field_by_id(field_id)
+                    .ok_or_else(|| Error::index(format!("column {field_id} does not exist")))?
+                    .name
+                    .as_str(),
+                new_uuid,
+                dataset.fragment_bitmap.iter().collect(),
+            )
+            .await?;
+            return Ok(Some(IndexMergeResults {
+                new_uuid,
+                removed_indices: old_indices.to_vec(),
+                retained_indices: Vec::new(),
+                new_fragment_bitmap: RoaringBitmap::new(),
+                new_logical_coverage: Some(current_coverage),
+                new_index_version: created_index.index_version as i32,
+                new_index_details: created_index.index_details,
+                files: created_index.files,
+            }));
+        }
+
+        let params = source_index.derive_index_params()?;
+        let column_name = dataset
+            .schema()
+            .field_by_id(field_id)
+            .ok_or_else(|| Error::index(format!("column {field_id} does not exist")))?
+            .name
+            .clone();
+        let created_index = super::scalar::build_btree_index_for_logical_selection(
+            dataset.as_ref(),
+            &column_name,
+            new_uuid,
+            &params,
+            fragments,
+            missing_selection.clone(),
+            &delta_coverage,
+            options.progress.clone(),
+        )
+        .await?;
+        let (removed_indices, retained_indices) = restrict_v23_index_owners(
+            dataset.as_ref(),
+            old_indices,
+            resolved_old,
+            &missing_selection,
+        )?;
+        return Ok(Some(IndexMergeResults {
+            new_uuid,
+            removed_indices,
+            retained_indices,
+            new_fragment_bitmap: RoaringBitmap::new(),
+            new_logical_coverage: Some(delta_coverage),
+            new_index_version: created_index.index_version as i32,
+            new_index_details: created_index.index_details,
+            files: created_index.files,
+        }));
+    }
+
     let new_uuid = Uuid::new_v4();
     let created_index = if first_is_vector {
         let source_index = dataset
@@ -136,6 +421,7 @@ async fn rebuild_v23_index<'a>(
     Ok(Some(IndexMergeResults {
         new_uuid,
         removed_indices: old_indices.to_vec(),
+        retained_indices: Vec::new(),
         new_fragment_bitmap: RoaringBitmap::new(),
         new_logical_coverage: Some(current_coverage),
         new_index_version: created_index.index_version as i32,
@@ -575,7 +861,7 @@ pub async fn merge_indices<'a>(
     };
 
     if dataset.manifest.uses_stable_logical_row_addresses() {
-        return rebuild_v23_index(dataset, old_indices, options).await;
+        return Box::pin(rebuild_v23_index(dataset, old_indices, options)).await;
     }
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
@@ -717,6 +1003,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 &field_path,
                 &selected_ivf_view,
                 options,
+                None,
             ))
             .await?;
             if indices_merged == 0 {
@@ -763,6 +1050,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 &field_path,
                 &ivf_view,
                 options,
+                None,
             )
             .boxed()
             .await?;
@@ -874,6 +1162,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     return Ok(Some(IndexMergeResults {
                         new_uuid,
                         removed_indices: old_indices.to_vec(),
+                        retained_indices: Vec::new(),
                         new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
                         new_logical_coverage: None,
                         new_index_version: created_index.index_version as i32,
@@ -905,16 +1194,17 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let scalar_index = dataset
                         .open_scalar_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
                         .await?;
-                    let inverted_index = scalar_index
-                        .as_any()
-                        .downcast_ref::<InvertedIndex>()
-                        .ok_or_else(|| {
-                            Error::index(format!(
-                                "Append index: expected inverted index segment {}, got {:?}",
-                                idx.uuid,
-                                scalar_index.index_type()
-                            ))
-                        })?;
+                    let inverted_index =
+                        crate::index::scalar_logical::raw_scalar_segment(scalar_index.as_ref())
+                            .as_any()
+                            .downcast_ref::<InvertedIndex>()
+                            .ok_or_else(|| {
+                                Error::index(format!(
+                                    "Append index: expected inverted index segment {}, got {:?}",
+                                    idx.uuid,
+                                    scalar_index.index_type()
+                                ))
+                            })?;
                     selected_indices.push(Arc::new(inverted_index.clone()));
                 }
 
@@ -991,6 +1281,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     Ok(Some(IndexMergeResults {
         new_uuid,
         removed_indices,
+        retained_indices: Vec::new(),
         new_fragment_bitmap,
         new_logical_coverage: None,
         new_index_version: created_index.index_version as i32,
@@ -1034,7 +1325,7 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[tokio::test]
-    async fn test_v23_scalar_optimize_rebuilds_logical_coverage() {
+    async fn test_v23_scalar_optimize_appends_logical_delta() {
         use lance_encoding::version::LanceFileVersion;
 
         let test_dir = TempStrDir::default();
@@ -1067,20 +1358,38 @@ mod tests {
             .await
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert!(indices[0].fragment_bitmap.is_none());
-        assert_eq!(
-            indices[0]
-                .logical_coverage
-                .as_ref()
-                .unwrap()
-                .shards
-                .iter()
-                .map(|shard| shard.row_count)
-                .sum::<u64>(),
-            24
-        );
-        let mut externalized = indices[0].clone();
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().all(|index| index.fragment_bitmap.is_none()));
+        let mut segment_rows = indices
+            .iter()
+            .map(|index| {
+                index
+                    .logical_coverage
+                    .as_ref()
+                    .unwrap()
+                    .shards
+                    .iter()
+                    .map(|shard| shard.row_count)
+                    .sum::<u64>()
+            })
+            .collect::<Vec<_>>();
+        segment_rows.sort_unstable();
+        assert_eq!(segment_rows, [8, 16]);
+        let mut externalized = indices
+            .iter()
+            .find(|index| {
+                index
+                    .logical_coverage
+                    .as_ref()
+                    .unwrap()
+                    .shards
+                    .iter()
+                    .map(|shard| shard.row_count)
+                    .sum::<u64>()
+                    == 8
+            })
+            .unwrap()
+            .clone();
         externalized
             .logical_coverage
             .as_mut()
@@ -1104,7 +1413,261 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v23_vector_optimize_rebuilds_logical_coverage() {
+    async fn test_v23_btree_update_catchup_transfers_exact_hot_set_ownership() {
+        use crate::dataset::UpdateBuilder;
+        use lance_encoding::version::LanceFileVersion;
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("value", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(1024), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 1024,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                true,
+            )
+            .await
+            .unwrap();
+        let original = dataset
+            .load_indices_by_name("value_idx")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let original_size = original
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum::<u64>();
+        let expected_ids = dataset
+            .scan()
+            .with_row_id()
+            .filter("id < 8")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let transferred = LogicalRowAddressSelection::from_bitmap(
+            roaring::RoaringTreemap::from_iter(expected_ids.iter().copied()),
+        )
+        .unwrap();
+        let mut external_summary = original.clone();
+        assert!(
+            external_summary
+                .logical_coverage
+                .as_mut()
+                .unwrap()
+                .externalize_detail_over(0)
+                .unwrap()
+        );
+        let resolved =
+            crate::index::resolve_logical_index_metadata(&dataset, std::slice::from_ref(&original))
+                .await
+                .unwrap();
+        let (removed, retained) =
+            restrict_v23_index_owners(&dataset, &[&external_summary], resolved, &transferred)
+                .unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(retained.len(), 1);
+        let retained_coverage = retained[0].logical_coverage.as_ref().unwrap();
+        assert!(retained_coverage.has_external_detail());
+        assert_eq!(
+            retained_coverage.shards[0]
+                .excluded_selection
+                .as_ref()
+                .unwrap()
+                .cardinality(),
+            8
+        );
+
+        dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 8")
+            .unwrap()
+            .set("value", "-1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+
+        let indices = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(indices.len(), 2);
+        let retained_base = indices
+            .iter()
+            .find(|index| index.uuid == original.uuid)
+            .unwrap();
+        assert_eq!(
+            retained_base
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .shards
+                .iter()
+                .filter_map(|shard| shard.excluded_selection.as_ref())
+                .map(LogicalRowAddressSelection::cardinality)
+                .sum::<u64>(),
+            8
+        );
+        let first_delta = indices
+            .iter()
+            .find(|index| index.uuid != original.uuid)
+            .unwrap();
+        let delta_size = first_delta
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum::<u64>();
+        assert!(
+            delta_size < original_size,
+            "selection delta ({delta_size}) should be smaller than base ({original_size})"
+        );
+        let exact_delta = crate::index::resolve_logical_index_coverage(&dataset, first_delta)
+            .await
+            .unwrap();
+        let actual_ids = exact_coverage_selection(&exact_delta, "delta coverage")
+            .unwrap()
+            .iter()
+            .map(|address| address.unwrap().raw())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual_ids, expected_ids);
+        let first_delta_uuid = first_delta.uuid;
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("value = -1")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("value >= 0")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            1016
+        );
+
+        dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 8")
+            .unwrap()
+            .set("value", "-2")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let second = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(second.len(), 2, "hot-set delta should be replaced");
+        assert!(second.iter().any(|index| index.uuid == original.uuid));
+        assert!(second.iter().all(|index| index.uuid != first_delta_uuid));
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("value = -2")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("value = -1")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            0
+        );
+
+        let consolidated = dataset.merge_existing_index_segments(second).await.unwrap();
+        dataset
+            .commit_existing_index_segments("value_idx", "value", vec![consolidated])
+            .await
+            .unwrap();
+        let merged = dataset.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(merged.len(), 1);
+        let merged_coverage = crate::index::resolve_logical_index_coverage(&dataset, &merged[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_coverage_selection(&merged_coverage, "merged coverage")
+                .unwrap()
+                .cardinality(),
+            1024
+        );
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("value = -1")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            dataset
+                .scan()
+                .filter("value = -2")
+                .unwrap()
+                .count_rows()
+                .await
+                .unwrap(),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_vector_optimize_appends_logical_delta() {
         use lance_encoding::version::LanceFileVersion;
 
         let test_dir = TempStrDir::default();
@@ -1159,31 +1722,37 @@ mod tests {
             .await
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1);
-        assert!(indices[0].fragment_bitmap.is_none());
-        assert_eq!(
-            indices[0]
-                .logical_coverage
-                .as_ref()
-                .unwrap()
-                .shards
-                .iter()
-                .map(|shard| shard.row_count)
-                .sum::<u64>(),
-            80
-        );
-        assert_eq!(
-            indices[0]
-                .logical_coverage
-                .as_ref()
-                .unwrap()
-                .external
-                .as_ref()
-                .unwrap()
-                .path,
-            INDEX_FILE_NAME
-        );
-        let mut externalized = indices[0].clone();
+        assert_eq!(indices.len(), 2);
+        assert!(indices.iter().all(|index| index.fragment_bitmap.is_none()));
+        let mut segment_rows = indices
+            .iter()
+            .map(|index| {
+                let coverage = index.logical_coverage.as_ref().unwrap();
+                assert_eq!(coverage.external.as_ref().unwrap().path, INDEX_FILE_NAME);
+                coverage
+                    .shards
+                    .iter()
+                    .map(|shard| shard.row_count)
+                    .sum::<u64>()
+            })
+            .collect::<Vec<_>>();
+        segment_rows.sort_unstable();
+        assert_eq!(segment_rows, [16, 64]);
+        let mut externalized = indices
+            .iter()
+            .find(|index| {
+                index
+                    .logical_coverage
+                    .as_ref()
+                    .unwrap()
+                    .shards
+                    .iter()
+                    .map(|shard| shard.row_count)
+                    .sum::<u64>()
+                    == 16
+            })
+            .unwrap()
+            .clone();
         externalized
             .logical_coverage
             .as_mut()
@@ -1217,6 +1786,274 @@ mod tests {
         let indexed = nearest_row_ids(&dataset, query.as_primitive::<Float32Type>(), true).await;
         let recall = indexed.intersection(&exact).count() as f32 / exact.len() as f32;
         assert!(recall >= 0.5, "vector optimize recall was {recall}");
+
+        let source_uuids = indices
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<std::collections::HashSet<_>>();
+        let merged = dataset
+            .merge_existing_index_segments(indices.to_vec())
+            .await
+            .unwrap();
+        assert!(!source_uuids.contains(&merged.uuid));
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![merged])
+            .await
+            .unwrap();
+        dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let committed = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        let coverage = crate::index::resolve_logical_index_coverage(&dataset, &committed[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_coverage_selection(&coverage, "merged vector coverage")
+                .unwrap()
+                .cardinality(),
+            80
+        );
+        assert_eq!(
+            coverage.external.as_ref().unwrap().path,
+            INDEX_FILE_NAME,
+            "the merged UUID must own its logical coverage artifact"
+        );
+        let indexed = nearest_row_ids(&dataset, query.as_primitive::<Float32Type>(), true).await;
+        let recall = indexed.intersection(&exact).count() as f32 / exact.len() as f32;
+        assert!(recall >= 0.5, "merged vector recall was {recall}");
+    }
+
+    #[tokio::test]
+    async fn test_v23_vector_commit_rejects_disjoint_metric_mismatch() {
+        use lance_encoding::version::LanceFileVersion;
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let centroids = dataset
+            .scan()
+            .project(&["vector"])
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()["vector"]
+            .as_fixed_size_list()
+            .clone();
+        let ivf = IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap();
+
+        let mut segments = Vec::new();
+        for fragment in fragments.iter() {
+            segments.push(
+                dataset
+                    .create_index_builder(
+                        &["vector"],
+                        IndexType::Vector,
+                        &VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf.clone()),
+                    )
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut cosine_details = segments[1]
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<lance_index::pb::VectorIndexDetails>()
+            .unwrap();
+        cosine_details.metric_type = lance_index::pb::VectorMetricType::Cosine.into();
+        segments[1].index_details = Some(Arc::new(
+            prost_types::Any::from_msg(&cosine_details).unwrap(),
+        ));
+
+        let error = dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mixes incompatible distance metrics"),
+            "unexpected mixed-metric commit error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_vector_update_catchup_builds_exact_delta() {
+        use lance_encoding::version::LanceFileVersion;
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 128,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &VectorIndexParams::ivf_flat(2, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        let original = dataset
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let original_size = original
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum::<u64>();
+        let expected_ids = dataset
+            .scan()
+            .with_row_id()
+            .filter("id < 8")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let updates = lance_datagen::gen_batch()
+            .col("id", array::step::<UInt32Type>())
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_batch_rows(RowCount::from(8))
+            .unwrap();
+        let query = updates["vector"].as_fixed_size_list().value(0);
+        let update_schema = updates.schema();
+        let merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap();
+        let (updated, stats) = merge
+            .execute(reader_to_stream(Box::new(RecordBatchIterator::new(
+                [Ok(updates)],
+                update_schema,
+            ))))
+            .await
+            .unwrap();
+        assert_eq!(stats.num_updated_rows, 8);
+        dataset = updated.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 2);
+        let retained_base = indices
+            .iter()
+            .find(|index| index.uuid == original.uuid)
+            .unwrap();
+        assert_eq!(
+            retained_base
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .shards
+                .iter()
+                .filter_map(|shard| shard.excluded_selection.as_ref())
+                .map(LogicalRowAddressSelection::cardinality)
+                .sum::<u64>(),
+            8
+        );
+        let delta = indices
+            .iter()
+            .find(|index| index.uuid != original.uuid)
+            .unwrap();
+        let delta_size = delta
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|file| file.size_bytes)
+            .sum::<u64>();
+        assert!(
+            delta_size < original_size,
+            "vector delta ({delta_size}) should be smaller than base ({original_size})"
+        );
+        let exact_delta = crate::index::resolve_logical_index_coverage(&dataset, delta)
+            .await
+            .unwrap();
+        let actual_ids = exact_coverage_selection(&exact_delta, "vector delta coverage")
+            .unwrap()
+            .iter()
+            .map(|address| address.unwrap().raw())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual_ids, expected_ids);
+
+        let mut nearest = dataset.scan();
+        nearest
+            .nearest("vector", query.as_primitive::<Float32Type>(), 1)
+            .unwrap()
+            .nprobes(2)
+            .with_row_id();
+        let nearest_id = nearest.try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .value(0);
+        assert_eq!(nearest_id, *expected_ids.first().unwrap());
+
+        let raw_merge_error = dataset
+            .merge_existing_index_segments(indices)
+            .await
+            .unwrap_err();
+        assert!(
+            raw_merge_error.to_string().contains("filtered rebuild"),
+            "unexpected vector raw-merge error: {raw_merge_error}"
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(usize::MAX))
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

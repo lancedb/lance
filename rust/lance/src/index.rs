@@ -35,6 +35,7 @@ use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::{
     LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY, LOGICAL_INDEX_COVERAGE_LENGTH_KEY,
     LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY, LOGICAL_INDEX_COVERAGE_OFFSET_KEY, LanceIndexStore,
+    OpenedIndexFile,
 };
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use lance_index::scalar::{CreatedIndex, IndexReader, IndexStore, ScalarIndex};
@@ -60,7 +61,7 @@ use lance_io::utils::{
 use lance_table::format::{
     FieldGeneration, Fragment, IndexFile, IndexMetadata, LogicalIndexCoverage,
     LogicalIndexCoverageArtifact, LogicalIndexCoverageFile, LogicalIndexCoverageShard,
-    LogicalRowAddressSelection, RowReferenceDomain, SelfDescribingFileReader,
+    LogicalRowAddressSelection, RowAddressLayout, RowReferenceDomain, SelfDescribingFileReader,
     list_index_files_with_sizes, pb as table_pb,
 };
 use lance_table::io::manifest::read_manifest_indexes;
@@ -101,6 +102,7 @@ use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
 use crate::session::index_caches::{
     FragReuseIndexKey, IndexMetadataKey, LogicalIndexCoverageArtifactKey,
+    LogicalIndexCoverageResolution,
 };
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
@@ -194,7 +196,9 @@ pub async fn build_logical_index_coverage(
         fields,
         validated_through,
     )?;
-    LogicalIndexCoverage::new_exact(vec![shard])
+    let mut coverage = LogicalIndexCoverage::new_exact(vec![shard])?;
+    mark_full_current_domain_proof(dataset, &mut coverage)?;
+    Ok(coverage)
 }
 
 pub(crate) async fn build_logical_index_coverage_artifact(
@@ -211,7 +215,7 @@ pub(crate) fn build_logical_index_coverage_artifact_from_exact(
     dataset: &Dataset,
     index_uuid: Uuid,
     field_ids: &[i32],
-    coverage: LogicalIndexCoverage,
+    mut coverage: LogicalIndexCoverage,
 ) -> Result<LogicalIndexCoverageArtifact> {
     let layout = dataset
         .manifest
@@ -223,6 +227,7 @@ pub(crate) fn build_logical_index_coverage_artifact_from_exact(
     let mut fields = field_ids.to_vec();
     fields.sort_unstable();
     fields.dedup();
+    mark_full_current_domain_proof(dataset, &mut coverage)?;
     let field_default_generations = fields
         .iter()
         .map(|field_id| {
@@ -326,6 +331,16 @@ pub(crate) async fn load_authoritative_logical_index_coverage(
         CoverageArtifactUse::StagedAdmission,
     )?;
     if let Some(requested) = index.logical_coverage.as_ref() {
+        if requested
+            .shards
+            .iter()
+            .any(|shard| shard.excluded_selection.is_some())
+        {
+            return Err(Error::invalid_input(format!(
+                "staged index segment {} cannot claim manifest ownership exclusions",
+                index.uuid
+            )));
+        }
         requested
             .resolve_from_authoritative(&artifact.coverage)
             .map_err(|_| {
@@ -578,10 +593,11 @@ fn validate_logical_index_coverage_artifact_owner(
 /// index anchor. Source floors are intentionally not re-applied here: they are
 /// an admission proof and may advance in the same commit that publishes this
 /// already-admitted segment.
-pub(crate) async fn resolve_logical_index_coverage(
+async fn resolve_logical_index_coverage_impl(
     dataset: &Dataset,
     index: &IndexMetadata,
-) -> Result<LogicalIndexCoverage> {
+    force_authoritative: bool,
+) -> Result<(LogicalIndexCoverage, Option<OpenedIndexFile>)> {
     let summary = index.logical_coverage.as_ref().ok_or_else(|| {
         Error::internal(format!(
             "v2.3 index segment {} is missing logical coverage",
@@ -603,8 +619,8 @@ pub(crate) async fn resolve_logical_index_coverage(
         })?;
     summary.validate_exact(Some(&index.fields), None)?;
     summary.validate_index_binding(layout.namespace_uuid, index.uuid, files)?;
-    if !summary.requires_authoritative_resolution() {
-        return Ok(summary.clone());
+    if !force_authoritative && !summary.requires_authoritative_resolution() {
+        return Ok((summary.clone(), None));
     }
 
     let external = summary.external.as_ref().ok_or_else(|| {
@@ -619,16 +635,18 @@ pub(crate) async fn resolve_logical_index_coverage(
                 external.path
             ))
         })?;
-    let artifact = dataset
+    let resolution = dataset
         .index_cache
         .get_or_insert_with_key(
             LogicalIndexCoverageArtifactKey {
+                namespace_uuid: layout.namespace_uuid,
                 uuid: &index.uuid,
-                summary_fingerprint: &summary.fingerprint,
+                object_id: &external.object_id,
             },
             || async {
                 let store = LanceIndexStore::from_dataset_for_existing(dataset, index).await?;
-                let reader = store.open_index_file(&external.path).await?;
+                let opened = store.open_index_file_handle(&external.path).await?;
+                let reader = opened.reader();
                 let (artifact, actual_external) =
                     decode_logical_index_coverage_artifact(reader.as_ref(), file)
                         .await?
@@ -644,21 +662,74 @@ pub(crate) async fn resolve_logical_index_coverage(
                         external.path
                     )));
                 }
-                Ok(artifact)
+                Ok(LogicalIndexCoverageResolution { artifact, opened })
             },
         )
         .await?;
+    let artifact = &resolution.artifact;
     validate_logical_index_coverage_artifact_owner(
         dataset,
         index,
-        artifact.as_ref(),
+        artifact,
         external,
         CoverageArtifactUse::CommittedResolution,
     )?;
     let resolved = summary.resolve_from_authoritative(&artifact.coverage)?;
     resolved.validate_index_binding(layout.namespace_uuid, index.uuid, files)?;
     resolved.validate_exact(Some(&index.fields), None)?;
-    Ok(resolved)
+    Ok((resolved, Some(resolution.opened.clone())))
+}
+
+pub(crate) async fn resolve_logical_index_coverage_from_authoritative(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<LogicalIndexCoverage> {
+    Ok(resolve_logical_index_coverage_impl(dataset, index, true)
+        .await?
+        .0)
+}
+
+pub(crate) async fn resolve_logical_index_coverage(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<LogicalIndexCoverage> {
+    Ok(resolve_logical_index_coverage_impl(dataset, index, false)
+        .await?
+        .0)
+}
+
+pub(crate) async fn resolve_logical_index_coverage_with_reader(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<(LogicalIndexCoverage, Option<OpenedIndexFile>)> {
+    resolve_logical_index_coverage_impl(dataset, index, false).await
+}
+
+#[cfg(test)]
+pub(crate) fn coverage_anchor_tail_gets(
+    stats: &lance_io::utils::tracking_store::IoStats,
+    index_id: Uuid,
+    external: &LogicalIndexCoverageFile,
+) -> usize {
+    let anchor_suffix = format!("{index_id}/{}", external.path);
+    stats
+        .requests
+        .iter()
+        .filter(|request| {
+            request.operation == lance_io::utils::tracking_store::IoOperation::Get
+                && request.path.as_ref().ends_with(&anchor_suffix)
+                && request.range.as_ref().map_or_else(
+                    || {
+                        // Small anchor files may be coalesced into one whole-object GET.
+                        request.num_bytes >= external.offset.saturating_add(external.byte_length)
+                    },
+                    |range| {
+                        range.start <= external.offset
+                            && range.end >= external.offset.saturating_add(external.byte_length)
+                    },
+                )
+        })
+        .count()
 }
 
 pub(crate) async fn resolve_logical_index_metadata(
@@ -682,6 +753,77 @@ pub(crate) async fn resolve_logical_index_metadata(
     }
     validate_resolved_logical_index_overlaps(&resolved)?;
     Ok(resolved)
+}
+
+/// Project the effective logical coverage of v2.3 index segments onto the
+/// current physical fragments. This bitmap is ephemeral query state: it is
+/// never persisted in index metadata and therefore does not require remapping
+/// postings when placement changes.
+pub(crate) struct LogicalIndexQueryScope {
+    pub(crate) physical_fragments: RoaringBitmap,
+    /// `None` is the compact identity set for all current logical rows.
+    pub(crate) logical_rows: Option<RoaringTreemap>,
+}
+
+pub(crate) async fn logical_index_query_scope(
+    dataset: &Dataset,
+    indices: &[IndexMetadata],
+) -> Result<LogicalIndexQueryScope> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Err(Error::invalid_input(
+            "logical index query scope is only valid for storage version 2.3",
+        ));
+    }
+    let mut current = Vec::with_capacity(indices.len());
+    for index in indices {
+        if logical_index_coverage_is_current(dataset, index)? {
+            current.push(index.clone());
+        }
+    }
+    if current.is_empty() {
+        return Ok(LogicalIndexQueryScope {
+            physical_fragments: RoaringBitmap::new(),
+            logical_rows: Some(RoaringTreemap::new()),
+        });
+    }
+    let current_refs = current.iter().collect::<Vec<_>>();
+    if logical_index_covers_all_current_slots(dataset, &current_refs)? {
+        return Ok(LogicalIndexQueryScope {
+            physical_fragments: dataset.fragment_bitmap.as_ref().clone(),
+            logical_rows: None,
+        });
+    }
+
+    let resolved = resolve_logical_index_metadata(dataset, &current).await?;
+    let resolved_refs = resolved.iter().collect::<Vec<_>>();
+    let effective = merge_logical_index_coverage(dataset, &resolved_refs)?;
+    let router = dataset.row_address_router()?;
+    let mut physical_fragments = RoaringBitmap::new();
+    let mut logical_rows = RoaringTreemap::new();
+    for shard in &effective.shards {
+        let selection = shard.selection.as_ref().ok_or_else(|| {
+            Error::internal("effective logical index coverage unexpectedly remained external")
+        })?;
+        let shard_rows = selection.to_roaring_treemap()?;
+        for (logical_fragment_id, slots) in shard_rows.bitmaps() {
+            physical_fragments |=
+                router.logical_selection_destination_fragments(logical_fragment_id, slots)?;
+        }
+        logical_rows |= shard_rows;
+    }
+    Ok(LogicalIndexQueryScope {
+        physical_fragments,
+        logical_rows: Some(logical_rows),
+    })
+}
+
+pub(crate) async fn logical_index_physical_coverage(
+    dataset: &Dataset,
+    indices: &[IndexMetadata],
+) -> Result<RoaringBitmap> {
+    Ok(logical_index_query_scope(dataset, indices)
+        .await?
+        .physical_fragments)
 }
 
 pub(crate) async fn finalize_v23_index_coverage(
@@ -758,11 +900,12 @@ pub fn merge_logical_index_coverage(
             ))
         })?;
         for shard in &coverage.shards {
-            let mut selection = required_logical_coverage_selection(
-                shard,
-                &format!("index segment {}", segment.uuid),
-            )?
-            .clone();
+            let mut selection = shard.effective_selection().map_err(|_| {
+                Error::internal(format!(
+                    "index segment {} logical coverage detail was not resolved from its index anchor",
+                    segment.uuid
+                ))
+            })?;
             let mut whole_shard_stale = false;
             for watermark in &shard.validated_through {
                 let default_is_newer = layout
@@ -800,27 +943,87 @@ pub fn merge_logical_index_coverage(
             )?);
         }
     }
-    LogicalIndexCoverage::new_exact(merged_shards)
+    let mut merged = LogicalIndexCoverage::new_exact(merged_shards)?;
+    mark_full_current_domain_proof(dataset, &mut merged)?;
+    Ok(merged)
 }
 
-pub(crate) fn fully_covered_logical_domains(
+pub(crate) fn mark_logical_coverage_validated_at_snapshot(
     dataset: &Dataset,
-    segments: &[&IndexMetadata],
-) -> Result<RoaringBitmap> {
-    if segments.is_empty() {
-        return Ok(RoaringBitmap::new());
+    effective: &LogicalIndexCoverage,
+) -> Result<LogicalIndexCoverage> {
+    if effective.shards.is_empty() {
+        return Err(Error::invalid_input(
+            "cannot materialize an index segment with empty effective logical coverage",
+        ));
     }
-    if segments.iter().any(|segment| {
-        segment
-            .logical_coverage
-            .as_ref()
-            .is_some_and(LogicalIndexCoverage::has_external_detail)
-    }) {
-        // This API is deliberately metadata-only. An external summary can
-        // prove possible coverage but not full slot coverage, so return the
-        // conservative result instead of adding index I/O.
-        return Ok(RoaringBitmap::new());
-    }
+    let shards = effective
+        .shards
+        .iter()
+        .map(|shard| {
+            let selection = shard.selection.clone().ok_or_else(|| {
+                Error::internal(
+                    "effective logical coverage unexpectedly remained external during materialization",
+                )
+            })?;
+            let validated_through = shard
+                .field_ids
+                .iter()
+                .map(|field_id| FieldGeneration {
+                    field_id: *field_id,
+                    generation: dataset.manifest.version,
+                })
+                .collect();
+            LogicalIndexCoverageShard::new_exact(
+                selection,
+                shard.field_ids.clone(),
+                validated_through,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut coverage = LogicalIndexCoverage::new_exact(shards)?;
+    mark_full_current_domain_proof(dataset, &mut coverage)?;
+    Ok(coverage)
+}
+
+fn logical_coverage_generations_cover_layout(
+    layout: &RowAddressLayout,
+    coverage: &LogicalIndexCoverage,
+) -> bool {
+    coverage.shards.iter().all(|shard| {
+        shard.excluded_selection.is_none()
+            && shard.validated_through.iter().all(|watermark| {
+                let Some(default_generation) = layout
+                    .field_default_generations
+                    .iter()
+                    .find(|generation| generation.field_id == watermark.field_id)
+                else {
+                    return false;
+                };
+                let Some(commit_floor) = layout
+                    .index_commit_floors
+                    .iter()
+                    .find(|generation| generation.field_id == watermark.field_id)
+                else {
+                    return false;
+                };
+                let required = layout
+                    .generation_regions
+                    .iter()
+                    .filter(|region| region.field_ids.binary_search(&watermark.field_id).is_ok())
+                    .fold(
+                        default_generation.generation.max(commit_floor.generation),
+                        |required, region| required.max(region.generation),
+                    );
+                watermark.generation >= required
+            })
+    })
+}
+
+fn exact_logical_coverage_covers_all_live_slots(
+    dataset: &Dataset,
+    coverage: &LogicalIndexCoverage,
+) -> Result<bool> {
     let layout = dataset
         .manifest
         .row_address_layout
@@ -828,20 +1031,27 @@ pub(crate) fn fully_covered_logical_domains(
         .ok_or_else(|| {
             Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
         })?;
-    let effective = merge_logical_index_coverage(dataset, segments)?;
+    if coverage.shards.is_empty()
+        || coverage
+            .shards
+            .iter()
+            .any(|shard| shard.excluded_selection.is_some())
+    {
+        return Ok(false);
+    }
+
     let mut covered = RoaringTreemap::new();
-    for shard in &effective.shards {
-        for range in
-            required_logical_coverage_selection(shard, "effective coverage")?.to_ranges()?
-        {
-            let start = (range.logical_fragment_id as u64) << 32 | range.start_slot as u64;
-            let end = (range.logical_fragment_id as u64) << 32 | range.end_slot as u64;
-            covered.insert_range(start..end);
-        }
+    for shard in &coverage.shards {
+        let selection = shard.selection.as_ref().ok_or_else(|| {
+            Error::invalid_input(
+                "full-domain proof requires resolved exact logical coverage detail",
+            )
+        })?;
+        covered |= selection.to_roaring_treemap()?;
     }
 
     let fragments = dataset.manifest.fragments.as_ref();
-    let mut fully_covered = RoaringBitmap::new();
+    let mut allocated = RoaringTreemap::new();
     for logical_fragment_id in layout.current_logical_fragment_bitmap(fragments)? {
         let domain = layout
             .logical_domain(fragments, logical_fragment_id)?
@@ -850,39 +1060,58 @@ pub(crate) fn fully_covered_logical_domains(
                     "current logical domain {logical_fragment_id} is missing metadata"
                 ))
             })?;
-        let start = (logical_fragment_id as u64) << 32;
-        let mut domain_slots = RoaringTreemap::new();
-        domain_slots.insert_range(start..start + domain.slot_count as u64);
-        for retired in &layout.retired_rows {
-            match &retired.membership {
-                lance_table::format::RetiredLogicalRowMembership::AllRows => {
-                    if retired
-                        .domains
-                        .domain_ordinal(logical_fragment_id)?
-                        .is_some()
-                    {
-                        domain_slots.clear();
-                    }
-                }
-                lance_table::format::RetiredLogicalRowMembership::Selection(selection) => {
-                    for range in selection
-                        .to_ranges()?
-                        .into_iter()
-                        .filter(|range| range.logical_fragment_id == logical_fragment_id)
-                    {
-                        domain_slots.remove_range(
-                            ((logical_fragment_id as u64) << 32 | range.start_slot as u64)
-                                ..((logical_fragment_id as u64) << 32 | range.end_slot as u64),
-                        );
-                    }
-                }
-            }
-        }
-        if domain_slots.is_subset(&covered) {
-            fully_covered.insert(logical_fragment_id);
-        }
+        let start = u64::from(logical_fragment_id) << 32;
+        allocated.insert_range(start..start + u64::from(domain.slot_count));
     }
-    Ok(fully_covered)
+    if !covered.is_subset(&allocated) {
+        return Ok(false);
+    }
+
+    let mut live = allocated;
+    live -= layout.retired_logical_row_bitmap()?;
+    Ok(live.is_subset(&covered))
+}
+
+fn mark_full_current_domain_proof(
+    dataset: &Dataset,
+    coverage: &mut LogicalIndexCoverage,
+) -> Result<()> {
+    coverage.set_full_domain_fingerprint(None)?;
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    if logical_coverage_generations_cover_layout(layout, coverage)
+        && exact_logical_coverage_covers_all_live_slots(dataset, coverage)?
+    {
+        coverage.set_full_domain_fingerprint(Some(layout.logical_domain_fingerprint.clone()))?;
+    }
+    Ok(())
+}
+
+fn logical_segment_requires_row_filter(dataset: &Dataset, segment: &IndexMetadata) -> Result<bool> {
+    let raw_rows = segment
+        .logical_coverage
+        .as_ref()
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "v2.3 index segment {} is missing exact logical coverage",
+                segment.uuid
+            ))
+        })?
+        .shards
+        .iter()
+        .map(|shard| shard.row_count)
+        .sum::<u64>();
+    let effective_rows = merge_logical_index_coverage(dataset, &[segment])?
+        .shards
+        .iter()
+        .map(|shard| shard.row_count)
+        .sum::<u64>();
+    Ok(raw_rows != effective_rows)
 }
 
 /// Return whether current, non-overlapping logical index segments cover every
@@ -893,6 +1122,9 @@ pub fn logical_index_covers_all_current_slots(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
 ) -> Result<bool> {
+    let [segment] = segments else {
+        return Ok(false);
+    };
     let layout = dataset
         .manifest
         .row_address_layout
@@ -900,8 +1132,24 @@ pub fn logical_index_covers_all_current_slots(
         .ok_or_else(|| {
             Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
         })?;
-    Ok(fully_covered_logical_domains(dataset, segments)?
-        == layout.current_logical_fragment_bitmap(dataset.manifest.fragments.as_ref())?)
+    let Some(coverage) = segment.logical_coverage.as_ref() else {
+        return Ok(false);
+    };
+    coverage.validate_exact(Some(&segment.fields), None)?;
+    if coverage.external.is_some() {
+        let files = segment.files.as_ref().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "v2.3 index segment {} is missing its declared files",
+                segment.uuid
+            ))
+        })?;
+        coverage.validate_index_binding(layout.namespace_uuid, segment.uuid, files)?;
+    }
+    Ok(coverage
+        .full_domain_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| fingerprint.as_slice() == layout.logical_domain_fingerprint)
+        && logical_coverage_generations_cover_layout(layout, coverage))
 }
 
 fn selections_intersect(
@@ -917,6 +1165,35 @@ pub(crate) fn validate_resolved_logical_index_overlaps(indices: &[IndexMetadata]
         by_name.entry(index.name.as_str()).or_default().push(index);
     }
     for (name, segments) in by_name {
+        let expected_fields = &segments[0].fields;
+        let expected_type = segments[0]
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.as_str());
+        let expected_vector_metric = vector_segment_metric(segments[0])?;
+        for segment in &segments[1..] {
+            if &segment.fields != expected_fields {
+                return Err(Error::invalid_input(format!(
+                    "v2.3 logical index '{name}' mixes fields {:?} and {:?}",
+                    expected_fields, segment.fields
+                )));
+            }
+            if segment
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.as_str())
+                != expected_type
+            {
+                return Err(Error::invalid_input(format!(
+                    "v2.3 logical index '{name}' mixes incompatible segment types"
+                )));
+            }
+            if vector_segment_metric(segment)? != expected_vector_metric {
+                return Err(Error::invalid_input(format!(
+                    "v2.3 logical vector index '{name}' mixes incompatible distance metrics"
+                )));
+            }
+        }
         for (position, left) in segments.iter().enumerate() {
             let left_coverage = left.logical_coverage.as_ref().ok_or_else(|| {
                 Error::internal(format!(
@@ -932,16 +1209,20 @@ pub(crate) fn validate_resolved_logical_index_overlaps(indices: &[IndexMetadata]
                     ))
                 })?;
                 for left_shard in &left_coverage.shards {
-                    let left_selection = required_logical_coverage_selection(
-                        left_shard,
-                        &format!("index segment {}", left.uuid),
-                    )?;
+                    let left_selection = left_shard.effective_selection().map_err(|_| {
+                        Error::internal(format!(
+                            "index segment {} logical coverage detail was not resolved from its index anchor",
+                            left.uuid
+                        ))
+                    })?;
                     for right_shard in &right_coverage.shards {
-                        let right_selection = required_logical_coverage_selection(
-                            right_shard,
-                            &format!("index segment {}", right.uuid),
-                        )?;
-                        if selections_intersect(left_selection, right_selection)? {
+                        let right_selection = right_shard.effective_selection().map_err(|_| {
+                            Error::internal(format!(
+                                "index segment {} logical coverage detail was not resolved from its index anchor",
+                                right.uuid
+                            ))
+                        })?;
+                        if selections_intersect(&left_selection, &right_selection)? {
                             return Err(Error::invalid_input(format!(
                                 "v2.3 logical index '{name}' has overlapping exact segment coverage between {} and {}",
                                 left.uuid, right.uuid
@@ -1123,10 +1404,12 @@ pub(crate) fn validate_index_contract(dataset: &Dataset, indices: &[IndexMetadat
                     let right = right.logical_coverage.as_ref().unwrap();
                     for left_shard in &left.shards {
                         for right_shard in &right.shards {
-                            if let (Some(left), Some(right)) = (
-                                left_shard.selection.as_ref(),
-                                right_shard.selection.as_ref(),
-                            ) && selections_intersect(left, right)?
+                            if left_shard.selection.is_some()
+                                && right_shard.selection.is_some()
+                                && selections_intersect(
+                                    &left_shard.effective_selection()?,
+                                    &right_shard.effective_selection()?,
+                                )?
                             {
                                 return Err(Error::internal(format!(
                                     "v2.3 logical index '{name}' has overlapping segment coverage"
@@ -1189,10 +1472,11 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
         for right in &logical_coverages[position + 1..] {
             for left_shard in &left.shards {
                 for right_shard in &right.shards {
-                    if let (Some(left), Some(right)) = (
-                        left_shard.selection.as_ref(),
-                        right_shard.selection.as_ref(),
-                    ) && left.overlaps(right)?
+                    if left_shard.selection.is_some()
+                        && right_shard.selection.is_some()
+                        && left_shard
+                            .effective_selection()?
+                            .overlaps(&right_shard.effective_selection()?)?
                     {
                         return Err(Error::invalid_input(format!(
                             "CreateIndex: overlapping logical coverage in segment set for index '{index_name}'"
@@ -1337,6 +1621,11 @@ async fn prewarm_opened_index(
             let inverted = index
                 .as_any()
                 .downcast_ref::<InvertedIndex>()
+                .or_else(|| {
+                    scalar_logical::raw_restricted_scalar_index(index.as_ref())?
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                })
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
                         "FTS prewarm options are only supported for inverted indices, got {:?}",
@@ -1548,8 +1837,28 @@ fn filter_index_segments_by_ids(
     Ok(filtered)
 }
 
+fn vector_segment_metric(segment: &IndexMetadata) -> Result<Option<i32>> {
+    let Some(details) = segment
+        .index_details
+        .as_ref()
+        .filter(|details| details.type_url.ends_with("VectorIndexDetails"))
+    else {
+        return Ok(None);
+    };
+    let details = details
+        .to_msg::<lance_index::pb::VectorIndexDetails>()
+        .map_err(|error| {
+            Error::invalid_input(format!(
+                "vector index segment {} has invalid details: {error}",
+                segment.uuid
+            ))
+        })?;
+    Ok(Some(details.metric_type))
+}
+
 fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) -> Result<()> {
     let mut type_url = None::<&str>;
+    let mut vector_metric = None::<i32>;
     for segment in segments {
         let segment_type_url = segment.index_details.as_ref().ok_or_else(|| {
             Error::invalid_input(format!(
@@ -1566,6 +1875,18 @@ fn validate_segment_index_details(index_name: &str, segments: &[IndexMetadata]) 
             }
             None => type_url = Some(segment_type_url.type_url.as_str()),
             Some(_) => {}
+        }
+        if let Some(metric) = vector_segment_metric(segment)? {
+            match vector_metric {
+                Some(expected) if expected != metric => {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: vector segment set for index '{}' mixes incompatible distance metrics",
+                        index_name
+                    )));
+                }
+                None => vector_metric = Some(metric),
+                Some(_) => {}
+            }
         }
     }
 
@@ -1888,10 +2209,11 @@ pub(crate) async fn remap_index(
 
             match scalar_index.index_type() {
                 IndexType::Inverted => {
-                    let inverted_index = scalar_index
-                        .as_any()
-                        .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
-                        .ok_or(Error::index("expected inverted index".to_string()))?;
+                    let inverted_index =
+                        crate::index::scalar_logical::raw_scalar_segment(scalar_index.as_ref())
+                            .as_any()
+                            .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+                            .ok_or(Error::index("expected inverted index".to_string()))?;
                     if inverted_index.is_legacy() {
                         log::warn!(
                             "reindex because of legacy format, index_type: {}, index_id: {}, field: {}",
@@ -2123,14 +2445,21 @@ impl IndexDescriptionImpl {
 
         for shard in &segments {
             if let Some(coverage) = shard.logical_coverage.as_ref() {
+                let owned_rows = coverage.shards.iter().try_fold(0_u64, |total, shard| {
+                    let excluded_rows = shard
+                        .excluded_selection
+                        .as_ref()
+                        .map_or(0, |selection| selection.cardinality());
+                    let owned_rows =
+                        shard.row_count.checked_sub(excluded_rows).ok_or_else(|| {
+                            Error::internal("logical index exclusion exceeds raw row count")
+                        })?;
+                    total
+                        .checked_add(owned_rows)
+                        .ok_or_else(|| Error::internal("logical index row count overflow"))
+                })?;
                 rows_indexed = rows_indexed
-                    .checked_add(
-                        coverage
-                            .shards
-                            .iter()
-                            .map(|coverage_shard| coverage_shard.row_count)
-                            .sum::<u64>(),
-                    )
+                    .checked_add(owned_rows)
                     .ok_or_else(|| Error::internal("logical index row count overflow"))?;
                 indexed_fragment_refs = indexed_fragment_refs
                     .checked_add(coverage.logical_fragment_bitmap()?.len())
@@ -2446,9 +2775,8 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let metadata_key = IndexMetadataKey {
-            version: self.version().version,
-        };
+        let metadata_key =
+            IndexMetadataKey::for_manifest(self.version().version, self.manifest.as_ref());
         let mut indices = match self.index_cache.get_with_key(&metadata_key).await {
             Some(indices) => indices,
             None => {
@@ -2553,11 +2881,25 @@ impl DatasetIndexExt for Dataset {
                     .to_string(),
             ));
         }
+        if self.manifest.uses_stable_logical_row_addresses()
+            && !all_btree
+            && source_segments
+                .iter()
+                .try_fold(false, |required, segment| {
+                    Ok::<_, Error>(required || logical_segment_requires_row_filter(self, segment)?)
+                })?
+        {
+            return Err(Error::not_supported(
+                "v2.3 immutable index segments with stale or transferred rows require an explicit filtered rebuild; merge_existing_index_segments refuses unfiltered scalar source material"
+                    .to_string(),
+            ));
+        }
 
         let merged_logical_coverage = if self.manifest.uses_stable_logical_row_addresses() {
-            Some(merge_logical_index_coverage(
-                self,
-                &source_segments.iter().collect::<Vec<_>>(),
+            let effective =
+                merge_logical_index_coverage(self, &source_segments.iter().collect::<Vec<_>>())?;
+            Some(mark_logical_coverage_validated_at_snapshot(
+                self, &effective,
             )?)
         } else {
             None
@@ -2565,9 +2907,9 @@ impl DatasetIndexExt for Dataset {
 
         let mut merged_segment = if all_vector {
             crate::index::vector::ivf::merge_segments(
-                self.object_store.as_ref(),
-                &self.indices_dir(),
+                self,
                 source_segments,
+                merged_logical_coverage.clone(),
             )
             .await?
         } else if all_inverted {
@@ -2901,6 +3243,7 @@ impl DatasetIndexExt for Dataset {
                 finalize_v23_index_coverage(self, &mut new_idx).await?;
             }
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
+            new_indices.extend(res.retained_indices);
             new_indices.push(new_idx);
         }
 
@@ -3246,6 +3589,14 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>>;
+    /// Open a vector index reusing an anchor reader retained by query planning.
+    async fn open_vector_index_with_reader(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+        preopened: Option<OpenedIndexFile>,
+    ) -> Result<Arc<dyn VectorIndex>>;
     /// Opens all segments for one logical vector index and returns a materialized snapshot.
     async fn open_logical_vector_index(
         &self,
@@ -3375,21 +3726,22 @@ impl DatasetIndexInternalExt for Dataset {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
+        self.open_vector_index_with_reader(column, uuid, metrics, None)
+            .await
+    }
+
+    async fn open_vector_index_with_reader(
+        &self,
+        column: &str,
+        uuid: &Uuid,
+        metrics: &dyn MetricsCollector,
+        preopened: Option<OpenedIndexFile>,
+    ) -> Result<Arc<dyn VectorIndex>> {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let index_meta = self
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        if self.manifest.uses_stable_logical_row_addresses() {
-            let mut siblings = self.load_indices_by_name(&index_meta.name).await?;
-            if siblings
-                .iter()
-                .all(|sibling| sibling.uuid != index_meta.uuid)
-            {
-                siblings.push(index_meta.clone());
-            }
-            resolve_logical_index_metadata(self, &siblings).await?;
-        }
         let object_store = self.object_store_for_index(&index_meta).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
@@ -3422,17 +3774,23 @@ impl DatasetIndexInternalExt for Dataset {
             .join(uuid.to_string())
             .join(INDEX_FILE_NAME);
         let file_sizes = index_meta.file_size_map();
-        let reader: Arc<dyn Reader> = vector::open_index_file(
-            object_store.as_ref(),
-            &index_file,
-            INDEX_FILE_NAME,
-            &file_sizes,
-        )
-        .await?
-        .into();
-
-        let tailing_bytes = read_last_block(reader.as_ref()).await?;
-        let (major_version, minor_version) = read_version(&tailing_bytes)?;
+        let preopened_current = preopened.and_then(|opened| opened.current_reader());
+        let (reader, major_version, minor_version): (Option<Arc<dyn Reader>>, _, _) =
+            if preopened_current.is_some() {
+                (None, 2, 0)
+            } else {
+                let reader: Arc<dyn Reader> = vector::open_index_file(
+                    object_store.as_ref(),
+                    &index_file,
+                    INDEX_FILE_NAME,
+                    &file_sizes,
+                )
+                .await?
+                .into();
+                let tailing_bytes = read_last_block(reader.as_ref()).await?;
+                let (major_version, minor_version) = read_version(&tailing_bytes)?;
+                (Some(reader), major_version, minor_version)
+            };
 
         // Namespace the index cache by the UUID of the index.
         let index_cache = self.index_cache.with_key_prefix(&cache_key.key());
@@ -3453,6 +3811,9 @@ impl DatasetIndexInternalExt for Dataset {
         ) {
             (0, 1) | (0, 0) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                let reader = reader.ok_or_else(|| {
+                    Error::internal("legacy vector index is missing its raw index reader")
+                })?;
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -3476,7 +3837,12 @@ impl DatasetIndexInternalExt for Dataset {
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = PreviousFileReader::try_new_self_described_from_reader(
-                    reader.clone(),
+                    reader
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::internal("legacy vector index is missing its raw index reader")
+                        })?
+                        .clone(),
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
@@ -3492,17 +3858,23 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 3) | (2, _) => {
-                let scheduler = Arc::new(ScanScheduler::new(
-                    self.object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&self.object_store),
-                ));
-                let reader = vector::ivf::v2::open_reader_cached(
-                    &scheduler,
-                    &index_file,
-                    self.metadata_cache.as_ref(),
-                    file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0),
-                )
-                .await?;
+                let reader = if let Some(reader) = preopened_current.as_ref() {
+                    reader.clone()
+                } else {
+                    let scheduler = Arc::new(ScanScheduler::new(
+                        self.object_store.clone(),
+                        SchedulerConfig::max_bandwidth(&self.object_store),
+                    ));
+                    Arc::new(
+                        vector::ivf::v2::open_reader_cached(
+                            &scheduler,
+                            &index_file,
+                            self.metadata_cache.as_ref(),
+                            file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0),
+                        )
+                        .await?,
+                    )
+                };
                 let index_metadata = reader
                     .schema()
                     .metadata
@@ -3529,6 +3901,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                Some(reader.clone()),
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3542,6 +3915,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                Some(reader.clone()),
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3561,6 +3935,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            Some(reader.clone()),
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3575,6 +3950,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            Some(reader.clone()),
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3589,6 +3965,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            Some(reader.clone()),
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3604,6 +3981,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                Some(reader.clone()),
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3617,6 +3995,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 self.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
+                                Some(reader.clone()),
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3632,6 +4011,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            Some(reader.clone()),
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3646,6 +4026,7 @@ impl DatasetIndexInternalExt for Dataset {
                             self.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
+                            Some(reader.clone()),
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3693,17 +4074,8 @@ impl DatasetIndexInternalExt for Dataset {
     ) -> Result<LogicalVectorIndex> {
         let uses_logical_addresses = self.manifest.uses_stable_logical_row_addresses();
         let mut metadatas = Vec::new();
-        for mut metadata in self.load_indices_by_name(name).await? {
+        for metadata in self.load_indices_by_name(name).await? {
             if logical_index_coverage_is_current(self, &metadata)? {
-                if uses_logical_addresses
-                    && metadata
-                        .logical_coverage
-                        .as_ref()
-                        .is_some_and(|coverage| coverage.requires_authoritative_resolution())
-                {
-                    metadata.logical_coverage =
-                        Some(resolve_logical_index_coverage(self, &metadata).await?);
-                }
                 metadatas.push(metadata);
             }
         }
@@ -3722,7 +4094,7 @@ impl DatasetIndexInternalExt for Dataset {
             )));
         }
         if uses_logical_addresses {
-            validate_resolved_logical_index_overlaps(&metadatas)?;
+            validate_segment_index_details(name, &metadatas)?;
         }
 
         let mut segments = Vec::with_capacity(metadatas.len());
@@ -6016,9 +6388,10 @@ mod tests {
         }
         // Write back via a no-op commit that carries the cleared indices.
         // We commit by doing a delete("false") after replacing the cached indices.
-        let metadata_key = crate::session::index_caches::IndexMetadataKey {
-            version: dataset.version().version,
-        };
+        let metadata_key = crate::session::index_caches::IndexMetadataKey::for_manifest(
+            dataset.version().version,
+            dataset.manifest.as_ref(),
+        );
         dataset
             .index_cache
             .insert_with_key(&metadata_key, Arc::new(indices))

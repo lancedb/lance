@@ -27,6 +27,8 @@ use crate::{
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
 };
 use arrow::compute::SortOptions;
+use arrow::compute::filter_record_batch;
+use arrow_array::{Array, BooleanArray, cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -38,6 +40,7 @@ use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Field;
+use lance_core::utils::address::LogicalRowAddress;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, Result};
 use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
@@ -57,11 +60,15 @@ use lance_index::scalar::registry::{
 };
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
-    RowIdRemapper, ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME,
-    inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
+    RowIdRemapper, ScalarIndex, ScalarIndexParams,
+    bitmap::BITMAP_LOOKUP_NAME,
+    inverted::INVERT_LIST_FILE,
+    lance_format::{LanceIndexStore, OpenedIndexFile},
 };
 use lance_index::{IndexCriteria, IndexType};
-use lance_table::format::{Fragment, IndexMetadata, pb as table_pb};
+use lance_table::format::{
+    Fragment, IndexMetadata, LogicalIndexCoverage, LogicalRowAddressSelection, pb as table_pb,
+};
 use log::info;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -372,6 +379,48 @@ pub(crate) async fn load_training_data(
     }
 }
 
+pub(crate) fn filter_training_data_to_logical_selection(
+    training_data: SendableRecordBatchStream,
+    selection: LogicalRowAddressSelection,
+) -> Result<SendableRecordBatchStream> {
+    let schema = training_data.schema();
+    let logical_address_position = schema
+        .index_of(ROW_ID)
+        .or_else(|_| schema.index_of(ROW_ADDR))
+        .map_err(|_| {
+            Error::internal(
+                "v2.3 selection training data is missing its logical row-address column",
+            )
+        })?;
+    let selection = Arc::new(selection);
+    let filtered = training_data.and_then(move |batch| {
+        let selection = selection.clone();
+        async move {
+            filter_batch_to_logical_selection(&batch, logical_address_position, selection.as_ref())
+                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))
+        }
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, filtered)))
+}
+
+pub(crate) fn filter_batch_to_logical_selection(
+    batch: &arrow_array::RecordBatch,
+    row_id_position: usize,
+    selection: &LogicalRowAddressSelection,
+) -> Result<arrow_array::RecordBatch> {
+    let row_ids = batch.column(row_id_position).as_primitive::<UInt64Type>();
+    if row_ids.null_count() != 0 {
+        return Err(Error::internal(
+            "v2.3 selection training data contains a null logical row id",
+        ));
+    }
+    let mut selected = Vec::with_capacity(row_ids.len());
+    for raw in row_ids.values() {
+        selected.push(selection.contains(LogicalRowAddress::try_from(*raw)?)?);
+    }
+    Ok(filter_record_batch(batch, &BooleanArray::from(selected))?)
+}
+
 // TODO: Allow users to register their own plugins
 static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
     LazyLock::new(IndexPluginRegistry::with_default_plugins);
@@ -485,6 +534,123 @@ pub(super) async fn build_scalar_index(
         .await?;
 
     Ok(created_index)
+}
+
+/// Build a v2.3 scalar segment from the current values of one exact logical selection.
+///
+/// This is a maintenance-path rebuild: physical fragments only bound the scan;
+/// logical coverage is the authoritative row set and is embedded in the output
+/// artifact under the new segment UUID.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all)]
+pub(super) async fn build_scalar_index_for_logical_selection(
+    dataset: &Dataset,
+    column: &str,
+    uuid: Uuid,
+    params: &ScalarIndexParams,
+    fragments: Vec<Fragment>,
+    selection: LogicalRowAddressSelection,
+    coverage: &LogicalIndexCoverage,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<CreatedIndex> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Err(Error::invalid_input(
+            "logical-selection scalar builds require storage version 2.3",
+        ));
+    }
+
+    let field = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::invalid_input_source(
+            format!("No column with name {}", column).into(),
+        ))?;
+    let field_id = field.id;
+    let field: arrow_schema::Field = field.into();
+    let index_store = configure_logical_coverage_artifact_from_exact(
+        dataset,
+        uuid,
+        &[field_id],
+        Some(coverage),
+        &params.index_type,
+        LanceIndexStore::from_dataset_for_new(dataset, &uuid)?,
+    )?;
+
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
+        Error::invalid_input_source(
+            format!(
+                "The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.",
+                params.index_type
+            )
+            .into(),
+        )
+    })?;
+    let training_request =
+        trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+
+    progress.stage_start("load_data", None, "rows").await?;
+    let training_data = scan_training_data(
+        dataset,
+        column,
+        training_request.criteria(),
+        Some(fragments.clone()),
+    )
+    .await?;
+    let training_data = filter_training_data_to_logical_selection(training_data, selection)?;
+    progress.stage_complete("load_data").await?;
+
+    trainer
+        .train_index(
+            training_data,
+            &index_store,
+            training_request,
+            Some(
+                fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+            ),
+            progress,
+        )
+        .await
+}
+
+/// Build a v2.3 BTree delta over one exact logical-row selection.
+///
+/// The selection and coverage are authored by the dataset core.  Restricting the
+/// physical scan alone is insufficient because an update fragment may contain
+/// rows outside the stale logical selection.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all)]
+pub(super) async fn build_btree_index_for_logical_selection(
+    dataset: &Dataset,
+    column: &str,
+    uuid: Uuid,
+    params: &ScalarIndexParams,
+    fragments: Vec<Fragment>,
+    selection: LogicalRowAddressSelection,
+    coverage: &LogicalIndexCoverage,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<CreatedIndex> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Err(Error::invalid_input(
+            "logical-selection BTree builds require storage version 2.3",
+        ));
+    }
+    if !params
+        .index_type
+        .eq_ignore_ascii_case(BuiltinIndexType::BTree.as_str())
+    {
+        return Err(Error::invalid_input(format!(
+            "logical-selection scalar builds currently support BTree, got '{}'",
+            params.index_type
+        )));
+    }
+    build_scalar_index_for_logical_selection(
+        dataset, column, uuid, params, fragments, selection, coverage, progress,
+    )
+    .await
 }
 
 /// Build a canonical bitmap index segment over a caller-selected fragment set.
@@ -610,15 +776,43 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    if dataset.manifest.uses_stable_logical_row_addresses() {
-        let mut siblings = dataset.load_indices_by_name(&index.name).await?;
-        if siblings.iter().all(|sibling| sibling.uuid != index.uuid) {
-            siblings.push(index.clone());
-        }
-        crate::index::resolve_logical_index_metadata(dataset, &siblings).await?;
-    }
+    open_resolved_scalar_index(dataset, column, index, metrics).await
+}
+
+pub(crate) async fn open_resolved_scalar_index(
+    dataset: &Dataset,
+    column: &str,
+    index: &IndexMetadata,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
+    open_resolved_scalar_index_with_reader(dataset, column, index, metrics, None).await
+}
+
+pub(crate) async fn open_resolved_scalar_index_with_reader(
+    dataset: &Dataset,
+    column: &str,
+    index: &IndexMetadata,
+    metrics: &dyn MetricsCollector,
+    preopened: Option<OpenedIndexFile>,
+) -> Result<Arc<dyn ScalarIndex>> {
     let index_uuid = index.uuid;
-    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
+    let mut index_store = LanceIndexStore::from_dataset_for_existing(dataset, index).await?;
+    if let Some(preopened) = preopened {
+        let anchor_path = index
+            .logical_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.external.as_ref())
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "preopened reader for index segment {} has no external coverage anchor",
+                    index.uuid
+                ))
+            })?
+            .path
+            .clone();
+        index_store = index_store.with_preopened_index_file(anchor_path, preopened);
+    }
+    let index_store = Arc::new(index_store);
 
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
@@ -655,9 +849,10 @@ pub async fn open_scalar_index(
         }
     });
 
-    plugin
+    let segment = plugin
         .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
-        .await
+        .await?;
+    crate::index::scalar_logical::restrict_scalar_segment_rows(dataset, segment, index).await
 }
 
 pub(crate) async fn infer_scalar_index_details(

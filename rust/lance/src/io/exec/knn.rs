@@ -68,6 +68,7 @@ use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::{Error, Result};
 use lance_arrow::*;
 
+use super::LogicalCoverageGroup;
 use super::utils::{
     FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
     SelectionVectorToPrefilter,
@@ -1109,19 +1110,22 @@ pub fn new_knn_exec(
     indices: &[IndexMetadata],
     query: &Query,
     prefilter_source: PreFilterSource,
+    logical_coverage_group: Option<LogicalCoverageGroup>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let ivf_node = ANNIvfPartitionExec::try_new(
+    let ivf_node = ANNIvfPartitionExec::try_new_with_logical_coverage(
         dataset.clone(),
         indices.iter().map(|idx| idx.uuid).collect_vec(),
         query.clone(),
+        logical_coverage_group.clone(),
     )?;
 
-    let sub_index = ANNIvfSubIndexExec::try_new(
+    let sub_index = ANNIvfSubIndexExec::try_new_with_logical_coverage(
         Arc::new(ivf_node),
         dataset,
         indices.to_vec(),
         query.clone(),
         prefilter_source,
+        logical_coverage_group,
     )?;
 
     Ok(Arc::new(sub_index))
@@ -1163,10 +1167,21 @@ pub struct ANNIvfPartitionExec {
     pub properties: Arc<PlanProperties>,
 
     pub metrics: ExecutionPlanMetricsSet,
+
+    logical_coverage_group: Option<LogicalCoverageGroup>,
 }
 
 impl ANNIvfPartitionExec {
     pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<Uuid>, query: Query) -> Result<Self> {
+        Self::try_new_with_logical_coverage(dataset, index_uuids, query, None)
+    }
+
+    pub(crate) fn try_new_with_logical_coverage(
+        dataset: Arc<Dataset>,
+        index_uuids: Vec<Uuid>,
+        query: Query,
+        logical_coverage_group: Option<LogicalCoverageGroup>,
+    ) -> Result<Self> {
         let dataset_schema = dataset.schema();
         get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
@@ -1189,6 +1204,7 @@ impl ANNIvfPartitionExec {
             index_uuids,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            logical_coverage_group,
         })
     }
 }
@@ -1278,15 +1294,25 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         let metrics = Arc::new(AnnPartitionMetrics::new(&self.metrics, partition));
         metrics.deltas_searched.add(self.index_uuids.len());
         let metrics_clone = metrics.clone();
+        let logical_coverage_group = self.logical_coverage_group.clone();
 
         let stream = stream::iter(self.index_uuids.clone())
             .map(move |uuid| {
                 let query = query.clone();
                 let ds = ds.clone();
                 let metrics = metrics.clone();
+                let logical_coverage_group = logical_coverage_group.clone();
                 async move {
+                    let preopened = logical_coverage_group
+                        .as_ref()
+                        .and_then(|group| group.preopened_index_file(&uuid));
                     let index = ds
-                        .open_vector_index(&query.column, &uuid, &metrics.index_metrics)
+                        .open_vector_index_with_reader(
+                            &query.column,
+                            &uuid,
+                            &metrics.index_metrics,
+                            preopened,
+                        )
                         .await?;
                     // Normalize cosine queries once before partition ranking.
                     let query = normalize_query_for_index(index.as_ref(), query.clone())?;
@@ -1390,6 +1416,8 @@ pub struct ANNIvfSubIndexExec {
     properties: Arc<PlanProperties>,
 
     metrics: ExecutionPlanMetricsSet,
+
+    logical_coverage_group: Option<LogicalCoverageGroup>,
 }
 
 impl ANNIvfSubIndexExec {
@@ -1399,6 +1427,17 @@ impl ANNIvfSubIndexExec {
         indices: Vec<IndexMetadata>,
         query: Query,
         prefilter_source: PreFilterSource,
+    ) -> Result<Self> {
+        Self::try_new_with_logical_coverage(input, dataset, indices, query, prefilter_source, None)
+    }
+
+    pub(crate) fn try_new_with_logical_coverage(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        indices: Vec<IndexMetadata>,
+        query: Query,
+        prefilter_source: PreFilterSource,
+        logical_coverage_group: Option<LogicalCoverageGroup>,
     ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
             return Err(Error::index(format!(
@@ -1420,6 +1459,7 @@ impl ANNIvfSubIndexExec {
             prefilter_source,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
+            logical_coverage_group,
         })
     }
 
@@ -1483,10 +1523,11 @@ struct ANNIvfEarlySearchResults {
     deltas_remaining: AtomicUsize,
     all_deltas_done: Notify,
     took_no_rows_shortcut: AtomicBool,
+    allow_no_rows_shortcut: bool,
 }
 
 impl ANNIvfEarlySearchResults {
-    fn new(deltas_remaining: usize, k: usize) -> Self {
+    fn new(deltas_remaining: usize, k: usize, allow_no_rows_shortcut: bool) -> Self {
         Self {
             k,
             initial_ids: Mutex::new(Vec::with_capacity(k)),
@@ -1494,6 +1535,7 @@ impl ANNIvfEarlySearchResults {
             deltas_remaining: AtomicUsize::new(deltas_remaining),
             all_deltas_done: Notify::new(),
             took_no_rows_shortcut: AtomicBool::new(false),
+            allow_no_rows_shortcut,
         }
     }
 
@@ -1656,7 +1698,9 @@ impl ANNIvfSubIndexExec {
                 // just return the prefilter ids and don't bother searching any further
 
                 // This next if check should be true, because we wouldn't get max_results otherwise
-                if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
+                if state.allow_no_rows_shortcut
+                    && let Some(iter_addrs) = prefilter_mask.iter_addrs()
+                {
                     // We only run this on the first delta because the prefilter mask is shared
                     // by all deltas and we don't want to duplicate the rows.
                     if state
@@ -1895,6 +1939,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 prefilter_source,
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
+                logical_coverage_group: self.logical_coverage_group.clone(),
             }
         } else {
             return Err(DataFusionError::Internal(
@@ -1915,7 +1960,21 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column = self.query.column.clone();
-        let indices = self.indices.clone();
+        let logical_coverage_group = self.logical_coverage_group.clone();
+        let indices = self
+            .indices
+            .iter()
+            .map(|index| {
+                let mut index = index.clone();
+                if let Some(coverage) = logical_coverage_group
+                    .as_ref()
+                    .and_then(|group| group.resolved_index_coverage(&index.uuid))
+                {
+                    index.logical_coverage = Some(coverage);
+                }
+                index
+            })
+            .collect::<Vec<_>>();
         let prefilter_source = self.prefilter_source.clone();
         let metrics = Arc::new(AnnIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
@@ -1973,13 +2032,28 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             PreFilterSource::None => None,
         };
 
-        let pre_filter = Arc::new(DatasetPreFilter::new(
-            ds.clone(),
-            &indices,
-            prefilter_loader,
-        ));
+        let uses_segment_filters = ds.manifest.uses_stable_logical_row_addresses();
+        let pre_filters = if uses_segment_filters {
+            DatasetPreFilter::new_logical_per_index(ds.clone(), &indices, prefilter_loader)
+                .map_err(|error| DataFusionError::Execution(error.to_string()))?
+        } else {
+            let shared = Arc::new(DatasetPreFilter::new(
+                ds.clone(),
+                &indices,
+                prefilter_loader,
+            ));
+            indices
+                .iter()
+                .map(|index| (index.uuid, shared.clone()))
+                .collect()
+        };
+        let pre_filters = Arc::new(pre_filters);
 
-        let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
+        let state = Arc::new(ANNIvfEarlySearchResults::new(
+            indices.len(),
+            query.k,
+            !uses_segment_filters,
+        ));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -1988,14 +2062,28 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let ds = ds.clone();
                     let column = column.clone();
                     let metrics = metrics.clone();
-                    let pre_filter = pre_filter.clone();
+                    let pre_filters = pre_filters.clone();
                     let state = state.clone();
+                    let logical_coverage_group = logical_coverage_group.clone();
                     let mut query = query.clone();
                     let pruned_nprobes = early_pruning(q_c_dists.values(), query.k);
                     adjust_probes(&mut query, pruned_nprobes);
                     async move {
+                        let pre_filter = pre_filters.get(&index_uuid).cloned().ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "ANNSubIndexExec has no prefilter for index segment {index_uuid}"
+                            ))
+                        })?;
+                        let preopened = logical_coverage_group
+                            .as_ref()
+                            .and_then(|group| group.preopened_index_file(&index_uuid));
                         let raw_index = ds
-                            .open_vector_index(&column, &index_uuid, &metrics.index_metrics)
+                            .open_vector_index_with_reader(
+                                &column,
+                                &index_uuid,
+                                &metrics.index_metrics,
+                                preopened,
+                            )
                             .await?;
                         let query = normalize_query_for_index(raw_index.as_ref(), query)?;
 
@@ -2917,7 +3005,7 @@ mod tests {
             prepared_index(row_ids);
         let mut query = base_query();
         query.minimum_nprobes = num_partitions;
-        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k, true));
 
         let partition_idx = (0..num_partitions as u32).collect::<Vec<_>>();
         let q_c_dists = (0..num_partitions)
@@ -2969,7 +3057,7 @@ mod tests {
             prepared_index(row_ids);
         let mut query = base_query();
         query.minimum_nprobes = num_partitions;
-        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k, true));
 
         let partition_idx = (0..num_partitions as u32).collect::<Vec<_>>();
         let q_c_dists = (0..num_partitions).map(|i| i as f32).collect::<Vec<_>>();
@@ -3007,7 +3095,7 @@ mod tests {
         query.k = 2;
         query.minimum_nprobes = 0;
         query.maximum_nprobes = Some(3);
-        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k, true));
         state.record_batch(
             &RecordBatch::try_new(
                 KNN_INDEX_SCHEMA.clone(),

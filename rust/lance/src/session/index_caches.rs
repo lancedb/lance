@@ -10,13 +10,17 @@
 //!     │    │
 //!     └────┴──► Index-specific cache (prefixed by index UUID and FRI UUID)
 
-use std::{borrow::Cow, fmt::Write as _, ops::Deref, sync::Arc};
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
-use lance_table::format::{IndexMetadata, LogicalIndexCoverageArtifact};
+use lance_index::scalar::lance_format::OpenedIndexFile;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_table::format::{IndexMetadata, LogicalIndexCoverageArtifact, Manifest};
 use uuid::Uuid;
+
+use crate::io::exec::LogicalCoverageGroup;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for index data.
 pub struct GlobalIndexCache(pub(super) LanceCache);
@@ -96,21 +100,106 @@ impl CacheKey for FragReuseIndexKey<'_> {
 
 #[derive(Debug)]
 pub struct LogicalIndexCoverageArtifactKey<'a> {
+    pub namespace_uuid: Uuid,
     pub uuid: &'a Uuid,
-    pub summary_fingerprint: &'a [u8],
+    pub object_id: &'a Uuid,
+}
+
+pub struct LogicalIndexCoverageResolution {
+    pub artifact: LogicalIndexCoverageArtifact,
+    pub opened: OpenedIndexFile,
+}
+
+impl DeepSizeOf for LogicalIndexCoverageResolution {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.artifact.deep_size_of_children(context) + self.opened.deep_size_of_children(context)
+    }
+}
+
+#[derive(Debug)]
+pub struct LogicalIndexInvalidationsKey<'a> {
+    pub namespace_uuid: Uuid,
+    pub version: u64,
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for LogicalIndexInvalidationsKey<'_> {
+    type ValueType = RowAddrTreeMap;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "logical_invalidations/{}/{}/{}",
+            self.namespace_uuid, self.version, self.uuid
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "LogicalIndexInvalidations"
+    }
+}
+
+#[derive(Debug)]
+pub struct LogicalLivenessMaskKey {
+    pub namespace_uuid: Uuid,
+    pub version: u64,
+    pub index_ids: Vec<Uuid>,
+}
+
+impl CacheKey for LogicalLivenessMaskKey {
+    type ValueType = RowAddrMask;
+
+    fn key(&self) -> Cow<'_, str> {
+        let mut key = format!(
+            "logical_liveness_mask/{}/{}",
+            self.namespace_uuid, self.version
+        );
+        for index_id in &self.index_ids {
+            key.push('/');
+            key.push_str(&index_id.to_string());
+        }
+        Cow::Owned(key)
+    }
+
+    fn type_name() -> &'static str {
+        "LogicalLivenessMask"
+    }
+}
+
+#[derive(Debug)]
+pub struct LogicalCoverageGroupKey {
+    pub namespace_uuid: Uuid,
+    pub version: u64,
+    pub index_ids: Vec<Uuid>,
+}
+
+impl CacheKey for LogicalCoverageGroupKey {
+    type ValueType = LogicalCoverageGroup;
+
+    fn key(&self) -> Cow<'_, str> {
+        let mut key = format!(
+            "logical_coverage_group/{}/{}",
+            self.namespace_uuid, self.version
+        );
+        for index_id in &self.index_ids {
+            key.push('/');
+            key.push_str(&index_id.to_string());
+        }
+        Cow::Owned(key)
+    }
+
+    fn type_name() -> &'static str {
+        "LogicalCoverageGroup"
+    }
 }
 
 impl CacheKey for LogicalIndexCoverageArtifactKey<'_> {
-    type ValueType = LogicalIndexCoverageArtifact;
+    type ValueType = LogicalIndexCoverageResolution;
 
     fn key(&self) -> Cow<'_, str> {
-        let mut key = String::with_capacity(54 + self.summary_fingerprint.len() * 2);
-        write!(&mut key, "logical_coverage/{}/", self.uuid)
-            .expect("writing to a String cannot fail");
-        for byte in self.summary_fingerprint {
-            write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
-        }
-        Cow::Owned(key)
+        Cow::Owned(format!(
+            "logical_coverage/{}/{}/{}",
+            self.namespace_uuid, self.uuid, self.object_id
+        ))
     }
 
     fn type_name() -> &'static str {
@@ -120,14 +209,30 @@ impl CacheKey for LogicalIndexCoverageArtifactKey<'_> {
 
 #[derive(Debug)]
 pub struct IndexMetadataKey {
+    pub namespace_uuid: Option<Uuid>,
     pub version: u64,
+}
+
+impl IndexMetadataKey {
+    pub(crate) fn for_manifest(version: u64, manifest: &Manifest) -> Self {
+        Self {
+            namespace_uuid: manifest
+                .row_address_layout
+                .as_ref()
+                .map(|layout| layout.namespace_uuid),
+            version,
+        }
+    }
 }
 
 impl CacheKey for IndexMetadataKey {
     type ValueType = Vec<IndexMetadata>;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(self.version.to_string())
+        Cow::Owned(match self.namespace_uuid {
+            Some(namespace_uuid) => format!("{namespace_uuid}/{}", self.version),
+            None => self.version.to_string(),
+        })
     }
 
     fn type_name() -> &'static str {
@@ -167,5 +272,57 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 
     fn type_name() -> &'static str {
         "ScalarIndexDetails"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_cache_keys_bind_dataset_incarnation() {
+        let first_namespace = Uuid::new_v4();
+        let second_namespace = Uuid::new_v4();
+        let index_id = Uuid::new_v4();
+        let object_id = Uuid::new_v4();
+        let keys = |namespace_uuid| {
+            vec![
+                LogicalLivenessMaskKey {
+                    namespace_uuid,
+                    version: 1,
+                    index_ids: vec![index_id],
+                }
+                .key()
+                .into_owned(),
+                LogicalIndexInvalidationsKey {
+                    namespace_uuid,
+                    version: 1,
+                    uuid: &index_id,
+                }
+                .key()
+                .into_owned(),
+                LogicalCoverageGroupKey {
+                    namespace_uuid,
+                    version: 1,
+                    index_ids: vec![index_id],
+                }
+                .key()
+                .into_owned(),
+                LogicalIndexCoverageArtifactKey {
+                    namespace_uuid,
+                    uuid: &index_id,
+                    object_id: &object_id,
+                }
+                .key()
+                .into_owned(),
+            ]
+        };
+
+        for (first, second) in keys(first_namespace)
+            .into_iter()
+            .zip(keys(second_namespace))
+        {
+            assert_ne!(first, second);
+        }
     }
 }

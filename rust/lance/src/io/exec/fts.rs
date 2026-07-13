@@ -35,9 +35,9 @@ use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
-use super::utils::{IndexMetrics, build_prefilter};
+use super::utils::{IndexMetrics, build_prefilters};
+use crate::Dataset;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
-use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
     FREQS_COLLECTED_METRIC, MetricsCollector,
@@ -54,6 +54,7 @@ use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer,
     flat_bm25_search_stream_with_metrics,
 };
+use lance_index::scalar::lance_format::OpenedIndexFile;
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
@@ -64,11 +65,17 @@ async fn open_fts_segment(
     column: &str,
     segment: &IndexMetadata,
     metrics: &IndexMetrics,
+    preopened_index_files: &HashMap<uuid::Uuid, OpenedIndexFile>,
 ) -> Result<Arc<InvertedIndex>> {
-    let index = dataset
-        .open_scalar_index(column, &segment.uuid, metrics)
-        .await?;
-    let inverted = index
+    let index = crate::index::scalar::open_resolved_scalar_index_with_reader(
+        dataset,
+        column,
+        segment,
+        metrics,
+        preopened_index_files.get(&segment.uuid).cloned(),
+    )
+    .await?;
+    let inverted = crate::index::scalar_logical::raw_scalar_segment(index.as_ref())
         .as_any()
         .downcast_ref::<InvertedIndex>()
         .ok_or_else(|| {
@@ -89,11 +96,12 @@ async fn open_fts_segments(
     column: &str,
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
+    preopened_index_files: &HashMap<uuid::Uuid, OpenedIndexFile>,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
     try_join_all(
-        segments
-            .iter()
-            .map(|segment| open_fts_segment(dataset, column, segment, metrics)),
+        segments.iter().map(|segment| {
+            open_fts_segment(dataset, column, segment, metrics, preopened_index_files)
+        }),
     )
     .await
 }
@@ -103,19 +111,25 @@ async fn search_segments(
     tokens: Arc<Tokens>,
     params: Arc<FtsSearchParams>,
     operator: lance_index::scalar::inverted::query::Operator,
-    pre_filter: Arc<dyn PreFilter>,
+    pre_filters: &[Arc<crate::index::prefilter::DatasetPreFilter>],
     metrics: Arc<FtsIndexMetrics>,
     base_scorer: Arc<MemBM25Scorer>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
+    if indices.len() != pre_filters.len() {
+        return Err(Error::internal(
+            "FTS index segment and prefilter counts differ",
+        ));
+    }
     let limit = params.limit.unwrap_or(usize::MAX);
     let mut candidates = std::collections::BinaryHeap::new();
     let searches = indices
         .iter()
-        .map(|index| {
+        .zip(pre_filters)
+        .map(|(index, pre_filter)| {
             let index = Arc::clone(index);
             let tokens = tokens.clone();
             let params = params.clone();
-            let pre_filter = pre_filter.clone();
+            let pre_filter: Arc<dyn PreFilter> = pre_filter.clone();
             let metrics = metrics.clone();
             let base_scorer = base_scorer.clone();
             async move {
@@ -231,6 +245,9 @@ pub struct MatchQueryExec {
     /// When set, `execute()` skips `load_segments` and searches exactly these
     /// segments.
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Readers opened while resolving external logical coverage. Keeping them
+    /// here lets index execution reuse the same anchor open.
+    preopened_index_files: Arc<HashMap<uuid::Uuid, OpenedIndexFile>>,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -289,6 +306,7 @@ impl MatchQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
+            preopened_index_files: Arc::new(HashMap::new()),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -324,6 +342,7 @@ impl MatchQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
+            preopened_index_files: Arc::new(HashMap::new()),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -343,6 +362,14 @@ impl MatchQueryExec {
     /// for constructing one.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub(crate) fn with_preopened_index_files(
+        mut self,
+        preopened_index_files: HashMap<uuid::Uuid, OpenedIndexFile>,
+    ) -> Self {
+        self.preopened_index_files = Arc::new(preopened_index_files);
         self
     }
 
@@ -415,6 +442,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source: PreFilterSource::None,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    preopened_index_files: self.preopened_index_files.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -442,6 +470,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    preopened_index_files: self.preopened_index_files.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -467,6 +496,7 @@ impl ExecutionPlan for MatchQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let preopened_index_files = self.preopened_index_files.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -484,11 +514,17 @@ impl ExecutionPlan for MatchQueryExec {
                     )))?,
             };
             let _details = load_segment_details(&ds, &column, &segments).await?;
-            let indices =
-                open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
+            let indices = open_fts_segments(
+                &ds,
+                &column,
+                &segments,
+                &metrics.index_metrics,
+                preopened_index_files.as_ref(),
+            )
+            .await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filters =
+                build_prefilters(context.clone(), partition, &prefilter_source, ds, &segments)?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -497,9 +533,11 @@ impl ExecutionPlan for MatchQueryExec {
                         deleted
                     });
             if !deleted_fragments.is_empty() {
-                Arc::get_mut(&mut pre_filter)
-                    .expect("prefilter just created")
-                    .set_deleted_fragments(deleted_fragments);
+                for pre_filter in &mut pre_filters {
+                    Arc::get_mut(pre_filter)
+                        .expect("prefilter just created")
+                        .set_deleted_fragments(deleted_fragments.clone());
+                }
             }
             metrics
                 .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
@@ -533,7 +571,12 @@ impl ExecutionPlan for MatchQueryExec {
                 ),
             };
 
-            pre_filter.wait_for_ready().await?;
+            try_join_all(
+                pre_filters
+                    .iter()
+                    .map(|pre_filter| pre_filter.wait_for_ready()),
+            )
+            .await?;
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
             let (doc_ids, mut scores) = search_segments(
@@ -541,7 +584,7 @@ impl ExecutionPlan for MatchQueryExec {
                 tokens,
                 params,
                 query.operator,
-                pre_filter,
+                &pre_filters,
                 metrics.clone(),
                 base_scorer,
             )
@@ -593,6 +636,7 @@ pub struct FlatMatchFilterExec {
     /// uses the first segment's tokenizer, but the full list is preserved so
     /// the field round-trips through `with_new_children`.
     preset_segments: Option<Vec<IndexMetadata>>,
+    preopened_index_files: Arc<HashMap<uuid::Uuid, OpenedIndexFile>>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -602,6 +646,7 @@ struct FlatMatchFilterStreamContext {
     query: MatchQuery,
     phrase_slop: Option<u32>,
     preset_segments: Option<Vec<IndexMetadata>>,
+    preopened_index_files: Arc<HashMap<uuid::Uuid, OpenedIndexFile>>,
 }
 
 impl DisplayAs for FlatMatchFilterExec {
@@ -632,6 +677,7 @@ impl FlatMatchFilterExec {
         dataset: &Dataset,
         column: &str,
         metrics: &IndexMetrics,
+        preopened_index_files: &HashMap<uuid::Uuid, OpenedIndexFile>,
     ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
         if let Some(segments) = load_segments(dataset, column).await? {
             let index_meta = segments.first().ok_or_else(|| {
@@ -640,9 +686,15 @@ impl FlatMatchFilterExec {
                     column
                 ))
             })?;
-            return Ok(open_fts_segment(dataset, column, index_meta, metrics)
-                .await?
-                .tokenizer());
+            return Ok(open_fts_segment(
+                dataset,
+                column,
+                index_meta,
+                metrics,
+                preopened_index_files,
+            )
+            .await?
+            .tokenizer());
         }
         Ok(default_text_tokenizer())
     }
@@ -652,13 +704,16 @@ impl FlatMatchFilterExec {
         column: &str,
         segments: &[IndexMetadata],
         metrics: &IndexMetrics,
+        preopened_index_files: &HashMap<uuid::Uuid, OpenedIndexFile>,
     ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
         let index_meta = segments.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(open_fts_segment(dataset, column, index_meta, metrics)
-            .await?
-            .tokenizer())
+        Ok(
+            open_fts_segment(dataset, column, index_meta, metrics, preopened_index_files)
+                .await?
+                .tokenizer(),
+        )
     }
 
     pub fn new(
@@ -674,6 +729,7 @@ impl FlatMatchFilterExec {
             phrase_slop: None,
             params,
             preset_segments: None,
+            preopened_index_files: Arc::new(HashMap::new()),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -695,6 +751,7 @@ impl FlatMatchFilterExec {
             phrase_slop: Some(phrase_slop),
             params,
             preset_segments: None,
+            preopened_index_files: Arc::new(HashMap::new()),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -716,6 +773,7 @@ impl FlatMatchFilterExec {
             phrase_slop: None,
             params,
             preset_segments: Some(segments),
+            preopened_index_files: Arc::new(HashMap::new()),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -738,8 +796,17 @@ impl FlatMatchFilterExec {
             phrase_slop: Some(phrase_slop),
             params,
             preset_segments: Some(segments),
+            preopened_index_files: Arc::new(HashMap::new()),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub(crate) fn with_preopened_index_files(
+        mut self,
+        preopened_index_files: HashMap<uuid::Uuid, OpenedIndexFile>,
+    ) -> Self {
+        self.preopened_index_files = Arc::new(preopened_index_files);
+        self
     }
 
     pub fn query(&self) -> &MatchQuery {
@@ -905,6 +972,7 @@ impl FlatMatchFilterExec {
             query,
             phrase_slop,
             preset_segments,
+            preopened_index_files,
         } = context;
         let metrics = Arc::new(FtsIndexMetrics::new(&metrics_set, partition));
         let column = query
@@ -921,10 +989,19 @@ impl FlatMatchFilterExec {
                     &column,
                     &segments,
                     &metrics.index_metrics,
+                    preopened_index_files.as_ref(),
                 )
                 .await?
             }
-            None => Self::load_tokenizer(&dataset, &column, &metrics.index_metrics).await?,
+            None => {
+                Self::load_tokenizer(
+                    &dataset,
+                    &column,
+                    &metrics.index_metrics,
+                    preopened_index_files.as_ref(),
+                )
+                .await?
+            }
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
 
@@ -1026,6 +1103,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
             phrase_slop: self.phrase_slop,
             params: self.params.clone(),
             preset_segments: self.preset_segments.clone(),
+            preopened_index_files: self.preopened_index_files.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
@@ -1047,6 +1125,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
                 query: self.query.clone(),
                 phrase_slop: self.phrase_slop,
                 preset_segments: self.preset_segments.clone(),
+                preopened_index_files: self.preopened_index_files.clone(),
             },
             self.metrics.clone(),
         );
@@ -1087,6 +1166,7 @@ pub struct FlatMatchQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
+    preopened_index_files: Arc<HashMap<uuid::Uuid, OpenedIndexFile>>,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -1135,6 +1215,7 @@ impl FlatMatchQueryExec {
             unindexed_input,
             base_scorer: None,
             preset_segments: None,
+            preopened_index_files: Arc::new(HashMap::new()),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1161,6 +1242,7 @@ impl FlatMatchQueryExec {
             unindexed_input,
             base_scorer: None,
             preset_segments: Some(segments),
+            preopened_index_files: Arc::new(HashMap::new()),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1169,6 +1251,14 @@ impl FlatMatchQueryExec {
     /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub(crate) fn with_preopened_index_files(
+        mut self,
+        preopened_index_files: HashMap<uuid::Uuid, OpenedIndexFile>,
+    ) -> Self {
+        self.preopened_index_files = Arc::new(preopened_index_files);
         self
     }
 
@@ -1231,6 +1321,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             unindexed_input,
             base_scorer: self.base_scorer.clone(),
             preset_segments: self.preset_segments.clone(),
+            preopened_index_files: self.preopened_index_files.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
@@ -1246,6 +1337,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let ds = self.dataset.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let preopened_index_files = self.preopened_index_files.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
@@ -1272,8 +1364,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
             let (tokenizer, base_scorer) = match segments {
                 Some(segments) => {
                     let _details = load_segment_details(&ds, &column, &segments).await?;
-                    let indices =
-                        open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
+                    let indices = open_fts_segments(
+                        &ds,
+                        &column,
+                        &segments,
+                        &metrics.index_metrics,
+                        preopened_index_files.as_ref(),
+                    )
+                    .await?;
                     metrics.record_parts_searched(
                         indices.iter().map(|index| index.partition_count()).sum(),
                     );
@@ -1357,6 +1455,8 @@ pub struct PhraseQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Readers opened while resolving external logical coverage.
+    preopened_index_files: Arc<HashMap<uuid::Uuid, OpenedIndexFile>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1406,6 +1506,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
+            preopened_index_files: Arc::new(HashMap::new()),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1434,6 +1535,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
+            preopened_index_files: Arc::new(HashMap::new()),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1442,6 +1544,14 @@ impl PhraseQueryExec {
     /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub(crate) fn with_preopened_index_files(
+        mut self,
+        preopened_index_files: HashMap<uuid::Uuid, OpenedIndexFile>,
+    ) -> Self {
+        self.preopened_index_files = Arc::new(preopened_index_files);
         self
     }
 
@@ -1507,6 +1617,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
                 preset_segments: self.preset_segments.clone(),
+                preopened_index_files: self.preopened_index_files.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -1532,6 +1643,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    preopened_index_files: self.preopened_index_files.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1557,6 +1669,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let preopened_index_files = self.preopened_index_files.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -1574,11 +1687,17 @@ impl ExecutionPlan for PhraseQueryExec {
                     )))?,
             };
             let _details = load_segment_details(&ds, &column, &segments).await?;
-            let indices =
-                open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
+            let indices = open_fts_segments(
+                &ds,
+                &column,
+                &segments,
+                &metrics.index_metrics,
+                preopened_index_files.as_ref(),
+            )
+            .await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filters =
+                build_prefilters(context.clone(), partition, &prefilter_source, ds, &segments)?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -1587,9 +1706,11 @@ impl ExecutionPlan for PhraseQueryExec {
                         deleted
                     });
             if !deleted_fragments.is_empty() {
-                Arc::get_mut(&mut pre_filter)
-                    .expect("prefilter just created")
-                    .set_deleted_fragments(deleted_fragments);
+                for pre_filter in &mut pre_filters {
+                    Arc::get_mut(pre_filter)
+                        .expect("prefilter just created")
+                        .set_deleted_fragments(deleted_fragments.clone());
+                }
             }
             metrics
                 .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());
@@ -1609,7 +1730,12 @@ impl ExecutionPlan for PhraseQueryExec {
                 ),
             };
 
-            pre_filter.wait_for_ready().await?;
+            try_join_all(
+                pre_filters
+                    .iter()
+                    .map(|pre_filter| pre_filter.wait_for_ready()),
+            )
+            .await?;
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
             let (doc_ids, scores) = search_segments(
@@ -1617,7 +1743,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 tokens,
                 params,
                 lance_index::scalar::inverted::query::Operator::And,
-                pre_filter,
+                &pre_filters,
                 metrics.clone(),
                 base_scorer,
             )
@@ -2175,7 +2301,10 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
 
     use crate::index::DatasetIndexExt;
     use arrow_array::{
@@ -2439,14 +2568,17 @@ mod tests {
             .unwrap();
 
         let metrics = IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics)
-            .await
-            .unwrap();
+        let no_preopened = HashMap::new();
+        let mut tokenizer =
+            FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics, &no_preopened)
+                .await
+                .unwrap();
         let query_tokens = collect_query_tokens("hello", &mut tokenizer);
 
-        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics)
-            .await
-            .unwrap();
+        let mut tokenizer =
+            FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics, &no_preopened)
+                .await
+                .unwrap();
         assert!(has_query_token("hello", &mut tokenizer, &query_tokens));
         assert!(
             !has_query_token("HELLO", &mut tokenizer, &query_tokens),
@@ -2698,9 +2830,11 @@ mod tests {
             .expect("FTS index just created");
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = IndexMetrics::new(&metrics_set, 0);
-        let indices = open_fts_segments(&dataset, "text", &preset_segments, &metrics)
-            .await
-            .unwrap();
+        let no_preopened = HashMap::new();
+        let indices =
+            open_fts_segments(&dataset, "text", &preset_segments, &metrics, &no_preopened)
+                .await
+                .unwrap();
         assert!(
             indices.len() >= 2,
             "expected >= 2 segments to exercise global IDF, got {}",

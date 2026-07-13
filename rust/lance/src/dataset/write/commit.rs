@@ -717,6 +717,7 @@ impl<'a> CommitBuilder<'a> {
             tag: None,
             transaction_properties: None,
             row_address_layout_delta,
+            original_request_fingerprint: None,
         };
         let requested_uuid = merged.uuid.clone();
         let dataset = self.execute(merged).await?;
@@ -909,6 +910,7 @@ mod tests {
             tag: None,
             transaction_properties: None,
             row_address_layout_delta: None,
+            original_request_fingerprint: None,
         }
     }
 
@@ -1559,6 +1561,7 @@ mod tests {
             tag: None,
             transaction_properties: None,
             row_address_layout_delta: None,
+            original_request_fingerprint: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

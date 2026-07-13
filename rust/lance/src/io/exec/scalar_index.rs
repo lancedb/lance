@@ -2,11 +2,14 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    collections::BTreeSet,
+    collections::HashMap,
     sync::{Arc, LazyLock},
 };
 
-use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
+use super::{
+    LogicalCoverageGroup,
+    utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter},
+};
 use crate::{
     Dataset,
     dataset::rowids::{load_row_id_sequence, load_row_id_sequences},
@@ -14,7 +17,8 @@ use crate::{
         DatasetIndexExt, PreFilter, logical_index_coverage_is_current,
         prefilter::DatasetPreFilter,
         scalar_logical::{
-            load_named_scalar_segments, open_named_scalar_index, scalar_index_fragment_bitmap,
+            open_named_scalar_index, open_named_scalar_index_with_readers,
+            scalar_index_fragment_bitmap,
         },
     },
 };
@@ -40,6 +44,7 @@ use lance_datafusion::{
         ExecutionPlanMetricsSetExt, SCALAR_INDEX_SEARCH_TIME_METRIC, SCALAR_INDEX_SER_TIME_METRIC,
     },
 };
+use lance_index::scalar::lance_format::OpenedIndexFile;
 use lance_index::{
     metrics::MetricsCollector,
     scalar::{
@@ -52,8 +57,9 @@ use lance_select::{
     RowAddrSelection, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use tracing::{debug_span, instrument};
+use uuid::Uuid;
 
 #[async_trait]
 impl ScalarIndexLoader for Dataset {
@@ -82,6 +88,56 @@ impl ScalarIndexLoader for Dataset {
         let lower = translate_addr_mask_to_row_ids(self, lower).await?;
         let upper = translate_addr_mask_to_row_ids(self, upper).await?;
         Ok(NullableIndexExprResult::new(lower, upper))
+    }
+}
+
+#[derive(Clone)]
+struct PlannedScalarIndexLoader {
+    dataset: Arc<Dataset>,
+    preopened: Arc<HashMap<Uuid, OpenedIndexFile>>,
+}
+
+impl PlannedScalarIndexLoader {
+    fn new(dataset: Arc<Dataset>, groups: &[LogicalCoverageGroup]) -> Self {
+        let mut preopened = HashMap::new();
+        for group in groups {
+            for index_id in group.index_ids() {
+                if let Some(opened) = group.preopened_index_file(index_id) {
+                    preopened.insert(*index_id, opened);
+                }
+            }
+        }
+        Self {
+            dataset,
+            preopened: Arc::new(preopened),
+        }
+    }
+}
+
+#[async_trait]
+impl ScalarIndexLoader for PlannedScalarIndexLoader {
+    async fn load_index(
+        &self,
+        column: &str,
+        index_name: &str,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        open_named_scalar_index_with_readers(
+            self.dataset.as_ref(),
+            column,
+            index_name,
+            metrics,
+            self.preopened.as_ref(),
+        )
+        .await
+    }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        <Dataset as ScalarIndexLoader>::row_addr_result_to_row_ids(self.dataset.as_ref(), result)
+            .await
     }
 }
 
@@ -186,6 +242,7 @@ async fn translate_addr_treemap_to_row_ids(
 pub struct ScalarIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
+    logical_coverage_groups: Option<Arc<Vec<LogicalCoverageGroup>>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     result_format: IndexExprResultWireFormat,
@@ -219,6 +276,7 @@ impl ScalarIndexExec {
         Self {
             dataset,
             expr: expr.optimize(),
+            logical_coverage_groups: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
@@ -227,6 +285,21 @@ impl ScalarIndexExec {
 
     pub fn dataset(&self) -> &Arc<Dataset> {
         &self.dataset
+    }
+
+    pub(crate) fn new_with_logical_coverage(
+        dataset: Arc<Dataset>,
+        expr: ScalarIndexExpr,
+        result_format: IndexExprResultWireFormat,
+        logical_coverage_groups: Vec<LogicalCoverageGroup>,
+    ) -> Self {
+        let mut exec = Self::new(dataset, expr, result_format);
+        exec.logical_coverage_groups = Some(Arc::new(logical_coverage_groups));
+        exec
+    }
+
+    pub(crate) fn logical_coverage_groups(&self) -> Option<&Arc<Vec<LogicalCoverageGroup>>> {
+        self.logical_coverage_groups.as_ref()
     }
 
     /// The parsed scalar-index expression this node will evaluate.
@@ -270,9 +343,44 @@ impl ScalarIndexExec {
         }
     }
 
+    fn logical_fragments_covered_by_index_query(
+        index_expr: &ScalarIndexExpr,
+        groups: &[LogicalCoverageGroup],
+    ) -> Result<RoaringBitmap> {
+        fn visit<'a>(
+            index_expr: &ScalarIndexExpr,
+            groups: &mut std::slice::Iter<'a, LogicalCoverageGroup>,
+        ) -> Result<RoaringBitmap> {
+            match index_expr {
+                ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
+                    Ok(visit(left, groups)? & visit(right, groups)?)
+                }
+                ScalarIndexExpr::Not(inner) => visit(inner, groups),
+                ScalarIndexExpr::Query(_) => groups
+                    .next()
+                    .map(|group| group.fully_covered_logical_fragments().clone())
+                    .ok_or_else(|| {
+                        Error::internal(
+                            "scalar index expression has more leaves than logical coverage groups",
+                        )
+                    }),
+            }
+        }
+
+        let mut groups = groups.iter();
+        let covered = visit(index_expr, &mut groups)?;
+        if groups.next().is_some() {
+            return Err(Error::internal(
+                "scalar index expression has fewer leaves than logical coverage groups",
+            ));
+        }
+        Ok(covered)
+    }
+
     async fn do_execute(
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
+        logical_coverage_groups: Option<Arc<Vec<LogicalCoverageGroup>>>,
         plan_metrics: ExecutionPlanMetricsSet,
         result_format: IndexExprResultWireFormat,
     ) -> Result<RecordBatch> {
@@ -280,10 +388,18 @@ impl ScalarIndexExec {
         let query_result = {
             let search_time = plan_metrics.new_time(SCALAR_INDEX_SEARCH_TIME_METRIC, 0);
             let _timer = search_time.timer();
-            expr.evaluate(dataset.as_ref(), &metrics).await?
+            if let Some(groups) = logical_coverage_groups.as_deref() {
+                let loader = PlannedScalarIndexLoader::new(dataset.clone(), groups);
+                expr.evaluate(&loader, &metrics).await?
+            } else {
+                expr.evaluate(dataset.as_ref(), &metrics).await?
+            }
         };
-        let fragments_covered_by_result =
-            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
+        let fragments_covered_by_result = if let Some(groups) = logical_coverage_groups.as_deref() {
+            Self::logical_fragments_covered_by_index_query(&expr, groups)?
+        } else {
+            Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?
+        };
         {
             let ser_time = plan_metrics.new_time(SCALAR_INDEX_SER_TIME_METRIC, 0);
             let _timer = ser_time.timer();
@@ -330,6 +446,7 @@ impl ExecutionPlan for ScalarIndexExec {
         let batch_fut = Self::do_execute(
             self.expr.clone(),
             self.dataset.clone(),
+            self.logical_coverage_groups.clone(),
             self.metrics.clone(),
             self.result_format,
         );
@@ -688,6 +805,7 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
+    logical_coverage_groups: Option<Arc<Vec<LogicalCoverageGroup>>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -744,35 +862,39 @@ impl Iterator for FragIdIter<'_> {
     }
 }
 
-fn collect_scalar_index_queries(expr: &ScalarIndexExpr, queries: &mut BTreeSet<(String, String)>) {
-    match expr {
-        ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
-            collect_scalar_index_queries(left, queries);
-            collect_scalar_index_queries(right, queries);
-        }
-        ScalarIndexExpr::Not(expr) => collect_scalar_index_queries(expr, queries),
-        ScalarIndexExpr::Query(search) => {
-            queries.insert((search.column.clone(), search.index_name.clone()));
+pub(crate) fn logical_coverage_effective_rows(
+    coverage_groups: &[LogicalCoverageGroup],
+) -> Result<Option<RoaringTreemap>> {
+    let mut effective: Option<RoaringTreemap> = None;
+    for group in coverage_groups {
+        if let Some(group_rows) = group.effective_rows()? {
+            effective = Some(match effective {
+                Some(rows) => rows & group_rows,
+                None => group_rows,
+            });
         }
     }
+    Ok(effective)
 }
 
-async fn logical_index_metadata_for_expr(
+pub(crate) fn logical_liveness_scope(
     dataset: &Dataset,
-    expr: &ScalarIndexExpr,
-) -> Result<Vec<lance_table::format::IndexMetadata>> {
-    let mut queries = BTreeSet::new();
-    collect_scalar_index_queries(expr, &mut queries);
-    let mut seen = BTreeSet::new();
-    let mut indices = Vec::new();
-    for (column, index_name) in queries {
-        for index in load_named_scalar_segments(dataset, &column, &index_name).await? {
-            if seen.insert(index.uuid) {
-                indices.push(index);
-            }
-        }
+    coverage_groups: &[LogicalCoverageGroup],
+) -> Result<(RoaringBitmap, Vec<uuid::Uuid>)> {
+    let index_ids = coverage_groups
+        .iter()
+        .flat_map(|group| group.index_ids().iter().copied())
+        .collect::<Vec<_>>();
+    let Some(effective) = logical_coverage_effective_rows(coverage_groups)? else {
+        return Ok((dataset.fragment_bitmap.as_ref().clone(), index_ids));
+    };
+    let router = dataset.row_address_router()?;
+    let mut physical_coverage = RoaringBitmap::new();
+    for (logical_fragment_id, slots) in effective.bitmaps() {
+        physical_coverage |=
+            router.logical_selection_destination_fragments(logical_fragment_id, slots)?;
     }
-    Ok(indices)
+    Ok((physical_coverage, index_ids))
 }
 
 impl MaterializeIndexExec {
@@ -791,9 +913,21 @@ impl MaterializeIndexExec {
             dataset,
             expr,
             fragments,
+            logical_coverage_groups: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub(crate) fn new_with_logical_coverage(
+        dataset: Arc<Dataset>,
+        expr: ScalarIndexExpr,
+        fragments: Arc<Vec<Fragment>>,
+        logical_coverage_groups: Option<Vec<LogicalCoverageGroup>>,
+    ) -> Self {
+        let mut exec = Self::new(dataset, expr, fragments);
+        exec.logical_coverage_groups = logical_coverage_groups.map(Arc::new);
+        exec
     }
 
     #[instrument(name = "materialize_scalar_index", skip_all, level = "debug")]
@@ -801,14 +935,13 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        planned_logical_coverage_groups: Option<Arc<Vec<LogicalCoverageGroup>>>,
         metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
         let span = debug_span!("create_prefilter");
-        let prefilter = if dataset.manifest.uses_stable_logical_row_addresses() {
-            let indices = logical_index_metadata_for_expr(dataset.as_ref(), &expr).await?;
-            Some(span.in_scope(|| {
-                DatasetPreFilter::do_create_deletion_mask_logical(dataset.clone(), indices).boxed()
-            }))
+        let uses_logical_addresses = dataset.manifest.uses_stable_logical_row_addresses();
+        let prefilter = if uses_logical_addresses {
+            None
         } else {
             let fragment_bitmap =
                 RoaringBitmap::from_iter(fragments.iter().map(|frag| frag.id as u32));
@@ -819,7 +952,6 @@ impl MaterializeIndexExec {
                 DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
             })
         };
-        let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
         // MaterializeIndexExec emits a deterministic set of row ids. The
         // `upper` mask of the interval is the candidate set (the answer is
         // a subset of `upper`). For `Exact` results this is the exact
@@ -835,13 +967,47 @@ impl MaterializeIndexExec {
             }
             Ok(result.upper)
         };
-        let mask = if let Some(prefilter) = prefilter {
+        let (mask, logical_coverage_groups) = if uses_logical_addresses {
+            let coverage_groups = match planned_logical_coverage_groups {
+                Some(groups) => groups.as_ref().clone(),
+                None => dataset.scan().logical_coverage_groups(&expr).await?,
+            };
+            let loader = PlannedScalarIndexLoader::new(dataset.clone(), &coverage_groups);
+            let expr_result = expr.evaluate(&loader, metrics.as_ref());
+            let (physical_coverage, index_ids) =
+                logical_liveness_scope(dataset.as_ref(), &coverage_groups)?;
+            let logical_coverage = logical_coverage_effective_rows(&coverage_groups)?;
+            let liveness = span.in_scope(|| {
+                DatasetPreFilter::do_create_logical_liveness_mask_for_physical_coverage(
+                    dataset.clone(),
+                    physical_coverage,
+                    logical_coverage,
+                    index_ids,
+                )
+                .boxed()
+            });
+            let (expr_result, prefilter) = futures::try_join!(expr_result, liveness)?;
+            (
+                take_upper(expr_result)? & (*prefilter).clone(),
+                Some(coverage_groups),
+            )
+        } else if let Some(prefilter) = prefilter {
+            let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
-            take_upper(expr_result)? & (*prefilter).clone()
+            (take_upper(expr_result)? & (*prefilter).clone(), None)
         } else {
-            take_upper(expr_result.await?)?
+            (
+                take_upper(expr.evaluate(dataset.as_ref(), metrics.as_ref()).await?)?,
+                None,
+            )
         };
-        let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
+        let ids = row_ids_for_mask(
+            mask,
+            &dataset,
+            &fragments,
+            logical_coverage_groups.as_deref(),
+        )
+        .await?;
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
@@ -854,7 +1020,20 @@ async fn logical_row_ids_for_mask(
     mask: &RowAddrMask,
     dataset: &Dataset,
     fragments: &[Fragment],
+    coverage_groups: &[LogicalCoverageGroup],
 ) -> Result<Vec<u64>> {
+    fn covered_by_all(groups: &[LogicalCoverageGroup], row_id: u64) -> Result<bool> {
+        if groups.is_empty() {
+            return Ok(false);
+        }
+        for group in groups {
+            if !group.contains_effective(row_id)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
     let target_fragments = fragments
         .iter()
@@ -868,7 +1047,12 @@ async fn logical_row_ids_for_mask(
     if let RowAddrMask::AllowList(allow_list) = mask
         && let Some(row_addrs) = allow_list.row_addrs()
     {
-        let candidates = row_addrs.map(u64::from).collect::<Vec<_>>();
+        let mut candidates = Vec::new();
+        for row_id in row_addrs.map(u64::from) {
+            if covered_by_all(coverage_groups, row_id)? {
+                candidates.push(row_id);
+            }
+        }
         let mut retained = Vec::with_capacity(candidates.len());
         for candidate_batch in candidates.chunks(RESOLVE_BATCH_SIZE) {
             let physical = dataset
@@ -904,15 +1088,17 @@ async fn logical_row_ids_for_mask(
             let physical = (start..end)
                 .map(|offset| RowAddress::new_from_parts(fragment_id, offset))
                 .collect::<Vec<_>>();
-            row_ids.extend(
-                dataset
-                    .resolve_current_physical_row_ids_async(&physical)
-                    .await?
-                    .into_iter()
-                    .flatten()
-                    .map(|logical| logical.raw())
-                    .filter(|logical| mask.selected(*logical)),
-            );
+            for logical in dataset
+                .resolve_current_physical_row_ids_async(&physical)
+                .await?
+                .into_iter()
+                .flatten()
+                .map(|logical| logical.raw())
+            {
+                if mask.selected(logical) && covered_by_all(coverage_groups, logical)? {
+                    row_ids.push(logical);
+                }
+            }
         }
     }
     Ok(row_ids)
@@ -923,9 +1109,16 @@ async fn row_ids_for_mask(
     mask: RowAddrMask,
     dataset: &Dataset,
     fragments: &[Fragment],
+    logical_coverage_groups: Option<&[LogicalCoverageGroup]>,
 ) -> Result<Vec<u64>> {
     if dataset.manifest.uses_stable_logical_row_addresses() {
-        return logical_row_ids_for_mask(&mask, dataset, fragments).await;
+        return logical_row_ids_for_mask(
+            &mask,
+            dataset,
+            fragments,
+            logical_coverage_groups.unwrap_or_default(),
+        )
+        .await;
     }
     match mask {
         RowAddrMask::BlockList(block_list) if block_list.is_empty() => {
@@ -1047,6 +1240,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.fragments.clone(),
+            self.logical_coverage_groups.clone(),
             metrics,
         );
         let stream = futures::stream::iter(vec![batch_fut])

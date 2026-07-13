@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: DATASET_ROOT=s3://bucket/prefix RESULT_ROOT=/absolute/path AWS_REGION=region EXPECTED_COMMIT=<40-hex> [PYTHON=/usr/bin/python3.11] [UNIT_NAME=stable-row-address-release] $0 {install|status}" >&2
+  echo "usage: DATASET_ROOT=s3://bucket/prefix RESULT_ROOT=/absolute/path AWS_REGION=region EXPECTED_COMMIT=<40-hex> [PYTHON=/usr/bin/python3.11] [CARGO_TARGET_DIR=/absolute/path] [UNIT_NAME=stable-row-address-release] $0 {install|status}" >&2
   exit 2
 }
 
@@ -25,11 +25,12 @@ install_service() {
   : "${AWS_REGION:?AWS_REGION is required}"
   : "${EXPECTED_COMMIT:?EXPECTED_COMMIT is required}"
   PYTHON=${PYTHON:-/usr/bin/python3.11}
+  CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-}
   [[ ${EXPECTED_COMMIT} =~ ^[0-9a-f]{40}$ ]] || {
     echo "EXPECTED_COMMIT must be a lowercase full Git SHA" >&2
     exit 2
   }
-  for value in "${DATASET_ROOT}" "${RESULT_ROOT}" "${AWS_REGION}" "${EXPECTED_COMMIT}" "${PYTHON}"; do
+  for value in "${DATASET_ROOT}" "${RESULT_ROOT}" "${AWS_REGION}" "${EXPECTED_COMMIT}" "${PYTHON}" "${CARGO_TARGET_DIR}"; do
     [[ ${value} =~ ^[-_./:a-zA-Z0-9]+$ ]] || {
       echo "service environment contains unsupported characters: ${value}" >&2
       exit 2
@@ -60,6 +61,14 @@ install_service() {
   cargo_bin=$(dirname "$(command -v cargo)")
   mkdir -p "${RESULT_ROOT}"
   RESULT_ROOT=$(cd "${RESULT_ROOT}" && pwd -P)
+  if [[ -n ${CARGO_TARGET_DIR} ]]; then
+    [[ ${CARGO_TARGET_DIR} == /* ]] || {
+      echo "CARGO_TARGET_DIR must be absolute" >&2
+      exit 2
+    }
+    mkdir -p "${CARGO_TARGET_DIR}"
+    CARGO_TARGET_DIR=$(cd "${CARGO_TARGET_DIR}" && pwd -P)
+  fi
   environment_file="/etc/systemd/system/${UNIT_NAME}.environment"
   unit_file="/etc/systemd/system/${UNIT_NAME}.service"
   environment_tmp="${RESULT_ROOT}/.${UNIT_NAME}.environment.tmp-$$"
@@ -71,6 +80,9 @@ install_service() {
     printf 'AWS_REGION=%s\n' "${AWS_REGION}"
     printf 'EXPECTED_COMMIT=%s\n' "${EXPECTED_COMMIT}"
     printf 'PYTHON=%s\n' "${PYTHON}"
+    if [[ -n ${CARGO_TARGET_DIR} ]]; then
+      printf 'CARGO_TARGET_DIR=%s\n' "${CARGO_TARGET_DIR}"
+    fi
     printf 'HOME=%s\n' "${service_home}"
     printf 'PATH=%s:/usr/local/bin:/usr/bin:/bin\n' "${cargo_bin}"
   } >"${environment_tmp}"

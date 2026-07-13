@@ -70,7 +70,7 @@ pub(crate) async fn open_and_merge_segments(
     for &segment in segments {
         let scalar_index =
             super::open_scalar_index(dataset, field_path, segment, &NoOpMetricsCollector).await?;
-        let btree = scalar_index
+        let btree = crate::index::scalar_logical::raw_scalar_segment(scalar_index.as_ref())
             .as_any()
             .downcast_ref::<BTreeIndex>()
             .ok_or_else(|| {
@@ -122,10 +122,21 @@ pub(crate) async fn merge_segments(
     let logical_coverage = dataset
         .manifest
         .uses_stable_logical_row_addresses()
-        .then(|| crate::index::merge_logical_index_coverage(dataset, &segment_refs))
+        .then(|| {
+            let effective = crate::index::merge_logical_index_coverage(dataset, &segment_refs)?;
+            crate::index::mark_logical_coverage_validated_at_snapshot(dataset, &effective)
+        })
         .transpose()?;
     let (fragment_bitmap, old_data_filters) = if logical_coverage.is_some() {
-        (RoaringBitmap::new(), vec![None; segment_refs.len()])
+        let old_data_filters = segment_refs
+            .iter()
+            .map(|segment| {
+                let effective = crate::index::merge_logical_index_coverage(dataset, &[*segment])?;
+                let row_ids = crate::index::scalar_logical::logical_coverage_row_ids(&effective)?;
+                Ok(Some(OldIndexDataFilter::RowIds(row_ids)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        (RoaringBitmap::new(), old_data_filters)
     } else {
         crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?
     };

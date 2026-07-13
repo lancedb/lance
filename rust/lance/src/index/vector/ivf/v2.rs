@@ -1005,6 +1005,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Create a new IVF index.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
         index_dir: Path,
@@ -1013,6 +1014,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
         file_sizes: HashMap<String, u64>,
+        preopened_index_reader: Option<Arc<FileReader>>,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
@@ -1023,13 +1025,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .clone()
             .join(uuid_str.as_str())
             .join(INDEX_FILE_NAME);
-        let index_reader = open_reader_cached(
-            &scheduler,
-            &uri,
-            file_metadata_cache,
-            file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0),
-        )
-        .await?;
+        let index_reader = match preopened_index_reader {
+            Some(reader) => reader.as_ref().clone(),
+            None => {
+                open_reader_cached(
+                    &scheduler,
+                    &uri,
+                    file_metadata_cache,
+                    file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0),
+                )
+                .await?
+            }
+        };
         let index_metadata: IndexMetadata = serde_json::from_str(
             index_reader
                 .schema()
@@ -3939,9 +3946,9 @@ mod tests {
 
         let progress = Arc::new(RecordingProgress::default());
         let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
-            dataset.object_store.as_ref(),
-            &dataset.indices_dir(),
+            &dataset,
             segments,
+            None,
             progress.clone(),
         )
         .await
@@ -4091,27 +4098,33 @@ mod tests {
     ) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..4, dataset)
-                    .await;
+                Box::pin(test_index_impl::<UInt8Type>(
+                    params,
+                    nlist,
+                    recall_requirement,
+                    0..4,
+                    dataset,
+                ))
+                .await;
             }
             _ => {
-                test_index_impl::<Float32Type>(
+                Box::pin(test_index_impl::<Float32Type>(
                     params.clone(),
                     nlist,
                     recall_requirement,
                     0.0..1.0,
                     dataset.clone(),
-                )
+                ))
                 .await;
 
                 if dataset.is_none() {
-                    test_index_impl::<Float64Type>(
+                    Box::pin(test_index_impl::<Float64Type>(
                         params,
                         nlist,
                         recall_requirement,
                         0.0..1.0,
                         dataset,
-                    )
+                    ))
                     .await;
                 }
             }

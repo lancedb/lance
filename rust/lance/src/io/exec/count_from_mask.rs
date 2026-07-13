@@ -19,7 +19,7 @@
 //! support; the others (mask-to-answer, zone-aware, dimension-keyed) each
 //! need additional plumbing — see the corresponding design issue.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
@@ -33,16 +33,19 @@ use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result};
-use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use lance_table::format::Fragment;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use tracing::instrument;
 
-use super::utils::InstrumentedRecordBatchStreamAdapter;
+use super::{
+    LogicalCoverageGroup,
+    scalar_index::{logical_coverage_effective_rows, logical_liveness_scope},
+    utils::InstrumentedRecordBatchStreamAdapter,
+};
 use crate::Dataset;
 use crate::dataset::rowids::load_row_id_sequences;
-use crate::index::prefilter::{DatasetPreFilter, PreFilter};
-use crate::index::{DatasetIndexExt, logical_index_coverage_is_current};
+use crate::index::prefilter::DatasetPreFilter;
 
 /// An execution node that computes a `COUNT(*)`-style aggregate from an
 /// optional row-address mask supplied by an upstream scalar-index search,
@@ -68,6 +71,7 @@ pub struct CountFromMaskExec {
     /// fragments only — the uncovered fragments are handled by a parallel
     /// scan branch.
     restrict_to_fragments: Option<RoaringBitmap>,
+    logical_coverage_groups: Option<Arc<Vec<LogicalCoverageGroup>>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -140,10 +144,23 @@ impl CountFromMaskExec {
             aggregate_funcs,
             prefilter_input,
             restrict_to_fragments,
+            logical_coverage_groups: None,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    pub(crate) fn try_new_logical(
+        dataset: Arc<Dataset>,
+        aggregate_funcs: Vec<Arc<AggregateFunctionExpr>>,
+        prefilter_input: Arc<dyn ExecutionPlan>,
+        coverage_groups: Arc<Vec<LogicalCoverageGroup>>,
+    ) -> Result<Self> {
+        let mut exec =
+            Self::try_new_restricted(dataset, aggregate_funcs, Some(prefilter_input), None)?;
+        exec.logical_coverage_groups = Some(coverage_groups);
+        Ok(exec)
     }
 
     /// Drain `prefilter_input` (a [`super::scalar_index::ScalarIndexExec`])
@@ -334,70 +351,254 @@ impl CountFromMaskExec {
         Ok(universe)
     }
 
-    fn logical_address_universe(dataset: &Dataset) -> Result<RowAddrTreeMap> {
-        let layout = dataset
-            .manifest
-            .row_address_layout
-            .as_ref()
-            .ok_or_else(|| {
-                Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
-            })?;
-        let fragments = dataset.manifest.fragments.as_ref();
-        let mut universe = RowAddrTreeMap::new();
-        for logical_fragment_id in layout.current_logical_fragment_bitmap(fragments)? {
-            let domain = layout
-                .logical_domain(fragments, logical_fragment_id)?
-                .ok_or_else(|| {
-                    Error::internal(format!(
-                        "current logical domain {logical_fragment_id} is missing metadata"
-                    ))
-                })?;
-            let start = (logical_fragment_id as u64) << 32;
-            universe.insert_range(start..start + domain.slot_count as u64);
-        }
-        Ok(universe)
-    }
-
-    fn collect_index_names(
-        expr: &lance_index::scalar::expression::ScalarIndexExpr,
-        names: &mut HashSet<String>,
-    ) {
-        use lance_index::scalar::expression::ScalarIndexExpr;
-        match expr {
-            ScalarIndexExpr::Not(inner) => Self::collect_index_names(inner, names),
-            ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
-                Self::collect_index_names(left, names);
-                Self::collect_index_names(right, names);
+    /// Count an index mask inside the current logical domains and the index's
+    /// effective coverage without materializing the logical-row universe.
+    ///
+    /// Positive predicates enumerate their postings and subtract liveness
+    /// invalidations. Negated predicates start from the coverage cardinality
+    /// and subtract the union of their postings and liveness invalidations.
+    /// Memory is therefore bounded by the existing postings, coverage, and
+    /// invalidation bitmaps instead of by the dataset's total row count.
+    fn count_logical_mask<F>(
+        current_domains: &RoaringBitmap,
+        mut domain_slot_count: F,
+        coverage: Option<&RoaringTreemap>,
+        prefilter: &RowAddrMask,
+        liveness: &RowAddrMask,
+    ) -> Result<u64>
+    where
+        F: FnMut(u32) -> Result<Option<u32>>,
+    {
+        fn checked_slot_count<F>(
+            current_domains: &RoaringBitmap,
+            domain_slot_count: &mut F,
+            logical_fragment_id: u32,
+        ) -> Result<Option<u32>>
+        where
+            F: FnMut(u32) -> Result<Option<u32>>,
+        {
+            if !current_domains.contains(logical_fragment_id) {
+                return Ok(None);
             }
-            ScalarIndexExpr::Query(search) => {
-                names.insert(search.index_name.clone());
-            }
+            domain_slot_count(logical_fragment_id)
         }
-    }
 
-    async fn logical_index_mask(
-        dataset: Arc<Dataset>,
-        input: &Arc<dyn ExecutionPlan>,
-    ) -> Result<Arc<RowAddrMask>> {
-        let scalar = input
-            .as_any()
-            .downcast_ref::<super::scalar_index::ScalarIndexExec>()
-            .ok_or_else(|| {
-                Error::internal("CountFromMaskExec: v2.3 prefilter input is not ScalarIndexExec")
-            })?;
-        let mut names = HashSet::new();
-        Self::collect_index_names(scalar.expr(), &mut names);
-        let mut indices = Vec::new();
-        for name in names {
-            for index in dataset.load_indices_by_name(&name).await? {
-                if logical_index_coverage_is_current(dataset.as_ref(), &index)? {
-                    indices.push(index);
+        fn selection_count(
+            selection: &RowAddrSelection,
+            coverage: Option<&RoaringBitmap>,
+            slot_count: u32,
+        ) -> u64 {
+            match (selection, coverage) {
+                (RowAddrSelection::Full, None) => u64::from(slot_count),
+                (RowAddrSelection::Full, Some(coverage)) => {
+                    coverage.range_cardinality(0..slot_count)
+                }
+                (RowAddrSelection::Partial(rows), None) => rows.range_cardinality(0..slot_count),
+                (RowAddrSelection::Partial(rows), Some(coverage)) => {
+                    if rows.max().is_none_or(|max| max < slot_count)
+                        && coverage.max().is_none_or(|max| max < slot_count)
+                    {
+                        rows.intersection_len(coverage)
+                    } else {
+                        (rows & coverage).range_cardinality(0..slot_count)
+                    }
                 }
             }
         }
-        let prefilter = DatasetPreFilter::new(dataset, &indices, None);
-        prefilter.wait_for_ready().await?;
-        Ok(prefilter.mask())
+
+        fn intersection_count(
+            left: &RowAddrSelection,
+            right: &RowAddrSelection,
+            coverage: Option<&RoaringBitmap>,
+            slot_count: u32,
+        ) -> u64 {
+            match (left, right) {
+                (RowAddrSelection::Full, selection) | (selection, RowAddrSelection::Full) => {
+                    selection_count(selection, coverage, slot_count)
+                }
+                (RowAddrSelection::Partial(left), RowAddrSelection::Partial(right)) => {
+                    let intersection = left & right;
+                    match coverage {
+                        None => intersection.range_cardinality(0..slot_count),
+                        Some(coverage) => selection_count(
+                            &RowAddrSelection::Partial(intersection),
+                            Some(coverage),
+                            slot_count,
+                        ),
+                    }
+                }
+            }
+        }
+
+        fn count_map<F>(
+            current_domains: &RoaringBitmap,
+            domain_slot_count: &mut F,
+            coverage: Option<&RoaringTreemap>,
+            rows: &RowAddrTreeMap,
+        ) -> Result<u64>
+        where
+            F: FnMut(u32) -> Result<Option<u32>>,
+        {
+            let mut coverage_iter = coverage.map(|coverage| coverage.bitmaps().peekable());
+            let mut count = 0_u64;
+            for (&logical_fragment_id, selection) in rows.iter() {
+                let Some(slot_count) =
+                    checked_slot_count(current_domains, domain_slot_count, logical_fragment_id)?
+                else {
+                    continue;
+                };
+                let domain_coverage = if let Some(coverage_iter) = coverage_iter.as_mut() {
+                    while coverage_iter
+                        .peek()
+                        .is_some_and(|(domain, _)| *domain < logical_fragment_id)
+                    {
+                        coverage_iter.next();
+                    }
+                    match coverage_iter.peek() {
+                        Some((domain, slots)) if *domain == logical_fragment_id => Some(*slots),
+                        _ => continue,
+                    }
+                } else {
+                    None
+                };
+                count = count
+                    .checked_add(selection_count(selection, domain_coverage, slot_count))
+                    .ok_or_else(|| Error::invalid_input("logical row count exceeds u64"))?;
+            }
+            Ok(count)
+        }
+
+        fn count_map_intersection<F>(
+            current_domains: &RoaringBitmap,
+            domain_slot_count: &mut F,
+            coverage: Option<&RoaringTreemap>,
+            left: &RowAddrTreeMap,
+            right: &RowAddrTreeMap,
+        ) -> Result<u64>
+        where
+            F: FnMut(u32) -> Result<Option<u32>>,
+        {
+            let mut right_iter = right.iter().peekable();
+            let mut coverage_iter = coverage.map(|coverage| coverage.bitmaps().peekable());
+            let mut count = 0_u64;
+            for (&logical_fragment_id, left_selection) in left.iter() {
+                while right_iter
+                    .peek()
+                    .is_some_and(|(domain, _)| **domain < logical_fragment_id)
+                {
+                    right_iter.next();
+                }
+                let Some((_, right_selection)) = right_iter
+                    .peek()
+                    .filter(|(domain, _)| **domain == logical_fragment_id)
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(slot_count) =
+                    checked_slot_count(current_domains, domain_slot_count, logical_fragment_id)?
+                else {
+                    continue;
+                };
+                let domain_coverage = if let Some(coverage_iter) = coverage_iter.as_mut() {
+                    while coverage_iter
+                        .peek()
+                        .is_some_and(|(domain, _)| *domain < logical_fragment_id)
+                    {
+                        coverage_iter.next();
+                    }
+                    match coverage_iter.peek() {
+                        Some((domain, slots)) if *domain == logical_fragment_id => Some(*slots),
+                        _ => continue,
+                    }
+                } else {
+                    None
+                };
+                count = count
+                    .checked_add(intersection_count(
+                        left_selection,
+                        right_selection,
+                        domain_coverage,
+                        slot_count,
+                    ))
+                    .ok_or_else(|| Error::invalid_input("logical row count exceeds u64"))?;
+            }
+            Ok(count)
+        }
+
+        let liveness_block = liveness.block_list().ok_or_else(|| {
+            Error::internal("CountFromMaskExec: v2.3 liveness mask must be a BlockList")
+        })?;
+        match prefilter {
+            RowAddrMask::AllowList(postings) => {
+                let selected =
+                    count_map(current_domains, &mut domain_slot_count, coverage, postings)?;
+                let invalid = count_map_intersection(
+                    current_domains,
+                    &mut domain_slot_count,
+                    coverage,
+                    postings,
+                    liveness_block,
+                )?;
+                selected.checked_sub(invalid).ok_or_else(|| {
+                    Error::internal("logical liveness intersection exceeds selected postings")
+                })
+            }
+            RowAddrMask::BlockList(postings) => {
+                let covered = if let Some(coverage) = coverage {
+                    let mut count = 0_u64;
+                    for (logical_fragment_id, slots) in coverage.bitmaps() {
+                        let Some(slot_count) = checked_slot_count(
+                            current_domains,
+                            &mut domain_slot_count,
+                            logical_fragment_id,
+                        )?
+                        else {
+                            continue;
+                        };
+                        count = count
+                            .checked_add(slots.range_cardinality(0..slot_count))
+                            .ok_or_else(|| Error::invalid_input("logical row count exceeds u64"))?;
+                    }
+                    count
+                } else {
+                    let mut count = 0_u64;
+                    for logical_fragment_id in current_domains.iter() {
+                        let Some(slot_count) = domain_slot_count(logical_fragment_id)? else {
+                            return Err(Error::internal(format!(
+                                "current logical domain {logical_fragment_id} is missing metadata"
+                            )));
+                        };
+                        count = count
+                            .checked_add(u64::from(slot_count))
+                            .ok_or_else(|| Error::invalid_input("logical row count exceeds u64"))?;
+                    }
+                    count
+                };
+                let postings_count =
+                    count_map(current_domains, &mut domain_slot_count, coverage, postings)?;
+                let liveness_count = count_map(
+                    current_domains,
+                    &mut domain_slot_count,
+                    coverage,
+                    liveness_block,
+                )?;
+                let overlap = count_map_intersection(
+                    current_domains,
+                    &mut domain_slot_count,
+                    coverage,
+                    postings,
+                    liveness_block,
+                )?;
+                let blocked = postings_count
+                    .checked_add(liveness_count)
+                    .and_then(|count| count.checked_sub(overlap))
+                    .ok_or_else(|| Error::internal("logical blocked-row cardinality overflow"))?;
+                covered.checked_sub(blocked).ok_or_else(|| {
+                    Error::internal("logical blocked rows exceed effective index coverage")
+                })
+            }
+        }
     }
 
     #[instrument(name = "count_from_mask", skip_all, level = "debug")]
@@ -406,14 +607,29 @@ impl CountFromMaskExec {
         aggregate_funcs_len: usize,
         prefilter_input: Option<Arc<dyn ExecutionPlan>>,
         restrict_to_fragments: Option<RoaringBitmap>,
+        logical_coverage_groups: Option<Arc<Vec<LogicalCoverageGroup>>>,
         context: Arc<datafusion::execution::context::TaskContext>,
         schema: SchemaRef,
     ) -> Result<RecordBatch> {
-        let logical_index_mask = if dataset.manifest.uses_stable_logical_row_addresses() {
-            match prefilter_input.as_ref() {
-                Some(input) => Some(Self::logical_index_mask(dataset.clone(), input).await?),
-                None => None,
-            }
+        let logical_liveness = if dataset.manifest.uses_stable_logical_row_addresses()
+            && prefilter_input.is_some()
+        {
+            let groups = logical_coverage_groups.as_deref().ok_or_else(|| {
+                Error::internal(
+                    "CountFromMaskExec: v2.3 index count is missing logical coverage groups",
+                )
+            })?;
+            let (physical_coverage, index_ids) = logical_liveness_scope(dataset.as_ref(), groups)?;
+            let logical_coverage = logical_coverage_effective_rows(groups)?;
+            Some(
+                DatasetPreFilter::do_create_logical_liveness_mask_for_physical_coverage(
+                    dataset.clone(),
+                    physical_coverage,
+                    logical_coverage,
+                    index_ids,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -431,30 +647,45 @@ impl CountFromMaskExec {
             None => dataset_fragments.clone(),
         };
 
-        // Under stable row ids the prefilter and deletion masks are in stable-id
-        // space, so the universe must be too (see `stable_id_universe`); the
-        // default path builds it in row-address space.
+        // Stable-id prefilters are counted in stable-id space. V2.3 uses the
+        // coverage cardinality directly; the older stable-id format still
+        // needs its row-id sequence as an explicit universe.
         let count = if dataset.manifest.uses_stable_logical_row_addresses() {
             match prefilter {
                 None => Self::count_live_rows(&dataset, &fragments_covered).await?,
                 Some(prefilter) => {
-                    if fragments_covered != dataset_fragments {
-                        return Err(Error::internal(
-                            "CountFromMaskExec: partial physical coverage is invalid for a v2.3 logical index",
-                        ));
-                    }
-                    let universe = Self::logical_address_universe(dataset.as_ref())?;
-                    let combined =
-                        Self::combine_masks(universe, Some(prefilter), logical_index_mask);
-                    let count =
-                        combined
-                            .allow_list()
-                            .and_then(RowSetOps::len)
-                            .ok_or_else(|| {
-                                Error::internal(
-                                    "CountFromMaskExec: v2.3 combined mask is not countable",
-                                )
-                            })?;
+                    let groups = logical_coverage_groups.as_deref().ok_or_else(|| {
+                        Error::internal(
+                            "CountFromMaskExec: v2.3 index count is missing logical coverage groups",
+                        )
+                    })?;
+                    let layout = dataset
+                        .manifest
+                        .row_address_layout
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::internal(
+                                "storage-version-2.3 manifest is missing RowAddressLayout",
+                            )
+                        })?;
+                    let current_domains = layout
+                        .current_logical_fragment_bitmap(dataset.manifest.fragments.as_ref())?;
+                    let router = dataset.row_address_router()?;
+                    let coverage = logical_coverage_effective_rows(groups)?;
+                    let liveness = logical_liveness.ok_or_else(|| {
+                        Error::internal("CountFromMaskExec: v2.3 liveness mask is missing")
+                    })?;
+                    let count = Self::count_logical_mask(
+                        &current_domains,
+                        |logical_fragment_id| {
+                            Ok(router
+                                .logical_domain(logical_fragment_id)?
+                                .map(|domain| domain.slot_count))
+                        },
+                        coverage.as_ref(),
+                        &prefilter,
+                        liveness.as_ref(),
+                    )?;
                     i64::try_from(count)
                         .map_err(|_| Error::invalid_input("CountFromMaskExec result exceeds i64"))?
                 }
@@ -529,6 +760,7 @@ impl ExecutionPlan for CountFromMaskExec {
             aggregate_funcs: self.aggregate_funcs.clone(),
             prefilter_input,
             restrict_to_fragments: self.restrict_to_fragments.clone(),
+            logical_coverage_groups: self.logical_coverage_groups.clone(),
             schema: self.schema.clone(),
             properties: self.properties.clone(),
             metrics: self.metrics.clone(),
@@ -546,6 +778,7 @@ impl ExecutionPlan for CountFromMaskExec {
             self.aggregate_funcs.len(),
             self.prefilter_input.clone(),
             self.restrict_to_fragments.clone(),
+            self.logical_coverage_groups.clone(),
             context,
             schema.clone(),
         );
@@ -803,5 +1036,50 @@ mod tests {
             CountFromMaskExec::try_new(dataset, vec![count_star_expr(&schema)], None).unwrap();
         let count = run(plan).await;
         assert_eq!(count, 30);
+    }
+
+    #[test]
+    fn logical_count_uses_cardinality_across_100k_domains() {
+        const DOMAIN_COUNT: u32 = 100_000;
+        const ROWS_PER_DOMAIN: u32 = 1_000;
+        let mut current_domains = RoaringBitmap::new();
+        current_domains.insert_range(0..DOMAIN_COUNT);
+
+        let row = |domain: u32, slot: u32| (u64::from(domain) << 32) | u64::from(slot);
+        let mut postings = RowAddrTreeMap::new();
+        postings.insert(row(0, 0));
+        postings.insert(row(50_000, 500));
+        postings.insert(row(99_999, 999));
+        let mut invalid = RowAddrTreeMap::new();
+        invalid.insert(row(50_000, 500));
+        invalid.insert(row(75_000, 750));
+        let liveness = RowAddrMask::from_block(invalid);
+
+        let positive = CountFromMaskExec::count_logical_mask(
+            &current_domains,
+            |_| Ok(Some(ROWS_PER_DOMAIN)),
+            None,
+            &RowAddrMask::from_allowed(postings.clone()),
+            &liveness,
+        )
+        .unwrap();
+        assert_eq!(positive, 2);
+
+        let negative = CountFromMaskExec::count_logical_mask(
+            &current_domains,
+            |_| Ok(Some(ROWS_PER_DOMAIN)),
+            None,
+            &RowAddrMask::from_block(postings),
+            &liveness,
+        )
+        .unwrap();
+        assert_eq!(
+            negative,
+            u64::from(DOMAIN_COUNT) * u64::from(ROWS_PER_DOMAIN) - 4
+        );
+
+        // The domain summary stays compressed. The counting path does not
+        // build one bitmap per domain or one entry per logical row.
+        assert!(current_domains.serialized_size() < 1_024);
     }
 }

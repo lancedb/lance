@@ -32,7 +32,7 @@ use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::optimize::{
     CompactionMetrics, CompactionOptions, CompactionPlan, IndexRemapper, IndexRemapperOptions,
     RemappedIndex, RowAddressMaintenanceOptions, TaskData, commit_compaction,
-    maintain_row_addresses, plan_compaction,
+    maintain_row_addresses, plan_compaction, rewrite_files_in_order,
 };
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::{
@@ -48,6 +48,7 @@ use lance_core::ROW_ID;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::ObjectStoreParams;
@@ -176,6 +177,7 @@ enum Operation {
     DefaultCompactionPreflight,
     DefaultCompaction,
     RandomDeleteReclaim,
+    BoundedRecluster,
     NormalizePlacement,
     Repack,
     Recluster,
@@ -201,6 +203,7 @@ impl Operation {
             Self::DefaultCompactionPreflight => "default_compaction_preflight",
             Self::DefaultCompaction => "default_compaction",
             Self::RandomDeleteReclaim => "random_delete_reclaim",
+            Self::BoundedRecluster => "bounded_recluster",
             Self::NormalizePlacement => "normalize_placement",
             Self::Repack => "repack",
             Self::Recluster => "recluster",
@@ -236,6 +239,7 @@ impl Operation {
             Self::RandomDeleteReclaim => {
                 "cold_session_open_and_same_postcondition_random_delete_reclaim_commit"
             }
+            Self::BoundedRecluster => "cold_session_open_and_bounded_recluster_commit",
             Self::NormalizePlacement => "cold_session_open_and_normalize_placement_commit",
             Self::Repack => "cold_session_open_and_repack_commit",
             Self::Recluster => "cold_session_open_and_recluster_commit",
@@ -303,6 +307,12 @@ impl UpdateDriver {
 enum SelectionKind {
     Range,
     Random,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum CompactionMode {
+    Standard,
+    FragmentReuse,
 }
 
 impl SelectionKind {
@@ -394,6 +404,9 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SelectionKind::Range)]
     selection: SelectionKind,
 
+    #[arg(long, value_enum, default_value_t = CompactionMode::Standard)]
+    compaction_mode: CompactionMode,
+
     #[arg(long, default_value_t = 1_000_000)]
     target_rows_per_fragment: usize,
 
@@ -441,6 +454,17 @@ struct Args {
 
     #[arg(long, default_value_t = usize::MAX)]
     max_source_fragments_per_group: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PmrIndexGenerationBlocker {
+    index_id: String,
+    index_name: String,
+    field_ids: Vec<i32>,
+    oldest_generation: u64,
+    region_bytes: u64,
+    blocked_transaction_start: u64,
+    blocked_transaction_end: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -506,11 +530,20 @@ struct BenchmarkRecord {
     manifest_bytes: Option<u64>,
     placement_root_bytes: Option<u64>,
     placement_delta_bytes: Option<u64>,
+    placement_delta_claimed_bytes: Option<u64>,
     w_epoch_bytes: Option<u64>,
     coverage: Option<f64>,
     recall: Option<f64>,
     admission: Option<bool>,
     placement_maintenance_required: Option<bool>,
+    pmr_reason: Option<&'static str>,
+    pmr_projected_delta_bytes: Option<u64>,
+    pmr_delta_limit_bytes: Option<u64>,
+    pmr_projected_epoch_bytes: Option<u64>,
+    pmr_epoch_limit_bytes: Option<u64>,
+    pmr_generation_delta_bytes: Option<u64>,
+    pmr_generation_epoch_bytes: Option<u64>,
+    pmr_blocking_indices: Option<Vec<PmrIndexGenerationBlocker>>,
     rows_inserted: Option<u64>,
     rows_updated: Option<u64>,
     rows_deleted: Option<u64>,
@@ -520,10 +553,14 @@ struct BenchmarkRecord {
     indices_remapped: Option<u64>,
     index_coverage_reuse: Option<f64>,
     layout_index_maintenance_ns: Option<u64>,
+    fragment_reuse_index_present: Option<bool>,
+    explicit_locator_objects_written: Option<u64>,
+    explicit_locator_bytes_written: Option<u64>,
     compaction_groups_planned: Option<u64>,
     compaction_groups_admitted: Option<u64>,
     compaction_groups_not_admitted: Option<u64>,
     state_digest: Option<String>,
+    physical_order_digest: Option<String>,
     io_by_path: Option<BTreeMap<String, PathIoMetrics>>,
     io_metrics_status: &'static str,
     status: &'static str,
@@ -542,11 +579,20 @@ struct OperationOutcome {
     manifest_bytes: Option<u64>,
     placement_root_bytes: Option<u64>,
     placement_delta_bytes: Option<u64>,
+    placement_delta_claimed_bytes: Option<u64>,
     w_epoch_bytes: Option<u64>,
     coverage: Option<f64>,
     recall: Option<f64>,
     admission: Option<bool>,
     placement_maintenance_required: Option<bool>,
+    pmr_reason: Option<&'static str>,
+    pmr_projected_delta_bytes: Option<u64>,
+    pmr_delta_limit_bytes: Option<u64>,
+    pmr_projected_epoch_bytes: Option<u64>,
+    pmr_epoch_limit_bytes: Option<u64>,
+    pmr_generation_delta_bytes: Option<u64>,
+    pmr_generation_epoch_bytes: Option<u64>,
+    pmr_blocking_indices: Option<Vec<PmrIndexGenerationBlocker>>,
     rows_inserted: Option<u64>,
     rows_updated: Option<u64>,
     rows_deleted: Option<u64>,
@@ -556,10 +602,14 @@ struct OperationOutcome {
     indices_remapped: Option<u64>,
     index_coverage_reuse: Option<f64>,
     layout_index_maintenance_ns: Option<u64>,
+    fragment_reuse_index_present: Option<bool>,
+    explicit_locator_objects_written: Option<u64>,
+    explicit_locator_bytes_written: Option<u64>,
     compaction_groups_planned: Option<u64>,
     compaction_groups_admitted: Option<u64>,
     compaction_groups_not_admitted: Option<u64>,
     state_digest: Option<String>,
+    physical_order_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -734,6 +784,7 @@ fn actual_attempts_cover_operation(operation: Operation, metrics: ObjectMetrics)
         | Operation::Backfill
         | Operation::DefaultCompaction
         | Operation::RandomDeleteReclaim
+        | Operation::BoundedRecluster
         | Operation::NormalizePlacement
         | Operation::Repack
         | Operation::Recluster
@@ -754,7 +805,10 @@ fn actual_attempts_cover_operation(operation: Operation, metrics: ObjectMetrics)
 enum PreparedOperation {
     None,
     Batches(SyntheticBatchSource),
-    Take { row_ids: Vec<u64> },
+    Take {
+        user_ids: Vec<u64>,
+        row_ids: Vec<u64>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -854,7 +908,7 @@ fn main() -> BenchResult<()> {
         Operation::Update if args.update_driver == UpdateDriver::ExactMatchedMerge => {
             make_exact_update_batches(&args).map(PreparedOperation::Batches)
         }
-        Operation::Take => read_take_ids_artifact(&args),
+        Operation::Take | Operation::IndexTake => read_take_ids_artifact(&args),
         _ => Ok(PreparedOperation::None),
     };
 
@@ -874,27 +928,40 @@ fn main() -> BenchResult<()> {
     let mut outcome = match result {
         Ok(outcome) => outcome,
         Err(error) => {
-            if is_placement_maintenance_required(error.as_ref()) {
-                OperationOutcome {
-                    admission: Some(false),
-                    placement_maintenance_required: Some(true),
-                    ..Default::default()
-                }
+            if let Some(diagnostic) = placement_maintenance_diagnostic(error.as_ref()) {
+                diagnostic
             } else {
                 errors.push(format!("{error:#}"));
                 OperationOutcome::default()
             }
         }
     };
-    if errors.is_empty() && outcome.coverage.is_some() {
+    let needs_delta_validation = outcome.placement_delta_claimed_bytes.is_some();
+    let needs_coverage_validation = outcome.coverage.is_some();
+    if errors.is_empty() && (needs_delta_validation || needs_coverage_validation) {
         let validation = runtime.block_on(async {
             let dataset = open_dataset(&args, Arc::new(IOTracker::default())).await?;
             args.format.validate_dataset(&dataset)?;
-            effective_index_coverage(&dataset, args.index_kind).await
+            let delta = if needs_delta_validation {
+                Some(exact_row_address_delta_bytes(&dataset).await?)
+            } else {
+                None
+            };
+            let coverage = if needs_coverage_validation {
+                Some(effective_index_coverage(&dataset, args.index_kind).await?)
+            } else {
+                None
+            };
+            Ok::<_, BenchError>((delta, coverage))
         });
         match validation {
-            Ok(coverage) => outcome.coverage = Some(coverage),
-            Err(error) => errors.push(format!("post-measurement coverage validation: {error:#}")),
+            Ok((delta, coverage)) => {
+                outcome.placement_delta_bytes = delta;
+                if let Some(coverage) = coverage {
+                    outcome.coverage = Some(coverage);
+                }
+            }
+            Err(error) => errors.push(format!("post-measurement evidence validation: {error:#}")),
         }
     }
     // The shared wrapper is propagated to primary and base-path stores. Dataset
@@ -1017,11 +1084,20 @@ fn main() -> BenchResult<()> {
         manifest_bytes: outcome.manifest_bytes,
         placement_root_bytes: outcome.placement_root_bytes,
         placement_delta_bytes: outcome.placement_delta_bytes,
+        placement_delta_claimed_bytes: outcome.placement_delta_claimed_bytes,
         w_epoch_bytes: outcome.w_epoch_bytes,
         coverage: outcome.coverage,
         recall: outcome.recall,
         admission: outcome.admission,
         placement_maintenance_required: outcome.placement_maintenance_required,
+        pmr_reason: outcome.pmr_reason,
+        pmr_projected_delta_bytes: outcome.pmr_projected_delta_bytes,
+        pmr_delta_limit_bytes: outcome.pmr_delta_limit_bytes,
+        pmr_projected_epoch_bytes: outcome.pmr_projected_epoch_bytes,
+        pmr_epoch_limit_bytes: outcome.pmr_epoch_limit_bytes,
+        pmr_generation_delta_bytes: outcome.pmr_generation_delta_bytes,
+        pmr_generation_epoch_bytes: outcome.pmr_generation_epoch_bytes,
+        pmr_blocking_indices: outcome.pmr_blocking_indices,
         rows_inserted: outcome.rows_inserted,
         rows_updated: outcome.rows_updated,
         rows_deleted: outcome.rows_deleted,
@@ -1031,10 +1107,14 @@ fn main() -> BenchResult<()> {
         indices_remapped: outcome.indices_remapped,
         index_coverage_reuse: outcome.index_coverage_reuse,
         layout_index_maintenance_ns: outcome.layout_index_maintenance_ns,
+        fragment_reuse_index_present: outcome.fragment_reuse_index_present,
+        explicit_locator_objects_written: outcome.explicit_locator_objects_written,
+        explicit_locator_bytes_written: outcome.explicit_locator_bytes_written,
         compaction_groups_planned: outcome.compaction_groups_planned,
         compaction_groups_admitted: outcome.compaction_groups_admitted,
         compaction_groups_not_admitted: outcome.compaction_groups_not_admitted,
         state_digest: outcome.state_digest,
+        physical_order_digest: outcome.physical_order_digest,
         io_by_path: Some(path_metrics),
         io_metrics_status: if args.storage == Storage::S3 {
             "measured"
@@ -1067,6 +1147,11 @@ fn validate_args(args: &Args) -> BenchResult<()> {
     if args.target_rows_per_fragment == 0 {
         return Err("--target-rows-per-fragment must be greater than zero".into());
     }
+    if args.compaction_mode != CompactionMode::Standard
+        && args.operation != Operation::DefaultCompaction
+    {
+        return Err("--compaction-mode requires --operation=default-compaction".into());
+    }
     if args.index_kind == IndexKind::Vector && args.schema_kind != SchemaKind::Vector {
         return Err("--index-kind=vector requires --schema-kind=vector".into());
     }
@@ -1093,11 +1178,17 @@ fn validate_args(args: &Args) -> BenchResult<()> {
         return Err("--order-index must be in 0..3".into());
     }
     let has_take_ids = args.prepare_take_ids_output.is_some() || args.take_ids_input.is_some();
-    if args.operation == Operation::Take && !has_take_ids {
-        return Err("take operation requires --take-ids-input or --prepare-take-ids-output".into());
+    if matches!(args.operation, Operation::Take | Operation::IndexTake) && !has_take_ids {
+        return Err(
+            "take and index-take operations require --take-ids-input or --prepare-take-ids-output"
+                .into(),
+        );
     }
-    if args.operation != Operation::Take && has_take_ids {
-        return Err("take-ID arguments require --operation=take".into());
+    if !matches!(args.operation, Operation::Take | Operation::IndexTake) && has_take_ids {
+        return Err("take-ID arguments require --operation=take or index-take".into());
+    }
+    if args.operation == Operation::IndexTake && args.prepare_take_ids_output.is_some() {
+        return Err("index-take requires --take-ids-input".into());
     }
     let has_plan_output = args.prepare_maintenance_plan_output.is_some();
     let has_plan_input = args.maintenance_plan_input.is_some();
@@ -1106,6 +1197,7 @@ fn validate_args(args: &Args) -> BenchResult<()> {
             args.operation,
             Operation::DefaultCompaction
                 | Operation::RandomDeleteReclaim
+                | Operation::BoundedRecluster
                 | Operation::NormalizePlacement
                 | Operation::Repack
                 | Operation::Recluster
@@ -1118,6 +1210,7 @@ fn validate_args(args: &Args) -> BenchResult<()> {
             args.operation,
             Operation::DefaultCompaction
                 | Operation::RandomDeleteReclaim
+                | Operation::BoundedRecluster
                 | Operation::NormalizePlacement
                 | Operation::Repack
                 | Operation::Recluster
@@ -1178,12 +1271,25 @@ fn implementation_path(args: &Args) -> &'static str {
         | Operation::Recluster
         | Operation::CheckpointGeneration => "capability_gated_explicit_maintenance",
         Operation::DefaultCompactionPreflight => "default_compaction_plan_only",
+        Operation::DefaultCompaction if args.compaction_mode == CompactionMode::FragmentReuse => {
+            match args.format {
+                BenchFormat::V22NoStable => "deferred_fragment_reuse_compaction",
+                BenchFormat::V22Stable => "inline_index_remap_compaction",
+                BenchFormat::V23Logical => "stable_logical_zero_remap_compaction",
+            }
+        }
         Operation::DefaultCompaction => "default_compaction",
         Operation::FixtureClone => "canonical_fixture_shallow_clone",
         Operation::RandomDeleteReclaim => match args.format {
             BenchFormat::V23Logical => "explicit_repack",
             BenchFormat::V22NoStable | BenchFormat::V22Stable => {
                 "same_postcondition_default_compaction"
+            }
+        },
+        Operation::BoundedRecluster => match args.format {
+            BenchFormat::V23Logical => "default_bounded_recluster_fast_path",
+            BenchFormat::V22NoStable | BenchFormat::V22Stable => {
+                "same_postcondition_bounded_recluster_rewrite"
             }
         },
         Operation::IndexBuild | Operation::IndexTake | Operation::IndexOptimize => {
@@ -1193,16 +1299,81 @@ fn implementation_path(args: &Args) -> &'static str {
     }
 }
 
-fn is_placement_maintenance_required(mut error: &(dyn std::error::Error + 'static)) -> bool {
+fn placement_maintenance_diagnostic(
+    mut error: &(dyn std::error::Error + 'static),
+) -> Option<OperationOutcome> {
     loop {
-        if error
-            .downcast_ref::<PlacementMaintenanceRequired>()
-            .is_some()
-        {
-            return true;
+        if let Some(reason) = error.downcast_ref::<PlacementMaintenanceRequired>() {
+            let mut outcome = OperationOutcome {
+                admission: Some(false),
+                placement_maintenance_required: Some(true),
+                ..Default::default()
+            };
+            match reason {
+                PlacementMaintenanceRequired::ProjectedDeltaBytes { projected, limit } => {
+                    outcome.pmr_reason = Some("projected_delta_bytes");
+                    outcome.pmr_projected_delta_bytes = Some(*projected);
+                    outcome.pmr_delta_limit_bytes = Some(*limit);
+                }
+                PlacementMaintenanceRequired::ProjectedEpochBytes { projected, limit } => {
+                    outcome.pmr_reason = Some("projected_epoch_bytes");
+                    outcome.pmr_projected_epoch_bytes = Some(*projected);
+                    outcome.pmr_epoch_limit_bytes = Some(*limit);
+                }
+                PlacementMaintenanceRequired::ExtentFanout { .. } => {
+                    outcome.pmr_reason = Some("extent_fanout");
+                }
+                PlacementMaintenanceRequired::ExistingExplicitMapRequiresRewrite { .. } => {
+                    outcome.pmr_reason = Some("existing_explicit_map_requires_rewrite");
+                }
+                PlacementMaintenanceRequired::ExplicitMapMetadataRequired { .. } => {
+                    outcome.pmr_reason = Some("explicit_map_metadata_required");
+                }
+                PlacementMaintenanceRequired::SelectionSubtractionRequiresRewrite { .. } => {
+                    outcome.pmr_reason = Some("selection_subtraction_requires_rewrite");
+                }
+                PlacementMaintenanceRequired::PackedRunSubtractionRequiresRewrite { .. } => {
+                    outcome.pmr_reason = Some("packed_run_subtraction_requires_rewrite");
+                }
+                PlacementMaintenanceRequired::LogicalOrderRequiresRewrite { .. } => {
+                    outcome.pmr_reason = Some("logical_order_requires_rewrite");
+                }
+                PlacementMaintenanceRequired::IndexGenerationBlocked {
+                    projected_delta_bytes,
+                    delta_limit,
+                    projected_epoch_bytes,
+                    epoch_limit,
+                    generation_delta_bytes,
+                    generation_epoch_bytes,
+                    blocking_indices,
+                } => {
+                    outcome.pmr_reason = Some("index_generation_blocked");
+                    outcome.pmr_projected_delta_bytes = Some(*projected_delta_bytes);
+                    outcome.pmr_delta_limit_bytes = Some(*delta_limit);
+                    outcome.pmr_projected_epoch_bytes = Some(*projected_epoch_bytes);
+                    outcome.pmr_epoch_limit_bytes = Some(*epoch_limit);
+                    outcome.pmr_generation_delta_bytes = Some(*generation_delta_bytes);
+                    outcome.pmr_generation_epoch_bytes = Some(*generation_epoch_bytes);
+                    outcome.pmr_blocking_indices = Some(
+                        blocking_indices
+                            .iter()
+                            .map(|blocker| PmrIndexGenerationBlocker {
+                                index_id: blocker.index_id.to_string(),
+                                index_name: blocker.index_name.clone(),
+                                field_ids: blocker.field_ids.clone(),
+                                oldest_generation: blocker.oldest_generation,
+                                region_bytes: blocker.region_bytes,
+                                blocked_transaction_start: blocker.blocked_transaction_start,
+                                blocked_transaction_end: blocker.blocked_transaction_end,
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            return Some(outcome);
         }
         let Some(source) = error.source() else {
-            return false;
+            return None;
         };
         error = source;
     }
@@ -1432,7 +1603,10 @@ fn make_exact_update_batches(args: &Args) -> BenchResult<SyntheticBatchSource> {
     .map(|position| position as u64)
     .collect::<Vec<_>>();
     ids.sort_unstable();
-    SyntheticBatchSource::explicit(args, ids, args.step as u64 + 1)
+    let mut source = SyntheticBatchSource::explicit(args, ids, args.step as u64 + 1)?;
+    // Exact repeated updates carry only the join key and the value being changed.
+    source.schema_kind = SchemaKind::Narrow16;
+    Ok(source)
 }
 
 fn make_merge_insert_batches(args: &Args) -> BenchResult<SyntheticBatchSource> {
@@ -2147,6 +2321,7 @@ struct CompactionObservation {
     indices_remapped: u64,
     index_coverage_reuse: Option<f64>,
     layout_index_maintenance_ns: u64,
+    fragment_reuse_index_present: bool,
 }
 
 fn default_compaction_options(args: &Args) -> CompactionOptions {
@@ -2156,6 +2331,8 @@ fn default_compaction_options(args: &Args) -> CompactionOptions {
         num_threads: Some(1),
         materialize_deletions: true,
         materialize_deletions_threshold: 0.0,
+        defer_index_remap: args.compaction_mode == CompactionMode::FragmentReuse
+            && args.format == BenchFormat::V22NoStable,
         ..Default::default()
     }
 }
@@ -2231,6 +2408,9 @@ async fn compact_files_with_observation(
         .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     metrics += plan.planning_metrics;
     let indices_after = dataset.load_indices().await?;
+    let fragment_reuse_index_present = indices_after
+        .iter()
+        .any(|index| index.name == FRAG_REUSE_INDEX_NAME);
     let index_coverage_reuse = if indices_before.is_empty() {
         None
     } else {
@@ -2261,6 +2441,56 @@ async fn compact_files_with_observation(
         indices_remapped: measurement.indices_remapped,
         index_coverage_reuse,
         layout_index_maintenance_ns,
+        fragment_reuse_index_present,
+    })
+}
+
+async fn rewrite_files_in_order_with_observation(
+    args: &Args,
+    dataset: &mut Dataset,
+    mut options: CompactionOptions,
+    maintenance_plan: &MaintenancePlanArtifact,
+) -> BenchResult<CompactionObservation> {
+    validate_maintenance_plan(args, maintenance_plan, dataset)?;
+    options.target_rows_per_fragment = maintenance_plan.execution_target_rows_per_fragment;
+    let indices_before = dataset.load_indices().await?;
+    let index_storage_bytes_before = index_storage_bytes(dataset).await?;
+    let compacted_data_bytes = fragment_file_bytes(dataset.manifest().fragments.iter());
+    let measurement = Arc::new(Mutex::new(RemapMeasurement::default()));
+    let metrics = rewrite_files_in_order(
+        dataset,
+        vec![ColumnOrdering::asc_nulls_first("id".to_string())],
+        options,
+        Some(Arc::new(MeasuredIndexRemapperOptions {
+            measurement: measurement.clone(),
+        })),
+    )
+    .await?;
+    let indices_after = dataset.load_indices().await?;
+    let fragment_reuse_index_present = indices_after
+        .iter()
+        .any(|index| index.name == FRAG_REUSE_INDEX_NAME);
+    let index_coverage_reuse = if indices_before.is_empty() {
+        None
+    } else {
+        let reused = indices_before
+            .iter()
+            .filter(|before| indices_after.iter().any(|after| after.uuid == before.uuid))
+            .count();
+        Some(reused as f64 / indices_before.len() as f64)
+    };
+    let measurement = measurement.lock().map_err(|_| {
+        lance_core::Error::internal("benchmark index-remap measurement mutex is poisoned")
+    })?;
+    Ok(CompactionObservation {
+        metrics,
+        compacted_data_bytes,
+        index_storage_bytes_before,
+        row_addresses_remapped: measurement.row_addresses_remapped,
+        indices_remapped: measurement.indices_remapped,
+        index_coverage_reuse,
+        layout_index_maintenance_ns: measurement.elapsed_ns,
+        fragment_reuse_index_present,
     })
 }
 
@@ -2561,6 +2791,7 @@ async fn execute(
                     indices_remapped: Some(observation.indices_remapped),
                     index_coverage_reuse: observation.index_coverage_reuse,
                     layout_index_maintenance_ns: Some(observation.layout_index_maintenance_ns),
+                    fragment_reuse_index_present: Some(observation.fragment_reuse_index_present),
                     compaction_groups_planned: Some(observation.metrics.groups_planned as u64),
                     compaction_groups_admitted: Some(observation.metrics.groups_admitted as u64),
                     compaction_groups_not_admitted: Some(
@@ -2606,6 +2837,9 @@ async fn execute(
                 let metrics = maintain_row_addresses(&mut dataset, options).await?;
                 let indices_after = dataset.load_indices().await?;
                 outcome.rows_updated = Some(metrics.rows_rewritten);
+                outcome.explicit_locator_objects_written =
+                    Some(metrics.locator_objects_written as u64);
+                outcome.explicit_locator_bytes_written = Some(metrics.locator_bytes_written);
                 outcome.compacted_data_bytes = compacted_data_bytes;
                 outcome.index_storage_bytes_before = index_storage_bytes_before;
                 outcome.row_addresses_remapped = Some(0);
@@ -2626,6 +2860,7 @@ async fn execute(
                 outcome.compaction_groups_planned = Some(1);
                 outcome.compaction_groups_admitted = Some(1);
                 outcome.compaction_groups_not_admitted = Some(0);
+                outcome.fragment_reuse_index_present = Some(false);
             } else {
                 let observation = compact_files_with_observation(
                     args,
@@ -2640,6 +2875,10 @@ async fn execute(
                 outcome.indices_remapped = Some(observation.indices_remapped);
                 outcome.index_coverage_reuse = observation.index_coverage_reuse;
                 outcome.layout_index_maintenance_ns = Some(observation.layout_index_maintenance_ns);
+                outcome.fragment_reuse_index_present =
+                    Some(observation.fragment_reuse_index_present);
+                outcome.explicit_locator_objects_written = Some(0);
+                outcome.explicit_locator_bytes_written = Some(0);
                 outcome.compaction_groups_planned = Some(observation.metrics.groups_planned as u64);
                 outcome.compaction_groups_admitted =
                     Some(observation.metrics.groups_admitted as u64);
@@ -2648,6 +2887,53 @@ async fn execute(
             }
             verify_maintenance_output(&dataset, maintenance_plan.as_ref())?;
             finish_outcome(args, &dataset, outcome).await
+        }
+        Operation::BoundedRecluster => {
+            let mut dataset = open_dataset(args, tracker).await?;
+            args.format.validate_dataset(&dataset)?;
+            if args.maintenance_plan_input.is_none() {
+                return Err("bounded recluster requires a paired maintenance plan".into());
+            }
+            let maintenance_plan = read_maintenance_plan(args, &dataset)?;
+            let observation = rewrite_files_in_order_with_observation(
+                args,
+                &mut dataset,
+                default_compaction_options(args),
+                &maintenance_plan,
+            )
+            .await?;
+            verify_maintenance_output(&dataset, Some(&maintenance_plan))?;
+            finish_outcome(
+                args,
+                &dataset,
+                OperationOutcome {
+                    result_rows: Some(args.expected_rows as u64),
+                    rows_updated: Some(args.expected_rows as u64),
+                    compacted_data_bytes: observation.compacted_data_bytes,
+                    index_storage_bytes_before: observation.index_storage_bytes_before,
+                    row_addresses_remapped: Some(observation.row_addresses_remapped),
+                    indices_remapped: Some(observation.indices_remapped),
+                    index_coverage_reuse: observation.index_coverage_reuse,
+                    layout_index_maintenance_ns: Some(observation.layout_index_maintenance_ns),
+                    fragment_reuse_index_present: Some(observation.fragment_reuse_index_present),
+                    explicit_locator_objects_written: Some(0),
+                    explicit_locator_bytes_written: Some(0),
+                    compaction_groups_planned: Some(observation.metrics.groups_planned as u64),
+                    compaction_groups_admitted: Some(observation.metrics.groups_admitted as u64),
+                    compaction_groups_not_admitted: Some(
+                        observation.metrics.groups_not_admitted as u64,
+                    ),
+                    coverage: (args.index_kind != IndexKind::None).then_some(0.0),
+                    admission: Some(
+                        observation.metrics.groups_planned > 0
+                            && observation.metrics.groups_admitted
+                                == observation.metrics.groups_planned
+                            && observation.metrics.groups_not_admitted == 0,
+                    ),
+                    ..Default::default()
+                },
+            )
+            .await
         }
         Operation::NormalizePlacement
         | Operation::Repack
@@ -2686,14 +2972,62 @@ async fn execute(
                 .map(|plan| plan.execution_target_rows_per_fragment)
                 .unwrap_or(args.target_rows_per_fragment);
             options.max_rows_per_group = args.rows_per_fragment;
+            let disclose_explicit_cost =
+                matches!(args.operation, Operation::Repack | Operation::Recluster);
+            let compacted_data_bytes = disclose_explicit_cost
+                .then(|| fragment_file_bytes(dataset.manifest().fragments.iter()))
+                .flatten();
+            let index_storage_bytes_before = if disclose_explicit_cost {
+                index_storage_bytes(&dataset).await?
+            } else {
+                None
+            };
+            let indices_before = if disclose_explicit_cost {
+                Some(dataset.load_indices().await?)
+            } else {
+                None
+            };
+            let commit_started = Instant::now();
             let metrics = maintain_row_addresses(&mut dataset, options).await?;
+            let layout_index_maintenance_ns =
+                u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             verify_maintenance_output(&dataset, maintenance_plan.as_ref())?;
+            let indices_after = if disclose_explicit_cost {
+                Some(dataset.load_indices().await?)
+            } else {
+                None
+            };
+            let index_coverage_reuse = indices_before.as_ref().and_then(|before| {
+                if before.is_empty() {
+                    return None;
+                }
+                let after = indices_after
+                    .as_ref()
+                    .expect("explicit cost loads both index sets");
+                let reused = before
+                    .iter()
+                    .filter(|index| after.iter().any(|candidate| candidate.uuid == index.uuid))
+                    .count();
+                Some(reused as f64 / before.len() as f64)
+            });
             finish_outcome(
                 args,
                 &dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     rows_updated: Some(metrics.rows_rewritten),
+                    compacted_data_bytes,
+                    index_storage_bytes_before,
+                    row_addresses_remapped: disclose_explicit_cost.then_some(0),
+                    indices_remapped: disclose_explicit_cost.then_some(0),
+                    index_coverage_reuse,
+                    layout_index_maintenance_ns: disclose_explicit_cost
+                        .then_some(layout_index_maintenance_ns),
+                    fragment_reuse_index_present: disclose_explicit_cost.then_some(false),
+                    explicit_locator_objects_written: disclose_explicit_cost
+                        .then_some(metrics.locator_objects_written as u64),
+                    explicit_locator_bytes_written: disclose_explicit_cost
+                        .then_some(metrics.locator_bytes_written),
                     coverage: (args.index_kind != IndexKind::None).then_some(0.0),
                     admission: Some(true),
                     ..Default::default()
@@ -2762,18 +3096,20 @@ async fn execute(
             .await
         }
         Operation::IndexTake => {
+            let PreparedOperation::Take { mut user_ids, .. } = prepared else {
+                return Err("index take is missing prepared live user IDs".into());
+            };
             let dataset = open_dataset(args, tracker).await?;
             args.format.validate_dataset(&dataset)?;
             let (result_rows, recall) = match args.index_kind {
                 IndexKind::None => unreachable!("validated before execution"),
                 IndexKind::Scalar => {
-                    let mut ids =
-                        sample_positions(args.expected_rows, args.take_count, args.seed, args.step);
-                    ids.sort_unstable();
+                    user_ids.sort_unstable();
                     let predicate = format!(
                         "id IN ({})",
-                        ids.iter()
-                            .map(usize::to_string)
+                        user_ids
+                            .iter()
+                            .map(u64::to_string)
                             .collect::<Vec<_>>()
                             .join(",")
                     );
@@ -2787,7 +3123,7 @@ async fn execute(
                         .column_by_name("id")
                         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                         .ok_or("scalar index take did not return the UInt64 id column")?;
-                    let expected = ids.into_iter().map(|id| id as u64).collect::<HashSet<_>>();
+                    let expected = user_ids.into_iter().collect::<HashSet<_>>();
                     let returned = returned_ids.iter().flatten().collect::<HashSet<_>>();
                     let matched = expected.intersection(&returned).count();
                     (
@@ -2796,13 +3132,16 @@ async fn execute(
                     )
                 }
                 IndexKind::Vector => {
-                    // The query is exactly the vector stored at row id 0.  This
-                    // gives us an exact top-1 ground truth without adding a
-                    // second full-table scan to the measured read path.
+                    // The untimed fixture scan selected a live business ID.
+                    // Reconstruct its vector deterministically so the measured
+                    // path contains only the indexed query.
+                    let query_id = user_ids[0];
                     let query =
                         Float32Array::from_iter_values((0..VECTOR_DIMENSION).map(|dimension| {
                             let bits = mix64(
-                                args.seed ^ (dimension as u64).wrapping_mul(0xd6e8_feb8_6659_fd93),
+                                query_id
+                                    ^ args.seed
+                                    ^ (dimension as u64).wrapping_mul(0xd6e8_feb8_6659_fd93),
                             );
                             ((bits >> 40) as u32) as f32 / (u32::MAX >> 8) as f32
                         }));
@@ -2813,7 +3152,7 @@ async fn execute(
                         .column_by_name("id")
                         .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
                         .ok_or("vector index take did not return the UInt64 id column")?;
-                    let exact_top_one_found = !ids.is_empty() && ids.value(0) == 0;
+                    let exact_top_one_found = !ids.is_empty() && ids.value(0) == query_id;
                     (
                         batch.num_rows(),
                         if exact_top_one_found { 1.0 } else { 0.0 },
@@ -2886,13 +3225,14 @@ async fn execute(
                 OperationOutcome {
                     result_rows: Some(result_rows),
                     state_digest: Some(digest.finish()),
+                    physical_order_digest: Some(digest.finish_ordered()),
                     ..Default::default()
                 },
             )
             .await
         }
         Operation::Take => {
-            let PreparedOperation::Take { row_ids } = prepared else {
+            let PreparedOperation::Take { row_ids, .. } = prepared else {
                 return Err("take operation is missing prepared row IDs".into());
             };
             let dataset = open_dataset(args, tracker).await?;
@@ -2945,6 +3285,50 @@ fn benchmark_index_name(kind: IndexKind) -> &'static str {
         IndexKind::Scalar => "stable_row_address_scalar",
         IndexKind::Vector => "stable_row_address_vector",
     }
+}
+
+async fn exact_row_address_delta_bytes(dataset: &Dataset) -> BenchResult<u64> {
+    let indices = dataset.load_indices().await?;
+
+    let mut fast_manifest = dataset.manifest().clone();
+    fast_manifest.row_address_layout = fast_manifest
+        .row_address_layout
+        .as_ref()
+        .map(|layout| layout.fast_admission_projection().map(Arc::new))
+        .transpose()?;
+    let fast_manifest_bytes = pb::Manifest::from(&fast_manifest).encoded_len() as u64;
+    let fast_index_bytes = pb::IndexSection {
+        indices: indices.iter().map(Into::into).collect(),
+    }
+    .encoded_len() as u64;
+
+    let mut core_manifest = dataset.manifest().clone();
+    core_manifest.row_address_layout = None;
+    core_manifest.max_logical_fragment_id = None;
+    let mut core_fragments = core_manifest.fragments.as_ref().clone();
+    for fragment in &mut core_fragments {
+        fragment.native_logical_domain = None;
+    }
+    core_manifest.fragments = Arc::new(core_fragments);
+    let mut core_indices = indices.as_ref().clone();
+    for index in &mut core_indices {
+        index.row_reference_domain = None;
+        index.logical_coverage = None;
+    }
+    let core_manifest_bytes = pb::Manifest::from(&core_manifest).encoded_len() as u64;
+    let core_index_bytes = pb::IndexSection {
+        indices: core_indices.iter().map(Into::into).collect(),
+    }
+    .encoded_len() as u64;
+
+    fast_manifest_bytes
+        .checked_add(fast_index_bytes)
+        .and_then(|fast| {
+            core_manifest_bytes
+                .checked_add(core_index_bytes)
+                .and_then(|core| fast.checked_sub(core))
+        })
+        .ok_or_else(|| "row-address manifest Delta overflow or underflow".into())
 }
 
 async fn finish_outcome(
@@ -3015,7 +3399,7 @@ async fn finish_outcome(
     if let Some(layout) = &dataset.manifest().row_address_layout {
         let layout_proto: pb::RowAddressLayout = layout.as_ref().into();
         outcome.placement_root_bytes = Some(layout_proto.encoded_len() as u64);
-        outcome.placement_delta_bytes = Some(layout.debt_summary.canonical_layout_bytes);
+        outcome.placement_delta_claimed_bytes = Some(layout.debt_summary.fast_delta_bytes);
         outcome.w_epoch_bytes = Some(layout.debt_summary.metadata_bytes_written_since_maintenance);
     }
     Ok(outcome)
@@ -3026,6 +3410,8 @@ struct StateDigest {
     rows: u64,
     xor: u64,
     sum: u64,
+    ordered_xor: u64,
+    ordered_sum: u64,
 }
 
 impl StateDigest {
@@ -3061,6 +3447,13 @@ impl StateDigest {
             }
             self.xor ^= row_hash;
             self.sum = self.sum.wrapping_add(row_hash.rotate_left(17));
+            let ordinal = self.rows + row_index as u64;
+            self.ordered_xor =
+                mix64(self.ordered_xor ^ row_hash ^ ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            self.ordered_sum = self
+                .ordered_sum
+                .wrapping_mul(0xa076_1d64_78bd_642f)
+                .wrapping_add(row_hash ^ ordinal.rotate_left(23));
         }
         self.rows = self
             .rows
@@ -3069,8 +3462,15 @@ impl StateDigest {
         Ok(())
     }
 
-    fn finish(self) -> String {
+    fn finish(&self) -> String {
         format!("{:016x}{:016x}{:016x}", self.rows, self.xor, self.sum)
+    }
+
+    fn finish_ordered(&self) -> String {
+        format!(
+            "{:016x}{:016x}{:016x}",
+            self.rows, self.ordered_xor, self.ordered_sum
+        )
     }
 }
 
@@ -3185,7 +3585,7 @@ fn read_take_ids_artifact(args: &Args) -> BenchResult<PreparedOperation> {
     let input = args
         .take_ids_input
         .as_ref()
-        .ok_or("take operation requires --take-ids-input")?;
+        .ok_or("take or index-take operation requires --take-ids-input")?;
     let artifact: TakeIdsArtifact = serde_json::from_slice(&fs::read(input)?)?;
     let expected = (
         1,
@@ -3235,6 +3635,7 @@ fn read_take_ids_artifact(args: &Args) -> BenchResult<PreparedOperation> {
         return Err("take-ID artifact must contain take_count unique row IDs".into());
     }
     Ok(PreparedOperation::Take {
+        user_ids: artifact.user_ids,
         row_ids: artifact.row_ids,
     })
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,18 +14,24 @@ use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, RowAddressManifestApplyContext, TransactionBuilder};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::index::DatasetIndexExt;
+use crate::io::exec::filtered_read::{EvaluatedIndex, FilteredReadExec, FilteredReadOptions};
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{PhysicalExpr, RecordBatchStream};
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, PhysicalExpr, RecordBatchStream,
+};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_physical_expr::LexOrdering;
@@ -37,18 +43,521 @@ use lance_core::utils::address::LogicalRowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
-use lance_datafusion::exec::execute_plan;
+use lance_datafusion::exec::{execute_plan, get_session_context};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::spill::{SpillSender, create_replay_spill};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{
     DeletionFile, DeletionFileType, Fragment, LogicalRowAddressSelection, RowAddressFieldChange,
-    RowAddressLayoutDelta, RowAddressPlacementDelta, RowAddressPlacementKind,
-    RowAddressSourceFloor, RowAddressTargetFragment, RowAddressTargetRange, RowIdMeta,
-    fingerprint_row_sequence,
+    RowAddressLayout, RowAddressLayoutDelta, RowAddressPlacement, RowAddressPlacementDelta,
+    RowAddressPlacementKind, RowAddressSourceFloor, RowAddressTargetFragment,
+    RowAddressTargetRange, RowIdMeta, fingerprint_row_sequence,
 };
 use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::ResultExt;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V2_3UpdateLogicalOrderPlan {
+    /// Exclusive physical-fragment boundaries for monotonic input runs.
+    /// Empty means the manifest's physical order is already logical order.
+    logical_run_ends: Vec<u32>,
+    /// ExplicitMap and an internally non-monotonic physical fragment cannot be
+    /// split into independently ordered scanner inputs.
+    requires_full_logical_sort: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LogicalOrderSegment {
+    destination_start: u32,
+    first_logical_address: u64,
+    last_logical_address: u64,
+}
+
+fn selection_logical_bounds(selection: &LogicalRowAddressSelection) -> Result<Option<(u64, u64)>> {
+    let cardinality = selection.cardinality();
+    if cardinality == 0 {
+        return Ok(None);
+    }
+    let first = selection.select(0)?.ok_or_else(|| {
+        Error::invalid_input("logical selection cardinality exceeds encoded values")
+    })?;
+    let last = selection.select(cardinality - 1)?.ok_or_else(|| {
+        Error::invalid_input("logical selection cardinality exceeds encoded values")
+    })?;
+    Ok(Some((first.raw(), last.raw())))
+}
+
+/// Plan logical-order UPDATE input from manifest routing metadata only.
+///
+/// Each fast placement codec is logically sorted inside a source segment. We
+/// inspect only the segment destination offset and its first/last logical
+/// address. Exclusions and deletion vectors only remove rows from those sorted
+/// sequences, so the untrimmed bounds are conservative without decoding rows.
+fn plan_v2_3_update_logical_order(
+    fragments: &[Fragment],
+    layout: &RowAddressLayout,
+) -> Result<V2_3UpdateLogicalOrderPlan> {
+    let fragment_ids = fragments
+        .iter()
+        .map(|fragment| {
+            u32::try_from(fragment.id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "physical fragment id {} exceeds row-address capacity",
+                    fragment.id
+                ))
+            })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut segments = BTreeMap::<u32, Vec<LogicalOrderSegment>>::new();
+    let mut push_segment = |physical_fragment_id: u32, segment: LogicalOrderSegment| {
+        if fragment_ids.contains(&physical_fragment_id) {
+            segments
+                .entry(physical_fragment_id)
+                .or_default()
+                .push(segment);
+        }
+    };
+
+    for placement in &layout.placements {
+        match placement {
+            RowAddressPlacement::Direct(value) => {
+                let first =
+                    LogicalRowAddress::try_new_from_parts(value.source.logical_fragment_id, 0)?;
+                let last = LogicalRowAddress::try_new_from_parts(
+                    value.source.logical_fragment_id,
+                    value.source.slot_count.checked_sub(1).ok_or_else(|| {
+                        Error::invalid_input("Direct placement has an empty logical domain")
+                    })?,
+                )?;
+                push_segment(
+                    value.destination_fragment_id,
+                    LogicalOrderSegment {
+                        destination_start: value.destination_start,
+                        first_logical_address: first.raw(),
+                        last_logical_address: last.raw(),
+                    },
+                );
+            }
+            RowAddressPlacement::PackedRun(value) => {
+                let first_domain = value.domains.domain_at(0)?;
+                let last_domain_ordinal =
+                    value.domains.domain_count().checked_sub(1).ok_or_else(|| {
+                        Error::invalid_input("PackedRun placement has no logical domains")
+                    })?;
+                let last_domain = value.domains.domain_at(last_domain_ordinal)?;
+                let first =
+                    LogicalRowAddress::try_new_from_parts(first_domain.logical_fragment_id, 0)?;
+                let last = LogicalRowAddress::try_new_from_parts(
+                    last_domain.logical_fragment_id,
+                    last_domain.slot_count.checked_sub(1).ok_or_else(|| {
+                        Error::invalid_input("PackedRun placement has an empty logical domain")
+                    })?,
+                )?;
+                push_segment(
+                    value.destination_fragment_id,
+                    LogicalOrderSegment {
+                        destination_start: value.destination_start,
+                        first_logical_address: first.raw(),
+                        last_logical_address: last.raw(),
+                    },
+                );
+            }
+            RowAddressPlacement::Selected(value) => {
+                if let Some((first, last)) = selection_logical_bounds(&value.selection)? {
+                    push_segment(
+                        value.destination_fragment_id,
+                        LogicalOrderSegment {
+                            destination_start: value.destination_start,
+                            first_logical_address: first,
+                            last_logical_address: last,
+                        },
+                    );
+                }
+            }
+            RowAddressPlacement::ExtentList(value) => {
+                for extent in &value.extents {
+                    let last_slot = extent
+                        .source_start
+                        .checked_add(extent.length)
+                        .and_then(|end| end.checked_sub(1))
+                        .ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "ExtentList source range overflows: source_start={}, length={}",
+                                extent.source_start, extent.length
+                            ))
+                        })?;
+                    let first = LogicalRowAddress::try_new_from_parts(
+                        value.source.logical_fragment_id,
+                        extent.source_start,
+                    )?;
+                    let last = LogicalRowAddress::try_new_from_parts(
+                        value.source.logical_fragment_id,
+                        last_slot,
+                    )?;
+                    push_segment(
+                        extent.destination_fragment_id,
+                        LogicalOrderSegment {
+                            destination_start: extent.destination_start,
+                            first_logical_address: first.raw(),
+                            last_logical_address: last.raw(),
+                        },
+                    );
+                }
+            }
+            RowAddressPlacement::SparseSelection(value) => {
+                let mut destination_start = u64::from(value.destination_start);
+                for source in &value.sources {
+                    if let Some((first, last)) = selection_logical_bounds(&source.selection)? {
+                        push_segment(
+                            value.destination_fragment_id,
+                            LogicalOrderSegment {
+                                destination_start: u32::try_from(destination_start).map_err(
+                                    |_| {
+                                        Error::invalid_input(
+                                            "SparseSelection destination offset exceeds u32",
+                                        )
+                                    },
+                                )?,
+                                first_logical_address: first,
+                                last_logical_address: last,
+                            },
+                        );
+                    }
+                    destination_start = destination_start
+                        .checked_add(source.selection.cardinality())
+                        .ok_or_else(|| {
+                            Error::invalid_input("SparseSelection destination offset overflow")
+                        })?;
+                }
+            }
+            RowAddressPlacement::ExplicitMap(value) => {
+                if value
+                    .destinations
+                    .iter()
+                    .any(|destination| fragment_ids.contains(&destination.physical_fragment_id))
+                {
+                    return Ok(V2_3UpdateLogicalOrderPlan {
+                        logical_run_ends: Vec::new(),
+                        requires_full_logical_sort: true,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut logical_run_ends = Vec::new();
+    let mut current_run_last = None;
+    for (fragment_index, fragment) in fragments.iter().enumerate() {
+        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+            Error::invalid_input(format!(
+                "physical fragment id {} exceeds row-address capacity",
+                fragment.id
+            ))
+        })?;
+        let mut fragment_segments = if let Some(native) = fragment.native_logical_domain {
+            let physical_rows = u32::try_from(fragment.physical_rows.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "native logical fragment {} is missing physical_rows",
+                    fragment.id
+                ))
+            })?)
+            .map_err(|_| Error::invalid_input("native logical fragment exceeds u32 rows"))?;
+            let first = LogicalRowAddress::try_new_from_parts(native.logical_fragment_id, 0)?;
+            let last_slot = physical_rows.checked_sub(1).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "native logical fragment {} has zero physical rows",
+                    fragment.id
+                ))
+            })?;
+            let last =
+                LogicalRowAddress::try_new_from_parts(native.logical_fragment_id, last_slot)?;
+            vec![LogicalOrderSegment {
+                destination_start: 0,
+                first_logical_address: first.raw(),
+                last_logical_address: last.raw(),
+            }]
+        } else {
+            segments.remove(&fragment_id).unwrap_or_default()
+        };
+        if fragment_segments.is_empty() {
+            continue;
+        }
+        fragment_segments.sort_unstable_by_key(|segment| segment.destination_start);
+        if fragment_segments
+            .windows(2)
+            .any(|pair| pair[0].last_logical_address >= pair[1].first_logical_address)
+        {
+            return Ok(V2_3UpdateLogicalOrderPlan {
+                logical_run_ends: Vec::new(),
+                requires_full_logical_sort: true,
+            });
+        }
+        let first = fragment_segments[0].first_logical_address;
+        let last = fragment_segments
+            .last()
+            .map(|segment| segment.last_logical_address)
+            .ok_or_else(|| Error::internal("logical-order fragment segments disappeared"))?;
+        if current_run_last.is_some_and(|previous| previous >= first) {
+            logical_run_ends.push(
+                u32::try_from(fragment_index).map_err(|_| {
+                    Error::invalid_input("update source fragment count exceeds u32")
+                })?,
+            );
+        }
+        current_run_last = Some(last);
+    }
+    if !logical_run_ends.is_empty() {
+        logical_run_ends.push(
+            u32::try_from(fragments.len())
+                .map_err(|_| Error::invalid_input("update source fragment count exceeds u32"))?,
+        );
+    }
+    Ok(V2_3UpdateLogicalOrderPlan {
+        logical_run_ends,
+        requires_full_logical_sort: false,
+    })
+}
+
+fn logical_row_ordering(plan: &Arc<dyn ExecutionPlan>) -> Result<LexOrdering> {
+    let row_id_sort = PhysicalSortExpr {
+        expr: expressions::col(ROW_ID_FIELD.name(), plan.schema().as_ref())?,
+        options: arrow::compute::SortOptions {
+            descending: false,
+            nulls_first: false,
+        },
+    };
+    LexOrdering::new([row_id_sort])
+        .ok_or_else(|| Error::internal("logical row ordering cannot be empty"))
+}
+
+async fn create_v2_3_update_scan_plan(
+    scanner: &crate::dataset::scanner::Scanner,
+    fragments: &[Fragment],
+    order_plan: &V2_3UpdateLogicalOrderPlan,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    create_v2_3_update_scan_plan_impl(scanner, fragments, order_plan, None).await
+}
+
+async fn create_v2_3_full_sort_scan_plan(
+    scanner: &crate::dataset::scanner::Scanner,
+    fragments: &[Fragment],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut full_scanner = scanner.clone();
+    full_scanner
+        .with_fragments(fragments.to_vec())
+        .scan_in_order(false);
+    let input = full_scanner.create_plan().await?;
+    let ordering = logical_row_ordering(&input)?;
+    Ok(Arc::new(SortExec::new(ordering, input)))
+}
+
+fn collect_filtered_read_execs<'a>(
+    plan: &'a Arc<dyn ExecutionPlan>,
+    output: &mut Vec<&'a FilteredReadExec>,
+) {
+    if let Some(filtered_read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+        output.push(filtered_read);
+    }
+    for child in plan.children() {
+        collect_filtered_read_execs(child, output);
+    }
+}
+
+fn replace_filtered_read(
+    template: Arc<dyn ExecutionPlan>,
+    dataset: Arc<Dataset>,
+    mut options: FilteredReadOptions,
+    fragments: &[Fragment],
+    evaluated_index: Option<Arc<EvaluatedIndex>>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    options.fragments = Some(Arc::new(fragments.to_vec()));
+    let replacement = FilteredReadExec::try_new(dataset, options, None)?;
+    let replacement = if let Some(evaluated_index) = evaluated_index {
+        replacement.with_evaluated_index(evaluated_index)
+    } else {
+        replacement
+    };
+    let replacement: Arc<dyn ExecutionPlan> = Arc::new(replacement);
+    let mut replacement_count = 0_usize;
+    let transformed = template.transform_up(|node| {
+        if node.as_any().is::<FilteredReadExec>() {
+            replacement_count += 1;
+            Ok(Transformed::yes(replacement.clone()))
+        } else {
+            Ok(Transformed::no(node))
+        }
+    })?;
+    if replacement_count != 1 {
+        return Err(Error::internal(format!(
+            "ordered UPDATE run replaced {replacement_count} FilteredReadExec nodes instead of one"
+        )));
+    }
+    Ok(transformed.data)
+}
+
+async fn create_v2_3_update_scan_plan_impl(
+    scanner: &crate::dataset::scanner::Scanner,
+    fragments: &[Fragment],
+    order_plan: &V2_3UpdateLogicalOrderPlan,
+    index_evaluations: Option<&std::sync::atomic::AtomicUsize>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if order_plan.requires_full_logical_sort {
+        if !order_plan.logical_run_ends.is_empty() {
+            return Err(Error::internal(
+                "full logical sort cannot also declare sort-preserving input runs",
+            ));
+        }
+        return create_v2_3_full_sort_scan_plan(scanner, fragments).await;
+    }
+
+    if order_plan.logical_run_ends.is_empty() {
+        let mut ordered_scanner = scanner.clone();
+        ordered_scanner
+            .with_fragments(fragments.to_vec())
+            .scan_in_order(true);
+        return ordered_scanner.create_plan().await;
+    }
+
+    let mut previous_end = 0_usize;
+    let mut logical_runs = Vec::with_capacity(order_plan.logical_run_ends.len());
+    for end in &order_plan.logical_run_ends {
+        let end = usize::try_from(*end)
+            .map_err(|_| Error::internal("logical run boundary does not fit in usize"))?;
+        if end <= previous_end || end > fragments.len() {
+            return Err(Error::internal(format!(
+                "invalid logical run boundary {end} after {previous_end} for {} source fragments",
+                fragments.len()
+            )));
+        }
+        logical_runs.push(previous_end..end);
+        previous_end = end;
+    }
+    if previous_end != fragments.len() {
+        return Err(Error::internal(format!(
+            "logical run boundaries cover {previous_end} of {} source fragments",
+            fragments.len()
+        )));
+    }
+
+    let mut ordered_scanner = scanner.clone();
+    ordered_scanner
+        .with_fragments(fragments.to_vec())
+        .scan_in_order(true);
+    let template = ordered_scanner.create_plan().await?;
+    let mut filtered_reads = Vec::new();
+    collect_filtered_read_execs(&template, &mut filtered_reads);
+    if filtered_reads.iter().any(|read| {
+        read.options().scan_range_before_filter.is_some()
+            || read.options().scan_range_after_filter.is_some()
+    }) {
+        return Err(Error::internal(
+            "storage-version-2.3 UPDATE cannot split a scan with a before-filter or after-filter range",
+        ));
+    }
+    if filtered_reads.len() != 1 {
+        return create_v2_3_full_sort_scan_plan(scanner, fragments).await;
+    }
+
+    let all_fragment_ids = fragments
+        .iter()
+        .map(|fragment| {
+            u32::try_from(fragment.id).map_err(|_| {
+                Error::internal(format!(
+                    "physical fragment id {} exceeds row-address capacity",
+                    fragment.id
+                ))
+            })
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if all_fragment_ids.len() != fragments.len() {
+        return Err(Error::internal(
+            "storage-version-2.3 UPDATE source contains duplicate physical fragment ids",
+        ));
+    }
+
+    let filtered_read = filtered_reads[0];
+    let dataset = filtered_read.dataset().clone();
+    let options = filtered_read.options().clone();
+    if filtered_read.index_input().is_none() {
+        let mut inputs = Vec::<Arc<dyn ExecutionPlan>>::with_capacity(logical_runs.len());
+        for run in &logical_runs {
+            let input = replace_filtered_read(
+                template.clone(),
+                dataset.clone(),
+                options.clone(),
+                &fragments[run.clone()],
+                None,
+            )?;
+            if input.output_partitioning().partition_count() != 1 {
+                return Err(Error::internal(format!(
+                    "ordered update run produced {} partitions instead of one",
+                    input.output_partitioning().partition_count()
+                )));
+            }
+            inputs.push(input);
+        }
+        let union = UnionExec::try_new(inputs)?;
+        let ordering = logical_row_ordering(&union)?;
+        return Ok(Arc::new(SortPreservingMergeExec::new(ordering, union)));
+    }
+
+    let execution_options = scanner.execution_options();
+    let task_ctx = get_session_context(&execution_options).task_ctx();
+    if let Some(index_evaluations) = index_evaluations {
+        index_evaluations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let evaluated_index = filtered_read
+        .evaluate_index(task_ctx)
+        .await?
+        .ok_or_else(|| {
+            Error::internal("indexed UPDATE scan did not produce an evaluated scalar index")
+        })?;
+
+    let mut fragment_coverage = BTreeMap::<u32, usize>::new();
+    let mut inputs = Vec::<Arc<dyn ExecutionPlan>>::with_capacity(logical_runs.len());
+    for run in logical_runs {
+        let run_fragments = &fragments[run];
+        let run_fragment_ids = run_fragments
+            .iter()
+            .map(|fragment| {
+                u32::try_from(fragment.id).map_err(|_| {
+                    Error::internal(format!(
+                        "physical fragment id {} exceeds row-address capacity",
+                        fragment.id
+                    ))
+                })
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        for fragment_id in run_fragment_ids {
+            *fragment_coverage.entry(fragment_id).or_default() += 1;
+        }
+
+        let input = replace_filtered_read(
+            template.clone(),
+            dataset.clone(),
+            options.clone(),
+            run_fragments,
+            Some(evaluated_index.clone()),
+        )?;
+        if input.output_partitioning().partition_count() != 1 {
+            return Err(Error::internal(format!(
+                "ordered update run produced {} partitions instead of one",
+                input.output_partitioning().partition_count()
+            )));
+        }
+        inputs.push(input);
+    }
+    if fragment_coverage.len() != all_fragment_ids.len()
+        || fragment_coverage.values().any(|count| *count != 1)
+    {
+        return Err(Error::internal(
+            "ordered UPDATE runs do not cover every physical fragment exactly once",
+        ));
+    }
+    let union = UnionExec::try_new(inputs)?;
+    let ordering = logical_row_ordering(&union)?;
+    Ok(Arc::new(SortPreservingMergeExec::new(ordering, union)))
+}
 
 /// Collect a field id and all of its descendant field ids (pre-order). A struct
 /// column update rewrites the whole subtree, so an index on any descendant must be
@@ -616,21 +1125,21 @@ impl UpdateJob {
         }
 
         let uses_logical_row_addresses = self.dataset.manifest.uses_stable_logical_row_addresses();
-        let mut plan = scanner.create_plan().await?;
-        if uses_logical_row_addresses {
-            let row_id_sort = PhysicalSortExpr {
-                expr: expressions::col(ROW_ID_FIELD.name(), plan.schema().as_ref())?,
-                options: arrow::compute::SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
-            };
-            plan = Arc::new(SortExec::new(
-                LexOrdering::new([row_id_sort])
-                    .ok_or_else(|| Error::internal("logical row ordering cannot be empty"))?,
-                plan,
-            ));
-        }
+        let plan = if uses_logical_row_addresses {
+            let layout = self
+                .dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::internal("storage-version-2.3 update is missing RowAddressLayout")
+                })?;
+            let fragments = self.dataset.manifest.fragments.as_ref();
+            let order_plan = plan_v2_3_update_logical_order(fragments, layout)?;
+            create_v2_3_update_scan_plan(&scanner, fragments, &order_plan).await?
+        } else {
+            scanner.create_plan().await?
+        };
         let stream = execute_plan(plan, scanner.execution_options())?;
 
         // We keep track of seen row ids so we can delete them from the existing
@@ -950,6 +1459,7 @@ mod tests {
 
     use super::*;
 
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteDestination, WriteMode};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
@@ -962,6 +1472,7 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
+    use datafusion::physical_plan::displayable;
     use futures::{TryStreamExt, future::try_join_all};
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
@@ -2193,6 +2704,348 @@ mod tests {
 
         let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
         assert_eq!(blobs.value(idx_foo), b"foo");
+    }
+
+    #[tokio::test]
+    async fn test_v23_update_after_update_compaction_uses_sort_preserving_merge() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..20)),
+                Arc::new(Int64Array::from_iter_values(0..20)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                Some("id_idx".to_owned()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let first = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id % 3 = 0")
+            .unwrap()
+            .set("value", "value + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let mut compacted = first.as_ref().clone();
+        compact_files(
+            &mut compacted,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(compacted.manifest.fragments.len(), 1);
+
+        let second = UpdateBuilder::new(Arc::new(compacted))
+            .update_where("id % 5 = 0")
+            .unwrap()
+            .set("value", "value + 1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let layout = second.manifest.row_address_layout.as_ref().unwrap();
+        let fragments = second.manifest.fragments.as_ref();
+        let order_plan = plan_v2_3_update_logical_order(fragments, layout).unwrap();
+        assert!(!order_plan.requires_full_logical_sort);
+        assert!(
+            !order_plan.logical_run_ends.is_empty(),
+            "the rewritten logical stripe must form a second monotonic run"
+        );
+
+        let mut scanner = second.scan();
+        scanner.with_row_id();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        scanner.filter("id = 7").unwrap();
+        let index_evaluations = std::sync::atomic::AtomicUsize::new(0);
+        let physical_plan = create_v2_3_update_scan_plan_impl(
+            &scanner,
+            fragments,
+            &order_plan,
+            Some(&index_evaluations),
+        )
+        .await
+        .unwrap();
+        let plan_text = displayable(physical_plan.as_ref()).indent(true).to_string();
+        assert!(
+            plan_text.contains("SortPreservingMergeExec"),
+            "expected a sort-preserving logical merge, got:\n{plan_text}"
+        );
+        assert!(
+            !plan_text
+                .lines()
+                .any(|line| line.trim_start().starts_with("SortExec:")),
+            "fast placement codecs must not globally sort UPDATE input:\n{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("ScalarIndexQuery"),
+            "the split plan must consume the precomputed index result:\n{plan_text}"
+        );
+        assert_eq!(
+            index_evaluations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "scalar-index evaluation and logical-to-physical translation must initialize once"
+        );
+        let selected = execute_plan(physical_plan, scanner.execution_options())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(selected.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            index_evaluations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "executing split runs must not repeat scalar-index evaluation or translation"
+        );
+
+        let third = UpdateBuilder::new(second)
+            .update_where("id = 7")
+            .unwrap()
+            .set("value", "value + 10000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let batch = third.scan().try_into_batch().await.unwrap();
+        let values = batch["id"]
+            .as_primitive::<Int64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                batch["value"]
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect::<HashMap<_, _>>();
+        for id in 0..20_i64 {
+            let expected = id
+                + if id % 3 == 0 { 100 } else { 0 }
+                + if id % 5 == 0 { 1000 } else { 0 }
+                + if id == 7 { 10000 } else { 0 };
+            assert_eq!(values[&id], expected, "id={id}");
+        }
+    }
+
+    #[test]
+    fn test_v23_update_order_plan_falls_back_for_explicit_map() {
+        let source = lance_table::format::RowAddressLogicalDomain::new(4, 2, 1).unwrap();
+        let selection = LogicalRowAddressSelection::from_full_domains(&[source]).unwrap();
+        let explicit = lance_table::format::ExplicitMapRowAddressPlacement {
+            sources: vec![lance_table::format::SparseSelectionSource {
+                source,
+                selection: Arc::new(selection),
+                excluded: None,
+            }],
+            object_path: "data/_row_addresses/locator.lance".to_owned(),
+            object_size: 128,
+            pages: vec![lance_table::format::ExplicitMapPage {
+                first_logical_address: 4_u64 << 32,
+                last_logical_address: (4_u64 << 32) | 1,
+                row_start: 0,
+                row_count: 2,
+                content_fingerprint: vec![11; 16],
+            }],
+            destinations: vec![lance_table::format::ExplicitMapDestination {
+                physical_fragment_id: 7,
+                destination_start: 0,
+                row_count: 2,
+                row_id_file_path: "data/_row_addresses/row_ids.lance".to_owned(),
+                row_id_file_size: 64,
+                row_id_pages: vec![lance_table::format::ExplicitMapRowIdPage {
+                    row_start: 0,
+                    row_count: 2,
+                    content_fingerprint: vec![12; 16],
+                }],
+            }],
+            base_id: None,
+        };
+        let mut layout = RowAddressLayout::new(uuid::Uuid::new_v4());
+        layout
+            .placements
+            .push(RowAddressPlacement::ExplicitMap(explicit));
+        let fragments = vec![Fragment {
+            id: 7,
+            files: Vec::new(),
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(2),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            native_logical_domain: None,
+        }];
+
+        let order_plan = plan_v2_3_update_logical_order(&fragments, &layout).unwrap();
+        assert!(order_plan.requires_full_logical_sort);
+        assert!(order_plan.logical_run_ends.is_empty());
+    }
+
+    #[test]
+    fn test_v23_update_order_plan_uses_fast_codec_routing_summaries() {
+        use lance_table::format::{
+            DirectRowAddressPlacement, ExtentListRowAddressPlacement, PackedRunRowAddressPlacement,
+            RowAddressExtent, RowAddressLogicalDomain, SelectedRowAddressPlacement,
+            SparseSelectionRowAddressPlacement, SparseSelectionSource,
+        };
+
+        let domain =
+            |logical_fragment_id| RowAddressLogicalDomain::new(logical_fragment_id, 4, 1).unwrap();
+        let selection = |logical_fragment_id, start_slot, end_slot| {
+            Arc::new(
+                LogicalRowAddressSelection::from_ranges(vec![
+                    lance_table::format::LogicalRowAddressRange::new(
+                        logical_fragment_id,
+                        start_slot,
+                        end_slot,
+                    ),
+                ])
+                .unwrap(),
+            )
+        };
+        let mut layout = RowAddressLayout::new(uuid::Uuid::new_v4());
+        layout
+            .placements
+            .push(RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(0),
+                destination_fragment_id: 0,
+                destination_start: 0,
+                excluded: Some(selection(0, 0, 1)),
+            }));
+        layout.placements.push(RowAddressPlacement::PackedRun(
+            PackedRunRowAddressPlacement::from_sources(vec![domain(1), domain(2)], 1, 0).unwrap(),
+        ));
+        layout
+            .placements
+            .push(RowAddressPlacement::Selected(SelectedRowAddressPlacement {
+                source: domain(3),
+                selection: selection(3, 0, 4),
+                destination_fragment_id: 2,
+                destination_start: 0,
+                excluded: Some(selection(3, 3, 4)),
+            }));
+        layout.placements.push(RowAddressPlacement::ExtentList(
+            ExtentListRowAddressPlacement {
+                source: domain(4),
+                extents: vec![RowAddressExtent {
+                    source_start: 1,
+                    length: 2,
+                    destination_fragment_id: 3,
+                    destination_start: 0,
+                }],
+            },
+        ));
+        layout.placements.push(RowAddressPlacement::SparseSelection(
+            SparseSelectionRowAddressPlacement {
+                sources: vec![
+                    SparseSelectionSource {
+                        source: domain(5),
+                        selection: selection(5, 0, 4),
+                        excluded: Some(selection(5, 3, 4)),
+                    },
+                    SparseSelectionSource {
+                        source: domain(6),
+                        selection: selection(6, 0, 4),
+                        excluded: Some(selection(6, 0, 1)),
+                    },
+                ],
+                destination_fragment_id: 4,
+                destination_start: 0,
+            },
+        ));
+        let fragments = (0..5)
+            .map(|id| Fragment {
+                id,
+                files: Vec::new(),
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(if id == 1 || id == 4 { 8 } else { 4 }),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                native_logical_domain: None,
+            })
+            .collect::<Vec<_>>();
+
+        let order_plan = plan_v2_3_update_logical_order(&fragments, &layout).unwrap();
+        assert!(!order_plan.requires_full_logical_sort);
+        assert!(order_plan.logical_run_ends.is_empty());
+    }
+
+    #[test]
+    fn test_v23_update_order_plan_falls_back_for_non_monotonic_fragment() {
+        let source = lance_table::format::RowAddressLogicalDomain::new(4, 4, 1).unwrap();
+        let mut layout = RowAddressLayout::new(uuid::Uuid::new_v4());
+        layout.placements.push(RowAddressPlacement::ExtentList(
+            lance_table::format::ExtentListRowAddressPlacement {
+                source,
+                extents: vec![
+                    lance_table::format::RowAddressExtent {
+                        source_start: 0,
+                        length: 2,
+                        destination_fragment_id: 7,
+                        destination_start: 2,
+                    },
+                    lance_table::format::RowAddressExtent {
+                        source_start: 2,
+                        length: 2,
+                        destination_fragment_id: 7,
+                        destination_start: 0,
+                    },
+                ],
+            },
+        ));
+        let fragments = vec![Fragment {
+            id: 7,
+            files: Vec::new(),
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(4),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            native_logical_domain: None,
+        }];
+
+        let order_plan = plan_v2_3_update_logical_order(&fragments, &layout).unwrap();
+        assert!(order_plan.requires_full_logical_sort);
+        assert!(order_plan.logical_run_ends.is_empty());
     }
 
     #[tokio::test]

@@ -85,11 +85,20 @@ def valid_record() -> dict[str, object]:
         "manifest_bytes": None,
         "placement_root_bytes": None,
         "placement_delta_bytes": None,
+        "placement_delta_claimed_bytes": None,
         "w_epoch_bytes": None,
         "coverage": None,
         "recall": None,
         "admission": None,
         "placement_maintenance_required": None,
+        "pmr_reason": None,
+        "pmr_projected_delta_bytes": None,
+        "pmr_delta_limit_bytes": None,
+        "pmr_projected_epoch_bytes": None,
+        "pmr_epoch_limit_bytes": None,
+        "pmr_generation_delta_bytes": None,
+        "pmr_generation_epoch_bytes": None,
+        "pmr_blocking_indices": None,
         "rows_inserted": None,
         "rows_updated": None,
         "rows_deleted": None,
@@ -99,10 +108,14 @@ def valid_record() -> dict[str, object]:
         "indices_remapped": None,
         "index_coverage_reuse": None,
         "layout_index_maintenance_ns": None,
+        "fragment_reuse_index_present": None,
+        "explicit_locator_objects_written": None,
+        "explicit_locator_bytes_written": None,
         "compaction_groups_planned": None,
         "compaction_groups_admitted": None,
         "compaction_groups_not_admitted": None,
         "state_digest": None,
+        "physical_order_digest": None,
         "io_by_path": None,
         "io_metrics_status": "not_instrumented",
         "status": "ok",
@@ -121,6 +134,15 @@ class RunTests(unittest.TestCase):
                 ("v23_logical", "v22_no_stable", "v22_stable"),
             ],
         )
+
+    def test_dynamic_format_order_is_scope_bound_and_replayable(self) -> None:
+        scopes = tuple(f"run/track/repeat-000/round-{index:03d}" for index in range(12))
+        first = [run.dynamic_format_order(0, scope) for scope in scopes]
+        second = [run.dynamic_format_order(0, scope) for scope in scopes]
+
+        self.assertEqual(first, second)
+        self.assertGreater(len(set(first)), 1)
+        self.assertTrue(all(set(order) == set(run.FORMATS) for order in first))
 
     def test_policy_hash_uses_canonical_json(self) -> None:
         policy = json.loads(run.DEFAULT_POLICY.read_text(encoding="utf-8"))

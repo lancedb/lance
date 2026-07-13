@@ -102,7 +102,10 @@ pub(crate) async fn merge_segments(
     let logical_coverage = dataset
         .manifest
         .uses_stable_logical_row_addresses()
-        .then(|| crate::index::merge_logical_index_coverage(dataset, &segment_refs))
+        .then(|| {
+            let effective = crate::index::merge_logical_index_coverage(dataset, &segment_refs)?;
+            crate::index::mark_logical_coverage_validated_at_snapshot(dataset, &effective)
+        })
         .transpose()?;
     for segment in &segments {
         finalize_segment_files_if_needed(dataset, segment).await?;
@@ -116,16 +119,17 @@ pub(crate) async fn merge_segments(
         }
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
-        let inverted_index = scalar_index
-            .as_any()
-            .downcast_ref::<InvertedIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected inverted segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
+        let inverted_index =
+            crate::index::scalar_logical::raw_scalar_segment(scalar_index.as_ref())
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "merge_existing_index_segments: expected inverted segment {}, got {:?}",
+                        segment.uuid,
+                        scalar_index.index_type()
+                    ))
+                })?;
         source_indices.push(Arc::new(inverted_index.clone()));
     }
 

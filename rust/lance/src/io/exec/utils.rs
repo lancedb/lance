@@ -45,13 +45,13 @@ pub enum PreFilterSource {
     None,
 }
 
-pub(crate) fn build_prefilter(
+pub(crate) fn build_prefilters(
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
-) -> Result<Arc<DatasetPreFilter>> {
+) -> Result<Vec<Arc<DatasetPreFilter>>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
             let stream = src_node.execute(partition, context)?;
@@ -63,11 +63,22 @@ pub(crate) fn build_prefilter(
         }
         PreFilterSource::None => None,
     };
-    Ok(Arc::new(DatasetPreFilter::new(
-        ds,
-        index_meta,
-        prefilter_loader,
-    )))
+    if ds.manifest.uses_stable_logical_row_addresses() {
+        let by_uuid = DatasetPreFilter::new_logical_per_index(ds, index_meta, prefilter_loader)?;
+        return index_meta
+            .iter()
+            .map(|index| {
+                by_uuid.get(&index.uuid).cloned().ok_or_else(|| {
+                    Error::internal(format!(
+                        "logical prefilter for index segment {} was not created",
+                        index.uuid
+                    ))
+                })
+            })
+            .collect();
+    }
+    let shared = Arc::new(DatasetPreFilter::new(ds, index_meta, prefilter_loader));
+    Ok(vec![shared; index_meta.len()])
 }
 
 // Utility to convert an input (containing row ids) into a prefilter

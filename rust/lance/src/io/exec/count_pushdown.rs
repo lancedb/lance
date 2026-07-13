@@ -57,13 +57,19 @@ use datafusion::physical_plan::{
 };
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::{Column, Literal};
+use lance_core::datatypes::OnMissing;
+use lance_datafusion::planner::Planner;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use log::warn;
 use roaring::RoaringBitmap;
 
 use super::count_from_mask::CountFromMaskExec;
 use super::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use super::logical_coverage::{
+    LogicalMissingRows, LogicalRowIdRangeExec, merged_missing_logical_rows,
+};
 use super::scalar_index::ScalarIndexExec;
+use super::{LanceFilterExec, TakeExec};
 
 /// Physical optimizer rule that rewrites a `COUNT(*)`-style aggregate into
 /// [`CountFromMaskExec`], optionally splitting into a parallel scan branch
@@ -199,6 +205,7 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     //   - Compute the index's fragment coverage from leaf `fragment_bitmap`s.
     //     `None` means at least one leaf has no bitmap and we can't reason
     //     about coverage synchronously — refuse to fire.
+    let mut logical_coverage_groups = None;
     let index_coverage = match &prefilter_input {
         None => None,
         Some(input) => {
@@ -214,10 +221,22 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             if scalar_exec.expr().needs_recheck() {
                 return Ok(None);
             }
-            let Some(coverage) = collect_coverage(scalar_exec.expr()) else {
-                return Ok(None);
-            };
-            Some(coverage)
+            if filtered_read
+                .dataset()
+                .manifest
+                .uses_stable_logical_row_addresses()
+            {
+                logical_coverage_groups = scalar_exec.logical_coverage_groups().cloned();
+                if logical_coverage_groups.is_none() {
+                    return Ok(None);
+                }
+                None
+            } else {
+                let Some(coverage) = collect_coverage(scalar_exec.expr()) else {
+                    return Ok(None);
+                };
+                Some(coverage)
+            }
         }
     };
 
@@ -231,49 +250,80 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     //    branch, prefilter feeds in directly.
     // 3. Prefilter + index covers a strict subset: split into pushdown over
     //    indexed fragments + parallel scan over unindexed fragments.
-    let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage {
-        None => {
-            // No prefilter at all (verified above): nothing to restrict.
-            let exec = CountFromMaskExec::try_new_restricted(
+    let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) =
+        if let Some(groups) = logical_coverage_groups {
+            let prefilter = prefilter_input.clone().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "count_pushdown: logical coverage requires a scalar index input".to_string(),
+                )
+            })?;
+            let pushdown_exec = CountFromMaskExec::try_new_logical(
                 dataset,
                 aggr_exprs.clone(),
-                prefilter_input,
-                None,
-            )?;
-            let schema = exec.schema();
-            (Arc::new(exec), schema)
-        }
-        Some(coverage) if (&dataset_fragments - &coverage).is_empty() => {
-            // Prefilter exists and the index covers every dataset fragment —
-            // safe to push the whole count down.
-            let exec = CountFromMaskExec::try_new_restricted(
-                dataset,
-                aggr_exprs.clone(),
-                prefilter_input,
-                None,
-            )?;
-            let schema = exec.schema();
-            (Arc::new(exec), schema)
-        }
-        Some(coverage) => {
-            // Split plan: CountFromMaskExec for the indexed fragments, a
-            // normal scan + AggregateExec(Partial) for the rest.
-            let uncovered = &dataset_fragments - &coverage;
-            let pushdown_exec = CountFromMaskExec::try_new_restricted(
-                dataset,
-                aggr_exprs.clone(),
-                prefilter_input,
-                Some(&dataset_fragments & &coverage),
+                prefilter,
+                groups.clone(),
             )?;
             let partial_state_schema = pushdown_exec.schema();
-            let pushdown_branch: Arc<dyn ExecutionPlan> = Arc::new(pushdown_exec);
-            let scan_branch =
-                build_scan_branch(filtered_read, options, &uncovered, aggr_exprs.clone())?;
-            let union: Arc<dyn ExecutionPlan> =
-                UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
-            (union, partial_state_schema)
-        }
-    };
+            let missing_logical_rows = merged_missing_logical_rows(groups.as_ref())?;
+            if missing_logical_rows.is_empty() {
+                (Arc::new(pushdown_exec), partial_state_schema)
+            } else {
+                let pushdown_branch: Arc<dyn ExecutionPlan> = Arc::new(pushdown_exec);
+                let scan_branch = build_logical_scan_branch(
+                    filtered_read,
+                    options,
+                    missing_logical_rows,
+                    aggr_exprs.clone(),
+                )?;
+                let union: Arc<dyn ExecutionPlan> =
+                    UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
+                (union, partial_state_schema)
+            }
+        } else {
+            match index_coverage {
+                None => {
+                    // No prefilter at all (verified above): nothing to restrict.
+                    let exec = CountFromMaskExec::try_new_restricted(
+                        dataset,
+                        aggr_exprs.clone(),
+                        prefilter_input,
+                        None,
+                    )?;
+                    let schema = exec.schema();
+                    (Arc::new(exec), schema)
+                }
+                Some(coverage) if (&dataset_fragments - &coverage).is_empty() => {
+                    // Prefilter exists and the index covers every dataset fragment —
+                    // safe to push the whole count down.
+                    let exec = CountFromMaskExec::try_new_restricted(
+                        dataset,
+                        aggr_exprs.clone(),
+                        prefilter_input,
+                        None,
+                    )?;
+                    let schema = exec.schema();
+                    (Arc::new(exec), schema)
+                }
+                Some(coverage) => {
+                    // Split plan: CountFromMaskExec for the indexed fragments, a
+                    // normal scan + AggregateExec(Partial) for the rest.
+                    let uncovered = &dataset_fragments - &coverage;
+                    let pushdown_exec = CountFromMaskExec::try_new_restricted(
+                        dataset,
+                        aggr_exprs.clone(),
+                        prefilter_input,
+                        Some(&dataset_fragments & &coverage),
+                    )?;
+                    let partial_state_schema = pushdown_exec.schema();
+                    let pushdown_branch: Arc<dyn ExecutionPlan> = Arc::new(pushdown_exec);
+                    let scan_branch =
+                        build_scan_branch(filtered_read, options, &uncovered, aggr_exprs.clone())?;
+                    let union: Arc<dyn ExecutionPlan> =
+                        UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
+                    (union, partial_state_schema)
+                }
+            }
+        };
 
     match mode {
         AggregateMode::Partial => {
@@ -352,6 +402,51 @@ fn build_scan_branch(
         scan_schema,
     )?;
     Ok(Arc::new(partial))
+}
+
+fn build_logical_scan_branch(
+    filtered_read: &FilteredReadExec,
+    options: &FilteredReadOptions,
+    missing_logical_rows: LogicalMissingRows,
+    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let dataset = filtered_read.dataset().clone();
+    let row_ids: Arc<dyn ExecutionPlan> = Arc::new(LogicalRowIdRangeExec::new(
+        missing_logical_rows,
+        options.batch_size.unwrap_or(64 * 1024) as usize,
+    ));
+    let filter = options.full_filter.as_ref().ok_or_else(|| {
+        datafusion::error::DataFusionError::Internal(
+            "logical count fallback requires the original filter".to_string(),
+        )
+    })?;
+    let filter_columns = Planner::column_names_in_expr(filter);
+    let mut take_projection = options
+        .projection
+        .clone()
+        .union_columns(filter_columns, OnMissing::Error)?;
+    take_projection.with_row_addr = false;
+    let taken: Arc<dyn ExecutionPlan> = Arc::new(
+        TakeExec::try_new(dataset, row_ids, take_projection)?.ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "logical count fallback did not request filter columns".to_string(),
+            )
+        })?,
+    );
+    let planner = Planner::new(taken.schema());
+    let physical_filter = planner.optimize_expr(filter.clone())?;
+    let filtered: Arc<dyn ExecutionPlan> =
+        Arc::new(LanceFilterExec::try_new(physical_filter, taken)?);
+    let scan_schema = filtered.schema();
+    let filters = (0..aggr_exprs.len()).map(|_| None).collect::<Vec<_>>();
+    Ok(Arc::new(AggregateExec::try_new(
+        AggregateMode::Partial,
+        PhysicalGroupBy::default(),
+        aggr_exprs,
+        filters,
+        filtered,
+        scan_schema,
+    )?))
 }
 
 /// Walk through row-preserving wrappers (`RepartitionExec`,
@@ -732,7 +827,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_3_indexed_count_uses_exact_scan_after_compaction_update_and_delete() {
+    async fn v2_3_indexed_count_pushes_down_after_compaction_update_and_delete() {
         use crate::dataset::optimize::{CompactionOptions, compact_files};
         use crate::dataset::{UpdateBuilder, WriteParams};
         use lance_file::version::LanceFileVersion;
@@ -791,8 +886,8 @@ mod tests {
         let (plan, count) = run_count(&mut scanner).await;
         assert_eq!(count, 39);
         assert!(
-            !plan_contains_pushdown(&plan),
-            "V2.3 indexed count must stay on the exact scan path until CountFromMaskExec has a logical-address universe: {}",
+            plan_contains_pushdown(&plan),
+            "V2.3 indexed count must use the logical-address universe and scan only uncovered rows: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }
@@ -840,6 +935,33 @@ mod tests {
         .unwrap();
         dataset.delete("ordered = 2").await.unwrap();
 
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        for index in &mut indices {
+            index
+                .logical_coverage
+                .as_mut()
+                .unwrap()
+                .externalize_detail_over(0)
+                .unwrap();
+        }
+        assert!(indices.iter().all(|index| {
+            index
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .has_external_detail()
+        }));
+        dataset
+            .index_cache
+            .insert_with_key(
+                &crate::session::index_caches::IndexMetadataKey::for_manifest(
+                    dataset.manifest.version,
+                    dataset.manifest.as_ref(),
+                ),
+                Arc::new(indices),
+            )
+            .await;
+
         let mut scanner = Arc::new(dataset).scan();
         scanner.filter("ordered < 25").unwrap();
         let (plan, count) = run_count(&mut scanner).await;
@@ -847,6 +969,82 @@ mod tests {
         assert!(
             plan_contains_pushdown(&plan),
             "fully covered V2.3 logical indices must retain metadata-only count pushdown: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_3_append_invalidates_full_index_count_proof() {
+        use crate::dataset::{WriteMode, WriteParams};
+        use lance_file::version::LanceFileVersion;
+
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset_with_params(
+                tmp.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let indexed_domain_fingerprint = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .logical_domain_fingerprint
+            .clone();
+
+        let extra = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(10),
+                lance_datagen::BatchCount::from(1),
+            );
+        let dataset = Dataset::write(
+            extra,
+            tmp.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .logical_domain_fingerprint,
+            indexed_domain_fingerprint
+        );
+
+        let mut scanner = Arc::new(dataset).scan();
+        scanner.filter("ordered >= 0").unwrap();
+        let (plan, count) = run_count(&mut scanner).await;
+        assert_eq!(count, 30);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "append must retain logical index pushdown and scan only appended coverage: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }

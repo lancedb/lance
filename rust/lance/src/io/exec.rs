@@ -34,6 +34,9 @@ pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
 pub use logical_coverage::{LogicalCoverageFilterExec, LogicalCoverageGroup};
+pub(crate) use logical_coverage::{
+    LogicalMissingRows, LogicalRowIdRangeExec, merged_missing_logical_rows_in_fragments,
+};
 pub use optimizer::get_physical_optimizer;
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
