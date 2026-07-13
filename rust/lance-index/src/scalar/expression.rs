@@ -903,7 +903,12 @@ impl ScalarQueryParser for TextQueryParser {
         };
 
         let query = match func.name() {
-            "contains" if args.len() == 2 => TextQuery::StringContains(pattern),
+            "contains" if args.len() == 2 => {
+                if !crate::scalar::ngram::contains_can_use_index(&pattern) {
+                    return None;
+                }
+                TextQuery::StringContains(pattern)
+            }
             "regexp_like" | "regexp_match" if self.supports_regex => {
                 let pattern = match args.get(2) {
                     Some(flags_expr) => apply_regex_flags(&pattern, flags_expr)?,
@@ -3093,6 +3098,39 @@ mod tests {
         assert_eq!(
             like_to_regex(r"%foo\%bar%", Some('\\')).as_deref(),
             Some(".*foo%bar.*")
+        );
+    }
+
+    #[test]
+    fn test_ngram_parser_skips_stop_only_queries() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(TextQueryParser::new(
+                    "color_ngram_idx".to_string(),
+                    "NGram".to_string(),
+                    true,
+                    true,
+                )),
+            ),
+        )]);
+
+        check_no_index(&index_info, "contains(color, 'the')");
+        check_no_index(&index_info, "regexp_like(color, 'the')");
+        check_no_index(&index_info, "color LIKE '%the%'");
+
+        check(
+            &index_info,
+            "contains(color, 'theory')",
+            Some(IndexedExpression::index_query_with_recheck(
+                "color".to_string(),
+                "color_ngram_idx".to_string(),
+                "NGram".to_string(),
+                Arc::new(TextQuery::StringContains("theory".to_string())),
+                true,
+            )),
+            false,
         );
     }
 

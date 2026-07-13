@@ -279,7 +279,7 @@ impl IndexType {
             Self::Bitmap => 0,
             Self::LabelList => 0,
             Self::Inverted => 0,
-            Self::NGram => 0,
+            Self::NGram => 1,
             Self::FragmentReuse => 0,
             Self::MemWal => 0,
             Self::ZoneMap => 0,
@@ -385,6 +385,11 @@ mod tests {
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
         assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+    }
+
+    #[test]
+    fn test_ngram_version_tracks_stop_trigram_omission() {
+        assert_eq!(IndexType::NGram.version(), 1);
     }
 
     #[test]

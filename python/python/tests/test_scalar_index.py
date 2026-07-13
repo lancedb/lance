@@ -730,7 +730,7 @@ def test_index_take_batch_size(tmp_path):
         mode="overwrite",
     )
     dataset.create_scalar_index("strings", index_type="NGRAM")
-    filter = "contains(strings, 'ing')"
+    filter = "contains(strings, 'str')"
     batches = dataset.scanner(
         with_row_id=True, filter=filter, batch_size=50, limit=1024
     ).to_batches()
@@ -5146,6 +5146,7 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
     ]
+    index_versions = [0, 0, 0, 0, 1, 0]
 
     for i in range(len(indices)):
         assert indices[i].name == names[i]
@@ -5157,7 +5158,7 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         assert len(indices[i].segments) == 1
         assert indices[i].segments[0].fragment_ids == {0}
         assert indices[i].segments[0].dataset_version_at_last_update == i + 2
-        assert indices[i].segments[0].index_version == 0
+        assert indices[i].segments[0].index_version == index_versions[i]
         assert indices[i].segments[0].created_at is not None
         assert isinstance(indices[i].segments[0].created_at, datetime)
         assert indices[i].segments[0].size_bytes is not None
