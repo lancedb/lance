@@ -232,11 +232,18 @@ impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
             ));
         };
 
+        // Present (and preserved) when round-tripping an existing fragment's
+        // overlays; None/0 when creating an overlay to commit, since the
+        // DataOverlay commit stamps the effective version.
+        let committed_version = ob
+            .getattr("committed_version")?
+            .extract::<Option<u64>>()?
+            .unwrap_or(0);
+
         Ok(Self(DataOverlayFile {
             data_file,
             coverage,
-            // The commit stamps the effective version; the value here is ignored.
-            committed_version: 0,
+            committed_version,
         }))
     }
 }
@@ -257,16 +264,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayFile> {
             .getattr("DataOverlayFile")
             .expect("Failed to get DataOverlayFile class");
 
+        let committed_version = self.0.committed_version;
+
         // Mirror the read side: a dense overlay becomes a flat list of offsets, a
         // sparse overlay a list of per-field lists.
         match &self.0.coverage {
             OverlayCoverage::Shared(bitmap) => {
                 let offsets: Vec<u32> = bitmap.iter().collect();
-                cls.call1((data_file, offsets))
+                cls.call1((data_file, offsets, committed_version))
             }
             OverlayCoverage::PerField(bitmaps) => {
                 let offsets: Vec<Vec<u32>> = bitmaps.iter().map(|b| b.iter().collect()).collect();
-                cls.call1((data_file, offsets))
+                cls.call1((data_file, offsets, committed_version))
             }
         }
     }

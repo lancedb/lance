@@ -5109,6 +5109,59 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
+def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+    import json
+
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([111, 444], pa.int32())}),
+        fields=[1],
+    )
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[1, 4])
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+    overlay_version = dataset.version
+
+    # Reading the fragment surfaces its overlays, stamped with the commit version.
+    metadata = dataset.get_fragments()[0].metadata
+    assert len(metadata.overlays) == 1
+    assert metadata.overlays[0].offsets == [1, 4]
+    assert metadata.overlays[0].committed_version == overlay_version
+
+    # The overlays survive a JSON round-trip of the metadata.
+    restored = lance.fragment.FragmentMetadata.from_json(json.dumps(metadata.to_json()))
+    assert len(restored.overlays) == 1
+    assert restored.overlays[0].offsets == [1, 4]
+    assert restored.overlays[0].committed_version == overlay_version
+
+    # A commit that round-trips the fragment (here an Overwrite) must keep the
+    # overlays, so the overlay still resolves on read instead of being dropped.
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.Overwrite(dataset.schema, [restored]),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("val").to_pylist() == [0, 111, 20, 30, 444, 50, 60, 70, 80, 90]
+    assert result.column("id").to_pylist() == list(range(10))
+
+
 def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})

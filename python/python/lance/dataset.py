@@ -5999,9 +5999,9 @@ class LanceOperation:
         layered over the base data without rewriting the base files.
 
         The overlay is dense or sparse depending on the shape of ``offsets``:
-        pass a flat ``List[int]`` for a dense overlay (one offset set shared by
+        pass a flat ``List[int]`` for a dense overlay (one offset list shared by
         every field in ``data_file``) or a ``List[List[int]]`` for a sparse
-        overlay (one offset set per field, in the order of the file's fields).
+        overlay (one offset list per field, in the order of the file's fields).
         Offsets are **physical** row offsets (positions in the base files,
         counting deleted rows), like deletion vectors.
 
@@ -6009,17 +6009,23 @@ class LanceOperation:
         ----------
         data_file : DataFile
             The Lance data file storing the overlay's new cell values — one
-            value column per covered field, with no row-offset key column. The
-            value at each covered offset is stored at the rank (0-based count of
-            covered offsets below it) of that offset in the field's coverage.
+            value column per covered field. The value at each covered offset is
+            stored at the rank (0-based count of covered offsets below it) of
+            that offset in the field's coverage.
         offsets : Union[List[int], List[List[int]]]
             The covered physical row offsets. A flat list is dense coverage
             (shared by every field); a list of per-field lists is sparse
             coverage (in field order).
+        committed_version : Optional[int]
+            The dataset version at which this overlay became effective. Leave as
+            ``None`` when creating an overlay to commit — the commit stamps it.
+            It is populated when reading an existing fragment's overlays so they
+            round-trip through :class:`FragmentMetadata`.
         """
 
         data_file: DataFile
         offsets: Union[List[int], List[List[int]]]
+        committed_version: Optional[int] = None
 
     @dataclass
     class DataOverlayGroup:
@@ -6044,8 +6050,11 @@ class LanceOperation:
         Operation that appends data overlay files to fragments.
 
         Overlays are appended to each fragment's existing overlays (overlays
-        written by concurrent commits are preserved) and resolved on read,
-        newest-last, over the base data without rewriting it.
+        written by concurrent commits are preserved) and resolved on read
+        over the base data without rewriting it.
+
+        If multiple groups target the same data then the values in the
+        latest group take precedence.
         """
 
         groups: List[LanceOperation.DataOverlayGroup]
