@@ -1482,6 +1482,19 @@ impl FilteredReadOptions {
         self.only_indexed_fragments = true;
         self
     }
+
+    /// Specify the threading mode to use for the scan.
+    ///
+    /// This controls how decode work is parallelized.  For the default single-partition
+    /// scan, the parameter of [`FilteredReadThreadingMode::OnePartitionMultipleThreads`]
+    /// bounds how many batch-decode tasks are buffered in flight (via `try_buffered`).
+    ///
+    /// The parallelism must be greater than 0.  A value of 0 is rejected by
+    /// [`FilteredReadExec::try_new`].
+    pub fn with_threading_mode(mut self, threading_mode: FilteredReadThreadingMode) -> Self {
+        self.threading_mode = threading_mode;
+        self
+    }
 }
 
 /// A plan node that reads a dataset, applying an optional filter and projection.
@@ -1571,6 +1584,23 @@ impl FilteredReadExec {
         if options.projection.is_empty() {
             return Err(Error::invalid_input_source("no columns were selected and with_row_id / with_row_address is false, there is nothing to scan"
                 .into()));
+        }
+
+        // A parallelism of 0 would cause `try_buffered(0)` to hang forever instead of erroring
+        match options.threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(0) => {
+                return Err(Error::invalid_input_source(
+                    "FilteredReadThreadingMode::OnePartitionMultipleThreads must be greater than 0, got 0"
+                        .into(),
+                ));
+            }
+            FilteredReadThreadingMode::MultiplePartitions(0) => {
+                return Err(Error::invalid_input_source(
+                    "FilteredReadThreadingMode::MultiplePartitions must be greater than 0, got 0"
+                        .into(),
+                ));
+            }
+            _ => {}
         }
 
         if options.scan_range_after_filter.is_some() {

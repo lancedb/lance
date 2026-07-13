@@ -3345,6 +3345,16 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::UpdateBases {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
+            Some(pb::transaction::Operation::DataOverlay(_)) => {
+                // Overlay files are not supported by this version of the library.
+                // A dataset that uses them sets reader feature flag 64, which is
+                // already rejected at the feature-flag layer; reject here too so a
+                // transaction referencing the operation can never be applied.
+                return Err(Error::not_supported(
+                    "data overlay files are not supported by this version of Lance \
+                     (reader feature flag 64)",
+                ));
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -6182,5 +6192,23 @@ mod tests {
         assert!(left.modifies_same_metadata(&same_key));
         assert!(!left.modifies_same_metadata(&different_key));
         assert!(left.modifies_same_metadata(&replace));
+    }
+
+    #[test]
+    fn test_data_overlay_operation_rejected() {
+        // Overlay files are not supported by this version of the library. A
+        // transaction carrying the DataOverlay operation must be rejected rather
+        // than silently ignored, mirroring the feature-flag-64 rejection.
+        let message = pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::DataOverlay(
+                pb::transaction::DataOverlay { groups: vec![] },
+            )),
+            ..Default::default()
+        };
+
+        let result = Transaction::try_from(message);
+        assert!(matches!(result, Err(Error::NotSupported { .. })));
     }
 }

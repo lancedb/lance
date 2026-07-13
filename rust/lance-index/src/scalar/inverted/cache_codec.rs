@@ -17,6 +17,9 @@
 //!   encoding);
 //! - the plain posting list: an IPC section of `(row_ids, frequencies)`, then
 //!   an optional legacy position IPC section;
+//! - a packed posting-list group: one IPC section containing the original
+//!   `List<LargeBinary>` posting rows; prewarmed groups omit score/length
+//!   metadata and inject it from the posting reader into query-local views;
 //! - the standalone [`Positions`] codec: the position sections alone.
 //!
 //! All sections read back zero-copy via [`lance_arrow::ipc`]. This is the FTS
@@ -41,7 +44,8 @@ use crate::cache_pb::{
 
 use super::index::{
     CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
-    Positions, PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
+    Positions, PostingList, PostingListGroup, PostingListGroupStorage, PostingTailCodec,
+    SharedPositionStream,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,6 +54,8 @@ use super::index::{
 
 const POSTING_VARIANT_PLAIN: u8 = 0;
 const POSTING_VARIANT_COMPRESSED: u8 = 1;
+const GROUP_VARIANT_MATERIALIZED: u8 = 0;
+const GROUP_VARIANT_PACKED: u8 = 1;
 
 // ---------------------------------------------------------------------------
 // Codec enum mappings
@@ -69,6 +75,23 @@ fn proto_to_posting_tail_codec(c: PbPostingTailCodec) -> PostingTailCodec {
     match c {
         PbPostingTailCodec::Fixed32 => PostingTailCodec::Fixed32,
         PbPostingTailCodec::VarintDelta => PostingTailCodec::VarintDelta,
+    }
+}
+
+fn posting_tail_codec_to_tag(c: PostingTailCodec) -> u8 {
+    match c {
+        PostingTailCodec::Fixed32 => 0,
+        PostingTailCodec::VarintDelta => 1,
+    }
+}
+
+fn posting_tail_codec_from_tag(tag: u8) -> Result<PostingTailCodec> {
+    match tag {
+        0 => Ok(PostingTailCodec::Fixed32),
+        1 => Ok(PostingTailCodec::VarintDelta),
+        other => Err(Error::io(format!(
+            "unknown packed posting tail codec: {other}"
+        ))),
     }
 }
 
@@ -336,34 +359,75 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
 // PostingListGroup codec
 // ---------------------------------------------------------------------------
 
-/// Serializes a [`PostingListGroup`] as a member-count header followed by each
-/// member posting list written **inline** through the same writer. Reusing the
-/// [`PostingList`] codec inline (rather than into per-member sub-buffers) keeps
-/// each member's Arrow IPC sections 64-byte aligned within the group entry, so
-/// they read back zero-copy. Member bodies are self-delimiting, so they need no
-/// length prefixes to separate them. See issue #7040.
+/// Version 2 distinguishes packed groups from the materialized fallback. A
+/// packed group writes one IPC batch; materialized groups retain the v1 inline
+/// member framing used by legacy and position-bearing prewarm paths.
 impl CacheCodecImpl for PostingListGroup {
     const TYPE_ID: &'static str = "lance.fts.PostingListGroup";
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        let count = u32::try_from(self.posting_lists.len())
+        let count = u32::try_from(self.len())
             .map_err(|_| Error::io("posting list group too large to serialize".to_string()))?;
-        w.write_header(&PostingListGroupHeader { count })?;
-        for posting in &self.posting_lists {
-            posting.serialize(w)?;
+        match &self.storage {
+            PostingListGroupStorage::Materialized(posting_lists) => {
+                w.write_u8(GROUP_VARIANT_MATERIALIZED)?;
+                w.write_header(&PostingListGroupHeader { count })?;
+                for posting in posting_lists {
+                    posting.serialize(w)?;
+                }
+            }
+            PostingListGroupStorage::Packed(group) => {
+                w.write_u8(GROUP_VARIANT_PACKED)?;
+                w.write_header(&PostingListGroupHeader { count })?;
+                w.write_u8(posting_tail_codec_to_tag(group.posting_tail_codec))?;
+                w.write_ipc(&group.batch)?;
+            }
         }
         Ok(())
     }
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
-        let header: PostingListGroupHeader = r.read_header()?;
-        let mut posting_lists = Vec::with_capacity(header.count as usize);
-        for _ in 0..header.count {
-            posting_lists.push(PostingList::deserialize(r)?);
+        match r.version() {
+            1 => return deserialize_materialized_group(r),
+            Self::CURRENT_VERSION => {}
+            other => {
+                return Err(Error::io(format!(
+                    "unsupported PostingListGroup cache version: {other}"
+                )));
+            }
         }
-        Ok(Self::new(posting_lists))
+
+        let variant = r.read_u8()?;
+        match variant {
+            GROUP_VARIANT_MATERIALIZED => deserialize_materialized_group(r),
+            GROUP_VARIANT_PACKED => {
+                let header: PostingListGroupHeader = r.read_header()?;
+                let posting_tail_codec = posting_tail_codec_from_tag(r.read_u8()?)?;
+                let batch = r.read_ipc()?;
+                if batch.num_rows() != header.count as usize {
+                    return Err(Error::io(format!(
+                        "packed posting group row count {} does not match header count {}",
+                        batch.num_rows(),
+                        header.count
+                    )));
+                }
+                Self::new_packed(batch, posting_tail_codec)
+            }
+            other => Err(Error::io(format!(
+                "unknown PostingListGroup variant: {other}"
+            ))),
+        }
     }
+}
+
+fn deserialize_materialized_group(r: &mut CacheEntryReader<'_>) -> Result<PostingListGroup> {
+    let header: PostingListGroupHeader = r.read_header()?;
+    let mut posting_lists = Vec::with_capacity(header.count as usize);
+    for _ in 0..header.count {
+        posting_lists.push(PostingList::deserialize(r)?);
+    }
+    Ok(PostingListGroup::new(posting_lists))
 }
 
 // ---------------------------------------------------------------------------
@@ -409,16 +473,20 @@ impl CacheCodecImpl for Positions {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::buffer::ScalarBuffer;
-    use arrow_array::LargeBinaryArray;
-    use arrow_array::builder::{Int32Builder, ListBuilder};
+    use arrow_array::builder::{Int32Builder, LargeBinaryBuilder, ListBuilder};
+    use arrow_array::{Array, LargeBinaryArray, RecordBatch};
+    use arrow_schema::{Field, Schema};
     use bytes::Bytes;
     use lance_core::Result;
     use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 
     use super::super::index::{
-        CompressedPositionStorage, CompressedPostingList, PlainPostingList, PositionStreamCodec,
-        Positions, PostingList, PostingListGroup, PostingTailCodec, SharedPositionStream,
+        CompressedPositionStorage, CompressedPostingList, POSTING_COL, PlainPostingList,
+        PositionStreamCodec, Positions, PostingList, PostingListGroup, PostingTailCodec,
+        SharedPositionStream,
     };
 
     fn legacy_positions(rows: &[&[i32]]) -> arrow_array::ListArray {
@@ -430,6 +498,27 @@ mod tests {
             builder.append(true);
         }
         builder.finish()
+    }
+
+    fn packed_group(
+        postings: &[Vec<Vec<u8>>],
+        posting_tail_codec: PostingTailCodec,
+    ) -> PostingListGroup {
+        let mut builder = ListBuilder::new(LargeBinaryBuilder::new());
+        for posting in postings {
+            for block in posting {
+                builder.values().append_value(block);
+            }
+            builder.append(true);
+        }
+        let postings = builder.finish();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            POSTING_COL,
+            postings.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(postings)]).unwrap();
+        PostingListGroup::new_packed(batch, posting_tail_codec).unwrap()
     }
 
     fn assert_plain_eq(a: &PlainPostingList, b: &PlainPostingList) {
@@ -661,9 +750,11 @@ mod tests {
         ] {
             let group = PostingListGroup::new(members.clone());
             let restored = from_body::<PostingListGroup>(&body_bytes(&group)).unwrap();
-            assert_eq!(restored.posting_lists.len(), members.len());
-            for (a, b) in members.iter().zip(restored.posting_lists.iter()) {
-                match (a, b) {
+            assert!(!restored.is_packed());
+            assert_eq!(restored.len(), members.len());
+            for (index, a) in members.iter().enumerate() {
+                let b = restored.posting_list(index, None, None).unwrap().unwrap();
+                match (a, &b) {
                     (PostingList::Plain(x), PostingList::Plain(y)) => assert_plain_eq(x, y),
                     (PostingList::Compressed(x), PostingList::Compressed(y)) => {
                         assert_eq!(x.blocks, y.blocks);
@@ -674,6 +765,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn packed_posting_list_group_roundtrip_and_v1_fallback() {
+        let group = packed_group(
+            &[vec![vec![1, 2, 3], vec![4, 5]], vec![vec![7; 16 * 1024]]],
+            PostingTailCodec::VarintDelta,
+        );
+        let restored = from_body::<PostingListGroup>(&body_bytes(&group)).unwrap();
+        assert!(restored.is_packed());
+        assert_eq!(restored.len(), 2);
+        for slot in 0..2 {
+            let max_score = [1.5, 3.25][slot];
+            let length = [3, 4096][slot];
+            let expected = group
+                .posting_list(slot, Some(max_score), Some(length))
+                .unwrap()
+                .unwrap();
+            let actual = restored
+                .posting_list(slot, Some(max_score), Some(length))
+                .unwrap()
+                .unwrap();
+            let (PostingList::Compressed(expected), PostingList::Compressed(actual)) =
+                (expected, actual)
+            else {
+                panic!("expected compressed packed posting views");
+            };
+            assert_eq!(actual.blocks, expected.blocks);
+            assert_eq!(actual.max_score, expected.max_score);
+            assert_eq!(actual.length, expected.length);
+            assert_eq!(actual.posting_tail_codec, expected.posting_tail_codec);
+        }
+
+        let legacy_member = PostingList::Compressed(CompressedPostingList::new(
+            LargeBinaryArray::from_opt_vec(vec![Some(&[9u8, 8, 7][..])]),
+            2.0,
+            3,
+            PostingTailCodec::VarintDelta,
+            None,
+        ));
+        let mut legacy_body = Vec::new();
+        let mut writer = CacheEntryWriter::new(&mut legacy_body);
+        writer
+            .write_header(&crate::cache_pb::PostingListGroupHeader { count: 1 })
+            .unwrap();
+        legacy_member.serialize(&mut writer).unwrap();
+        let legacy_body = Bytes::from(legacy_body);
+        let mut reader = CacheEntryReader::new(&legacy_body, 0, 1);
+        let restored = PostingListGroup::deserialize(&mut reader).unwrap();
+        assert!(!restored.is_packed());
+        assert_eq!(restored.len(), 1);
     }
 
     #[test]
@@ -795,25 +937,17 @@ mod tests {
             assert!(points_in(stream.bytes().as_ptr() as usize));
         }
 
-        /// Every member of a `PostingListGroup` must also decode zero-copy. The
-        /// group writes its members inline so each member's IPC sections stay
-        /// 64-byte aligned within the entry; embedding members in per-member
-        /// sub-buffers would land them at arbitrary offsets and force a
-        /// realigning memcpy on load.
+        /// A packed group's single IPC batch and all posting views decoded from
+        /// it must borrow the cache entry's aligned input buffer.
         #[test]
-        fn group_member_sections_are_zero_copy_through_envelope() {
-            let make_member = |fill: u8| {
-                let blocks =
-                    LargeBinaryArray::from_opt_vec(vec![Some(&[fill; 48][..]), Some(&[fill; 48])]);
-                PostingList::Compressed(CompressedPostingList::new(
-                    blocks,
-                    7.0,
-                    3,
-                    PostingTailCodec::VarintDelta,
-                    None,
-                ))
-            };
-            let group = PostingListGroup::new(vec![make_member(9), make_member(1)]);
+        fn packed_group_sections_are_zero_copy_through_envelope() {
+            let group = packed_group(
+                &[
+                    vec![vec![9; 48], vec![9; 48]],
+                    vec![vec![1; 48], vec![1; 48]],
+                ],
+                PostingTailCodec::VarintDelta,
+            );
 
             let group_codec = CacheCodec::from_impl::<PostingListGroup>();
             let any: ArcAny = Arc::new(group);
@@ -828,8 +962,13 @@ mod tests {
             let end = base + serialized.len();
             let points_in = |ptr: usize| ptr >= base && ptr < end;
 
-            assert_eq!(restored.posting_lists.len(), 2);
-            for member in &restored.posting_lists {
+            assert!(restored.is_packed());
+            assert_eq!(restored.len(), 2);
+            for slot in 0..restored.len() {
+                let member = restored
+                    .posting_list(slot, Some(7.0), Some(3))
+                    .unwrap()
+                    .unwrap();
                 let PostingList::Compressed(member) = member else {
                     panic!("expected Compressed member");
                 };

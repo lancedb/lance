@@ -6249,10 +6249,12 @@ class ScannerBuilder:
 
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
         """
-        This parameter is ignored when reading v2 files
+        Set the maximum number of batches to decode concurrently.
+
+        This parameter must be greater than zero.
         """
-        if nbatches is not None and int(nbatches) < 0:
-            raise ValueError("batch_readahead must be non-negative")
+        if nbatches is not None and int(nbatches) <= 0:
+            raise ValueError("batch_readahead must be greater than 0")
         self._batch_readahead = nbatches
         return self
 
