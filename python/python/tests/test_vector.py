@@ -254,3 +254,5 @@ def test_hamming_clustering_multi_segment(tmp_path):
         get_ivf_partition_info(dataset, index.name, index_segments=["not-a-uuid"])
     with pytest.raises(TypeError, match="str or uuid.UUID"):
         get_ivf_partition_info(dataset, index.name, index_segments=[123])
+    with pytest.raises(TypeError, match="not a single"):
+        get_ivf_partition_info(dataset, index.name, index_segments=first_segment.uuid)

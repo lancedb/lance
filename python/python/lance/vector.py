@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import re
 import tempfile
-import uuid
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
@@ -20,9 +19,10 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .log import LOGGER
-from .util import MetricType, _normalize_metric_type
+from .util import MetricType, _normalize_index_segment_ids, _normalize_metric_type
 
 if TYPE_CHECKING:
+    import uuid
     from pathlib import Path
 
     from . import LanceDataset
@@ -757,23 +757,6 @@ def one_pass_assign_ivf_pq_on_accelerator(
 # =============================================================================
 
 
-def _normalize_index_segments(
-    index_segments: Optional[Iterable[Union[str, uuid.UUID]]],
-) -> Optional[List[str]]:
-    if index_segments is None:
-        return None
-    segment_ids = []
-    for segment_id in index_segments:
-        if isinstance(segment_id, (str, uuid.UUID)):
-            segment_ids.append(str(segment_id))
-        else:
-            raise TypeError(
-                "index_segments must be an iterable of str or uuid.UUID. "
-                f"Got {type(segment_id)} instead."
-            )
-    return segment_ids
-
-
 def hamming_clustering_for_ivf_partition(
     dataset: "LanceDataset",
     index_name: str,
@@ -819,7 +802,7 @@ def hamming_clustering_for_ivf_partition(
         index_name,
         partition_id,
         hamming_threshold,
-        _normalize_index_segments(index_segments),
+        _normalize_index_segment_ids(index_segments),
     )
 
 
@@ -851,7 +834,7 @@ def get_ivf_partition_info(
         List of partition info dicts with 'partition_id' and 'size'
     """
     return dataset._ds.get_ivf_partition_info(
-        index_name, _normalize_index_segments(index_segments)
+        index_name, _normalize_index_segment_ids(index_segments)
     )
 
 
