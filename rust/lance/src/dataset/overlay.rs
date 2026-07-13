@@ -34,10 +34,11 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_schema::DataType;
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema};
@@ -290,28 +291,33 @@ fn assemble_overlay_column(
     interleave(&sources, &routing.indices).map_err(Error::from)
 }
 
-/// One overlay's contribution to one projected field, with its file reader opened:
-/// the cells it covers, and the reader from which the field's values are fetched by
-/// `offset_in_overlay` at merge time.
+/// One overlay's contribution to one projected atom, with its file reader opened.
 #[derive(Debug, Clone)]
-struct LoadedFieldOverlay {
-    /// The `offset_in_frag` cells this overlay covers for the field.
+struct LoadedAtomOverlay {
+    /// The `offset_in_frag` cells this overlay covers for the atom.
     coverage: Arc<RoaringBitmap>,
-    /// Reader over the overlay data file, projected to the covered fields; shared
-    /// across the fields that the same file covers.
+    /// Reader over the overlay data file, projected to the covered atoms; shared
+    /// across the atoms that the same file covers.
     reader: Arc<dyn GenericFileReader>,
-    /// Single-field projection used when fetching the value column.
-    field_projection: Arc<Schema>,
 }
 
-/// The overlays that apply to a single projected field, ordered newest-first, with
-/// readers opened and pruned to a specific read. `field_name` is the top-level
-/// read-batch column name the plan applies to. Produced by [`resolve_overlays`] and
-/// consumed by [`merge_overlay_batch`].
+/// The overlays that apply to a single projected atom — a per-row field an overlay
+/// can replace as a unit (a primitive leaf, or a whole list/map field; structs are
+/// recursed through, not treated as atoms). Ordered newest-first, with readers opened
+/// and pruned to a specific read. Produced by [`resolve_overlays`] and consumed by
+/// [`merge_overlay_batch`].
 #[derive(Debug, Clone)]
-pub struct FieldOverlayPlan {
-    field_name: String,
-    overlays_newest_first: Vec<LoadedFieldOverlay>,
+pub struct AtomOverlayPlan {
+    /// The top-level output column the atom lives in (its name locates the batch
+    /// column; its field tree drives the descend/splice into that column).
+    top_field: Arc<Field>,
+    /// Child field ids from `top_field` down to the atom (empty when the atom *is*
+    /// the top-level column). Drives descending to, and splicing back, the atom.
+    ancestor_ids: Vec<i32>,
+    /// Projection of exactly the atom (its ancestor path pruned to the atom subtree),
+    /// used to fetch the atom's values from the overlay file.
+    fetch_projection: Arc<Schema>,
+    overlays_newest_first: Vec<LoadedAtomOverlay>,
 }
 
 /// One overlay file that may contribute to a read, before it is opened. Opened
@@ -319,43 +325,43 @@ pub struct FieldOverlayPlan {
 #[derive(Debug, Clone)]
 struct PlannedOverlayFile {
     data_file: DataFile,
-    /// The covered ∩ projected fields to project when the file is opened, so a
-    /// single reader serves every field the file contributes to.
+    /// The covered ∩ projected atoms to project when the file is opened, so a single
+    /// reader serves every atom the file contributes to.
     open_projection: Arc<Schema>,
 }
 
-/// One overlay's contribution to one projected field, before the file is opened.
+/// One overlay's contribution to one projected atom, before the file is opened.
 #[derive(Debug, Clone)]
-struct PlannedFieldOverlay {
+struct PlannedAtomOverlay {
     /// Index into [`OverlayReadPlanner::files`] of the file that supplies the value.
     file: usize,
     coverage: Arc<RoaringBitmap>,
 }
 
-/// The overlays that apply to a single projected field, ordered newest-first,
-/// before any file is opened.
+/// The overlays that apply to a single projected atom, ordered newest-first, before
+/// any file is opened.
 #[derive(Debug, Clone)]
-struct PlannedField {
-    field_name: String,
-    /// Single-field projection used when fetching this field's value column.
-    field_projection: Arc<Schema>,
-    overlays_newest_first: Vec<PlannedFieldOverlay>,
+struct PlannedAtom {
+    top_field: Arc<Field>,
+    ancestor_ids: Vec<i32>,
+    fetch_projection: Arc<Schema>,
+    overlays_newest_first: Vec<PlannedAtomOverlay>,
 }
 
 /// A fragment's overlay-resolution plan for a projection, derived from coverage
 /// metadata alone — no file opened, no IO. [`resolve_overlays`] turns it into opened
-/// [`FieldOverlayPlan`]s for one specific read, opening only the files whose cells
+/// [`AtomOverlayPlan`]s for one specific read, opening only the files whose cells
 /// the read's rows actually touch.
 #[derive(Debug, Clone)]
 pub struct OverlayReadPlanner {
     files: Vec<PlannedOverlayFile>,
-    fields: Vec<PlannedField>,
+    atoms: Vec<PlannedAtom>,
 }
 
 impl OverlayReadPlanner {
-    /// True when no projected field has any overlay, so there is nothing to resolve.
+    /// True when no projected atom has any overlay, so there is nothing to resolve.
     pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
+        self.atoms.is_empty()
     }
 }
 
@@ -365,18 +371,17 @@ impl OverlayReadPlanner {
 ///
 /// Overlays are stored oldest-first (sorted newest-last on load, see
 /// `sort_overlays_newest_last`), so walking them in reverse gives newest-first
-/// precedence. A single pass — visiting only each overlay's own fields and matching
-/// them against the projection through a field-id map — builds the per-field overlay
-/// lists, so planning is `O(total overlay fields + projected fields)` rather than
-/// `O(projected fields × overlays)` (a fragment can have thousands of fields).
+/// precedence.
 ///
-/// An overlay contributes to a projected field when any id in its `data_file.fields`
-/// belongs to that top-level field's subtree. Overlays are written against the field
-/// ids the file actually stores, which for a struct or list column is its *leaf*
-/// child ids (the V2_1 structural encoding does not record the parent id), so a leaf
-/// is mapped back to its top-level projected ancestor — the whole column is then
-/// fetched and replaced as a unit. Each contributing overlay *file* appears once in
-/// `files`, shared by every top-level field it covers.
+/// Resolution is per *atom* — a per-row field that an overlay replaces as a unit: a
+/// primitive leaf, or a whole list/map field. Structs are internal nodes, so each
+/// leaf of a struct is its own atom and can be overlaid independently of its
+/// siblings. An overlay is written against the leaf ids it stores (the V2_1
+/// structural encoding records only leaves), so an overlay contributes to a projected
+/// atom when any id in its `data_file.fields` falls in that atom's leaf set. At merge
+/// time the atom's value is fetched and spliced into its output column, so an overlay
+/// on a sub-field never disturbs the column's other leaves. Each contributing overlay
+/// *file* appears once in `files`, shared by every atom it covers.
 pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<OverlayReadPlanner> {
     let overlays = &fragment.metadata.overlays;
     debug_assert!(
@@ -386,84 +391,184 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         "overlays must be sorted newest-last (see sort_overlays_newest_last)"
     );
 
-    // Every id in the projection subtree (top-level fields *and* their nested
-    // descendants) mapped to its top-level projected field, so an overlay written
-    // against leaf ids still resolves to the column it belongs to, in O(1).
-    let mut top_level_of: HashMap<i32, &Field> = HashMap::new();
-    for field in &projection.fields {
-        index_field_subtree(field, field, &mut top_level_of);
+    // The projection's atoms, and a leaf-id -> atom-index map so an overlay's stored
+    // leaf ids resolve to the atom they belong to in O(1).
+    struct AtomInfo<'a> {
+        top_field: &'a Field,
+        ancestor_ids: Vec<i32>,
+        atom_id: i32,
     }
-
-    // Walk overlays newest-first, visiting only each overlay's own fields. Every
-    // covered top-level field is appended to its entry in `field_overlays`; because we
-    // walk newest-first, each entry ends up ordered newest-first for free.
-    let mut files = Vec::new();
-    let mut field_overlays: HashMap<i32, Vec<PlannedFieldOverlay>> = HashMap::new();
-    for overlay in overlays.iter().rev() {
-        // The distinct top-level fields this overlay covers, each with the
-        // `data_file.fields` position whose coverage to read (a struct/list stores
-        // several leaf ids all mapping to the same top-level field — the first wins,
-        // as whole-value replacement shares one coverage across the leaves).
-        let mut seen = HashSet::new();
-        let mut contributions: Vec<(&Field, usize)> = Vec::new();
-        for (field_pos, &field_id) in overlay.data_file.fields.iter().enumerate() {
-            if let Some(&top) = top_level_of.get(&field_id)
-                && seen.insert(top.id)
-            {
-                contributions.push((top, field_pos));
+    let mut atom_infos: Vec<AtomInfo> = Vec::new();
+    let mut leaf_to_atom: HashMap<i32, usize> = HashMap::new();
+    for top in &projection.fields {
+        for (atom, ancestor_ids) in enumerate_atoms(top) {
+            let idx = atom_infos.len();
+            let mut value_leaf_ids = Vec::new();
+            collect_leaf_ids(atom, &mut value_leaf_ids);
+            for leaf in value_leaf_ids {
+                leaf_to_atom.insert(leaf, idx);
             }
-        }
-        if contributions.is_empty() {
-            continue;
-        }
-        let file = files.len();
-        files.push(PlannedOverlayFile {
-            data_file: overlay.data_file.clone(),
-            open_projection: Arc::new(Schema {
-                fields: contributions
-                    .iter()
-                    .map(|(top, _)| (*top).clone())
-                    .collect(),
-                metadata: Default::default(),
-            }),
-        });
-        for (top, field_pos) in contributions {
-            field_overlays
-                .entry(top.id)
-                .or_default()
-                .push(PlannedFieldOverlay {
-                    file,
-                    coverage: overlay.coverage_for_field(field_pos)?,
-                });
-        }
-    }
-
-    // Emit one PlannedField per projected field that has overlays, in projection
-    // order for deterministic results.
-    let mut fields = Vec::new();
-    for field in &projection.fields {
-        if let Some(overlays_newest_first) = field_overlays.remove(&field.id) {
-            fields.push(PlannedField {
-                field_name: field.name.clone(),
-                field_projection: Arc::new(Schema {
-                    fields: vec![field.clone()],
-                    metadata: Default::default(),
-                }),
-                overlays_newest_first,
+            atom_infos.push(AtomInfo {
+                top_field: top,
+                ancestor_ids,
+                atom_id: atom.id,
             });
         }
     }
-    Ok(OverlayReadPlanner { files, fields })
+
+    // Walk overlays newest-first. For each overlay, find the atoms it covers and push
+    // (newest-first, for free) into their per-atom overlay lists.
+    let mut files = Vec::new();
+    let mut atom_overlays: Vec<Vec<PlannedAtomOverlay>> = vec![Vec::new(); atom_infos.len()];
+    for overlay in overlays.iter().rev() {
+        // atom index -> the `data_file.fields` position whose coverage to read. An
+        // overlay writes one value per row per atom, so its leaves share a coverage;
+        // the first leaf of each atom to appear wins.
+        let mut covered: HashMap<usize, usize> = HashMap::new();
+        for (field_pos, &field_id) in overlay.data_file.fields.iter().enumerate() {
+            if let Some(&atom_idx) = leaf_to_atom.get(&field_id) {
+                covered.entry(atom_idx).or_insert(field_pos);
+            }
+        }
+        if covered.is_empty() {
+            continue;
+        }
+        let file = files.len();
+        let covered_ids: Vec<i32> = covered.keys().map(|&i| atom_infos[i].atom_id).collect();
+        files.push(PlannedOverlayFile {
+            data_file: overlay.data_file.clone(),
+            open_projection: Arc::new(projection.project_by_ids(&covered_ids, true)),
+        });
+        for (atom_idx, field_pos) in covered {
+            atom_overlays[atom_idx].push(PlannedAtomOverlay {
+                file,
+                coverage: overlay.coverage_for_field(field_pos)?,
+            });
+        }
+    }
+
+    // Emit one PlannedAtom per projected atom that has overlays, in atom order.
+    let mut atoms = Vec::new();
+    for (idx, info) in atom_infos.iter().enumerate() {
+        let overlays_newest_first = std::mem::take(&mut atom_overlays[idx]);
+        if overlays_newest_first.is_empty() {
+            continue;
+        }
+        atoms.push(PlannedAtom {
+            top_field: Arc::new(info.top_field.clone()),
+            ancestor_ids: info.ancestor_ids.clone(),
+            fetch_projection: Arc::new(projection.project_by_ids(&[info.atom_id], true)),
+            overlays_newest_first,
+        });
+    }
+    Ok(OverlayReadPlanner { files, atoms })
 }
 
-/// Map `node` and every descendant field id to `top`, the top-level projected field
-/// the subtree belongs to. Used so an overlay written against a struct/list's leaf
-/// ids resolves to the top-level column.
-fn index_field_subtree<'a>(top: &'a Field, node: &'a Field, out: &mut HashMap<i32, &'a Field>) {
-    out.insert(node.id, top);
-    for child in &node.children {
-        index_field_subtree(top, child, out);
+/// The per-row atoms of a projected top-level field, each with the child-id path from
+/// the top-level field down to it. Structs are recursed through; a primitive leaf or a
+/// whole list/map field is an atom (values are one-per-row). A top-level primitive or
+/// list yields a single atom with an empty path.
+fn enumerate_atoms(top: &Field) -> Vec<(&Field, Vec<i32>)> {
+    fn recurse<'a>(field: &'a Field, path: &mut Vec<i32>, out: &mut Vec<(&'a Field, Vec<i32>)>) {
+        if matches!(field.data_type(), DataType::Struct(_)) {
+            for child in &field.children {
+                path.push(child.id);
+                recurse(child, path, out);
+                path.pop();
+            }
+        } else {
+            out.push((field, path.clone()));
+        }
     }
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    recurse(top, &mut path, &mut out);
+    out
+}
+
+/// Collect the leaf field ids in `field`'s subtree — the ids an overlay stores for
+/// this atom (its own id if primitive; its item leaves if a list/map).
+fn collect_leaf_ids(field: &Field, out: &mut Vec<i32>) {
+    if field.children.is_empty() {
+        out.push(field.id);
+    } else {
+        for child in &field.children {
+            collect_leaf_ids(child, out);
+        }
+    }
+}
+
+/// Follow a path of child field ids from `field` down through nested structs, taking
+/// the corresponding child array at each step. Returns the array at the end of the
+/// path (the whole `array` when `ancestor_ids` is empty).
+fn descend_by_ids(array: &ArrayRef, field: &Field, ancestor_ids: &[i32]) -> Result<ArrayRef> {
+    let mut arr = array.clone();
+    let mut fld = field;
+    for &id in ancestor_ids {
+        let child_pos = fld
+            .children
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "overlay descend: field id {id} not found under '{}'",
+                    fld.name
+                ))
+            })?;
+        let structs = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "overlay descend: expected a struct at '{}'",
+                fld.name
+            ))
+        })?;
+        arr = structs.column(child_pos).clone();
+        fld = &fld.children[child_pos];
+    }
+    Ok(arr)
+}
+
+/// Rebuild `array` with the array at `ancestor_ids` replaced by `new_atom`, cloning
+/// the struct spine along the path and preserving each struct's null buffer and other
+/// children. With an empty path this is just `new_atom` (whole-column replacement).
+fn splice_by_ids(
+    array: &ArrayRef,
+    field: &Field,
+    ancestor_ids: &[i32],
+    new_atom: ArrayRef,
+) -> Result<ArrayRef> {
+    let Some((&id, rest)) = ancestor_ids.split_first() else {
+        return Ok(new_atom);
+    };
+    let child_pos = field
+        .children
+        .iter()
+        .position(|c| c.id == id)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "overlay splice: field id {id} not found under '{}'",
+                field.name
+            ))
+        })?;
+    let structs = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "overlay splice: expected a struct at '{}'",
+                field.name
+            ))
+        })?;
+    let len = structs.len();
+    let (fields, mut children, nulls) = structs.clone().into_parts();
+    children[child_pos] = splice_by_ids(
+        &children[child_pos],
+        &field.children[child_pos],
+        rest,
+        new_atom,
+    )?;
+    Ok(Arc::new(StructArray::try_new_with_length(
+        fields, children, nulls, len,
+    )?))
 }
 
 /// Open the overlay readers a specific read needs and return the per-field plans to
@@ -480,14 +585,14 @@ pub async fn resolve_overlays(
     offsets_in_frag: &[u32],
     fragment: &FileFragment,
     read_config: &FragReadConfig,
-) -> Result<Vec<FieldOverlayPlan>> {
+) -> Result<Vec<AtomOverlayPlan>> {
     let read_offsets = read_offsets_bitmap(offsets_in_frag);
 
-    // A file is opened only if some field it covers has cells among the requested
-    // rows. This is the row-selection pruning: overlays outside the read are skipped.
+    // A file is opened only if some atom it covers has cells among the requested rows.
+    // This is the row-selection pruning: overlays outside the read are skipped.
     let mut file_needed = vec![false; planner.files.len()];
-    for field in &planner.fields {
-        for overlay in &field.overlays_newest_first {
+    for atom in &planner.atoms {
+        for overlay in &atom.overlays_newest_first {
             if !overlay.coverage.is_disjoint(&read_offsets) {
                 file_needed[overlay.file] = true;
             }
@@ -495,12 +600,14 @@ pub async fn resolve_overlays(
     }
 
     // Open each needed file once, concurrently. The reader is shared (via `Arc`) by
-    // every field that file covers.
+    // every atom that file covers.
     //
-    // TODO(overlay perf): these reads use the default reader priority. Once we
-    // benchmark take/scan over overlays, decide whether overlay value reads should
-    // inherit `read_config.reader_priority` (or get a dedicated priority) so they
-    // schedule alongside the base reads.
+    // These reads use priority 0 (highest): they are issued only when a ready
+    // consumer polls the batch task (see `merge_overlay_batch`), so we have already
+    // committed to reading this batch and the overlay reads cannot clog the
+    // backpressure queue ahead of work we are not ready for. (A future optimization
+    // could start the overlay fetches earlier to fill compute bubbles, which would
+    // want a priority tied to the base read.)
     let opened: Vec<Option<Arc<dyn GenericFileReader>>> =
         futures::future::try_join_all(planner.files.iter().enumerate().map(|(i, file)| {
             let needed = file_needed[i];
@@ -517,21 +624,22 @@ pub async fn resolve_overlays(
         .await?;
 
     let mut plans = Vec::new();
-    for field in &planner.fields {
+    for atom in &planner.atoms {
         let mut overlays_newest_first = Vec::new();
-        for overlay in &field.overlays_newest_first {
+        for overlay in &atom.overlays_newest_first {
             let Some(reader) = &opened[overlay.file] else {
                 continue; // pruned: coverage disjoint from the read
             };
-            overlays_newest_first.push(LoadedFieldOverlay {
+            overlays_newest_first.push(LoadedAtomOverlay {
                 coverage: overlay.coverage.clone(),
                 reader: reader.clone(),
-                field_projection: field.field_projection.clone(),
             });
         }
         if !overlays_newest_first.is_empty() {
-            plans.push(FieldOverlayPlan {
-                field_name: field.field_name.clone(),
+            plans.push(AtomOverlayPlan {
+                top_field: atom.top_field.clone(),
+                ancestor_ids: atom.ancestor_ids.clone(),
+                fetch_projection: atom.fetch_projection.clone(),
                 overlays_newest_first,
             });
         }
@@ -554,16 +662,16 @@ fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
     bitmap
 }
 
-/// Resolve overlays for one base batch: route each projected field against the
-/// batch's `offsets_in_frag`, fetch only the overlay values the batch needs
-/// (concurrently with the base read), and assemble the merged columns. Fields with
-/// no plan, and the row-id/row-address system columns, pass through.
+/// Resolve overlays for one base batch: route each projected atom against the batch's
+/// `offsets_in_frag`, fetch only the overlay values the batch needs (concurrently with
+/// the base read), assemble the merged atom, and splice it into its output column.
+/// Atoms with no covered rows, and columns with no plan, pass through.
 pub async fn merge_overlay_batch(
     base: ReadBatchFut,
     offsets_in_frag: &[u32],
-    plans: &[FieldOverlayPlan],
+    plans: &[AtomOverlayPlan],
 ) -> Result<RecordBatch> {
-    let field_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
+    let atom_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
         let coverages: Vec<&RoaringBitmap> = plan
             .overlays_newest_first
             .iter()
@@ -571,46 +679,59 @@ pub async fn merge_overlay_batch(
             .collect();
         let routing = route_overlays(offsets_in_frag, &coverages);
         if routing.all_fall_through() {
-            return Ok::<_, Error>((plan.field_name.as_str(), None));
+            return Ok::<_, Error>((plan, None));
         }
+        // Fetch each overlay's values and descend to the atom array. The fetch is
+        // projected to the atom's ancestor path, so the fetched column is the pruned
+        // top-level column; `descend_by_ids` walks it down to the atom.
+        let atom_field = &plan.fetch_projection.fields[0];
         let fetched = futures::future::try_join_all(
             plan.overlays_newest_first
                 .iter()
                 .zip(routing.offsets_in_overlay())
-                .map(|(overlay, offsets_in_overlay)| {
-                    fetch_overlay_values(
+                .map(|(overlay, offsets_in_overlay)| async move {
+                    let column = fetch_overlay_values(
                         overlay.reader.as_ref(),
-                        overlay.field_projection.clone(),
+                        plan.fetch_projection.clone(),
                         offsets_in_overlay,
                     )
+                    .await?;
+                    descend_by_ids(&column, atom_field, &plan.ancestor_ids)
                 }),
         )
         .await?;
-        Ok((plan.field_name.as_str(), Some((routing, fetched))))
+        Ok((plan, Some((routing, fetched))))
     }));
 
     // The base read and every overlay value read proceed concurrently.
-    let (batch, resolved) = futures::future::try_join(base, field_work).await?;
+    let (batch, resolved) = futures::future::try_join(base, atom_work).await?;
 
     let schema = batch.schema();
     let mut columns = batch.columns().to_vec();
-    for (field_name, work) in resolved {
+    for (plan, work) in resolved {
         let Some((routing, fetched)) = work else {
             continue;
         };
-        let Some(idx) = schema.index_of(field_name).ok() else {
-            // The plan's field is not in this batch's projection; skip it.
+        let Some(idx) = schema.index_of(&plan.top_field.name).ok() else {
+            // The plan's column is not in this batch's projection; skip it.
             continue;
         };
-        columns[idx] = assemble_overlay_column(&columns[idx], &routing, &fetched)?;
+        let base_atom = descend_by_ids(&columns[idx], &plan.top_field, &plan.ancestor_ids)?;
+        let merged_atom = assemble_overlay_column(&base_atom, &routing, &fetched)?;
+        columns[idx] = splice_by_ids(
+            &columns[idx],
+            &plan.top_field,
+            &plan.ancestor_ids,
+            merged_atom,
+        )?;
     }
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 /// Fetch one overlay's values at the given `offsets_in_overlay` (sorted, unique):
-/// the corresponding entries of its value column. Returns a column of
-/// `offsets_in_overlay.len()` values in the same order; empty input reads nothing
-/// and returns an empty column.
+/// the corresponding entries of its value column, as the top-level column pruned to
+/// `projection`. Returns `offsets_in_overlay.len()` rows in the same order; empty
+/// input reads nothing and returns an empty column.
 async fn fetch_overlay_values(
     reader: &dyn GenericFileReader,
     projection: Arc<Schema>,
@@ -844,5 +965,104 @@ mod tests {
             );
             assert_eq!(fast.any_overlay, general.any_overlay, "any_overlay differs");
         }
+    }
+
+    /// `outer { middle { a, b } }` for exercising the descend/splice helpers.
+    fn nested_struct() -> (Schema, ArrayRef) {
+        use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+        let mid = Fields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]);
+        let outer_fields =
+            Fields::from(vec![ArrowField::new("middle", DataType::Struct(mid), true)]);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "outer",
+            DataType::Struct(outer_fields),
+            true,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let middle = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("a", DataType::Int32, true)),
+                i32_array([Some(1), Some(2), Some(3)]),
+            ),
+            (
+                Arc::new(ArrowField::new("b", DataType::Int32, true)),
+                i32_array([Some(10), Some(20), Some(30)]),
+            ),
+        ]);
+        let outer: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("middle", middle.data_type().clone(), true)),
+            Arc::new(middle) as ArrayRef,
+        )]));
+        (schema, outer)
+    }
+
+    #[test]
+    fn test_descend_and_splice_roundtrip() {
+        let (schema, outer_arr) = nested_struct();
+        let outer_field = &schema.fields[0];
+        let middle_id = outer_field.children[0].id;
+        let a_id = outer_field.children[0].children[0].id;
+        let path = [middle_id, a_id];
+
+        // Descend to the deep leaf `outer.middle.a`.
+        let a = descend_by_ids(&outer_arr, outer_field, &path).unwrap();
+        assert_i32_eq(&a, [Some(1), Some(2), Some(3)]);
+
+        // Splice a replacement in; only `a` changes, `b` is preserved.
+        let spliced = splice_by_ids(
+            &outer_arr,
+            outer_field,
+            &path,
+            i32_array([Some(7), Some(8), Some(9)]),
+        )
+        .unwrap();
+        let middle = spliced
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .clone();
+        assert_i32_eq(&middle.column(0).clone(), [Some(7), Some(8), Some(9)]);
+        assert_i32_eq(&middle.column(1).clone(), [Some(10), Some(20), Some(30)]);
+    }
+
+    #[test]
+    fn test_splice_preserves_struct_nulls() {
+        use arrow_buffer::NullBuffer;
+        let (schema, base) = nested_struct();
+        let outer_field = &schema.fields[0];
+        // Rebuild `outer` with a null at row 1 (a null struct value).
+        let base = base.as_any().downcast_ref::<StructArray>().unwrap();
+        let (fields, children, _) = base.clone().into_parts();
+        let outer_arr: ArrayRef = Arc::new(
+            StructArray::try_new(
+                fields,
+                children,
+                Some(NullBuffer::from(vec![true, false, true])),
+            )
+            .unwrap(),
+        );
+        let path = [
+            outer_field.children[0].id,
+            outer_field.children[0].children[0].id,
+        ];
+        let spliced = splice_by_ids(
+            &outer_arr,
+            outer_field,
+            &path,
+            i32_array([Some(7), Some(8), Some(9)]),
+        )
+        .unwrap();
+        let spliced = spliced.as_any().downcast_ref::<StructArray>().unwrap();
+        // The outer struct's null buffer survives the splice.
+        assert!(!spliced.is_null(0));
+        assert!(spliced.is_null(1));
+        assert!(!spliced.is_null(2));
     }
 }
