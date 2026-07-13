@@ -32,7 +32,9 @@ use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::GenerationWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
-use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
+use crate::dataset::mem_wal::util::{
+    derived_store_params, flushed_memtable_path, generate_random_hash,
+};
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -74,8 +76,9 @@ pub struct MemTableFlusher {
     /// When present, each new generation is warmed before it is committed, so
     /// the first query sees zero cold reads. `None` => no warming.
     warmer: Option<Arc<dyn GenerationWarmer>>,
-    /// Store params for the flusher's derived-URI opens (base + generations),
-    /// reusing the store the base was opened with. `None` opens by URI alone.
+    /// Store params the base dataset was opened with, reused for the flusher's
+    /// own opens + writes. Used verbatim only for the base's own URI; generation
+    /// URIs go through [`derived_store_params`]. `None` opens by URI alone.
     store_params: Option<ObjectStoreParams>,
     /// Session for those opens, sharing the base's store registry. `None` opens
     /// with a fresh session.
@@ -120,13 +123,32 @@ impl MemTableFlusher {
         self
     }
 
-    /// Open the dataset at a URI derived from this shard's base — the base table
-    /// itself or a flushed generation under `_mem_wal/` — reusing the injected
-    /// store params + session, or opening by URI alone when none were set.
-    async fn open_derived(&self, uri: &str) -> Result<Dataset> {
+    /// Open the base table, reusing the injected store params verbatim — they
+    /// were resolved for exactly this URI, so a path-bound `object_store`
+    /// binding still points where it should.
+    async fn open_base(&self) -> Result<Dataset> {
+        self.open_uri(&self.base_uri, self.store_params.clone())
+            .await
+    }
+
+    /// Open a flushed generation under `_mem_wal/`. The params must be adapted
+    /// first: a path-bound store binding would redirect the open at the base
+    /// table (see [`derived_store_params`]).
+    async fn open_generation(&self, uri: &str) -> Result<Dataset> {
+        self.open_uri(uri, self.store_params.as_ref().map(derived_store_params))
+            .await
+    }
+
+    /// Open `uri` with the injected session, or by URI alone when nothing was
+    /// injected.
+    async fn open_uri(
+        &self,
+        uri: &str,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Dataset> {
         let mut builder = DatasetBuilder::from_uri(uri);
-        if let Some(params) = &self.store_params {
-            builder = builder.with_store_params(params.clone());
+        if let Some(params) = store_params {
+            builder = builder.with_store_params(params);
         }
         if let Some(session) = &self.session {
             builder = builder.with_session(session.clone());
@@ -175,7 +197,7 @@ impl MemTableFlusher {
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
     async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
-        match self.open_derived(&self.base_uri).await {
+        match self.open_base().await {
             Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
             Err(Error::DatasetNotFound { .. }) => {
                 Ok(lance_file::version::LanceFileVersion::default())
@@ -230,7 +252,7 @@ impl MemTableFlusher {
         // generation exposes newest-per-PK on every read path.
         if !deleted.is_empty() {
             let uri = self.path_to_uri(&gen_path);
-            let dataset = self.open_derived(&uri).await?;
+            let dataset = self.open_generation(&uri).await?;
             self.finalize_generation(&dataset, &deleted, None).await?;
         }
 
@@ -339,9 +361,11 @@ impl MemTableFlusher {
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?),
-            // Write the generation through the base's store params + session so
-            // it uses the same store the base was opened with.
-            store_params: self.store_params.clone(),
+            // Write the generation through the base's store params + session so it
+            // uses the same store the base was opened with. Adapted for the
+            // generation URI: a path-bound store binding would send this write at
+            // the base table's own path (see [`derived_store_params`]).
+            store_params: self.store_params.as_ref().map(derived_store_params),
             session: self.session.clone(),
             ..Default::default()
         };
@@ -460,7 +484,7 @@ impl MemTableFlusher {
         // Open the dataset once for all index building. Dataset::write already
         // created a v1 manifest with the fragment data.
         let uri = self.path_to_uri(&gen_path);
-        let mut dataset = self.open_derived(&uri).await?;
+        let mut dataset = self.open_generation(&uri).await?;
 
         // Collect all index metadata without committing individually.
         // We write a single manifest containing both data and all indexes.

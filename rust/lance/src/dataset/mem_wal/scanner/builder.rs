@@ -30,6 +30,7 @@ use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use crate::dataset::Dataset;
+use crate::dataset::mem_wal::util::derived_store_params;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -242,7 +243,10 @@ impl LsmScanner {
         // the shared index / metadata caches without extra wiring. An
         // explicit `with_session` still overrides this.
         let session = Some(base_table.session());
-        let store_params = base_table.store_params().cloned();
+        // The scanner only ever opens flushed generations with these — the base
+        // table is already open and handed in — so they must not carry a
+        // path-bound store binding.
+        let store_params = base_table.store_params().map(derived_store_params);
         Self {
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),

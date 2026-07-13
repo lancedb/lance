@@ -26,6 +26,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use super::ShardWriterConfig;
 use super::scanner::flushed_cache::open_flushed_dataset;
 use super::scanner::{DatasetCache, ShardSnapshot};
+use super::util::derived_store_params;
 use super::write::MemIndexConfig;
 use super::write::ShardWriter;
 
@@ -596,7 +597,8 @@ impl DatasetMemWalExt for Dataset {
         cache: Option<&Arc<dyn DatasetCache>>,
     ) -> Result<()> {
         let session = self.session();
-        let store_params = self.store_params().cloned();
+        // Every open below targets a generation URI, never the base's own.
+        let store_params = self.store_params().map(derived_store_params);
         // Resolve flushed paths exactly as the LSM collector does, so the
         // session/cache entries we warm key-match the paths later lookups open.
         let base_path = self.uri().trim_end_matches('/').to_string();
