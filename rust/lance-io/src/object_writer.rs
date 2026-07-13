@@ -282,6 +282,13 @@ impl ObjectWriter {
         Bytes::from(part)
     }
 
+    fn already_closed_err(path: &Path) -> io::Error {
+        io::Error::other(format!(
+            "cannot write to object writer for '{}' after shutdown",
+            path
+        ))
+    }
+
     fn put_part(
         upload: &mut dyn MultipartUpload,
         buffer: Bytes,
@@ -481,6 +488,10 @@ impl AsyncWrite for ObjectWriter {
         buf: &[u8],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
         self.as_mut().poll_tasks(cx)?;
+
+        if matches!(&self.state, UploadState::Done(_)) {
+            return Poll::Ready(Err(Self::already_closed_err(self.path.as_ref())));
+        }
 
         // Fill buffer up to remaining capacity.
         let remaining_capacity = self.buffer.capacity() - self.buffer.len();
@@ -751,8 +762,8 @@ impl AsyncWrite for LocalWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
-        let path = self.path.clone();
-        match &mut self.state {
+        let Self { path, state, .. } = &mut *self;
+        match state {
             LocalWriteState::Writing(state) => {
                 let poll = Pin::new(&mut state.writer).poll_write(cx, buf);
                 if let Poll::Ready(Ok(n)) = &poll {
@@ -760,11 +771,11 @@ impl AsyncWrite for LocalWriter {
                 }
                 poll
             }
-            LocalWriteState::Failed(message) => Poll::Ready(Err(Self::failed_err(&path, message))),
-            LocalWriteState::Aborted => Poll::Ready(Err(Self::aborted_err(&path))),
-            LocalWriteState::Poisoned => Poll::Ready(Err(Self::poisoned_err(&path))),
+            LocalWriteState::Failed(message) => Poll::Ready(Err(Self::failed_err(path, message))),
+            LocalWriteState::Aborted => Poll::Ready(Err(Self::aborted_err(path))),
+            LocalWriteState::Poisoned => Poll::Ready(Err(Self::poisoned_err(path))),
             LocalWriteState::Finishing { .. } | LocalWriteState::Done(_) => {
-                Poll::Ready(Err(Self::already_closed_err(&path)))
+                Poll::Ready(Err(Self::already_closed_err(path)))
             }
         }
     }
@@ -773,14 +784,14 @@ impl AsyncWrite for LocalWriter {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        let path = self.path.clone();
-        match &mut self.state {
+        let Self { path, state, .. } = &mut *self;
+        match state {
             LocalWriteState::Writing(state) => Pin::new(&mut state.writer).poll_flush(cx),
-            LocalWriteState::Failed(message) => Poll::Ready(Err(Self::failed_err(&path, message))),
-            LocalWriteState::Aborted => Poll::Ready(Err(Self::aborted_err(&path))),
-            LocalWriteState::Poisoned => Poll::Ready(Err(Self::poisoned_err(&path))),
+            LocalWriteState::Failed(message) => Poll::Ready(Err(Self::failed_err(path, message))),
+            LocalWriteState::Aborted => Poll::Ready(Err(Self::aborted_err(path))),
+            LocalWriteState::Poisoned => Poll::Ready(Err(Self::poisoned_err(path))),
             LocalWriteState::Finishing { .. } | LocalWriteState::Done(_) => {
-                Poll::Ready(Err(Self::already_closed_err(&path)))
+                Poll::Ready(Err(Self::already_closed_err(path)))
             }
         }
     }
@@ -1172,6 +1183,29 @@ mod tests {
         }
         let res = Writer::shutdown(&mut object_writer).await.unwrap();
         assert_eq!(res.size, buf.len() * 5);
+    }
+
+    #[tokio::test]
+    async fn test_write_after_shutdown_returns_error() {
+        let store = LanceObjectStore::memory();
+        let mut writer = ObjectWriter::new(&store, &Path::from("/closed"))
+            .await
+            .unwrap();
+        writer.write_all(b"payload").await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
+
+        for payload in [&b"more"[..], &b"again"[..]] {
+            let error =
+                tokio::time::timeout(std::time::Duration::from_secs(1), writer.write_all(payload))
+                    .await
+                    .expect("write after shutdown must not remain pending without a waker")
+                    .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(
+                error.to_string(),
+                "cannot write to object writer for 'closed' after shutdown"
+            );
+        }
     }
 
     #[tokio::test]

@@ -274,6 +274,21 @@ impl SpillLifecycle {
         }
     }
 
+    /// Start aborting the writer. `false` means a previous abort already
+    /// completed successfully, so the operation is idempotently complete.
+    fn begin_abort(&self) -> io::Result<bool> {
+        let state = self.state.lock().unwrap();
+        match state.phase {
+            SpillWriterPhase::Finished => {
+                Err(self.writer_error("abort", "shutdown has already completed"))
+            }
+            SpillWriterPhase::Aborted => Ok(false),
+            SpillWriterPhase::Writing
+            | SpillWriterPhase::ShuttingDown
+            | SpillWriterPhase::Failed => Ok(true),
+        }
+    }
+
     fn shutdown_failed(&self) {
         self.state.lock().unwrap().phase = SpillWriterPhase::Failed;
     }
@@ -297,6 +312,15 @@ impl SpillLifecycle {
     fn abort_succeeded(&self) {
         let reserved_bytes = {
             let mut state = self.state.lock().unwrap();
+            debug_assert!(
+                matches!(
+                    state.phase,
+                    SpillWriterPhase::Writing
+                        | SpillWriterPhase::ShuttingDown
+                        | SpillWriterPhase::Failed
+                ),
+                "abort completion requires an active or failed spill writer"
+            );
             state.phase = SpillWriterPhase::Aborted;
             std::mem::take(&mut state.reserved_bytes)
         };
@@ -462,6 +486,9 @@ impl Writer for SpillWriter {
     }
 
     async fn abort(&mut self) -> Result<()> {
+        if !self.lifecycle.begin_abort()? {
+            return Ok(());
+        }
         self.inner.abort().await?;
         self.lifecycle.abort_succeeded();
         Ok(())
@@ -838,6 +865,7 @@ mod tests {
     struct ControlledWriter {
         outcome: Poll<io::Result<usize>>,
         remaining_abort_failures: usize,
+        abort_calls: Arc<AtomicU64>,
     }
 
     fn test_lifecycle(quota: DiskQuota) -> (Arc<SpillLifecycle>, tempfile::TempDir) {
@@ -879,6 +907,7 @@ mod tests {
         }
 
         async fn abort(&mut self) -> Result<()> {
+            self.abort_calls.fetch_add(1, Ordering::Relaxed);
             if self.remaining_abort_failures > 0 {
                 self.remaining_abort_failures -= 1;
                 Err(Error::io("controlled abort failure"))
@@ -1007,6 +1036,7 @@ mod tests {
             inner: Box::new(ControlledWriter {
                 outcome: Poll::Ready(Ok(10)),
                 remaining_abort_failures: 0,
+                abort_calls: Arc::new(AtomicU64::new(0)),
             }),
             lifecycle,
         };
@@ -1025,6 +1055,7 @@ mod tests {
             inner: Box::new(ControlledWriter {
                 outcome: Poll::Ready(Err(io::Error::other("boom"))),
                 remaining_abort_failures: 0,
+                abort_calls: Arc::new(AtomicU64::new(0)),
             }),
             lifecycle,
         };
@@ -1040,10 +1071,12 @@ mod tests {
     async fn test_spill_writer_retains_reservation_when_abort_fails() {
         let quota = DiskQuota::new(100);
         let (lifecycle, _temp_dir) = test_lifecycle(quota.clone());
+        let abort_calls = Arc::new(AtomicU64::new(0));
         let mut writer = SpillWriter {
             inner: Box::new(ControlledWriter {
                 outcome: Poll::Ready(Ok(40)),
                 remaining_abort_failures: 1,
+                abort_calls: abort_calls.clone(),
             }),
             lifecycle,
         };
@@ -1069,6 +1102,53 @@ mod tests {
             *quota.used.lock().unwrap(),
             0,
             "a successful retry should release the retained reservation"
+        );
+
+        Writer::abort(&mut writer).await.unwrap();
+        assert_eq!(
+            abort_calls.load(Ordering::Relaxed),
+            2,
+            "an idempotent abort must not call the inner writer again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_after_finished_preserves_file_and_reservation() {
+        let quota = DiskQuota::new(100);
+        let (lifecycle, _temp_dir) = test_lifecycle(quota.clone());
+        let fs_path = lifecycle.fs_path.clone();
+        let abort_calls = Arc::new(AtomicU64::new(0));
+        let mut writer = SpillWriter {
+            inner: Box::new(ControlledWriter {
+                outcome: Poll::Ready(Ok(40)),
+                remaining_abort_failures: 0,
+                abort_calls: abort_calls.clone(),
+            }),
+            lifecycle,
+        };
+        writer.write_all(&[0u8; 40]).await.unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
+        std::fs::write(&fs_path, [0u8; 40]).unwrap();
+
+        let error = Writer::abort(&mut writer).await.unwrap_err();
+        assert!(
+            matches!(error, Error::IO { .. }),
+            "expected IO error, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("shutdown has already completed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            abort_calls.load(Ordering::Relaxed),
+            0,
+            "the finished lifecycle must reject abort before calling the inner writer"
+        );
+        assert!(fs_path.exists(), "abort must not remove a finished spill");
+        assert_eq!(
+            *quota.used.lock().unwrap(),
+            40,
+            "abort must not release a finished spill's reservation"
         );
     }
 }

@@ -61,16 +61,7 @@ fn descriptor_field_to_pyarrow<'py>(
 /// byte-level core writer.
 fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     match ArrayData::from_pyarrow_bound(payloads) {
-        Ok(data) => {
-            let array = make_array(data);
-            if !matches!(array.data_type(), DataType::Binary | DataType::LargeBinary) {
-                return Err(PyValueError::new_err(format!(
-                    "Packed blob payloads must have Arrow type Binary or LargeBinary, got {}",
-                    array.data_type()
-                )));
-            }
-            Ok(vec![array])
-        }
+        Ok(data) => Ok(vec![validated_blob_payload(data, None)?]),
         Err(_) => {
             let pyarrow = PyModule::import(payloads.py(), "pyarrow")?;
             let chunked_array_type = pyarrow.getattr("ChunkedArray")?;
@@ -90,20 +81,35 @@ fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>>
 
             let chunks = payloads.getattr("chunks")?;
             let mut arrays = Vec::with_capacity(chunks.len()?);
-            for chunk in chunks.try_iter()? {
-                arrays.push(make_array(ArrayData::from_pyarrow_bound(&chunk?)?));
-            }
-            for (chunk_index, array) in arrays.iter().enumerate() {
-                if !matches!(array.data_type(), DataType::Binary | DataType::LargeBinary) {
-                    return Err(PyValueError::new_err(format!(
-                        "Packed blob payload chunk {chunk_index} must have Arrow type Binary or LargeBinary, got {}",
-                        array.data_type()
-                    )));
-                }
+            for (chunk_index, chunk) in chunks.try_iter()?.enumerate() {
+                let data = ArrayData::from_pyarrow_bound(&chunk?)?;
+                arrays.push(validated_blob_payload(data, Some(chunk_index))?);
             }
             Ok(arrays)
         }
     }
+}
+
+fn validated_blob_payload(data: ArrayData, chunk_index: Option<usize>) -> PyResult<ArrayRef> {
+    let context = chunk_index
+        .map(|index| format!("Packed blob payload chunk {index}"))
+        .unwrap_or_else(|| "Packed blob payload array".to_string());
+    if !matches!(data.data_type(), DataType::Binary | DataType::LargeBinary) {
+        return Err(PyValueError::new_err(format!(
+            "{context} must have Arrow type Binary or LargeBinary, got {}",
+            data.data_type()
+        )));
+    }
+    if data.is_empty() {
+        // PyArrow may export an empty slice without the values preceding its
+        // nonzero first offset. Normalize it because an empty array never
+        // observes those buffers, and Arrow validation would reject the slice.
+        return Ok(make_array(ArrayData::new_empty(data.data_type())));
+    }
+    data.validate_full().map_err(|error| {
+        PyValueError::new_err(format!("{context} contains invalid Arrow data: {error}"))
+    })?;
+    Ok(make_array(data))
 }
 
 struct OwnedArrowBuffer(Buffer);

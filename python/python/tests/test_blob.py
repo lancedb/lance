@@ -1274,6 +1274,47 @@ def test_packed_blob_writer_bulk_excludes_physical_null_bytes(
     assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"abc"
 
 
+@pytest.mark.parametrize(
+    "array_type,offset_type",
+    [
+        pytest.param(pa.binary(), pa.int32(), id="binary"),
+        pytest.param(pa.large_binary(), pa.int64(), id="large_binary"),
+    ],
+)
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+def test_packed_blob_writer_bulk_rejects_non_monotonic_offsets(
+    tmp_path, array_type, offset_type, as_chunked
+):
+    offsets = pa.array([0, 2, 1, 2], type=offset_type).buffers()[1]
+    malformed = pa.Array.from_buffers(
+        array_type,
+        3,
+        [None, offsets, pa.py_buffer(b"ab")],
+    )
+    payloads = malformed
+    expected_context = "Packed blob payload array"
+    if as_chunked:
+        payloads = pa.chunked_array([pa.array([b"valid"], type=array_type), malformed])
+        expected_context = "Packed blob payload chunk 1"
+
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    with pytest.raises(ValueError, match="invalid Arrow data") as error:
+        packed.write_blobs(payloads)
+    assert expected_context in str(error.value)
+    assert "non-monotonic offset" in str(error.value)
+
+    packed.write_blob(b"still usable")
+    descriptors = packed.finish_array("blob")
+    assert len(descriptors) == 1
+    assert (
+        _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"still usable"
+    )
+
+
 def test_packed_blob_writer_mixed_calls_preserve_legacy_finish_alignment(tmp_path):
     file_id = str(uuid.uuid4())
     blob_id = 7

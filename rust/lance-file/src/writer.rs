@@ -951,9 +951,11 @@ impl FileWriter {
         })
     }
 
+    /// Request best-effort cleanup of an unfinished file write.
+    ///
+    /// Cleanup failures cannot be observed through this legacy no-result API.
     pub async fn abort(&mut self) {
-        // For multipart uploads, ObjectWriter's Drop impl will abort
-        // the upload when the writer is dropped.
+        let _ = Writer::abort(self.writer.as_mut()).await;
     }
 
     pub async fn tell(&mut self) -> Result<u64> {
@@ -1164,6 +1166,23 @@ mod tests {
         }
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_abort_delegates_to_inner_writer() {
+        let tmp_path = TempObjFile::default();
+        let obj_store = Arc::new(ObjectStore::local());
+        let writer = obj_store.create(&tmp_path).await.unwrap();
+        let arrow_schema = ArrowSchema::new(vec![Field::new("value", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let mut file_writer =
+            FileWriter::try_new(writer, lance_schema, FileWriterOptions::default()).unwrap();
+
+        file_writer.abort().await;
+
+        let error = file_writer.tell().await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::IO { .. }));
+        assert!(error.to_string().contains("aborted"));
     }
 
     // Read a single column back at an explicit range/index set, returning its

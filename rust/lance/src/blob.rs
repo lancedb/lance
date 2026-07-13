@@ -746,41 +746,50 @@ fn next_dedicated_size(current: u64, append: u64) -> Result<u64> {
     })
 }
 
-fn ensure_writer_usable(failure: &Option<String>, path: &Path) -> Result<()> {
-    if let Some(failure) = failure {
-        return Err(Error::io(format!(
-            "Blob writer for '{path}' cannot be used after a failed or interrupted write. Previous error: {failure}"
-        )));
+#[derive(Default)]
+enum BlobWriteState {
+    #[default]
+    Ready,
+    InProgress,
+    Failed(String),
+}
+
+fn ensure_writer_usable(state: &BlobWriteState, path: &Path) -> Result<()> {
+    match state {
+        BlobWriteState::Ready => Ok(()),
+        BlobWriteState::InProgress => Err(Error::io(format!(
+            "Blob writer for '{path}' cannot be used after an interrupted write. Previous error: Blob write was cancelled before completion"
+        ))),
+        BlobWriteState::Failed(failure) => Err(Error::io(format!(
+            "Blob writer for '{path}' cannot be used after a failed write. Previous error: {failure}"
+        ))),
     }
-    Ok(())
 }
 
 fn take_writer_for_write(
     writer: &mut Option<Box<dyn Writer>>,
-    failure: &mut Option<String>,
+    state: &mut BlobWriteState,
     path: &Path,
 ) -> Result<Box<dyn Writer>> {
-    ensure_writer_usable(failure, path)?;
+    ensure_writer_usable(state, path)?;
     let writer = writer
         .take()
         .ok_or_else(|| Error::io(format!("Blob writer for '{path}' has no active upload")))?;
 
-    // Keep the writer out of `self` and the failure marker set across the await. If the
-    // write future is cancelled after accepting a prefix, the writer is dropped and the
-    // logical offset can never be reused for the partially written physical bytes.
-    *failure = Some(format!(
-        "Blob write to '{path}' was cancelled before completion"
-    ));
+    // Keep the writer out of `self` and the in-progress marker set across the await. If
+    // the write future is cancelled after accepting a prefix, the writer is dropped and
+    // the logical offset can never be reused for the partially written physical bytes.
+    *state = BlobWriteState::InProgress;
     Ok(writer)
 }
 
 async fn poison_writer<T>(
     writer: &mut Option<Box<dyn Writer>>,
-    failure: &mut Option<String>,
+    state: &mut BlobWriteState,
     path: &Path,
     error: Error,
 ) -> Result<T> {
-    *failure = Some(error.to_string());
+    *state = BlobWriteState::Failed(error.to_string());
     if let Some(mut writer) = writer.take()
         && let Err(abort_error) = writer.abort().await
     {
@@ -820,7 +829,7 @@ async fn shutdown_writer(writer: &mut Box<dyn Writer>, path: &Path) -> Result<()
 /// let mut writer = PackedBlobWriter::try_new(
 ///     ObjectStore::memory(),
 ///     Path::from("dataset/data.lance"),
-///     0,
+///     1,
 /// )
 /// .await?;
 /// writer.write_blob(b"first payload").await?;
@@ -837,7 +846,7 @@ pub struct PackedBlobWriter {
     writer: Option<Box<dyn Writer>>,
     offset: u64,
     values: Vec<BlobDescriptor>,
-    failure: Option<String>,
+    write_state: BlobWriteState,
 }
 
 impl PackedBlobWriter {
@@ -856,7 +865,7 @@ impl PackedBlobWriter {
             writer: Some(writer),
             offset: 0,
             values: Vec::new(),
-            failure: None,
+            write_state: BlobWriteState::Ready,
         })
     }
 
@@ -946,20 +955,20 @@ impl PackedBlobWriter {
 
         if !bytes.is_empty() {
             let mut writer =
-                take_writer_for_write(&mut self.writer, &mut self.failure, &self.path)?;
+                take_writer_for_write(&mut self.writer, &mut self.write_state, &self.path)?;
             let write_result = writer.write_all(&bytes).await;
             if let Err(error) = write_result {
                 self.writer = Some(writer);
                 return poison_writer(
                     &mut self.writer,
-                    &mut self.failure,
+                    &mut self.write_state,
                     &self.path,
                     error.into(),
                 )
                 .await;
             }
             self.writer = Some(writer);
-            self.failure = None;
+            self.write_state = BlobWriteState::Ready;
         }
 
         self.offset = next_output_offset;
@@ -971,19 +980,20 @@ impl PackedBlobWriter {
         self.ensure_writable()?;
         let size = bytes.len() as u64;
         let (descriptor, next_offset) = packed_descriptor(self.blob_id, self.offset, size)?;
-        let mut writer = take_writer_for_write(&mut self.writer, &mut self.failure, &self.path)?;
+        let mut writer =
+            take_writer_for_write(&mut self.writer, &mut self.write_state, &self.path)?;
         let write_result = writer.write_all(bytes).await;
         self.writer = Some(writer);
         if let Err(error) = write_result {
             return poison_writer(
                 &mut self.writer,
-                &mut self.failure,
+                &mut self.write_state,
                 &self.path,
                 error.into(),
             )
             .await;
         }
-        self.failure = None;
+        self.write_state = BlobWriteState::Ready;
         self.offset = next_offset;
         self.values.push(descriptor.clone());
         Ok(descriptor)
@@ -997,20 +1007,21 @@ impl PackedBlobWriter {
         self.ensure_writable()?;
         let size = range.len() as u64;
         let (descriptor, next_offset) = packed_descriptor(self.blob_id, self.offset, size)?;
-        let mut writer = take_writer_for_write(&mut self.writer, &mut self.failure, &self.path)?;
+        let mut writer =
+            take_writer_for_write(&mut self.writer, &mut self.write_state, &self.path)?;
         let write_result = writer.copy_range_from_reader(reader, range).await;
         self.writer = Some(writer);
         if let Err(error) = write_result {
-            return poison_writer(&mut self.writer, &mut self.failure, &self.path, error).await;
+            return poison_writer(&mut self.writer, &mut self.write_state, &self.path, error).await;
         }
-        self.failure = None;
+        self.write_state = BlobWriteState::Ready;
         self.offset = next_offset;
         self.values.push(descriptor.clone());
         Ok(descriptor)
     }
 
     fn ensure_writable(&self) -> Result<()> {
-        ensure_writer_usable(&self.failure, &self.path)
+        ensure_writer_usable(&self.write_state, &self.path)
     }
 
     /// Finish the packed sidecar and return descriptors in write order.
@@ -1049,7 +1060,7 @@ impl PackedBlobWriter {
 /// let mut writer = DedicatedBlobWriter::try_new(
 ///     ObjectStore::memory(),
 ///     Path::from("dataset/data.lance"),
-///     0,
+///     1,
 /// )
 /// .await?;
 /// writer.write(b"one logical payload").await?;
@@ -1067,7 +1078,7 @@ pub struct DedicatedBlobWriter {
     blob_id: u32,
     writer: Option<Box<dyn Writer>>,
     size: u64,
-    failure: Option<String>,
+    write_state: BlobWriteState,
 }
 
 impl DedicatedBlobWriter {
@@ -1085,7 +1096,7 @@ impl DedicatedBlobWriter {
             blob_id,
             writer: Some(writer),
             size: 0,
-            failure: None,
+            write_state: BlobWriteState::Ready,
         })
     }
 
@@ -1110,19 +1121,20 @@ impl DedicatedBlobWriter {
         let bytes = bytes.as_ref();
         let size = bytes.len() as u64;
         let next_size = next_dedicated_size(self.size, size)?;
-        let mut writer = take_writer_for_write(&mut self.writer, &mut self.failure, &self.path)?;
+        let mut writer =
+            take_writer_for_write(&mut self.writer, &mut self.write_state, &self.path)?;
         let write_result = writer.write_all(bytes).await;
         self.writer = Some(writer);
         if let Err(error) = write_result {
             return poison_writer(
                 &mut self.writer,
-                &mut self.failure,
+                &mut self.write_state,
                 &self.path,
                 error.into(),
             )
             .await;
         }
-        self.failure = None;
+        self.write_state = BlobWriteState::Ready;
         self.size = next_size;
         Ok(())
     }
@@ -1135,19 +1147,20 @@ impl DedicatedBlobWriter {
         self.ensure_writable()?;
         let size = range.len() as u64;
         let next_size = next_dedicated_size(self.size, size)?;
-        let mut writer = take_writer_for_write(&mut self.writer, &mut self.failure, &self.path)?;
+        let mut writer =
+            take_writer_for_write(&mut self.writer, &mut self.write_state, &self.path)?;
         let write_result = writer.copy_range_from_reader(reader, range).await;
         self.writer = Some(writer);
         if let Err(error) = write_result {
-            return poison_writer(&mut self.writer, &mut self.failure, &self.path, error).await;
+            return poison_writer(&mut self.writer, &mut self.write_state, &self.path, error).await;
         }
-        self.failure = None;
+        self.write_state = BlobWriteState::Ready;
         self.size = next_size;
         Ok(())
     }
 
     fn ensure_writable(&self) -> Result<()> {
-        ensure_writer_usable(&self.failure, &self.path)
+        ensure_writer_usable(&self.write_state, &self.path)
     }
 
     /// Finish the dedicated sidecar and return its descriptor.
@@ -1737,7 +1750,7 @@ mod tests {
             })),
             offset: 0,
             values: Vec::new(),
-            failure: None,
+            write_state: BlobWriteState::Ready,
         };
         let error = packed
             .write_packed_blobs(Bytes::from_static(b"abcdef"), vec![6])
@@ -1764,7 +1777,7 @@ mod tests {
                 aborted: dedicated_aborted.clone(),
             })),
             size: 0,
-            failure: None,
+            write_state: BlobWriteState::Ready,
         };
 
         let error = dedicated.write(b"abcdef").await.unwrap_err();
@@ -1785,7 +1798,7 @@ mod tests {
             writer: Some(writer),
             offset: 0,
             values: Vec::new(),
-            failure: None,
+            write_state: BlobWriteState::Ready,
         };
 
         cancel_pending(packed.write_blob(b"abcdef"));
@@ -1807,7 +1820,7 @@ mod tests {
             writer: Some(writer),
             offset: 0,
             values: Vec::new(),
-            failure: None,
+            write_state: BlobWriteState::Ready,
         };
         cancel_pending(packed.write_packed_blobs(Bytes::from_static(b"abcdef"), vec![6]));
 
@@ -1827,7 +1840,7 @@ mod tests {
             blob_id: 9,
             writer: Some(writer),
             size: 0,
-            failure: None,
+            write_state: BlobWriteState::Ready,
         };
 
         cancel_pending(dedicated.write(b"abcdef"));
@@ -1878,7 +1891,7 @@ mod tests {
             })),
             offset: 0,
             values: Vec::new(),
-            failure: None,
+            write_state: BlobWriteState::Ready,
         };
 
         let error = writer.finish().await.unwrap_err();
