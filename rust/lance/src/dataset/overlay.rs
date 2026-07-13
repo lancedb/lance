@@ -56,8 +56,8 @@ use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
 ///
 /// Built by [`route_overlays`] from the coverage bitmaps alone — before any value
 /// column is read — so the caller can fetch only the overlay values it will
-/// actually use (see [`OverlayRouting::offsets_in_overlay`]) rather than whole
-/// columns, then build the merged column with [`assemble_overlay_column`].
+/// actually use (its `offsets_in_overlay`) rather than whole columns, then build the
+/// merged column with [`assemble_overlay_column`].
 struct OverlayRouting {
     /// One `(source, position)` pair per output row, ready to hand to `interleave`.
     /// Source `0` is the base column, with `position` = the row's `offset_in_batch`;
@@ -69,22 +69,9 @@ struct OverlayRouting {
     /// value column to fetch.
     offsets_in_overlay: Vec<Vec<u32>>,
     /// Whether any row is covered by an overlay at all (false ⇒ every row falls
-    /// through to the base column).
+    /// through to the base column, so the base is already the answer and no overlay
+    /// values need to be read).
     any_overlay: bool,
-}
-
-impl OverlayRouting {
-    /// Per overlay (newest-first), the `offset_in_overlay` values to fetch from its
-    /// value column.
-    fn offsets_in_overlay(&self) -> &[Vec<u32>] {
-        &self.offsets_in_overlay
-    }
-
-    /// True when no row is covered by any overlay, so the base column is already the
-    /// answer and no overlay values need to be read.
-    fn all_fall_through(&self) -> bool {
-        !self.any_overlay
-    }
 }
 
 /// For each row in `offsets_in_frag`, decide whether its value comes from the base
@@ -254,7 +241,7 @@ fn route_arbitrary(
 /// `offset_in_overlay` values [`route_overlays`] asked for.
 ///
 /// `fetched_newest_first[k]` holds overlay `k`'s values for `routing`'s
-/// `offsets_in_overlay()[k]`, in that order. The result has the same length and
+/// `offsets_in_overlay[k]`, in that order. The result has the same length and
 /// type as `base`. A covered row whose overlay value is NULL resolves **to** NULL
 /// (distinct from a fall-through, which keeps the base value).
 fn assemble_overlay_column(
@@ -262,7 +249,7 @@ fn assemble_overlay_column(
     routing: &OverlayRouting,
     fetched_newest_first: &[ArrayRef],
 ) -> Result<ArrayRef> {
-    if routing.all_fall_through() {
+    if !routing.any_overlay {
         return Ok(base.clone());
     }
     if fetched_newest_first.len() != routing.offsets_in_overlay.len() {
@@ -307,7 +294,7 @@ struct LoadedAtomOverlay {
 /// and pruned to a specific read. Produced by [`resolve_overlays`] and consumed by
 /// [`merge_overlay_batch`].
 #[derive(Debug, Clone)]
-pub struct AtomOverlayPlan {
+pub struct LoadedAtom {
     /// The top-level output column the atom lives in (its name locates the batch
     /// column; its field tree drives the descend/splice into that column).
     top_field: Arc<Field>,
@@ -350,7 +337,7 @@ struct PlannedAtom {
 
 /// A fragment's overlay-resolution plan for a projection, derived from coverage
 /// metadata alone — no file opened, no IO. [`resolve_overlays`] turns it into opened
-/// [`AtomOverlayPlan`]s for one specific read, opening only the files whose cells
+/// [`LoadedAtom`]s for one specific read, opening only the files whose cells
 /// the read's rows actually touch.
 #[derive(Debug, Clone)]
 pub struct OverlayReadPlanner {
@@ -585,7 +572,7 @@ pub async fn resolve_overlays(
     offsets_in_frag: &[u32],
     fragment: &FileFragment,
     read_config: &FragReadConfig,
-) -> Result<Vec<AtomOverlayPlan>> {
+) -> Result<Vec<LoadedAtom>> {
     let read_offsets = read_offsets_bitmap(offsets_in_frag);
 
     // A file is opened only if some atom it covers has cells among the requested rows.
@@ -636,7 +623,7 @@ pub async fn resolve_overlays(
             });
         }
         if !overlays_newest_first.is_empty() {
-            plans.push(AtomOverlayPlan {
+            plans.push(LoadedAtom {
                 top_field: atom.top_field.clone(),
                 ancestor_ids: atom.ancestor_ids.clone(),
                 fetch_projection: atom.fetch_projection.clone(),
@@ -669,7 +656,7 @@ fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
 pub async fn merge_overlay_batch(
     base: ReadBatchFut,
     offsets_in_frag: &[u32],
-    plans: &[AtomOverlayPlan],
+    plans: &[LoadedAtom],
 ) -> Result<RecordBatch> {
     let atom_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
         let coverages: Vec<&RoaringBitmap> = plan
@@ -678,7 +665,7 @@ pub async fn merge_overlay_batch(
             .map(|overlay| overlay.coverage.as_ref())
             .collect();
         let routing = route_overlays(offsets_in_frag, &coverages);
-        if routing.all_fall_through() {
+        if !routing.any_overlay {
             return Ok::<_, Error>((plan, None));
         }
         // Fetch each overlay's values and descend to the atom array. The fetch is
@@ -688,7 +675,7 @@ pub async fn merge_overlay_batch(
         let fetched = futures::future::try_join_all(
             plan.overlays_newest_first
                 .iter()
-                .zip(routing.offsets_in_overlay())
+                .zip(&routing.offsets_in_overlay)
                 .map(|(overlay, offsets_in_overlay)| async move {
                     let column = fetch_overlay_values(
                         overlay.reader.as_ref(),
@@ -792,7 +779,7 @@ mod tests {
         let routing = route_overlays(offsets, &coverages);
         let fetched: Vec<ArrayRef> = overlays_newest_first
             .iter()
-            .zip(routing.offsets_in_overlay())
+            .zip(&routing.offsets_in_overlay)
             .map(|((_, full), offsets_in_overlay)| {
                 let indices = UInt32Array::from(offsets_in_overlay.clone());
                 arrow_select::take::take(full.as_ref(), &indices, None).unwrap()
@@ -899,12 +886,12 @@ mod tests {
         let routing = route_overlays(&[5, 2, 5], &[&coverage]);
         // offset_in_frag 5 is offset_in_overlay 1, offset_in_frag 2 is
         // offset_in_overlay 0: distinct values {0, 1}, sorted.
-        assert_eq!(routing.offsets_in_overlay(), &[vec![0, 1]]);
+        assert_eq!(routing.offsets_in_overlay, vec![vec![0, 1]]);
         let full = i32_array([Some(20), Some(50)]); // values at offset_in_overlay 0, 1
         let fetched = vec![
             arrow_select::take::take(
                 full.as_ref(),
-                &UInt32Array::from(routing.offsets_in_overlay()[0].clone()),
+                &UInt32Array::from(routing.offsets_in_overlay[0].clone()),
                 None,
             )
             .unwrap(),
