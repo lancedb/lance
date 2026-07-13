@@ -41,8 +41,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
-use crate::index::DatasetIndexExt;
-use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::Dataset;
 use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::blob::{
@@ -50,6 +48,8 @@ use crate::dataset::blob::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
 };
+use crate::index::DatasetIndexExt;
+use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::session::Session;
 
 use super::DATA_DIR;
@@ -743,8 +743,13 @@ pub async fn do_write_fragments(
     if let Some(mut writer) = writer.take() {
         if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
             drop(writer);
-            cleanup_data_fragments(&object_store, base_dir, cleanup_bases.as_deref(), &fragments)
-                .await;
+            cleanup_data_fragments(
+                &object_store,
+                base_dir,
+                cleanup_bases.as_deref(),
+                &fragments,
+            )
+            .await;
             return Err(e);
         }
         match writer.finish().await {

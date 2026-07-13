@@ -1386,9 +1386,8 @@ impl ZoneMapSeedWriter {
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.null_count));
         let nan_counts =
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.nan_count));
-        let zone_lengths = arrow_array::UInt64Array::from_iter_values(
-            zones.iter().map(|s| s.bound.length as u64),
-        );
+        let zone_lengths =
+            arrow_array::UInt64Array::from_iter_values(zones.iter().map(|s| s.bound.length as u64));
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             Field::new("min", data_type.clone(), true),
@@ -3551,7 +3550,10 @@ mod tests {
 
         // Zone 2: values 20..22 -> min=20, max=21, partial zone of 2 rows
         assert_eq!(zones[2].bound.start, 8);
-        assert_eq!(zones[2].bound.length, 2, "partial zone length must be exact");
+        assert_eq!(
+            zones[2].bound.length, 2,
+            "partial zone length must be exact"
+        );
         assert_eq!(zones[2].min, ScalarValue::Int32(Some(20)));
         assert_eq!(zones[2].max, ScalarValue::Int32(Some(21)));
 
