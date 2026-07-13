@@ -1119,6 +1119,30 @@ def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_repl
     assert blobs[0].readall() == b"replacement"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"payload", id="bytes"),
+        pytest.param(bytearray(b"payload"), id="bytearray"),
+        pytest.param(memoryview(b"payload"), id="memoryview"),
+        pytest.param(list(b"payload"), id="integer_sequence"),
+    ],
+)
+def test_packed_blob_writer_scalar_buffer_inputs(tmp_path, payload):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    packed.write_blob(payload)
+    descriptors = packed.finish()
+
+    assert [repr(descriptor) for descriptor in descriptors] == [
+        "Packed { blob_id: 7, offset: 0, size: 7 }"
+    ]
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"payload"
+
+
 @pytest.mark.parametrize("array_type", [pa.binary(), pa.large_binary()])
 @pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
 @pytest.mark.parametrize(

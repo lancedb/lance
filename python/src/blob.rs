@@ -19,7 +19,7 @@ use pyo3::{
     pyclass, pymethods,
     types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule, PyTypeMethods},
 };
-use std::{ops::Range, sync::Arc};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 /// Reconstruct the PyArrow equivalent of [`BlobDescriptorArrayBuilder::field`].
 ///
@@ -412,8 +412,12 @@ impl PyPackedBlobWriter {
         descriptor_field_to_pyarrow(field, py)
     }
 
-    pub fn write_blob(&mut self, data: Vec<u8>) -> PyResult<()> {
-        rt().block_on(None, self.inner_mut()?.write_blob(data))?
+    /// Append one packed blob.
+    ///
+    /// Python ``bytes`` are borrowed without copying. Other compatible byte
+    /// sequences use owned storage for the duration of the write.
+    pub fn write_blob(&mut self, data: Cow<'_, [u8]>) -> PyResult<()> {
+        rt().block_on(None, self.inner_mut()?.write_blob(data.as_ref()))?
             .infer_error()?;
         self.row_validity.push(true);
         Ok(())
