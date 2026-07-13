@@ -241,6 +241,15 @@ impl MiniBlockDecompressor for InlineBitpacking {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
+        if num_values == 0 {
+            // Empty mini-blocks have no inline bit-width header to decode.
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::empty(),
+                bits_per_value: self.uncompressed_bit_width,
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            }));
+        }
         match self.uncompressed_bit_width {
             8 => Self::unchunk::<u8>(data, num_values),
             16 => Self::unchunk::<u16>(data, num_values),
@@ -528,14 +537,35 @@ mod test {
 
     use arrow_array::{Array, Int8Array, Int64Array};
     use arrow_schema::DataType;
+    use rstest::rstest;
 
-    use super::{ELEMS_PER_CHUNK, bitpack_out_of_line, unpack_out_of_line};
+    use super::{ELEMS_PER_CHUNK, InlineBitpacking, bitpack_out_of_line, unpack_out_of_line};
     use crate::{
         buffer::LanceBuffer,
-        data::{BlockInfo, FixedWidthDataBlock},
+        compression::MiniBlockDecompressor,
+        data::{BlockInfo, DataBlock, FixedWidthDataBlock},
         testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
+
+    #[rstest]
+    #[case::u8(8)]
+    #[case::u16(16)]
+    #[case::u32(32)]
+    #[case::u64(64)]
+    fn test_inline_bitpacking_decompress_empty_miniblock(#[case] bit_width: u64) {
+        let decompressor = InlineBitpacking::new(bit_width);
+        let decompressed =
+            MiniBlockDecompressor::decompress(&decompressor, vec![LanceBuffer::empty()], 0)
+                .unwrap();
+
+        let DataBlock::FixedWidth(block) = decompressed else {
+            panic!("Expected FixedWidth block");
+        };
+        assert_eq!(block.bits_per_value, bit_width);
+        assert_eq!(block.num_values, 0);
+        assert_eq!(block.data.len(), 0);
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_miniblock_bitpack() {

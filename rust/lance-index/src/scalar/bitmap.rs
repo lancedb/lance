@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     cmp::Reverse,
@@ -795,7 +796,7 @@ impl ScalarIndex for BitmapIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let state = self.load_bitmap_index_state().await?;
@@ -890,8 +891,7 @@ impl BitmapBatchWriter {
             return Ok(());
         }
         let keys_array =
-            ScalarValue::iter_to_array(self.keys.drain(..).collect::<Vec<_>>().into_iter())
-                .unwrap();
+            ScalarValue::iter_to_array(self.keys.drain(..).collect::<Vec<_>>()).unwrap();
         let total_size: usize = self.serialized.iter().map(|b| b.len()).sum();
         let mut binary_builder = BinaryBuilder::with_capacity(self.serialized.len(), total_size);
         for b in self.serialized.drain(..) {
@@ -1122,10 +1122,7 @@ async fn drain_same_key_bitmaps(
     let merged_key = OrderableScalarValue(key);
     advance_cursor_and_push(cursors, heap, item.shard_idx).await?;
 
-    loop {
-        let Some(Reverse(next_item)) = heap.peek() else {
-            break;
-        };
+    while let Some(Reverse(next_item)) = heap.peek() {
         if next_item.key != merged_key {
             break;
         }
@@ -1279,7 +1276,7 @@ impl BitmapIndexPlugin {
             let bitmap_size = bytes.len();
 
             if cur_bytes + bitmap_size > MAX_BITMAP_ARRAY_LENGTH {
-                let keys_array = ScalarValue::iter_to_array(cur_keys.clone().into_iter()).unwrap();
+                let keys_array = ScalarValue::iter_to_array(cur_keys.clone()).unwrap();
                 let mut binary_builder = BinaryBuilder::new();
                 for b in &cur_bitmaps {
                     binary_builder.append_value(b);
@@ -1549,7 +1546,7 @@ impl BitmapIndexPlugin {
     /// Remaps every bitmap in a materialized bitmap-index state using row-id mappings.
     pub(crate) fn remap_bitmap_state(
         state: HashMap<ScalarValue, RowAddrTreeMap>,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> HashMap<ScalarValue, RowAddrTreeMap> {
         state
             .into_iter()
@@ -1557,10 +1554,7 @@ impl BitmapIndexPlugin {
                 let remapped_bitmap =
                     RowAddrTreeMap::from_iter(bitmap.row_addrs().unwrap().filter_map(|addr| {
                         let addr_as_u64 = u64::from(addr);
-                        mapping
-                            .get(&addr_as_u64)
-                            .copied()
-                            .unwrap_or(Some(addr_as_u64))
+                        mapping.get(addr_as_u64).unwrap_or(Some(addr_as_u64))
                     }));
                 (key, remapped_bitmap)
             })
@@ -1909,7 +1903,7 @@ mod tests {
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowSetOps;
-    use std::collections::HashMap;
+    use rstest::rstest;
 
     fn assert_state_roundtrips(state: &BitmapIndexState) {
         let mut buf = Vec::new();
@@ -2460,8 +2454,44 @@ mod tests {
         assert_eq!(red_rows_2, vec![0, 3, 6, 10, 11]);
     }
 
+    // frags 1 and 2 (3 rows each) are compacted into frag 3: the 6 rows are
+    // rewritten in order to frag 3 offsets 0..6.
+    fn bitmap_remap_compact() -> RowAddrRemap {
+        use lance_core::utils::row_addr_remap::GroupInput;
+        use roaring::RoaringTreemap;
+        RowAddrRemap::compact([GroupInput {
+            rewritten_old_row_addrs: RoaringTreemap::from_iter(
+                (0..3)
+                    .map(|o| u64::from(RowAddress::new_from_parts(1, o)))
+                    .chain((0..3).map(|o| u64::from(RowAddress::new_from_parts(2, o)))),
+            ),
+            old_frag_ids: vec![1, 2],
+            new_frags: vec![(3, 6)],
+        }])
+        .unwrap()
+    }
+
+    fn bitmap_remap_explicit() -> RowAddrRemap {
+        // The same mapping, listed out explicitly.
+        RowAddrRemap::direct(
+            (0..6u32)
+                .map(|i| {
+                    let (f, o) = if i < 3 { (1, i) } else { (2, i - 3) };
+                    (
+                        u64::from(RowAddress::new_from_parts(f, o)),
+                        Some(u64::from(RowAddress::new_from_parts(3, i))),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    // remap must behave identically whether the mapping is compact or explicit.
+    #[rstest]
+    #[case(bitmap_remap_compact())]
+    #[case(bitmap_remap_explicit())]
     #[tokio::test]
-    async fn test_remap_bitmap_with_null() {
+    async fn test_remap_bitmap_with_null(#[case] remap: RowAddrRemap) {
         use arrow_array::UInt32Array;
 
         // Create a temporary store.
@@ -2526,38 +2556,8 @@ mod tests {
         assert_eq!(index.index_map.len(), 2); // 2 non-null values (1 and 2)
         assert!(!index.null_map.is_empty()); // Should have null values
 
-        // Create a remap that simulates compaction of frags 1 and 2 into frag 3
-        let mut row_addr_map = HashMap::<u64, Option<u64>>::new();
-        row_addr_map.insert(
-            RowAddress::new_from_parts(1, 0).into(),
-            Some(RowAddress::new_from_parts(3, 0).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(1, 1).into(),
-            Some(RowAddress::new_from_parts(3, 1).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(1, 2).into(),
-            Some(RowAddress::new_from_parts(3, 2).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(2, 0).into(),
-            Some(RowAddress::new_from_parts(3, 3).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(2, 1).into(),
-            Some(RowAddress::new_from_parts(3, 4).into()),
-        );
-        row_addr_map.insert(
-            RowAddress::new_from_parts(2, 2).into(),
-            Some(RowAddress::new_from_parts(3, 5).into()),
-        );
-
         // Perform remap
-        index
-            .remap(&row_addr_map, test_store.as_ref())
-            .await
-            .unwrap();
+        index.remap(&remap, test_store.as_ref()).await.unwrap();
 
         // Reload and check
         let reloaded_idx = BitmapIndex::load(test_store, None, &LanceCache::no_cache())

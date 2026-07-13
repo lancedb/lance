@@ -1213,7 +1213,23 @@ mod tests {
         assert_eq!(results.num_rows(), 2);
         let mut id_arr = results["id"].as_primitive::<UInt32Type>().values().to_vec();
         id_arr.sort();
-        assert_eq!(id_arr, vec![0, 1000]);
+        // For exact indexes (e.g. IvfFlat) the top-2 nearest neighbors of the
+        // query vector are deterministic (id 0 in the first delta and id 1000
+        // in the second delta, since the same vector is duplicated across
+        // the two fragments). For approximate indexes (e.g. IvfPq, IvfHnswSq)
+        // the returned ids are not guaranteed to be exactly [0, 1000]; the key
+        // property this test verifies is that both delta indices are queried
+        // (i.e. one result comes from each delta), so we only assert that.
+        let is_approximate = !matches!(index_params.index_type(), IndexType::IvfFlat);
+        if is_approximate {
+            assert!(
+                id_arr[0] < TOTAL as u32 && id_arr[1] >= TOTAL as u32,
+                "expected one result from each delta index, got {:?}",
+                id_arr
+            );
+        } else {
+            assert_eq!(id_arr, vec![0, 1000]);
+        }
     }
 
     #[tokio::test]

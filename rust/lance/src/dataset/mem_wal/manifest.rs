@@ -519,8 +519,8 @@ impl ShardManifestStore {
         shard_id: Uuid,
     ) -> Result<()> {
         match manifest {
-            Some(m) if m.writer_epoch > local_epoch => Err(Error::io(format!(
-                "Writer fenced: local epoch {} < stored epoch {} for shard {}",
+            Some(m) if m.writer_epoch > local_epoch => Err(Error::fenced_by_peer(format!(
+                "local epoch {} < stored epoch {} for shard {}",
                 local_epoch, m.writer_epoch, shard_id
             ))),
             _ => Ok(()),

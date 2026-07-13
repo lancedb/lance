@@ -1071,6 +1071,17 @@ pub enum BlobHandling {
 }
 
 impl BlobHandling {
+    fn should_load_binary(&self, field: &Field) -> bool {
+        if !field.is_blob() {
+            return false;
+        }
+        match self {
+            Self::AllBinary => true,
+            Self::SomeBlobsBinary(set) | Self::SomeBinary(set) => set.contains(&(field.id as u32)),
+            Self::BlobsDescriptions | Self::AllDescriptions => false,
+        }
+    }
+
     fn should_unload(&self, field: &Field) -> bool {
         // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
         // even if the physical data type is not binary-like.
@@ -1086,10 +1097,34 @@ impl BlobHandling {
         }
     }
 
+    /// Whether `field` will be projected as a lightweight blob *description*
+    /// (offset + size) rather than its full binary value under this handling.
+    ///
+    /// A description is tiny and cheap to read eagerly; the full binary value is
+    /// not. Materialization heuristics use this to decide early vs late loading.
+    pub fn returns_description(&self, field: &Field) -> bool {
+        self.should_unload(field)
+    }
+
+    /// Apply this blob handling policy to a projected field tree.
+    ///
+    /// Blob descriptor modes convert blob leaves to descriptor views. Binary
+    /// modes convert selected blob leaves to `LargeBinary`. Non-blob nested
+    /// fields are preserved while their children are handled recursively.
     pub fn unload_if_needed(&self, mut field: Field) -> Field {
+        if self.should_load_binary(&field) {
+            field.binary_blob_mut();
+            return field;
+        }
         if self.should_unload(&field) {
             field.unloaded_mut();
+            return field;
         }
+        field.children = field
+            .children
+            .into_iter()
+            .map(|child| self.unload_if_needed(child))
+            .collect();
         field
     }
 }

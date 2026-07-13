@@ -828,6 +828,9 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            // Overlays are not exposed to Java yet, and the reverse conversion
+            // does not export them, so this round-trip is overlay-free.
+            overlays: vec![],
         })
     }
 }

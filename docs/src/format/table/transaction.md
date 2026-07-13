@@ -466,6 +466,64 @@ The following operations are retryable conflicts with DataReplacement:
 A concurrent Delete or Update that only adds a deletion vector to a target fragment (without removing it) is compatible: the
 positional column file stays aligned and the rebase preserves the deletion vector.
 
+### DataOverlay
+
+Attaches [overlay files](data_overlay_file.md) to fragments, supplying new values
+for a subset of `(row offset, field)` cells without rewriting the fragments' base
+data files. The overlays are appended to each fragment's existing `overlays` list,
+so overlays written by concurrent commits are preserved. Each overlay's
+`committed_version` is stamped to the new dataset version at commit time (and
+re-stamped on retry), like the created-at / last-updated-at version sequences.
+
+<details>
+<summary>DataOverlay protobuf message</summary>
+
+```protobuf
+%%% proto.message.DataOverlay %%%
+
+%%% proto.message.DataOverlayGroup %%%
+```
+
+</details>
+
+#### DataOverlay Compatibility
+
+A DataOverlay operation only changes cells within existing fragments and preserves
+physical row addresses, so — like DataReplacement — it is intentionally permissive.
+Because overlays stack and the higher `committed_version` wins each covered cell,
+independent backfills never conflict, and a concurrent Delete simply makes the
+overlay value for a deleted offset inert. Here are the operations that conflict
+with DataOverlay:
+
+- Overwrite
+- Restore
+- UpdateMemWalState
+
+The following operations are retryable conflicts with DataOverlay:
+
+- Rewrite (only if overlapping fragments) — row-rewriting compaction or an
+  overlay→base fold changes physical row addresses or consumes the overlays, so
+  the overlay's offsets are no longer valid; the writer must re-read the new
+  fragment, recompute, and retry.
+- Merge (always).
+- A row-moving Update that touches an overlaid fragment — a delete-and-reinsert
+  update (any update that is not a `REWRITE_COLUMNS` column rewrite) relocates the
+  updated rows into new fragments, so the overlay's physical offsets no longer
+  address them; the writer must re-read and retry.
+
+DataOverlay is compatible with another DataOverlay (any fields), Append, Delete, a
+`REWRITE_COLUMNS` column rewrite, and DataReplacement, because all of these
+preserve physical row addresses: overlay offsets stay valid, the overlay is newer
+and wins its covered cells, and the version gate excludes those cells from any
+rebuilt index.
+
+When a DataReplacement or a `REWRITE_COLUMNS` update writes new base values for a
+field, it supersedes any older overlay on that field: the writer tombstones the
+overlay's entry for the rewritten field — replacing the field id with the obsolete
+sentinel, as with obsolete base columns — so the fresh base values are not silently
+shadowed. Overlay entries for other fields are preserved, and an overlay left with
+no live fields is dropped.
+
 ### UpdateMemWalState
 
 Updates the state of MemWal indices (write-ahead log based indices).

@@ -41,6 +41,35 @@ These options apply to all object stores.
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 
+## Per-Base Configuration
+
+A dataset can register additional base paths that store part of its data, and each
+base may live in a different bucket, account, or storage provider. A storage option
+key of the form `base_<id>.<key>` applies `<key>` only to the base path with that
+manifest id. Every base inherits the unscoped options; base-scoped entries add to or
+override them for that base only.
+
+```python
+import lance
+ds = lance.dataset(
+    "az://account-a/path",
+    storage_options={
+        # Shared defaults, used by the primary dataset and inherited by bases
+        "account_name": "account-a",
+        "account_key": "key-a",
+        # Overrides for the base path with id 1
+        "base_1.account_name": "account-b",
+        "base_1.account_key": "key-b",
+    },
+)
+```
+
+Base ids are assigned when bases are registered (`initial_bases` ids are assigned
+sequentially starting at 1, in order) and can be inspected through the manifest base
+paths. Keys that do not match `base_<id>.<key>` exactly (e.g. `base_url`) are treated
+as regular storage options. Exact per-base parameter maps (`base_store_params`,
+keyed by base path URI) take precedence over base-scoped keys for that base.
+
 ## S3 Configuration
 
 S3 (and S3-compatible stores) have additional configuration options that configure

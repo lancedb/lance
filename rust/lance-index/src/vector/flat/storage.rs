@@ -134,7 +134,7 @@ impl VectorStore for FlatFloatStorage {
 
     fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch])?;
         let mut storage = self.clone();
         storage.row_ids = Arc::new(
             new_batch
@@ -296,7 +296,7 @@ impl VectorStore for FlatBinStorage {
 
     fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
         // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch])?;
         let mut storage = self.clone();
         storage.row_ids = Arc::new(
             new_batch

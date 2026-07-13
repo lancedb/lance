@@ -2304,4 +2304,70 @@ mod tests {
             "Should have 0 rows with value='banana' after deletion"
         );
     }
+
+    // End-to-end: create index → delete a whole fragment → search (via index) →
+    // update index → search again.  No deleted rows should ever appear.
+    #[tokio::test]
+    async fn test_zonemap_search_with_deleted_fragment_before_and_after_update() {
+        use arrow::datatypes::Int32Type;
+        use lance_datagen::array;
+        use lance_index::IndexType;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // 3 fragments × 10 rows: id 0-9 (frag 0), 10-19 (frag 1), 20-29 (frag 2).
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Delete the middle fragment entirely.
+        ds.delete("id >= 10 AND id < 20").await.unwrap();
+
+        // Helper: run a filter scan and return the sorted id values.
+        async fn live_ids(ds: &crate::Dataset) -> Vec<i32> {
+            let batch = ds
+                .scan()
+                .filter("id >= 0")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids: Vec<i32> = batch["id"]
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        // --- Before index update ---
+        let ids = live_ids(&ds).await;
+        assert_eq!(ids.len(), 20, "expected 20 live rows before index update");
+        assert!(
+            ids.iter().all(|&id| !(10..20).contains(&id)),
+            "deleted fragment rows (id 10-19) must not appear before index update; got: {:?}",
+            ids
+        );
+
+        // Update the zone map index to reflect the deletion.
+        ds.optimize_indices(&OptimizeOptions::new()).await.unwrap();
+
+        // --- After index update ---
+        let ids = live_ids(&ds).await;
+        assert_eq!(ids.len(), 20, "expected 20 live rows after index update");
+        assert!(
+            ids.iter().all(|&id| !(10..20).contains(&id)),
+            "deleted fragment rows (id 10-19) must not appear after index update; got: {:?}",
+            ids
+        );
+    }
 }

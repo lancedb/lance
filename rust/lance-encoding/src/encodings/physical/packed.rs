@@ -323,7 +323,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
         let mut field_data = Vec::with_capacity(self.fields.len());
         let mut field_metadata = Vec::with_capacity(self.fields.len());
 
-        for (field, child_block) in self.fields.iter().zip(struct_block.children.into_iter()) {
+        for (field, child_block) in self.fields.iter().zip(struct_block.children) {
             let compressor = crate::compression::CompressionStrategy::create_per_value(
                 &self.strategy,
                 field,
@@ -688,7 +688,7 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
         }
 
         let mut children = Vec::with_capacity(self.fields.len());
-        for (field, accumulator) in self.fields.iter().zip(accumulators.into_iter()) {
+        for (field, accumulator) in self.fields.iter().zip(accumulators) {
             match (field, accumulator) {
                 (
                     VariablePackedStructFieldDecoder {

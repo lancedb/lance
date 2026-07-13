@@ -396,6 +396,23 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn target_bases(
+        mut slf: PyRefMut<'_, Self>,
+        bases: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_base_names_or_paths(bases);
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (include_primary = true))]
+    pub fn target_all_bases(
+        mut slf: PyRefMut<'_, Self>,
+        include_primary: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_all_bases(include_primary);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -530,6 +547,23 @@ fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegm
         }
     }
     Ok(extracted)
+}
+
+fn parse_index_segment_ids(index_segments: Option<Vec<String>>) -> PyResult<Option<Vec<Uuid>>> {
+    index_segments
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| {
+                    Uuid::parse_str(&segment).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "invalid index segment uuid '{segment}': {err}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
 }
 
 impl MergeInsertBuilder {
@@ -2430,6 +2464,11 @@ impl Dataset {
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
+                    if let Some(block_size) = kwargs.get_item("block_size")? {
+                        params = params
+                            .block_size(block_size.extract()?)
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
                     }
@@ -2445,7 +2484,7 @@ impl Dataset {
                             value.to_string()
                         } else {
                             return Err(PyValueError::new_err(
-                                "format_version must be 1, 2, 'v1', or 'v2'",
+                                "format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'",
                             ));
                         };
                         let format_version = value
@@ -2583,18 +2622,31 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (name, *, with_position = false))]
-    fn prewarm_index(&self, name: &str, with_position: bool) -> PyResult<()> {
+    #[pyo3(signature = (name, *, with_position = false, index_segments = None))]
+    fn prewarm_index(
+        &self,
+        name: &str,
+        with_position: bool,
+        index_segments: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let index_segments = parse_index_segment_ids(index_segments)?;
+
         rt().block_on(None, async {
             if with_position {
-                self.ds
-                    .prewarm_index_with_options(
-                        name,
-                        &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
-                    )
-                    .await
+                let options = PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true));
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds
+                        .prewarm_index_segments_with_options(name, index_segments, &options)
+                        .await
+                } else {
+                    self.ds.prewarm_index_with_options(name, &options).await
+                }
             } else {
-                self.ds.prewarm_index(name).await
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds.prewarm_index_segments(name, index_segments).await
+                } else {
+                    self.ds.prewarm_index(name).await
+                }
             }
         })?
         .infer_error()
@@ -3586,9 +3638,10 @@ impl Dataset {
 
     /// Perform pairwise hamming distance clustering on a partition of an IVF_FLAT index.
     ///
-    /// This function loads a specific partition from an IVF_FLAT index on a hash column,
-    /// computes pairwise hamming distances between all hashes in the partition,
-    /// filters by threshold, and clusters the results using union-find.
+    /// This function loads a specific partition from every segment of an IVF_FLAT
+    /// index on a hash column, computes pairwise hamming distances between all
+    /// hashes in the combined partition, filters by threshold, and clusters the
+    /// results using union-find.
     ///
     /// Parameters
     /// ----------
@@ -3598,6 +3651,9 @@ impl Dataset {
     ///     The partition ID within the IVF_FLAT index
     /// hamming_threshold : int
     ///     Maximum hamming distance to consider as similar
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute rows. Defaults to all segments.
     ///
     /// Returns
     /// -------
@@ -3605,27 +3661,45 @@ impl Dataset {
     ///     A reader yielding batches with columns:
     ///     - 'representative': uint64 - The representative row ID for each cluster
     ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
-    #[pyo3(signature = (index_name, partition_id, hamming_threshold))]
+    #[pyo3(signature = (index_name, partition_id, hamming_threshold, index_segments=None))]
     fn hamming_clustering_for_ivf_partition(
         &self,
         py: Python<'_>,
         index_name: &str,
         partition_id: usize,
         hamming_threshold: u32,
+        index_segments: Option<Vec<String>>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        use lance::index::vector::hamming::hamming_clustering_for_ivf_partition;
+        use lance::index::vector::hamming::{
+            hamming_clustering_for_ivf_partition, hamming_clustering_for_ivf_partition_segments,
+        };
 
+        let segment_ids = parse_index_segment_ids(index_segments)?;
         let ds = self.ds.as_ref();
         let reader = rt()
-            .block_on(
-                Some(py),
-                hamming_clustering_for_ivf_partition(
-                    ds,
-                    index_name,
-                    partition_id,
-                    hamming_threshold,
-                ),
-            )?
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        hamming_clustering_for_ivf_partition_segments(
+                            ds,
+                            index_name,
+                            segment_ids,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                    None => {
+                        hamming_clustering_for_ivf_partition(
+                            ds,
+                            index_name,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(PyArrowType(reader))
@@ -3633,26 +3707,43 @@ impl Dataset {
 
     /// Get partition information for an IVF_FLAT index.
     ///
+    /// Partition sizes are aggregated across all segments of the logical index
+    /// unless a subset is selected via ``index_segments``.
+    ///
     /// Parameters
     /// ----------
     /// index_name : str
     ///     Name of the IVF_FLAT index
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute to the sizes. Defaults to all segments.
     ///
     /// Returns
     /// -------
     /// List[dict]
     ///     List of partition info dicts with 'partition_id' and 'size'
-    #[pyo3(signature = (index_name))]
+    #[pyo3(signature = (index_name, index_segments=None))]
     fn get_ivf_partition_info(
         &self,
         py: Python<'_>,
         index_name: &str,
+        index_segments: Option<Vec<String>>,
     ) -> PyResult<Vec<Py<PyDict>>> {
-        use lance::index::vector::hamming::get_ivf_partition_info;
+        use lance::index::vector::hamming::{
+            get_ivf_partition_info, get_ivf_partition_info_segments,
+        };
 
+        let segment_ids = parse_index_segment_ids(index_segments)?;
         let ds = self.ds.as_ref();
         let result = rt()
-            .block_on(Some(py), get_ivf_partition_info(ds, index_name))?
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        get_ivf_partition_info_segments(ds, index_name, segment_ids).await
+                    }
+                    None => get_ivf_partition_info(ds, index_name).await,
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         let partitions: PyResult<Vec<_>> = result
@@ -4519,6 +4610,11 @@ pub fn get_write_params(
             && !target_bases_list.is_empty()
         {
             p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        // Handle target_all_bases parameter (bool: include primary storage)
+        if let Some(target_all_bases) = get_dict_opt::<bool>(options, "target_all_bases")? {
+            p = p.with_target_all_bases(target_all_bases);
         }
 
         // Handle base_store_params: per-base storage options keyed by base path URI

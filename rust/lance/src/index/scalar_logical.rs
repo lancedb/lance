@@ -3,6 +3,7 @@
 
 //! Query-time logical views over scalar index segments.
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -135,13 +136,19 @@ impl ScalarIndex for LogicalScalarIndex {
         combine_search_results(results)
     }
 
+    fn results_are_row_addresses(&self) -> bool {
+        // All segments of a logical index share the same underlying index type,
+        // so they agree on the result domain.
+        self.segments[0].results_are_row_addresses()
+    }
+
     fn can_remap(&self) -> bool {
         false
     }
 
     async fn remap(
         &self,
-        _mapping: &std::collections::HashMap<u64, Option<u64>>,
+        _mapping: &RowAddrRemap,
         _dest_store: &dyn lance_index::scalar::IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input(format!(

@@ -58,7 +58,7 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, SerializedRepDefs, StructuralPagePlan, build_control_word_iterator,
+        MiniBlockRepDefBudget, RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -3660,7 +3660,18 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
         let mut remaining = num_rows;
         let mut tasks = Vec::new();
         while remaining > 0 {
-            let cur_page = self.page_decoders.front_mut().unwrap();
+            let queued_pages = self.page_decoders.len();
+            let Some(cur_page) = self.page_decoders.front_mut() else {
+                return Err(Error::internal(format!(
+                    "Primitive decoder missing page decoder while draining field '{}' (data_type={:?}, requested_rows={}, remaining_rows={}, rows_drained_in_current={}, queued_pages={})",
+                    self.field.name(),
+                    self.field.data_type(),
+                    num_rows,
+                    remaining,
+                    self.rows_drained_in_current,
+                    queued_pages
+                )));
+            };
             let num_in_page = cur_page.num_rows() - self.rows_drained_in_current;
             let to_take = num_in_page.min(remaining);
 
@@ -3776,7 +3787,7 @@ struct DictEncodingBudget {
     max_encoded_size: usize,
 }
 
-// A primitive page after optional structural splitting.
+// A primitive page after applying the dense mini-block rep/def budget.
 struct PrimitivePageData {
     // Arrow leaf arrays that contain this page's visible values.
     arrays: Vec<ArrayRef>,
@@ -3786,8 +3797,8 @@ struct PrimitivePageData {
     row_number: u64,
     // Number of top-level rows in this page.
     num_rows: u64,
-    // Present when one top-level row is too large for one miniblock rep/def chunk.
-    unsplittable_miniblock_levels: Option<u64>,
+    // Present when one top-level row is too large for one mini-block rep/def page.
+    single_row_miniblock_repdef_levels: Option<u64>,
 }
 
 // Immutable encoder state shared by per-page encode tasks.
@@ -5281,33 +5292,33 @@ impl PrimitiveStructuralEncoder {
         Ok(sliced)
     }
 
-    fn split_structural_pages_for_miniblock_budget(
+    fn split_pages_for_miniblock_repdef_budget(
         arrays: Vec<ArrayRef>,
         repdef: SerializedRepDefs,
-        plan: StructuralPagePlan,
+        budget: MiniBlockRepDefBudget,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<PrimitivePageData>> {
-        if plan == StructuralPagePlan::Fits {
+        if budget == MiniBlockRepDefBudget::WithinBudget {
             return Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
                 row_number,
                 num_rows,
-                unsplittable_miniblock_levels: None,
+                single_row_miniblock_repdef_levels: None,
             }]);
         }
-        if let StructuralPagePlan::UnsplittableOverBudget(num_levels) = plan {
+        if let MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) = budget {
             return Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
                 row_number,
                 num_rows,
-                unsplittable_miniblock_levels: Some(num_levels),
+                single_row_miniblock_repdef_levels: Some(num_levels),
             }]);
         }
 
-        let StructuralPagePlan::Split(splits) = plan else {
+        let MiniBlockRepDefBudget::RequiresPageSplit(splits) = budget else {
             unreachable!();
         };
 
@@ -5320,7 +5331,7 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
-                unsplittable_miniblock_levels: None,
+                single_row_miniblock_repdef_levels: None,
             });
         }
         Ok(pages)
@@ -5342,7 +5353,7 @@ impl PrimitiveStructuralEncoder {
             repdef,
             row_number,
             num_rows,
-            unsplittable_miniblock_levels,
+            single_row_miniblock_repdef_levels,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
 
@@ -5425,7 +5436,7 @@ impl PrimitiveStructuralEncoder {
             );
         }
 
-        if let Some(num_levels) = unsplittable_miniblock_levels {
+        if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let requested_encoding = encoding_metadata
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
@@ -5652,16 +5663,17 @@ impl PrimitiveStructuralEncoder {
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-        let (repdef, structural_plan) = RepDefBuilder::serialize_with_structural_plan(
-            repdefs,
-            miniblock::max_repdef_levels_per_chunk,
-            num_rows,
-            num_values,
-        )?;
-        let pages = Self::split_structural_pages_for_miniblock_budget(
+        let (repdef, miniblock_repdef_budget) =
+            RepDefBuilder::serialize_with_miniblock_repdef_budget(
+                repdefs,
+                miniblock::max_repdef_levels_per_chunk,
+                num_rows,
+                num_values,
+            )?;
+        let pages = Self::split_pages_for_miniblock_repdef_budget(
             arrays,
             repdef,
-            structural_plan,
+            miniblock_repdef_budget,
             row_number,
             num_rows,
         )?;
@@ -5794,9 +5806,9 @@ mod tests {
         STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
-    use crate::decoder::PageEncoding;
+    use crate::decoder::{PageEncoding, StructuralFieldDecoder};
     use crate::encodings::logical::primitive::{
-        ChunkDrainInstructions, PrimitiveStructuralEncoder,
+        ChunkDrainInstructions, PrimitiveStructuralEncoder, StructuralPrimitiveFieldDecoder,
     };
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
@@ -5805,7 +5817,7 @@ mod tests {
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
     use std::{collections::VecDeque, sync::Arc};
 
@@ -5827,6 +5839,33 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[test]
+    fn test_primitive_decoder_empty_page_queue_returns_error() {
+        let field = Arc::new(ArrowField::new("vector", DataType::Float32, true));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+
+        let err = decoder.drain(1).unwrap_err();
+        assert!(
+            matches!(&err, lance_core::Error::Internal { .. }),
+            "expected internal error, got: {err:?}"
+        );
+        let message = err.to_string();
+        for expected in [
+            "Primitive decoder missing page decoder",
+            "field 'vector'",
+            "data_type=Float32",
+            "requested_rows=1",
+            "remaining_rows=1",
+            "rows_drained_in_current=0",
+            "queued_pages=0",
+        ] {
+            assert!(
+                message.contains(expected),
+                "expected error to contain {expected:?}, got: {message}"
+            );
+        }
     }
 
     #[test]

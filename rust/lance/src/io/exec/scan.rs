@@ -26,7 +26,10 @@ use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{
+    Error, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD,
+};
 use lance_file::reader::FileReaderOptions;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
@@ -192,7 +195,36 @@ impl LanceStream {
     ) -> Result<Self> {
         let scan_metrics = ScanMetrics::new(metrics, partition);
         let timer = scan_metrics.baseline_metrics.elapsed_compute().timer();
-        let project_schema = projection.clone();
+        let materialize_blob_v2_binary =
+            crate::dataset::blob::schema_has_blob_v2_binary_view(projection.as_ref());
+        let read_projection = if materialize_blob_v2_binary {
+            Arc::new(crate::dataset::blob::blob_v2_descriptor_schema(
+                projection.as_ref(),
+            ))
+        } else {
+            projection.clone()
+        };
+        let project_schema = read_projection;
+        let output_projection = if materialize_blob_v2_binary {
+            let mut output_projection = projection.as_ref().clone();
+            let mut system_fields = Vec::with_capacity(4);
+            if config.with_row_id {
+                system_fields.push(ROW_ID_FIELD.clone());
+            }
+            if config.with_row_address {
+                system_fields.push(ROW_ADDR_FIELD.clone());
+            }
+            if config.with_row_last_updated_at_version {
+                system_fields.push(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone());
+            }
+            if config.with_row_created_at_version {
+                system_fields.push(ROW_CREATED_AT_VERSION_FIELD.clone());
+            }
+            output_projection.extend(&system_fields)?;
+            Arc::new(output_projection)
+        } else {
+            projection.clone()
+        };
         let io_parallelism = dataset.object_store.io_parallelism();
         // First, use the value specified by the user in the call
         // Second, use the default from the environment variable, if specified
@@ -275,12 +307,14 @@ impl LanceStream {
 
         let scan_scheduler_clone = scan_scheduler.clone();
 
+        let materialize_dataset = dataset;
         let config_for_stream = config.clone();
         let batches = stream::iter(file_fragments.into_iter().enumerate())
             .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
                 let config = config_for_stream.clone();
+                let force_row_address = materialize_blob_v2_binary;
                 #[allow(clippy::type_complexity)]
                 let frag_task: BoxFuture<
                     Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
@@ -288,7 +322,7 @@ impl LanceStream {
                     (async move {
                         let mut frag_config = FragReadConfig::default()
                             .with_row_id(config.with_row_id)
-                            .with_row_address(config.with_row_address)
+                            .with_row_address(config.with_row_address || force_row_address)
                             .with_row_last_updated_at_version(
                                 config.with_row_last_updated_at_version,
                             )
@@ -349,6 +383,25 @@ impl LanceStream {
             )
             .stream_in_current_span()
             .boxed();
+        let inner_stream = if materialize_blob_v2_binary {
+            inner_stream
+                .and_then(move |batch| {
+                    let dataset = materialize_dataset.clone();
+                    let output_projection = output_projection.clone();
+                    async move {
+                        crate::dataset::blob::materialize_blob_v2_binary_batch(
+                            &dataset,
+                            output_projection.as_ref(),
+                            batch,
+                        )
+                        .await
+                        .map_err(DataFusionError::from)
+                    }
+                })
+                .boxed()
+        } else {
+            inner_stream
+        };
 
         timer.done();
         Ok(Self {
@@ -482,7 +535,9 @@ impl core::fmt::Debug for LanceStream {
 
 impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
-        let mut schema: ArrowSchema = self.projection.as_ref().into();
+        let output_projection =
+            crate::dataset::blob::public_blob_v2_binary_output_schema(self.projection.as_ref());
+        let mut schema: ArrowSchema = (&output_projection).into();
         if self.config.with_row_id {
             schema = schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
@@ -602,7 +657,9 @@ impl LanceScanExec {
         projection: Arc<Schema>,
         config: LanceScanConfig,
     ) -> Self {
-        let mut output_schema: ArrowSchema = projection.as_ref().into();
+        let output_projection =
+            crate::dataset::blob::public_blob_v2_binary_output_schema(projection.as_ref());
+        let mut output_schema: ArrowSchema = (&output_projection).into();
 
         if config.with_row_id {
             output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();

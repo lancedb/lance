@@ -177,7 +177,7 @@ or updated. These should be filtered out during query execution.
   </figcaption>
 </figure>
 
-There are three situations to consider:
+There are four situations to consider:
 
 1. **A fragment has some deleted rows.** A few of the rows in the fragment have been marked
    as deleted, but some of the rows are still present. The row addresses from the deletion
@@ -188,6 +188,17 @@ There are three situations to consider:
 3. **A fragment has had the indexed column updated in place.** This cannot be detected just
    by examining metadata. To prevent reading invalid data, the engine should filter out any
    row addresses that are not in the index's current `fragment_bitmap`.
+4. **A fragment has an updated value in an [overlay file](../table/data_overlay_file.md).**
+   This can be detected by checking if any of the fragments in the index's `fragment_bitmap`
+   have overlay files. For each overlay whose `committed_version` is greater than the index
+   segment's `dataset_version`, the overlay carries updated values not reflected in the index,
+   so its covered rows must be excluded from index results. Excluded rows are re-evaluated
+   against their current (overlaid) values on the flat path — dropping them without
+   re-evaluation would silently lose rows that match under the new value. Exclusion is
+   field-aware: only overlays covering the indexed field matter. You may exclude just the
+   affected rows or the whole fragment; the latter is simpler and safer but re-evaluates more
+   rows than necessary. See [Data Overlay Files](../table/data_overlay_file.md#index-integration)
+   for the exclusion set, re-evaluation, and correctness invariant.
 
 ## Compaction and remapping
 

@@ -492,6 +492,7 @@ async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments
     cleanup_data_fragments(
         &first_fragment.dataset().object_store,
         &first_fragment.dataset().base,
+        None,
         &fragments_to_cleanup,
     )
     .await;
@@ -1956,6 +1957,7 @@ mod test {
                     Ok(Some(Fragment {
                         files: vec![],
                         id: 0,
+                        overlays: vec![],
                         deletion_file: None,
                         row_id_meta: None,
                         physical_rows: Some(50),

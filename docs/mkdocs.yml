@@ -51,7 +51,12 @@ markdown_extensions:
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  - pymdownx.snippets:
+      # Allow snippets to pull in files from the repo root (e.g. shared docs
+      # kept alongside Rust source). Paths are relative to the docs/ dir.
+      base_path:
+        - .
+        - ..
   - pymdownx.tabbed:
       alternate_style: true
   - attr_list

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
     collections::HashMap,
@@ -212,7 +213,7 @@ impl ScalarIndex for LabelListIndex {
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let state = self.values_index.load_bitmap_index_state().await?;
@@ -220,10 +221,7 @@ impl ScalarIndex for LabelListIndex {
         let remapped_nulls =
             RowAddrTreeMap::from_iter(self.list_nulls.row_addrs().unwrap().filter_map(|addr| {
                 let addr_as_u64 = u64::from(addr);
-                mapping
-                    .get(&addr_as_u64)
-                    .copied()
-                    .unwrap_or(Some(addr_as_u64))
+                mapping.get(addr_as_u64).unwrap_or(Some(addr_as_u64))
             }));
         let file = write_label_list_bitmap_index(
             remapped_state,

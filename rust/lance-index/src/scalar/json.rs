@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
-    collections::HashMap,
     ops::Bound,
     sync::{Arc, Mutex},
 };
@@ -116,7 +116,7 @@ impl ScalarIndex for JsonIndex {
 
     async fn remap(
         &self,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         let target_created = self.target_index.remap(mapping, dest_store).await?;

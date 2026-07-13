@@ -593,6 +593,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use futures::FutureExt;
     use lance_core::ROW_ID;
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -1709,7 +1710,7 @@ mod tests {
         let remapped_dir = TempDir::default();
         let remapped_store = test_store(&remapped_dir);
         index
-            .remap(&mapping, remapped_store.as_ref())
+            .remap(&RowAddrRemap::direct(mapping), remapped_store.as_ref())
             .await
             .unwrap();
         let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
