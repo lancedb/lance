@@ -3907,6 +3907,7 @@ dependencies = [
  "log",
  "lz4",
  "num-traits",
+ "object_store",
  "prost",
  "prost-build",
  "rand 0.9.4",
