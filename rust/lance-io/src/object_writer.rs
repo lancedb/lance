@@ -444,6 +444,19 @@ impl ObjectWriter {
     ///
     /// The writer becomes terminal immediately. Multipart cleanup runs in the
     /// background on a best-effort basis, and cleanup failures are logged.
+    ///
+    /// This inherent method is selected by ordinary `writer.abort()` syntax and
+    /// preserves the legacy `()` return. Call [`Writer::abort`] explicitly when
+    /// a result-returning interface is required:
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::{object_writer::ObjectWriter, traits::Writer};
+    /// # async fn abort(writer: &mut ObjectWriter) -> Result<()> {
+    /// Writer::abort(writer).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn abort(&mut self) {
         self.abort_inner();
     }
