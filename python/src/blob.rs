@@ -3,22 +3,23 @@
 
 use crate::{error::PythonErrorExt, rt};
 use arrow::{
-    array::{ArrayRef, make_array},
+    array::{Array, ArrayRef, GenericBinaryArray, OffsetSizeTrait, cast::AsArray, make_array},
+    buffer::Buffer,
     pyarrow::{FromPyArrow, ToPyArrow},
 };
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use lance::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
 };
 use pyo3::{
     Bound, PyResult,
-    exceptions::PyValueError,
+    exceptions::{PyRuntimeError, PyValueError},
     pyclass, pymethods,
     types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule, PyTypeMethods},
 };
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 /// Reconstruct the PyArrow equivalent of [`BlobDescriptorArrayBuilder::field`].
 ///
@@ -52,11 +53,12 @@ fn descriptor_field_to_pyarrow<'py>(
     pyarrow.call_method("field", (field.name().as_str(), data_type), Some(&kwargs))
 }
 
-/// Normalize inputs accepted by [`PackedBlobWriter::write_blobs`] into Arrow arrays.
+/// Normalize inputs accepted by [`PyPackedBlobWriter::write_blobs`] into Arrow arrays.
 ///
 /// BinaryArray, LargeBinaryArray, and ChunkedArray values of either binary type
 /// are accepted. Chunk boundaries, nulls, and empty values remain in the arrays;
-/// row-level blob semantics are handled by the core writer.
+/// row-level blob semantics are prepared by the binding before invoking the
+/// byte-level core writer.
 fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
     match ArrayData::from_pyarrow_bound(payloads) {
         Ok(data) => {
@@ -102,6 +104,132 @@ fn extract_blob_payloads(payloads: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>>
             Ok(arrays)
         }
     }
+}
+
+struct OwnedArrowBuffer(Buffer);
+
+impl AsRef<[u8]> for OwnedArrowBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+struct PackedBlobBatch {
+    bytes: Bytes,
+    sizes: Vec<usize>,
+    row_validity: Vec<bool>,
+}
+
+fn packed_blob_batch(payloads: &dyn Array) -> PyResult<PackedBlobBatch> {
+    match payloads.data_type() {
+        DataType::Binary => packed_binary_blob_batch(payloads.as_binary::<i32>()),
+        DataType::LargeBinary => packed_binary_blob_batch(payloads.as_binary::<i64>()),
+        data_type => Err(PyValueError::new_err(format!(
+            "Packed blob payloads must have Arrow type Binary or LargeBinary, got {data_type}"
+        ))),
+    }
+}
+
+/// Prepare an Arrow binary array for the byte-level core writer.
+///
+/// The usual case retains the Arrow value buffer through a zero-copy `Bytes` owner.
+/// If non-empty physical data for null rows separates valid values, only the valid
+/// ranges are compacted so null payload bytes are never written to the sidecar.
+fn packed_binary_blob_batch<O: OffsetSizeTrait>(
+    payloads: &GenericBinaryArray<O>,
+) -> PyResult<PackedBlobBatch> {
+    let value_offsets = payloads.value_offsets();
+    let value_data = payloads.value_data();
+    let mut sizes = Vec::with_capacity(payloads.len() - payloads.null_count());
+    let mut row_validity = Vec::with_capacity(payloads.len());
+    let mut source_ranges: Vec<Range<usize>> = Vec::new();
+
+    for row in 0..payloads.len() {
+        let is_valid = payloads.is_valid(row);
+        row_validity.push(is_valid);
+        if !is_valid {
+            continue;
+        }
+
+        let source_start = value_offsets[row].as_usize();
+        let source_end = value_offsets[row + 1].as_usize();
+        sizes.push(source_end - source_start);
+        if source_start == source_end {
+            continue;
+        }
+
+        if let Some(last_range) = source_ranges.last_mut()
+            && last_range.end == source_start
+        {
+            last_range.end = source_end;
+        } else {
+            source_ranges.push(source_start..source_end);
+        }
+    }
+
+    let total_size = source_ranges.iter().map(Range::len).sum::<usize>();
+    let bytes = match source_ranges.as_slice() {
+        [] => Bytes::new(),
+        [source_range] => {
+            let value_buffer = Bytes::from_owner(OwnedArrowBuffer(payloads.values().clone()));
+            value_buffer.slice(source_range.clone())
+        }
+        source_ranges => {
+            let mut compacted = BytesMut::with_capacity(total_size);
+            for source_range in source_ranges {
+                compacted.extend_from_slice(&value_data[source_range.clone()]);
+            }
+            compacted.freeze()
+        }
+    };
+    debug_assert_eq!(
+        bytes.len(),
+        total_size,
+        "packed blob byte preparation must preserve the valid payload size"
+    );
+
+    Ok(PackedBlobBatch {
+        bytes,
+        sizes,
+        row_validity,
+    })
+}
+
+fn align_blob_descriptors(
+    descriptors: Vec<BlobDescriptor>,
+    row_validity: &[bool],
+) -> PyResult<Vec<BlobDescriptor>> {
+    let descriptor_count = descriptors.len();
+    let expected_descriptor_count = row_validity.iter().filter(|is_valid| **is_valid).count();
+    if descriptor_count != expected_descriptor_count {
+        return Err(PyRuntimeError::new_err(format!(
+            "Packed blob descriptor count does not match valid input rows: \
+             descriptors={descriptor_count}, valid_rows={expected_descriptor_count}"
+        )));
+    }
+    if expected_descriptor_count == row_validity.len() {
+        return Ok(descriptors);
+    }
+
+    let mut descriptors = descriptors.into_iter();
+    let mut aligned = Vec::with_capacity(row_validity.len());
+    for is_valid in row_validity {
+        if *is_valid {
+            let Some(descriptor) = descriptors.next() else {
+                return Err(PyRuntimeError::new_err(
+                    "Packed blob descriptor alignment ended unexpectedly",
+                ));
+            };
+            aligned.push(descriptor);
+        } else {
+            aligned.push(BlobDescriptor::Null);
+        }
+    }
+    debug_assert!(
+        descriptors.next().is_none(),
+        "packed blob descriptor alignment must consume every descriptor"
+    );
+    Ok(aligned)
 }
 
 #[pyclass(name = "BlobDescriptor", skip_from_py_object)]
@@ -221,6 +349,7 @@ pub struct PyPackedBlobWriter {
     path: String,
     field: Option<Field>,
     inner: Option<PackedBlobWriter>,
+    row_validity: Vec<bool>,
 }
 
 impl PyPackedBlobWriter {
@@ -238,6 +367,7 @@ impl PyPackedBlobWriter {
             path: inner.path().to_string(),
             field: None,
             inner: Some(inner),
+            row_validity: Vec::new(),
         })
     }
 
@@ -276,7 +406,9 @@ impl PyPackedBlobWriter {
 
     pub fn write_blob(&mut self, data: Vec<u8>) -> PyResult<()> {
         rt().block_on(None, self.inner_mut()?.write_blob(data))?
-            .infer_error()
+            .infer_error()?;
+        self.row_validity.push(true);
+        Ok(())
     }
 
     /// Append a batch of packed blob payloads.
@@ -299,13 +431,33 @@ impl PyPackedBlobWriter {
     /// 3
     pub fn write_blobs(&mut self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
         let payloads = extract_blob_payloads(payloads)?;
-        rt().block_on(None, async {
-            let writer = self.inner_mut()?;
-            for payloads in payloads {
-                writer.write_blobs(payloads.as_ref()).await.infer_error()?;
+        let result = {
+            let writer = self
+                .inner
+                .as_mut()
+                .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+            let row_validity = &mut self.row_validity;
+            rt().block_on(None, async {
+                for payloads in payloads {
+                    let batch = packed_blob_batch(payloads.as_ref())?;
+                    writer
+                        .write_packed_blobs(batch.bytes, batch.sizes)
+                        .await
+                        .infer_error()?;
+                    row_validity.extend(batch.row_validity);
+                }
+                Ok(())
+            })
+        };
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                // KeyboardInterrupt drops the async batch future. Remove the core
+                // writer as well so a completed prefix cannot be reused as a new batch.
+                self.inner.take();
+                Err(error)
             }
-            Ok(())
-        })?
+        }
     }
 
     pub fn finish(&mut self) -> PyResult<Vec<PyBlobDescriptor>> {
@@ -314,6 +466,7 @@ impl PyPackedBlobWriter {
             .take()
             .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
         let values = rt().block_on(None, inner.finish())?.infer_error()?;
+        let values = align_blob_descriptors(values, &self.row_validity)?;
         Ok(values.into_iter().map(Into::into).collect())
     }
 
@@ -352,9 +505,11 @@ impl PyPackedBlobWriter {
             .inner
             .take()
             .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
-        let column = rt()
-            .block_on(None, inner.finish_array(field_name))?
-            .infer_error()?;
+        let values = rt().block_on(None, inner.finish())?.infer_error()?;
+        let values = align_blob_descriptors(values, &self.row_validity)?;
+        let mut builder = BlobDescriptorArrayBuilder::new(field_name);
+        builder.extend(values).infer_error()?;
+        let column = builder.finish().infer_error()?;
         let (field, array) = column.into_parts();
         self.field = Some(field);
         array.to_data().to_pyarrow(py)

@@ -1217,6 +1217,86 @@ def test_packed_blob_writer_bulk_arrow_array(
 
 
 @pytest.mark.parametrize(
+    "array_type,offset_type",
+    [
+        pytest.param(pa.binary(), pa.int32(), id="binary"),
+        pytest.param(pa.large_binary(), pa.int64(), id="large_binary"),
+    ],
+)
+def test_packed_blob_writer_bulk_excludes_physical_null_bytes(
+    tmp_path, array_type, offset_type
+):
+    offsets = pa.array([0, 1, 5, 5, 7], type=offset_type).buffers()[1]
+    payloads = pa.Array.from_buffers(
+        array_type,
+        4,
+        [
+            pa.py_buffer(bytes([0b00001101])),
+            offsets,
+            pa.py_buffer(b"aJUNKbc"),
+        ],
+    )
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+
+    assert descriptors.to_pylist() == [
+        {
+            "kind": 1,
+            "data": None,
+            "uri": None,
+            "blob_id": blob_id,
+            "blob_size": 1,
+            "position": 0,
+        },
+        None,
+        {
+            "kind": 1,
+            "data": None,
+            "uri": None,
+            "blob_id": blob_id,
+            "blob_size": 0,
+            "position": 1,
+        },
+        {
+            "kind": 1,
+            "data": None,
+            "uri": None,
+            "blob_id": blob_id,
+            "blob_size": 2,
+            "position": 1,
+        },
+    ]
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"abc"
+
+
+def test_packed_blob_writer_mixed_calls_preserve_legacy_finish_alignment(tmp_path):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    packed.write_blob(b"s")
+    packed.write_blobs(pa.array([b"a", None, b""], type=pa.binary()))
+    packed.write_blobs(pa.array([None, b"bc"], type=pa.large_binary()))
+    descriptors = packed.finish()
+
+    assert [repr(descriptor) for descriptor in descriptors] == [
+        "Packed { blob_id: 7, offset: 0, size: 1 }",
+        "Packed { blob_id: 7, offset: 1, size: 1 }",
+        "Null",
+        "Packed { blob_id: 7, offset: 2, size: 0 }",
+        "Null",
+        "Packed { blob_id: 7, offset: 2, size: 2 }",
+    ]
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"sabc"
+
+
+@pytest.mark.parametrize(
     "payloads",
     [
         pytest.param(pa.array([1, 2], type=pa.int32()), id="array"),

@@ -850,6 +850,8 @@ impl Writer for ObjectWriter {
 pub struct LocalWriter {
     path: Path,
     state: LocalWriteState,
+    #[cfg(test)]
+    persist_hooks: LocalPersistTestHooks,
 }
 
 #[derive(Default)]
@@ -857,17 +859,31 @@ enum LocalWriteState {
     Writing(WritingState),
     Finishing {
         size: usize,
-        future: BoxFuture<'static, Result<WriteResult>>,
+        // Keep ownership of the temp path in the state machine. The blocking
+        // task only prepares metadata, so aborting or dropping this state can
+        // delete the temp file without leaving a detached publisher behind.
+        temp_path: tempfile::TempPath,
+        io_tracker: Arc<IOTracker>,
+        future: BoxFuture<'static, Result<String>>,
     },
     Done(WriteResult),
+    Failed(String),
+    Aborted,
     #[default]
     Poisoned,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LocalPersistTestHooks {
+    before_prepare: Option<Box<dyn FnOnce() + Send>>,
+    after_prepare: Option<Box<dyn FnOnce() + Send>>,
 }
 
 struct WritingState {
     writer: tokio::io::BufWriter<tokio::fs::File>,
     cursor: usize,
-    /// Temp path that auto-deletes on drop. Set to `None` after `persist()`.
+    /// Temp path that auto-deletes on drop until it is successfully persisted.
     temp_path: tempfile::TempPath,
     io_tracker: Arc<IOTracker>,
 }
@@ -887,6 +903,8 @@ impl LocalWriter {
                 temp_path,
                 io_tracker,
             }),
+            #[cfg(test)]
+            persist_hooks: LocalPersistTestHooks::default(),
         }
     }
 
@@ -901,35 +919,45 @@ impl LocalWriter {
         io::Error::other(format!("LocalWriter for {} is in poisoned state", path))
     }
 
-    async fn persist(
-        temp_path: tempfile::TempPath,
-        final_path: Path,
-        size: usize,
-        io_tracker: Arc<IOTracker>,
-    ) -> Result<WriteResult> {
-        let local_path = crate::local::to_local_path(&final_path);
-        let e_tag = tokio::task::spawn_blocking(move || -> Result<String> {
-            temp_path.persist(&local_path).map_err(|e| {
-                Error::io(format!(
-                    "failed to persist temp file to {}: {}",
-                    local_path, e.error
-                ))
-            })?;
+    fn aborted_err(path: &Path) -> io::Error {
+        io::Error::other(format!("LocalWriter for {} was aborted", path))
+    }
 
-            let metadata = std::fs::metadata(&local_path).map_err(|e| {
-                Error::io(format!("failed to read metadata for {}: {}", local_path, e))
-            })?;
-            Ok(get_etag(&metadata))
+    fn failed_err(path: &Path, message: &str) -> io::Error {
+        io::Error::other(format!("LocalWriter for {} failed: {}", path, message))
+    }
+
+    async fn prepare_persist(
+        temp_file_path: std::path::PathBuf,
+        final_path: Path,
+        #[cfg(test)] mut test_hooks: LocalPersistTestHooks,
+    ) -> Result<String> {
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            #[cfg(test)]
+            if let Some(hook) = test_hooks.before_prepare.take() {
+                hook();
+            }
+
+            let result = std::fs::metadata(&temp_file_path)
+                .map(|metadata| get_etag(&metadata))
+                .map_err(|error| {
+                    Error::io(format!(
+                        "failed to prepare temp file {} for {}: {}",
+                        temp_file_path.display(),
+                        final_path,
+                        error
+                    ))
+                });
+
+            #[cfg(test)]
+            if let Some(hook) = test_hooks.after_prepare.take() {
+                hook();
+            }
+
+            result
         })
         .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
-
-        io_tracker.record_write("put", final_path, size as u64);
-
-        Ok(WriteResult {
-            size,
-            e_tag: Some(e_tag),
-        })
+        .map_err(|error| Error::io(format!("spawn_blocking failed: {}", error)))?
     }
 }
 
@@ -939,14 +967,21 @@ impl AsyncWrite for LocalWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
-        if let LocalWriteState::Writing(state) = &mut self.state {
-            let poll = Pin::new(&mut state.writer).poll_write(cx, buf);
-            if let Poll::Ready(Ok(n)) = &poll {
-                state.cursor += *n;
+        let path = self.path.clone();
+        match &mut self.state {
+            LocalWriteState::Writing(state) => {
+                let poll = Pin::new(&mut state.writer).poll_write(cx, buf);
+                if let Poll::Ready(Ok(n)) = &poll {
+                    state.cursor += *n;
+                }
+                poll
             }
-            poll
-        } else {
-            Poll::Ready(Err(Self::already_closed_err(&self.path)))
+            LocalWriteState::Failed(message) => Poll::Ready(Err(Self::failed_err(&path, message))),
+            LocalWriteState::Aborted => Poll::Ready(Err(Self::aborted_err(&path))),
+            LocalWriteState::Poisoned => Poll::Ready(Err(Self::poisoned_err(&path))),
+            LocalWriteState::Finishing { .. } | LocalWriteState::Done(_) => {
+                Poll::Ready(Err(Self::already_closed_err(&path)))
+            }
         }
     }
 
@@ -954,10 +989,15 @@ impl AsyncWrite for LocalWriter {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        if let LocalWriteState::Writing(state) = &mut self.state {
-            Pin::new(&mut state.writer).poll_flush(cx)
-        } else {
-            Poll::Ready(Err(Self::already_closed_err(&self.path)))
+        let path = self.path.clone();
+        match &mut self.state {
+            LocalWriteState::Writing(state) => Pin::new(&mut state.writer).poll_flush(cx),
+            LocalWriteState::Failed(message) => Poll::Ready(Err(Self::failed_err(&path, message))),
+            LocalWriteState::Aborted => Poll::Ready(Err(Self::aborted_err(&path))),
+            LocalWriteState::Poisoned => Poll::Ready(Err(Self::poisoned_err(&path))),
+            LocalWriteState::Finishing { .. } | LocalWriteState::Done(_) => {
+                Poll::Ready(Err(Self::already_closed_err(&path)))
+            }
         }
     }
 
@@ -969,35 +1009,88 @@ impl AsyncWrite for LocalWriter {
         loop {
             match &mut mut_self.state {
                 LocalWriteState::Writing(state) => {
-                    if Pin::new(&mut state.writer).poll_shutdown(cx).is_pending() {
-                        return Poll::Pending;
+                    match Pin::new(&mut state.writer).poll_shutdown(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(error)) => {
+                            let message = error.to_string();
+                            mut_self.state = LocalWriteState::Failed(message);
+                            return Poll::Ready(Err(error));
+                        }
                     }
 
-                    // Write is complete, we can transition to persisting.
+                    // Flush is complete. Prepare the ETag off-thread, but retain
+                    // the temp path here so cancellation cannot detach a rename.
+                    #[cfg(test)]
+                    let test_hooks = std::mem::take(&mut mut_self.persist_hooks);
                     let LocalWriteState::Writing(state) =
                         std::mem::replace(&mut mut_self.state, LocalWriteState::Poisoned)
                     else {
                         unreachable!()
                     };
                     let size = state.cursor;
+                    let temp_file_path = state.temp_path.to_path_buf();
+                    #[cfg(test)]
+                    let future = Box::pin(Self::prepare_persist(
+                        temp_file_path,
+                        mut_self.path.clone(),
+                        test_hooks,
+                    ));
+                    #[cfg(not(test))]
+                    let future =
+                        Box::pin(Self::prepare_persist(temp_file_path, mut_self.path.clone()));
                     mut_self.state = LocalWriteState::Finishing {
                         size,
-                        future: Box::pin(Self::persist(
-                            state.temp_path,
-                            mut_self.path.clone(),
-                            size,
-                            state.io_tracker,
-                        )),
+                        temp_path: state.temp_path,
+                        io_tracker: state.io_tracker,
+                        future,
                     };
                 }
                 LocalWriteState::Finishing { future, .. } => match future.poll_unpin(cx) {
-                    Poll::Ready(Ok(result)) => mut_self.state = LocalWriteState::Done(result),
-                    Poll::Ready(Err(e)) => {
-                        return Poll::Ready(Err(io::Error::other(e)));
+                    Poll::Ready(Ok(e_tag)) => {
+                        let LocalWriteState::Finishing {
+                            size,
+                            temp_path,
+                            io_tracker,
+                            ..
+                        } = std::mem::replace(&mut mut_self.state, LocalWriteState::Poisoned)
+                        else {
+                            unreachable!()
+                        };
+
+                        // This single rename is the commit point. It runs after
+                        // metadata preparation and cannot be cancelled between
+                        // successful publication and installing the Done state.
+                        let local_path = crate::local::to_local_path(&mut_self.path);
+                        if let Err(error) = temp_path.persist(&local_path) {
+                            let message = format!(
+                                "failed to persist temp file to {}: {}",
+                                local_path, error.error
+                            );
+                            mut_self.state = LocalWriteState::Failed(message.clone());
+                            return Poll::Ready(Err(io::Error::other(message)));
+                        }
+
+                        mut_self.state = LocalWriteState::Done(WriteResult {
+                            size,
+                            e_tag: Some(e_tag),
+                        });
+                        io_tracker.record_write("put", mut_self.path.clone(), size as u64);
+                    }
+                    Poll::Ready(Err(error)) => {
+                        let message = error.to_string();
+                        mut_self.state = LocalWriteState::Failed(message);
+                        return Poll::Ready(Err(io::Error::other(error)));
                     }
                     Poll::Pending => return Poll::Pending,
                 },
                 LocalWriteState::Done(_) => return Poll::Ready(Ok(())),
+                LocalWriteState::Failed(message) => {
+                    return Poll::Ready(Err(Self::failed_err(&mut_self.path, message)));
+                }
+                LocalWriteState::Aborted => {
+                    return Poll::Ready(Err(Self::aborted_err(&mut_self.path)));
+                }
                 LocalWriteState::Poisoned => {
                     return Poll::Ready(Err(Self::poisoned_err(&self.path)));
                 }
@@ -1013,6 +1106,8 @@ impl Writer for LocalWriter {
             LocalWriteState::Writing(state) => Ok(state.cursor),
             LocalWriteState::Finishing { size, .. } => Ok(*size),
             LocalWriteState::Done(result) => Ok(result.size),
+            LocalWriteState::Failed(message) => Err(Self::failed_err(&self.path, message).into()),
+            LocalWriteState::Aborted => Err(Self::aborted_err(&self.path).into()),
             LocalWriteState::Poisoned => Err(Self::poisoned_err(&self.path).into()),
         }
     }
@@ -1032,8 +1127,20 @@ impl Writer for LocalWriter {
     }
 
     async fn abort(&mut self) -> Result<()> {
-        self.state = LocalWriteState::Poisoned;
-        Ok(())
+        match &self.state {
+            LocalWriteState::Done(_) => Err(Error::io(format!(
+                "cannot abort LocalWriter for {} because the file is already committed",
+                self.path
+            ))),
+            LocalWriteState::Aborted => Ok(()),
+            LocalWriteState::Poisoned => Err(Self::poisoned_err(&self.path).into()),
+            LocalWriteState::Writing(_)
+            | LocalWriteState::Finishing { .. }
+            | LocalWriteState::Failed(_) => {
+                self.state = LocalWriteState::Aborted;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1070,6 +1177,7 @@ mod tests {
 
     use futures::future;
     use object_store::{PutPayload, PutResult, UploadPart};
+    use rstest::rstest;
     use tokio::io::AsyncWriteExt;
     use url::Url;
 
@@ -1162,6 +1270,12 @@ mod tests {
 
     struct PendingPart {
         events: Arc<StdMutex<Vec<&'static str>>>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum LocalFinishCancellation {
+        Abort,
+        Drop,
     }
 
     impl Future for PendingPart {
@@ -1486,6 +1600,11 @@ mod tests {
         assert!(file_path.exists());
         assert!(!temp_file_path.exists());
 
+        let abort_error = Writer::abort(&mut writer).await.unwrap_err();
+        assert!(matches!(&abort_error, Error::IO { .. }));
+        assert!(abort_error.to_string().contains("already committed"));
+        assert!(file_path.exists());
+
         let stats = io_tracker.stats();
         assert_eq!(stats.write_iops, 1);
         assert_eq!(stats.written_bytes, data.len() as u64);
@@ -1505,6 +1624,142 @@ mod tests {
         writer.write_all(b"partial").await.unwrap();
         Writer::abort(&mut writer).await.unwrap();
 
+        assert!(!temp_file_path.exists());
+        assert!(!file_path.exists());
+
+        let write_error = writer.write_all(b"more").await.unwrap_err();
+        assert!(write_error.to_string().contains("was aborted"));
+        Writer::abort(&mut writer).await.unwrap();
+    }
+
+    #[rstest]
+    #[case::abort(LocalFinishCancellation::Abort)]
+    #[case::drop(LocalFinishCancellation::Drop)]
+    #[tokio::test]
+    async fn test_local_writer_cancelled_finishing_cannot_publish(
+        #[case] cancellation: LocalFinishCancellation,
+    ) {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("cancelled_finishing.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let io_tracker = Arc::new(IOTracker::default());
+
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path.clone(), temp_path, io_tracker.clone());
+
+        let (prepare_started_tx, prepare_started_rx) = tokio::sync::oneshot::channel();
+        let (release_prepare_tx, release_prepare_rx) = std::sync::mpsc::channel();
+        let (prepare_finished_tx, prepare_finished_rx) = tokio::sync::oneshot::channel();
+        writer.persist_hooks.before_prepare = Some(Box::new(move || {
+            prepare_started_tx
+                .send(())
+                .expect("shutdown future should wait for metadata preparation");
+            release_prepare_rx
+                .recv()
+                .expect("test should release metadata preparation");
+        }));
+        writer.persist_hooks.after_prepare = Some(Box::new(move || {
+            prepare_finished_tx
+                .send(())
+                .expect("test should wait for detached metadata preparation");
+        }));
+
+        writer.write_all(b"stale payload").await.unwrap();
+        let mut shutdown = Box::pin(Writer::shutdown(&mut writer));
+        tokio::select! {
+            result = &mut shutdown => {
+                panic!("shutdown completed before the preparation gate: {result:?}");
+            }
+            result = prepare_started_rx => {
+                result.expect("metadata preparation task should start");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                panic!("metadata preparation task did not start");
+            }
+        }
+        drop(shutdown);
+        assert!(matches!(&writer.state, LocalWriteState::Finishing { .. }));
+        assert!(temp_file_path.exists());
+
+        if matches!(cancellation, LocalFinishCancellation::Abort) {
+            Writer::abort(&mut writer).await.unwrap();
+            assert!(matches!(&writer.state, LocalWriteState::Aborted));
+        }
+        drop(writer);
+
+        assert!(!temp_file_path.exists());
+        assert!(!file_path.exists());
+
+        // Commit a retry while the cancelled writer's blocking task is still
+        // paused. Releasing that old task must not let it overwrite the retry.
+        let retry_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let (retry_file, retry_path) = retry_temp.into_parts();
+        let retry_file = tokio::fs::File::from_std(retry_file);
+        let mut retry = LocalWriter::new(
+            retry_file,
+            os_path,
+            retry_path,
+            Arc::new(IOTracker::default()),
+        );
+        retry.write_all(b"fresh payload").await.unwrap();
+        Writer::shutdown(&mut retry).await.unwrap();
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"fresh payload");
+
+        release_prepare_tx
+            .send(())
+            .expect("metadata preparation task should still be running");
+        tokio::time::timeout(std::time::Duration::from_secs(5), prepare_finished_rx)
+            .await
+            .expect("detached metadata preparation should finish")
+            .expect("detached metadata preparation task should not be cancelled");
+
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"fresh payload");
+        assert_eq!(io_tracker.stats().write_iops, 0);
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_prepare_failure_is_terminal() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("prepare_failure.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, Arc::new(IOTracker::default()));
+
+        let removed_temp_path = temp_file_path.clone();
+        writer.persist_hooks.before_prepare = Some(Box::new(move || {
+            std::fs::remove_file(&removed_temp_path)
+                .expect("the closed temporary file should be removable");
+        }));
+        writer.write_all(b"payload").await.unwrap();
+
+        let first_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(matches!(&first_error, Error::IO { .. }));
+        assert!(
+            first_error
+                .to_string()
+                .contains("failed to prepare temp file")
+        );
+        assert!(matches!(&writer.state, LocalWriteState::Failed(_)));
+
+        let second_error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(matches!(&second_error, Error::IO { .. }));
+        assert!(
+            second_error
+                .to_string()
+                .contains("failed to prepare temp file")
+        );
+        let write_error = writer.write_all(b"more").await.unwrap_err();
+        assert!(
+            write_error
+                .to_string()
+                .contains("failed to prepare temp file")
+        );
         assert!(!temp_file_path.exists());
         assert!(!file_path.exists());
     }

@@ -15,7 +15,7 @@ use std::sync::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, GenericBinaryArray, OffsetSizeTrait, StructArray,
+    Array, ArrayRef, StructArray,
     builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder},
     cast::AsArray,
     types::{UInt8Type, UInt32Type, UInt64Type},
@@ -810,8 +810,7 @@ async fn shutdown_writer(writer: &mut Box<dyn Writer>, path: &Path) -> Result<()
 /// Writes a Lance-owned packed sidecar blob for one data file and returns descriptors.
 ///
 /// Create a writer with [`PackedBlobWriter::try_new`], append payloads, and call
-/// [`PackedBlobWriter::finish`] or [`PackedBlobWriter::finish_array`] once to commit
-/// the sidecar and obtain its descriptors.
+/// [`PackedBlobWriter::finish`] once to commit the sidecar and obtain its descriptors.
 ///
 /// ```no_run
 /// # use lance::{PackedBlobWriter, Result};
@@ -881,81 +880,72 @@ impl PackedBlobWriter {
         Ok(())
     }
 
-    /// Append an Arrow binary array to the packed sidecar without materializing its
-    /// payloads individually.
+    /// Append multiple logical blobs from one contiguous byte buffer.
     ///
-    /// Both [`arrow_array::BinaryArray`] and [`arrow_array::LargeBinaryArray`] are
-    /// supported. Null rows are retained as null descriptors, while valid empty rows
-    /// produce zero-length packed descriptors. Sliced arrays are read using their
-    /// logical offsets.
+    /// `sizes` contains one entry per logical blob, in order, and its sum must equal
+    /// `bytes.len()`. A zero size represents a valid empty blob. Nullability is a
+    /// column concern and is intentionally handled by callers before this byte-level
+    /// writer is invoked.
     ///
-    /// Input validation happens before any payload is written. If I/O fails after a
+    /// Input validation happens before any payload is written. If I/O fails after the
     /// batch starts, the underlying upload is aborted before the error is returned. If
     /// the future is cancelled after writing starts, the active upload is discarded.
     /// Both cases poison this writer, so subsequent writes and [`Self::finish`] return
     /// an I/O error describing the interrupted write.
     ///
     /// ```
-    /// # use arrow_array::BinaryArray;
+    /// # use bytes::Bytes;
     /// # use lance::{PackedBlobWriter, Result};
     /// # async fn write(mut writer: PackedBlobWriter) -> Result<()> {
-    /// let payloads = BinaryArray::from(vec![Some(b"first".as_slice()), None, Some(b"".as_slice())]);
-    /// writer.write_blobs(&payloads).await?;
-    /// let descriptors = writer.finish_array("image").await?;
-    /// assert_eq!(descriptors.array().len(), 3);
+    /// writer
+    ///     .write_packed_blobs(Bytes::from_static(b"firstsecond"), vec![5, 0, 6])
+    ///     .await?;
+    /// let descriptors = writer.finish().await?;
+    /// assert_eq!(descriptors.len(), 3);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn write_blobs(&mut self, payloads: &dyn Array) -> Result<()> {
+    pub async fn write_packed_blobs(&mut self, bytes: Bytes, sizes: Vec<usize>) -> Result<()> {
         self.ensure_writable()?;
-        match payloads.data_type() {
-            DataType::Binary => self.write_binary_blobs(payloads.as_binary::<i32>()).await,
-            DataType::LargeBinary => self.write_binary_blobs(payloads.as_binary::<i64>()).await,
-            data_type => Err(Error::invalid_input(format!(
-                "Packed blob payloads must have Arrow type Binary or LargeBinary, got {data_type}"
-            ))),
+
+        let total_size =
+            sizes
+                .iter()
+                .enumerate()
+                .try_fold(0usize, |total_size, (index, size)| {
+                    total_size.checked_add(*size).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Packed blob sizes overflow usize at index {index}: \
+                         accumulated_size={total_size}, size={size}"
+                        ))
+                    })
+                })?;
+        if total_size != bytes.len() {
+            return Err(Error::invalid_input(format!(
+                "Packed blob byte length must equal the sum of sizes: \
+                 bytes.len()={}, sizes_total={total_size}",
+                bytes.len()
+            )));
         }
-    }
 
-    async fn write_binary_blobs<O: OffsetSizeTrait>(
-        &mut self,
-        payloads: &GenericBinaryArray<O>,
-    ) -> Result<()> {
-        let value_offsets = payloads.value_offsets();
-        let value_data = payloads.value_data();
-        let mut descriptors = Vec::with_capacity(payloads.len());
-        let mut source_ranges: Vec<Range<usize>> = Vec::new();
+        let mut descriptors = Vec::with_capacity(sizes.len());
         let mut next_output_offset = self.offset;
-
-        for row in 0..payloads.len() {
-            if payloads.is_null(row) {
-                descriptors.push(BlobDescriptor::Null);
-                continue;
-            }
-
-            let source_start = value_offsets[row].as_usize();
-            let source_end = value_offsets[row + 1].as_usize();
-            let size = (source_end - source_start) as u64;
+        for (index, size) in sizes.into_iter().enumerate() {
+            let size = u64::try_from(size).map_err(|_| {
+                Error::invalid_input(format!(
+                    "Packed blob size at index {index} does not fit in u64: size={size}"
+                ))
+            })?;
             let (descriptor, following_output_offset) =
                 packed_descriptor(self.blob_id, next_output_offset, size)?;
             descriptors.push(descriptor);
             next_output_offset = following_output_offset;
-
-            if source_start == source_end {
-                continue;
-            }
-            if let Some(last_range) = source_ranges.last_mut()
-                && last_range.end == source_start
-            {
-                last_range.end = source_end;
-            } else {
-                source_ranges.push(source_start..source_end);
-            }
         }
 
-        let mut writer = take_writer_for_write(&mut self.writer, &mut self.failure, &self.path)?;
-        for source_range in source_ranges {
-            let write_result = writer.write_all(&value_data[source_range]).await;
+        if !bytes.is_empty() {
+            let mut writer =
+                take_writer_for_write(&mut self.writer, &mut self.failure, &self.path)?;
+            let write_result = writer.write_all(&bytes).await;
             if let Err(error) = write_result {
                 self.writer = Some(writer);
                 return poison_writer(
@@ -966,9 +956,9 @@ impl PackedBlobWriter {
                 )
                 .await;
             }
+            self.writer = Some(writer);
+            self.failure = None;
         }
-        self.writer = Some(writer);
-        self.failure = None;
 
         self.offset = next_output_offset;
         self.values.extend(descriptors);
@@ -1041,29 +1031,6 @@ impl PackedBlobWriter {
             )));
         }
         Ok(self.values)
-    }
-
-    /// Finish the packed sidecar and return its descriptors as an Arrow struct array.
-    ///
-    /// The returned column preserves null rows written by [`Self::write_blobs`] and is
-    /// compatible with the writer-side blob v2 field returned by
-    /// [`BlobDescriptorArrayBuilder::field`].
-    ///
-    /// See [`PackedBlobWriter`] for a complete lifecycle example.
-    ///
-    /// ```
-    /// # use lance::{PackedBlobWriter, Result};
-    /// # async fn finish(writer: PackedBlobWriter) -> Result<()> {
-    /// let descriptors = writer.finish_array("image").await?;
-    /// assert_eq!(descriptors.field().name(), "image");
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn finish_array(self, field_name: impl Into<String>) -> Result<BlobDescriptorColumn> {
-        let values = self.finish().await?;
-        let mut builder = BlobDescriptorArrayBuilder::new(field_name);
-        builder.extend(values)?;
-        builder.finish()
     }
 }
 
@@ -1319,7 +1286,7 @@ mod tests {
 
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::{Array, BinaryArray, StringArray};
+    use arrow_array::{Array, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use async_trait::async_trait;
     use futures::task::noop_waker;
@@ -1693,42 +1660,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_packed_blob_writer_bulk_array() {
+    async fn test_packed_blob_writer_bulk_bytes() {
         let temp_dir = TempDir::default();
         let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
         let data_file_path = data_dir.join("data-file.lance");
         let object_store = ObjectStore::local();
-        let payloads = BinaryArray::from(vec![
-            Some(b"a".as_slice()),
-            None,
-            Some(b"".as_slice()),
-            Some(b"bc".as_slice()),
-        ]);
 
         let mut writer = PackedBlobWriter::try_new(object_store, data_file_path, 7)
             .await
             .unwrap();
-        writer.write_blobs(&payloads).await.unwrap();
-        let column = writer.finish_array("blob").await.unwrap();
-        let descriptors = column.array().as_struct();
-        let positions = descriptors
-            .column_by_name("position")
-            .unwrap()
-            .as_primitive::<UInt64Type>();
-        let sizes = descriptors
-            .column_by_name("blob_size")
-            .unwrap()
-            .as_primitive::<UInt64Type>();
+        writer
+            .write_packed_blobs(Bytes::from_static(b"abc"), vec![1, 0, 2])
+            .await
+            .unwrap();
+        let descriptors = writer.finish().await.unwrap();
 
-        assert_eq!(descriptors.len(), 4);
-        assert_eq!(descriptors.null_count(), 1);
-        assert_eq!(positions.value(0), 0);
-        assert_eq!(sizes.value(0), 1);
-        assert!(descriptors.is_null(1));
-        assert_eq!(positions.value(2), 1);
-        assert_eq!(sizes.value(2), 0);
-        assert_eq!(positions.value(3), 1);
-        assert_eq!(sizes.value(3), 2);
+        assert_eq!(
+            descriptors,
+            vec![
+                BlobDescriptor::Packed {
+                    blob_id: 7,
+                    offset: 0,
+                    size: 1,
+                },
+                BlobDescriptor::Packed {
+                    blob_id: 7,
+                    offset: 1,
+                    size: 0,
+                },
+                BlobDescriptor::Packed {
+                    blob_id: 7,
+                    offset: 1,
+                    size: 2,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_packed_blob_writer_bulk_validates_size_total_before_writing() {
+        let temp_dir = TempDir::default();
+        let data_dir = Path::from_absolute_path(temp_dir.std_path().join("data")).unwrap();
+        let data_file_path = data_dir.join("data-file.lance");
+        let mut writer = PackedBlobWriter::try_new(ObjectStore::local(), data_file_path, 7)
+            .await
+            .unwrap();
+
+        let error = writer
+            .write_packed_blobs(Bytes::from_static(b"abc"), vec![1, 1])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("bytes.len()=3, sizes_total=2"));
+
+        writer
+            .write_packed_blobs(Bytes::from_static(b"ok"), vec![2])
+            .await
+            .unwrap();
+        assert_eq!(writer.finish().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1747,9 +1736,10 @@ mod tests {
             values: Vec::new(),
             failure: None,
         };
-        let payloads = BinaryArray::from(vec![b"abcdef".as_slice()]);
-
-        let error = packed.write_blobs(&payloads).await.unwrap_err();
+        let error = packed
+            .write_packed_blobs(Bytes::from_static(b"abcdef"), vec![6])
+            .await
+            .unwrap_err();
         assert!(matches!(error, Error::IO { .. }));
         assert!(error.to_string().contains("injected write failure"));
         assert!(packed_aborted.load(Ordering::SeqCst));
@@ -1816,9 +1806,7 @@ mod tests {
             values: Vec::new(),
             failure: None,
         };
-        let payloads = BinaryArray::from(vec![b"abcdef".as_slice()]);
-
-        cancel_pending(packed.write_blobs(&payloads));
+        cancel_pending(packed.write_packed_blobs(Bytes::from_static(b"abcdef"), vec![6]));
 
         assert_eq!(bytes_written.load(Ordering::SeqCst), 2);
         assert!(dropped.load(Ordering::SeqCst));
