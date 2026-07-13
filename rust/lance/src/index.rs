@@ -7085,6 +7085,11 @@ mod tests {
             .map(|segment| segment.uuid)
             .collect::<HashSet<_>>();
         assert_eq!(
+            tasks.iter().map(Vec::len).sum::<usize>(),
+            segments.len(),
+            "a full plan should contain every segment exactly once"
+        );
+        assert_eq!(
             planned_uuids,
             segments
                 .iter()
