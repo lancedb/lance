@@ -3816,7 +3816,7 @@ enum PrimitivePageStructure {
     },
     Sparse {
         plan: sparse::SparseStructuralPlan,
-        prepared_values: Option<DataBlock>,
+        prepared_values: Option<sparse::writer::PreparedSparseValues>,
     },
 }
 
@@ -5425,7 +5425,14 @@ impl PrimitiveStructuralEncoder {
                     column_idx,
                     &field,
                     compression_strategy.as_ref(),
-                    prepared_values.unwrap_or_else(|| DataBlock::from_arrays(&arrays, num_values)),
+                    prepared_values.map_or_else(
+                        || {
+                            sparse::writer::SparseValueInput::Unprepared(DataBlock::from_arrays(
+                                &arrays, num_values,
+                            ))
+                        },
+                        sparse::writer::SparseValueInput::Prepared,
+                    ),
                     plan,
                     row_number,
                     num_rows,
@@ -5775,29 +5782,34 @@ impl PrimitiveStructuralEncoder {
                     if !sparse::writer::supports_value_block(&data) {
                         return Ok(None);
                     }
-                    if let Err(error) = self
-                        .compression_strategy
-                        .create_miniblock_compressor(&self.field, &data)
-                    {
-                        trace!(
-                            "Keeping column {} on its dense structural path because sparse value compression is unavailable: {}",
-                            self.column_index, error
-                        );
-                        return Ok(None);
-                    }
+                    let prepared_values = match sparse::writer::prepare_values(
+                        &self.field,
+                        self.compression_strategy.as_ref(),
+                        data,
+                        self.support_large_chunk,
+                    ) {
+                        Ok(prepared_values) => prepared_values,
+                        Err(error) => {
+                            trace!(
+                                "Keeping column {} on its dense structural path because sparse value preparation is unavailable: {}",
+                                self.column_index, error
+                            );
+                            return Ok(None);
+                        }
+                    };
                     let plan = sparse::writer::plan(&normalized, num_values)?;
                     if sparse::writer::uses_constant_layout(&plan, &self.field) {
                         return Ok(None);
                     }
-                    Ok(Some((plan, data)))
+                    Ok(Some((plan, prepared_values)))
                 },
             )?;
             match automatic_sparse {
-                Some((plan, data)) => vec![PrimitivePageData {
+                Some((plan, prepared_values)) => vec![PrimitivePageData {
                     arrays,
                     structure: PrimitivePageStructure::Sparse {
                         plan,
-                        prepared_values: Some(data),
+                        prepared_values: Some(prepared_values),
                     },
                     row_number,
                     num_rows,
