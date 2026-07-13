@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
-use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
@@ -1159,12 +1158,11 @@ impl FilteredReadStream {
             )))
             .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1));
 
-        let result: Pin<Box<dyn Stream<Item = Result<ReadBatchFut>> + Send>> =
-            if let Some(limit) = fragment_soft_limit {
-                Box::pin(Self::apply_soft_limit(fragment_stream, limit))
-            } else {
-                Box::pin(fragment_stream)
-            };
+        let result = if let Some(limit) = fragment_soft_limit {
+            Self::apply_soft_limit(fragment_stream, limit).boxed()
+        } else {
+            fragment_stream.boxed()
+        };
         Ok(result)
     }
 

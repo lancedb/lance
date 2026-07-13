@@ -64,6 +64,9 @@ pub struct DeferredDocSet {
     docs_path: String,
     is_legacy: bool,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// V3 (256-doc block) partitions score with quantized doc lengths; the
+    /// flag is applied to every `DocSet` this deferred set materializes.
+    quantized_scoring: bool,
     /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
     /// `sum(num_tokens)` cached on first compute.
@@ -126,18 +129,21 @@ impl lance_core::deepsize::DeepSizeOf for LazyDocSet {
 }
 
 impl LazyDocSet {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn IndexStore>,
         docs_path: String,
         num_rows: usize,
         is_legacy: bool,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        quantized_scoring: bool,
     ) -> Self {
         Self::Deferred(Box::new(DeferredDocSet {
             store,
             docs_path,
             is_legacy,
             frag_reuse_index,
+            quantized_scoring,
             num_rows,
             total_tokens: OnceCell::new(),
             num_tokens_col: OnceCell::new(),
@@ -300,7 +306,7 @@ impl DeferredDocSet {
             .get_or_try_init(|| async {
                 // If the stats path already pulled NUM_TOKEN_COL,
                 // read only ROW_ID and rebuild from the two columns.
-                let docs = if self.num_tokens_col.get().is_some() {
+                let mut docs = if self.num_tokens_col.get().is_some() {
                     let num_tokens = self.num_tokens_column().await?;
                     let row_ids = self.row_ids_column().await?;
                     DocSet::from_columns(
@@ -317,6 +323,7 @@ impl DeferredDocSet {
                     )
                     .await?
                 };
+                docs.set_quantized_scoring(self.quantized_scoring);
                 Result::Ok(Arc::new(docs))
             })
             .await?
@@ -333,7 +340,9 @@ impl DeferredDocSet {
             .tokens_only
             .get_or_try_init(|| async {
                 let num_tokens = self.num_tokens_column().await?;
-                Result::Ok(Arc::new(DocSet::from_num_tokens_only(num_tokens.as_ref())))
+                let mut docs = DocSet::from_num_tokens_only(num_tokens.as_ref());
+                docs.set_quantized_scoring(self.quantized_scoring);
+                Result::Ok(Arc::new(docs))
             })
             .await?
             .clone();

@@ -29,8 +29,8 @@ use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
     builder::ScoredDoc,
     encoding::{
-        decode_position_stream_block, decompress_positions, decompress_posting_block,
-        decompress_posting_remainder,
+        MAX_POSTING_BLOCK_SIZE, decode_position_stream_block, decompress_positions,
+        decompress_posting_block, decompress_posting_remainder,
     },
     query::FtsSearchParams,
     scorer::Scorer,
@@ -66,7 +66,7 @@ struct CompressedState {
     block_idx: usize,
     doc_ids: Vec<u32>,
     freqs: Vec<u32>,
-    buffer: Box<[u32; BLOCK_SIZE]>,
+    buffer: Box<[u32; MAX_POSTING_BLOCK_SIZE]>,
     position_block_idx: Option<usize>,
     position_values: Vec<u32>,
     position_offsets: Vec<usize>,
@@ -74,12 +74,12 @@ struct CompressedState {
 }
 
 impl CompressedState {
-    fn new() -> Self {
+    fn new(block_size: usize) -> Self {
         Self {
             block_idx: 0,
-            doc_ids: Vec::with_capacity(BLOCK_SIZE),
-            freqs: Vec::with_capacity(BLOCK_SIZE),
-            buffer: Box::new([0; BLOCK_SIZE]),
+            doc_ids: Vec::with_capacity(block_size),
+            freqs: Vec::with_capacity(block_size),
+            buffer: Box::new([0; MAX_POSTING_BLOCK_SIZE]),
             position_block_idx: None,
             position_values: Vec::new(),
             position_offsets: Vec::new(),
@@ -95,21 +95,29 @@ impl CompressedState {
         num_blocks: usize,
         length: u32,
         tail_codec: super::PostingTailCodec,
+        block_size: usize,
     ) {
         self.doc_ids.clear();
         self.freqs.clear();
 
-        let remainder = length as usize % BLOCK_SIZE;
+        let remainder = length as usize % block_size;
         if block_idx + 1 == num_blocks && remainder != 0 {
             decompress_posting_remainder(
                 block,
                 remainder,
                 tail_codec,
+                block_size,
                 &mut self.doc_ids,
                 &mut self.freqs,
             );
         } else {
-            decompress_posting_block(block, &mut self.buffer, &mut self.doc_ids, &mut self.freqs);
+            decompress_posting_block(
+                block,
+                &mut self.buffer[..],
+                &mut self.doc_ids,
+                &mut self.freqs,
+                block_size,
+            );
         }
         self.block_idx = block_idx;
         self.position_block_idx = None;
@@ -279,6 +287,7 @@ impl PostingIterator {
                 list.blocks.len(),
                 list.length,
                 list.posting_tail_codec,
+                list.block_size,
             );
         }
         compressed as *mut CompressedState
@@ -307,8 +316,12 @@ impl PostingIterator {
             Some(max_score) => max_score,
             None => idf(list.len(), num_doc) * (K1 + 1.0),
         };
-
-        let is_compressed = matches!(list, PostingList::Compressed(_));
+        let compressed = match &list {
+            PostingList::Compressed(list) => {
+                Some(UnsafeCell::new(CompressedState::new(list.block_size)))
+            }
+            PostingList::Plain(_) => None,
+        };
 
         Self {
             token,
@@ -319,7 +332,7 @@ impl PostingIterator {
             index: 0,
             block_idx: 0,
             approximate_upper_bound,
-            compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
+            compressed,
         }
     }
 
@@ -361,8 +374,8 @@ impl PostingIterator {
 
         match self.list {
             PostingList::Compressed(ref list) => {
-                let block_idx = self.index / BLOCK_SIZE;
-                let block_offset = self.index % BLOCK_SIZE;
+                let block_idx = self.index >> list.block_shift();
+                let block_offset = self.index & list.block_mask();
                 let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
 
                 // Read from the decompressed block
@@ -400,8 +413,8 @@ impl PostingIterator {
                     ))
                 }
                 CompressedPositionStorage::SharedStream(stream) => {
-                    let block_idx = self.index / BLOCK_SIZE;
-                    let block_offset = self.index % BLOCK_SIZE;
+                    let block_idx = self.index >> list.block_shift();
+                    let block_offset = self.index & list.block_mask();
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     if compressed.position_block_idx != Some(block_idx) {
@@ -441,33 +454,34 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
-                let mut block_idx = self.index / BLOCK_SIZE;
+                let shift = list.block_shift();
+                let mut block_idx = self.index >> shift;
                 while block_idx + 1 < list.blocks.len()
                     && list.block_least_doc_id(block_idx + 1) <= least_id
                 {
                     block_idx += 1;
                 }
-                self.index = self.index.max(block_idx * BLOCK_SIZE);
+                self.index = self.index.max(block_idx << shift);
                 let length = list.length as usize;
                 while self.index < length {
-                    let block_idx = self.index / BLOCK_SIZE;
-                    let block_offset = self.index % BLOCK_SIZE;
+                    let block_idx = self.index >> shift;
+                    let block_offset = self.index & list.block_mask();
                     let compressed =
                         unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                     let in_block = &compressed.doc_ids[block_offset..];
                     let offset_in_block = in_block.partition_point(|&doc_id| doc_id < least_id);
                     let new_offset = block_offset + offset_in_block;
                     if new_offset < compressed.doc_ids.len() {
-                        self.index = block_idx * BLOCK_SIZE + new_offset;
+                        self.index = (block_idx << shift) + new_offset;
                         break;
                     }
                     if block_idx + 1 >= list.blocks.len() {
                         self.index = length;
                         break;
                     }
-                    self.index = (block_idx + 1) * BLOCK_SIZE;
+                    self.index = (block_idx + 1) << shift;
                 }
-                self.block_idx = self.index / BLOCK_SIZE;
+                self.block_idx = self.index >> shift;
             }
             PostingList::Plain(ref list) => {
                 self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
@@ -903,7 +917,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             let doc_length = match &doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
 
@@ -1077,7 +1091,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             // score the doc
             let doc_length = match is_compressed {
-                true => self.docs.num_tokens(doc_id as u32),
+                true => self.docs.scoring_num_tokens(doc_id as u32),
                 false => self.docs.num_tokens_by_row_id(row_id),
             };
             if self.operator == Operator::Or && !self.refine_or_candidate(doc_id, doc_length) {
@@ -1227,7 +1241,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 continue;
             };
             let doc_length = match &first_doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             let mut lead_score = 0.0;
@@ -1309,7 +1323,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
             let doc_length = match &lead_doc {
-                DocInfo::Raw(doc) => self.docs.num_tokens(doc.doc_id),
+                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
                 DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
             };
             if self.and_candidate_cannot_beat_threshold(doc_length) {
@@ -2146,6 +2160,7 @@ mod tests {
                 max_score,
                 doc_ids.len() as u32,
                 crate::scalar::inverted::PostingTailCodec::VarintDelta,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
                 None,
             ))
         } else {

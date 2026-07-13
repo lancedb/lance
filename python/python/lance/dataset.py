@@ -3366,8 +3366,10 @@ class LanceDataset(pa.dataset.Dataset):
         format_version: int or str, optional
             This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
             format version to write when creating a new index. Accepts ``1``,
-            ``2``, ``"v1"``, or ``"v2"``. If unset, Lance chooses the current
-            default format.
+            ``2``, ``3``, ``"v1"``, ``"v2"``, or ``"v3"``. If unset, Lance
+            writes v2 for ``block_size=128`` and v3 for ``block_size=256``.
+            ``format_version=3`` is experimental and is only valid with
+            ``block_size=256``.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -3375,6 +3377,12 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        block_size: int, default 128
+            This is for the ``INVERTED`` index. Number of documents per compressed
+            posting block. Must be one of ``128`` or ``256``.
+            ``block_size=256`` is experimental and may introduce breaking changes.
+            Use ``128`` when stable compatibility with the legacy posting layout is
+            required.
         memory_limit: int, optional
             This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
             If set, Lance divides this budget evenly across the workers. If unset,
