@@ -167,7 +167,8 @@ def print_comparison(title: str, no_seeds: dict, with_seeds: dict) -> None:
     print(f"  {title}")
     print(f"{'=' * 70}")
     print(
-        f"  {'Phase':<20} {'No Seeds':>{col_w}} {'With Seeds':>{col_w}} {'Speedup':>{col_w}}"
+        f"  {'Phase':<20} {'No Seeds':>{col_w}} "
+        + f"{'With Seeds':>{col_w}} {'Speedup':>{col_w}}"
     )
     print(f"  {'-' * (20 + col_w * 3 + 6)}")
     for phase in phases:
