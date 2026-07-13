@@ -7057,7 +7057,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
@@ -9491,74 +9491,215 @@ mod tests {
         doc_writer.finish().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
+    async fn load_global_scoring_test_index(
+        second_partition_has_impacts: bool,
+    ) -> (TempObjDir, Arc<InvertedIndex>) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-
-        let mut impact_builder = InnerBuilder::new_with_format_version(
-            0,
-            false,
-            TokenSetFormat::default(),
-            InvertedListFormatVersion::V1,
-        );
-        impact_builder.tokens.add("alpha".to_owned());
-        impact_builder
-            .posting_lists
-            .push(PostingListBuilder::new_with_posting_tail_codec(
+        let partition_specs = [
+            (0, 100, 5_000, 101..111, 5_000, true),
+            (1, 200, 1_000, 201..301, 1, second_partition_has_impacts),
+        ];
+        for (
+            partition_id,
+            matching_row_id,
+            matching_doc_length,
+            other_row_ids,
+            other_doc_length,
+            with_impacts,
+        ) in partition_specs
+        {
+            let mut builder = InnerBuilder::new_with_format_version(
+                partition_id,
                 false,
-                InvertedListFormatVersion::V1.posting_tail_codec(),
-            ));
-        impact_builder.posting_lists[0].add(0, PositionRecorder::Count(1));
-        impact_builder.docs.append(100, 5_000);
-        for row_id in 101..111 {
-            impact_builder.docs.append(row_id, 5_000);
+                TokenSetFormat::default(),
+                InvertedListFormatVersion::V1,
+            );
+            builder.tokens.add("alpha".to_owned());
+            builder
+                .posting_lists
+                .push(PostingListBuilder::new_with_posting_tail_codec(
+                    false,
+                    InvertedListFormatVersion::V1.posting_tail_codec(),
+                ));
+            builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+            builder.docs.append(matching_row_id, matching_doc_length);
+            for row_id in other_row_ids {
+                builder.docs.append(row_id, other_doc_length);
+            }
+            write_test_partition_with_optional_impacts(
+                &store,
+                partition_id,
+                builder,
+                TokenSetFormat::default(),
+                with_impacts,
+            )
+            .await;
         }
-        write_test_partition_with_optional_impacts(
-            &store,
-            0,
-            impact_builder,
-            TokenSetFormat::default(),
-            true,
-        )
-        .await;
-
-        let mut legacy_builder = InnerBuilder::new_with_format_version(
-            1,
-            false,
-            TokenSetFormat::default(),
-            InvertedListFormatVersion::V1,
-        );
-        legacy_builder.tokens.add("alpha".to_owned());
-        legacy_builder
-            .posting_lists
-            .push(PostingListBuilder::new_with_posting_tail_codec(
-                false,
-                InvertedListFormatVersion::V1.posting_tail_codec(),
-            ));
-        legacy_builder.posting_lists[0].add(0, PositionRecorder::Count(1));
-        legacy_builder.docs.append(200, 1_000);
-        for row_id in 201..301 {
-            legacy_builder.docs.append(row_id, 1);
-        }
-        write_test_partition_with_optional_impacts(
-            &store,
-            1,
-            legacy_builder,
-            TokenSetFormat::default(),
-            false,
-        )
-        .await;
 
         write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
-        let cache = Arc::new(LanceCache::with_capacity(4096));
-        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+        let cache = LanceCache::with_capacity(4096);
+        let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+        (tmpdir, index)
+    }
+
+    async fn search_test_impact_partition(
+        partition: &InvertedPartition,
+        tokens: &Tokens,
+        params: &FtsSearchParams,
+        scorer: Arc<MemBM25Scorer>,
+        shared_threshold: Arc<AtomicU32>,
+    ) -> Vec<DocCandidate> {
+        let LoadedPostings {
+            postings,
+            grouped_expansions,
+            impact_safe,
+        } = partition
+            .load_posting_lists(
+                tokens,
+                params,
+                Operator::Or,
+                scorer.as_ref(),
+                &NoOpMetricsCollector,
+            )
             .await
             .unwrap();
+        assert!(impact_safe);
+        assert!(grouped_expansions.is_empty());
+
+        let mask = NoFilter.mask();
+        let docs_for_wand = partition.docs.docs_for_wand(mask.as_ref()).await.unwrap();
+        let mut candidates = partition
+            .bm25_search(
+                docs_for_wand.as_ref(),
+                params,
+                Operator::Or,
+                mask,
+                postings,
+                Some(scorer),
+                &NoOpMetricsCollector,
+                shared_threshold,
+            )
+            .unwrap();
+        resolve_deferred_candidates(&partition.docs, &mut candidates)
+            .await
+            .unwrap();
+        candidates
+    }
+
+    #[tokio::test]
+    async fn test_impact_partitions_share_global_threshold_without_pruning_winner() {
+        // Partition 0 wins under its local corpus statistics but loses under
+        // the global statistics. If its local score escapes into the shared
+        // floor, partition 1 will incorrectly prune the real global winner.
+        let (_tmpdir, index) = load_global_scoring_test_index(true).await;
+        let first_partition = index
+            .partitions
+            .iter()
+            .find(|partition| partition.id() == 0)
+            .unwrap();
+        let second_partition = index
+            .partitions
+            .iter()
+            .find(|partition| partition.id() == 1)
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
+        let scorer = Arc::new(
+            index
+                .bm25_base_scorer(tokens.as_ref(), params.as_ref())
+                .await
+                .unwrap(),
+        );
+        first_partition
+            .inverted_list
+            .ensure_metadata_loaded()
+            .await
+            .unwrap();
+        second_partition
+            .inverted_list
+            .ensure_metadata_loaded()
+            .await
+            .unwrap();
+        let first_local_scorer = IndexBM25Scorer::new(std::iter::once(first_partition.as_ref()));
+        let second_local_scorer = IndexBM25Scorer::new(std::iter::once(second_partition.as_ref()));
+        let first_local_score =
+            first_local_scorer.query_weight("alpha") * first_local_scorer.doc_weight(1, 5_000);
+        let second_local_score =
+            second_local_scorer.query_weight("alpha") * second_local_scorer.doc_weight(1, 1_000);
+        assert!(first_local_score > second_local_score);
+        let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+
+        // Search sequentially so partition 0 deterministically publishes its
+        // score before partition 1 evaluates its impact upper bound.
+        let first_candidates = search_test_impact_partition(
+            first_partition,
+            tokens.as_ref(),
+            params.as_ref(),
+            scorer.clone(),
+            shared_threshold.clone(),
+        )
+        .await;
+        assert_eq!(first_candidates.len(), 1);
+        assert!(matches!(
+            first_candidates[0].addr,
+            CandidateAddr::RowId(100)
+        ));
+        let first_score =
+            scorer.query_weight("alpha") * scorer.doc_weight(1, first_candidates[0].doc_length);
+        let published_threshold = f32::from_bits(shared_threshold.load(Ordering::Relaxed));
+        assert!(
+            (published_threshold - first_score).abs() < 1e-6,
+            "published threshold: {published_threshold}, expected global score: {first_score}"
+        );
+
+        let second_candidates = search_test_impact_partition(
+            second_partition,
+            tokens.as_ref(),
+            params.as_ref(),
+            scorer.clone(),
+            shared_threshold.clone(),
+        )
+        .await;
+        assert_eq!(second_candidates.len(), 1);
+        assert!(matches!(
+            second_candidates[0].addr,
+            CandidateAddr::RowId(200)
+        ));
+        let second_score =
+            scorer.query_weight("alpha") * scorer.doc_weight(1, second_candidates[0].doc_length);
+        assert!(
+            second_score > first_score,
+            "second score: {second_score}, first score: {first_score}"
+        );
+        assert!(
+            (f32::from_bits(shared_threshold.load(Ordering::Relaxed)) - second_score).abs() < 1e-6
+        );
+
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_ids, vec![200]);
+        assert_eq!(scores.len(), 1);
+        assert!((scores[0] - second_score).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
+        let (_tmpdir, index) = load_global_scoring_test_index(false).await;
 
         let impact_partition = index
             .partitions
