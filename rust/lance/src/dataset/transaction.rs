@@ -6433,12 +6433,16 @@ mod tests {
         let mut frag2 = Fragment::new(2);
         frag2.overlays = vec![overlay_with_field(9, 3)]; // untargeted, committed at v3
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
-        let manifest = Manifest::new(
+        let mut manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![frag0, frag1, frag2]),
             lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
             HashMap::new(),
         );
+        // The pre-existing overlays were committed at v3, so the current
+        // manifest must be at least that version; the new commit then stamps
+        // its overlay at v4, keeping the fragment's overlays newest-last.
+        manifest.version = 3;
 
         let txn = Transaction::new(
             manifest.version,
