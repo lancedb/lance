@@ -711,53 +711,6 @@ pub fn hamming_clustering_from_hashes(
     clustering.into_reader(None)
 }
 
-/// Perform pairwise hamming distance clustering on provided fixed-width binary
-/// hashes (no I/O).
-pub fn hamming_clustering_from_binary_hashes(
-    hashes: &BinaryHashValues,
-    row_ids: Option<&[u64]>,
-    hamming_threshold: u32,
-) -> Box<dyn RecordBatchReader + Send> {
-    let num_rows = hashes.len();
-    if num_rows < 2 {
-        let empty = ClusteringResult {
-            clusters: Vec::new(),
-        };
-        return empty.into_reader(None);
-    }
-
-    let total_pairs = (num_rows as u64) * (num_rows as u64 - 1) / 2;
-
-    let t_compute_start = Instant::now();
-    let pairwise =
-        pairwise_hamming_distance_binary_parallel(hashes, row_ids, Some(hamming_threshold));
-    let compute_time = t_compute_start.elapsed();
-
-    let t_cluster_start = Instant::now();
-    let clustering = cluster_pairwise_result(&pairwise);
-    let cluster_time = t_cluster_start.elapsed();
-
-    let pairs_per_sec = if compute_time.as_secs_f64() > 0.0 {
-        total_pairs as f64 / compute_time.as_secs_f64()
-    } else {
-        0.0
-    };
-    tracing::info!(
-        num_rows,
-        hash_width_bytes = hashes.byte_width(),
-        total_pairs,
-        edges = pairwise.len(),
-        compute_time_ms = compute_time.as_millis(),
-        cluster_time_ms = cluster_time.as_millis(),
-        pairs_per_sec_millions = pairs_per_sec / 1_000_000.0,
-        num_clusters = clustering.num_clusters(),
-        num_duplicates = clustering.num_duplicates(),
-        "Hamming clustering completed"
-    );
-
-    clustering.into_reader(None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,32 +817,6 @@ mod tests {
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].0, 100); // representative
         assert_eq!(clusters[0].1, vec![200]); // duplicates
-    }
-
-    #[test]
-    fn test_hamming_clustering_from_binary_hashes_128() {
-        let hashes = BinaryHashValues::try_new(
-            vec![
-                0,
-                0,
-                1,
-                u64::MAX, // lane 0
-                0,
-                1,
-                1,
-                u64::MAX, // lane 1
-            ],
-            4,
-            16,
-        )
-        .unwrap();
-
-        let reader = hamming_clustering_from_binary_hashes(&hashes, None, 1);
-        let clusters = collect_clusters(reader);
-
-        assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].0, 0);
-        assert_eq!(clusters[0].1, vec![1, 2]);
     }
 
     #[tokio::test]
