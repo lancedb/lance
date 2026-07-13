@@ -59,28 +59,56 @@ upload_artifact() {
 run_lance() {
     local run_rows=$1
     local label=$2
-    local prefix=${S3_PREFIX}/lance-${label}
+    local prefix=${S3_PREFIX}/lance-${label}-${RUN_ID}
     local csv=${RESULT_DIR}/lance-${label}-${RUN_ID}.csv
     local tmp=${csv}.tmp
     local err=${RESULT_DIR}/lance-${label}-${RUN_ID}.err
+    local failures=${RESULT_DIR}/lance-${label}-${RUN_ID}-failures.csv
+    local header=case,mode,rows,bytes,objects,data_files,pages,op,phase,ms,out_rows,uri
+    local case_name
+    local mode
 
-    ACTION=lance \
-    ROWS="${run_rows}" \
-    BATCH_ROWS="${BATCH_ROWS}" \
-    TAKE_COUNT="${TAKE_COUNT}" \
-    CASES=hnsw,uniform,deep \
-    MODES=sparse,miniblock,fullzip \
-    S3_BUCKET="${S3_BUCKET}" \
-    S3_PREFIX="${prefix}" \
-        "${BIN}" > "${tmp}" 2> "${err}"
+    printf '%s\n' "${header}" > "${tmp}"
+    printf 'case,mode,exit_code\n' > "${failures}"
+    : > "${err}"
+    for case_name in hnsw uniform deep; do
+        for mode in sparse miniblock fullzip; do
+            local part=${RESULT_DIR}/lance-${label}-${RUN_ID}-${case_name}-${mode}.csv
+            local part_err=${RESULT_DIR}/lance-${label}-${RUN_ID}-${case_name}-${mode}.err
+            local exit_code=0
+            if ACTION=lance \
+                ROWS="${run_rows}" \
+                BATCH_ROWS="${BATCH_ROWS}" \
+                TAKE_COUNT="${TAKE_COUNT}" \
+                CASES="${case_name}" \
+                MODES="${mode}" \
+                S3_BUCKET="${S3_BUCKET}" \
+                S3_PREFIX="${prefix}" \
+                    "${BIN}" > "${part}" 2> "${part_err}"; then
+                :
+            else
+                exit_code=$?
+                printf '%s,%s,%s\n' "${case_name}" "${mode}" "${exit_code}" >> "${failures}"
+            fi
+            if [[ $(head -n 1 "${part}") != "${header}" ]]; then
+                echo "unexpected CSV header in ${part}" >&2
+                exit 1
+            fi
+            if [[ ${exit_code} -eq 0 && $(wc -l < "${part}") -ne 10 ]]; then
+                echo "unexpected successful CSV line count in ${part}" >&2
+                exit 1
+            fi
+            tail -n +2 "${part}" >> "${tmp}"
+            printf 'case=%s mode=%s exit_code=%s\n' \
+                "${case_name}" "${mode}" "${exit_code}" >> "${err}"
+            cat "${part_err}" >> "${err}"
+        done
+    done
 
-    validate_csv \
-        "${tmp}" \
-        "case,mode,rows,bytes,objects,data_files,pages,op,phase,ms,out_rows,uri" \
-        82
     mv "${tmp}" "${csv}"
     upload_artifact "${csv}" "artifacts/$(basename "${csv}")"
     upload_artifact "${err}" "artifacts/$(basename "${err}")"
+    upload_artifact "${failures}" "artifacts/$(basename "${failures}")"
 }
 
 run_formats() {
@@ -104,7 +132,7 @@ run_formats() {
     upload_artifact "${csv}" "artifacts/$(basename "${csv}")"
     upload_artifact "${err}" "artifacts/$(basename "${err}")"
     for output in "${out_dir}"/*; do
-        upload_artifact "${output}" "formats/${label}/$(basename "${output}")"
+        upload_artifact "${output}" "formats/${label}-${RUN_ID}/$(basename "${output}")"
     done
 }
 
