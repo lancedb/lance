@@ -238,6 +238,17 @@ class Step:
             return INDEX_RECORD_NAMES[self.index_kind]
         return "native_dataset_api"
 
+    def implementation_path_for_format(self, format_name: str) -> str:
+        if format_name not in run.FORMATS:
+            raise ValueError(f"unsupported benchmark format: {format_name}")
+        if self.operation == "random_delete_reclaim":
+            return (
+                "explicit_repack"
+                if format_name == "v23_logical"
+                else "same_postcondition_default_compaction"
+            )
+        return self.implementation_path
+
 
 @dataclasses.dataclass(frozen=True)
 class MatrixCase:
@@ -833,6 +844,9 @@ class ProtocolRunner:
         return str((Path(self.dataset_root).expanduser().resolve() / suffix).resolve())
 
     def _expected(self, step: Step, **identity: Any) -> dict[str, Any]:
+        format_name = identity.get("format")
+        if not isinstance(format_name, str):
+            raise ValueError("worker identity must include format")
         return {
             "schema_version": run.SCHEMA_VERSION,
             "suite": run.SUITE,
@@ -858,7 +872,7 @@ class ProtocolRunner:
             "schema_kind": SCHEMA_RECORD_NAMES[step.schema_kind],
             "index_kind": INDEX_RECORD_NAMES[step.index_kind],
             "selection": SELECTION_RECORD_NAMES[step.selection],
-            "implementation_path": step.implementation_path,
+            "implementation_path": step.implementation_path_for_format(format_name),
             **identity,
         }
 

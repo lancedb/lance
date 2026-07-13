@@ -89,6 +89,70 @@ class ProtocolTests(unittest.TestCase):
             "random_delete_reclaim",
         )
 
+    def test_random_delete_reclaim_provenance_is_format_specific(self) -> None:
+        reclaim = protocol.Step("random_delete_reclaim", expected_rows=50)
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.run_id = "run-1"
+        runner.commit = "1" * 40
+        runner.host = "host"
+        runner.seed = 7
+        runner.policy_sha256 = "2" * 64
+        runner.policy_version = 1
+        runner.mode = "smoke"
+        runner.storage = "ebs"
+        runner.rows = 100
+        runner.rows_per_fragment = 10
+        runner.take_count = 1
+        expected_paths = {
+            "v22_no_stable": "same_postcondition_default_compaction",
+            "v22_stable": "same_postcondition_default_compaction",
+            "v23_logical": "explicit_repack",
+        }
+        for order_index, (format_name, implementation_path) in enumerate(
+            expected_paths.items()
+        ):
+            expected = runner._expected(
+                reclaim,
+                pair_id="run-1/reclaim",
+                round=0,
+                order_index=order_index,
+                dataset_uri=f"/tmp/{format_name}.lance",
+                format=format_name,
+                maintenance_plan_path=None,
+                maintenance_plan_sha256=None,
+            )
+            self.assertEqual(
+                expected["implementation_path"], implementation_path
+            )
+            record = dict.fromkeys(run.RECORD_FIELDS)
+            record.update(expected)
+            record.update(
+                {
+                    "started_at_unix_ns": 1,
+                    "duration_ns": 1,
+                    "result_rows": 50,
+                    "dataset_version": 2,
+                    "fragments": 1,
+                    "physical_rows": 100,
+                    "physical_data_bytes": 1600,
+                    "estimated_live_data_bytes": 800,
+                    "scan_byte_amplification": 2.0,
+                    "dataset_bytes": 1600,
+                    "peak_rss_bytes": 4096,
+                    "io_metrics_status": "not_instrumented",
+                    "status": "ok",
+                    "error": None,
+                }
+            )
+            self.assertIs(run.validate_record(record, expected), record)
+            record["implementation_path"] = (
+                "same_postcondition_repack_or_default_compaction"
+            )
+            with self.assertRaisesRegex(
+                run.RecordValidationError, "worker record provenance mismatch"
+            ):
+                run.validate_record(record, expected)
+
     def test_clustered_delete_reclaim_is_a_default_fast_path(self) -> None:
         matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
         cases = {
