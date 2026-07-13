@@ -76,7 +76,8 @@ run_lance() {
             local part=${RESULT_DIR}/lance-${label}-${RUN_ID}-${case_name}-${mode}.csv
             local part_err=${RESULT_DIR}/lance-${label}-${RUN_ID}-${case_name}-${mode}.err
             local exit_code=0
-            if ACTION=lance \
+            if RUST_BACKTRACE=1 \
+                ACTION=lance \
                 ROWS="${run_rows}" \
                 BATCH_ROWS="${BATCH_ROWS}" \
                 TAKE_COUNT="${TAKE_COUNT}" \
