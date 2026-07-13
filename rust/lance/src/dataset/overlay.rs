@@ -38,7 +38,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
-use arrow_schema::DataType;
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema};
@@ -467,7 +466,7 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
 /// list yields a single atomic field with an empty path.
 fn enumerate_atomic_fields(top: &Field) -> Vec<(&Field, Vec<i32>)> {
     fn recurse<'a>(field: &'a Field, path: &mut Vec<i32>, out: &mut Vec<(&'a Field, Vec<i32>)>) {
-        if matches!(field.data_type(), DataType::Struct(_)) {
+        if field.logical_type.is_struct() {
             for child in &field.children {
                 path.push(child.id);
                 recurse(child, path, out);
