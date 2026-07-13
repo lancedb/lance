@@ -1,0 +1,22 @@
+[package]
+name = "sparse-structural-final-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-schema = "58"
+async-fs = "2.2.0"
+futures = "0.3"
+lance = { path = "../../rust/lance", features = ["aws"] }
+lance-file = { path = "../../rust/lance-file" }
+lance-io = { path = "../../rust/lance-io" }
+object_store = "0.13"
+parquet = { version = "58", default-features = false, features = ["arrow", "zstd"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
+vortex = { version = "0.78.0", features = ["tokio"] }
