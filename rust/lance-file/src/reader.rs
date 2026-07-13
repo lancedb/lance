@@ -961,7 +961,7 @@ impl FileReader {
             fields: Fields(pb_schema.fields),
             metadata: pb_schema.metadata,
         };
-        let schema = lance_core::datatypes::Schema::from(fields_with_meta);
+        let schema = fields_with_meta.try_into_schema()?;
         Ok((num_rows, schema))
     }
 

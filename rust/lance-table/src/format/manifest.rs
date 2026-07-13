@@ -900,7 +900,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             Some(format) => DataStorageFormat::from(format),
         };
 
-        let schema = Schema::from(fields_with_meta);
+        let schema = fields_with_meta.try_into_schema()?;
 
         Ok(Self {
             schema,
