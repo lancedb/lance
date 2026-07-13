@@ -30,30 +30,6 @@ pub trait Writer: AsyncWrite + Unpin + Send {
     /// Flush all buffered data and finalize the write, returning metadata about
     /// the written object.
     async fn shutdown(&mut self) -> Result<WriteResult>;
-
-    /// Abort an unfinished write and make the writer terminal.
-    ///
-    /// After this method succeeds, callers must treat the writer as terminal:
-    /// do not write, flush, or call [`Writer::shutdown`]. Implementations should
-    /// initiate cleanup of backend resources, but remote cleanup may run on a
-    /// best-effort basis after this method returns. Success therefore does not
-    /// universally confirm that remote resources have already been reclaimed.
-    /// Idempotency, errors, and retry behavior are implementation-specific.
-    ///
-    /// Writers without backend state may use the default no-op implementation.
-    ///
-    /// ```
-    /// # use lance_core::Result;
-    /// # use lance_io::traits::Writer;
-    /// # async fn discard<W: Writer + ?Sized>(writer: &mut W) -> Result<()> {
-    /// Writer::abort(writer).await?;
-    /// // `writer` is no longer used after abort is requested.
-    /// # Ok(())
-    /// # }
-    /// ```
-    async fn abort(&mut self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -64,10 +40,6 @@ impl Writer for Box<dyn Writer> {
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
         self.as_mut().shutdown().await
-    }
-
-    async fn abort(&mut self) -> Result<()> {
-        self.as_mut().abort().await
     }
 }
 

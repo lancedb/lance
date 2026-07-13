@@ -351,8 +351,6 @@ impl PyBlobDescriptorArrayBuilder {
 
 #[pyclass(name = "PackedBlobWriter", skip_from_py_object, unsendable)]
 pub struct PyPackedBlobWriter {
-    blob_id: u32,
-    path: String,
     field: Option<Field>,
     inner: Option<PackedBlobWriter>,
     row_validity: Vec<bool>,
@@ -369,12 +367,16 @@ impl PyPackedBlobWriter {
                 .await
                 .infer_error()?;
         Ok(Self {
-            blob_id: inner.blob_id(),
-            path: inner.path().to_string(),
             field: None,
             inner: Some(inner),
             row_validity: Vec::new(),
         })
+    }
+
+    fn inner(&self) -> PyResult<&PackedBlobWriter> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut PackedBlobWriter> {
@@ -387,13 +389,13 @@ impl PyPackedBlobWriter {
 #[pymethods]
 impl PyPackedBlobWriter {
     #[getter]
-    pub fn blob_id(&self) -> u32 {
-        self.blob_id
+    pub fn blob_id(&self) -> PyResult<u32> {
+        Ok(self.inner()?.blob_id())
     }
 
     #[getter]
-    pub fn path(&self) -> &str {
-        &self.path
+    pub fn path(&self) -> PyResult<String> {
+        Ok(self.inner()?.path().to_string())
     }
 
     /// The descriptor field associated with the array returned by
@@ -459,7 +461,8 @@ impl PyPackedBlobWriter {
             Ok(result) => result,
             Err(error) => {
                 // KeyboardInterrupt drops the async batch future. Remove the core
-                // writer as well so a completed prefix cannot be reused as a new batch.
+                // writer as well so RAII cleanup runs and a completed prefix cannot
+                // be reused as a new batch.
                 self.inner.take();
                 Err(error)
             }
@@ -517,15 +520,14 @@ impl PyPackedBlobWriter {
         builder.extend(values).infer_error()?;
         let column = builder.finish().infer_error()?;
         let (field, array) = column.into_parts();
+        let array = array.to_data().to_pyarrow(py)?;
         self.field = Some(field);
-        array.to_data().to_pyarrow(py)
+        Ok(array)
     }
 }
 
 #[pyclass(name = "DedicatedBlobWriter", skip_from_py_object, unsendable)]
 pub struct PyDedicatedBlobWriter {
-    blob_id: u32,
-    path: String,
     inner: Option<DedicatedBlobWriter>,
 }
 
@@ -539,11 +541,13 @@ impl PyDedicatedBlobWriter {
             DedicatedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
                 .await
                 .infer_error()?;
-        Ok(Self {
-            blob_id: inner.blob_id(),
-            path: inner.path().to_string(),
-            inner: Some(inner),
-        })
+        Ok(Self { inner: Some(inner) })
+    }
+
+    fn inner(&self) -> PyResult<&DedicatedBlobWriter> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut DedicatedBlobWriter> {
@@ -556,13 +560,13 @@ impl PyDedicatedBlobWriter {
 #[pymethods]
 impl PyDedicatedBlobWriter {
     #[getter]
-    pub fn blob_id(&self) -> u32 {
-        self.blob_id
+    pub fn blob_id(&self) -> PyResult<u32> {
+        Ok(self.inner()?.blob_id())
     }
 
     #[getter]
-    pub fn path(&self) -> &str {
-        &self.path
+    pub fn path(&self) -> PyResult<String> {
+        Ok(self.inner()?.path().to_string())
     }
 
     pub fn write(&mut self, data: Vec<u8>) -> PyResult<()> {

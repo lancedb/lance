@@ -1180,7 +1180,6 @@ def test_packed_blob_writer_bulk_arrow_array(
 
     files = LanceFileSession(tmp_path)
     packed = files.open_packed_blob_writer(data_file_name, blob_id)
-    packed_path = packed.path
     with pytest.raises(ValueError, match="available after finish_array"):
         packed.field
     packed.write_blobs(payloads)
@@ -1211,8 +1210,6 @@ def test_packed_blob_writer_bulk_arrow_array(
     assert pa.record_batch(
         [descriptors], schema=pa.schema([descriptor_field])
     ).num_rows == len(expected_values)
-    assert packed.path == packed_path
-    assert packed.blob_id == blob_id
     assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == expected_data
 
 
@@ -1356,21 +1353,6 @@ def test_packed_blob_writer_bulk_rejects_non_binary_array(tmp_path, payloads):
 
     packed.write_blob(b"still usable")
     assert len(packed.finish_array("blob")) == 1
-
-
-def test_packed_blob_writer_properties_available_after_failed_finish(tmp_path):
-    base_path = tmp_path / "base"
-    files = LanceFileSession(base_path)
-    packed = files.open_packed_blob_writer("data-file.lance", 7)
-    path = packed.path
-    packed.write_blob(b"payload")
-    _blob_sidecar_path(base_path, "data-file", 7).mkdir(parents=True)
-
-    with pytest.raises(OSError, match="failed to shutdown local writer"):
-        packed.finish_array("blob")
-
-    assert packed.path == path
-    assert packed.blob_id == 7
 
 
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):
