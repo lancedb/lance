@@ -1971,8 +1971,13 @@ impl MergeInsertJob {
                 WhenMatched::Delete | WhenMatched::DeleteIf(_) | WhenMatched::DeleteIfExpr(_)
             );
 
+        // The indexed path requires the source to be schema-compatible with the target.
+        // Delete-only sources may also carry predicate-only columns (for example, a
+        // `deleted` tombstone flag) that are intentionally absent from the target. Keep
+        // those sources on the standard plan, which can evaluate the extra columns.
         let would_use_scalar_index = if self.params.use_index
             && !is_partial_delete_with_insert
+            && (is_full_schema || is_subset_schema)
             && matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -10366,6 +10371,67 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .unwrap(),
             1,
             "id=2 must survive with its original value"
+        );
+    }
+
+    /// A scalar index must not route a delete-only source with predicate-only columns
+    /// through the indexed path, which requires every source column to exist in the target.
+    #[tokio::test]
+    async fn test_indexed_merge_insert_when_matched_delete_if_source_only_column() {
+        let initial = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = initial.schema();
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        ds.create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let ds = Arc::new(ds);
+
+        let source = record_batch!(
+            ("id", Int32, [2, 3, 4]),
+            ("deleted", Boolean, [true, false, true])
+        )
+        .unwrap();
+        let condition = WhenMatched::delete_if(&ds, "source.deleted").unwrap();
+
+        let (updated_ds, stats) = MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .unwrap()
+            .when_matched(condition)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source.clone())],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_deleted_rows, 2);
+        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            updated_ds
+                .count_rows(Some("id = 3 AND value = 30".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "the matched row whose tombstone is false must survive"
         );
     }
 

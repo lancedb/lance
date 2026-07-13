@@ -159,6 +159,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 
         // Check if this is a delete-only operation (no writes needed)
         // In delete-only mode, we only need the key columns from source for matching
+        // after the input projection has evaluated any conditional predicate into
+        // `__action`; predicate-only columns do not need to cross the write boundary.
         let no_upsert = matches!(
             self.params.when_matched,
             crate::dataset::WhenMatched::Delete
@@ -219,7 +221,7 @@ impl MergeInsertPlanner {
     /// Check if this is a delete-only operation that can use the optimized path.
     ///
     /// Delete-only operations are when:
-    /// - `when_matched` is `Delete`
+    /// - `when_matched` is `Delete`, `DeleteIf`, or `DeleteIfExpr`
     /// - `insert_not_matched` is `false` (no inserts)
     /// - `delete_not_matched_by_source` is `Keep` (no additional deletes of unmatched target rows)
     fn is_delete_only(params: &MergeInsertParams) -> bool {
