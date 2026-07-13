@@ -88,10 +88,14 @@ def gen_fsb_batches(num_rows: int, blob_bytes: int, batch_size: int):
 def gen_large_binary_batches(num_rows: int, blob_bytes: int, batch_size: int):
     for start in range(0, num_rows, batch_size):
         n = min(batch_size, num_rows - start)
-        yield pa.table({"value": pa.array(
-            [os.urandom(blob_bytes) for _ in range(n)],
-            type=pa.large_binary(),
-        )})
+        yield pa.table(
+            {
+                "value": pa.array(
+                    [os.urandom(blob_bytes) for _ in range(n)],
+                    type=pa.large_binary(),
+                )
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +108,8 @@ def run_scenario(
     schema: pa.Schema,
     seed_rows: int,
     seed_batch_size: int,
-    gen_seed_batches,       # () -> Iterator[pa.Table] for the initial write
-    gen_bulk_batches,       # () -> Iterator[pa.Table] for the appended data
+    gen_seed_batches,  # () -> Iterator[pa.Table] for the initial write
+    gen_bulk_batches,  # () -> Iterator[pa.Table] for the appended data
     use_seeds: bool,
 ) -> dict:
     """
@@ -196,13 +200,19 @@ def bench_integers(base: Path, num_rows: int) -> None:
     schema = pa.schema([pa.field("value", pa.int64())])
 
     no_seeds = run_scenario(
-        base / "int_no_seeds", schema, seed_rows, seed_bs,
+        base / "int_no_seeds",
+        schema,
+        seed_rows,
+        seed_bs,
         lambda: gen_int_batches(seed_rows, seed_bs),
         lambda: gen_int_batches(bulk_rows, bulk_bs),
         use_seeds=False,
     )
     with_seeds = run_scenario(
-        base / "int_with_seeds", schema, seed_rows, seed_bs,
+        base / "int_with_seeds",
+        schema,
+        seed_rows,
+        seed_bs,
         lambda: gen_int_batches(seed_rows, seed_bs),
         lambda: gen_int_batches(bulk_rows, bulk_bs),
         use_seeds=True,
@@ -225,13 +235,19 @@ def bench_vectors(base: Path, num_rows: int) -> None:
     schema = pa.schema([pa.field("value", pa.binary(blob_bytes))])
 
     no_seeds = run_scenario(
-        base / "vec_no_seeds", schema, seed_rows, seed_bs,
+        base / "vec_no_seeds",
+        schema,
+        seed_rows,
+        seed_bs,
         lambda: gen_fsb_batches(seed_rows, blob_bytes, seed_bs),
         lambda: gen_fsb_batches(bulk_rows, blob_bytes, bulk_bs),
         use_seeds=False,
     )
     with_seeds = run_scenario(
-        base / "vec_with_seeds", schema, seed_rows, seed_bs,
+        base / "vec_with_seeds",
+        schema,
+        seed_rows,
+        seed_bs,
         lambda: gen_fsb_batches(seed_rows, blob_bytes, seed_bs),
         lambda: gen_fsb_batches(bulk_rows, blob_bytes, bulk_bs),
         use_seeds=True,
@@ -258,13 +274,19 @@ def bench_large_binary(base: Path, num_rows: int) -> None:
     schema = pa.schema([pa.field("value", pa.large_binary())])
 
     no_seeds = run_scenario(
-        base / "bin_no_seeds", schema, seed_rows, seed_bs,
+        base / "bin_no_seeds",
+        schema,
+        seed_rows,
+        seed_bs,
         lambda: gen_large_binary_batches(seed_rows, blob_bytes, seed_bs),
         lambda: gen_large_binary_batches(bulk_rows, blob_bytes, bulk_bs),
         use_seeds=False,
     )
     with_seeds = run_scenario(
-        base / "bin_with_seeds", schema, seed_rows, seed_bs,
+        base / "bin_with_seeds",
+        schema,
+        seed_rows,
+        seed_bs,
         lambda: gen_large_binary_batches(seed_rows, blob_bytes, seed_bs),
         lambda: gen_large_binary_batches(bulk_rows, blob_bytes, bulk_bs),
         use_seeds=True,
