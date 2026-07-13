@@ -3,6 +3,7 @@
 
 use super::InvertedPartition;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:
@@ -10,6 +11,40 @@ use std::collections::HashMap;
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
+
+    /// Finite upper bound for every non-negative value returned by
+    /// [`Self::doc_weight`]. Returning `None` disables score-independent
+    /// pruning where the posting format has no stored impact bounds.
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        None
+    }
+
+    /// Stable identity for the corpus-level inputs used by [`Self::doc_weight`].
+    ///
+    /// Implementations should return `Some` only when equal keys guarantee the
+    /// same document weight for every `(freq, doc_tokens)` pair. Scorers without
+    /// such an identity keep impact bounds in the query-local cache only.
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl<T: Scorer + ?Sized> Scorer for Arc<T> {
+    fn query_weight(&self, token: &str) -> f32 {
+        self.as_ref().query_weight(token)
+    }
+
+    fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+        self.as_ref().doc_weight(freq, doc_tokens)
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        self.as_ref().doc_weight_upper_bound()
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        self.as_ref().doc_weight_cache_key()
+    }
 }
 
 // BM25 parameters
@@ -82,6 +117,14 @@ impl Scorer for MemBM25Scorer {
         let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length());
         (K1 + 1.0) * freq / (freq + doc_norm)
     }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        Some(K1 + 1.0)
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        Some(u64::from(self.avg_doc_length().to_bits()))
+    }
 }
 
 pub struct IndexBM25Scorer<'a> {
@@ -145,6 +188,14 @@ impl Scorer for IndexBM25Scorer<'_> {
         let doc_tokens = doc_tokens as f32;
         let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length);
         (K1 + 1.0) * freq / (freq + doc_norm)
+    }
+
+    fn doc_weight_upper_bound(&self) -> Option<f32> {
+        Some(K1 + 1.0)
+    }
+
+    fn doc_weight_cache_key(&self) -> Option<u64> {
+        Some(u64::from(self.avg_doc_length.to_bits()))
     }
 }
 

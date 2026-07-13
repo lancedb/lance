@@ -795,6 +795,13 @@ impl CompressionStrategy for DefaultCompressionStrategy {
                 if (max_len > 32 * 1024 || per_value_requested)
                     && data_size >= FSST_LEAST_INPUT_SIZE as u64
                 {
+                    if compression == Some("zstd") {
+                        let config = CompressionConfig::new(
+                            CompressionScheme::Zstd,
+                            field_params.compression_level,
+                        );
+                        return Ok(Box::new(CompressedBufferEncoder::try_new(config)?));
+                    }
                     return Ok(Box::new(CompressedBufferEncoder::default()));
                 }
 
@@ -1889,6 +1896,30 @@ mod tests {
         assert!(
             per_value_debug.contains("FsstPerValueEncoder"),
             "expected FsstPerValueEncoder, got: {per_value_debug}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_compression_level_honored_for_large_per_value() {
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "html".to_string(),
+            CompressionFieldParams {
+                compression: Some("zstd".to_string()),
+                compression_level: Some(19),
+                ..Default::default()
+            },
+        );
+        let strategy = DefaultCompressionStrategy::with_params(params);
+        let field = create_test_field("html", DataType::Utf8);
+        let large = create_variable_width_block(32, 64, 40 * 1024);
+
+        let per_value = strategy.create_per_value(&field, &large).unwrap();
+        let debug = format!("{per_value:?}");
+        assert!(
+            debug.contains("ZstdBufferCompressor") && debug.contains("compression_level: 19"),
+            "expected zstd level 19 to reach the per-value compressor, got: {debug}"
         );
     }
 

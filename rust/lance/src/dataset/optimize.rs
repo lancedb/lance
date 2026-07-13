@@ -2221,6 +2221,7 @@ mod tests {
         let fragment = Fragment {
             id: 0,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(0),

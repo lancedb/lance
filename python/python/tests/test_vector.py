@@ -5,7 +5,12 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.vector import hamming_clustering_for_sample, vec_to_table
+from lance.vector import (
+    get_ivf_partition_info,
+    hamming_clustering_for_ivf_partition,
+    hamming_clustering_for_sample,
+    vec_to_table,
+)
 
 
 def test_dict():
@@ -182,3 +187,72 @@ def test_hamming_clustering_for_sample(tmp_path):
     }
     # Singleton row 5 is not emitted as a cluster.
     assert clusters == {0: [1, 2], 3: [4]}
+
+
+def test_hamming_clustering_multi_segment(tmp_path):
+    # 25 distinct hash values, two copies each; the same table is written to
+    # fragment 0 and appended as fragment 1.
+    values = [((i // 2) * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF for i in range(50)]
+    table = _hash_table([list(value.to_bytes(8, "little")) for value in values])
+    dataset = lance.write_dataset(table, tmp_path / "hashes")
+    dataset.create_index(
+        "hash", index_type="IVF_FLAT", num_partitions=4, metric="hamming"
+    )
+    dataset = lance.write_dataset(table, tmp_path / "hashes", mode="append")
+    # Optimizing with merge disabled creates a delta segment for fragment 1.
+    dataset.optimize.optimize_indices(num_indices_to_merge=0)
+
+    index = dataset.describe_indices()[0]
+    assert len(index.segments) == 2
+
+    infos = get_ivf_partition_info(dataset, index.name)
+    assert sum(info["size"] for info in infos) == 100
+
+    # All four copies of each value cluster together across both fragments.
+    frag1_start = 1 << 32
+    clusters = []
+    for info in infos:
+        result = hamming_clustering_for_ivf_partition(
+            dataset, index.name, info["partition_id"], 0
+        ).read_all()
+        clusters.extend(
+            zip(
+                result["representative"].to_pylist(),
+                result["duplicates"].to_pylist(),
+            )
+        )
+    assert len(clusters) == 25
+    for representative, duplicates in clusters:
+        assert representative < frag1_start
+        assert len(duplicates) == 3
+        assert any(dup >= frag1_start for dup in duplicates)
+
+    # Selecting the fragment-0 segment reproduces the single-segment scope.
+    first_segment = next(
+        segment for segment in index.segments if segment.fragment_ids == {0}
+    )
+    infos = get_ivf_partition_info(
+        dataset, index.name, index_segments=[first_segment.uuid]
+    )
+    assert sum(info["size"] for info in infos) == 50
+    num_selected_clusters = 0
+    for info in infos:
+        result = hamming_clustering_for_ivf_partition(
+            dataset,
+            index.name,
+            info["partition_id"],
+            0,
+            index_segments=[first_segment.uuid],
+        ).read_all()
+        for duplicates in result["duplicates"].to_pylist():
+            num_selected_clusters += 1
+            assert duplicates == [dup for dup in duplicates if dup < frag1_start]
+            assert len(duplicates) == 1
+    assert num_selected_clusters == 25
+
+    with pytest.raises(ValueError, match="invalid index segment uuid"):
+        get_ivf_partition_info(dataset, index.name, index_segments=["not-a-uuid"])
+    with pytest.raises(TypeError, match="str or uuid.UUID"):
+        get_ivf_partition_info(dataset, index.name, index_segments=[123])
+    with pytest.raises(TypeError, match="not a single"):
+        get_ivf_partition_info(dataset, index.name, index_segments=first_segment.uuid)

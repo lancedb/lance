@@ -568,8 +568,13 @@ class _Dataset:
         index_name: str,
         partition_id: int,
         hamming_threshold: int,
+        index_segments: Optional[List[str]] = None,
     ) -> pa.RecordBatchReader: ...
-    def get_ivf_partition_info(self, index_name: str) -> List[dict]: ...
+    def get_ivf_partition_info(
+        self,
+        index_name: str,
+        index_segments: Optional[List[str]] = None,
+    ) -> List[dict]: ...
     def hamming_clustering_for_sample(
         self,
         column: str,

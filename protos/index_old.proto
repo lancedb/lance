@@ -39,4 +39,9 @@ message InvertedIndexDetails {
   uint32 min_ngram_length = 9;
   uint32 max_ngram_length = 10;
   bool prefix_only = 11;
+  // Number of documents per compressed posting block. An absent value means
+  // the index predates this field and must use the legacy block size of 128.
+  // A present value records the block size used by the index; 256 is only
+  // valid with format version 3.
+  optional uint32 block_size = 12;
 }
