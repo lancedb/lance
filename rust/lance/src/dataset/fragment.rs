@@ -911,6 +911,16 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
+        // Overlay files supply newer cell values that must be merged on read.
+        // Until the scan/take merge path lands (the rest of OSS-1322 / OSS-1324),
+        // reading a fragment that has overlays would silently return stale base
+        // values, so we refuse rather than serve incorrect data.
+        if !self.metadata.overlays.is_empty() {
+            return Err(Error::not_supported(
+                "reading fragments with data overlay files is not yet supported \
+                 (overlay merge is in progress)",
+            ));
+        }
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 

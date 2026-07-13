@@ -75,7 +75,11 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import _target_partition_size_to_num_partitions, td_to_micros
+from .util import (
+    _normalize_index_segment_ids,
+    _target_partition_size_to_num_partitions,
+    td_to_micros,
+)
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -4332,20 +4336,10 @@ class LanceDataset(pa.dataset.Dataset):
             named logical index. Use :meth:`describe_indices` to inspect logical
             indices and obtain segment UUIDs from ``IndexDescription.segments``.
         """
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
         return self._ds.prewarm_index(
-            name, with_position=with_position, index_segments=index_segments
+            name,
+            with_position=with_position,
+            index_segments=_normalize_index_segment_ids(index_segments),
         )
 
     def merge_index_metadata(
@@ -6431,19 +6425,7 @@ class ScannerBuilder:
     def with_index_segments(
         self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
     ) -> ScannerBuilder:
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
-        self._index_segments = index_segments
+        self._index_segments = _normalize_index_segment_ids(index_segments)
         return self
 
     def nearest(
