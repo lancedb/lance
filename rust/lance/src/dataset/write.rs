@@ -30,7 +30,7 @@ use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
-use lance_table::format::{BasePath, DataFile, Fragment};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -41,6 +41,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tracing::{info, instrument};
 
+use crate::index::DatasetIndexExt;
+use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::Dataset;
 use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::blob::{
@@ -741,7 +743,8 @@ pub async fn do_write_fragments(
     if let Some(mut writer) = writer.take() {
         if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
             drop(writer);
-            cleanup_data_fragments(&object_store, base_dir, &fragments).await;
+            cleanup_data_fragments(&object_store, base_dir, cleanup_bases.as_deref(), &fragments)
+                .await;
             return Err(e);
         }
         match writer.finish().await {
@@ -1385,10 +1388,6 @@ async fn create_seed_writers(
     params: &WriteParams,
     storage_version: LanceFileVersion,
 ) -> Result<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> {
-    use crate::index::DatasetIndexExt;
-    use crate::index::scalar::{IndexDetails, fetch_index_details};
-    use lance_table::format::IndexMetadata;
-
     // Seeds only make sense when appending to an existing dataset with V2 files.
     if storage_version == LanceFileVersion::Legacy {
         return Ok(Vec::new());
@@ -4276,6 +4275,7 @@ mod tests {
             },
             LanceFileVersion::V2_1,
             Some(target_bases),
+            vec![],
         )
         .await;
 
@@ -4590,6 +4590,7 @@ mod tests {
             .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+    }
 
     #[tokio::test]
     async fn test_zone_map_seeds_used_during_update() {
@@ -4615,8 +4616,9 @@ mod tests {
             .into_reader_rows(RowCount::from(100), BatchCount::from(1));
         let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
 
-        // Step 2: Create a zone map index
-        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap);
+        // Step 2: Create a zone map index with seeds explicitly enabled (Int32 defaults to off).
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
         dataset
             .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
             .await

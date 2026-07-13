@@ -30,11 +30,14 @@ message ZoneMapIndexDetails {
   // is created for the index.
   optional uint64 rows_per_zone = 1;
   // Whether seed-based incremental updates are enabled for this index.
-  // Absent (old datasets) or false: seeds disabled.
-  // true: seeds enabled; the index will embed per-fragment seed buffers in
-  // data files and harvest them during incremental updates to skip full scans.
-  // Defaults to true for variable-length column types (strings, binary) and
-  // fixed-width types wider than 8 bytes when not explicitly set by the user.
+  // On-disk semantics: absent means seeds are disabled (old datasets written
+  // before this field was added). Present false means explicitly disabled.
+  // Present true means seeds are enabled: the index will embed per-fragment
+  // seed buffers in data files and harvest them during incremental updates
+  // to skip full column scans.
+  // Creation-time default: index creation code sets this to true for
+  // variable-length types (strings, binary) and fixed-width types wider than
+  // 8 bytes, and to false for narrow fixed-width types (e.g. Int64, Float64).
   optional bool use_seeds = 2;
 }
 message InvertedIndexDetails {

@@ -315,7 +315,10 @@ def main() -> None:
 
     if args.tmpdir is not None:
         args.tmpdir.mkdir(parents=True, exist_ok=True)
-        run(args.tmpdir)
+        with tempfile.TemporaryDirectory(
+            prefix="lance_zonemap_bench_", dir=args.tmpdir
+        ) as tmp:
+            run(Path(tmp))
     else:
         with tempfile.TemporaryDirectory(prefix="lance_zonemap_bench_") as tmp:
             run(Path(tmp))

@@ -242,7 +242,10 @@ async fn try_harvest_seeds(
         };
 
         // The buf_index is always the portion before the first ':'.
-        let Ok(buf_index) = meta_value.split(':').next().unwrap().parse::<u32>() else {
+        let Some(buf_index_str) = meta_value.split(':').next() else {
+            return Ok(None);
+        };
+        let Ok(buf_index) = buf_index_str.parse::<u32>() else {
             return Ok(None);
         };
 

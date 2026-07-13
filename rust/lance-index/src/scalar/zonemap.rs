@@ -764,12 +764,12 @@ impl ZoneMapIndex {
             self.data_type.clone(),
         )?;
         builder.maps = new_zones;
-        let file = builder.write_index(dest_store).await?;
+        let files = builder.write_index(dest_store).await?;
 
         Ok(Some(CreatedIndex {
             index_details: make_zone_map_index_details(self.rows_per_zone, self.use_seeds),
             index_version: ZONEMAP_INDEX_VERSION,
-            files: vec![file],
+            files,
         }))
     }
 }
@@ -1288,10 +1288,11 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         if !details.as_ref().and_then(|d| d.use_seeds).unwrap_or(false) {
             return Ok(None);
         }
-        match ZoneMapSeedWriter::new(field_path, rows_per_zone, data_type.clone()) {
-            Ok(writer) => Ok(Some(Box::new(writer))),
-            Err(_) => Ok(None),
-        }
+        Ok(Some(Box::new(ZoneMapSeedWriter::new(
+            field_path,
+            rows_per_zone,
+            data_type.clone(),
+        )?)))
     }
 
     async fn update_from_seeds(
@@ -1385,12 +1386,16 @@ impl ZoneMapSeedWriter {
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.null_count));
         let nan_counts =
             arrow_array::UInt32Array::from_iter_values(zones.iter().map(|s| s.nan_count));
+        let zone_lengths = arrow_array::UInt64Array::from_iter_values(
+            zones.iter().map(|s| s.bound.length as u64),
+        );
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![
             Field::new("min", data_type.clone(), true),
             Field::new("max", data_type.clone(), true),
             Field::new("null_count", DataType::UInt32, false),
             Field::new("nan_count", DataType::UInt32, false),
+            Field::new("zone_length", DataType::UInt64, false),
         ]));
 
         let columns: Vec<ArrayRef> = vec![
@@ -1398,6 +1403,7 @@ impl ZoneMapSeedWriter {
             maxs,
             Arc::new(null_counts) as ArrayRef,
             Arc::new(nan_counts) as ArrayRef,
+            Arc::new(zone_lengths) as ArrayRef,
         ];
         Ok(arrow_array::RecordBatch::try_new(schema, columns)?)
     }
@@ -1452,15 +1458,20 @@ impl ZoneMapSeedWriter {
             .as_any()
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| lance_core::Error::invalid_input("seed 'nan_count' is not UInt32"))?;
+        let zone_length_col = batch
+            .column_by_name("zone_length")
+            .ok_or_else(|| {
+                lance_core::Error::invalid_input("seed batch missing 'zone_length' column")
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| lance_core::Error::invalid_input("seed 'zone_length' is not UInt64"))?;
 
         let num_zones = batch.num_rows();
         let mut zones = Vec::with_capacity(num_zones);
         for i in 0..num_zones {
             let zone_start = i as u64 * rows_per_zone;
-            // Last zone may be shorter; but for reconstruction we don't know the
-            // exact row count here so we use rows_per_zone as a sentinel. The
-            // actual length is only needed for zone-map lookups, not for appending.
-            let zone_length = rows_per_zone as usize;
+            let zone_length = zone_length_col.value(i) as usize;
             zones.push(ZoneMapStatistics {
                 min: datafusion_common::ScalarValue::try_from_array(min_col, i)?,
                 max: datafusion_common::ScalarValue::try_from_array(max_col, i)?,
@@ -1673,7 +1684,7 @@ mod tests {
         .await
         .unwrap();
 
-        ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+        ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
             .await
             .expect("Failed to load ZoneMapIndex")
     }
@@ -3343,6 +3354,7 @@ mod tests {
                 &cache,
                 10,
                 Some(modern_null_rows), // modern: complete bitmap
+                false,
             )
             .unwrap(),
         );
@@ -3378,6 +3390,7 @@ mod tests {
                 &cache,
                 10,
                 None, // legacy: null positions unknown
+                false,
             )
             .unwrap(),
         );
@@ -3398,7 +3411,7 @@ mod tests {
         .await
         .unwrap();
 
-        let merged = ZoneMapIndex::load(dest_store.clone(), None, &LanceCache::no_cache())
+        let merged = ZoneMapIndex::load(dest_store.clone(), None, &LanceCache::no_cache(), false)
             .await
             .unwrap();
 
@@ -3470,7 +3483,7 @@ mod tests {
         // Write a legacy index with one zone that has nulls but no null bitmap.
         write_legacy_zonemap(store.as_ref(), 10).await;
 
-        let index = ZoneMapIndex::load(store, None, &LanceCache::no_cache())
+        let index = ZoneMapIndex::load(store, None, &LanceCache::no_cache(), false)
             .await
             .expect("failed to load legacy zonemap");
 
@@ -3536,10 +3549,15 @@ mod tests {
         assert_eq!(zones[1].min, ScalarValue::Int32(Some(10)));
         assert_eq!(zones[1].max, ScalarValue::Int32(Some(13)));
 
-        // Zone 2: values 20..22 -> min=20, max=21
+        // Zone 2: values 20..22 -> min=20, max=21, partial zone of 2 rows
         assert_eq!(zones[2].bound.start, 8);
+        assert_eq!(zones[2].bound.length, 2, "partial zone length must be exact");
         assert_eq!(zones[2].min, ScalarValue::Int32(Some(20)));
         assert_eq!(zones[2].max, ScalarValue::Int32(Some(21)));
+
+        // Full zones must have the full rows_per_zone length
+        assert_eq!(zones[0].bound.length, rows_per_zone as usize);
+        assert_eq!(zones[1].bound.length, rows_per_zone as usize);
     }
 
     #[tokio::test]
@@ -3566,12 +3584,15 @@ mod tests {
         );
 
         // Zone 0: rows 0..5
+        assert_eq!(zones[0].bound.length, 5);
         assert_eq!(zones[0].min, ScalarValue::Int32(Some(0)));
         assert_eq!(zones[0].max, ScalarValue::Int32(Some(4)));
         // Zone 1: rows 5..10
+        assert_eq!(zones[1].bound.length, 5);
         assert_eq!(zones[1].min, ScalarValue::Int32(Some(5)));
         assert_eq!(zones[1].max, ScalarValue::Int32(Some(9)));
         // Zone 2: rows 10..12 (partial)
+        assert_eq!(zones[2].bound.length, 2, "partial zone length must be 2");
         assert_eq!(zones[2].min, ScalarValue::Int32(Some(10)));
         assert_eq!(zones[2].max, ScalarValue::Int32(Some(11)));
     }
