@@ -121,7 +121,9 @@ pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts}
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
-pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
+/// Rows per output batch when neither the scan options nor
+/// `LANCE_DEFAULT_BATCH_SIZE` specify one.
+pub const BATCH_SIZE_FALLBACK: usize = 8192;
 
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
 fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>

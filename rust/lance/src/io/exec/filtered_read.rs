@@ -425,7 +425,6 @@ impl FilteredReadStream {
         let fragment_streams = futures::stream::iter(scoped_fragments)
             .map({
                 let scan_range_after_filter = scan_range_after_filter.clone();
-                let dataset = dataset.clone();
                 move |scoped_fragment| {
                     let metrics = global_metrics_clone.clone();
                     let limit = scan_range_after_filter.as_ref().map(|r| r.end);
@@ -2439,48 +2438,15 @@ impl RowStreamRead {
         let _compute_timer = self.baseline_metrics.elapsed_compute().timer();
         let keys = self.key_array(&batch, "input")?;
         let read_keys = self.key_array(&read_data, "read")?;
-
-        // Fast path: one read row per input row with an identical key
-        // sequence — already aligned, skip the hash map and the permutation
-        if keys.null_count() == 0
-            && read_data.num_rows() == batch.num_rows()
-            && read_keys.values() == keys.values()
-        {
-            let new_data = read_data.project_by_schema(self.source.new_fields_schema.as_ref())?;
-            let carried = batch.project_by_schema(self.carried_schema.as_ref())?;
-            return Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?);
-        }
-
-        let key_to_index: HashMap<u64, u32> = read_keys
-            .values()
-            .iter()
-            .enumerate()
-            .map(|(index, key)| (*key, index as u32))
-            .collect();
-
-        // Sizes differ only when some input keys have no live row (null or
-        // stale keys): drop those input rows first
-        let batch = if read_data.num_rows() != batch.num_rows() {
-            let matched: BooleanArray = keys
-                .iter()
-                .map(|key| key.map(|key| key_to_index.contains_key(&key)))
-                .collect();
-            arrow::compute::filter_record_batch(&batch, &matched)?
-        } else {
-            batch
-        };
-        if batch.num_rows() == 0 {
-            return Ok(RecordBatch::new_empty(self.output_schema.clone()));
-        }
-
-        // Gather the read rows into input order — every remaining key hits
-        let keys = self.key_array(&batch, "input")?;
-        let indices =
-            UInt32Array::from_iter_values(keys.values().iter().map(|key| key_to_index[key]));
-        let new_data = arrow_select::take::take_record_batch(&read_data, &indices)?;
-        let new_data = new_data.project_by_schema(self.source.new_fields_schema.as_ref())?;
-        let carried = batch.project_by_schema(self.carried_schema.as_ref())?;
-        Ok(carried.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+        attach_read_columns(
+            &batch,
+            keys,
+            &read_data,
+            read_keys,
+            self.carried_schema.as_ref(),
+            self.source.new_fields_schema.as_ref(),
+            &self.output_schema,
+        )
     }
 
     async fn execute_batch(
@@ -2496,78 +2462,6 @@ impl RowStreamRead {
         self.attach_columns(batch, read_data)
     }
 
-    /// Coalesce the input up to `target` rows per batch the way
-    /// [`CoalesceBatchesExec`] does: small batches merge until the buffer
-    /// reaches the target, larger batches pass through whole — a caller's
-    /// batch is never split.  Bigger batches make denser reads (more ranges
-    /// per fragment close enough to merge into one I/O), so the window a
-    /// caller hands us is worth keeping.  Order is preserved.
-    ///
-    /// [`CoalesceBatchesExec`]: datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec
-    fn coalesce_batches(
-        input: SendableRecordBatchStream,
-        target: usize,
-    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-        struct CoalesceState {
-            input: SendableRecordBatchStream,
-            buffered: Vec<RecordBatch>,
-            buffered_rows: usize,
-            exhausted: bool,
-        }
-        let schema = input.schema();
-        futures::stream::try_unfold(
-            CoalesceState {
-                input,
-                buffered: Vec::new(),
-                buffered_rows: 0,
-                exhausted: false,
-            },
-            move |mut state| {
-                let schema = schema.clone();
-                async move {
-                    loop {
-                        if state.buffered_rows >= target
-                            || (state.exhausted && !state.buffered.is_empty())
-                        {
-                            let batch = if state.buffered.len() == 1 {
-                                state.buffered.pop().unwrap()
-                            } else {
-                                arrow::compute::concat_batches(&schema, state.buffered.iter())?
-                            };
-                            state.buffered.clear();
-                            state.buffered_rows = 0;
-                            return Ok(Some((batch, state)));
-                        }
-                        if state.exhausted {
-                            return Ok(None);
-                        }
-                        match state.input.try_next().await? {
-                            Some(batch)
-                                if batch.num_rows() >= target && !state.buffered.is_empty() =>
-                            {
-                                // Flush the partial buffer on its own so the
-                                // large batch passes through without a copy
-                                // (it emits whole on the next iteration)
-                                let out =
-                                    arrow::compute::concat_batches(&schema, state.buffered.iter())?;
-                                state.buffered_rows = batch.num_rows();
-                                state.buffered = vec![batch];
-                                return Ok(Some((out, state)));
-                            }
-                            Some(batch) => {
-                                if batch.num_rows() > 0 {
-                                    state.buffered_rows += batch.num_rows();
-                                    state.buffered.push(batch);
-                                }
-                            }
-                            None => state.exhausted = true,
-                        }
-                    }
-                }
-            },
-        )
-    }
-
     fn apply(
         self: Arc<Self>,
         input: SendableRecordBatchStream,
@@ -2580,7 +2474,7 @@ impl RowStreamRead {
             .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
         let on_result = self.clone();
         let on_done = self.clone();
-        Self::coalesce_batches(input, batch_target_rows)
+        coalesce_batches(input, batch_target_rows)
             .enumerate()
             .map(move |(batch_index, batch)| {
                 let batch = batch?;
@@ -2621,6 +2515,139 @@ impl RowStreamRead {
                     .record(&on_done.scan_scheduler);
             })
     }
+}
+
+/// Align `read_data` rows back to a keyed batch's row order and merge the
+/// fetched columns on.
+///
+/// `keys` is the row-id-space key of each `batch` row (usually the batch's
+/// own key column; a caller that keys by address passes the resolved ids
+/// instead) and `read_keys` the key of each `read_data` row, which must be
+/// unique. Input rows whose key has no read row — null or stale keys — are
+/// DROPPED; duplicate input keys re-expand through the gather. Output
+/// columns follow `output_schema`: `carried_schema` names come from `batch`,
+/// `new_fields_schema` names from `read_data`.
+pub fn attach_read_columns(
+    batch: &RecordBatch,
+    keys: &arrow_array::PrimitiveArray<UInt64Type>,
+    read_data: &RecordBatch,
+    read_keys: &arrow_array::PrimitiveArray<UInt64Type>,
+    carried_schema: &arrow_schema::Schema,
+    new_fields_schema: &arrow_schema::Schema,
+    output_schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    // Fast path: one read row per input row with an identical key sequence —
+    // already aligned, skip the hash map and the permutation
+    if keys.null_count() == 0
+        && read_data.num_rows() == batch.num_rows()
+        && read_keys.values() == keys.values()
+    {
+        let new_data = read_data.project_by_schema(new_fields_schema)?;
+        let carried = batch.project_by_schema(carried_schema)?;
+        return Ok(carried.merge_with_schema(&new_data, output_schema.as_ref())?);
+    }
+
+    let key_to_index: HashMap<u64, u32> = read_keys
+        .values()
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (*key, index as u32))
+        .collect();
+
+    // Sizes differ only when some input keys have no live row (null or
+    // stale keys): drop those input rows first
+    let (batch, keys) = if read_data.num_rows() != batch.num_rows() {
+        let matched: BooleanArray = keys
+            .iter()
+            .map(|key| key.map(|key| key_to_index.contains_key(&key)))
+            .collect();
+        let keys = arrow::compute::filter(keys, &matched)?
+            .as_primitive::<UInt64Type>()
+            .clone();
+        (arrow::compute::filter_record_batch(batch, &matched)?, keys)
+    } else {
+        (batch.clone(), keys.clone())
+    };
+    if batch.num_rows() == 0 {
+        return Ok(RecordBatch::new_empty(output_schema.clone()));
+    }
+
+    // Gather the read rows into input order — every remaining key hits
+    let indices = UInt32Array::from_iter_values(keys.values().iter().map(|key| key_to_index[key]));
+    let new_data = arrow_select::take::take_record_batch(read_data, &indices)?;
+    let new_data = new_data.project_by_schema(new_fields_schema)?;
+    let carried = batch.project_by_schema(carried_schema)?;
+    Ok(carried.merge_with_schema(&new_data, output_schema.as_ref())?)
+}
+
+/// Coalesce the input up to `target` rows per batch the way
+/// [`CoalesceBatchesExec`] does: small batches merge until the buffer
+/// reaches the target, larger batches pass through whole — a caller's
+/// batch is never split.  Bigger batches make denser reads (more ranges
+/// per fragment close enough to merge into one I/O), so the window a
+/// caller hands us is worth keeping.  Order is preserved.
+///
+/// [`CoalesceBatchesExec`]: datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec
+pub fn coalesce_batches(
+    input: SendableRecordBatchStream,
+    target: usize,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    struct CoalesceState {
+        input: SendableRecordBatchStream,
+        buffered: Vec<RecordBatch>,
+        buffered_rows: usize,
+        exhausted: bool,
+    }
+    let schema = input.schema();
+    futures::stream::try_unfold(
+        CoalesceState {
+            input,
+            buffered: Vec::new(),
+            buffered_rows: 0,
+            exhausted: false,
+        },
+        move |mut state| {
+            let schema = schema.clone();
+            async move {
+                loop {
+                    if state.buffered_rows >= target
+                        || (state.exhausted && !state.buffered.is_empty())
+                    {
+                        let batch = if state.buffered.len() == 1 {
+                            state.buffered.pop().unwrap()
+                        } else {
+                            arrow::compute::concat_batches(&schema, state.buffered.iter())?
+                        };
+                        state.buffered.clear();
+                        state.buffered_rows = 0;
+                        return Ok(Some((batch, state)));
+                    }
+                    if state.exhausted {
+                        return Ok(None);
+                    }
+                    match state.input.try_next().await? {
+                        Some(batch) if batch.num_rows() >= target && !state.buffered.is_empty() => {
+                            // Flush the partial buffer on its own so the
+                            // large batch passes through without a copy
+                            // (it emits whole on the next iteration)
+                            let out =
+                                arrow::compute::concat_batches(&schema, state.buffered.iter())?;
+                            state.buffered_rows = batch.num_rows();
+                            state.buffered = vec![batch];
+                            return Ok(Some((out, state)));
+                        }
+                        Some(batch) => {
+                            if batch.num_rows() > 0 {
+                                state.buffered_rows += batch.num_rows();
+                                state.buffered.push(batch);
+                            }
+                        }
+                        None => state.exhausted = true,
+                    }
+                }
+            }
+        },
+    )
 }
 
 impl DisplayAs for FilteredReadExec {
