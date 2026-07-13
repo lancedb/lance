@@ -327,6 +327,82 @@ The protobuf for the full zip layout describes the compression of the data buffe
 size of the control words and how many bits we have per value (for fixed-width data) or how many bits we
 have per offset (for variable-width data).
 
+### Sparse Page Layout
+
+Sparse pages are a Lance 2.3+ structural layout for nested data whose Arrow structure is more compactly represented as
+slot-domain mappings than as dense repetition and definition events. Readers must reject this layout in files whose
+declared version is earlier than 2.3. This layout is identified only by `PageLayout.sparse_layout`; field metadata does
+not identify the layout of an existing page.
+
+Structural layers are ordered from outer-most to inner-most:
+
+- validity maps a nullable item or struct slot to valid or null
+- list maps non-empty parent slots to variable-size child ranges
+- fixed-size-list maps each parent slot to a child range of a fixed dimension
+
+A list slot that is valid and absent from `non_empty_positions` is an empty list. Maps use the same structural contract
+as lists. The terminal child-domain size equals `SparseLayout.num_visible_items`.
+
+Position sets have four semantic representations: `empty`, `all`, one non-empty `range`, or an `explicit`
+delta-compressed `u64` buffer. Count sets are `empty`, one positive `constant` value, or an `explicit` compressed `u64`
+buffer. Every layer has a `SparseValiditySet` whose meaning is explicit:
+
+- `SPARSE_VALIDITY_NULL_POSITIONS`: stored positions are null and all other positions are valid
+- `SPARSE_VALIDITY_VALID_POSITIONS`: stored positions are valid and all other positions are null
+
+The unspecified validity meaning is invalid. Both polarities are part of the wire contract and have identical Arrow
+semantics after normalization.
+
+#### Buffers and Selective Reads
+
+A sparse page contains the following physical buffers:
+
+| Buffer | Contents |
+| ------ | -------- |
+| 0 | Value chunk metadata, one 8-byte entry per chunk |
+| 1 | Mini-block compressed value chunks without repetition or definition levels |
+| 2+ | One buffer for each explicit position or count set, in structural-layer field order |
+
+Each value chunk metadata entry stores `(chunk_size / 8) - 1` as little-endian `u32`, followed by its visible value
+count as little-endian `u32`. The sum of chunk sizes must equal buffer 1 exactly and the sum of chunk value counts must
+equal `num_visible_items`. `num_buffers` describes the number of value buffers inside every chunk and excludes the
+structural buffers.
+
+Readers normalize structural metadata once, project requested top-level ranges through each layer, and read only value
+chunks that intersect the resulting leaf ranges. When no leaf range remains, readers rebuild offsets and validity from
+the structural plan without reading buffer 1.
+
+#### Validation
+
+Readers must reject malformed sparse metadata instead of inferring or repairing it. Required checks include:
+
+- physical buffer count and every checked offset/size range
+- first-layer row domain, adjacent parent/child domain chaining, and terminal visible-value domain
+- semantic set cardinality, explicit position ordering and bounds, and validity meaning
+- list non-empty positions being valid, count cardinality, positive counts, and child-count sum
+- fixed-size-list dimension and checked child-domain multiplication
+- value chunk byte/value sums, per-chunk descriptor buffer count, and complete chunk consumption
+
+```protobuf
+%%% proto.message.SparseLayout %%%
+```
+
+```protobuf
+%%% proto.message.SparseStructuralLayer %%%
+```
+
+```protobuf
+%%% proto.message.SparseValiditySet %%%
+```
+
+```protobuf
+%%% proto.message.SparsePositionSet %%%
+```
+
+```protobuf
+%%% proto.message.SparseCountSet %%%
+```
+
 ### Constant Page Layout
 
 This layout is used when all (visible) values in the page are the same scalar value.

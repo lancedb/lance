@@ -118,7 +118,10 @@ use arrow_buffer::{
 };
 use lance_core::{Error, Result, utils::bit::log_2_ceil};
 
-use crate::buffer::LanceBuffer;
+use crate::{
+    buffer::LanceBuffer,
+    encodings::logical::primitive::sparse::{SparseStructuralPlan, SparseStructuralUnraveler},
+};
 
 pub type LevelBuffer = Vec<u16>;
 
@@ -1514,6 +1517,7 @@ impl RepDefBuilder {
 /// This is used during decoding to create the necessary arrow structures
 #[derive(Debug)]
 pub struct RepDefUnraveler {
+    sparse: Option<SparseStructuralUnraveler>,
     rep_levels: Option<LevelBuffer>,
     def_levels: Option<LevelBuffer>,
     // Maps from definition level to the rep level at which that definition level is visible
@@ -1567,6 +1571,7 @@ impl RepDefUnraveler {
             }
         }
         Self {
+            sparse: None,
             rep_levels,
             def_levels,
             current_def_cmp: 0,
@@ -1578,7 +1583,24 @@ impl RepDefUnraveler {
         }
     }
 
+    pub(crate) fn new_sparse(plan: SparseStructuralPlan) -> Self {
+        Self {
+            sparse: Some(SparseStructuralUnraveler::new(plan)),
+            rep_levels: None,
+            def_levels: None,
+            levels_to_rep: Vec::new(),
+            def_meaning: Arc::new([]),
+            current_def_cmp: 0,
+            current_rep_cmp: 0,
+            current_layer: 0,
+            num_items: 0,
+        }
+    }
+
     pub fn is_all_valid(&self) -> bool {
+        if let Some(sparse) = &self.sparse {
+            return sparse.is_all_valid();
+        }
         self.def_levels.is_none() || self.def_meaning[self.current_layer].is_all_valid()
     }
 
@@ -1587,15 +1609,19 @@ impl RepDefUnraveler {
     ///
     /// This is not valid to call when the current level is a struct/primitive layer because
     /// in some cases there may be no rep or def information to know this.
-    pub fn max_lists(&self) -> usize {
+    pub fn max_lists(&self) -> Result<usize> {
+        if let Some(sparse) = &self.sparse {
+            return sparse.max_lists();
+        }
         debug_assert!(
             self.def_meaning[self.current_layer] != DefinitionInterpretation::NullableItem
         );
-        self.rep_levels
+        Ok(self
+            .rep_levels
             .as_ref()
             // Worst case every rep item is max_rep and a new list
             .map(|levels| levels.len())
-            .unwrap_or(0)
+            .unwrap_or(0))
     }
 
     /// Unravels a layer of offsets from the unraveler into the given offset width
@@ -1607,6 +1633,9 @@ impl RepDefUnraveler {
         offsets: &mut Vec<T>,
         validity: Option<&mut BooleanBufferBuilder>,
     ) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.unravel_offsets(offsets, validity);
+        }
         let rep_levels = self
             .rep_levels
             .as_mut()
@@ -1757,18 +1786,25 @@ impl RepDefUnraveler {
         }
     }
 
-    pub fn skip_validity(&mut self) {
+    pub fn skip_validity(&mut self) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.skip_validity();
+        }
         debug_assert!(self.is_all_valid());
         self.current_layer += 1;
+        Ok(())
     }
 
     /// Unravels a layer of validity from the definition levels
-    pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) {
+    pub fn unravel_validity(&mut self, validity: &mut BooleanBufferBuilder) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.unravel_validity(validity);
+        }
         let meaning = self.def_meaning[self.current_layer];
         if meaning == DefinitionInterpretation::AllValidItem || self.def_levels.is_none() {
             self.current_layer += 1;
             validity.append_n(self.num_items as usize, true);
-            return;
+            return Ok(());
         }
 
         self.current_layer += 1;
@@ -1786,9 +1822,13 @@ impl RepDefUnraveler {
         }) {
             validity.append(is_valid);
         }
+        Ok(())
     }
 
-    pub fn decimate(&mut self, dimension: usize) {
+    pub fn decimate(&mut self, dimension: usize) -> Result<()> {
+        if let Some(sparse) = self.sparse.as_mut() {
+            return sparse.decimate(dimension);
+        }
         if self.rep_levels.is_some() {
             // If we need to support this then I think we need to walk through the rep def levels to find
             // the spots at which we keep.  E.g. if we have:
@@ -1804,7 +1844,7 @@ impl RepDefUnraveler {
             todo!("Not yet supported FSL<...List<...>>");
         }
         let Some(def_levels) = self.def_levels.as_mut() else {
-            return;
+            return Ok(());
         };
         let mut read_idx = 0;
         let mut write_idx = 0;
@@ -1816,6 +1856,7 @@ impl RepDefUnraveler {
             read_idx += dimension;
         }
         def_levels.truncate(write_idx);
+        Ok(())
     }
 }
 
@@ -1845,7 +1886,7 @@ impl CompositeRepDefUnraveler {
     /// Unravels a layer of validity
     ///
     /// Returns None if there are no null items in this layer
-    pub fn unravel_validity(&mut self, num_values: usize) -> Option<NullBuffer> {
+    pub fn unravel_validity(&mut self, num_values: usize) -> Result<Option<NullBuffer>> {
         let is_all_valid = self
             .unravelers
             .iter()
@@ -1853,15 +1894,15 @@ impl CompositeRepDefUnraveler {
 
         if is_all_valid {
             for unraveler in self.unravelers.iter_mut() {
-                unraveler.skip_validity();
+                unraveler.skip_validity()?;
             }
-            None
+            Ok(None)
         } else {
             let mut validity = BooleanBufferBuilder::new(num_values);
             for unraveler in self.unravelers.iter_mut() {
-                unraveler.unravel_validity(&mut validity);
+                unraveler.unravel_validity(&mut validity)?;
             }
-            Some(NullBuffer::new(validity.finish()))
+            Ok(Some(NullBuffer::new(validity.finish())))
         }
     }
 
@@ -1869,9 +1910,9 @@ impl CompositeRepDefUnraveler {
         &mut self,
         num_values: usize,
         dimension: usize,
-    ) -> Option<NullBuffer> {
+    ) -> Result<Option<NullBuffer>> {
         for unraveler in self.unravelers.iter_mut() {
-            unraveler.decimate(dimension);
+            unraveler.decimate(dimension)?;
         }
         self.unravel_validity(num_values)
     }
@@ -1881,10 +1922,16 @@ impl CompositeRepDefUnraveler {
         &mut self,
     ) -> Result<(OffsetBuffer<T>, Option<NullBuffer>)> {
         let mut is_all_valid = true;
-        let mut max_num_lists = 0;
+        let mut max_num_lists: usize = 0;
         for unraveler in self.unravelers.iter() {
             is_all_valid &= unraveler.is_all_valid();
-            max_num_lists += unraveler.max_lists();
+            max_num_lists = max_num_lists
+                .checked_add(unraveler.max_lists()?)
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        "Combined repetition/definition list count exceeds usize::MAX".into(),
+                    )
+                })?;
         }
 
         let mut validity = if is_all_valid {
@@ -2666,7 +2713,7 @@ mod tests {
         // Note: validity doesn't exactly round-trip because repdef normalizes some of the
         // redundant validity values
         assert_eq!(
-            unraveler.unravel_validity(9),
+            unraveler.unravel_validity(9).unwrap(),
             Some(validity(&[
                 true, true, true, false, false, false, true, true, false
             ]))
@@ -2804,14 +2851,14 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, false, false, false, false
             ]))
         );
-        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2).unwrap(), None);
         assert_eq!(
-            unraveler.unravel_fsl_validity(2, 2),
+            unraveler.unravel_fsl_validity(2, 2).unwrap(),
             Some(validity(&[true, false]))
         );
     }
@@ -2847,10 +2894,10 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(8), None);
-        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(unraveler.unravel_validity(8).unwrap(), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2).unwrap(), None);
         assert_eq!(
-            unraveler.unravel_fsl_validity(2, 2),
+            unraveler.unravel_fsl_validity(2, 2).unwrap(),
             Some(validity(&[true, false]))
         );
     }
@@ -2928,7 +2975,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, None);
@@ -2954,7 +3001,7 @@ mod tests {
             9,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(9), None);
+        assert_eq!(unraveler.unravel_validity(9).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 1, 3, 5, 7, 9]).inner());
         assert_eq!(val, None);
@@ -3018,7 +3065,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, None);
@@ -3048,7 +3095,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, false, true])));
@@ -3078,7 +3125,7 @@ mod tests {
             8,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(6), None);
+        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
         assert_eq!(val, Some(validity(&[true, false, true, true])));
@@ -3106,11 +3153,11 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[false, true, false, false]))
         );
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[false, true, false, false]))
         );
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
@@ -3139,14 +3186,14 @@ mod tests {
         )]);
 
         assert_eq!(
-            unraveler.unravel_validity(5),
+            unraveler.unravel_validity(5).unwrap(),
             Some(validity(&[false, false, true, true, false]))
         );
         assert_eq!(
-            unraveler.unravel_validity(5),
+            unraveler.unravel_validity(5).unwrap(),
             Some(validity(&[false, false, true, true, true]))
         );
-        assert_eq!(unraveler.unravel_validity(5), None);
+        assert_eq!(unraveler.unravel_validity(5).unwrap(), None);
     }
 
     #[test]
@@ -3188,7 +3235,7 @@ mod tests {
 
         let mut unraveler = CompositeRepDefUnraveler::new(vec![unravel1, unravel2]);
 
-        assert!(unraveler.unravel_validity(9).is_none());
+        assert!(unraveler.unravel_validity(9).unwrap().is_none());
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(
             off.inner(),
@@ -3484,11 +3531,11 @@ mod tests {
             0,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(0), None);
+        assert_eq!(unraveler.unravel_validity(0).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 0, 0, 0]).inner());
         assert_eq!(val, Some(validity(&[false, false, false])));
-        let val = unraveler.unravel_validity(3).unwrap();
+        let val = unraveler.unravel_validity(3).unwrap().unwrap();
         assert_eq!(val.inner(), validity(&[true, false, true]).inner());
     }
 
@@ -3516,7 +3563,7 @@ mod tests {
             1,
         )]);
 
-        assert_eq!(unraveler.unravel_validity(1), None);
+        assert_eq!(unraveler.unravel_validity(1).unwrap(), None);
         let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
         assert_eq!(off.inner(), offsets_32(&[0, 1, 1]).inner());
         assert_eq!(val, Some(validity(&[true, false])));
@@ -3547,7 +3594,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, true, true, true, true
             ]))
@@ -3584,7 +3631,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(4),
+            unraveler.unravel_validity(4).unwrap(),
             Some(validity(&[true, false, true, true]))
         );
         assert_eq!(
@@ -3616,7 +3663,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            unraveler.unravel_validity(8),
+            unraveler.unravel_validity(8).unwrap(),
             Some(validity(&[
                 true, false, true, false, true, true, true, true
             ]))

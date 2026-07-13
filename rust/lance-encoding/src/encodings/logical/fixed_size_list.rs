@@ -255,7 +255,7 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
         match &self.data_type {
             DataType::FixedSizeList(child_field, dimension) => {
                 let num_rows = self.num_rows as usize;
-                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize);
+                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize)?;
                 let fsl_array = arrow_array::FixedSizeListArray::try_new(
                     child_field.clone(),
                     *dimension,

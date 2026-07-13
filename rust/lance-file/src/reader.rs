@@ -919,11 +919,17 @@ impl FileReader {
         let mut global_bufs_cursor = Cursor::new(gbo_bytes);
 
         let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
-        for _ in 0..footer.num_global_buffers {
+        for buffer_index in 0..footer.num_global_buffers {
             let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()?;
-            assert!(
-                version < LanceFileVersion::V2_1 || buf_pos % PAGE_BUFFER_ALIGNMENT as u64 == 0
-            );
+            if version >= LanceFileVersion::V2_1 && buf_pos % PAGE_BUFFER_ALIGNMENT as u64 != 0 {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Global buffer {} position {} is not aligned to {} bytes",
+                        buffer_index, buf_pos, PAGE_BUFFER_ALIGNMENT
+                    )
+                    .into(),
+                ));
+            }
             let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
             global_buffers.push(BufferDescriptor {
                 position: buf_pos,
@@ -1021,7 +1027,7 @@ impl FileReader {
         let num_data_bytes = footer.column_meta_start - num_global_buffer_bytes;
         let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
 
-        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
+        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version)?;
 
         // The tail read above already pulled in any global buffer that lives within
         // the captured window. Copy those user buffers (index >= 1; the schema at 0
@@ -1129,74 +1135,146 @@ impl FileReader {
         Self::read_metadata_index_with_known_schema(scheduler, Some((file_schema, num_rows))).await
     }
 
-    fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> M {
+    fn fetch_encoding<M: Default + Name + Sized>(encoding: &pbfile::Encoding) -> Result<M> {
         match &encoding.location {
-            Some(pbfile::encoding::Location::Indirect(_)) => todo!(),
+            Some(pbfile::encoding::Location::Indirect(_)) => Err(Error::invalid_input_source(
+                "Indirect file encodings are not supported".into(),
+            )),
             Some(pbfile::encoding::Location::Direct(encoding)) => {
                 let encoding_buf = Bytes::from(encoding.encoding.clone());
-                let encoding_any = prost_types::Any::decode(encoding_buf).unwrap();
-                encoding_any.to_msg::<M>().unwrap()
+                let encoding_any = prost_types::Any::decode(encoding_buf)?;
+                Ok(encoding_any.to_msg::<M>()?)
             }
-            Some(pbfile::encoding::Location::None(_)) => panic!(),
-            None => panic!(),
+            Some(pbfile::encoding::Location::None(_)) => Err(Error::invalid_input_source(
+                format!("Missing {} encoding description", M::NAME).into(),
+            )),
+            None => Err(Error::invalid_input_source(
+                format!("Missing {} encoding location", M::NAME).into(),
+            )),
         }
     }
 
     fn meta_to_col_infos(
         column_metadatas: &[pbfile::ColumnMetadata],
         file_version: LanceFileVersion,
-    ) -> Vec<Arc<ColumnInfo>> {
+    ) -> Result<Vec<Arc<ColumnInfo>>> {
         column_metadatas
             .iter()
             .enumerate()
             .map(|(col_idx, col_meta)| {
-                Self::meta_to_col_info(col_idx as u32, col_meta, file_version)
+                let col_idx = u32::try_from(col_idx).map_err(|_| {
+                    Error::invalid_input_source("File has more than u32::MAX columns".into())
+                })?;
+                Self::meta_to_col_info(col_idx, col_meta, file_version)
             })
-            .collect::<Vec<_>>()
+            .collect()
     }
 
     fn meta_to_col_info(
         col_idx: u32,
         col_meta: &pbfile::ColumnMetadata,
         file_version: LanceFileVersion,
-    ) -> Arc<ColumnInfo> {
+    ) -> Result<Arc<ColumnInfo>> {
         let page_infos = col_meta
             .pages
             .iter()
-            .map(|page| {
+            .enumerate()
+            .map(|(page_idx, page)| {
                 let num_rows = page.length;
                 let encoding = match file_version {
                     LanceFileVersion::V2_0 => {
                         PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
-                            page.encoding.as_ref().unwrap(),
-                        ))
+                            page.encoding.as_ref().ok_or_else(|| {
+                                Error::invalid_input_source(
+                                    format!(
+                                        "Column {} page {} is missing its encoding",
+                                        col_idx, page_idx
+                                    )
+                                    .into(),
+                                )
+                            })?,
+                        )?)
                     }
-                    _ => PageEncoding::Structural(Self::fetch_encoding::<pbenc21::PageLayout>(
-                        page.encoding.as_ref().unwrap(),
-                    )),
+                    _ => {
+                        let layout = Self::fetch_encoding::<pbenc21::PageLayout>(
+                            page.encoding.as_ref().ok_or_else(|| {
+                                Error::invalid_input_source(
+                                    format!(
+                                        "Column {} page {} is missing its encoding",
+                                        col_idx, page_idx
+                                    )
+                                    .into(),
+                                )
+                            })?,
+                        )?;
+                        if file_version < LanceFileVersion::V2_3
+                            && matches!(
+                                &layout.layout,
+                                Some(pbenc21::page_layout::Layout::SparseLayout(_))
+                            )
+                        {
+                            return Err(Error::invalid_input_source(
+                                format!(
+                                    "Column {} page {} uses SparseLayout in a pre-2.3 file",
+                                    col_idx, page_idx
+                                )
+                                .into(),
+                            ));
+                        }
+                        PageEncoding::Structural(layout)
+                    }
                 };
+                if page.buffer_offsets.len() != page.buffer_sizes.len() {
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Column {} page {} has {} buffer offsets but {} buffer sizes",
+                            col_idx,
+                            page_idx,
+                            page.buffer_offsets.len(),
+                            page.buffer_sizes.len()
+                        )
+                        .into(),
+                    ));
+                }
                 let buffer_offsets_and_sizes = Arc::from(
                     page.buffer_offsets
                         .iter()
                         .zip(page.buffer_sizes.iter())
-                        .map(|(offset, size)| {
-                            // Starting with version 2.1 we can assert that page buffers are aligned
-                            assert!(
-                                file_version < LanceFileVersion::V2_1
-                                    || offset % PAGE_BUFFER_ALIGNMENT as u64 == 0
-                            );
-                            (*offset, *size)
+                        .map(|(offset, size)| -> Result<_> {
+                            if file_version >= LanceFileVersion::V2_1
+                                && offset % PAGE_BUFFER_ALIGNMENT as u64 != 0
+                            {
+                                return Err(Error::invalid_input_source(
+                                    format!(
+                                        "Column {} page {} buffer offset {} is not aligned to {} bytes",
+                                        col_idx, page_idx, offset, PAGE_BUFFER_ALIGNMENT
+                                    )
+                                    .into(),
+                                ));
+                            }
+                            Ok((*offset, *size))
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<Result<Vec<_>>>()?,
                 );
-                PageInfo {
+                Ok(PageInfo {
                     buffer_offsets_and_sizes,
                     encoding,
                     num_rows,
                     priority: page.priority,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
+        if col_meta.buffer_offsets.len() != col_meta.buffer_sizes.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Column {} has {} buffer offsets but {} buffer sizes",
+                    col_idx,
+                    col_meta.buffer_offsets.len(),
+                    col_meta.buffer_sizes.len()
+                )
+                .into(),
+            ));
+        }
         let buffer_offsets_and_sizes = Arc::from(
             col_meta
                 .buffer_offsets
@@ -1205,12 +1283,16 @@ impl FileReader {
                 .map(|(offset, size)| (*offset, *size))
                 .collect::<Vec<_>>(),
         );
-        Arc::new(ColumnInfo {
+        Ok(Arc::new(ColumnInfo {
             index: col_idx,
             page_infos: Arc::from(page_infos),
             buffer_offsets_and_sizes,
-            encoding: Self::fetch_encoding(col_meta.encoding.as_ref().unwrap()),
-        })
+            encoding: Self::fetch_encoding(col_meta.encoding.as_ref().ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!("Column {} is missing its encoding", col_idx).into(),
+                )
+            })?)?,
+        }))
     }
 
     fn validate_projection(
@@ -1946,7 +2028,7 @@ impl FileMetadataProvider {
                     column_index,
                     &column_metadata,
                     metadata_index.version,
-                );
+                )?;
                 let cached = Arc::new(CachedColumnMetadata {
                     column_metadata,
                     column_info: column_info.clone(),
@@ -2108,7 +2190,21 @@ impl FileReadCore {
                     column_infos.len()
                 ))
             })?;
-            Ok(info.page_infos.iter().map(|page| page.num_rows).sum())
+            info.page_infos.iter().try_fold(0_u64, |rows, page| {
+                let page_rows = match &page.encoding {
+                    PageEncoding::Structural(layout) => match &layout.layout {
+                        Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => sparse
+                            .structural_layers
+                            .first()
+                            .map_or(page.num_rows, |layer| layer.num_slots),
+                        _ => page.num_rows,
+                    },
+                    _ => page.num_rows,
+                };
+                rows.checked_add(page_rows).ok_or_else(|| {
+                    Error::invalid_input_source("Column row count overflows u64".into())
+                })
+            })
         };
         let column_indices = &prepared.decoder_projection.column_indices;
         let fields = &prepared.decoder_projection.schema.fields;
@@ -2512,7 +2608,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
             footer.minor_version as u32,
         )?;
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version)?;
 
         Ok(Self {
             data: bytes,
@@ -2561,7 +2657,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version)?;
 
         Ok(Self {
             data: bytes,
@@ -2580,6 +2676,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
+        path::PathBuf,
         pin::Pin,
         sync::Arc,
     };
@@ -2589,6 +2686,7 @@ mod tests {
         types::{Float64Type, Int32Type},
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    use arrow_select::{concat::concat_batches, take::take};
     use bytes::Bytes;
     use futures::{StreamExt, prelude::stream::TryStreamExt};
     use lance_arrow::{BLOB_META_KEY, RecordBatchExt};
@@ -2601,8 +2699,15 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch},
         version::LanceFileVersion,
     };
-    use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{
+        object_store::ObjectStore,
+        scheduler::{IoStats, ScanScheduler, SchedulerConfig},
+        stream::RecordBatchStream,
+        utils::CachedFileSize,
+    };
     use log::debug;
+    use prost::{Message, Name};
+    use prost_types::Any;
     use rstest::rstest;
     use tokio::sync::mpsc;
 
@@ -2613,6 +2718,355 @@ mod tests {
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
     use lance_encoding::decoder::DecoderConfig;
+
+    fn direct_encoding<M: Message + Name>(message: &M) -> crate::format::pbfile::Encoding {
+        crate::format::pbfile::Encoding {
+            location: Some(crate::format::pbfile::encoding::Location::Direct(
+                crate::format::pbfile::DirectEncoding {
+                    encoding: Any::from_msg(message).unwrap().encode_to_vec(),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn sparse_layout_requires_file_version_2_3() {
+        use lance_encoding::format::{pb, pb21};
+
+        let layout = pb21::PageLayout {
+            layout: Some(pb21::page_layout::Layout::SparseLayout(
+                pb21::SparseLayout {
+                    value_compression: None,
+                    num_buffers: 0,
+                    num_items: 0,
+                    num_visible_items: 0,
+                    has_large_chunk: false,
+                    structural_layers: Vec::new(),
+                },
+            )),
+        };
+        let column_encoding = pb::ColumnEncoding {
+            column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
+        };
+        let metadata = crate::format::pbfile::ColumnMetadata {
+            pages: vec![crate::format::pbfile::column_metadata::Page {
+                buffer_offsets: vec![0, 4096],
+                buffer_sizes: vec![0, 0],
+                length: 0,
+                encoding: Some(direct_encoding(&layout)),
+                priority: 0,
+            }],
+            buffer_offsets: Vec::new(),
+            buffer_sizes: Vec::new(),
+            encoding: Some(direct_encoding(&column_encoding)),
+        };
+
+        let err = FileReader::meta_to_col_info(0, &metadata, LanceFileVersion::V2_2).unwrap_err();
+        assert!(err.to_string().contains("SparseLayout in a pre-2.3 file"));
+        FileReader::meta_to_col_info(0, &metadata, LanceFileVersion::V2_3).unwrap();
+    }
+
+    fn sparse_fixture_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/v2.3.0")
+    }
+
+    async fn open_sparse_fixture_named(name: &str) -> (FileReader, RecordBatch) {
+        let fixture_dir = sparse_fixture_dir();
+        let object_store = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(object_store, SchedulerConfig::default_for_testing());
+        let path = object_store::path::Path::from_filesystem_path(
+            fixture_dir.join(format!("{name}.lance")),
+        )
+        .unwrap();
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let expected_file = std::fs::File::open(fixture_dir.join(format!("{name}.arrow"))).unwrap();
+        let mut expected_reader =
+            arrow_ipc::reader::FileReader::try_new(expected_file, None).unwrap();
+        let expected = expected_reader.next().unwrap().unwrap();
+        assert!(expected_reader.next().is_none());
+        (reader, expected)
+    }
+
+    async fn open_sparse_fixture() -> (FileReader, RecordBatch) {
+        open_sparse_fixture_named("sparse_reader").await
+    }
+
+    #[tokio::test]
+    async fn sparse_v23_fixture_scan_range_and_discontiguous_take() {
+        let (reader, expected) = open_sparse_fixture().await;
+        assert!(matches!(
+            expected.schema().field(3).data_type(),
+            DataType::List(_)
+        ));
+        assert_eq!(reader.metadata().version(), LanceFileVersion::V2_3);
+        assert_eq!(reader.num_rows(), 4096);
+
+        let full = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        verify_expected(std::slice::from_ref(&expected), full, 4096, None).await;
+
+        let expected_range = expected.slice(95, 25);
+        let range = reader
+            .read_stream(
+                lance_io::ReadBatchParams::Range(95..120),
+                4096,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        verify_expected(&[expected_range], range, 25, None).await;
+
+        let selected_ranges = [0..2, 100..103, 4095..4096];
+        let expected_slices = selected_ranges
+            .iter()
+            .map(|range| expected.slice(range.start as usize, (range.end - range.start) as usize))
+            .collect::<Vec<_>>();
+        let expected_ranges = concat_batches(&expected.schema(), &expected_slices).unwrap();
+        let ranges = reader
+            .read_stream(
+                lance_io::ReadBatchParams::Ranges(Arc::new(selected_ranges)),
+                4096,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        verify_expected(&[expected_ranges], ranges, 6, None).await;
+
+        let indices = UInt32Array::from(vec![0, 17, 511, 1024, 2048, 4095]);
+        let expected_columns = expected
+            .columns()
+            .iter()
+            .map(|column| take(column.as_ref(), &indices, None).unwrap())
+            .collect::<Vec<_>>();
+        let expected_take = RecordBatch::try_new(expected.schema(), expected_columns).unwrap();
+        let take_stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::Indices(indices),
+                4096,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        verify_expected(&[expected_take], take_stream, 6, None).await;
+    }
+
+    fn record_sparse_position_variant(
+        positions: &Option<lance_encoding::format::pb21::SparsePositionSet>,
+        seen: &mut [bool; 4],
+    ) {
+        use lance_encoding::format::pb21::sparse_position_set::Positions;
+
+        match positions
+            .as_ref()
+            .and_then(|positions| positions.positions.as_ref())
+            .expect("fixture position set must be present")
+        {
+            Positions::Empty(_) => seen[0] = true,
+            Positions::All(_) => seen[1] = true,
+            Positions::Range(_) => seen[2] = true,
+            Positions::Explicit(_) => seen[3] = true,
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_v23_fixture_covers_the_frozen_wire_contract() {
+        use lance_encoding::format::pb21::{
+            page_layout::Layout, sparse_count_set::Counts, sparse_structural_layer::Kind,
+            sparse_validity_set::Meaning,
+        };
+
+        let (reader, expected) = open_sparse_fixture().await;
+        assert!(matches!(
+            expected.schema().field(4).data_type(),
+            DataType::LargeList(_)
+        ));
+        assert!(matches!(
+            expected.schema().field(5).data_type(),
+            DataType::Map(_, _)
+        ));
+        assert!(matches!(
+            expected.schema().field(6).data_type(),
+            DataType::FixedSizeList(_, _)
+        ));
+        assert!(matches!(
+            expected.schema().field(7).data_type(),
+            DataType::FixedSizeList(_, _)
+        ));
+        assert!(matches!(
+            expected.schema().field(8).data_type(),
+            DataType::Struct(_)
+        ));
+
+        let mut position_variants = [false; 4];
+        let mut count_variants = [false; 3];
+        let mut validity_meanings = [false; 2];
+        let mut layer_kinds = [false; 3];
+        let mut has_deep_plan = false;
+        let mut sparse_pages = 0;
+
+        let (empty_reader, _) = open_sparse_fixture_named("empty_sparse_reader").await;
+        for column in reader
+            .metadata()
+            .column_infos
+            .iter()
+            .chain(empty_reader.metadata().column_infos.iter())
+        {
+            for page in column.page_infos.iter() {
+                let lance_encoding::decoder::PageEncoding::Structural(layout) = &page.encoding
+                else {
+                    continue;
+                };
+                let Some(Layout::SparseLayout(sparse)) = &layout.layout else {
+                    continue;
+                };
+                sparse_pages += 1;
+                has_deep_plan |= sparse.structural_layers.len() >= 4;
+                assert!(sparse.value_compression.is_some());
+                assert!(sparse.num_items >= sparse.num_visible_items);
+                for layer in &sparse.structural_layers {
+                    let kind = Kind::try_from(layer.kind).unwrap();
+                    match kind {
+                        Kind::SparseLayerValidity => layer_kinds[0] = true,
+                        Kind::SparseLayerList => layer_kinds[1] = true,
+                        Kind::SparseLayerFixedSizeList => layer_kinds[2] = true,
+                        Kind::SparseLayerUnspecified => panic!("unspecified fixture layer"),
+                    }
+                    let validity = layer.validity.as_ref().unwrap();
+                    match Meaning::try_from(validity.meaning).unwrap() {
+                        Meaning::SparseValidityNullPositions => validity_meanings[0] = true,
+                        Meaning::SparseValidityValidPositions => validity_meanings[1] = true,
+                        Meaning::SparseValidityUnspecified => {
+                            panic!("unspecified fixture validity meaning")
+                        }
+                    }
+                    record_sparse_position_variant(&validity.positions, &mut position_variants);
+                    if kind == Kind::SparseLayerList {
+                        record_sparse_position_variant(
+                            &layer.non_empty_positions,
+                            &mut position_variants,
+                        );
+                        match layer
+                            .counts
+                            .as_ref()
+                            .and_then(|counts| counts.counts.as_ref())
+                            .unwrap()
+                        {
+                            Counts::Empty(_) => count_variants[0] = true,
+                            Counts::Constant(_) => count_variants[1] = true,
+                            Counts::Explicit(_) => count_variants[2] = true,
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(sparse_pages > expected.num_columns());
+        assert_eq!(position_variants, [true; 4]);
+        assert_eq!(count_variants, [true; 3]);
+        assert_eq!(validity_meanings, [true; 2]);
+        assert_eq!(layer_kinds, [true; 3]);
+        assert!(has_deep_plan);
+    }
+
+    #[tokio::test]
+    async fn sparse_v23_fixture_reads_only_intersecting_value_chunks() {
+        let (reader, _expected) = open_sparse_fixture().await;
+        let list_projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_3,
+            reader.schema(),
+            &["all_non_empty_list"],
+        )
+        .unwrap();
+
+        let full_stats = IoStats::new();
+        let measured_reader = reader.with_io_stats(full_stats.recorder());
+        measured_reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                4096,
+                1,
+                list_projection.clone(),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let full_stats = full_stats.snapshot();
+
+        let selective_stats = IoStats::new();
+        let measured_reader = reader.with_io_stats(selective_stats.recorder());
+        let actual = measured_reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![3, 2049, 4095])),
+                4096,
+                1,
+                list_projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        let selective_stats = selective_stats.snapshot();
+        assert!(selective_stats.bytes_read > 0);
+        assert!(selective_stats.bytes_read < full_stats.bytes_read);
+
+        let (empty_reader, empty_expected) = open_sparse_fixture_named("empty_sparse_reader").await;
+        let no_value_projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_3,
+            empty_reader.schema(),
+            &["no_value_list"],
+        )
+        .unwrap();
+        let no_value_stats = IoStats::new();
+        let measured_reader = empty_reader.with_io_stats(no_value_stats.recorder());
+        let actual = measured_reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::Range(1..2),
+                1,
+                1,
+                no_value_projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(
+            actual[0].column(0).to_data(),
+            empty_expected.column(0).slice(1, 1).to_data()
+        );
+        assert_eq!(no_value_stats.snapshot().bytes_read, 0);
+    }
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![

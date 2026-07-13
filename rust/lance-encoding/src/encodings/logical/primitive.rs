@@ -92,6 +92,7 @@ pub mod constant;
 pub mod dict;
 pub mod fullzip;
 pub mod miniblock;
+pub(crate) mod sparse;
 
 const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
@@ -3349,6 +3350,16 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
+            Layout::SparseLayout(sparse_layout) => {
+                Box::new(sparse::SparseStructuralScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    page_info.num_rows,
+                    target_field.data_type(),
+                    sparse_layout,
+                    decompressors,
+                )?)
+            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -3576,25 +3587,34 @@ impl StructuralCompositeDecodeArrayTask {
     fn restore_validity(
         array: Arc<dyn Array>,
         unraveler: &mut CompositeRepDefUnraveler,
-    ) -> Arc<dyn Array> {
-        let validity = unraveler.unravel_validity(array.len());
+    ) -> Result<Arc<dyn Array>> {
+        let validity = unraveler.unravel_validity(array.len())?;
         let Some(validity) = validity else {
-            return array;
+            return Ok(array);
         };
         if array.data_type() == &DataType::Null {
             // We unravel from a null array but we don't add the null buffer because arrow-rs doesn't like it
-            return array;
+            return Ok(array);
         }
-        assert_eq!(validity.len(), array.len());
-        // SAFETY: We've should have already asserted the buffers are all valid, we are just
-        // adding null buffers to the array here
-        make_array(unsafe {
+        if validity.len() != array.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Structural validity has {} entries for an array with {} values",
+                    validity.len(),
+                    array.len()
+                )
+                .into(),
+            ));
+        }
+        // SAFETY: The array buffers have already been validated and the null buffer length
+        // matches the array. We are only attaching the null buffer here.
+        Ok(make_array(unsafe {
             array
                 .to_data()
                 .into_builder()
                 .nulls(Some(validity))
                 .build_unchecked()
-        })
+        }))
     }
 }
 
@@ -3620,7 +3640,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         let array = arrow_select::concat::concat(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
-        let array = Self::restore_validity(array, &mut repdef);
+        let array = Self::restore_validity(array, &mut repdef)?;
 
         Ok(DecodedArray {
             array,
@@ -4362,7 +4382,7 @@ impl PrimitiveStructuralEncoder {
             return Ok(None);
         }
         let mut validity = BooleanBufferBuilder::new(num_values);
-        unraveler.unravel_validity(&mut validity);
+        unraveler.unravel_validity(&mut validity)?;
         Ok(Some(validity.finish()))
     }
 

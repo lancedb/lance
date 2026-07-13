@@ -21,7 +21,7 @@ The following values are supported:
 | 2.0            | 0.16.0                | Any                   | Rework of the Lance file format that removed row groups and introduced null support for lists, fixed size lists, and primitives |
 | 2.1            | 0.38.1                | Any                   | Enhances integer and string compression, adds support for nulls in struct fields, and improves random access performance with nested fields. |
 | 2.2            | None                  | Any                   | Adds support for newer nested type/encoding capabilities (including map support) and 2.2-era storage features. |
-| 2.3 (unstable) | None                  | Any                   | Adds experimental encodings for upcoming features. |
+| 2.3 (unstable) | None                  | Any                   | Adds sparse structural pages and other experimental encodings. |
 | legacy         | N/A                   | N/A                   | Alias for 0.1 |
 | stable         | N/A                   | N/A                   | Alias for the default version for new datasets in the Lance release you are running. |
 | next           | N/A                   | N/A                   | Alias for the latest unstable version in the Lance release you are running.|
