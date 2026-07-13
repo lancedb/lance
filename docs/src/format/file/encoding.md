@@ -353,6 +353,24 @@ buffer. Every layer has a `SparseValiditySet` whose meaning is explicit:
 The unspecified validity meaning is invalid. Both polarities are part of the wire contract and have identical Arrow
 semantics after normalization.
 
+#### Writer Selection
+
+Writers may emit this layout only for Lance 2.3+ fields that explicitly set
+`lance-encoding:structural-encoding=sparse`. The same request is an input error for earlier file versions. This metadata
+controls writer selection only: readers always use `PageLayout` to determine the layout of an encoded page and must
+not use field metadata for that decision.
+
+Sparse selection is opt-in. The default Lance 2.3 writer policy remains unchanged, as do explicit `miniblock` and
+`fullzip` requests. Writers normalize Arrow validity and list structure once, then use that semantic structure for
+either dense repetition/definition serialization or sparse position/count serialization. They should choose the
+validity polarity with the lower semantic encoded cost; ties use null positions.
+
+Pages without a value payload keep the existing canonical `ConstantLayout`: structural-only types such as an empty
+struct, and leaf pages whose visible values are all null, do not emit `SparseLayout`. An explicitly sparse page with
+at least one non-null visible value does emit `SparseLayout`, even when all non-null values are equal. This boundary
+avoids introducing a second structural-only representation without evidence that it improves the existing constant
+encoding.
+
 #### Buffers and Selective Reads
 
 A sparse page contains the following physical buffers:

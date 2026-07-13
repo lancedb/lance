@@ -5,6 +5,8 @@ use super::*;
 use arrow_array::new_empty_array;
 use arrow_buffer::ArrowNativeType;
 
+pub(super) mod writer;
+
 fn usize_from_u64(value: u64, label: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
         Error::invalid_input_source(
