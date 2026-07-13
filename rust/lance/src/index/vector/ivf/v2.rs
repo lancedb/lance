@@ -3956,7 +3956,7 @@ mod tests {
     /// correctness.
     #[rstest]
     #[case::ivf_flat(IndexType::IvfFlat, 0.95)]
-    #[case::ivf_pq(IndexType::IvfPq, 0.15)]
+    #[case::ivf_pq(IndexType::IvfPq, 0.2)]
     #[case::ivf_sq(IndexType::IvfSq, 0.7)]
     #[case::ivf_hnsw_pq(IndexType::IvfHnswPq, 0.15)]
     #[tokio::test]
