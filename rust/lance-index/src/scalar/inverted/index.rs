@@ -975,7 +975,7 @@ impl InvertedIndex {
                             tokens.as_ref(),
                             params.as_ref(),
                             operator,
-                            Some(impact_scorer.as_ref()),
+                            impact_scorer.as_ref(),
                             metrics.as_ref(),
                         )
                         .await?;
@@ -1959,7 +1959,7 @@ impl InvertedPartition {
         tokens: &Tokens,
         params: &FtsSearchParams,
         operator: Operator,
-        impact_scorer: Option<&MemBM25Scorer>,
+        impact_scorer: &MemBM25Scorer,
         metrics: &dyn MetricsCollector,
     ) -> Result<LoadedPostings> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
@@ -2038,18 +2038,18 @@ impl InvertedPartition {
         }
 
         if !is_fuzzy_and_query {
-            let impact_safe = impact_scorer.is_some()
-                && loaded_postings
-                    .iter()
-                    .all(|(_, _, _, posting)| posting.has_impacts());
+            let impact_safe = loaded_postings
+                .iter()
+                .all(|(_, _, _, posting)| posting.has_impacts());
             return Ok(LoadedPostings {
                 postings: loaded_postings
                     .into_iter()
                     .map(|(token_id, token, position, posting)| {
-                        let query_weight = impact_scorer
-                            .filter(|_| impact_safe)
-                            .map(|scorer| scorer.query_weight(&token))
-                            .unwrap_or_else(|| idf(posting.len(), num_docs));
+                        let query_weight = if impact_safe {
+                            impact_scorer.query_weight(&token)
+                        } else {
+                            idf(posting.len(), num_docs)
+                        };
                         PostingIterator::with_query_weight(
                             token,
                             token_id,
@@ -4033,7 +4033,7 @@ impl PostingListGroup {
                     "packed posting group column {IMPACT_COL} must not contain nulls"
                 )));
             }
-            let mut total_impact_entries = 0usize;
+            let mut derived_cache_bytes = 0usize;
             for slot in 0..batch.num_rows() {
                 let posting_blocks = postings.value_length(slot) as usize;
                 let impact_entries = impacts.value_length(slot) as usize;
@@ -4044,7 +4044,9 @@ impl PostingListGroup {
                         "packed posting group impact slot {slot} has {impact_entries} entries, expected {expected_impact_entries} for {posting_blocks} posting blocks"
                     )));
                 }
-                total_impact_entries = total_impact_entries.saturating_add(impact_entries);
+                derived_cache_bytes = derived_cache_bytes.saturating_add(
+                    ImpactSkipData::derived_cache_bytes_for_entries(impact_entries),
+                );
             }
 
             let states: Arc<[OnceLock<Box<ImpactSkipData>>]> = (0..batch.num_rows())
@@ -4054,22 +4056,12 @@ impl PostingListGroup {
             // Account up front for every allocation that the lazy states can
             // eventually retain. The impact entry bytes themselves remain in
             // `batch` and are already charged exactly once above.
-            // `ImpactSkipData` owns one mutex-backed keyed-bounds slot. Use a
-            // deliberately wider Arc payload here as a conservative stand-in
-            // for that private allocation, plus the bounds slab metadata.
-            let keyed_bounds_metadata_bytes =
-                std::mem::size_of::<std::sync::Mutex<Option<(u64, Arc<[f32]>)>>>()
-                    .saturating_add(std::mem::size_of::<(Box<[f32]>, f32)>());
             let per_slot_bytes = std::mem::size_of::<OnceLock<Box<ImpactSkipData>>>()
-                .saturating_add(std::mem::size_of::<ImpactSkipData>())
-                .saturating_add(keyed_bounds_metadata_bytes)
-                .saturating_add(std::mem::size_of::<f32>());
-            let per_entry_bytes =
-                std::mem::size_of::<u32>().saturating_add(std::mem::size_of::<f32>());
+                .saturating_add(std::mem::size_of::<ImpactSkipData>());
             let capacity_bytes = states
                 .len()
                 .saturating_mul(per_slot_bytes)
-                .saturating_add(total_impact_entries.saturating_mul(per_entry_bytes));
+                .saturating_add(derived_cache_bytes);
             (Some(states), capacity_bytes)
         } else {
             (None, 0)
@@ -4758,6 +4750,7 @@ impl CompressedPostingList {
         block[0..4].try_into().map(f32::from_le_bytes).unwrap()
     }
 
+    #[inline]
     pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
         self.block_first_docs()[block_idx]
     }

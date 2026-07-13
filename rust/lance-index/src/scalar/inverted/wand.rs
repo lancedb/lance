@@ -98,7 +98,6 @@ struct CompressedState {
     position_offsets: Vec<usize>,
     block_max_window: BlockMaxWindow,
     current_block_max_score: Option<(usize, f32)>,
-    block_least_doc_ids: Vec<Option<u32>>,
 }
 
 impl CompressedState {
@@ -113,7 +112,6 @@ impl CompressedState {
             position_offsets: Vec::new(),
             block_max_window: BlockMaxWindow::new(),
             current_block_max_score: None,
-            block_least_doc_ids: Vec::new(),
         }
     }
 
@@ -323,22 +321,6 @@ impl Ord for PostingIterator {
 }
 
 impl PostingIterator {
-    #[inline]
-    fn block_least_doc_id(&self, list: &CompressedPostingList, block_idx: usize) -> u32 {
-        let compressed = unsafe { &mut *self.compressed_state_ptr() };
-        if compressed.block_least_doc_ids.len() < list.blocks.len() {
-            compressed
-                .block_least_doc_ids
-                .resize(list.blocks.len(), None);
-        }
-        if let Some(doc_id) = compressed.block_least_doc_ids[block_idx] {
-            return doc_id;
-        }
-        let doc_id = list.block_least_doc_id(block_idx);
-        compressed.block_least_doc_ids[block_idx] = Some(doc_id);
-        doc_id
-    }
-
     fn block_idx_for_doc(
         &self,
         list: &CompressedPostingList,
@@ -347,7 +329,7 @@ impl PostingIterator {
     ) -> usize {
         let mut linear_skips = 0;
         while block_idx + 1 < list.blocks.len() && linear_skips < LINEAR_BLOCK_SKIP_LIMIT {
-            if self.block_least_doc_id(list, block_idx + 1) > least_id {
+            if list.block_least_doc_id(block_idx + 1) > least_id {
                 return block_idx;
             }
             block_idx += 1;
@@ -404,7 +386,7 @@ impl PostingIterator {
         let mut right = right;
         while left < right {
             let mid = left + (right - left) / 2;
-            if self.block_least_doc_id(list, mid) <= least_id {
+            if list.block_least_doc_id(mid) <= least_id {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -770,7 +752,7 @@ impl PostingIterator {
     fn block_first_doc(&self) -> Option<u64> {
         match self.list {
             PostingList::Compressed(ref list) => {
-                Some(self.block_least_doc_id(list, self.block_idx) as u64)
+                Some(list.block_least_doc_id(self.block_idx) as u64)
             }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index).cloned(),
         }
@@ -783,7 +765,7 @@ impl PostingIterator {
                 if self.block_idx + 1 >= list.blocks.len() {
                     return None;
                 }
-                Some(self.block_least_doc_id(list, self.block_idx + 1) as u64)
+                Some(list.block_least_doc_id(self.block_idx + 1) as u64)
             }
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index + 1).cloned(),
         }

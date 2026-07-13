@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::mem::{size_of, size_of_val};
+use std::mem::size_of;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow_array::builder::LargeBinaryBuilder;
@@ -20,7 +20,6 @@ const SMALL_FRONTIER_FREQ_LIMIT: usize = 256;
 /// reports whether a one-byte norm delta follows. The norm itself is the
 /// quantized `u8` document-length code; the common `norm_delta == 1` case needs
 /// no norm byte.
-
 #[derive(Debug, Clone)]
 pub struct ImpactSkipData {
     entries: LargeBinaryArray,
@@ -221,10 +220,14 @@ impl ImpactSkipData {
     /// yet. The Arrow impact entries are owned by the enclosing batch and are
     /// deliberately excluded so packed-group cache accounting counts them once.
     pub(crate) fn derived_cache_bytes(&self) -> usize {
-        size_of_val(&*self.entry_doc_up_tos)
+        Self::derived_cache_bytes_for_entries(self.entries.len())
+    }
+
+    pub(crate) fn derived_cache_bytes_for_entries(entry_count: usize) -> usize {
+        entry_count * size_of::<u32>()
             + size_of::<Mutex<LastKeyedImpactBounds>>()
             + size_of::<ImpactBounds>()
-            + self.entries.len() * size_of::<f32>()
+            + entry_count * size_of::<f32>()
     }
 
     #[cfg(test)]
@@ -253,24 +256,6 @@ impl ImpactSkipData {
         }
     }
 
-    /// Max score of the docs covered by the level0 entry of `block_idx`,
-    /// answered from the baked bounds slab.
-    // Only tests exercise the uncached form until the maxscore rework
-    // (stacked follow-up) anchors its block-max caches on it.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn level0_score<S: Scorer + ?Sized>(
-        &self,
-        block_idx: usize,
-        query_weight: f32,
-        scorer: &S,
-    ) -> f32 {
-        if block_idx >= self.level0_len || query_weight <= 0.0 {
-            return 0.0;
-        }
-        let mut cache = ImpactScoreCache::default();
-        cache.entry_score(self, block_idx, query_weight, scorer)
-    }
-
     pub fn level0_score_cached<S: Scorer + ?Sized>(
         &self,
         block_idx: usize,
@@ -284,24 +269,6 @@ impl ImpactSkipData {
         cache.entry_score(self, block_idx, query_weight, scorer)
     }
 
-    #[cfg(test)]
-    pub fn max_score_up_to<S, F>(
-        &self,
-        start_block_idx: usize,
-        up_to: u64,
-        _block_least_doc_id: F,
-        query_weight: f32,
-        scorer: &S,
-    ) -> ImpactScore
-    where
-        S: Scorer + ?Sized,
-        F: FnMut(usize) -> u32,
-    {
-        self.max_score_up_to_with(start_block_idx, up_to, |impacts, entry_idx| {
-            impacts.entry_score(entry_idx, query_weight, scorer)
-        })
-    }
-
     pub fn max_score_up_to_cached<S>(
         &self,
         start_block_idx: usize,
@@ -312,20 +279,6 @@ impl ImpactSkipData {
     ) -> ImpactScore
     where
         S: Scorer + ?Sized,
-    {
-        self.max_score_up_to_with(start_block_idx, up_to, |impacts, entry_idx| {
-            cache.entry_score(impacts, entry_idx, query_weight, scorer)
-        })
-    }
-
-    fn max_score_up_to_with<E>(
-        &self,
-        start_block_idx: usize,
-        up_to: u64,
-        mut entry_score: E,
-    ) -> ImpactScore
-    where
-        E: FnMut(&Self, usize) -> f32,
     {
         let mut block_idx = start_block_idx;
         let mut max_score = 0.0_f32;
@@ -345,7 +298,12 @@ impl ImpactSkipData {
                         };
                     }
                     doc_up_to if u64::from(doc_up_to) <= up_to => {
-                        max_score = max_score.max(entry_score(self, level1_entry_idx));
+                        max_score = max_score.max(cache.entry_score(
+                            self,
+                            level1_entry_idx,
+                            query_weight,
+                            scorer,
+                        ));
                         entries_scanned += 1;
                         block_idx = group_end;
                         continue;
@@ -354,7 +312,7 @@ impl ImpactSkipData {
                 }
             }
 
-            max_score = max_score.max(entry_score(self, block_idx));
+            max_score = max_score.max(cache.entry_score(self, block_idx, query_weight, scorer));
             entries_scanned += 1;
             match self.entry_doc_up_tos[block_idx] {
                 u32::MAX => {
@@ -373,28 +331,6 @@ impl ImpactSkipData {
             score: max_score,
             entries_scanned,
         }
-    }
-
-    #[cfg(test)]
-    fn entry_score<S: Scorer + ?Sized>(
-        &self,
-        entry_idx: usize,
-        query_weight: f32,
-        scorer: &S,
-    ) -> f32 {
-        if query_weight <= 0.0 {
-            return 0.0;
-        }
-        let bytes = self.entries.value(entry_idx);
-        let mut max_doc_weight = 0.0_f32;
-        if for_each_entry_pair(bytes, |freq, doc_len| {
-            max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
-        })
-        .is_err()
-        {
-            return f32::INFINITY;
-        }
-        query_weight * max_doc_weight
     }
 }
 
@@ -778,7 +714,8 @@ mod tests {
         assert_eq!(impacts.level0_len(), 40);
         assert_eq!(impacts.level1_len(), 2);
         let scorer = MemBM25Scorer::new(400, 40, HashMap::from([(String::from("token"), 40usize)]));
-        let score = impacts.max_score_up_to(0, 31, |idx| idx as u32, 1.0, &scorer);
+        let mut cache = ImpactScoreCache::default();
+        let score = impacts.max_score_up_to_cached(0, 31, 1.0, &scorer, &mut cache);
         assert!(score.entries_scanned < IMPACT_LEVEL1_BLOCKS);
         assert!(score.score > 0.0);
     }
@@ -879,25 +816,6 @@ mod tests {
     }
 
     #[test]
-    fn impact_score_cache_matches_uncached_scores() {
-        let blocks = (0..40)
-            .map(|block| vec![(block as u32, 1 + block as u32 % 3, 10)])
-            .collect::<Vec<_>>();
-        let impacts = build_impact_skip_data(&blocks).unwrap();
-        let scorer = MemBM25Scorer::new(400, 40, HashMap::from([(String::from("token"), 40usize)]));
-        let mut cache = ImpactScoreCache::default();
-
-        let uncached_level0 = impacts.level0_score(3, 1.0, &scorer);
-        let cached_level0 = impacts.level0_score_cached(3, 1.0, &scorer, &mut cache);
-        assert_eq!(cached_level0, uncached_level0);
-
-        let uncached = impacts.max_score_up_to(0, 31, |idx| idx as u32, 1.0, &scorer);
-        let cached = impacts.max_score_up_to_cached(0, 31, 1.0, &scorer, &mut cache);
-        assert_eq!(cached.score, uncached.score);
-        assert_eq!(cached.entries_scanned, uncached.entries_scanned);
-    }
-
-    #[test]
     fn impact_bounds_follow_changed_bm25_average_doc_length() {
         let impacts = build_impact_skip_data(&[vec![(0, 1, 100)]]).unwrap();
         let low_avgdl = MemBM25Scorer::new(1, 1, HashMap::new());
@@ -948,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn impact_entries_are_decoded_lazily() {
+    fn malformed_unscanned_entry_does_not_poison_range_score() {
         let level0_0 = encode_impact_entry(&[(0, 1, 10)]).unwrap();
         let malformed_level0_1 = vec![1, 2, 3];
         let level1 = encode_impact_entry(&[(0, 1, 10), (1, 1, 10)]).unwrap();
@@ -959,12 +877,12 @@ mod tests {
         ]);
         let impacts = ImpactSkipData::new(entries, 2).unwrap();
         let scorer = MemBM25Scorer::new(10, 10, HashMap::from([(String::from("token"), 2usize)]));
+        let mut cache = ImpactScoreCache::default();
 
-        let score = impacts.max_score_up_to(0, 0, |_| 0, 1.0, &scorer);
+        let score = impacts.max_score_up_to_cached(0, 0, 1.0, &scorer, &mut cache);
         assert!(score.score.is_finite());
         assert_eq!(score.entries_scanned, 1);
 
-        let mut cache = ImpactScoreCache::default();
         assert_eq!(
             impacts.level0_score_cached(1, 1.0, &scorer, &mut cache),
             f32::INFINITY
@@ -1026,8 +944,13 @@ mod tests {
         let impacts = build_impact_skip_data(&blocks).unwrap();
         assert_eq!(impacts.level1_doc_up_to(0), Some(767));
         let scorer = MemBM25Scorer::new(400, 768, HashMap::from([(String::from("t"), 768usize)]));
-        assert!(impacts.level0_score(0, 1.0, &scorer).is_finite());
-        let level1 = impacts.max_score_up_to(0, 767, |idx| (idx * 256) as u32, 1.0, &scorer);
+        let mut cache = ImpactScoreCache::default();
+        assert!(
+            impacts
+                .level0_score_cached(0, 1.0, &scorer, &mut cache)
+                .is_finite()
+        );
+        let level1 = impacts.max_score_up_to_cached(0, 767, 1.0, &scorer, &mut cache);
         assert!(level1.score.is_finite() && level1.score > 0.0);
     }
 
@@ -1055,6 +978,7 @@ mod tests {
         let impacts = build_impact_skip_data(&blocks).unwrap();
         let scorer = MemBM25Scorer::new(474, 31, HashMap::from([(String::from("token"), 4usize)]));
         let query_weight = scorer.query_weight("token");
+        let mut cache = ImpactScoreCache::default();
 
         for start_block_idx in 0..blocks.len() {
             let up_to = blocks
@@ -1065,12 +989,12 @@ mod tests {
                 .map(|(doc_id, _, _)| *doc_id)
                 .max()
                 .unwrap();
-            let upper_bound = impacts.max_score_up_to(
+            let upper_bound = impacts.max_score_up_to_cached(
                 start_block_idx,
                 u64::from(up_to),
-                |idx| blocks[idx][0].0,
                 query_weight,
                 &scorer,
+                &mut cache,
             );
             let exact_max = blocks
                 .iter()
