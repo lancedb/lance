@@ -368,15 +368,19 @@ semantics after normalization.
 
 #### Writer Selection
 
-The Lance 2.3 writer selects this layout when a field sets `lance-encoding:structural-encoding=sparse`. The same request
-is an input error for earlier file versions. This metadata controls writer selection only: readers always use
-`PageLayout` to determine the layout of an encoded page and must not use field metadata for that decision.
+Writers may emit this layout only for Lance 2.3+ fields. A field can request it explicitly with
+`lance-encoding:structural-encoding=sparse`; the same request is an input error for earlier file versions. Without an
+explicit structural encoding, the Lance 2.3 writer selects sparse only when the dense mini-block repetition/definition
+budget would split the page or one top-level row exceeds that budget, and only when the value path is supported by the
+sparse writer. Explicit `miniblock`, `fullzip`, and `sparse` requests are not changed by this automatic policy. Lance
+2.2 and earlier writers never select sparse.
 
-The default Lance 2.3 writer policy remains unchanged, as do explicit `miniblock` and `fullzip` requests. Writers
-normalize Arrow validity and list structure once, then use that semantic structure for either dense
-repetition/definition serialization or sparse position/count serialization. All-valid layers use null positions plus
-`empty`; all-null layers use valid positions plus `empty`. Other layers choose the validity polarity with the lower
-semantic encoded cost, with ties using null positions.
+Unsupported sparse value paths, including dictionary values and variable-width packed structs, retain their dense
+behavior. Writers normalize Arrow validity and list structure once. Within-budget dense pages do not build sparse
+position/count plans. All-valid layers use null positions plus `empty`; all-null layers use valid positions plus
+`empty`. Other layers choose the validity polarity with the lower semantic encoded cost, with ties using null
+positions. Field metadata controls writer selection only: readers always use `PageLayout` to determine the layout of
+an encoded page and must not use field metadata for that decision.
 
 Pages without a value payload keep the existing canonical `ConstantLayout`: structural-only types such as an empty
 struct, and leaf pages whose visible values are all null, do not emit `SparseLayout`. An explicitly sparse page with
@@ -687,7 +691,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
-| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural encoding; `sparse` requires Lance 2.3.                               |
+| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Force a structural encoding; `sparse` requires Lance 2.3.                                |
 
 ### Configuration Details
 
