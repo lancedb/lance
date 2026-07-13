@@ -55,6 +55,8 @@ const PARTITION_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PQ_MERGE_PARTITION_WINDOW_SIZ
 const DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT: usize = 2;
 const PARTITION_PREFETCH_WINDOW_COUNT_ENV: &str =
     "LANCE_IVF_PQ_MERGE_PARTITION_PREFETCH_WINDOW_COUNT";
+const DEFAULT_NON_TRANSFORMED_PARTITION_WINDOW_BYTES: usize = 128 * 1024 * 1024;
+const NON_TRANSFORMED_PARTITION_WINDOW_BYTES_ENV: &str = "LANCE_IVF_MERGE_PARTITION_WINDOW_BYTES";
 static PARTITION_WINDOW_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var(PARTITION_WINDOW_SIZE_ENV)
         .ok()
@@ -67,6 +69,67 @@ static PARTITION_PREFETCH_WINDOW_COUNT: LazyLock<usize> = LazyLock::new(|| {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PARTITION_PREFETCH_WINDOW_COUNT)
 });
+static NON_TRANSFORMED_PARTITION_WINDOW_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var(NON_TRANSFORMED_PARTITION_WINDOW_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_NON_TRANSFORMED_PARTITION_WINDOW_BYTES)
+});
+
+fn fixed_width_bytes(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => Some(1),
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => Some(2),
+        DataType::Int32
+        | DataType::UInt32
+        | DataType::Float32
+        | DataType::Date32
+        | DataType::Time32(_) => Some(4),
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Float64
+        | DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_) => Some(8),
+        DataType::FixedSizeBinary(width) => Some(*width as usize),
+        DataType::FixedSizeList(field, len) => {
+            fixed_width_bytes(field.data_type()).map(|width| width * *len as usize)
+        }
+        _ => None,
+    }
+}
+
+fn estimate_schema_row_width_bytes(schema: &ArrowSchema) -> usize {
+    schema
+        .fields()
+        .iter()
+        .map(|field| fixed_width_bytes(field.data_type()).unwrap_or(64))
+        .sum::<usize>()
+        .max(1)
+}
+
+fn estimate_non_transformed_partition_window_size(
+    accumulated_lengths: &[u32],
+    row_width_bytes: usize,
+    configured_window_size: usize,
+    target_window_bytes: usize,
+) -> usize {
+    let max_window_size = configured_window_size
+        .max(1)
+        .min(accumulated_lengths.len().max(1));
+    let Some(max_partition_rows) = accumulated_lengths.iter().copied().max() else {
+        return max_window_size;
+    };
+    if max_partition_rows == 0 {
+        return max_window_size;
+    }
+
+    let target_rows = (target_window_bytes as u128 / row_width_bytes.max(1) as u128).max(1);
+    let partitions = target_rows / max_partition_rows as u128;
+    partitions.clamp(1, max_window_size as u128) as usize
+}
 
 /// Strict bitwise equality check for FixedSizeListArray values.
 /// Returns true only if length, value_length and all underlying primitive values are equal.
@@ -757,6 +820,7 @@ pub async fn merge_partial_vector_auxiliary_files(
     // Track per-shard readers, IVF lengths, and precomputed partition offsets.
     // This avoids reopening each shard file for every partition during merge.
     let mut shard_infos: Vec<ShardInfo> = Vec::new();
+    let mut non_transformed_row_width_bytes: Option<usize> = None;
 
     progress
         .stage_start(
@@ -884,6 +948,21 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Handle logic based on detected index type
         let idx_type = detected_index_type
             .ok_or_else(|| Error::index("Unable to detect index type".to_string()))?;
+        if matches!(
+            idx_type,
+            SupportedIvfIndexType::IvfFlat
+                | SupportedIvfIndexType::IvfSq
+                | SupportedIvfIndexType::IvfHnswFlat
+                | SupportedIvfIndexType::IvfHnswSq
+        ) {
+            let schema_arrow: ArrowSchema = reader.schema().as_ref().into();
+            let row_width = estimate_schema_row_width_bytes(&schema_arrow);
+            non_transformed_row_width_bytes = Some(
+                non_transformed_row_width_bytes
+                    .map(|existing| existing.max(row_width))
+                    .unwrap_or(row_width),
+            );
+        }
 
         // Compute format version once; defaults to V2_0 if no shards processed yet
         let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
@@ -1481,7 +1560,19 @@ pub async fn merge_partial_vector_auxiliary_files(
             // Non-transformed storage (FLAT, SQ, and HNSW variants) can be
             // copied directly, but still needs the windowed reader to avoid
             // one read stream per (partition, shard).
-            let partition_window_size = *PARTITION_WINDOW_SIZE;
+            let row_width_bytes = non_transformed_row_width_bytes.unwrap_or(1);
+            let partition_window_size = estimate_non_transformed_partition_window_size(
+                &accumulated_lengths,
+                row_width_bytes,
+                *PARTITION_WINDOW_SIZE,
+                *NON_TRANSFORMED_PARTITION_WINDOW_BYTES,
+            );
+            log::info!(
+                "Using non-transformed IVF merge partition window size {} (estimated row width: {} bytes, target window bytes: {})",
+                partition_window_size,
+                row_width_bytes,
+                *NON_TRANSFORMED_PARTITION_WINDOW_BYTES
+            );
             let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
             let mut shard_merge_reader = ShardMergeReader::new(
                 shard_infos,
@@ -1760,6 +1851,54 @@ mod tests {
                 row_ids.values().iter().copied().collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_estimate_non_transformed_window_size_accounts_for_row_width() {
+        let lengths = vec![4_000_u32; 1_024];
+        let target_window_bytes = 128 * 1024 * 1024;
+        let configured_window_size = 512;
+
+        let hash_like_row_width = 16;
+        let f32_768_row_width = 8 + 768 * 4;
+        let f32_1024_row_width = 8 + 1024 * 4;
+
+        let hash_window = estimate_non_transformed_partition_window_size(
+            &lengths,
+            hash_like_row_width,
+            configured_window_size,
+            target_window_bytes,
+        );
+        let f32_768_window = estimate_non_transformed_partition_window_size(
+            &lengths,
+            f32_768_row_width,
+            configured_window_size,
+            target_window_bytes,
+        );
+        let f32_1024_window = estimate_non_transformed_partition_window_size(
+            &lengths,
+            f32_1024_row_width,
+            configured_window_size,
+            target_window_bytes,
+        );
+
+        assert_eq!(hash_window, configured_window_size);
+        assert_eq!(f32_768_window, 10);
+        assert_eq!(f32_1024_window, 8);
+    }
+
+    #[test]
+    fn test_estimate_schema_row_width_bytes_for_fixed_size_vector() {
+        let schema = ArrowSchema::new(vec![
+            (*ROW_ID_FIELD).clone(),
+            Field::new(
+                crate::vector::flat::storage::FLAT_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 768),
+                true,
+            ),
+        ]);
+
+        assert_eq!(estimate_schema_row_width_bytes(&schema), 8 + 768 * 4);
     }
 
     #[tokio::test]
