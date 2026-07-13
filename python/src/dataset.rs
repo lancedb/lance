@@ -3768,7 +3768,8 @@ impl Dataset {
     /// Parameters
     /// ----------
     /// column : str
-    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
     /// sample_size : int, optional
     ///     Number of rows to sample (if None or >= total rows, uses all rows)
     /// hamming_threshold : int
@@ -3811,7 +3812,8 @@ impl Dataset {
     /// Parameters
     /// ----------
     /// column : str
-    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
     /// fragment_id : int
     ///     The fragment ID to read from
     /// start_row : int
