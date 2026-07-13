@@ -515,18 +515,35 @@ async fn create_aws_vendor(
     // explicit token-file path wins; otherwise, if opted in, resolve the
     // EKS-injected `AWS_WEB_IDENTITY_TOKEN_FILE`. Falling back to the chained
     // AssumeRole path when neither is present keeps existing behavior.
+    let assume_via_pod = properties
+        .get(aws_props::ASSUME_VIA_POD_WEB_IDENTITY)
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let pod_token_file = properties
         .get(aws_props::POD_WEB_IDENTITY_TOKEN_FILE)
         .cloned()
         .or_else(|| {
-            let enabled = properties
-                .get(aws_props::ASSUME_VIA_POD_WEB_IDENTITY)
-                .map(|v| v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            enabled
+            assume_via_pod
                 .then(|| std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").ok())
                 .flatten()
         });
+    // Log the resolved assume path once at vendor init so a deployment can
+    // confirm at runtime which branch `assume_scoped` will take.
+    match &pod_token_file {
+        Some(path) => log::info!(
+            "AWS credential vendor (role {role_arn}): direct AssumeRoleWithWebIdentity \
+             via pod token file '{path}'"
+        ),
+        None if assume_via_pod => log::warn!(
+            "AWS credential vendor (role {role_arn}): aws_assume_via_pod_web_identity=true \
+             but no token file resolved (aws_pod_web_identity_token_file unset and \
+             AWS_WEB_IDENTITY_TOKEN_FILE not in env); falling back to chained AssumeRole"
+        ),
+        None => log::info!(
+            "AWS credential vendor (role {role_arn}): chained AssumeRole \
+             (pod web-identity not enabled)"
+        ),
+    }
     if let Some(path) = pod_token_file {
         config = config.with_pod_web_identity_token_file(path);
     }

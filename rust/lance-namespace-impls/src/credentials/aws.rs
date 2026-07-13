@@ -24,6 +24,18 @@ use super::{
     redact_credential,
 };
 
+/// Render an error together with its full `source()` chain.
+fn full_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    out
+}
+
 /// Configuration for AWS credential vending.
 #[derive(Debug, Clone)]
 pub struct AwsCredentialVendorConfig {
@@ -427,7 +439,8 @@ impl AwsCredentialVendor {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
                         "AssumeRoleWithWebIdentity failed for role '{}': {}",
-                        self.config.role_arn, e
+                        self.config.role_arn,
+                        full_error_chain(&e)
                     ),
                 })
             })?;
@@ -493,7 +506,8 @@ impl AwsCredentialVendor {
                     lance_core::Error::from(NamespaceError::Internal {
                         message: format!(
                             "AssumeRoleWithWebIdentity (pod) failed for role '{}': {}",
-                            self.config.role_arn, e
+                            self.config.role_arn,
+                            full_error_chain(&e)
                         ),
                     })
                 })?;
@@ -518,7 +532,8 @@ impl AwsCredentialVendor {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
                         "AssumeRole failed for role '{}': {}",
-                        self.config.role_arn, e
+                        self.config.role_arn,
+                        full_error_chain(&e)
                     ),
                 })
             })?;
