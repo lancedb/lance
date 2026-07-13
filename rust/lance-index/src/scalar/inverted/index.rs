@@ -4210,16 +4210,12 @@ impl PostingListGroup {
                                 "packed posting group impact slot {slot} is not LargeBinary"
                             ))
                         })?;
-                        let impacts = state.get_or_init(|| {
-                            Box::new(
-                                ImpactSkipData::new(
-                                    entries.clone(),
-                                    blocks.len(),
-                                    super::impact::ImpactFormat::for_block_size(group.block_size),
-                                )
-                                .expect("packed impact entry count was validated at construction"),
-                            )
-                        });
+                        let impacts =
+                            state.get_or_init(|| {
+                                Box::new(ImpactSkipData::new(entries.clone(), blocks.len()).expect(
+                                    "packed impact entry count was validated at construction",
+                                ))
+                            });
                         Some(impacts.as_ref().clone())
                     }
                     (None, None) => None,
@@ -4724,11 +4720,7 @@ impl CompressedPostingList {
             .column_by_name(IMPACT_COL)
             .map(|col| {
                 let entries = col.as_list::<i32>().value(0).as_binary::<i64>().clone();
-                ImpactSkipData::new(
-                    entries,
-                    blocks.len(),
-                    super::impact::ImpactFormat::for_block_size(block_size),
-                )
+                ImpactSkipData::new(entries, blocks.len())
             })
             .transpose()?;
 
@@ -6074,12 +6066,11 @@ impl Ord for RawDocInfo {
     }
 }
 
-/// Lucene SmallFloat-style doc-length quantization for V3 (256-doc block)
-/// scoring: a 4-mantissa-bit float-like byte code. Values 0-7 are exact;
-/// larger values keep their top four significand bits (relative error
-/// <= 6.25%) and decode to their bucket floor. The floor only ever shortens
-/// a doc, and a shorter doc only raises its BM25 weight, so bounds baked
-/// from quantized lengths stay valid upper bounds of quantized scores.
+/// Lucene SmallFloat-style doc-length quantization for V3 scoring and impact
+/// norms: a 4-mantissa-bit float-like byte code. Values 0-7 are exact; larger
+/// values keep their top four significand bits (relative error <= 6.25%) and
+/// decode to their bucket floor. The floor only ever shortens a doc, so impact
+/// bounds remain conservative for exact-scoring V2 as well as quantized V3.
 pub(super) fn quantize_doc_length(value: u32) -> u8 {
     let num_bits = 32 - value.leading_zeros();
     if num_bits < 4 {

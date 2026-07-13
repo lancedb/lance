@@ -392,11 +392,7 @@ fn deserialize_compressed(r: &mut CacheEntryReader<'_>) -> Result<CompressedPost
             .downcast_ref::<LargeBinaryArray>()
             .ok_or_else(|| Error::io("impacts column is not a LargeBinaryArray".to_string()))?
             .clone();
-        Some(ImpactSkipData::new(
-            entries,
-            blocks.len(),
-            super::impact::ImpactFormat::for_block_size(block_size),
-        )?)
+        Some(ImpactSkipData::new(entries, blocks.len())?)
     } else {
         None
     };

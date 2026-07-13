@@ -13,34 +13,18 @@ use super::scorer::Scorer;
 pub const IMPACT_LEVEL1_BLOCKS: usize = 32;
 const SMALL_FRONTIER_FREQ_LIMIT: usize = 256;
 
-/// On-disk encoding of one impact entry.
+/// On-disk encoding of one impact entry, shared by every posting block size.
 ///
-/// `FixedU32` (128-doc blocks): [doc_up_to u32][pair_count u32][(freq u32,
-/// doc_len u32)...]. `Varint` (256-doc blocks, format V3): [doc_up_to varint]
-/// [pair_count varint][(freq delta varint, doc_len varint)...] with the
-/// frontier's freqs delta-encoded in ascending order — pairs shrink from 8
-/// bytes to ~2-3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImpactFormat {
-    FixedU32,
-    Varint,
-}
-
-impl ImpactFormat {
-    pub fn for_block_size(block_size: usize) -> Self {
-        if block_size == 256 {
-            Self::Varint
-        } else {
-            Self::FixedU32
-        }
-    }
-}
+/// Entries contain `[doc_up_to varint][pair_count varint][pairs...]`. Each
+/// pair stores a varint whose high bits are `freq_delta - 1` and whose low bit
+/// reports whether a one-byte norm delta follows. The norm itself is the
+/// quantized `u8` document-length code; the common `norm_delta == 1` case needs
+/// no norm byte.
 
 #[derive(Debug, Clone)]
 pub struct ImpactSkipData {
     entries: LargeBinaryArray,
     level0_len: usize,
-    format: ImpactFormat,
     // Last doc id covered by each entry (level0 entries then level1 entries),
     // decoded once at construction. Level1 markers are fully validated because
     // WAND may use them to skip a group; u32::MAX marks malformed entries.
@@ -54,9 +38,7 @@ pub struct ImpactSkipData {
 
 impl PartialEq for ImpactSkipData {
     fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries
-            && self.level0_len == other.level0_len
-            && self.format == other.format
+        self.entries == other.entries && self.level0_len == other.level0_len
     }
 }
 
@@ -119,14 +101,8 @@ impl ImpactScoreCache {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ImpactEntryHeader {
-    doc_up_to: u32,
-    pair_count: usize,
-}
-
 impl ImpactSkipData {
-    pub fn new(entries: LargeBinaryArray, level0_len: usize, format: ImpactFormat) -> Result<Self> {
+    pub fn new(entries: LargeBinaryArray, level0_len: usize) -> Result<Self> {
         let expected_len = level0_len + level1_len(level0_len);
         if entries.len() != expected_len {
             return Err(Error::index(format!(
@@ -143,9 +119,9 @@ impl ImpactSkipData {
                 }
                 let bytes = entries.value(entry_idx);
                 let doc_up_to = if entry_idx < level0_len {
-                    decode_level0_entry_doc_up_to(bytes, format)
+                    decode_level0_entry_doc_up_to(bytes)
                 } else {
-                    decode_entry_doc_up_to(bytes, format)
+                    decode_entry_doc_up_to(bytes)
                 };
                 doc_up_to.unwrap_or(u32::MAX)
             })
@@ -153,7 +129,6 @@ impl ImpactSkipData {
         Ok(Self {
             entries,
             level0_len,
-            format,
             entry_doc_up_tos,
             last_keyed_bounds: Arc::new(Mutex::new(None)),
         })
@@ -198,12 +173,6 @@ impl ImpactSkipData {
     }
 
     fn compute_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> ImpactBounds {
-        // V3 (Varint impacts <=> 256-doc blocks) scores with quantized doc
-        // lengths, so bake the bounds against the same quantized lengths.
-        // Quantization is monotone, so pareto dominance among the stored
-        // (freq, doc_len) frontier pairs is preserved and the frontier max
-        // still bounds every doc in the range.
-        let quantized = self.format == ImpactFormat::Varint;
         let per_entry = (0..self.entries.len())
             .map(|entry_idx| {
                 if self.entries.is_null(entry_idx) {
@@ -211,14 +180,7 @@ impl ImpactSkipData {
                 }
                 let bytes = self.entries.value(entry_idx);
                 let mut max_doc_weight = 0.0_f32;
-                match for_each_entry_pair(bytes, self.format, |freq, doc_len| {
-                    let doc_len = if quantized {
-                        super::index::dequantize_doc_length(super::index::quantize_doc_length(
-                            doc_len,
-                        ))
-                    } else {
-                        doc_len
-                    };
+                match for_each_entry_pair(bytes, |freq, doc_len| {
                     max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
                 }) {
                     Ok(()) => max_doc_weight,
@@ -425,7 +387,7 @@ impl ImpactSkipData {
         }
         let bytes = self.entries.value(entry_idx);
         let mut max_doc_weight = 0.0_f32;
-        if for_each_entry_pair(bytes, self.format, |freq, doc_len| {
+        if for_each_entry_pair(bytes, |freq, doc_len| {
             max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
         })
         .is_err()
@@ -441,7 +403,6 @@ pub struct ImpactSkipDataBuilder {
     level0_len: usize,
     level1_entries: Vec<Vec<u8>>,
     level1_docs: Vec<(u32, u32, u32)>,
-    format: ImpactFormat,
 }
 
 impl ImpactSkipDataBuilder {
@@ -454,12 +415,11 @@ impl ImpactSkipDataBuilder {
             level0_len: 0,
             level1_entries: Vec::with_capacity(level1_len(level0_blocks)),
             level1_docs: Vec::with_capacity(IMPACT_LEVEL1_BLOCKS * block_size),
-            format: ImpactFormat::for_block_size(block_size),
         }
     }
 
     pub fn append_block(&mut self, docs: &[(u32, u32, u32)]) -> Result<()> {
-        let bytes = encode_impact_entry(docs, self.format)?;
+        let bytes = encode_impact_entry(docs)?;
         self.entries.append_value(bytes.as_slice());
         self.level0_len += 1;
         self.level1_docs.extend_from_slice(docs);
@@ -476,11 +436,11 @@ impl ImpactSkipDataBuilder {
         for entry in self.level1_entries {
             self.entries.append_value(entry.as_slice());
         }
-        ImpactSkipData::new(self.entries.finish(), self.level0_len, self.format)
+        ImpactSkipData::new(self.entries.finish(), self.level0_len)
     }
 
     fn flush_level1(&mut self) -> Result<()> {
-        let bytes = encode_impact_entry(self.level1_docs.as_slice(), self.format)?;
+        let bytes = encode_impact_entry(self.level1_docs.as_slice())?;
         self.level1_entries.push(bytes);
         self.level1_docs.clear();
         Ok(())
@@ -497,7 +457,7 @@ pub fn build_impact_skip_data(blocks: &[Vec<(u32, u32, u32)>]) -> Result<ImpactS
     builder.finish()
 }
 
-fn encode_impact_entry(docs: &[(u32, u32, u32)], format: ImpactFormat) -> Result<Vec<u8>> {
+fn encode_impact_entry(docs: &[(u32, u32, u32)]) -> Result<Vec<u8>> {
     if docs.is_empty() {
         return Err(Error::index(
             "cannot encode an empty impact entry".to_owned(),
@@ -507,117 +467,182 @@ fn encode_impact_entry(docs: &[(u32, u32, u32)], format: ImpactFormat) -> Result
         .last()
         .map(|(doc_id, _, _)| *doc_id)
         .expect("non-empty impact entry was validated above");
-    let frontier = impact_frontier(docs);
+    let frontier = quantized_impact_frontier(docs);
     let pair_count = u32::try_from(frontier.len()).map_err(|_| {
         Error::index("impact frontier too large to encode as u32 pair count".to_string())
     })?;
-    let mut bytes = Vec::with_capacity(8 + frontier.len() * 8);
-    match format {
-        ImpactFormat::FixedU32 => {
-            bytes.extend_from_slice(&doc_up_to.to_le_bytes());
-            bytes.extend_from_slice(&pair_count.to_le_bytes());
-            for (freq, doc_len) in frontier {
-                bytes.extend_from_slice(&freq.to_le_bytes());
-                bytes.extend_from_slice(&doc_len.to_le_bytes());
-            }
+    let mut bytes = Vec::with_capacity(5 + frontier.len() * 2);
+    super::encoding::encode_varint_u32(&mut bytes, doc_up_to);
+    super::encoding::encode_varint_u32(&mut bytes, pair_count);
+    let mut previous_freq = 0u32;
+    let mut previous_norm = 0u8;
+    for (pair_idx, (freq, norm)) in frontier.into_iter().enumerate() {
+        let freq_delta_minus_one = freq
+            .checked_sub(previous_freq)
+            .and_then(|delta| delta.checked_sub(1))
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "impact frequencies must be positive and strictly increasing: previous={previous_freq}, current={freq}"
+                ))
+            })?;
+        let norm_delta = norm.checked_sub(previous_norm).ok_or_else(|| {
+            Error::index(format!(
+                "impact norms must be non-decreasing: previous={previous_norm}, current={norm}"
+            ))
+        })?;
+        if pair_idx > 0 && norm_delta == 0 {
+            return Err(Error::index(format!(
+                "impact norms must be strictly increasing after quantization: norm={norm}"
+            )));
         }
-        ImpactFormat::Varint => {
-            super::encoding::encode_varint_u32(&mut bytes, doc_up_to);
-            super::encoding::encode_varint_u32(&mut bytes, pair_count);
-            let mut previous_freq = 0u32;
-            for (freq, doc_len) in frontier {
-                super::encoding::encode_varint_u32(&mut bytes, freq - previous_freq);
-                super::encoding::encode_varint_u32(&mut bytes, doc_len);
-                previous_freq = freq;
-            }
+
+        let has_explicit_norm_delta = norm_delta != 1;
+        let packed_freq_delta =
+            (u64::from(freq_delta_minus_one) << 1) | u64::from(has_explicit_norm_delta);
+        encode_varint_u64(&mut bytes, packed_freq_delta);
+        if has_explicit_norm_delta {
+            bytes.push(norm_delta);
         }
+        previous_freq = freq;
+        previous_norm = norm;
     }
     Ok(bytes)
 }
 
-fn decode_entry_doc_up_to(bytes: &[u8], format: ImpactFormat) -> Result<u32> {
-    match format {
-        ImpactFormat::FixedU32 => {
-            let header = decode_header(bytes)?;
-            if header.pair_count == 0 {
-                return Err(Error::index(
-                    "impact entry must contain at least one frontier pair".to_owned(),
-                ));
-            }
-            Ok(header.doc_up_to)
-        }
-        ImpactFormat::Varint => {
-            let mut offset = 0usize;
-            let doc_up_to = super::encoding::decode_varint_u32(bytes, &mut offset)?;
-            // Level-1 doc ids drive whole-group skips, so only publish a doc
-            // id after validating the complete entry. A truncated entry may
-            // still have a valid first varint.
-            for_each_entry_pair(bytes, format, |_, _| {})?;
-            Ok(doc_up_to)
-        }
-    }
+fn decode_entry_doc_up_to(bytes: &[u8]) -> Result<u32> {
+    let mut offset = 0usize;
+    let doc_up_to = super::encoding::decode_varint_u32(bytes, &mut offset)?;
+    // Level-1 doc ids drive whole-group skips, so only publish a doc id after
+    // validating the complete entry. A truncated entry may still have a valid
+    // first varint.
+    for_each_entry_pair(bytes, |_, _| {})?;
+    Ok(doc_up_to)
 }
 
-fn decode_level0_entry_doc_up_to(bytes: &[u8], format: ImpactFormat) -> Result<u32> {
-    match format {
-        // Fixed entries validate their complete layout from the header in O(1).
-        ImpactFormat::FixedU32 => decode_entry_doc_up_to(bytes, format),
-        // A malformed level0 frontier bakes an INFINITY score before this
-        // marker can terminate a range scan, so avoid parsing every frontier
-        // twice on the query-load path. Level1 entries are fully validated.
-        ImpactFormat::Varint => {
-            let mut offset = 0usize;
-            super::encoding::decode_varint_u32(bytes, &mut offset)
-        }
-    }
+fn decode_level0_entry_doc_up_to(bytes: &[u8]) -> Result<u32> {
+    // A malformed level0 frontier bakes an INFINITY score before this marker
+    // can terminate a range scan, so avoid parsing every frontier twice on the
+    // query-load path. Level1 entries are fully validated.
+    let mut offset = 0usize;
+    super::encoding::decode_varint_u32(bytes, &mut offset)
 }
 
 /// Walk an entry's (freq, doc_len) frontier pairs, validating the layout.
-fn for_each_entry_pair(
-    bytes: &[u8],
-    format: ImpactFormat,
-    mut visit: impl FnMut(u32, u32),
-) -> Result<()> {
-    match format {
-        ImpactFormat::FixedU32 => {
-            let header = decode_header(bytes)?;
-            if header.pair_count == 0 {
-                return Err(Error::index(
-                    "impact entry must contain at least one frontier pair".to_owned(),
-                ));
-            }
-            let mut offset = 8usize;
-            for _ in 0..header.pair_count {
-                visit(read_u32_le(bytes, offset), read_u32_le(bytes, offset + 4));
-                offset += 8;
-            }
+fn for_each_entry_pair(bytes: &[u8], mut visit: impl FnMut(u32, u32)) -> Result<()> {
+    let mut offset = 0usize;
+    let _doc_up_to = super::encoding::decode_varint_u32(bytes, &mut offset)?;
+    let pair_count = super::encoding::decode_varint_u32(bytes, &mut offset)?;
+    if pair_count == 0 {
+        return Err(Error::index(
+            "impact entry must contain at least one frontier pair".to_owned(),
+        ));
+    }
+
+    let mut previous_freq = 0u32;
+    let mut previous_norm = 0u16;
+    for pair_idx in 0..pair_count {
+        let packed_freq_delta = decode_varint_u64(bytes, &mut offset)?;
+        let freq_delta_minus_one = u32::try_from(packed_freq_delta >> 1)
+            .map_err(|_| Error::index("impact freq delta exceeds u32".to_owned()))?;
+        let freq_delta = freq_delta_minus_one
+            .checked_add(1)
+            .ok_or_else(|| Error::index("impact freq delta overflow".to_owned()))?;
+        let freq = previous_freq
+            .checked_add(freq_delta)
+            .ok_or_else(|| Error::index("impact frequency overflow".to_owned()))?;
+
+        let has_explicit_norm_delta = packed_freq_delta & 1 != 0;
+        let norm_delta = if has_explicit_norm_delta {
+            let norm_delta = bytes.get(offset).copied().ok_or_else(|| {
+                Error::index("unexpected EOF while decoding impact norm delta".to_owned())
+            })?;
+            offset += 1;
+            norm_delta
+        } else {
+            1
+        };
+        if pair_idx > 0 && norm_delta == 0 {
+            return Err(Error::index(
+                "impact norms must be strictly increasing".to_owned(),
+            ));
         }
-        ImpactFormat::Varint => {
-            let mut offset = 0usize;
-            let _doc_up_to = super::encoding::decode_varint_u32(bytes, &mut offset)?;
-            let pair_count = super::encoding::decode_varint_u32(bytes, &mut offset)?;
-            if pair_count == 0 {
-                return Err(Error::index(
-                    "impact entry must contain at least one frontier pair".to_owned(),
-                ));
-            }
-            let mut freq = 0u32;
-            for _ in 0..pair_count {
-                freq = freq
-                    .checked_add(super::encoding::decode_varint_u32(bytes, &mut offset)?)
-                    .ok_or_else(|| Error::index("impact freq delta overflow".to_owned()))?;
-                let doc_len = super::encoding::decode_varint_u32(bytes, &mut offset)?;
-                visit(freq, doc_len);
-            }
-            if offset != bytes.len() {
-                return Err(Error::index(format!(
-                    "impact varint entry has {} trailing bytes",
-                    bytes.len() - offset
-                )));
-            }
-        }
+
+        let norm = previous_norm
+            .checked_add(u16::from(norm_delta))
+            .filter(|norm| *norm <= u16::from(u8::MAX))
+            .ok_or_else(|| Error::index("impact norm delta overflow".to_owned()))?;
+        let norm = norm as u8;
+        visit(freq, super::index::dequantize_doc_length(norm));
+        previous_freq = freq;
+        previous_norm = u16::from(norm);
+    }
+    if offset != bytes.len() {
+        return Err(Error::index(format!(
+            "impact entry has {} trailing bytes",
+            bytes.len() - offset
+        )));
     }
     Ok(())
+}
+
+#[inline]
+fn encode_varint_u64(dst: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        dst.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    dst.push(value as u8);
+}
+
+#[inline]
+fn decode_varint_u64(src: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    while *offset < src.len() {
+        let byte = src[*offset];
+        *offset += 1;
+        if shift == 63 && byte & 0xFE != 0 {
+            return Err(Error::index(
+                "invalid u64 varint in impact entry".to_owned(),
+            ));
+        }
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift > 63 {
+            return Err(Error::index(
+                "invalid u64 varint in impact entry".to_owned(),
+            ));
+        }
+    }
+    Err(Error::index(
+        "unexpected EOF while decoding impact entry".to_owned(),
+    ))
+}
+
+fn quantized_impact_frontier(docs: &[(u32, u32, u32)]) -> Vec<(u32, u8)> {
+    let raw_frontier = impact_frontier(docs);
+    let mut frontier: Vec<(u32, u8)> = Vec::with_capacity(raw_frontier.len());
+    for (freq, doc_len) in raw_frontier {
+        let norm = super::index::quantize_doc_length(doc_len);
+        match frontier.last_mut() {
+            Some((last_freq, last_norm)) if *last_norm == norm => {
+                // At the same quantized norm, the larger frequency dominates.
+                *last_freq = freq;
+            }
+            Some((_, last_norm)) => {
+                debug_assert!(
+                    *last_norm < norm,
+                    "raw impact frontier document lengths must be increasing"
+                );
+                frontier.push((freq, norm));
+            }
+            None => frontier.push((freq, norm)),
+        }
+    }
+    frontier
 }
 
 fn impact_frontier(docs: &[(u32, u32, u32)]) -> Vec<(u32, u32)> {
@@ -674,39 +699,6 @@ fn frontier_from_min_doc_lens(min_doc_lens: Vec<(u32, u32)>) -> Vec<(u32, u32)> 
     }
     frontier.reverse();
     frontier
-}
-
-fn decode_header(bytes: &[u8]) -> Result<ImpactEntryHeader> {
-    if bytes.len() < 8 {
-        return Err(Error::index(format!(
-            "impact entry too short: {} bytes",
-            bytes.len()
-        )));
-    }
-    let pair_count = read_u32_le(bytes, 4) as usize;
-    let expected_len = pair_count
-        .checked_mul(8)
-        .and_then(|pairs_len| 8usize.checked_add(pairs_len))
-        .ok_or_else(|| Error::index("impact entry length overflow".to_owned()))?;
-    if bytes.len() != expected_len {
-        return Err(Error::index(format!(
-            "impact entry length mismatch: got {} bytes, expected {} for {} pairs",
-            bytes.len(),
-            expected_len,
-            pair_count
-        )));
-    }
-    Ok(ImpactEntryHeader {
-        doc_up_to: read_u32_le(bytes, 0),
-        pair_count,
-    })
-}
-
-#[inline]
-fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
-    let mut value = [0u8; 4];
-    value.copy_from_slice(&bytes[offset..offset + 4]);
-    u32::from_le_bytes(value)
 }
 
 fn level1_len(level0_len: usize) -> usize {
@@ -766,6 +758,18 @@ mod tests {
     }
 
     #[test]
+    fn quantized_impact_frontier_drops_equal_norms() {
+        let docs = vec![(0, 1, 16), (1, 2, 17), (2, 3, 24)];
+        assert_eq!(
+            quantized_impact_frontier(&docs),
+            vec![
+                (2, super::super::index::quantize_doc_length(17)),
+                (3, super::super::index::quantize_doc_length(24)),
+            ]
+        );
+    }
+
+    #[test]
     fn impact_max_score_can_use_level1_entry() {
         let blocks = (0..40)
             .map(|block| vec![(block as u32, 1 + block as u32 % 3, 10)])
@@ -796,20 +800,20 @@ mod tests {
 
     #[test]
     fn impact_level1_doc_up_to_returns_none_for_malformed_entry() {
-        let level0 = encode_impact_entry(&[(0, 1, 10)], ImpactFormat::FixedU32).unwrap();
+        let level0 = encode_impact_entry(&[(0, 1, 10)]).unwrap();
         let malformed_level1 = vec![1, 2, 3];
         let entries = LargeBinaryArray::from_opt_vec(vec![
             Some(level0.as_slice()),
             Some(malformed_level1.as_slice()),
         ]);
-        let impacts = ImpactSkipData::new(entries, 1, ImpactFormat::FixedU32).unwrap();
+        let impacts = ImpactSkipData::new(entries, 1).unwrap();
 
         assert_eq!(impacts.level1_doc_up_to(0), None);
     }
 
     #[test]
-    fn impact_level1_doc_up_to_validates_complete_varint_entry() {
-        let level0 = encode_impact_entry(&[(0, 1, 10)], ImpactFormat::Varint).unwrap();
+    fn impact_level1_doc_up_to_validates_complete_entry() {
+        let level0 = encode_impact_entry(&[(0, 1, 10)]).unwrap();
         // A complete first varint is not enough: the pair count and frontier
         // are required before this doc id can safely drive a group skip.
         let truncated_level1 = [31_u8];
@@ -817,7 +821,7 @@ mod tests {
             Some(level0.as_slice()),
             Some(truncated_level1.as_slice()),
         ]);
-        let impacts = ImpactSkipData::new(entries, 1, ImpactFormat::Varint).unwrap();
+        let impacts = ImpactSkipData::new(entries, 1).unwrap();
 
         assert_eq!(impacts.level1_doc_up_to(0), None);
     }
@@ -825,30 +829,21 @@ mod tests {
     #[test]
     fn empty_impact_frontiers_are_malformed_bounds() {
         let scorer = MemBM25Scorer::new(10, 1, HashMap::new());
-        for format in [ImpactFormat::FixedU32, ImpactFormat::Varint] {
-            let level0 = encode_impact_entry(&[(0, 1, 10)], format).unwrap();
-            let empty_level1 = match format {
-                ImpactFormat::FixedU32 => {
-                    let mut bytes = 0_u32.to_le_bytes().to_vec();
-                    bytes.extend_from_slice(&0_u32.to_le_bytes());
-                    bytes
-                }
-                ImpactFormat::Varint => vec![0, 0],
-            };
-            let entries = LargeBinaryArray::from_opt_vec(vec![
-                Some(level0.as_slice()),
-                Some(empty_level1.as_slice()),
-            ]);
-            let impacts = ImpactSkipData::new(entries, 1, format).unwrap();
-            let mut cache = ImpactScoreCache::default();
+        let level0 = encode_impact_entry(&[(0, 1, 10)]).unwrap();
+        let empty_level1 = [0, 0];
+        let entries = LargeBinaryArray::from_opt_vec(vec![
+            Some(level0.as_slice()),
+            Some(empty_level1.as_slice()),
+        ]);
+        let impacts = ImpactSkipData::new(entries, 1).unwrap();
+        let mut cache = ImpactScoreCache::default();
 
-            assert_eq!(impacts.level1_doc_up_to(0), None);
-            assert!(
-                impacts
-                    .global_max_doc_weight_cached(&scorer, &mut cache)
-                    .is_infinite()
-            );
-        }
+        assert_eq!(impacts.level1_doc_up_to(0), None);
+        assert!(
+            impacts
+                .global_max_doc_weight_cached(&scorer, &mut cache)
+                .is_infinite()
+        );
         assert!(
             ImpactSkipDataBuilder::with_capacity(1, 128)
                 .append_block(&[])
@@ -858,8 +853,8 @@ mod tests {
 
     #[test]
     fn null_impact_entry_is_an_infinite_bound_even_with_hidden_bytes() {
-        let level0 = encode_impact_entry(&[(0, 1, 10)], ImpactFormat::FixedU32).unwrap();
-        let level1 = encode_impact_entry(&[(0, 2, 8)], ImpactFormat::FixedU32).unwrap();
+        let level0 = encode_impact_entry(&[(0, 1, 10)]).unwrap();
+        let level1 = encode_impact_entry(&[(0, 2, 8)]).unwrap();
         let mut values = level0.clone();
         values.extend_from_slice(&level1);
         let entries = LargeBinaryArray::new(
@@ -871,7 +866,7 @@ mod tests {
             Buffer::from_vec(values),
             Some(NullBuffer::from(vec![true, false])),
         );
-        let impacts = ImpactSkipData::new(entries, 1, ImpactFormat::FixedU32).unwrap();
+        let impacts = ImpactSkipData::new(entries, 1).unwrap();
         let scorer = MemBM25Scorer::new(10, 1, HashMap::new());
         let mut cache = ImpactScoreCache::default();
 
@@ -912,9 +907,14 @@ mod tests {
 
         let low_bound = impacts.global_max_doc_weight_cached(&low_avgdl, &mut low_cache);
         let high_bound = impacts.global_max_doc_weight_cached(&high_avgdl, &mut high_cache);
+        let quantized_doc_length = super::super::index::dequantize_doc_length(
+            super::super::index::quantize_doc_length(100),
+        );
 
-        assert!((low_bound - low_avgdl.doc_weight(1, 100)).abs() < 1e-6);
-        assert!((high_bound - high_avgdl.doc_weight(1, 100)).abs() < 1e-6);
+        assert!((low_bound - low_avgdl.doc_weight(1, quantized_doc_length)).abs() < 1e-6);
+        assert!((high_bound - high_avgdl.doc_weight(1, quantized_doc_length)).abs() < 1e-6);
+        assert!(low_bound >= low_avgdl.doc_weight(1, 100));
+        assert!(high_bound >= high_avgdl.doc_weight(1, 100));
         assert!(
             high_bound > low_bound,
             "larger avgdl must recompute a larger bound: low={low_bound}, high={high_bound}"
@@ -949,16 +949,15 @@ mod tests {
 
     #[test]
     fn impact_entries_are_decoded_lazily() {
-        let level0_0 = encode_impact_entry(&[(0, 1, 10)], ImpactFormat::FixedU32).unwrap();
+        let level0_0 = encode_impact_entry(&[(0, 1, 10)]).unwrap();
         let malformed_level0_1 = vec![1, 2, 3];
-        let level1 =
-            encode_impact_entry(&[(0, 1, 10), (1, 1, 10)], ImpactFormat::FixedU32).unwrap();
+        let level1 = encode_impact_entry(&[(0, 1, 10), (1, 1, 10)]).unwrap();
         let entries = LargeBinaryArray::from_opt_vec(vec![
             Some(level0_0.as_slice()),
             Some(malformed_level0_1.as_slice()),
             Some(level1.as_slice()),
         ]);
-        let impacts = ImpactSkipData::new(entries, 2, ImpactFormat::FixedU32).unwrap();
+        let impacts = ImpactSkipData::new(entries, 2).unwrap();
         let scorer = MemBM25Scorer::new(10, 10, HashMap::from([(String::from("token"), 2usize)]));
 
         let score = impacts.max_score_up_to(0, 0, |_| 0, 1.0, &scorer);
@@ -973,29 +972,54 @@ mod tests {
     }
 
     #[test]
-    fn impact_varint_entries_roundtrip_and_match_fixed() {
-        let docs = vec![(3, 1, 100), (9, 2, 40), (200, 7, 80), (4095, 130, 900)];
-        let fixed = encode_impact_entry(&docs, ImpactFormat::FixedU32).unwrap();
-        let varint = encode_impact_entry(&docs, ImpactFormat::Varint).unwrap();
-        assert!(varint.len() < fixed.len());
-        assert_eq!(
-            decode_entry_doc_up_to(&fixed, ImpactFormat::FixedU32).unwrap(),
-            decode_entry_doc_up_to(&varint, ImpactFormat::Varint).unwrap()
-        );
-        let mut fixed_pairs = Vec::new();
-        for_each_entry_pair(&fixed, ImpactFormat::FixedU32, |f, l| {
-            fixed_pairs.push((f, l))
-        })
-        .unwrap();
-        let mut varint_pairs = Vec::new();
-        for_each_entry_pair(&varint, ImpactFormat::Varint, |f, l| {
-            varint_pairs.push((f, l))
-        })
-        .unwrap();
-        assert_eq!(fixed_pairs, varint_pairs);
-        assert!(!fixed_pairs.is_empty());
+    fn impact_entries_store_quantized_norm_deltas() {
+        let docs = vec![(7, 1, 1), (9, 2, 2), (12, 3, 5)];
+        let encoded = encode_impact_entry(&docs).unwrap();
 
-        // a 256-doc-block skip data goes through the varint path end to end
+        // doc_up_to=12, pair_count=3, two implicit +1 norm deltas, then an
+        // explicit +3 norm delta folded behind the frequency varint's low bit.
+        assert_eq!(encoded, vec![12, 3, 0, 0, 1, 3]);
+
+        let mut pairs = Vec::new();
+        for_each_entry_pair(&encoded, |freq, doc_len| pairs.push((freq, doc_len))).unwrap();
+        assert_eq!(pairs, vec![(1, 1), (2, 2), (3, 5)]);
+    }
+
+    #[test]
+    fn malformed_norm_deltas_are_rejected() {
+        // doc_up_to=0, pair_count=1, and the pair flag promises a norm byte
+        // that is not present.
+        let truncated = [0, 1, 1];
+        let error = for_each_entry_pair(&truncated, |_, _| {}).unwrap_err();
+        assert!(matches!(&error, Error::Index { .. }));
+        assert!(error.to_string().contains("impact norm delta"));
+
+        // The first pair reaches norm 255, so an implicit +1 on the second
+        // pair must fail instead of wrapping back to zero.
+        let overflowing = [0, 2, 1, 255, 0];
+        let error = for_each_entry_pair(&overflowing, |_, _| {}).unwrap_err();
+        assert!(matches!(&error, Error::Index { .. }));
+        assert!(error.to_string().contains("impact norm delta overflow"));
+    }
+
+    #[test]
+    fn impact_entries_roundtrip_quantized_frontier() {
+        let docs = vec![(3, 1, 100), (9, 2, 40), (200, 7, 80), (4095, 130, 900)];
+        let encoded = encode_impact_entry(&docs).unwrap();
+        assert_eq!(decode_entry_doc_up_to(&encoded).unwrap(), 4095);
+        let mut decoded_pairs = Vec::new();
+        for_each_entry_pair(&encoded, |freq, doc_len| {
+            decoded_pairs.push((freq, doc_len))
+        })
+        .unwrap();
+        let expected_pairs = quantized_impact_frontier(&docs)
+            .into_iter()
+            .map(|(freq, norm)| (freq, super::super::index::dequantize_doc_length(norm)))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_pairs, expected_pairs);
+        assert!(!decoded_pairs.is_empty());
+
+        // A 256-doc-block skip data goes through the shared codec end to end.
         let blocks: Vec<Vec<(u32, u32, u32)>> = (0..3)
             .map(|b| (0..256).map(|i| (b * 256 + i, 1 + i % 5, 10)).collect())
             .collect();
@@ -1005,6 +1029,19 @@ mod tests {
         assert!(impacts.level0_score(0, 1.0, &scorer).is_finite());
         let level1 = impacts.max_score_up_to(0, 767, |idx| (idx * 256) as u32, 1.0, &scorer);
         assert!(level1.score.is_finite() && level1.score > 0.0);
+    }
+
+    #[test]
+    fn v2_and_v3_impacts_use_identical_encoding() {
+        let docs = vec![(3, 1, 100), (9, 2, 40), (200, 7, 80)];
+        let mut v2_builder = ImpactSkipDataBuilder::with_capacity(1, 128);
+        v2_builder.append_block(&docs).unwrap();
+        let v2 = v2_builder.finish().unwrap();
+        let mut v3_builder = ImpactSkipDataBuilder::with_capacity(1, 256);
+        v3_builder.append_block(&docs).unwrap();
+        let v3 = v3_builder.finish().unwrap();
+
+        assert_eq!(v2.entries(), v3.entries());
     }
 
     #[test]
