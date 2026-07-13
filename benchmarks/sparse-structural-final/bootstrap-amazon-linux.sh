@@ -11,7 +11,8 @@ sudo dnf install -y \
     openssl-devel \
     perl \
     pkgconf-pkg-config \
-    protobuf-compiler
+    protobuf-compiler \
+    protobuf-devel
 
 if ! command -v rustup >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
