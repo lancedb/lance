@@ -173,7 +173,7 @@ def _hash_table(hashes):
 @pytest.mark.parametrize("byte_width", [8, 16])
 def test_hamming_clustering_for_sample(tmp_path, byte_width):
     hash_a = [0] * byte_width
-    hash_b = [255] + [0] * (byte_width - 1)  # 8 bits from hash_a
+    hash_b = [0] * (byte_width - 8) + [255] + [0] * 7  # 8 bits from hash_a
     hash_c = list(range(1, byte_width + 1))  # far from both
     # Rows 0,1,2 share hash_a; rows 3,4 share hash_b; row 5 is unique.
     table = _hash_table([hash_a, hash_a, hash_a, hash_b, hash_b, hash_c])
@@ -199,15 +199,22 @@ def test_hamming_clustering_multi_segment(tmp_path, byte_width):
     mask = (1 << 64) - 1
 
     def hash_bytes(value):
-        row = []
-        for lane in range(byte_width // 8):
-            lane_value = (value ^ ((lane * 0xA5A5A5A5A5A5A5A5) & mask)) & mask
-            row.extend(lane_value.to_bytes(8, "little"))
-        return row
+        if byte_width == 8:
+            lanes = [(value * 0x9E3779B97F4A7C15) & mask]
+        else:
+            # Adjacent logical values share the first 64-bit lane and differ in
+            # later lanes, so threshold-0 clustering must compare every lane.
+            lanes = [
+                ((value // 2) * 0x9E3779B97F4A7C15) & mask,
+                ((value * 0xD6E8FEB86659FD93) ^ 0xA5A5A5A5A5A5A5A5) & mask,
+            ]
+        return [
+            byte for lane_value in lanes for byte in lane_value.to_bytes(8, "little")
+        ]
 
     # 25 distinct hash values, two copies each; the same table is written to
     # fragment 0 and appended as fragment 1.
-    values = [((i // 2) * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF for i in range(50)]
+    values = [i // 2 for i in range(50)]
     table = _hash_table([hash_bytes(value) for value in values])
     dataset = lance.write_dataset(table, tmp_path / "hashes")
     dataset.create_index(
