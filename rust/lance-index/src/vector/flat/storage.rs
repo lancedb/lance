@@ -53,6 +53,14 @@ impl QuantizerStorage for FlatFloatStorage {
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        // For cosine distance, vectors have already been normalized by the IVF
+        // transform pipeline, so cosine distance is equivalent to dot distance
+        // over normalized vectors. Use dot to avoid redundant norm computation.
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::Dot,
+            _ => distance_type,
+        };
+
         let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
         } else {
@@ -534,7 +542,7 @@ impl DistCalculator for FlatFloatDistanceCalc<'_> {
 mod tests {
     use super::*;
 
-    use arrow_array::{Float16Array, Float64Array};
+    use arrow_array::{Float16Array, Float32Array, Float64Array};
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
 
@@ -582,5 +590,53 @@ mod tests {
         assert_eq!(distances.len(), 2);
         assert_eq!(distances[0], 0.0);
         assert!((distances[1] - 25.0).abs() < 1e-6);
+    }
+
+    fn make_flat_test_batch(vectors: FixedSizeListArray) -> RecordBatch {
+        let num_rows = vectors.len();
+        RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+            ),
+            (FLAT_COLUMN, Arc::new(vectors) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn test_try_from_batch_converts_cosine_to_dot() {
+        // For cosine distance, vectors are normalized by the IVF transform
+        // pipeline, so cosine is equivalent to dot over normalized vectors.
+        // try_from_batch should convert Cosine to Dot to avoid redundant
+        // norm computation during distance calculation.
+        let values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, 4).unwrap();
+        let batch = make_flat_test_batch(vectors);
+        let metadata = FlatMetadata { dim: 4 };
+
+        let storage =
+            FlatFloatStorage::try_from_batch(batch, &metadata, DistanceType::Cosine, None).unwrap();
+
+        assert_eq!(storage.distance_type(), DistanceType::Dot);
+    }
+
+    #[test]
+    fn test_try_from_batch_keeps_non_cosine_distance_types() {
+        let values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, 4).unwrap();
+        let metadata = FlatMetadata { dim: 4 };
+
+        for distance_type in [DistanceType::L2, DistanceType::Dot] {
+            let batch = make_flat_test_batch(vectors.clone());
+            let storage =
+                FlatFloatStorage::try_from_batch(batch, &metadata, distance_type, None).unwrap();
+            assert_eq!(
+                storage.distance_type(),
+                distance_type,
+                "distance type should not change for {:?}",
+                distance_type
+            );
+        }
     }
 }
