@@ -1142,8 +1142,16 @@ impl FileReader {
             )),
             Some(pbfile::encoding::Location::Direct(encoding)) => {
                 let encoding_buf = Bytes::from(encoding.encoding.clone());
-                let encoding_any = prost_types::Any::decode(encoding_buf)?;
-                Ok(encoding_any.to_msg::<M>()?)
+                let encoding_any = prost_types::Any::decode(encoding_buf).map_err(|error| {
+                    Error::invalid_input_source(
+                        format!("Invalid direct {} encoding envelope: {error}", M::NAME).into(),
+                    )
+                })?;
+                encoding_any.to_msg::<M>().map_err(|error| {
+                    Error::invalid_input_source(
+                        format!("Invalid direct {} encoding: {error}", M::NAME).into(),
+                    )
+                })
             }
             Some(pbfile::encoding::Location::None(_)) => Err(Error::invalid_input_source(
                 format!("Missing {} encoding description", M::NAME).into(),
@@ -1208,10 +1216,7 @@ impl FileReader {
                             })?,
                         )?;
                         if file_version < LanceFileVersion::V2_3
-                            && matches!(
-                                &layout.layout,
-                                Some(pbenc21::page_layout::Layout::SparseLayout(_))
-                            )
+                            && Self::layout_contains_sparse(&layout)
                         {
                             return Err(Error::invalid_input_source(
                                 format!(
@@ -1293,6 +1298,20 @@ impl FileReader {
                 )
             })?)?,
         }))
+    }
+
+    fn layout_contains_sparse(layout: &pbenc21::PageLayout) -> bool {
+        let mut current = Some(layout);
+        while let Some(layout) = current {
+            match layout.layout.as_ref() {
+                Some(pbenc21::page_layout::Layout::SparseLayout(_)) => return true,
+                Some(pbenc21::page_layout::Layout::BlobLayout(blob)) => {
+                    current = blob.inner_layout.as_deref();
+                }
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn validate_projection(
@@ -2681,9 +2700,10 @@ mod tests {
     };
 
     use arrow_array::{
-        RecordBatch, UInt32Array,
+        Int32Array, ListArray, RecordBatch, RecordBatchIterator, UInt32Array,
         types::{Float64Type, Int32Type},
     };
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
     use futures::{StreamExt, prelude::stream::TryStreamExt};
@@ -2691,10 +2711,13 @@ mod tests {
     use lance_core::{ArrowResult, datatypes::Schema};
     use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::{
+        constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE},
         decoder::{
-            DecodeBatchScheduler, DecoderPlugins, FilterExpression, ReadBatchTask, decode_batch,
+            DecodeBatchScheduler, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
+            decode_batch,
         },
         encoder::{EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch},
+        format::pb21,
         version::LanceFileVersion,
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
@@ -2757,6 +2780,160 @@ mod tests {
         let err = FileReader::meta_to_col_info(0, &metadata, LanceFileVersion::V2_2).unwrap_err();
         assert!(err.to_string().contains("SparseLayout in a pre-2.3 file"));
         FileReader::meta_to_col_info(0, &metadata, LanceFileVersion::V2_3).unwrap();
+
+        let blob_wrapped_layout = pb21::PageLayout {
+            layout: Some(pb21::page_layout::Layout::BlobLayout(Box::new(
+                pb21::BlobLayout {
+                    inner_layout: Some(Box::new(layout)),
+                    layers: Vec::new(),
+                },
+            ))),
+        };
+        let mut blob_wrapped = metadata.clone();
+        blob_wrapped.pages[0].encoding = Some(direct_encoding(&blob_wrapped_layout));
+        let err =
+            FileReader::meta_to_col_info(0, &blob_wrapped, LanceFileVersion::V2_2).unwrap_err();
+        assert!(err.to_string().contains("SparseLayout in a pre-2.3 file"));
+
+        let mut malformed = metadata;
+        malformed.pages[0].encoding = Some(crate::format::pbfile::Encoding {
+            location: Some(crate::format::pbfile::encoding::Location::Direct(
+                crate::format::pbfile::DirectEncoding {
+                    encoding: vec![0xff],
+                },
+            )),
+        });
+        let err = FileReader::meta_to_col_info(0, &malformed, LanceFileVersion::V2_3).unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn sparse_file_writer_reader_scan_range_and_take_roundtrip() {
+        let fs = FsFixture::default();
+        let sparse_metadata = HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_SPARSE.to_string(),
+        )]);
+        let value_field =
+            Field::new("values", DataType::Int32, true).with_metadata(sparse_metadata.clone());
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_field = Field::new("items", DataType::List(item_field.clone()), true)
+            .with_metadata(sparse_metadata);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![value_field, list_field]));
+        let list = ListArray::try_new(
+            item_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 2, 2, 3, 3, 5])),
+            Arc::new(Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+                Some(5),
+            ])),
+            Some(NullBuffer::from(vec![true, false, true, true, true, true])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    None,
+                    Some(30),
+                    Some(40),
+                    None,
+                    Some(60),
+                ])),
+                Arc::new(list),
+            ],
+        )
+        .unwrap();
+        let input = RecordBatchIterator::new(vec![Ok(batch.clone())], arrow_schema);
+        write_lance_file(
+            input,
+            &fs,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(file_reader.metadata.column_infos.len(), 2);
+        assert!(
+            file_reader
+                .metadata
+                .column_infos
+                .iter()
+                .flat_map(|column| column.page_infos.iter())
+                .all(|page| {
+                    matches!(
+                        &page.encoding,
+                        PageEncoding::Structural(layout)
+                            if matches!(
+                                layout.layout,
+                                Some(pb21::page_layout::Layout::SparseLayout(_))
+                            )
+                    )
+                })
+        );
+
+        let scan = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(scan, vec![batch.clone()]);
+
+        let range = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Range(1..5),
+                1024,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(range, vec![batch.slice(1, 4)]);
+
+        let indices = UInt32Array::from(vec![0, 3, 5]);
+        let take = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::Indices(indices.clone()),
+                1024,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(take, vec![batch.take(&indices).unwrap()]);
     }
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {

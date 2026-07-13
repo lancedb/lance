@@ -329,10 +329,10 @@ have per offset (for variable-width data).
 
 ### Sparse Page Layout
 
-Sparse pages are a Lance 2.3+ structural layout for nested data whose Arrow structure is more compactly represented as
-slot-domain mappings than as dense repetition and definition events. Readers must reject this layout in files whose
-declared version is earlier than 2.3. This layout is identified only by `PageLayout.sparse_layout`; field metadata does
-not identify the layout of an existing page.
+Sparse pages are a Lance 2.3+ layout for flat or nested data whose Arrow structure can be represented directly as
+slot-domain mappings instead of dense repetition and definition events. Readers must reject this layout in files whose
+declared version is earlier than 2.3, including when it is nested as a blob layout's inner page. This layout is
+identified only by `PageLayout`; field metadata does not identify the layout of an existing page.
 
 Structural layers are ordered from outer-most to inner-most:
 
@@ -340,8 +340,18 @@ Structural layers are ordered from outer-most to inner-most:
 - list maps non-empty parent slots to variable-size child ranges
 - fixed-size-list maps each parent slot to a child range of a fixed dimension
 
+The layer list may be empty for a flat, non-nullable leaf page. In that case the scheduling domain and
+`num_visible_items` must be equal. The explicit writer currently emits its normalized all-valid layer even when a flat
+page could use this shorter wire representation.
+
 A list slot that is valid and absent from `non_empty_positions` is an empty list. Maps use the same structural contract
 as lists. The terminal child-domain size equals `SparseLayout.num_visible_items`.
+
+`SparseLayout.num_items` is exact, not a lower bound. It equals `num_visible_items` plus, for every list layer,
+`num_slots - non_empty_positions.num_positions`. `ColumnMetadata.Page.length` is the encoded scheduling length: it
+equals the outer layer's `num_slots` multiplied by every fixed-size-list dimension in the layer chain. It is not the
+primitive leaf count when a fixed-size-list is nested below a list. The first layer's `num_slots` is the logical
+top-level row count used for projection. With no layers, `Page.length` equals `num_visible_items`.
 
 Position sets have four semantic representations: `empty`, `all`, one non-empty `range`, or an `explicit`
 delta-compressed `u64` buffer. Count sets are `empty`, one positive `constant` value, or an `explicit` compressed `u64`
@@ -351,7 +361,8 @@ buffer. Every layer has a `SparseValiditySet` whose meaning is explicit:
 - `SPARSE_VALIDITY_VALID_POSITIONS`: stored positions are valid and all other positions are null
 
 The unspecified validity meaning is invalid. Both polarities are part of the wire contract and have identical Arrow
-semantics after normalization.
+semantics after normalization. The aggregate cardinality of all `explicit` position and count sets in one page must
+not exceed 8,388,608 `u64` values (64 MiB before allocator overhead); larger structures must be split across pages.
 
 #### Writer Selection
 
@@ -362,8 +373,9 @@ not use field metadata for that decision.
 
 Sparse selection is opt-in. The default Lance 2.3 writer policy remains unchanged, as do explicit `miniblock` and
 `fullzip` requests. Writers normalize Arrow validity and list structure once, then use that semantic structure for
-either dense repetition/definition serialization or sparse position/count serialization. They should choose the
-validity polarity with the lower semantic encoded cost; ties use null positions.
+either dense repetition/definition serialization or sparse position/count serialization. All-valid layers use null
+positions plus `empty`; all-null layers use valid positions plus `empty`. Other layers choose the validity polarity
+with the lower semantic encoded cost, with ties using null positions.
 
 Pages without a value payload keep the existing canonical `ConstantLayout`: structural-only types such as an empty
 struct, and leaf pages whose visible values are all null, do not emit `SparseLayout`. An explicitly sparse page with
@@ -383,8 +395,13 @@ A sparse page contains the following physical buffers:
 
 Each value chunk metadata entry stores `(chunk_size / 8) - 1` as little-endian `u32`, followed by its visible value
 count as little-endian `u32`. The sum of chunk sizes must equal buffer 1 exactly and the sum of chunk value counts must
-equal `num_visible_items`. `num_buffers` describes the number of value buffers inside every chunk and excludes the
-structural buffers.
+equal `num_visible_items`. A value chunk contains at most 32,768 visible values. `num_buffers` describes the number of
+value buffers inside every chunk and excludes the structural buffers.
+
+Buffer 0, each individual value chunk, each structural buffer, and all structural buffers combined are limited to
+64 MiB. General-compressed sparse buffers must use the length-prefixed LZ4 or Zstd representation, declare at most
+64 MiB of decompressed data, and must not contain another general-compression wrapper. Compression descriptor trees
+are limited to 32 levels and 256 nodes. These bounds are checked before the corresponding allocation or I/O request.
 
 Readers normalize structural metadata once, project requested top-level ranges through each layer, and read only value
 chunks that intersect the resulting leaf ranges. When no leaf range remains, readers rebuild offsets and validity from
@@ -394,12 +411,14 @@ the structural plan without reading buffer 1.
 
 Readers must reject malformed sparse metadata instead of inferring or repairing it. Required checks include:
 
-- physical buffer count and every checked offset/size range
+- physical buffer count, chunk-count bounds, every checked offset/size range, and pre-I/O resource limits
 - first-layer row domain, adjacent parent/child domain chaining, and terminal visible-value domain
 - semantic set cardinality, explicit position ordering and bounds, and validity meaning
+- exact `num_items` and the aggregate explicit-value limit
 - list non-empty positions being valid, count cardinality, positive counts, and child-count sum
 - fixed-size-list dimension and checked child-domain multiplication
-- value chunk byte/value sums, per-chunk descriptor buffer count, and complete chunk consumption
+- value chunk byte/value sums, per-chunk value limit, bounded decompression, descriptor buffer count, and complete
+  chunk consumption
 
 ```protobuf
 %%% proto.message.SparseLayout %%%
@@ -643,7 +662,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
-| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`               | Not set          | Force a particular structural encoding to be applied (only useful for testing purposes) |
+| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural encoding; `sparse` is an explicit Lance 2.3-only opt-in.             |
 
 ### Configuration Details
 

@@ -65,7 +65,7 @@ impl FieldEncoder for FixedSizeListStructuralEncoder {
         } else {
             deep_copy_nulls(array.nulls())
         };
-        repdef.add_fsl(validity.clone(), dimension, num_rows as usize);
+        repdef.add_fsl(validity.clone(), dimension, fsl_arr.len());
 
         // FSL forces child elements to exist even under null rows. Normalize any
         // nested lists under null FSL rows to null empty lists.

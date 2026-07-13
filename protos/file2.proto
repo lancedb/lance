@@ -176,7 +176,9 @@ message ColumnMetadata {
     // This field will have the same length as `buffer_offsets` and
     // may be empty.
     repeated uint64 buffer_sizes = 2;
-    // Logical length (e.g. # rows) of the page
+    // Encoded scheduling length of the page. This is usually the logical row count,
+    // but structural layouts may scale it while preserving their top-level row domain
+    // in the page encoding.
     uint64 length = 3;
     // The encoding used to encode the page
     Encoding encoding = 4;

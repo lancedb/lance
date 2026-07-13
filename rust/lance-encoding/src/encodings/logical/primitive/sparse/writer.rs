@@ -283,7 +283,7 @@ pub(in crate::encodings::logical::primitive) fn plan(
                         num_slots_u64,
                         "list non-empty",
                     )?,
-                    counts: SparseCountSet::from_counts(counts),
+                    counts: SparseCountSet::from_counts(counts)?,
                     validity: validity_set(validity, num_slots, "list validity")?,
                 });
             }
@@ -599,13 +599,13 @@ fn encode_count_set(
             None,
             pb21::sparse_count_set::Counts::Constant(pb21::SparseCountConstant { value: *value }),
         ),
-        SparseCountSet::Explicit(counts) => {
+        SparseCountSet::Explicit { counts, .. } => {
             if counts.is_empty() {
                 return Err(Error::internal(
                     "Sparse structural explicit count set is empty".to_string(),
                 ));
             }
-            let (buffer, encoding) = encode_u64_values(counts.clone(), compression_strategy)?;
+            let (buffer, encoding) = encode_u64_values(counts.to_vec(), compression_strategy)?;
             (
                 Some(buffer),
                 pb21::sparse_count_set::Counts::Explicit(encoding),
@@ -928,6 +928,48 @@ mod tests {
         )
     }
 
+    fn list_fixed_size_list_struct() -> ArrayRef {
+        let struct_fields = Fields::from(vec![ArrowField::new("value", DataType::Int32, true)]);
+        let structs = Arc::new(StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(0),
+                None,
+                Some(2),
+                Some(3),
+                None,
+                Some(5),
+            ]))],
+            Some(null_buffer([true, true, false, true, true, true])),
+        )) as ArrayRef;
+        let fixed_size_list = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(struct_fields),
+                    true,
+                )),
+                2,
+                structs,
+                Some(null_buffer([true, false, true])),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new(
+                    "item",
+                    fixed_size_list.data_type().clone(),
+                    true,
+                )),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 1, 3, 3])),
+                fixed_size_list,
+                Some(null_buffer([true, false, true, true])),
+            )
+            .unwrap(),
+        )
+    }
+
     fn nullable_struct() -> ArrayRef {
         let fields = Fields::from(vec![ArrowField::new("value", DataType::Int32, true)]);
         Arc::new(StructArray::new(
@@ -1143,9 +1185,9 @@ mod tests {
             planned_list_layer(&explicit),
             SparseStructuralLayerPlan::List {
                 non_empty_positions: SparsePositionSet::Explicit(positions),
-                counts: SparseCountSet::Explicit(counts),
+                counts: SparseCountSet::Explicit { counts, .. },
                 ..
-            } if positions == &vec![0, 2, 4] && counts == &vec![1, 3, 2]
+            } if positions == &vec![0, 2, 4] && counts.as_ref() == [1, 3, 2]
         ));
     }
 
@@ -1249,6 +1291,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_explicit_sparse_struct_with_constant_and_sparse_children() {
+        let fields = Fields::from(vec![
+            ArrowField::new("constant", DataType::Int32, true),
+            ArrowField::new("sparse", DataType::Int32, true),
+        ]);
+        let array = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![None::<i32>; 5])),
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    Some(20),
+                    None,
+                    Some(40),
+                    Some(50),
+                ])),
+            ],
+            Some(null_buffer([true, false, true, true, false])),
+        )) as ArrayRef;
+        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
+            .await
+            .unwrap();
+        assert!(pages.iter().any(|page| matches!(
+            page_layout(page),
+            pb21::page_layout::Layout::ConstantLayout(_)
+        )));
+        assert!(pages.iter().any(|page| matches!(
+            page_layout(page),
+            pb21::page_layout::Layout::SparseLayout(_)
+        )));
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1])
+            .with_range(1..5)
+            .with_indices(vec![0, 2, 4]);
+        check_round_trip_encoding_of_data(vec![array], &cases, sparse_metadata()).await;
+    }
+
+    #[tokio::test]
     async fn test_explicit_sparse_emits_both_validity_polarities() {
         let mostly_valid = Arc::new(Int32Array::from(vec![
             Some(0),
@@ -1267,9 +1350,13 @@ mod tests {
             None,
         ])) as ArrayRef;
 
-        let null_positions = encode_pages(mostly_valid, LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let null_positions = encode_pages(
+            mostly_valid.clone(),
+            LanceFileVersion::V2_3,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         let validity = sparse_layout(&null_positions[0]).structural_layers[0]
             .validity
             .as_ref()
@@ -1279,9 +1366,13 @@ mod tests {
             pb21::sparse_validity_set::Meaning::SparseValidityNullPositions as i32
         );
 
-        let valid_positions = encode_pages(mostly_null, LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let valid_positions = encode_pages(
+            mostly_null.clone(),
+            LanceFileVersion::V2_3,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         let validity = sparse_layout(&valid_positions[0]).structural_layers[0]
             .validity
             .as_ref()
@@ -1290,6 +1381,16 @@ mod tests {
             validity.meaning,
             pb21::sparse_validity_set::Meaning::SparseValidityValidPositions as i32
         );
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1])
+            .with_range(1..5)
+            .with_indices(vec![0, 2, 5]);
+        for array in [mostly_valid, mostly_null] {
+            check_round_trip_encoding_of_data(vec![array], &cases, sparse_metadata()).await;
+        }
     }
 
     #[tokio::test]
@@ -1387,6 +1488,20 @@ mod tests {
         let fsl_pages = encode_pages(fsl.clone(), LanceFileVersion::V2_3, sparse_metadata())
             .await
             .unwrap();
+        for page in &fsl_pages {
+            let layout = sparse_layout(page);
+            let outer_slots = layout.structural_layers.first().unwrap().num_slots;
+            let fixed_size_scale = layout
+                .structural_layers
+                .iter()
+                .filter(|layer| {
+                    layer.kind
+                        == pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32
+                })
+                .map(|layer| layer.fixed_size_list_dimension)
+                .product::<u64>();
+            assert_eq!(page.num_rows, outer_slots * fixed_size_scale);
+        }
         assert!(fsl_pages.iter().map(sparse_layout).any(|layout| {
             layout.structural_layers.iter().any(|layer| {
                 layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32
@@ -1403,14 +1518,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_explicit_sparse_list_fixed_size_list_struct_roundtrip() {
+        let array = list_fixed_size_list_struct();
+        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
+            .await
+            .unwrap();
+        assert!(pages.iter().map(sparse_layout).any(|layout| {
+            let kinds = layout
+                .structural_layers
+                .iter()
+                .map(|layer| layer.kind)
+                .collect::<Vec<_>>();
+            kinds.starts_with(&[
+                pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
+                pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32,
+            ])
+        }));
+        for page in &pages {
+            let layout = sparse_layout(page);
+            let outer_slots = layout.structural_layers.first().unwrap().num_slots;
+            assert_eq!(page.num_rows, outer_slots * 2);
+        }
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1])
+            .with_range(1..4)
+            .with_indices(vec![0, 2, 3])
+            .with_indices(vec![1, 3]);
+        check_round_trip_encoding_of_data(vec![array], &cases, sparse_metadata()).await;
+    }
+
+    #[tokio::test]
     async fn test_explicit_sparse_serializes_semantic_list_forms() {
-        let all = encode_pages(
-            list_i32(vec![0, 2, 4, 6], None),
-            LanceFileVersion::V2_3,
-            sparse_metadata(),
-        )
-        .await
-        .unwrap();
+        let all_array = list_i32(vec![0, 2, 4, 6], None);
+        let all = encode_pages(all_array.clone(), LanceFileVersion::V2_3, sparse_metadata())
+            .await
+            .unwrap();
         let all_layer = list_layer(sparse_layout(&all[0]));
         assert!(matches!(
             all_layer.non_empty_positions.as_ref().unwrap().positions,
@@ -1424,8 +1569,9 @@ mod tests {
         ));
         assert_eq!(all[0].data.len(), 2);
 
+        let range_array = list_i32(vec![0, 2, 4, 4, 4], None);
         let range = encode_pages(
-            list_i32(vec![0, 2, 4, 4, 4], None),
+            range_array.clone(),
             LanceFileVersion::V2_3,
             sparse_metadata(),
         )
@@ -1449,8 +1595,9 @@ mod tests {
         ));
         assert_eq!(range[0].data.len(), 2);
 
+        let explicit_array = list_i32(vec![0, 1, 1, 4, 4, 6], None);
         let explicit = encode_pages(
-            list_i32(vec![0, 1, 1, 4, 4, 6], None),
+            explicit_array.clone(),
             LanceFileVersion::V2_3,
             sparse_metadata(),
         )
@@ -1470,6 +1617,16 @@ mod tests {
             Some(pb21::sparse_count_set::Counts::Explicit(_))
         ));
         assert_eq!(explicit[0].data.len(), 4);
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1])
+            .with_range(1..3)
+            .with_indices(vec![0, 2]);
+        for array in [all_array, range_array, explicit_array] {
+            check_round_trip_encoding_of_data(vec![array], &cases, sparse_metadata()).await;
+        }
     }
 
     #[tokio::test]

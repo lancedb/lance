@@ -1661,6 +1661,17 @@ impl RepDefUnraveler {
         }
     }
 
+    fn ensure_exhausted(&self) -> Result<()> {
+        if let Some(sparse) = &self.sparse {
+            sparse.ensure_exhausted()?;
+        }
+        Ok(())
+    }
+
+    fn is_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
     pub fn is_all_valid(&self) -> bool {
         if let Some(sparse) = &self.sparse {
             return sparse.is_all_valid();
@@ -1940,11 +1951,61 @@ impl RepDefUnraveler {
 #[derive(Debug)]
 pub struct CompositeRepDefUnraveler {
     unravelers: Vec<RepDefUnraveler>,
+    comparisons: Vec<Self>,
 }
 
 impl CompositeRepDefUnraveler {
     pub fn new(unravelers: Vec<RepDefUnraveler>) -> Self {
-        Self { unravelers }
+        Self {
+            unravelers,
+            comparisons: Vec::new(),
+        }
+    }
+
+    pub(crate) fn add_compatibility_check(&mut self, other: Self) {
+        self.comparisons.push(other);
+    }
+
+    pub(crate) fn has_sparse(&self) -> bool {
+        self.unravelers.iter().any(RepDefUnraveler::is_sparse)
+            || self.comparisons.iter().any(Self::has_sparse)
+    }
+
+    pub(crate) fn ensure_exhausted(&self) -> Result<()> {
+        for unraveler in &self.unravelers {
+            unraveler.ensure_exhausted()?;
+        }
+        for comparison in &self.comparisons {
+            comparison.ensure_exhausted()?;
+        }
+        Ok(())
+    }
+
+    fn null_buffers_equal(
+        left: &Option<NullBuffer>,
+        right: &Option<NullBuffer>,
+        expected_len: usize,
+    ) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.len() == expected_len
+                    && right.len() == expected_len
+                    && left.iter().eq(right.iter())
+            }
+            (None, Some(right)) => right.len() == expected_len && right.null_count() == 0,
+            (Some(left), None) => left.len() == expected_len && left.null_count() == 0,
+        }
+    }
+
+    fn decimate(&mut self, dimension: usize) -> Result<()> {
+        for unraveler in &mut self.unravelers {
+            unraveler.decimate(dimension)?;
+        }
+        for comparison in &mut self.comparisons {
+            comparison.decimate(dimension)?;
+        }
+        Ok(())
     }
 
     /// Unravels a layer of validity
@@ -1956,18 +2017,30 @@ impl CompositeRepDefUnraveler {
             .iter()
             .all(|unraveler| unraveler.is_all_valid());
 
-        if is_all_valid {
+        let validity = if is_all_valid {
             for unraveler in self.unravelers.iter_mut() {
                 unraveler.skip_validity()?;
             }
-            Ok(None)
+            None
         } else {
             let mut validity = BooleanBufferBuilder::new(num_values);
             for unraveler in self.unravelers.iter_mut() {
                 unraveler.unravel_validity(&mut validity)?;
             }
-            Ok(Some(NullBuffer::new(validity.finish())))
+            Some(NullBuffer::new(validity.finish()))
+        };
+        for comparison in &mut self.comparisons {
+            let other = comparison.unravel_validity(num_values)?;
+            if !Self::null_buffers_equal(&validity, &other, num_values) {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Structural sibling fields have incompatible validity metadata for {num_values} values"
+                    )
+                    .into(),
+                ));
+            }
         }
+        Ok(validity)
     }
 
     pub fn unravel_fsl_validity(
@@ -1975,9 +2048,7 @@ impl CompositeRepDefUnraveler {
         num_values: usize,
         dimension: usize,
     ) -> Result<Option<NullBuffer>> {
-        for unraveler in self.unravelers.iter_mut() {
-            unraveler.decimate(dimension)?;
-        }
+        self.decimate(dimension)?;
         self.unravel_validity(num_values)
     }
 
@@ -2012,10 +2083,28 @@ impl CompositeRepDefUnraveler {
             unraveler.unravel_offsets(&mut offsets, validity.as_mut())?;
         }
 
-        Ok((
-            OffsetBuffer::new(ScalarBuffer::from(offsets)),
-            validity.map(|mut v| NullBuffer::new(v.finish())),
-        ))
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+        let validity = validity.map(|mut v| NullBuffer::new(v.finish()));
+        for comparison in &mut self.comparisons {
+            let (other_offsets, other_validity) = comparison.unravel_offsets::<T>()?;
+            if offsets.as_ref() != other_offsets.as_ref()
+                || !Self::null_buffers_equal(
+                    &validity,
+                    &other_validity,
+                    offsets.len().saturating_sub(1),
+                )
+            {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Structural sibling fields have incompatible list metadata for {} slots",
+                        offsets.len().saturating_sub(1)
+                    )
+                    .into(),
+                ));
+            }
+        }
+
+        Ok((offsets, validity))
     }
 }
 
@@ -2714,6 +2803,10 @@ impl ControlWordParser {
 mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 
+    use crate::encodings::logical::primitive::sparse::{
+        SparsePositionSet, SparseStructuralLayerPlan, SparseStructuralPlan, SparseValidityMeaning,
+        SparseValiditySet,
+    };
     use crate::repdef::{
         CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler, SerializedRepDefs,
     };
@@ -2730,6 +2823,31 @@ mod tests {
 
     fn offsets_64(values: &[i64]) -> OffsetBuffer<i64> {
         OffsetBuffer::<i64>::new(ScalarBuffer::from_iter(values.iter().copied()))
+    }
+
+    #[test]
+    fn sparse_sibling_validity_mismatch_is_invalid_input() {
+        let sparse = |positions| {
+            RepDefUnraveler::new_sparse(SparseStructuralPlan {
+                layers: vec![SparseStructuralLayerPlan::Validity {
+                    num_slots: 2,
+                    validity: SparseValiditySet {
+                        meaning: SparseValidityMeaning::NullPositions,
+                        positions,
+                    },
+                }],
+                num_items: 2,
+                num_visible_items: 2,
+            })
+        };
+        let mut repdef = CompositeRepDefUnraveler::new(vec![sparse(SparsePositionSet::Empty)]);
+        repdef.add_compatibility_check(CompositeRepDefUnraveler::new(vec![sparse(
+            SparsePositionSet::Explicit(vec![0]),
+        )]));
+
+        let err = repdef.unravel_validity(2).unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("incompatible validity metadata"));
     }
 
     #[test]
