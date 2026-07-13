@@ -41,6 +41,8 @@ use lance_core::error::Result;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
+use object_store::path::Path;
+
 use super::DataFile;
 use crate::format::pb;
 
@@ -77,11 +79,16 @@ enum OverlayCoverageBytes {
     PerField(Vec<Vec<u8>>),
 }
 
-fn deserialize_roaring(bytes: &[u8]) -> Result<RoaringBitmap> {
+// The bytes come from a persisted overlay (the protobuf manifest or a
+// serialized fragment), so a decode failure is on-disk corruption, not caller
+// input. `path` locates the overlay's data file when known (empty on the serde
+// path, which deserializes coverage in isolation).
+fn deserialize_roaring(bytes: &[u8], path: &Path) -> Result<RoaringBitmap> {
     RoaringBitmap::deserialize_from(bytes).map_err(|e| {
-        Error::invalid_input(format!(
-            "failed to deserialize overlay coverage bitmap: {e}"
-        ))
+        Error::corrupt_file(
+            path.clone(),
+            format!("failed to deserialize overlay coverage bitmap: {e}"),
+        )
     })
 }
 
@@ -107,11 +114,16 @@ impl TryFrom<OverlayCoverageBytes> for OverlayCoverage {
     type Error = Error;
 
     fn try_from(bytes: OverlayCoverageBytes) -> Result<Self> {
+        // Serde deserializes the coverage in isolation, so the owning data
+        // file's path is not available here.
+        let path = Path::default();
         Ok(match bytes {
-            OverlayCoverageBytes::Shared(b) => Self::Shared(Arc::new(deserialize_roaring(&b)?)),
+            OverlayCoverageBytes::Shared(b) => {
+                Self::Shared(Arc::new(deserialize_roaring(&b, &path)?))
+            }
             OverlayCoverageBytes::PerField(bs) => Self::PerField(
                 bs.iter()
-                    .map(|b| deserialize_roaring(b).map(Arc::new))
+                    .map(|b| deserialize_roaring(b, &path).map(Arc::new))
                     .collect::<Result<_>>()?,
             ),
         })
@@ -285,14 +297,15 @@ impl TryFrom<pb::DataOverlayFile> for DataOverlayFile {
         let data_file = proto
             .data_file
             .ok_or_else(|| Error::invalid_input("DataOverlayFile is missing its data_file"))?;
+        let path = Path::from(data_file.path.as_str());
         let coverage = match proto.coverage {
             Some(pb::data_overlay_file::Coverage::SharedOffsetBitmap(bytes)) => {
-                OverlayCoverage::Shared(Arc::new(deserialize_roaring(&bytes)?))
+                OverlayCoverage::Shared(Arc::new(deserialize_roaring(&bytes, &path)?))
             }
             Some(pb::data_overlay_file::Coverage::FieldCoverage(fc)) => OverlayCoverage::PerField(
                 fc.offset_bitmaps
                     .iter()
-                    .map(|b| deserialize_roaring(b).map(Arc::new))
+                    .map(|b| deserialize_roaring(b, &path).map(Arc::new))
                     .collect::<Result<_>>()?,
             ),
             None => {
