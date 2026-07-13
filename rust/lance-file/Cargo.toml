@@ -37,7 +37,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-arrow-ipc.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
 criterion.workspace = true

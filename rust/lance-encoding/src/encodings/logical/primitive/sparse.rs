@@ -4834,6 +4834,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selective_read_requests_only_intersecting_value_chunk() {
+        let mut layout = sparse_layout();
+        layout.num_items = 4;
+        layout.num_visible_items = 4;
+        let decompressors = DefaultDecompressionStrategy::default();
+        let mut scheduler = SparseStructuralScheduler::try_new(
+            &[(0, 16), (16, 32)],
+            0,
+            4,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap();
+
+        let mut data = Vec::new();
+        for _ in 0..2 {
+            data.extend_from_slice(&1_u32.to_le_bytes());
+            data.extend_from_slice(&2_u32.to_le_bytes());
+        }
+        for values in [[10_i32, 20], [30, 40]] {
+            data.extend_from_slice(&0_u16.to_le_bytes());
+            data.extend_from_slice(&8_u16.to_le_bytes());
+            data.extend_from_slice(&[0; 4]);
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        let io = Arc::new(RecordingIo::new(Bytes::from(data)));
+        let trait_io: Arc<dyn EncodingsIo> = io.clone();
+        scheduler.initialize(&trait_io).await.unwrap();
+        let mut page_tasks = scheduler.schedule_ranges(&[2..3], &trait_io).unwrap();
+        let page_task = page_tasks.pop().unwrap();
+        let mut decoder = page_task.decoder_fut.await.unwrap();
+        let decoded = decoder.drain(1).unwrap().decode().unwrap();
+        assert_eq!(decoded.data.num_values(), 1);
+
+        let calls = io.calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &[vec![0..16], vec![32..48]]);
+    }
+
+    #[tokio::test]
     async fn empty_leaf_selection_rebuilds_offsets_without_value_io() {
         let mut layout = sparse_layout();
         layout.num_visible_items = 0;
