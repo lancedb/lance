@@ -1385,7 +1385,7 @@ impl CompactionPlan {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum CompactionCandidacy {
     /// Compact the fragment if it has neighbors that are also candidates
     CompactWithNeighbors,
@@ -1394,6 +1394,7 @@ enum CompactionCandidacy {
 }
 
 /// Internal struct used for planning compaction.
+#[derive(Debug, Clone, PartialEq)]
 struct CandidateBin {
     pub fragments: Vec<Fragment>,
     pub pos_range: Range<usize>,
@@ -1417,35 +1418,69 @@ impl CandidateBin {
     }
 
     /// Split into one or more bins with at least `min_num_rows` in them.
-    fn split_for_size(mut self, min_num_rows: usize) -> Vec<Self> {
+    fn split_for_size(self, min_num_rows: usize) -> Vec<Self> {
+        debug_assert_eq!(self.fragments.len(), self.candidacy.len());
+        debug_assert_eq!(self.fragments.len(), self.row_counts.len());
+        debug_assert_eq!(self.fragments.len(), self.pos_range.len());
+
+        if self.row_counts.is_empty() || min_num_rows == 0 {
+            return vec![self];
+        }
+
+        let Self {
+            fragments,
+            pos_range,
+            candidacy,
+            row_counts,
+            indices,
+        } = self;
+
+        // A CandidateBin cannot contain enough entries for this sum to overflow u128.
+        let mut remaining_row_count = row_counts
+            .iter()
+            .map(|&row_count| row_count as u128)
+            .sum::<u128>();
+        let min_num_rows = min_num_rows as u128;
         let mut bins = Vec::new();
+        let mut current_fragments = Vec::new();
+        let mut current_candidacy = Vec::new();
+        let mut current_row_counts = Vec::new();
+        let mut current_row_count = 0_u128;
+        let mut current_pos = pos_range.start;
 
-        loop {
-            let mut bin_len = 0;
-            let mut bin_row_count = 0;
-            while bin_row_count < min_num_rows && bin_len < self.row_counts.len() {
-                bin_row_count += self.row_counts[bin_len];
-                bin_len += 1;
-            }
+        for ((fragment, candidacy), row_count) in
+            fragments.into_iter().zip(candidacy).zip(row_counts)
+        {
+            let row_count = row_count as u128;
+            remaining_row_count -= row_count;
+            current_row_count += row_count;
+            current_fragments.push(fragment);
+            current_candidacy.push(candidacy);
+            current_row_counts.push(row_count as usize);
 
-            // If there's enough remaining to make another worthwhile bin, then
-            // push what we have as a bin.
-            if self.row_counts[bin_len..].iter().sum::<usize>() >= min_num_rows {
+            if current_row_count >= min_num_rows && remaining_row_count >= min_num_rows {
+                let next_pos = current_pos + current_fragments.len();
                 bins.push(Self {
-                    fragments: self.fragments.drain(0..bin_len).collect(),
-                    pos_range: self.pos_range.start..(self.pos_range.start + bin_len),
-                    candidacy: self.candidacy.drain(0..bin_len).collect(),
-                    row_counts: self.row_counts.drain(0..bin_len).collect(),
+                    fragments: std::mem::take(&mut current_fragments),
+                    pos_range: current_pos..next_pos,
+                    candidacy: std::mem::take(&mut current_candidacy),
+                    row_counts: std::mem::take(&mut current_row_counts),
                     // By the time we are splitting for size we are done considering indices
                     indices: Vec::new(),
                 });
-                self.pos_range.start += bin_len;
-            } else {
-                // Otherwise, just push the remaining fragments into the last bin
-                bins.push(self);
-                break;
+                current_pos = next_pos;
+                current_row_count = 0;
             }
         }
+
+        // Any underfilled tail stays attached to the current group.
+        bins.push(Self {
+            fragments: current_fragments,
+            pos_range: current_pos..pos_range.end,
+            candidacy: current_candidacy,
+            row_counts: current_row_counts,
+            indices,
+        });
 
         bins
     }
@@ -2205,7 +2240,72 @@ mod tests {
     use std::collections::HashSet;
     use std::io::Cursor;
     use std::sync::Arc;
+    use std::time::Instant;
     use uuid::Uuid;
+
+    fn candidate_bin(row_counts: Vec<usize>) -> CandidateBin {
+        let pos_start = 17;
+        let fragments = row_counts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| Fragment {
+                id: 1_000 + index as u64,
+                files: vec![],
+                deletion_file: None,
+                row_id_meta: None,
+                physical_rows: Some(0),
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+            })
+            .collect::<Vec<_>>();
+        let candidacy = row_counts
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index % 2 == 0 {
+                    CompactionCandidacy::CompactItself
+                } else {
+                    CompactionCandidacy::CompactWithNeighbors
+                }
+            })
+            .collect();
+        CandidateBin {
+            fragments,
+            pos_range: pos_start..(pos_start + row_counts.len()),
+            candidacy,
+            row_counts,
+            indices: vec![2, 5],
+        }
+    }
+
+    fn split_for_size_reference(mut bin: CandidateBin, min_num_rows: usize) -> Vec<CandidateBin> {
+        let mut bins = Vec::new();
+
+        loop {
+            let mut bin_len = 0;
+            let mut bin_row_count = 0;
+            while bin_row_count < min_num_rows && bin_len < bin.row_counts.len() {
+                bin_row_count += bin.row_counts[bin_len];
+                bin_len += 1;
+            }
+
+            if bin.row_counts[bin_len..].iter().sum::<usize>() >= min_num_rows {
+                bins.push(CandidateBin {
+                    fragments: bin.fragments.drain(0..bin_len).collect(),
+                    pos_range: bin.pos_range.start..(bin.pos_range.start + bin_len),
+                    candidacy: bin.candidacy.drain(0..bin_len).collect(),
+                    row_counts: bin.row_counts.drain(0..bin_len).collect(),
+                    indices: Vec::new(),
+                });
+                bin.pos_range.start += bin_len;
+            } else {
+                bins.push(bin);
+                break;
+            }
+        }
+
+        bins
+    }
 
     #[test]
     fn test_candidate_bin() {
@@ -2261,6 +2361,140 @@ mod tests {
         assert_eq!(split[0].pos_range, 0..2);
         assert_eq!(split[1].pos_range, 2..5);
         assert_eq!(split[2].pos_range, 5..8);
+    }
+
+    #[test]
+    fn test_candidate_bin_split_exact_targets() {
+        let split = candidate_bin(vec![5, 5, 5, 5]).split_for_size(10);
+
+        assert_eq!(
+            split
+                .iter()
+                .map(|bin| bin.row_counts.as_slice())
+                .collect::<Vec<_>>(),
+            vec![&[5, 5][..], &[5, 5][..]]
+        );
+        assert_eq!(split[0].pos_range, 17..19);
+        assert_eq!(split[1].pos_range, 19..21);
+    }
+
+    #[test]
+    fn test_candidate_bin_split_merges_underfilled_tail() {
+        let split = candidate_bin(vec![5, 5, 5, 5, 4]).split_for_size(10);
+
+        assert_eq!(
+            split
+                .iter()
+                .map(|bin| bin.row_counts.as_slice())
+                .collect::<Vec<_>>(),
+            vec![&[5, 5][..], &[5, 5, 4][..]]
+        );
+        assert_eq!(split[0].pos_range, 17..19);
+        assert_eq!(split[1].pos_range, 19..22);
+    }
+
+    #[rstest]
+    #[case(vec![1_000], 500)]
+    #[case(vec![10], 500)]
+    #[case(vec![1_000, 10], 500)]
+    #[case(vec![10, 1_000], 500)]
+    fn test_candidate_bin_split_large_and_small_edges(
+        #[case] row_counts: Vec<usize>,
+        #[case] min_num_rows: usize,
+    ) {
+        let original = candidate_bin(row_counts);
+        let split = original.clone().split_for_size(min_num_rows);
+
+        assert_eq!(split, vec![original]);
+    }
+
+    #[test]
+    fn test_candidate_bin_split_preserves_order_and_metadata() {
+        let original = candidate_bin(vec![2, 3, 5, 1]);
+        let split = original.clone().split_for_size(5);
+
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            split[0]
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![1_000, 1_001]
+        );
+        assert_eq!(
+            split[1]
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>(),
+            vec![1_002, 1_003]
+        );
+        assert_eq!(split[0].candidacy, original.candidacy[0..2]);
+        assert_eq!(split[1].candidacy, original.candidacy[2..4]);
+        assert_eq!(split[0].pos_range, 17..19);
+        assert_eq!(split[1].pos_range, 19..21);
+        assert!(split[0].indices.is_empty());
+        assert_eq!(split[1].indices, original.indices);
+    }
+
+    #[test]
+    fn test_candidate_bin_split_degenerate_inputs() {
+        let empty = candidate_bin(vec![]);
+        assert_eq!(empty.clone().split_for_size(10), vec![empty]);
+
+        let zero_target = candidate_bin(vec![1, 2, 3]);
+        assert_eq!(zero_target.clone().split_for_size(0), vec![zero_target]);
+    }
+
+    #[test]
+    fn test_candidate_bin_split_matches_reference() {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+
+        for _ in 0..5_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let num_fragments = (state % 65) as usize;
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let min_num_rows = (state % 1_000) as usize + 1;
+            let row_counts = (0..num_fragments)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    (state % 1_500) as usize
+                })
+                .collect::<Vec<_>>();
+            let bin = candidate_bin(row_counts.clone());
+
+            assert_eq!(
+                bin.clone().split_for_size(min_num_rows),
+                split_for_size_reference(bin, min_num_rows),
+                "row_counts={row_counts:?}, min_num_rows={min_num_rows}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual scalability benchmark"]
+    #[allow(clippy::print_stderr)]
+    fn benchmark_candidate_bin_split_scalability() {
+        for num_fragments in [10_000, 100_000, 1_000_000] {
+            let bin = candidate_bin(vec![1; num_fragments]);
+            let start = Instant::now();
+            let split = std::hint::black_box(bin).split_for_size(30);
+            let elapsed = start.elapsed();
+
+            assert_eq!(split.len(), num_fragments / 30);
+            assert_eq!(
+                split.iter().map(|bin| bin.fragments.len()).sum::<usize>(),
+                num_fragments
+            );
+            eprintln!("{num_fragments} fragments: {elapsed:?}");
+        }
     }
 
     fn sample_data() -> RecordBatch {
