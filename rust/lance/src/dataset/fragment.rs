@@ -4355,9 +4355,10 @@ mod tests {
             assert_eq!(row2.values(), &[77, 88, 99]);
         }
 
-        /// A top-level Map column resolves as a single atom even though its value
-        /// spans two leaves (key and value): both leaf ids map back to the one Map
-        /// atom, and the whole map value at a covered offset is replaced. Maps require
+        /// A top-level Map column resolves as a single atomic field even though its
+        /// value spans two leaves (key and value): both leaf ids map back to the one
+        /// Map atomic field, and the whole map value at a covered offset is replaced.
+        /// Maps require
         /// the 2.2+ file format, so this runs only at V2_2 (unlike the V2_0/V2_1
         /// parametrized tests).
         #[tokio::test]
@@ -4716,7 +4717,7 @@ mod tests {
             // Projecting the *intermediate* struct `outer.middle` (field id 2) while
             // the overlay targets a deeper field (id 3) must still apply: the
             // overlay's leaf id falls inside the projected subtree, so it maps to a
-            // projected atom. (This is the case wjones127/westonpace flagged where a
+            // projected atomic field. (This is the case wjones127/westonpace flagged where a
             // top-level-only mapping would miss the overlay.)
             let middle_only = dataset.schema().project_by_ids(&[2], true);
             let batch = frag.take(&[2], &middle_only).await.unwrap();

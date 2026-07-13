@@ -278,33 +278,34 @@ fn assemble_overlay_column(
     interleave(&sources, &routing.indices).map_err(Error::from)
 }
 
-/// One overlay's contribution to one projected atom, with its file reader opened.
+/// One overlay's contribution to one projected atomic field, with its file reader opened.
 #[derive(Debug, Clone)]
-struct LoadedAtomOverlay {
-    /// The `offset_in_frag` cells this overlay covers for the atom.
+struct LoadedAtomicFieldOverlay {
+    /// The `offset_in_frag` cells this overlay covers for the atomic field.
     coverage: Arc<RoaringBitmap>,
-    /// Reader over the overlay data file, projected to the covered atoms; shared
-    /// across the atoms that the same file covers.
+    /// Reader over the overlay data file, projected to the covered atomic fields; shared
+    /// across the atomic fields that the same file covers.
     reader: Arc<dyn GenericFileReader>,
 }
 
-/// The overlays that apply to a single projected atom — a per-row field an overlay
+/// The overlays that apply to a single projected atomic field — a per-row field an overlay
 /// can replace as a unit (a primitive leaf, or a whole list/map field; structs are
-/// recursed through, not treated as atoms). Ordered newest-first, with readers opened
+/// recursed through, not treated as atomic fields). Ordered newest-first, with readers opened
 /// and pruned to a specific read. Produced by [`resolve_overlays`] and consumed by
 /// [`merge_overlay_batch`].
 #[derive(Debug, Clone)]
-pub struct LoadedAtom {
-    /// The top-level output column the atom lives in (its name locates the batch
+pub struct LoadedAtomicField {
+    /// The top-level output column the atomic field lives in (its name locates the batch
     /// column; its field tree drives the descend/splice into that column).
     top_field: Arc<Field>,
-    /// Child field ids from `top_field` down to the atom (empty when the atom *is*
-    /// the top-level column). Drives descending to, and splicing back, the atom.
+    /// Child field ids from `top_field` down to the atomic field (empty when the atomic
+    /// field *is* the top-level column). Drives descending to, and splicing back, the
+    /// atomic field.
     ancestor_ids: Vec<i32>,
-    /// Projection of exactly the atom (its ancestor path pruned to the atom subtree),
-    /// used to fetch the atom's values from the overlay file.
+    /// Projection of exactly the atomic field (its ancestor path pruned to the atomic
+    /// field subtree), used to fetch the atomic field's values from the overlay file.
     fetch_projection: Arc<Schema>,
-    overlays_newest_first: Vec<LoadedAtomOverlay>,
+    overlays_newest_first: Vec<LoadedAtomicFieldOverlay>,
 }
 
 /// One overlay file that may contribute to a read, before it is opened. Opened
@@ -312,43 +313,43 @@ pub struct LoadedAtom {
 #[derive(Debug, Clone)]
 struct PlannedOverlayFile {
     data_file: DataFile,
-    /// The covered ∩ projected atoms to project when the file is opened, so a single
-    /// reader serves every atom the file contributes to.
+    /// The covered ∩ projected atomic fields to project when the file is opened, so a single
+    /// reader serves every atomic field the file contributes to.
     open_projection: Arc<Schema>,
 }
 
-/// One overlay's contribution to one projected atom, before the file is opened.
+/// One overlay's contribution to one projected atomic field, before the file is opened.
 #[derive(Debug, Clone)]
-struct PlannedAtomOverlay {
+struct PlannedAtomicFieldOverlay {
     /// Index into [`OverlayReadPlanner::files`] of the file that supplies the value.
     file: usize,
     coverage: Arc<RoaringBitmap>,
 }
 
-/// The overlays that apply to a single projected atom, ordered newest-first, before
+/// The overlays that apply to a single projected atomic field, ordered newest-first, before
 /// any file is opened.
 #[derive(Debug, Clone)]
-struct PlannedAtom {
+struct PlannedAtomicField {
     top_field: Arc<Field>,
     ancestor_ids: Vec<i32>,
     fetch_projection: Arc<Schema>,
-    overlays_newest_first: Vec<PlannedAtomOverlay>,
+    overlays_newest_first: Vec<PlannedAtomicFieldOverlay>,
 }
 
 /// A fragment's overlay-resolution plan for a projection, derived from coverage
 /// metadata alone — no file opened, no IO. [`resolve_overlays`] turns it into opened
-/// [`LoadedAtom`]s for one specific read, opening only the files whose cells
+/// [`LoadedAtomicField`]s for one specific read, opening only the files whose cells
 /// the read's rows actually touch.
 #[derive(Debug, Clone)]
 pub struct OverlayReadPlanner {
     files: Vec<PlannedOverlayFile>,
-    atoms: Vec<PlannedAtom>,
+    atomic_fields: Vec<PlannedAtomicField>,
 }
 
 impl OverlayReadPlanner {
-    /// True when no projected atom has any overlay, so there is nothing to resolve.
+    /// True when no projected atomic field has any overlay, so there is nothing to resolve.
     pub fn is_empty(&self) -> bool {
-        self.atoms.is_empty()
+        self.atomic_fields.is_empty()
     }
 }
 
@@ -360,15 +361,16 @@ impl OverlayReadPlanner {
 /// `sort_overlays_newest_last`), so walking them in reverse gives newest-first
 /// precedence.
 ///
-/// Resolution is per *atom* — a per-row field that an overlay replaces as a unit: a
+/// Resolution is per *atomic field* — a per-row field that an overlay replaces as a unit: a
 /// primitive leaf, or a whole list/map field. Structs are internal nodes, so each
-/// leaf of a struct is its own atom and can be overlaid independently of its
+/// leaf of a struct is its own atomic field and can be overlaid independently of its
 /// siblings. An overlay is written against the leaf ids it stores (the V2_1
 /// structural encoding records only leaves), so an overlay contributes to a projected
-/// atom when any id in its `data_file.fields` falls in that atom's leaf set. At merge
-/// time the atom's value is fetched and spliced into its output column, so an overlay
-/// on a sub-field never disturbs the column's other leaves. Each contributing overlay
-/// *file* appears once in `files`, shared by every atom it covers.
+/// atomic field when any id in its `data_file.fields` falls in that atomic field's leaf
+/// set. At merge time the atomic field's value is fetched and spliced into its output
+/// column, so an overlay on a sub-field never disturbs the column's other leaves. Each
+/// contributing overlay *file* appears once in `files`, shared by every atomic field it
+/// covers.
 pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<OverlayReadPlanner> {
     let overlays = &fragment.metadata.overlays;
     debug_assert!(
@@ -378,84 +380,92 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         "overlays must be sorted newest-last (see sort_overlays_newest_last)"
     );
 
-    // The projection's atoms, and a leaf-id -> atom-index map so an overlay's stored
-    // leaf ids resolve to the atom they belong to in O(1).
-    struct AtomInfo<'a> {
+    // The projection's atomic fields, and a leaf-id -> atomic-field-index map so an
+    // overlay's stored leaf ids resolve to the atomic field they belong to in O(1).
+    struct AtomicFieldInfo<'a> {
         top_field: &'a Field,
         ancestor_ids: Vec<i32>,
-        atom_id: i32,
+        atomic_field_id: i32,
     }
-    let mut atom_infos: Vec<AtomInfo> = Vec::new();
-    let mut leaf_to_atom: HashMap<i32, usize> = HashMap::new();
+    let mut atomic_field_infos: Vec<AtomicFieldInfo> = Vec::new();
+    let mut leaf_to_atomic_field: HashMap<i32, usize> = HashMap::new();
     for top in &projection.fields {
-        for (atom, ancestor_ids) in enumerate_atoms(top) {
-            let idx = atom_infos.len();
+        for (atomic_field, ancestor_ids) in enumerate_atomic_fields(top) {
+            let idx = atomic_field_infos.len();
             let mut value_leaf_ids = Vec::new();
-            collect_leaf_ids(atom, &mut value_leaf_ids);
+            collect_leaf_ids(atomic_field, &mut value_leaf_ids);
             for leaf in value_leaf_ids {
-                leaf_to_atom.insert(leaf, idx);
+                leaf_to_atomic_field.insert(leaf, idx);
             }
-            atom_infos.push(AtomInfo {
+            atomic_field_infos.push(AtomicFieldInfo {
                 top_field: top,
                 ancestor_ids,
-                atom_id: atom.id,
+                atomic_field_id: atomic_field.id,
             });
         }
     }
 
-    // Walk overlays newest-first. For each overlay, find the atoms it covers and push
-    // (newest-first, for free) into their per-atom overlay lists.
+    // Walk overlays newest-first. For each overlay, find the atomic fields it covers and push
+    // (newest-first, for free) into their per-atomic field overlay lists.
     let mut files = Vec::new();
-    let mut atom_overlays: Vec<Vec<PlannedAtomOverlay>> = vec![Vec::new(); atom_infos.len()];
+    let mut atomic_field_overlays: Vec<Vec<PlannedAtomicFieldOverlay>> =
+        vec![Vec::new(); atomic_field_infos.len()];
     for overlay in overlays.iter().rev() {
-        // atom index -> the `data_file.fields` position whose coverage to read. An
-        // overlay writes one value per row per atom, so its leaves share a coverage;
-        // the first leaf of each atom to appear wins.
+        // atomic field index -> the `data_file.fields` position whose coverage to read. An
+        // overlay writes one value per row per atomic field, so its leaves share a coverage;
+        // the first leaf of each atomic field to appear wins.
         let mut covered: HashMap<usize, usize> = HashMap::new();
         for (field_pos, &field_id) in overlay.data_file.fields.iter().enumerate() {
-            if let Some(&atom_idx) = leaf_to_atom.get(&field_id) {
-                covered.entry(atom_idx).or_insert(field_pos);
+            if let Some(&atomic_field_idx) = leaf_to_atomic_field.get(&field_id) {
+                covered.entry(atomic_field_idx).or_insert(field_pos);
             }
         }
         if covered.is_empty() {
             continue;
         }
         let file = files.len();
-        let covered_ids: Vec<i32> = covered.keys().map(|&i| atom_infos[i].atom_id).collect();
+        let covered_ids: Vec<i32> = covered
+            .keys()
+            .map(|&i| atomic_field_infos[i].atomic_field_id)
+            .collect();
         files.push(PlannedOverlayFile {
             data_file: overlay.data_file.clone(),
             open_projection: Arc::new(projection.project_by_ids(&covered_ids, true)),
         });
-        for (atom_idx, field_pos) in covered {
-            atom_overlays[atom_idx].push(PlannedAtomOverlay {
+        for (atomic_field_idx, field_pos) in covered {
+            atomic_field_overlays[atomic_field_idx].push(PlannedAtomicFieldOverlay {
                 file,
                 coverage: overlay.coverage_for_field(field_pos)?,
             });
         }
     }
 
-    // Emit one PlannedAtom per projected atom that has overlays, in atom order.
-    let mut atoms = Vec::new();
-    for (idx, info) in atom_infos.iter().enumerate() {
-        let overlays_newest_first = std::mem::take(&mut atom_overlays[idx]);
+    // Emit one PlannedAtomicField per projected atomic field that has overlays, in
+    // atomic field order.
+    let mut atomic_fields = Vec::new();
+    for (idx, info) in atomic_field_infos.iter().enumerate() {
+        let overlays_newest_first = std::mem::take(&mut atomic_field_overlays[idx]);
         if overlays_newest_first.is_empty() {
             continue;
         }
-        atoms.push(PlannedAtom {
+        atomic_fields.push(PlannedAtomicField {
             top_field: Arc::new(info.top_field.clone()),
             ancestor_ids: info.ancestor_ids.clone(),
-            fetch_projection: Arc::new(projection.project_by_ids(&[info.atom_id], true)),
+            fetch_projection: Arc::new(projection.project_by_ids(&[info.atomic_field_id], true)),
             overlays_newest_first,
         });
     }
-    Ok(OverlayReadPlanner { files, atoms })
+    Ok(OverlayReadPlanner {
+        files,
+        atomic_fields,
+    })
 }
 
-/// The per-row atoms of a projected top-level field, each with the child-id path from
+/// The per-row atomic fields of a projected top-level field, each with the child-id path from
 /// the top-level field down to it. Structs are recursed through; a primitive leaf or a
-/// whole list/map field is an atom (values are one-per-row). A top-level primitive or
-/// list yields a single atom with an empty path.
-fn enumerate_atoms(top: &Field) -> Vec<(&Field, Vec<i32>)> {
+/// whole list/map field is an atomic field (values are one-per-row). A top-level primitive or
+/// list yields a single atomic field with an empty path.
+fn enumerate_atomic_fields(top: &Field) -> Vec<(&Field, Vec<i32>)> {
     fn recurse<'a>(field: &'a Field, path: &mut Vec<i32>, out: &mut Vec<(&'a Field, Vec<i32>)>) {
         if matches!(field.data_type(), DataType::Struct(_)) {
             for child in &field.children {
@@ -474,7 +484,7 @@ fn enumerate_atoms(top: &Field) -> Vec<(&Field, Vec<i32>)> {
 }
 
 /// Collect the leaf field ids in `field`'s subtree — the ids an overlay stores for
-/// this atom (its own id if primitive; its item leaves if a list/map).
+/// this atomic field (its own id if primitive; its item leaves if a list/map).
 fn collect_leaf_ids(field: &Field, out: &mut Vec<i32>) {
     if field.children.is_empty() {
         out.push(field.id);
@@ -514,17 +524,17 @@ fn descend_by_ids(array: &ArrayRef, field: &Field, ancestor_ids: &[i32]) -> Resu
     Ok(arr)
 }
 
-/// Rebuild `array` with the array at `ancestor_ids` replaced by `new_atom`, cloning
+/// Rebuild `array` with the array at `ancestor_ids` replaced by `new_atomic_field`, cloning
 /// the struct spine along the path and preserving each struct's null buffer and other
-/// children. With an empty path this is just `new_atom` (whole-column replacement).
+/// children. With an empty path this is just `new_atomic_field` (whole-column replacement).
 fn splice_by_ids(
     array: &ArrayRef,
     field: &Field,
     ancestor_ids: &[i32],
-    new_atom: ArrayRef,
+    new_atomic_field: ArrayRef,
 ) -> Result<ArrayRef> {
     let Some((&id, rest)) = ancestor_ids.split_first() else {
-        return Ok(new_atom);
+        return Ok(new_atomic_field);
     };
     let child_pos = field
         .children
@@ -551,7 +561,7 @@ fn splice_by_ids(
         &children[child_pos],
         &field.children[child_pos],
         rest,
-        new_atom,
+        new_atomic_field,
     )?;
     Ok(Arc::new(StructArray::try_new_with_length(
         fields, children, nulls, len,
@@ -572,14 +582,14 @@ pub async fn resolve_overlays(
     offsets_in_frag: &[u32],
     fragment: &FileFragment,
     read_config: &FragReadConfig,
-) -> Result<Vec<LoadedAtom>> {
+) -> Result<Vec<LoadedAtomicField>> {
     let read_offsets = read_offsets_bitmap(offsets_in_frag);
 
-    // A file is opened only if some atom it covers has cells among the requested rows.
+    // A file is opened only if some atomic field it covers has cells among the requested rows.
     // This is the row-selection pruning: overlays outside the read are skipped.
     let mut file_needed = vec![false; planner.files.len()];
-    for atom in &planner.atoms {
-        for overlay in &atom.overlays_newest_first {
+    for atomic_field in &planner.atomic_fields {
+        for overlay in &atomic_field.overlays_newest_first {
             if !overlay.coverage.is_disjoint(&read_offsets) {
                 file_needed[overlay.file] = true;
             }
@@ -587,7 +597,7 @@ pub async fn resolve_overlays(
     }
 
     // Open each needed file once, concurrently. The reader is shared (via `Arc`) by
-    // every atom that file covers.
+    // every atomic field that file covers.
     //
     // These reads use priority 0 (highest): they are issued only when a ready
     // consumer polls the batch task (see `merge_overlay_batch`), so we have already
@@ -611,22 +621,22 @@ pub async fn resolve_overlays(
         .await?;
 
     let mut plans = Vec::new();
-    for atom in &planner.atoms {
+    for atomic_field in &planner.atomic_fields {
         let mut overlays_newest_first = Vec::new();
-        for overlay in &atom.overlays_newest_first {
+        for overlay in &atomic_field.overlays_newest_first {
             let Some(reader) = &opened[overlay.file] else {
                 continue; // pruned: coverage disjoint from the read
             };
-            overlays_newest_first.push(LoadedAtomOverlay {
+            overlays_newest_first.push(LoadedAtomicFieldOverlay {
                 coverage: overlay.coverage.clone(),
                 reader: reader.clone(),
             });
         }
         if !overlays_newest_first.is_empty() {
-            plans.push(LoadedAtom {
-                top_field: atom.top_field.clone(),
-                ancestor_ids: atom.ancestor_ids.clone(),
-                fetch_projection: atom.fetch_projection.clone(),
+            plans.push(LoadedAtomicField {
+                top_field: atomic_field.top_field.clone(),
+                ancestor_ids: atomic_field.ancestor_ids.clone(),
+                fetch_projection: atomic_field.fetch_projection.clone(),
                 overlays_newest_first,
             });
         }
@@ -649,16 +659,16 @@ fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
     bitmap
 }
 
-/// Resolve overlays for one base batch: route each projected atom against the batch's
+/// Resolve overlays for one base batch: route each projected atomic field against the batch's
 /// `offsets_in_frag`, fetch only the overlay values the batch needs (concurrently with
-/// the base read), assemble the merged atom, and splice it into its output column.
-/// Atoms with no covered rows, and columns with no plan, pass through.
+/// the base read), assemble the merged atomic field, and splice it into its output column.
+/// AtomicFields with no covered rows, and columns with no plan, pass through.
 pub async fn merge_overlay_batch(
     base: ReadBatchFut,
     offsets_in_frag: &[u32],
-    plans: &[LoadedAtom],
+    plans: &[LoadedAtomicField],
 ) -> Result<RecordBatch> {
-    let atom_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
+    let atomic_field_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
         let coverages: Vec<&RoaringBitmap> = plan
             .overlays_newest_first
             .iter()
@@ -668,10 +678,10 @@ pub async fn merge_overlay_batch(
         if !routing.any_overlay {
             return Ok::<_, Error>((plan, None));
         }
-        // Fetch each overlay's values and descend to the atom array. The fetch is
-        // projected to the atom's ancestor path, so the fetched column is the pruned
-        // top-level column; `descend_by_ids` walks it down to the atom.
-        let atom_field = &plan.fetch_projection.fields[0];
+        // Fetch each overlay's values and descend to the atomic field array. The fetch is
+        // projected to the atomic field's ancestor path, so the fetched column is the pruned
+        // top-level column; `descend_by_ids` walks it down to the atomic field.
+        let atomic_field = &plan.fetch_projection.fields[0];
         let fetched = futures::future::try_join_all(
             plan.overlays_newest_first
                 .iter()
@@ -683,7 +693,7 @@ pub async fn merge_overlay_batch(
                         offsets_in_overlay,
                     )
                     .await?;
-                    descend_by_ids(&column, atom_field, &plan.ancestor_ids)
+                    descend_by_ids(&column, atomic_field, &plan.ancestor_ids)
                 }),
         )
         .await?;
@@ -691,7 +701,7 @@ pub async fn merge_overlay_batch(
     }));
 
     // The base read and every overlay value read proceed concurrently.
-    let (batch, resolved) = futures::future::try_join(base, atom_work).await?;
+    let (batch, resolved) = futures::future::try_join(base, atomic_field_work).await?;
 
     let schema = batch.schema();
     let mut columns = batch.columns().to_vec();
@@ -703,13 +713,13 @@ pub async fn merge_overlay_batch(
             // The plan's column is not in this batch's projection; skip it.
             continue;
         };
-        let base_atom = descend_by_ids(&columns[idx], &plan.top_field, &plan.ancestor_ids)?;
-        let merged_atom = assemble_overlay_column(&base_atom, &routing, &fetched)?;
+        let base_atomic_field = descend_by_ids(&columns[idx], &plan.top_field, &plan.ancestor_ids)?;
+        let merged_atomic_field = assemble_overlay_column(&base_atomic_field, &routing, &fetched)?;
         columns[idx] = splice_by_ids(
             &columns[idx],
             &plan.top_field,
             &plan.ancestor_ids,
-            merged_atom,
+            merged_atomic_field,
         )?;
     }
     Ok(RecordBatch::try_new(schema, columns)?)
