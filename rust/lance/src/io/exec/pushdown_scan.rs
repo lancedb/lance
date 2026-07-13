@@ -25,7 +25,8 @@ use datafusion::{
 };
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
@@ -325,7 +326,7 @@ impl FragmentScanner {
         })
     }
 
-    pub fn scan(self) -> Result<impl Stream<Item = Result<RecordBatch>> + 'static + Send> {
+    pub fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
