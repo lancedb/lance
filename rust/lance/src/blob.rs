@@ -872,8 +872,9 @@ impl PackedBlobWriter {
 
     /// Append one logical blob payload to the packed sidecar.
     ///
-    /// An I/O failure or cancellation after writing starts discards the active upload and
-    /// poisons this writer, so subsequent writes and [`Self::finish`] return an I/O error.
+    /// An I/O failure requests cleanup of the active upload. Cancellation after writing
+    /// starts drops it and triggers the same best-effort cleanup. Both cases poison this
+    /// writer, so subsequent writes and [`Self::finish`] return an I/O error.
     pub async fn write_blob(&mut self, bytes: impl AsRef<[u8]>) -> Result<()> {
         let bytes = bytes.as_ref();
         self.write_blob_bytes(bytes).await?;
@@ -888,10 +889,11 @@ impl PackedBlobWriter {
     /// writer is invoked.
     ///
     /// Input validation happens before any payload is written. If I/O fails after the
-    /// batch starts, the underlying upload is aborted before the error is returned. If
-    /// the future is cancelled after writing starts, the active upload is discarded.
-    /// Both cases poison this writer, so subsequent writes and [`Self::finish`] return
-    /// an I/O error describing the interrupted write.
+    /// batch starts, cleanup of the underlying upload is requested before the error is
+    /// returned. If the future is cancelled after writing starts, dropping the active
+    /// upload triggers the same best-effort cleanup. Both cases poison this writer, so
+    /// subsequent writes and [`Self::finish`] return an I/O error describing the
+    /// interrupted write.
     ///
     /// ```
     /// # use bytes::Bytes;
@@ -1099,9 +1101,10 @@ impl DedicatedBlobWriter {
 
     /// Append bytes to the dedicated sidecar.
     ///
-    /// An I/O failure aborts the underlying upload. Cancellation after writing starts
-    /// discards the active upload. Both cases poison this writer, so later writes and
-    /// [`Self::finish`] return an I/O error describing the interrupted write.
+    /// An I/O failure requests cleanup of the underlying upload. Cancellation after
+    /// writing starts drops the active upload and triggers the same best-effort cleanup.
+    /// Both cases poison this writer, so later writes and [`Self::finish`] return an I/O
+    /// error describing the interrupted write.
     pub async fn write(&mut self, bytes: impl AsRef<[u8]>) -> Result<()> {
         self.ensure_writable()?;
         let bytes = bytes.as_ref();
