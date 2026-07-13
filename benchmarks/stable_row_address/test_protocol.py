@@ -29,6 +29,13 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(release["delete_percentages"], [1, 50, 90])
         self.assertEqual(release["repeated_update_rounds"], 100)
         self.assertEqual(release["hot_set_rows"], 1_000_000)
+        self.assertEqual(
+            matrix["profiles"]["smoke"]["random_delete_reclaim_admission"],
+            "must_admit",
+        )
+        self.assertEqual(
+            release["random_delete_reclaim_admission"], "must_not_admit"
+        )
         self.assertEqual(len(digest), 64)
         self.assertIn('"schema_version":1', canonical)
 
@@ -360,6 +367,17 @@ class ProtocolTests(unittest.TestCase):
                 protocol.PROFILE_FIELDS,
                 "profile smoke",
             )
+
+    def test_matrix_rejects_changed_reclaim_admission_contract(self) -> None:
+        matrix = json.loads(protocol.DEFAULT_MATRIX.read_text(encoding="utf-8"))
+        matrix["profiles"]["smoke"][
+            "random_delete_reclaim_admission"
+        ] = "must_not_admit"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "matrix.json"
+            path.write_text(json.dumps(matrix), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be must_admit"):
+                protocol.load_matrix(path)
 
 
 def dataclasses_replace(value: protocol.Step, **changes: object) -> protocol.Step:

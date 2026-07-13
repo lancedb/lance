@@ -29,6 +29,7 @@ def make_sidecar(
     *,
     variants: list[str] | None = None,
     matrix_case_names: list[str] | None = None,
+    profile: str = "smoke",
 ) -> dict[str, Any]:
     matrix, matrix_canonical, matrix_sha256 = protocol.load_matrix(
         protocol.DEFAULT_MATRIX
@@ -43,11 +44,11 @@ def make_sidecar(
         "source_provenance": "clean-committed-source",
         "host": "host-1",
         "seed": 7,
-        "profile": "smoke",
+        "profile": profile,
         "tracks": tracks,
         "variants": variants or ["bare"],
         "matrix_case_names": matrix_case_names or [],
-        "storage": "ebs",
+        "storage": "s3" if profile == "release" else "ebs",
         "dataset_root": "/tmp/data",
         "base_dataset_root": "/tmp/data",
         "shard_count": 1,
@@ -57,7 +58,11 @@ def make_sidecar(
         "output_jsonl": "/tmp/results.jsonl",
         "executable": "/tmp/stable_row_address_e2e",
         "data_retention": "preserve",
-        "storage_scope": "bounded_smoke",
+        "storage_scope": (
+            "same_region_s3_preserved_release"
+            if profile == "release"
+            else "bounded_smoke"
+        ),
         "fixture_strategy": "canonical_base_per_format_schema_fragment_layout_then_shallow_clone",
         "fixture_lineage_jsonl": "/tmp/results.jsonl.fixture_lineage.jsonl",
         "checkpoint_json": "/tmp/results.jsonl.checkpoint.json",
@@ -115,6 +120,7 @@ def make_record(
         format_name
     ]
     duration = duration if duration is not None else multiplier
+    is_preflight = operation == protocol_report.DEFAULT_COMPACTION_PREFLIGHT
     writes = operation in protocol_report.COMMIT_OPERATIONS and not pmr and not not_admitted
     reads = operation != "create"
     empty = {
@@ -192,6 +198,8 @@ def make_record(
         "implementation_path": (
             "native_update_builder"
             if operation == "update"
+            else "default_compaction_plan_only"
+            if is_preflight
             else "default_compaction"
             if operation == "default_compaction"
             else "native_dataset_api"
@@ -222,11 +230,21 @@ def make_record(
         "dataset_bytes": 2_000_000,
         "peak_rss_bytes": multiplier * 10,
         **totals,
-        "actual_get_attempts": None,
-        "actual_head_attempts": None,
-        "actual_list_attempts": None,
-        "actual_put_attempts": None,
-        "actual_delete_attempts": None,
+        "actual_get_attempts": (
+            totals["get_requests"] if sidecar["storage"] == "s3" else None
+        ),
+        "actual_head_attempts": (
+            totals["head_requests"] if sidecar["storage"] == "s3" else None
+        ),
+        "actual_list_attempts": (
+            totals["list_requests"] if sidecar["storage"] == "s3" else None
+        ),
+        "actual_put_attempts": (
+            totals["put_requests"] if sidecar["storage"] == "s3" else None
+        ),
+        "actual_delete_attempts": (
+            totals["delete_requests"] if sidecar["storage"] == "s3" else None
+        ),
         "data_bytes": data["read_bytes"] + data["write_bytes"],
         "index_bytes": index["read_bytes"] + index["write_bytes"],
         "metadata_bytes": metadata["read_bytes"] + metadata["write_bytes"],
@@ -240,7 +258,13 @@ def make_record(
             if operation == "index_take" and index_kind in {"scalar", "vector"}
             else None
         ),
-        "admission": False if pmr or not_admitted else True if is_commit else None,
+        "admission": (
+            False
+            if pmr or not_admitted
+            else True
+            if is_commit or is_preflight
+            else None
+        ),
         "placement_maintenance_required": pmr,
         "rows_inserted": None,
         "rows_updated": None,
@@ -272,25 +296,29 @@ def make_record(
             multiplier if operation in protocol_report.RELOCATION_OPERATIONS else None
         ),
         "compaction_groups_planned": (
-            1 if operation in protocol_report.RELOCATION_OPERATIONS else None
+            1
+            if operation in protocol_report.RELOCATION_OPERATIONS or is_preflight
+            else None
         ),
         "compaction_groups_admitted": (
             0
             if not_admitted
             else 1
-            if operation in protocol_report.RELOCATION_OPERATIONS
+            if operation in protocol_report.RELOCATION_OPERATIONS or is_preflight
             else None
         ),
         "compaction_groups_not_admitted": (
             1
             if not_admitted
             else 0
-            if operation in protocol_report.RELOCATION_OPERATIONS
+            if operation in protocol_report.RELOCATION_OPERATIONS or is_preflight
             else None
         ),
         "state_digest": state_digest,
         "io_by_path": io_by_path,
-        "io_metrics_status": "logical_only",
+        "io_metrics_status": (
+            "measured" if sidecar["storage"] == "s3" else "logical_only"
+        ),
         "status": "ok",
         "error": None,
     }
@@ -325,6 +353,32 @@ def complete_records(sidecar: dict[str, Any]) -> list[dict[str, Any]]:
                 )
             )
     return records
+
+
+def append_reclaim_preflights(
+    sidecar: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    case_name: str,
+    not_admitted: bool,
+) -> list[dict[str, Any]]:
+    preflights: list[dict[str, Any]] = []
+    profile = sidecar["matrix"]["profiles"][sidecar["profile"]]
+    for repeat in range(profile["paired_repeats"]):
+        pair_id = (
+            f"{sidecar['run_id']}/matrix/{case_name}/repeat-{repeat:03d}/"
+            "step-002/default-reclaim-preflight"
+        )
+        preflight = make_record(
+            sidecar,
+            pair_id,
+            "v23_logical",
+            operation=protocol_report.DEFAULT_COMPACTION_PREFLIGHT,
+            not_admitted=not_admitted,
+        )
+        records.append(preflight)
+        preflights.append(preflight)
+    return preflights
 
 
 class ProtocolReportTests(unittest.TestCase):
@@ -576,28 +630,99 @@ class ProtocolReportTests(unittest.TestCase):
         )
         self.assertEqual(hashlib.sha256(encoded.encode()).digest_size, 32)
 
-    def test_random_delete_reclaim_requires_not_admitted_preflight(self) -> None:
+    def test_random_delete_reclaim_preflight_accepts_profile_result(self) -> None:
+        case_name = "delete-random-50/narrow16/take-1"
+        for profile, not_admitted in (("smoke", False), ("release", True)):
+            sidecar = make_sidecar(
+                ["matrix"], matrix_case_names=[case_name], profile=profile
+            )
+            records = complete_records(sidecar)
+            append_reclaim_preflights(
+                sidecar,
+                records,
+                case_name=case_name,
+                not_admitted=not_admitted,
+            )
+            result = protocol_report.analyze(
+                sidecar, records, bootstrap_samples=101, enforce_gates=False
+            )
+            self.assertEqual(result.verdict, "PASS", profile)
+
+    def test_random_delete_reclaim_preflight_rejects_inverse_result(self) -> None:
+        case_name = "delete-random-50/narrow16/take-1"
+        for profile, not_admitted in (("smoke", True), ("release", False)):
+            sidecar = make_sidecar(
+                ["matrix"], matrix_case_names=[case_name], profile=profile
+            )
+            records = complete_records(sidecar)
+            append_reclaim_preflights(
+                sidecar,
+                records,
+                case_name=case_name,
+                not_admitted=not_admitted,
+            )
+            result = protocol_report.analyze(
+                sidecar, records, bootstrap_samples=101, enforce_gates=False
+            )
+            self.assertEqual(result.verdict, "FAIL", profile)
+
+    def test_random_delete_reclaim_preflight_missing_is_incomplete(self) -> None:
         case_name = "delete-random-50/narrow16/take-1"
         sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
         records = complete_records(sidecar)
-        for repeat in range(sidecar["matrix"]["profiles"]["smoke"]["paired_repeats"]):
-            pair_id = (
-                f"run-1/matrix/{case_name}/repeat-{repeat:03d}/"
-                "step-002/default-reclaim-preflight"
-            )
-            records.append(
-                make_record(
-                    sidecar,
-                    pair_id,
-                    "v23_logical",
-                    operation="default_compaction",
-                    not_admitted=True,
-                )
-            )
-        result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
-        self.assertEqual(result.verdict, "PASS")
+        append_reclaim_preflights(
+            sidecar, records, case_name=case_name, not_admitted=False
+        )
         missing = protocol_report.analyze(sidecar, records[:-1], bootstrap_samples=101)
         self.assertEqual(missing.verdict, "INCOMPLETE")
+
+    def test_random_delete_reclaim_preflight_version_side_effect_fails(self) -> None:
+        case_name = "delete-random-50/narrow16/take-1"
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
+        records = complete_records(sidecar)
+        preflights = append_reclaim_preflights(
+            sidecar, records, case_name=case_name, not_admitted=False
+        )
+        preflights[0]["dataset_version"] += 1
+        result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
+        self.assertEqual(result.verdict, "FAIL")
+        self.assertTrue(
+            any("changed dataset version" in failure for failure in result.machine["failures"])
+        )
+
+    def test_random_delete_reclaim_preflight_requires_plan_only_path(self) -> None:
+        case_name = "delete-random-50/narrow16/take-1"
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
+        records = complete_records(sidecar)
+        preflights = append_reclaim_preflights(
+            sidecar, records, case_name=case_name, not_admitted=False
+        )
+        preflights[0]["implementation_path"] = "default_compaction"
+        result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
+        self.assertEqual(result.verdict, "FAIL")
+        self.assertTrue(
+            any("implementation path" in failure for failure in result.machine["failures"])
+        )
+
+    def test_random_delete_reclaim_preflight_write_side_effect_fails(self) -> None:
+        case_name = "delete-random-50/narrow16/take-1"
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
+        records = complete_records(sidecar)
+        preflights = append_reclaim_preflights(
+            sidecar, records, case_name=case_name, not_admitted=False
+        )
+        metadata = preflights[0]["io_by_path"]["metadata"]
+        metadata["put_requests"] = 1
+        metadata["write_bytes"] = 10
+        preflights[0]["put_requests"] = 1
+        preflights[0]["write_bytes"] = 10
+        preflights[0]["metadata_bytes"] += 10
+        run.validate_record(preflights[0])
+        result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
+        self.assertEqual(result.verdict, "FAIL")
+        self.assertTrue(
+            any("wrote objects" in failure for failure in result.machine["failures"])
+        )
 
     def test_indexed_relocation_has_zero_remap_and_10x_2x_gates(self) -> None:
         case_name = "indexed-compact-8-to-1/scalar"

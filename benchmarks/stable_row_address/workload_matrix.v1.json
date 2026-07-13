@@ -15,7 +15,8 @@
       "repeated_compaction_rounds": [10],
       "repeated_update_rounds": 10,
       "hot_set_rows": 655,
-      "minimum_sustained_boundaries": 3
+      "minimum_sustained_boundaries": 3,
+      "random_delete_reclaim_admission": "must_admit"
     },
     "release": {
       "paired_repeats": 10,
@@ -30,7 +31,8 @@
       "repeated_compaction_rounds": [10, 100],
       "repeated_update_rounds": 100,
       "hot_set_rows": 1000000,
-      "minimum_sustained_boundaries": 3
+      "minimum_sustained_boundaries": 3,
+      "random_delete_reclaim_admission": "must_not_admit"
     }
   },
   "tracks": {

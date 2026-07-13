@@ -91,6 +91,7 @@ RELOCATION_OPERATIONS = {
     "repack",
     "recluster",
 }
+DEFAULT_COMPACTION_PREFLIGHT = "default_compaction_preflight"
 STANDARD_METRICS = (
     "latency",
     "throughput",
@@ -296,6 +297,15 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
     profile = temporary_matrix["profiles"].get(value["profile"])
     if not isinstance(profile, dict):
         raise ValueError("selected profile is missing from matrix")
+    expected_reclaim_admission = {
+        "smoke": "must_admit",
+        "release": "must_not_admit",
+    }[value["profile"]]
+    if profile.get("random_delete_reclaim_admission") != expected_reclaim_admission:
+        raise ValueError(
+            "selected profile random_delete_reclaim_admission does not match "
+            f"{expected_reclaim_admission}"
+        )
     cases_by_name = {
         case.name: case
         for case in protocol.iter_matrix_cases(
@@ -985,6 +995,11 @@ def audit_grid_and_correctness(
     for pair_id, pair_records in grouped.items():
         if pair_id in complete:
             continue
+        if any(
+            record["operation"] == DEFAULT_COMPACTION_PREFLIGHT
+            for record in pair_records
+        ):
+            continue
         if Counter(record["format"] for record in pair_records) != Counter(run.FORMATS):
             continue
         by_format = {record["format"]: record for record in pair_records}
@@ -1121,6 +1136,17 @@ def audit_grid_and_correctness(
                         )
                         continue
                     record = preflight[0]
+                    if record["operation"] != DEFAULT_COMPACTION_PREFLIGHT:
+                        issues.append(
+                            f"{pair_id}: reclaim preflight used {record['operation']}, "
+                            f"expected {DEFAULT_COMPACTION_PREFLIGHT}"
+                        )
+                        continue
+                    if record["implementation_path"] != "default_compaction_plan_only":
+                        failures.append(
+                            f"{pair_id}: reclaim preflight used implementation path "
+                            f"{record['implementation_path']}"
+                        )
                     source_pair_id = (
                         f"{sidecar['run_id']}/matrix/{case_name}/"
                         f"repeat-{repeat:03d}/step-{step_index - 1:03d}/delete"
@@ -1135,32 +1161,68 @@ def audit_grid_and_correctness(
                     )
                     if source is None or source["dataset_version"] is None:
                         issues.append(
-                            f"{pair_id}: cannot bind not_admitted evidence to delete version"
+                            f"{pair_id}: cannot bind plan-only evidence to delete version"
                         )
                     planned = record["compaction_groups_planned"]
+                    admitted = record["compaction_groups_admitted"]
+                    not_admitted = record["compaction_groups_not_admitted"]
+                    expected_admission = (
+                        profile["random_delete_reclaim_admission"] == "must_admit"
+                    )
                     if (
                         record["placement_maintenance_required"] is True
-                        or record["admission"] is not False
                         or planned is None
                         or planned <= 0
-                        or record["compaction_groups_admitted"] != 0
-                        or record["compaction_groups_not_admitted"] != planned
+                        or admitted is None
+                        or not_admitted is None
+                        or planned != admitted + not_admitted
+                        or record["admission"] is not (admitted == planned)
                     ):
                         failures.append(
-                            f"{pair_id}: default reclaim was not reported as not_admitted"
+                            f"{pair_id}: default compaction preflight admission counts "
+                            "are inconsistent"
+                        )
+                    elif record["admission"] is not expected_admission:
+                        failures.append(
+                            f"{pair_id}: profile requires "
+                            f"{profile['random_delete_reclaim_admission']}, observed "
+                            f"admission={record['admission']}"
                         )
                     if (
                         source is not None
                         and record["dataset_version"] != source["dataset_version"]
                     ):
                         failures.append(
-                            f"{pair_id}: not_admitted preflight changed dataset version"
+                            f"{pair_id}: plan-only preflight changed dataset version"
                         )
                     if (
-                        record["io_by_path"]["data"]["write_bytes"] != 0
-                        or record["io_by_path"]["data"]["put_requests"] != 0
+                        record["put_requests"] != 0
+                        or record["delete_requests"] != 0
+                        or record["write_bytes"] != 0
+                        or (record["actual_put_attempts"] or 0) != 0
+                        or (record["actual_delete_attempts"] or 0) != 0
+                        or any(
+                            metrics["put_requests"] != 0
+                            or metrics["delete_requests"] != 0
+                            or metrics["write_bytes"] != 0
+                            for metrics in record["io_by_path"].values()
+                        )
                     ):
-                        failures.append(f"{pair_id}: rejected preflight wrote data")
+                        failures.append(f"{pair_id}: plan-only preflight wrote objects")
+                    relocation_only_fields = (
+                        "maintenance_plan_path",
+                        "maintenance_plan_sha256",
+                        "compacted_data_bytes",
+                        "index_storage_bytes_before",
+                        "row_addresses_remapped",
+                        "indices_remapped",
+                        "index_coverage_reuse",
+                        "layout_index_maintenance_ns",
+                    )
+                    if any(record[field] is not None for field in relocation_only_fields):
+                        failures.append(
+                            f"{pair_id}: plan-only preflight reported relocation output"
+                        )
 
     provenance_fields = (
         "run_id",
@@ -1283,7 +1345,6 @@ def audit_grid_and_correctness(
         elif (
             record["operation"] in COMMIT_OPERATIONS
             and record["admission"] is not True
-            and not record["pair_id"].endswith("/default-reclaim-preflight")
         ):
             failures.append(
                 f"{record['pair_id']}/{record['format']}: commit operation was not admitted"
@@ -1293,10 +1354,6 @@ def audit_grid_and_correctness(
             and record["placement_maintenance_required"] is not True
             and record["status"] == "ok"
             and record["maintenance_plan_sha256"] is None
-            and not (
-                record["pair_id"].endswith("/default-reclaim-preflight")
-                and record["admission"] is False
-            )
         ):
             failures.append(
                 f"{record['pair_id']}/{record['format']}: relocation is missing its frozen plan"
@@ -1392,6 +1449,8 @@ def track_of(pair_id: str, run_id: str) -> str:
 
 
 def standard_scope_is_gated(track: str, template: str, operation: str) -> bool:
+    if operation == DEFAULT_COMPACTION_PREFLIGHT:
+        return False
     if track == "matrix":
         return True
     if track == "sustained":

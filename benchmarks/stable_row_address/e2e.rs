@@ -173,6 +173,7 @@ enum Operation {
     Update,
     MergeInsert,
     Backfill,
+    DefaultCompactionPreflight,
     DefaultCompaction,
     RandomDeleteReclaim,
     NormalizePlacement,
@@ -197,6 +198,7 @@ impl Operation {
             Self::Update => "update",
             Self::MergeInsert => "merge_insert",
             Self::Backfill => "backfill",
+            Self::DefaultCompactionPreflight => "default_compaction_preflight",
             Self::DefaultCompaction => "default_compaction",
             Self::RandomDeleteReclaim => "random_delete_reclaim",
             Self::NormalizePlacement => "normalize_placement",
@@ -227,6 +229,9 @@ impl Operation {
                 "cold_session_open_and_merge_insert_commit_including_bounded_synthetic_stream_generation"
             }
             Self::Backfill => "cold_session_open_and_row_aligned_backfill_commit",
+            Self::DefaultCompactionPreflight => {
+                "cold_session_open_and_default_compaction_plan_only"
+            }
             Self::DefaultCompaction => "cold_session_open_and_default_compaction_commit",
             Self::RandomDeleteReclaim => {
                 "cold_session_open_and_same_postcondition_random_delete_reclaim_commit"
@@ -731,6 +736,9 @@ fn actual_attempts_cover_operation(operation: Operation, metrics: ObjectMetrics)
                 > 0
         }
         Operation::Open => metrics.actual_get_attempts + metrics.actual_head_attempts > 0,
+        Operation::DefaultCompactionPreflight => {
+            metrics.actual_get_attempts + metrics.actual_head_attempts > 0
+        }
         Operation::Scan | Operation::Take | Operation::IndexTake => metrics.actual_get_attempts > 0,
     }
 }
@@ -1161,6 +1169,7 @@ fn implementation_path(args: &Args) -> &'static str {
         | Operation::Repack
         | Operation::Recluster
         | Operation::CheckpointGeneration => "capability_gated_explicit_maintenance",
+        Operation::DefaultCompactionPreflight => "default_compaction_plan_only",
         Operation::DefaultCompaction => "default_compaction",
         Operation::FixtureClone => "canonical_fixture_shallow_clone",
         Operation::RandomDeleteReclaim => match args.format {
@@ -2132,6 +2141,17 @@ struct CompactionObservation {
     layout_index_maintenance_ns: u64,
 }
 
+fn default_compaction_options(args: &Args) -> CompactionOptions {
+    CompactionOptions {
+        target_rows_per_fragment: args.target_rows_per_fragment,
+        max_rows_per_group: args.rows_per_fragment,
+        num_threads: Some(1),
+        materialize_deletions: true,
+        materialize_deletions_threshold: 0.0,
+        ..Default::default()
+    }
+}
+
 async fn compact_files_with_observation(
     args: &Args,
     dataset: &mut Dataset,
@@ -2451,6 +2471,46 @@ async fn execute(
             )
             .await
         }
+        Operation::DefaultCompactionPreflight => {
+            let dataset = open_dataset(args, tracker).await?;
+            args.format.validate_dataset(&dataset)?;
+            let source_version = dataset.version().version;
+            let plan = plan_compaction(&dataset, &default_compaction_options(args)).await?;
+            if plan.read_version() != source_version || dataset.version().version != source_version
+            {
+                return Err(format!(
+                    "plan-only default compaction changed or mismatched source version: source={source_version}, plan={}, current={}",
+                    plan.read_version(),
+                    dataset.version().version
+                )
+                .into());
+            }
+            let admitted = plan.num_tasks();
+            let rejected_planned = plan.planning_metrics.groups_planned;
+            let not_admitted = plan.planning_metrics.groups_not_admitted;
+            if rejected_planned != not_admitted {
+                return Err(format!(
+                    "default compaction preflight rejection counts disagree: planned={rejected_planned}, not_admitted={not_admitted}"
+                )
+                .into());
+            }
+            let planned = admitted
+                .checked_add(rejected_planned)
+                .ok_or("default compaction preflight group count overflow")?;
+            finish_outcome(
+                args,
+                &dataset,
+                OperationOutcome {
+                    result_rows: Some(args.expected_rows as u64),
+                    compaction_groups_planned: Some(planned as u64),
+                    compaction_groups_admitted: Some(admitted as u64),
+                    compaction_groups_not_admitted: Some(not_admitted as u64),
+                    admission: Some(admitted == planned),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
         Operation::DefaultCompaction => {
             let mut dataset = open_dataset(args, tracker).await?;
             args.format.validate_dataset(&dataset)?;
@@ -2462,14 +2522,7 @@ async fn execute(
             let observation = compact_files_with_observation(
                 args,
                 &mut dataset,
-                CompactionOptions {
-                    target_rows_per_fragment: args.target_rows_per_fragment,
-                    max_rows_per_group: args.rows_per_fragment,
-                    num_threads: Some(1),
-                    materialize_deletions: true,
-                    materialize_deletions_threshold: 0.0,
-                    ..Default::default()
-                },
+                default_compaction_options(args),
                 maintenance_plan.as_ref(),
             )
             .await?;
@@ -2554,14 +2607,7 @@ async fn execute(
                 let observation = compact_files_with_observation(
                     args,
                     &mut dataset,
-                    CompactionOptions {
-                        target_rows_per_fragment: args.target_rows_per_fragment,
-                        max_rows_per_group: args.rows_per_fragment,
-                        num_threads: Some(1),
-                        materialize_deletions: true,
-                        materialize_deletions_threshold: 0.0,
-                        ..Default::default()
-                    },
+                    default_compaction_options(args),
                     maintenance_plan.as_ref(),
                 )
                 .await?;

@@ -39,6 +39,7 @@ PROFILE_FIELDS = {
     "repeated_update_rounds",
     "hot_set_rows",
     "minimum_sustained_boundaries",
+    "random_delete_reclaim_admission",
 }
 TRACK_FIELDS = {
     "matrix": {"cases"},
@@ -153,6 +154,15 @@ def load_matrix(path: Path) -> tuple[dict[str, Any], str, str]:
             raise ValueError("profiles must freeze narrow16/wide128/vector schemas")
         if any(value > profile["rows"] for value in profile["take_counts"]):
             raise ValueError(f"profile {profile_name} take_count exceeds rows")
+        expected_reclaim_admission = {
+            "smoke": "must_admit",
+            "release": "must_not_admit",
+        }[profile_name]
+        if profile["random_delete_reclaim_admission"] != expected_reclaim_admission:
+            raise ValueError(
+                f"profile {profile_name}.random_delete_reclaim_admission must be "
+                f"{expected_reclaim_admission}"
+            )
 
     tracks = _strict_object(matrix["tracks"], set(TRACK_FIELDS), "tracks")
     for track_name, fields in TRACK_FIELDS.items():
@@ -220,6 +230,8 @@ class Step:
             return "capability_gated_explicit_maintenance"
         if self.operation == "default_compaction":
             return "default_compaction"
+        if self.operation == "default_compaction_preflight":
+            return "default_compaction_plan_only"
         if self.operation == "random_delete_reclaim":
             return "same_postcondition_repack_or_default_compaction"
         if self.operation in {"index_build", "index_take", "index_optimize"}:
@@ -1702,7 +1714,9 @@ def run_matrix(
                         step_index=step_index,
                     )
                     preflight = runner.invoke_one(
-                        dataclasses.replace(step, operation="default_compaction"),
+                        dataclasses.replace(
+                            step, operation="default_compaction_preflight"
+                        ),
                         track="matrix",
                         case=case.name,
                         repeat=repeat,
@@ -1713,9 +1727,12 @@ def run_matrix(
                         ),
                         order_index=0,
                     )
-                    assert_default_not_admitted(
+                    assert_default_compaction_preflight(
                         preflight,
                         source_version=source_version,
+                        expected_admission=(
+                            profile["random_delete_reclaim_admission"] == "must_admit"
+                        ),
                         context="uniform-random delete reclaim",
                     )
                 maintenance_plan = None
@@ -2116,28 +2133,60 @@ def assert_pmr_preflight(record: dict[str, Any], context: str) -> None:
         )
 
 
-def assert_default_not_admitted(
-    record: dict[str, Any], *, source_version: int, context: str
+def assert_default_compaction_preflight(
+    record: dict[str, Any],
+    *,
+    source_version: int,
+    expected_admission: bool,
+    context: str,
 ) -> None:
-    data = record["io_by_path"]["data"]
     planned = record["compaction_groups_planned"]
     admitted = record["compaction_groups_admitted"]
     not_admitted = record["compaction_groups_not_admitted"]
+    io_by_path = record["io_by_path"]
+    wrote_objects = io_by_path is None or any(
+        metrics["put_requests"] != 0
+        or metrics["delete_requests"] != 0
+        or metrics["write_bytes"] != 0
+        for metrics in (io_by_path or {}).values()
+    )
+    reported_relocation = any(
+        record[field] is not None
+        for field in (
+            "compacted_data_bytes",
+            "index_storage_bytes_before",
+            "row_addresses_remapped",
+            "indices_remapped",
+            "index_coverage_reuse",
+            "layout_index_maintenance_ns",
+        )
+    )
     if (
         record["status"] != "ok"
+        or record["operation"] != "default_compaction_preflight"
+        or record["implementation_path"] != "default_compaction_plan_only"
         or record["placement_maintenance_required"] is True
-        or record["admission"] is not False
+        or record["admission"] is not expected_admission
         or planned is None
         or planned <= 0
-        or admitted != 0
-        or not_admitted != planned
+        or admitted is None
+        or not_admitted is None
+        or planned != admitted + not_admitted
+        or record["admission"] is not (admitted == planned)
         or record["dataset_version"] != source_version
-        or data["put_requests"] != 0
-        or data["write_bytes"] != 0
+        or record["put_requests"] != 0
+        or record["delete_requests"] != 0
+        or record["write_bytes"] != 0
+        or (record["actual_put_attempts"] or 0) != 0
+        or (record["actual_delete_attempts"] or 0) != 0
+        or record["maintenance_plan_path"] is not None
+        or record["maintenance_plan_sha256"] is not None
+        or reported_relocation
+        or wrote_objects
     ):
         raise RuntimeError(
-            f"{context}: default compaction did not produce a side-effect-free "
-            "not_admitted result"
+            f"{context}: default compaction plan-only preflight did not produce the "
+            "profile-required side-effect-free admission result"
         )
 
 

@@ -13,9 +13,13 @@ the remote host's default `python3` is older.
   row-aligned backfill, N-to-one and repeated compaction, scalar/vector index
   take/optimize, cold open/scan/random take, indexed relocation, and the
   `N-to-one pack -> random update/delete -> cold scan/take` chain. Clustered
-  delete reclaim must be admitted by default compaction. Random 50% and 90%
-  delete reclaim must produce a side-effect-free `not_admitted` result before
-  paired explicit `Repack`/baseline compaction reaches the same postcondition.
+  delete reclaim must be admitted by default compaction. Before random 50% and
+  90% delete reclaim, v2.3 runs `default_compaction_preflight`: it calls only
+  the default compaction planner, never executes or commits its tasks, and must
+  leave the dataset version and every object-store write counter unchanged.
+  The bounded smoke fixture freezes `must_admit`; the 100M-row release fixture
+  freezes `must_not_admit`. Paired explicit `Repack`/baseline compaction then
+  reaches the same postcondition independently of that plan-only observation.
 - `sustained` updates one fixed, exactly sampled hot set. Only the deterministic
   v2.2 no-stable physical policy may create a common maintenance boundary.
   Placement backpressure is a failure.
