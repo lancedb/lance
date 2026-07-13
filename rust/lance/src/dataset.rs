@@ -82,7 +82,7 @@ mod metadata;
 pub mod optimize;
 pub mod progress;
 pub mod refs;
-pub(crate) mod rowids;
+pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
 pub mod sql;
